@@ -13,7 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::{array::Float32Array, datatypes::DataType};
+#![allow(dead_code)]
+use arrow::{
+    array::{Array, Float32Array},
+    datatypes::DataType,
+};
 use datafusion::{
     common::{
         cast::as_fixed_size_list_array, plan_err, DataFusionError, Result as DataFusionResult,
@@ -40,6 +44,22 @@ impl ArrayDistance {
         Self {
             signature: Signature::uniform(2, valid_types, Volatility::Immutable),
         }
+    }
+
+    fn to_float32_array(input: &Arc<dyn Array>) -> Result<Vec<Float32Array>, DataFusionError> {
+        as_fixed_size_list_array(input)?
+            .iter()
+            .map(|v| {
+                v.ok_or_else(|| DataFusionError::Internal("no null entries allowed".into()))
+                    .and_then(|vv| {
+                        let binding = Arc::clone(&vv);
+                        match binding.as_any().downcast_ref::<Float32Array>() {
+                            Some(a) => Ok(a.clone()),
+                            None => Err(DataFusionError::Internal("downcast failed".into())),
+                        }
+                    })
+            })
+            .collect::<Result<Vec<Float32Array>, DataFusionError>>()
     }
 }
 
@@ -77,19 +97,13 @@ impl ScalarUDFImpl for ArrayDistance {
                 Ok(DataType::Float32)
             }
             (DataType::FixedSizeList(_f1, _size1), _) => {
-                return plan_err!(
-                    "array_distance requires the second argument to be of type FixedSizeList"
-                )
+                plan_err!("array_distance requires the second argument to be of type FixedSizeList")
             }
             (_, DataType::FixedSizeList(_f1, _size1)) => {
-                return plan_err!(
-                    "array_distance requires the first argument to be of type FixedSizeList"
-                )
+                plan_err!("array_distance requires the first argument to be of type FixedSizeList")
             }
             _ => {
-                return plan_err!(
-                    "array_distance requires the first argument to be of type FixedSizeList"
-                )
+                plan_err!("array_distance requires the first argument to be of type FixedSizeList")
             }
         }
     }
@@ -98,32 +112,8 @@ impl ScalarUDFImpl for ArrayDistance {
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
         let args = ColumnarValue::values_to_arrays(args)?;
 
-        let v1: Vec<Float32Array> = as_fixed_size_list_array(&args[0])?
-            .iter()
-            .map(|v| {
-                v.ok_or_else(|| DataFusionError::Internal("no null entries allowed".into()))
-                    .and_then(|vv| {
-                        Arc::clone(&vv)
-                            .as_any()
-                            .downcast_ref::<Float32Array>()
-                            .map(|array| array.clone())
-                            .ok_or_else(|| DataFusionError::Internal("downcast failed".into()))
-                    })
-            })
-            .collect::<Result<Vec<Float32Array>, DataFusionError>>()?;
-
-        let v2: Vec<Float32Array> = as_fixed_size_list_array(&args[1])?
-            .iter()
-            .map(|v| {
-                v.ok_or_else(|| DataFusionError::Internal("no null entries allowed".into()))
-                    .and_then(|vv| {
-                        vv.as_any()
-                            .downcast_ref::<Float32Array>()
-                            .map(|array| array.clone())
-                            .ok_or_else(|| DataFusionError::Internal("downcast failed".into()))
-                    })
-            })
-            .collect::<Result<Vec<Float32Array>, DataFusionError>>()?;
+        let v1: Vec<Float32Array> = Self::to_float32_array(&args[0])?;
+        let v2: Vec<Float32Array> = Self::to_float32_array(&args[1])?;
 
         let z = v1
             .iter()
@@ -161,8 +151,9 @@ mod tests {
 
     use super::ArrayDistance;
 
+    #[allow(clippy::float_cmp)]
     #[tokio::test]
-    async fn test_basic() -> Result<(), String> {
+    async fn test_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
@@ -171,40 +162,28 @@ mod tests {
         let values = Float32Array::try_new(
             vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
             None,
-        )
-        .unwrap();
-        let list_array = FixedSizeListArray::try_new(
-            Arc::clone(&field),
-            i32::try_from(3).unwrap(),
-            Arc::new(values),
-            None,
-        )
-        .unwrap();
+        )?;
+
+        let list_array =
+            FixedSizeListArray::try_new(Arc::clone(&field), 3_i32, Arc::new(values), None)?;
 
         let arc_list = Arc::new(list_array) as Arc<dyn Array>;
 
-        match array_distance.invoke(&[
+        let col_array = array_distance.invoke(&[
             ColumnarValue::Array(Arc::clone(&arc_list)),
             ColumnarValue::Array(Arc::clone(&arc_list)),
-        ]) {
-            Ok(array) => match ColumnarValue::values_to_arrays(&[array]) {
-                Ok(array) => {
-                    let array = array[0].as_any().downcast_ref::<Float32Array>().unwrap();
-                    assert_eq!(array.len(), 3);
-                    assert_eq!(array.value(0), 0.0);
-                    assert_eq!(array.value(1), 0.0);
-                    assert_eq!(array.value(2), 0.0);
-                }
-                Err(e) => {
-                    println!("Error {:#?}", e);
-                    assert!(false);
-                }
-            },
-            Err(e) => {
-                println!("Error {:#?}", e);
-                assert!(false);
-            }
-        };
+        ])?;
+
+        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
+        let array = array_vec[0]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or("failed downcast of result")?;
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), 0.0);
+        assert_eq!(array.value(1), 0.0);
+        assert_eq!(array.value(2), 0.0);
+
         Ok(())
     }
 }
