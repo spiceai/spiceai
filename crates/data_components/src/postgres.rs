@@ -39,7 +39,10 @@ use db_connection_pool::{
 };
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
-use sql_provider_datafusion::{expr::{self, Engine}, SqlTable};
+use sql_provider_datafusion::{
+    expr::{self, Engine},
+    SqlTable,
+};
 use std::sync::Arc;
 
 use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
