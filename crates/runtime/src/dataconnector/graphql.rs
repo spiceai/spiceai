@@ -114,19 +114,16 @@ impl GraphQLClient {
         }
 
         let response = request.send().await.context(UnableToHandleRequestSnafu)?;
-
-        if !response.status().is_success() {
-            return Err(Error::FailedToRequestData {
-                response: response
-                    .json::<serde_json::Value>()
-                    .await
-                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
-                    .unwrap_or_default(),
-            });
-        }
+        let status = response.status();
 
         let mut response: serde_json::Value =
             response.json().await.context(UnableToParseResponseSnafu)?;
+
+        if response["data"].is_null() || !status.is_success() {
+            return Err(Error::FailedToRequestData {
+                response: serde_json::to_string_pretty(&response).unwrap_or_default(),
+            });
+        }
 
         for key in self.json_path.split('.') {
             response = response[key].clone();
