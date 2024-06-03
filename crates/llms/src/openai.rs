@@ -14,7 +14,7 @@ limitations under the License.
 use crate::embeddings::{Embed, EmbeddingInput, Error as EmbedError, Result as EmbedResult};
 use crate::nql::{Error as NqlError, Nql, Result as NqlResult};
 
-use async_openai::types::CreateEmbeddingRequestArgs;
+use async_openai::types::{CreateEmbeddingRequest, CreateEmbeddingRequestArgs};
 use async_openai::{
     config::OpenAIConfig,
     types::{
@@ -25,6 +25,7 @@ use async_openai::{
     Client,
 };
 use async_trait::async_trait;
+use futures::future::try_join_all;
 use serde_json::Value;
 use snafu::ResultExt;
 
@@ -143,26 +144,67 @@ impl Nql for Openai {
 #[async_trait]
 impl Embed for Openai {
     async fn embed(&mut self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
-        let req = CreateEmbeddingRequestArgs::default()
-            .model(self.model.clone())
-            .input(to_openai_embedding_input(input))
-            .build()
-            .boxed()
-            .map_err(|source| EmbedError::FailedToPrepareInput { source })?;
+        // Batch requests to OpenAI endpoint because "any array must be 2048 dimensions or less".
+        // https://platform.openai.com/docs/api-reference/embeddings/create#embeddings-create-input
+        let embed_batches = match input {
+            EmbeddingInput::StringBatch(ref batch) => batch
+                .chunks(2048)
+                .map(|chunk| EmbeddingInput::StringBatch(chunk.to_vec()))
+                .collect(),
+            EmbeddingInput::TokensBatch(ref batch) => batch
+                .chunks(2048)
+                .map(|chunk| EmbeddingInput::TokensBatch(chunk.to_vec()))
+                .collect(),
+            _ => vec![input],
+        };
 
-        let embedding: Vec<Vec<f32>> = self
-            .client
-            .embeddings()
-            .create(req)
-            .await
-            .boxed()
-            .map_err(|source| EmbedError::FailedToCreateEmbedding { source })?
-            .data
-            .iter()
-            .map(|d| d.embedding.clone())
+        let request_batches_result: EmbedResult<Vec<CreateEmbeddingRequest>> = embed_batches
+            .into_iter()
+            .map(|batch| {
+                CreateEmbeddingRequestArgs::default()
+                    .model(self.model.clone())
+                    .input(to_openai_embedding_input(batch))
+                    .build()
+                    .boxed()
+                    .map_err(|source| EmbedError::FailedToPrepareInput { source })
+            })
             .collect();
 
-        Ok(embedding)
+        let embed_futures: Vec<_> = request_batches_result?
+            .into_iter()
+            .map(|req| {
+                let local_client = self.client.clone();
+                async move {
+                    let embedding: Vec<Vec<f32>> = local_client
+                        .embeddings()
+                        .create(req)
+                        .await
+                        .boxed()
+                        .map_err(|source| EmbedError::FailedToCreateEmbedding { source })?
+                        .data
+                        .iter()
+                        .map(|d| d.embedding.clone())
+                        .collect();
+                    Ok::<Vec<Vec<f32>>, EmbedError>(embedding)
+                }
+            })
+            .collect();
+
+        let combined_results: Vec<Vec<f32>> = try_join_all(embed_futures)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        Ok(combined_results)
+    }
+
+    fn size(&self) -> i32 {
+        match self.model.as_str() {
+            "text-embedding-3-large" => 3_072,
+            "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
+            _ => 0, // unreachable. If not a valid model, it won't create embeddings.
+        }
     }
 }
 

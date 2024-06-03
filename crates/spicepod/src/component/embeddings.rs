@@ -96,3 +96,12 @@ pub enum EmbeddingParams {
     },
     None,
 }
+
+/// Configuration for if and how a dataset's column should be embedded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColumnEmbeddingConfig {
+    pub column: String,
+
+    #[serde(rename = "use", default)]
+    pub model: String,
+}
