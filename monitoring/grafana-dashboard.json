@@ -440,7 +440,7 @@
       },
       "id": 26,
       "panels": [],
-      "title": "Queries",
+      "title": "SQL Queries",
       "type": "row"
     },
     {
@@ -528,9 +528,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\",datasets!~\"runtime.*\"}",
+          "expr": "sum by (datasets, quantile) (query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\",datasets!~\"runtime.*\"})",
           "instant": false,
-          "legendFormat": "{{datasets}}",
+          "legendFormat": "{{datasets}}(P{{quantile}})",
           "range": true,
           "refId": "A"
         }
@@ -622,9 +622,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (datasets, protocol) (increase(query_failures{pod=~\"${pods}\"}[$__rate_interval])) > 0",
+          "expr": "sum by (datasets, protocol, tags)(increase(query_failures{pod=~\"${pods}\"}[$__rate_interval])) > 0",
           "instant": false,
-          "legendFormat": "__auto",
+          "legendFormat": "",
           "range": true,
           "refId": "A"
         }
