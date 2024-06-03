@@ -15,9 +15,11 @@ WORKDIR /build
 ARG CARGO_FEATURES
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
+ARG RUSTFLAGS
 ENV CARGO_FEATURES=$CARGO_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
-    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI
+    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
+    RUSTFLAGS=$RUSTFLAGS
 
 RUN \
   --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
@@ -43,5 +45,7 @@ fi
 COPY --from=build /root/spiced /usr/local/bin/spiced
 
 EXPOSE 3000 50051
+
+WORKDIR /app
 
 ENTRYPOINT ["/usr/local/bin/spiced"]

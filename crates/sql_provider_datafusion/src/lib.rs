@@ -100,13 +100,14 @@ impl<T, P> SqlTable<T, P> {
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
+        engine: Option<expr::Engine>,
     ) -> Self {
         Self {
             name,
             pool: Arc::clone(pool),
             schema: schema.into(),
             table_reference: table_reference.into(),
-            engine: None,
+            engine,
             dialect: None,
         }
     }
