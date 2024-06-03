@@ -40,6 +40,7 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+use query::{Protocol, QueryBuilder};
 use secrets::Secret;
 use snafu::prelude::*;
 use tokio::spawn;
@@ -790,6 +791,10 @@ impl DataFusion {
                 schema: SPICE_DEFAULT_SCHEMA.to_string(),
             })?
             .table_names())
+    }
+
+    pub fn query_builder(self: &Arc<Self>, sql: String, protocol: Protocol) -> QueryBuilder {
+        QueryBuilder::new(sql, Arc::clone(self), protocol)
     }
 }
 

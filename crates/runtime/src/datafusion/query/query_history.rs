@@ -22,7 +22,10 @@ use std::{
 use crate::component::dataset::TimeFormat;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use arrow::{
-    array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array},
+    array::{
+        BooleanArray, Float32Array, Int8Array, RecordBatch, StringArray, TimestampNanosecondArray,
+        UInt64Array,
+    },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use datafusion::sql::TableReference;
@@ -68,7 +71,7 @@ pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, 
 fn table_schema() -> Schema {
     Schema::new(vec![
         Field::new("query_id", DataType::Utf8, false),
-        Field::new("schema", DataType::Utf8, false),
+        Field::new("schema", DataType::Utf8, true),
         Field::new("sql", DataType::Utf8, false),
         Field::new("nsql", DataType::Utf8, true),
         Field::new(
@@ -81,9 +84,11 @@ fn table_schema() -> Schema {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
-        Field::new("execution_time", DataType::UInt64, true), //todo: make this required
+        Field::new("execution_time", DataType::Float32, false),
+        Field::new("execution_status", DataType::Int8, false),
         Field::new("rows_produced", DataType::UInt64, false),
         Field::new("results_cache_hit", DataType::Boolean, false),
+        Field::new("error_message", DataType::Utf8, true),
     ])
 }
 
@@ -170,6 +175,11 @@ impl Query {
             .boxed()
             .context(UnableToCreateRowSnafu)?;
 
+        let execution_status = match self.error_message {
+            Some(_) => -1,
+            None => 0,
+        };
+
         RecordBatch::try_new(
             Arc::new(table_schema()),
             vec![
@@ -182,9 +192,13 @@ impl Query {
                 Arc::new(StringArray::from(vec![self.nsql.clone()])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-                Arc::new(UInt64Array::from(vec![self.execution_time])),
+                Arc::new(Float32Array::from(vec![self.execution_time])),
+                Arc::new(Int8Array::from(vec![execution_status])),
                 Arc::new(UInt64Array::from(vec![self.rows_produced])),
-                Arc::new(BooleanArray::from(vec![self.results_cache_hit])),
+                Arc::new(BooleanArray::from(vec![self
+                    .results_cache_hit
+                    .unwrap_or(false)])),
+                Arc::new(StringArray::from(vec![self.error_message.clone()])),
             ],
         )
         .boxed()
@@ -194,9 +208,7 @@ impl Query {
     fn validate(&self) -> Result<(), Error> {
         let mut missing_fields: Vec<&str> = Vec::new();
 
-        check_required_field!(self.schema, "schema", missing_fields);
         check_required_field!(self.end_time, "end_time", missing_fields);
-        check_required_field!(self.rows_produced, "rows_produced", missing_fields);
 
         if missing_fields.is_empty() {
             Ok(())
