@@ -50,8 +50,9 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tokio::{signal, sync::RwLock};
+pub use util::shutdown_signal;
 
 use crate::extension::{Extension, ExtensionFactory};
 pub mod accelerated_table;
@@ -195,16 +196,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
+#[derive(Clone)]
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
     pub embeds: Arc<RwLock<EmbeddingModelStore>>,
-    pub pods_watcher: Option<podswatcher::PodsWatcher>,
+    pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
-    extensions: Vec<Box<dyn Extension>>,
+    extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
@@ -217,18 +219,16 @@ impl Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
-        let cache_provider = Self::init_results_cache(&app);
-
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
-            df: Arc::new(DataFusion::new_with_cache_provider(cache_provider)),
+            df: Arc::new(DataFusion::new()),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher: None,
+            pods_watcher: Arc::new(RwLock::new(None)),
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
-            extensions: vec![],
+            extensions: Arc::new(RwLock::new(vec![])),
         };
 
         let mut extensions: Vec<Box<dyn Extension>> = vec![];
@@ -242,7 +242,7 @@ impl Runtime {
             };
         }
 
-        rt.extensions = extensions;
+        rt.extensions = Arc::new(RwLock::new(extensions));
 
         rt
     }
@@ -252,19 +252,17 @@ impl Runtime {
         Arc::clone(&self.df)
     }
 
-    pub async fn start_extensions(&mut self) {
-        let mut extensions: Vec<Box<dyn Extension>> = std::mem::take(&mut self.extensions);
-        for extension in &mut extensions {
-            if let Err(err) = extension.on_start(self).await {
+    pub async fn start_extensions(&self) {
+        let mut extensions = self.extensions.write().await;
+        for i in 0..extensions.len() {
+            if let Err(err) = extensions[i].on_start(self).await {
                 tracing::warn!("Failed to start extension: {err}");
             }
         }
-
-        self.extensions = extensions;
     }
 
     pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
-        self.pods_watcher = Some(pods_watcher);
+        self.pods_watcher = Arc::new(RwLock::new(Some(pods_watcher)));
     }
 
     pub async fn load_secrets(&self) {
@@ -860,7 +858,7 @@ impl Runtime {
     }
 
     pub async fn start_servers(
-        &mut self,
+        &self,
         config: Config,
         with_metrics: Option<SocketAddr>,
     ) -> Result<()> {
@@ -892,8 +890,9 @@ impl Runtime {
         }
     }
 
-    pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let Some(mut pods_watcher) = self.pods_watcher.take() else {
+    pub async fn start_pods_watcher(&self) -> notify::Result<()> {
+        let mut pods_watcher = self.pods_watcher.write().await;
+        let Some(mut pods_watcher) = pods_watcher.take() else {
             return Ok(());
         };
         let mut rx = pods_watcher.watch()?;
@@ -971,26 +970,25 @@ impl Runtime {
         Ok(())
     }
 
-    fn init_results_cache(app: &Option<App>) -> Option<Arc<QueryResultsCacheProvider>> {
-        let app = app.as_ref()?;
+    pub async fn init_results_cache(&self) {
+        let app = self.app.read().await;
+        let Some(app) = app.as_ref() else { return };
 
         let cache_config = &app.runtime.results_cache;
 
         if !cache_config.enabled {
-            return None;
+            return;
         }
 
-        let cache_provider = match QueryResultsCacheProvider::new(cache_config) {
-            Ok(cache_provider) => Arc::new(cache_provider),
+        match QueryResultsCacheProvider::new(cache_config) {
+            Ok(cache_provider) => {
+                tracing::info!("Initialized results cache; {cache_provider}");
+                self.datafusion().set_cache_provider(cache_provider);
+            }
             Err(e) => {
                 tracing::warn!("Failed to initialize results cache: {e}");
-                return None;
             }
         };
-
-        tracing::info!("Initialized results cache; {cache_provider}");
-
-        Some(cache_provider)
     }
 
     pub async fn init_query_history(&self) -> Result<()> {
@@ -1127,17 +1125,4 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let signal_result = signal::ctrl_c().await;
-        if let Err(err) = signal_result {
-            tracing::error!("Failed to listen to shutdown signal: {err}");
-        }
-    };
-
-    tokio::select! {
-        () = ctrl_c => {},
-    }
 }

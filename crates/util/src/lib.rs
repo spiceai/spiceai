@@ -19,6 +19,8 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
+use tokio::signal;
+
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_possible_truncation)]
@@ -49,6 +51,19 @@ pub fn pretty_print_number(num: usize) -> String {
         .collect::<Result<Vec<&str>, _>>()
         .unwrap_or(vec![])
         .join(",")
+}
+
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let signal_result = signal::ctrl_c().await;
+        if let Err(err) = signal_result {
+            tracing::error!("Failed to listen to shutdown signal: {err}");
+        }
+    };
+
+    tokio::select! {
+        () = ctrl_c => {},
+    }
 }
 
 /**
