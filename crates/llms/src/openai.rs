@@ -144,7 +144,6 @@ impl Nql for Openai {
 #[async_trait]
 impl Embed for Openai {
     async fn embed(&mut self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
-
         // Batch requests to OpenAI endpoint because "any array must be 2048 dimensions or less".
         // https://platform.openai.com/docs/api-reference/embeddings/create#embeddings-create-input
         let embed_batches = match input {
