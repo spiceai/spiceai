@@ -16,7 +16,7 @@ limitations under the License.
 
 use serde::{Deserialize, Serialize};
 
-use super::{params::Params, WithDependsOn};
+use super::{embeddings::ColumnEmbeddingConfig, params::Params, WithDependsOn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +79,10 @@ pub struct Dataset {
     pub acceleration: Option<acceleration::Acceleration>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "embeddings", default)]
+    pub embeddings: Vec<ColumnEmbeddingConfig>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
 }
@@ -98,6 +102,7 @@ impl Dataset {
             time_column: None,
             time_format: None,
             acceleration: None,
+            embeddings: Vec::default(),
             depends_on: Vec::default(),
         }
     }
@@ -117,6 +122,7 @@ impl WithDependsOn<Dataset> for Dataset {
             time_column: self.time_column.clone(),
             time_format: self.time_format.clone(),
             acceleration: self.acceleration.clone(),
+            embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
         }
     }

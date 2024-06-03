@@ -287,7 +287,11 @@ fn to_sendable_stream(
                     continue;
                     }
                     match ObjectStoreMetadataTable::to_record_batch(&[object_meta]) {
-                        Ok(batch) => {yield Ok(batch); count += 1;},
+                        Ok(batch) => {
+                            let n = batch.num_rows();
+                            yield Ok(batch);
+                            count += n;
+                        },
                         Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
                     }
                 },
