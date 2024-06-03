@@ -120,7 +120,7 @@ impl Query {
             Err(e) => handle_error!(ctx, e, UnableToExecuteQuery),
         };
 
-        if let Some(cache_provider) = &ctx.df.cache_provider {
+        if let Some(cache_provider) = &ctx.df.cache_provider() {
             if let Some(cached_result) = match cache_provider.get(&plan).await {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => None,
@@ -177,7 +177,7 @@ impl Query {
         };
 
         if cache_is_enabled_for_plan(&plan_copy) {
-            if let Some(cache_provider) = &ctx.df.cache_provider {
+            if let Some(cache_provider) = &ctx.df.cache_provider() {
                 let record_batch_stream = to_cached_record_batch_stream(
                     Arc::clone(cache_provider),
                     res_stream,
