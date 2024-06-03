@@ -171,8 +171,7 @@ impl Refresher {
                         Ok(plan) => {
                             if let Err(e) = collect(plan, ctx.task_ctx()).await {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
-                                self.mark_dataset_status(status::ComponentStatus::Error)
-                                    .await;
+                                self.mark_dataset_status(status::ComponentStatus::Error);
                             } else {
                                 if let Some(start_time) = start_time {
                                     let num_rows = data_update
@@ -217,8 +216,7 @@ impl Refresher {
                             };
                         }
                         Err(e) => {
-                            self.mark_dataset_status(status::ComponentStatus::Error)
-                                .await;
+                            self.mark_dataset_status(status::ComponentStatus::Error);
                             tracing::error!("Error adding data for {dataset_name}: {e}");
                         }
                     }
@@ -547,29 +545,27 @@ impl Refresher {
         if let Some(sender) = ready_sender.take() {
             sender.send(()).ok();
         };
-        self.mark_dataset_status(status).await;
-    }
 
-    async fn mark_dataset_status(&self, status: status::ComponentStatus) {
-        status::update_dataset(&self.dataset_name, status);
+        self.mark_dataset_status(status);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
 
         let mut labels = vec![("dataset", self.dataset_name.to_string())];
         if let Some(sql) = &self.refresh.read().await.sql {
             labels.push(("sql", sql.to_string()));
         };
 
-        match status {
-            status::ComponentStatus::Ready => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                metrics::gauge!("datasets_acceleration_last_refresh_time", &labels)
-                    .set(now.as_secs_f64());
-            }
-            status::ComponentStatus::Error => {
-                metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
-            }
-            _ => (),
+        metrics::gauge!("datasets_acceleration_last_refresh_time", &labels).set(now.as_secs_f64());
+    }
+
+    fn mark_dataset_status(&self, status: status::ComponentStatus) {
+        status::update_dataset(&self.dataset_name, status);
+
+        if status == status::ComponentStatus::Error {
+            let labels = [("dataset", self.dataset_name.to_string())];
+            metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
         }
     }
 }
