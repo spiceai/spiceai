@@ -18,11 +18,10 @@ use crate::component::dataset::Dataset;
 use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
-use std::path::{self, Path};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use url::{ParseError, Url};
+use url::Url;
 
 use super::{
     DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
