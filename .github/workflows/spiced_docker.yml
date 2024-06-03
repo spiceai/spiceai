@@ -49,6 +49,7 @@ jobs:
           push: ${{ startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
+            RUSTFLAGS=-C link-dead-code=n
             CARGO_FEATURES=release
           tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-slim

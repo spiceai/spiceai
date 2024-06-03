@@ -57,11 +57,14 @@ pub mod databricks;
 pub mod dremio;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod file;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod localhost;
+#[cfg(feature = "duckdb")]
+pub mod motherduck;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
@@ -228,6 +231,7 @@ pub async fn register_all() {
     register_connector_factory("databricks", databricks::Databricks::create).await;
     #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
+    register_connector_factory("file", file::File::create).await;
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
@@ -242,6 +246,8 @@ pub async fn register_all() {
     register_connector_factory("postgres", postgres::Postgres::create).await;
     #[cfg(feature = "duckdb")]
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
+    #[cfg(feature = "duckdb")]
+    register_connector_factory("motherduck", motherduck::MotherDuck::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
     #[cfg(feature = "odbc")]
