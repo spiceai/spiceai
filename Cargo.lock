@@ -8246,6 +8246,7 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
+ "futures",
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.2",
@@ -9509,6 +9510,8 @@ name = "util"
 version = "0.14.0-alpha"
 dependencies = [
  "humantime",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

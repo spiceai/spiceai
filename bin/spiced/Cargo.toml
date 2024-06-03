@@ -20,6 +20,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics-exporter-prometheus = "0.13.0"
+futures = { workspace = true }
 
 [features]
 default = [
