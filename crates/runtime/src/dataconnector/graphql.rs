@@ -16,9 +16,11 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::error::ArrowError;
 use arrow_json::reader::infer_json_schema_from_iterator;
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
@@ -39,6 +41,30 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use super::{DataConnector, DataConnectorFactory};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to handle request: {source}"))]
+    UnableToHandleRequest { source: reqwest::Error },
+
+    #[snafu(display("Failed to request data:\n {response}"))]
+    FailedToRequestData { response: String },
+
+    #[snafu(display("Unable to parse response: {source}"))]
+    UnableToParseResponse { source: reqwest::Error },
+
+    #[snafu(display("Unable to read batch: {source}"))]
+    UnableToReadBatch { source: ArrowError },
+
+    #[snafu(display("Unable to collect batch: {source}"))]
+    UnableToCollectBatch { source: ArrowError },
+
+    #[snafu(display("Unable to infer schema: {source}"))]
+    UnableToInferSchema { source: ArrowError },
+
+    #[snafu(display("Invalid object access: {message}"))]
+    InvalidObjectAccess { message: String },
+}
 
 pub struct GraphQL {
     secret: Option<Secret>,
@@ -85,71 +111,73 @@ impl GraphQLClient {
             _ => {}
         }
 
-        let response = request.send().await.map_err(|_| {
-            datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
-        })?;
+        let response = request
+            .send()
+            .await
+            .context(UnableToHandleRequestSnafu)
+            .map_err(to_execution_error)?;
 
         if !response.status().is_success() {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Request error:\n{}",
-                response
+            return Err(Error::FailedToRequestData {
+                response: response
                     .json::<serde_json::Value>()
                     .await
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
-                    .unwrap_or_default()
-            )));
+                    .unwrap_or_default(),
+            })
+            .map_err(to_execution_error);
         }
 
-        let mut response: serde_json::Value = response.json().await.map_err(|_| {
-            datafusion::error::DataFusionError::Execution("Failed to parse response".to_string())
-        })?;
+        let mut response: serde_json::Value = response
+            .json()
+            .await
+            .context(UnableToParseResponseSnafu)
+            .map_err(to_execution_error)?;
+
         for key in self.json_path.split('.') {
             response = response[key].clone();
         }
 
-        let unwraped = match response {
-            Value::Array(val) => val.clone(),
-            obj @ Value::Object(_) => vec![obj.clone()],
-            Value::Null => Err(datafusion::error::DataFusionError::Execution(
-                "Value is null".to_string(),
-            ))?,
-            _ => Err(datafusion::error::DataFusionError::Execution(
-                "Value is not an array or object".to_string(),
-            ))?,
+        let unwrapped = match response {
+            Value::Array(val) => Ok(val.clone()),
+            obj @ Value::Object(_) => Ok(vec![obj.clone()]),
+            Value::Null => Err(Error::InvalidObjectAccess {
+                message: "Found null value".to_string(),
+            }),
+            _ => Err(Error::InvalidObjectAccess {
+                message: "Found primitive value".to_string(),
+            }),
         };
 
+        let unwrapped = unwrapped.map_err(to_execution_error)?;
+
         let schema = Arc::new(
-            infer_json_schema_from_iterator(unwraped.clone().into_iter().map(Result::Ok)).map_err(
-                |_| {
-                    datafusion::error::DataFusionError::Execution(
-                        "Failed to infer schema".to_string(),
-                    )
-                },
-            )?,
+            infer_json_schema_from_iterator(unwrapped.clone().into_iter().map(Result::Ok))
+                .context(UnableToInferSchemaSnafu)
+                .map_err(to_execution_error)?,
         );
 
         let mut res = vec![];
-        for v in unwraped {
+        for v in unwrapped {
             let buf = v.to_string();
             let batch = ReaderBuilder::new(Arc::clone(&schema))
                 .with_batch_size(1024)
                 .build(Cursor::new(buf.as_bytes()))
-                .map_err(|_| {
-                    datafusion::error::DataFusionError::Execution(
-                        "Failed to read batch".to_string(),
-                    )
-                })?
+                .context(UnableToReadBatchSnafu)
+                .map_err(to_execution_error)?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| {
-                    datafusion::error::DataFusionError::Execution(
-                        "Failed to collect batch".to_string(),
-                    )
-                })?;
+                .context(UnableToCollectBatchSnafu)
+                .map_err(to_execution_error)?;
             res.push(batch);
         }
 
         Ok((res, schema))
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn to_execution_error(e: Error) -> DataFusionError {
+    DataFusionError::Execution(format!("{e}"))
 }
 
 impl GraphQL {
