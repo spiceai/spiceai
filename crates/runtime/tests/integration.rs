@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use datafusion::{
     assert_batches_eq, execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
+use futures::Future;
 use runtime::Runtime;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
@@ -31,6 +32,9 @@ mod graphql;
 mod federation;
 mod refresh_sql;
 mod results_cache;
+
+#[cfg(feature = "odbc")]
+mod odbc;
 
 /// Modifies the runtime configuration of `DataFusion` to make test results reproducible across all machines.
 ///
@@ -125,4 +129,22 @@ where
     }
 
     Ok(())
+}
+
+async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < max_wait {
+        if f().await {
+            return true;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    false
 }
