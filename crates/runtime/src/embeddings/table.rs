@@ -78,9 +78,9 @@ impl EmbeddingTable {
             if let Some(model_lock) = embedding_models.read().await.get(model) {
                 let z = model_lock.read().await.size();
                 model_sizes.insert(col.clone(), z);
-                println!("Model {model} has size {z}");
+                tracing::debug!("Model {model} has size {z}");
             } else {
-                println!("Model {model} not found for column {col}");
+                tracing::debug!("Model {model} not found for column {col}");
             }
         }
         model_sizes
