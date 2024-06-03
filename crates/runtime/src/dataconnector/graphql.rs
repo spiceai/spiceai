@@ -185,7 +185,7 @@ impl GraphQL {
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
-                message: "Invalid URL",
+                message: "Invalid URL in dataset `from` definition",
             },
         )?;
         let json_path = self
