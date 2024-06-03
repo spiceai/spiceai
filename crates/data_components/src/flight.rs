@@ -142,7 +142,13 @@ impl FlightTable {
     ) -> Result<SchemaRef> {
         let mut stream = client
             .clone()
-            .query(format!("SELECT * FROM {table_reference} limit 1").as_str())
+            .query(
+                format!(
+                    "SELECT * FROM {} limit 1",
+                    table_reference.to_quoted_string()
+                )
+                .as_str(),
+            )
             .await
             .context(FlightSnafu)?;
 

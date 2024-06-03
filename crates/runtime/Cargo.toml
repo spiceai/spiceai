@@ -151,3 +151,7 @@ snowflake = [
     "data_components/snowflake",
 ]
 models = ["model_components/full", "llms/mistralrs"]
+
+[[bench]]
+name = "bench"
+harness = false

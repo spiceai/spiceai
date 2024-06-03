@@ -37,6 +37,10 @@ nextest:
 test-integration:
 	@cargo test -p runtime --test integration --features mysql -- --nocapture
 
+.PHONY: test-bench
+test-bench:
+	@cargo bench -p runtime
+
 .PHONY: lint lint-go lint-rust
 lint: lint-go lint-rust
 
