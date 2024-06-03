@@ -56,7 +56,7 @@ bytes = "1.6.0"
 url = "2.5.0"
 
 [features]
-duckdb = ["dep:duckdb", "dep:r2d2"]
+duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb"]
 flightsql = ["dep:tonic", "dep:r2d2"]
 postgres = ["dep:bb8", "dep:bb8-postgres", "dep:postgres-native-tls", "arrow_sql_gen/postgres", "dep:tokio-postgres"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]

@@ -75,3 +75,22 @@ ssh2 = { version = "0.9.4" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "bf5fac66ca196ca52221df1ac90f38879d9b6ea8" }
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "bf5fac66ca196ca52221df1ac90f38879d9b6ea8" }
 object_store = { version = "0.9.1" }
+
+[patch."https://github.com/spiceai/datafusion.git"]
+datafusion = { path = "/Users/phillip/code/apache/datafusion/datafusion/core" }
+datafusion-substrait = { path = "/Users/phillip/code/apache/datafusion/datafusion/substrait" }
+datafusion-proto = { path = "/Users/phillip/code/apache/datafusion/datafusion/proto" }
+datafusion-expr = { path = "/Users/phillip/code/apache/datafusion/datafusion/expr" }
+datafusion-execution = { path = "/Users/phillip/code/apache/datafusion/datafusion/execution" }
+datafusion-sql = { path = "/Users/phillip/code/apache/datafusion/datafusion/sql" }
+datafusion-physical-plan = { path = "/Users/phillip/code/apache/datafusion/datafusion/physical-plan" }
+datafusion-common = { path = "/Users/phillip/code/apache/datafusion/datafusion/common" }
+datafusion-common-runtime = { path = "/Users/phillip/code/apache/datafusion/datafusion/common-runtime" }
+datafusion-physical-expr = { path = "/Users/phillip/code/apache/datafusion/datafusion/physical-expr" }
+datafusion-physical-expr-common = { path = "/Users/phillip/code/apache/datafusion/datafusion/physical-expr-common" }
+datafusion-functions = { path = "/Users/phillip/code/apache/datafusion/datafusion/functions" }
+datafusion-functions-array = { path = "/Users/phillip/code/apache/datafusion/datafusion/functions-array" }
+
+[patch."https://github.com/spiceai/datafusion-federation.git"]
+datafusion-federation = { path = "/Users/phillip/code/datafusion-contrib/datafusion-federation/datafusion-federation" }
+datafusion-federation-sql = { path = "/Users/phillip/code/datafusion-contrib/datafusion-federation/sources/sql" }

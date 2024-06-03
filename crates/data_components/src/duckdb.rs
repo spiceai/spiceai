@@ -22,10 +22,15 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
-    sql::TableReference,
+    sql::{
+        sqlparser::{
+            ast::TableFactor, dialect::DuckDbDialect, parser::Parser, tokenizer::Tokenizer,
+        },
+        TableReference,
+    },
 };
 use db_connection_pool::{
-    dbconnection::{duckdbconn::DuckDbConnection, DbConnection},
+    dbconnection::{duckdbconn::DuckDbConnection, get_schema, DbConnection},
     duckdbpool::DuckDbConnectionPool,
     DbConnectionPool, Mode,
 };
@@ -344,18 +349,15 @@ impl Read for DuckDBTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
+        let conn = Arc::clone(&pool).connect().await?;
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
-        let table_provider = SqlTable::new("duckdb", &dyn_pool, table_reference, None)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let schema = get_schema(conn, &table_reference).await?;
+        let table_provider =
+            SqlTable::new_with_schema("duckdb", &dyn_pool, schema, table_reference, None);
 
         let table_provider = Arc::new(table_provider);
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let table_provider = Arc::new(table_provider.create_federated_table_provider()?);
 
         Ok(table_provider)
     }
@@ -377,5 +379,53 @@ impl ReadWrite for DuckDBTableFactory {
         );
 
         Ok(DuckDBTableWriter::create(read_provider, duckdb))
+    }
+}
+
+fn is_table_function(table_reference: &TableReference) -> bool {
+    let table_name = match table_reference {
+        TableReference::Full { .. } | TableReference::Partial { .. } => return false,
+        TableReference::Bare { table } => table,
+    };
+
+    let dialect = DuckDbDialect {};
+    let mut tokenizer = Tokenizer::new(&dialect, table_name);
+    let Ok(tokens) = tokenizer.tokenize() else {
+        return false;
+    };
+    let Ok(tf) = Parser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_table_factor()
+    else {
+        return false;
+    };
+
+    let TableFactor::Table { args, .. } = tf else {
+        return false;
+    };
+
+    args.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_table_function() {
+        let tests = vec![
+            ("table_name", false),
+            ("table_name()", true),
+            ("table_name(arg1, arg2)", true),
+            ("read_parquet", false),
+            ("read_parquet()", true),
+            ("read_parquet('my_parquet_file.parquet')", true),
+            ("read_csv_auto('my_csv_file.csv')", true),
+        ];
+
+        for (table_name, expected) in tests {
+            let table_reference = TableReference::bare(table_name.to_string());
+            assert_eq!(is_table_function(&table_reference), expected);
+        }
     }
 }
