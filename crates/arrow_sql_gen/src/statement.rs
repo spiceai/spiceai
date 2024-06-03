@@ -24,7 +24,7 @@ use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
-    Alias, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
+    Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
     IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
     SqliteQueryBuilder, Table,
 };
@@ -418,6 +418,18 @@ impl InsertBuilder {
                             }
                         }
                     }
+                    DataType::Binary => {
+                        let array = column.as_any().downcast_ref::<array::BinaryArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
                     unimplemented_type => {
                         return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
                             data_type: unimplemented_type.clone(),
@@ -522,6 +534,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
         }
+        DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
 
         // Add more mappings here as needed
         _ => unimplemented!("Data type mapping not implemented for {:?}", data_type),

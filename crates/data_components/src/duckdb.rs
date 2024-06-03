@@ -34,7 +34,7 @@ use duckdb::{
     Transaction,
 };
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use sql_provider_datafusion::{expr::Engine, SqlTable};
 use std::{cmp, sync::Arc};
 
 use self::write::DuckDBTableWriter;
@@ -187,6 +187,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             &dyn_pool,
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
+            Some(Engine::DuckDB),
         ));
 
         let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb);
