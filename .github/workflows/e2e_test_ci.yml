@@ -306,7 +306,7 @@ jobs:
         - name: Spice dataset configure
           working-directory: test_app
           run: |
-            echo -e "test_graphql_table\nrepos\graphql:https://api.github.com/graphql\ny" | spice dataset configure
+            echo -e "test_graphql_table\nrepos\ngraphql:https://api.github.com/graphql\ny" | spice dataset configure
             # configure mysql credentials
             echo -e "params:\n  auth_token_key: token\n  json_path: data.viewer.repositories.nodes\n  query: |
             {
@@ -330,7 +330,7 @@ jobs:
 
         - name: Start spice runtime
           env:
-            SPICE_SECRET_GRAPHQL_TOKEN: ${{ secrets.SPICE_SECRET_GITHUB_TOKEN }}
+            SPICE_SECRET_GRAPHQL_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           working-directory: test_app
           run: |
             spice run &> spice.log &
