@@ -62,7 +62,7 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 }
 
 // Run these tests with
-// `databricks_odbc_host=copy-paste-here databricks_warehouse_id=copy-paste-here databricks_access_token=copy-paste-here cargo test --package runtime 'databricks_odbc' --features='odbc'`
+// `databricks_odbc_host=copy-paste-here databricks_warehouse_id=copy-paste-here databricks_access_token=copy-paste-here cargo test --package runtime 'databricks_odbc' --features=odbc,duckdb,sqlite`
 //
 // Running this test in local requires ODBC setup in local, check https://github.com/spiceai/spiceai/pull/1204 to see the details
 
