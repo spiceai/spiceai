@@ -653,7 +653,7 @@ impl Runtime {
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         // Only wrap data connector when necessary.
-        let connector = if ds.embeddings.is_empty() {
+        let connector = if !ds.embeddings.is_empty() {
             Arc::new(EmbeddingConnector::new(
                 data_connector,
                 Arc::clone(&embedding),
