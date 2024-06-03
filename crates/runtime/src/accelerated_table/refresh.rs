@@ -113,6 +113,7 @@ impl Refresher {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn start(
         &self,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -130,8 +131,13 @@ impl Refresher {
 
             match future_result {
                 Some(result) => {
-                    let Ok((start_time, data_update)) = result else {
-                        continue;
+                    let (start_time, data_update) = match result {
+                        Ok((start_time, data_update)) => (start_time, data_update),
+                        Err(e) => {
+                            tracing::debug!("Error getting update for dataset {dataset_name}: {e}");
+                            self.mark_dataset_status(status::ComponentStatus::Error);
+                            continue;
+                        }
                     };
 
                     if data_update.data.is_empty()
