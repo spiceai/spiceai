@@ -193,13 +193,13 @@ async fn test_graphql() -> Result<(), String> {
         (
             "SELECT * FROM test_graphql",
             vec![
-                "+---------------+--------------------------------------------------------+",
-                "| plan_type     | plan                                                   |",
-                "+---------------+--------------------------------------------------------+",
-                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts]   |",
-                "| physical_plan | MemoryExec: partitions=4, partition_sizes=[1, 1, 1, 1] |",
-                "|               |                                                        |",
-                "+---------------+--------------------------------------------------------+",
+                "+---------------+------------------------------------------------------+",
+                "| plan_type     | plan                                                 |",
+                "+---------------+------------------------------------------------------+",
+                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |",
+                "| physical_plan | MemoryExec: partitions=1, partition_sizes=[4]        |",
+                "|               |                                                      |",
+                "+---------------+------------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 for batch in result_batches {
@@ -217,7 +217,7 @@ async fn test_graphql() -> Result<(), String> {
                 "| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8(\"title\")) AS test_graphql.posts[Int64(1)][title] |",
                 "|               |   TableScan: test_graphql projection=[posts]                                                                             |",
                 "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]]                |",
-                "|               |   MemoryExec: partitions=4, partition_sizes=[1, 1, 1, 1]                                                                 |",
+                "|               |   MemoryExec: partitions=1, partition_sizes=[4]                                                                          |",
                 "|               |                                                                                                                          |",
                 "+---------------+--------------------------------------------------------------------------------------------------------------------------+"
             ],
