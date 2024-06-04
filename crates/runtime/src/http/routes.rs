@@ -67,6 +67,7 @@ pub(crate) fn routes(
             .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql", post(v1::nsql::post))
             .route("/v1/embed", post(v1::embed::post))
+            .route("/v1/assist", post(v1::assist::post))
             .layer(Extension(llms))
             .layer(Extension(models))
             .layer(Extension(embeddings));

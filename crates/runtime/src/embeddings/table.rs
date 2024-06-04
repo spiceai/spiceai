@@ -69,6 +69,18 @@ impl EmbeddingTable {
         }
     }
 
+    /// Get the names of the embedding models used by this table across its columns.
+    #[must_use]
+    pub fn get_embedding_models_used(&self) -> Vec<String> {
+        self.embedded_columns.values().cloned().collect()
+    }
+
+    /// Get the names of the columns that are augmented with embeddings.
+    #[must_use]
+    pub fn get_embedding_columns(&self) -> Vec<String> {
+        self.embedded_columns.keys().cloned().collect()
+    }
+
     async fn precompute_embedding_sizes(
         embedded_columns: &HashMap<String, String>,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
