@@ -19,6 +19,7 @@ use async_openai::types::{
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateEmbeddingRequest,
     CreateEmbeddingRequestArgs, CreateEmbeddingResponse,
 };
+
 use async_openai::{
     config::OpenAIConfig,
     types::{
@@ -224,19 +225,25 @@ fn to_openai_embedding_input(input: EmbeddingInput) -> OpenAiEmbeddingInput {
     }
 }
 
+/// Default implementation of the OpenAI server using Openai.
+/// Note: The model provided by the client will be the name of the spicepod LLM, not the model specified in the params. Must alter incoming requests accordingly.
 #[async_trait]
 impl Server for Openai {
     async fn chat(
         &mut self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        self.client.chat().create(req).await
+        let mut inner_req = CreateChatCompletionRequest::from(req);
+        inner_req.model = self.model.clone();
+        self.client.chat().create(inner_req).await
     }
 
     async fn embed(
         &mut self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
-        self.client.embeddings().create(req).await
+        let mut inner_req = CreateEmbeddingRequest::from(req);
+        inner_req.model = self.model.clone();
+        self.client.embeddings().create(inner_req).await
     }
 }

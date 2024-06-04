@@ -41,9 +41,9 @@ use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
 use llms::embeddings::Embed;
-use llms::nql::Nql;
+use llms::openai::server::Server;
 use metrics::SetRecorderError;
-use model::{try_to_embedding, try_to_nql};
+use model::{try_to_embedding, try_to_nql, try_to_openai_server, LLMModelStore};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
@@ -195,8 +195,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
+pub type OpenaiServerStore = HashMap<String, RwLock<Box<dyn Server>>>;
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -204,6 +204,7 @@ pub struct Runtime {
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
+    pub openai_servers: Arc<RwLock<OpenaiServerStore>>,
     pub embeds: Arc<RwLock<EmbeddingModelStore>>,
     pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
@@ -226,6 +227,7 @@ impl Runtime {
             df: Arc::new(DataFusion::new()),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
+            openai_servers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(None)),
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
@@ -740,6 +742,13 @@ impl Runtime {
                         );
                     }
                 }
+
+                // For the LLMs that are OpenAI server compatible,
+                if let Some(openai_server) = try_to_openai_server(in_llm) {
+                    let mut openai_server_map = self.openai_servers.write().await;
+                    openai_server_map.insert(in_llm.name.clone(), openai_server.into());
+                    tracing::info!("[{}] deployed as an OpenAI-compatible server", in_llm.name);
+                }
             }
         }
     }
@@ -883,6 +892,7 @@ impl Runtime {
             Arc::clone(&self.models),
             Arc::clone(&self.llms),
             Arc::clone(&self.embeds),
+            Arc::clone(&self.openai_servers),
             config.clone().into(),
             with_metrics,
         );

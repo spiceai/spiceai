@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, LLMModelStore};
+use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, model::LLMModelStore};
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {

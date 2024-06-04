@@ -16,20 +16,28 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::OpenaiServerStore;
+use async_openai::types::CreateChatCompletionRequest;
 use axum::{
-    body::Bytes,
-    extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension,
+    Extension, Json,
 };
-
-use crate::datafusion::DataFusion;
+use tokio::sync::RwLock;
 
 pub(crate) async fn post(
-    Path(name): Path<String>,
-    Extension(df): Extension<Arc<DataFusion>>,
-    body: Bytes,
+    Extension(openai_server_store): Extension<Arc<RwLock<OpenaiServerStore>>>,
+    Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, "not implemented").into_response()
+    let model_id = req.model.clone();
+    match openai_server_store.read().await.get(&model_id) {
+        Some(model_lock) => {
+            let mut model = model_lock.write().await;
+            match model.chat(req).await {
+                Ok(response) => Json(response).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        None => (StatusCode::NOT_FOUND, "model not found").into_response(),
+    }
 }
