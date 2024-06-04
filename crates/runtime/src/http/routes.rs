@@ -36,6 +36,7 @@ use tokio::{sync::RwLock, time::Instant};
 
 use super::v1;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<DataFusion>,

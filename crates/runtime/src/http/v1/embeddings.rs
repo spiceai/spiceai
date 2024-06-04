@@ -19,7 +19,6 @@ use std::sync::Arc;
 use crate::OpenaiServerStore;
 use async_openai::types::{CreateEmbeddingRequest, EmbeddingInput, EncodingFormat};
 use axum::{
-    debug_handler,
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
@@ -29,7 +28,6 @@ use tokio::sync::RwLock;
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
-#[debug_handler]
 pub(crate) async fn post(
     Extension(openai_server_store): Extension<Arc<RwLock<OpenaiServerStore>>>,
     body: String,
@@ -93,6 +91,7 @@ pub enum LocalEncodingFormat {
     Base64,
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn to_openai_encoding_format(format: LocalEncodingFormat) -> EncodingFormat {
     match format {
         LocalEncodingFormat::Float => EncodingFormat::Float,

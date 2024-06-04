@@ -160,9 +160,7 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
 /// Currently only `OpenAI` models are supported for `OpenAI` Server compatible endpoints.
 #[must_use]
 pub fn try_to_openai_server(component: &spicepod::component::llms::Llm) -> Option<Box<dyn Server>> {
-    let Some(prefix) = component.get_prefix() else {
-        return None;
-    };
+    let prefix = component.get_prefix()?;
 
     let model_id = component.get_model_id();
     match construct_llm_params(

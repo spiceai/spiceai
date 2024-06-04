@@ -233,8 +233,8 @@ impl Server for Openai {
         &mut self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut inner_req = CreateChatCompletionRequest::from(req);
-        inner_req.model = self.model.clone();
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
         self.client.chat().create(inner_req).await
     }
 
@@ -242,8 +242,8 @@ impl Server for Openai {
         &mut self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
-        let mut inner_req = CreateEmbeddingRequest::from(req);
-        inner_req.model = self.model.clone();
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
         self.client.embeddings().create(inner_req).await
     }
 }
