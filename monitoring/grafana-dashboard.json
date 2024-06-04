@@ -706,7 +706,7 @@
           "refId": "A"
         }
       ],
-      "title": "Last Refresh",
+      "title": "Time Since Last Refresh",
       "type": "bargauge"
     },
     {
