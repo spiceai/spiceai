@@ -1180,12 +1180,13 @@ pub(crate) mod embed {
 }
 
 pub(crate) mod assist {
+    use arrow::array::StringArray;
     use axum::{
         http::StatusCode,
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use datafusion::sql::TableReference;
+    use datafusion::{datasource::TableProvider, sql::TableReference};
 
     use itertools::Itertools;
     use serde::{Deserialize, Serialize};
@@ -1257,6 +1258,14 @@ pub(crate) mod assist {
         format!("{}\n{}", data, input)
     }
 
+    /// Find the name of columns in the table reference that have associated embedding columns.
+    fn embedding_columns_in(tbl: Arc<dyn TableProvider>) -> Vec<String> {
+        match tbl.as_any().downcast_ref::<EmbeddingTable>() {
+            Some(embedding_table) => embedding_table.get_embedding_models_used(),
+            None => vec![],
+        }
+    }
+
     /// For the data sources that assumedly exist in the [`DataFusion`] instance, find the embedding models used in each data source.
     async fn find_relevant_embedding_models(
         data_sources: Vec<TableReference>,
@@ -1270,17 +1279,16 @@ pub(crate) mod assist {
                         format!("Data source {} does not exist", data_source.clone()).into(),
                     )
                 }
-                Some(table) => match table.as_any().downcast_ref::<EmbeddingTable>() {
-                    Some(embedding_table) => {
-                        embeddings_to_run
-                            .insert(data_source, embedding_table.get_embedding_names_used());
-                    }
-                    None => {
+                Some(table) => match embedding_columns_in(table) {
+                    v if v.is_empty() => {
                         return Err(format!(
                             "Data source {} does not have an embedded column",
                             data_source.clone()
                         )
                         .into())
+                    }
+                    v => {
+                        embeddings_to_run.insert(data_source, v);
                     }
                 },
             }
@@ -1292,20 +1300,62 @@ pub(crate) mod assist {
     async fn vector_search(
         df: Arc<DataFusion>,
         embedded_inputs: HashMap<TableReference, Vec<Vec<f32>>>,
+        n: usize,
     ) -> Result<HashMap<TableReference, Vec<String>>, Box<dyn std::error::Error>> {
+        let mut search_result: HashMap<TableReference, Vec<String>> = HashMap::new();
+
         for (tbl, search_vectors) in embedded_inputs {
+            println!("Running vector search for table {tbl:#?}");
+
+            let provider = df
+                .get_table(tbl.clone())
+                .await
+                .ok_or(format!("Table {} not found", tbl.clone()))?;
+
+            let embedding_table = provider
+                .as_any()
+                .downcast_ref::<EmbeddingTable>()
+                .ok_or(format!("Table {tbl} is not an embedding table"))?;
+
+            // Only support one embedding column per table.
+            let embedding_columns = embedding_table.get_embedding_columns();
+            let embedding_column = embedding_columns
+                .first()
+                .ok_or(format!("No embeddings found for table {tbl}"))?;
+
             if search_vectors.len() != 1 {
                 return Err(format!("Only one embedding column per table currently supported. Table: {tbl} has {} embeddings", search_vectors.len()).into());
             }
             match search_vectors.first() {
                 None => return Err(format!("No embeddings found for table {tbl}").into()),
                 Some(embedding) => {
-                    println!("I have a vector for tbl: {tbl}");
+                    let sql_query = format!("SELECT {embedding_column} FROM {tbl} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {n}");
+
+                    let result = df.ctx.sql(&sql_query).await?;
+                    let batch = result.collect().await?;
+
+                    let outt: Vec<_> = batch
+                        .iter()
+                        .map(|b| {
+                            let z = b.column(0).as_any().downcast_ref::<StringArray>().ok_or(
+                                "Expected first column of SQL query to return a String type",
+                            );
+                            let zz = z.map(|s| {
+                                s.iter()
+                                    .map(|ss| ss.unwrap_or_default().to_string())
+                                    .collect::<Vec<String>>()
+                            });
+                            zz
+                        })
+                        .collect::<Result<Vec<_>, &str>>()?;
+
+                    let outtt: Vec<String> = outt.iter().flat_map(|x| x.clone()).collect();
+                    search_result.insert(tbl, outtt);
                 }
             };
         }
 
-        Ok(HashMap::new())
+        Ok(search_result)
     }
 
     /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
@@ -1366,7 +1416,7 @@ pub(crate) mod assist {
             .collect();
 
         // Vector search to get relevant data from data sources.
-        let relevant_data = match vector_search(Arc::clone(&df), per_table_embeddings).await {
+        let relevant_data = match vector_search(Arc::clone(&df), per_table_embeddings, 3).await {
             Ok(relevant_data) => relevant_data,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };

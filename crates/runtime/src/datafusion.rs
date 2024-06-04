@@ -24,8 +24,8 @@ use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
-use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
@@ -215,7 +215,7 @@ impl DataFusion {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
 
         let ctx = SessionContext::new_with_state(state);
-
+        ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
