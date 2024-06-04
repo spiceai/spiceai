@@ -54,7 +54,7 @@ assignees: ''
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
 - [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
-- [ ] Create a new branch `release-v[semver]` for the next release version. E.g. `release-v0.14.0-alpha`
+- [ ] Create a new branch `release-v[semver]` for the next release version from the current release branch. E.g. `release-v0.14.0-alpha`
 
 ## Announcement Checklist
 
