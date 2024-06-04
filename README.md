@@ -70,18 +70,21 @@ https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name         | Description                                                                                    | Status | Protocol/Format                                                                                    | Refresh Modes |
-| ------------ | ---------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- | ------------- | ------------- | -------- | ----- | ------------ | --- | ------- | ----- | ----- | --------------------------------------------------------------------------------- |
-| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
-| `postgres`   | PostgreSQL                                                                                     | Alpha  |                                                                                                    |
-| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha  | Arrow Flight                                                                                       |
-| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha  | Parquet, CSV                                                                                       |
-| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha  | Arrow Flight                                                                                       |
-| `mysql`      | MySQL                                                                                          | Alpha  |                                                                                                    |
-| `duckdb`     | DuckDB                                                                                         | Alpha  |                                                                                                    |
-| `clickhouse` | Clickhouse                                                                                     | Alpha  |                                                                                                    |               | `odbc`        | ODBC     | Alpha | ODBC         |     | `spark` | Spark | Alpha | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html) |
-| `flightsql`  | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
-| `snowflake`  | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |               | `ftp`, `sftp` | FTP/SFTP | Alpha | Parquet, CSV |
+| Name          | Description                                                                                    | Status | Protocol/Format                                                                                    |
+| ------------- | ---------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- |
+| `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
+| `postgres`    | PostgreSQL                                                                                     | Alpha  |                                                                                                    |
+| `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha  | Arrow Flight                                                                                       |
+| `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha  | Parquet, CSV                                                                                       |
+| `dremio`      | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha  | Arrow Flight                                                                                       |
+| `mysql`       | MySQL                                                                                          | Alpha  |                                                                                                    |
+| `duckdb`      | DuckDB                                                                                         | Alpha  |                                                                                                    |
+| `clickhouse`  | Clickhouse                                                                                     | Alpha  |                                                                                                    |
+| `odbc`        | ODBC                                                                                           | Alpha  | ODBC                                                                                               |
+| `spark`       | Spark                                                                                          | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  |
+| `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
+| `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
+| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       |
 
 ### Supported Data Stores/Accelerators
 
@@ -147,10 +150,11 @@ Example output will be shown as follows:
 ```bash
 Spice.ai runtime starting...
 Using latest 'local' runtime version.
-2024-05-20T22:37:26.787577Z  INFO spiced: Metrics listening on 127.0.0.1:9000
-2024-05-20T22:37:26.788298Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
-2024-05-20T22:37:26.788329Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2024-05-20T22:37:26.788402Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2024-06-03T23:21:26.819978Z  INFO spiced: Metrics listening on 127.0.0.1:9000
+2024-06-03T23:21:26.821863Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
+2024-06-03T23:21:26.821898Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-06-03T23:21:26.821958Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2024-06-03T23:21:26.822128Z  INFO runtime: Initialized results cache; max size: 128.00 MiB, item ttl: 1s
 ```
 
 The runtime is now started and ready for queries.
@@ -174,8 +178,9 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-02-22T05:53:48.222952Z  INFO runtime: Registered dataset taxi_trips
-2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector::refresh: Loading data for dataset taxi_trips
+2024-06-03T23:21:29.721705Z  INFO runtime: Registered dataset taxi_trips
+2024-06-03T23:21:29.722839Z  INFO runtime::accelerated_table::refresh: Loading data for dataset taxi_trips
+2024-06-03T23:21:50.813510Z  INFO runtime::accelerated_table::refresh: Loaded 2,964,624 rows (421.71 MiB) for dataset taxi_trips in 21s 90ms.
 ```
 
 **Step 5.** Start the Spice SQL REPL:
@@ -232,7 +237,7 @@ Output:
 | 44018.64      | 52.43        |
 +---------------+--------------+
 
-Time: 0.002458976 seconds
+Time: 0.015596458 seconds. 10 rows.
 ```
 
 ## ⚙️ Runtime Container Deployment
@@ -328,8 +333,9 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-05-20T22:50:17.997446Z  INFO runtime: Registered dataset eth_recent_blocks
-2024-05-20T22:50:17.998125Z  INFO runtime::accelerated_table::refresh: Loading data for dataset eth_recent_blocks
+2024-06-03T23:25:59.514395Z  INFO runtime: Registered dataset eth_recent_blocks
+2024-06-03T23:25:59.514624Z  INFO runtime::accelerated_table::refresh: Loading data for dataset eth_recent_blocks
+2024-06-03T23:26:00.758813Z  INFO runtime::accelerated_table::refresh: Loaded 143 rows (6.22 MiB) for dataset eth_recent_blocks in 1s 244ms.
 ```
 
 **Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
@@ -360,7 +366,7 @@ The output displays the results of the query along with the query execution time
 | 19281336 | 150137 | 13418403 |
 +----------+--------+----------+
 
-Time: 0.004057791 seconds
+Time: 0.004057791 seconds. 10 rows.
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
