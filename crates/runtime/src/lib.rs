@@ -412,11 +412,6 @@ impl Runtime {
         };
 
         Ok(data_connector)
-
-        // Ok(Arc::new(EmbeddingConnector::new(
-        //     data_connector,
-        //     Arc::clone(&self.embeds),
-        // )) as Arc<dyn DataConnector>)
     }
 
     pub async fn register_loaded_dataset(
