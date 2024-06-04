@@ -67,6 +67,8 @@ pub(crate) fn routes(
             .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql", post(v1::nsql::post))
             .route("/v1/embed", post(v1::embed::post))
+            .route("v1/oai/:name/chat/completions", post(v1::oai::chat))
+            .route("v1/oai/:name/embeddings", post(v1::oai::embeddings))
             .layer(Extension(llms))
             .layer(Extension(models))
             .layer(Extension(embeddings));
