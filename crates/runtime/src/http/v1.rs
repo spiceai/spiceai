@@ -1252,7 +1252,7 @@ pub(crate) mod assist {
 
     fn combined_relevant_data_and_input(
         relevant_data: &HashMap<TableReference, Vec<String>>,
-        input: String,
+        input: &str,
     ) -> String {
         let data = relevant_data.values().map(|v| v.join("\n")).join("\n");
         format!("{data}\n{input}")
@@ -1422,7 +1422,7 @@ pub(crate) mod assist {
         };
 
         // Using returned data, create input for LLM.
-        let model_input = combined_relevant_data_and_input(&relevant_data, payload.text.clone());
+        let model_input = combined_relevant_data_and_input(&relevant_data, &payload.text);
 
         // Run LLM with input.
         match llms.read().await.get(&payload.model) {
