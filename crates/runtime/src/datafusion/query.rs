@@ -198,6 +198,25 @@ impl Query {
         ))
     }
 
+    pub async fn get_schema(self, log_error: bool) -> Result<Schema, DataFusionError> {
+        let df = match self.df.ctx.sql(&self.sql).await {
+            Ok(df) => df,
+            Err(err) => {
+                if log_error {
+                    if let Err(write_err) = self
+                        .finish_with_error(err.to_string())
+                        .write_query_history()
+                        .await
+                    {
+                        tracing::error!("Error writing query history: {write_err}");
+                    }
+                }
+                return Err(err);
+            }
+        };
+        Ok(df.schema().into())
+    }
+
     #[must_use]
     fn finish_with_error(mut self, error_message: String) -> Self {
         self.error_message = Some(error_message);

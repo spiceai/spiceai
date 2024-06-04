@@ -154,12 +154,16 @@ impl FlightService for Service {
 
 impl Service {
     async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
-        let df = datafusion
-            .ctx
-            .sql(&sql)
+        let query = QueryBuilder::new(sql, datafusion, Protocol::Flight)
+            .protocol(Protocol::Flight)
+            .build();
+
+        let schema = query
+            .get_schema(true)
             .await
             .map_err(handle_datafusion_error)?;
-        Ok(df.schema().into())
+
+        Ok(schema)
     }
 
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
