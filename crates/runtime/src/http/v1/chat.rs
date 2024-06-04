@@ -26,15 +26,7 @@ use axum::{
 
 use crate::datafusion::DataFusion;
 
-pub(crate) async fn chat(
-    Path(name): Path<String>,
-    Extension(df): Extension<Arc<DataFusion>>,
-    body: Bytes,
-) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, "not implemented").into_response()
-}
-
-pub(crate) async fn embeddings(
+pub(crate) async fn post(
     Path(name): Path<String>,
     Extension(df): Extension<Arc<DataFusion>>,
     body: Bytes,
