@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::record_batch::RecordBatch;
 use llms::embeddings::Embed;
 use llms::nql::{Error as LlmError, Nql};
+use llms::openai::server::Server;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
@@ -24,8 +25,10 @@ use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::DataFusion;
+pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
@@ -150,6 +153,36 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
             )
             .into(),
         }),
+    }
+}
+
+/// Attempt to derive a runnable `OpenAI` Server model from a given component from the Spicepod definition.
+/// Currently only `OpenAI` models are supported for `OpenAI` Server compatible endpoints.
+#[must_use]
+pub fn try_to_openai_server(component: &spicepod::component::llms::Llm) -> Option<Box<dyn Server>> {
+    let prefix = component.get_prefix()?;
+
+    let model_id = component.get_model_id();
+    match construct_llm_params(
+        &prefix,
+        &model_id,
+        &(component.params).clone().unwrap_or_default(),
+    ) {
+        Ok(LlmParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        }) => Some(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
+
+        // Currently only OpenAI models are supported for OpenAI Server compatible endpoints.
+        _ => None,
     }
 }
 

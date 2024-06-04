@@ -14,7 +14,12 @@ limitations under the License.
 use crate::embeddings::{Embed, EmbeddingInput, Error as EmbedError, Result as EmbedResult};
 use crate::nql::{Error as NqlError, Nql, Result as NqlResult};
 
-use async_openai::types::{CreateEmbeddingRequest, CreateEmbeddingRequestArgs};
+use async_openai::error::OpenAIError;
+use async_openai::types::{
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateEmbeddingRequest,
+    CreateEmbeddingRequestArgs, CreateEmbeddingResponse,
+};
+
 use async_openai::{
     config::OpenAIConfig,
     types::{
@@ -27,7 +32,10 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use serde_json::Value;
+use server::Server;
 use snafu::ResultExt;
+
+pub mod server;
 
 const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
@@ -214,5 +222,28 @@ fn to_openai_embedding_input(input: EmbeddingInput) -> OpenAiEmbeddingInput {
         EmbeddingInput::Tokens(t) => OpenAiEmbeddingInput::IntegerArray(t),
         EmbeddingInput::StringBatch(sb) => OpenAiEmbeddingInput::StringArray(sb),
         EmbeddingInput::TokensBatch(tb) => OpenAiEmbeddingInput::ArrayOfIntegerArray(tb),
+    }
+}
+
+/// Default implementation of the OpenAI server using Openai.
+/// Note: The model provided by the client will be the name of the spicepod LLM, not the model specified in the params. Must alter incoming requests accordingly.
+#[async_trait]
+impl Server for Openai {
+    async fn chat(
+        &mut self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
+        self.client.chat().create(inner_req).await
+    }
+
+    async fn embed(
+        &mut self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
+        self.client.embeddings().create(inner_req).await
     }
 }
