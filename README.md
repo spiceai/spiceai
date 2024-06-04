@@ -86,7 +86,6 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              | `full`           |
 | `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       | `full`           |
 
-
 ### Supported Data Stores/Accelerators
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
