@@ -130,8 +130,13 @@ impl Refresher {
 
             match future_result {
                 Some(result) => {
-                    let Ok((start_time, data_update)) = result else {
-                        continue;
+                    let (start_time, data_update) = match result {
+                        Ok((start_time, data_update)) => (start_time, data_update),
+                        Err(e) => {
+                            tracing::debug!("Error getting update for dataset {dataset_name}: {e}");
+                            self.mark_dataset_status(status::ComponentStatus::Error);
+                            continue;
+                        }
                     };
 
                     if data_update.data.is_empty()
@@ -141,19 +146,10 @@ impl Refresher {
                             .map_or(false, |x| x.columns().is_empty())
                     {
                         if let Some(start_time) = start_time {
-                            if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-                                    tracing::debug!(
-                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
-                                    );
-                                }
-                            }
+                            self.trace_dataset_loaded(start_time, 0, None);
                         }
-                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
+                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready)
+                            .await;
                         continue;
                     };
 
@@ -180,22 +176,17 @@ impl Refresher {
                                         .map(|x| x.num_rows())
                                         .sum::<usize>();
 
-                                    let memory_size = util::human_readable_bytes(
-                                        data_update
-                                            .data
-                                            .into_iter()
-                                            .map(|x| x.get_array_memory_size())
-                                            .sum::<usize>(),
-                                    );
-                                    let num_rows = util::pretty_print_number(num_rows);
+                                    let memory_size = data_update
+                                        .data
+                                        .into_iter()
+                                        .map(|x| x.get_array_memory_size())
+                                        .sum::<usize>();
 
-                                    if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-                                            tracing::debug!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
-                                        } else {
-                                            tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
-                                        }
-                                    }
+                                    self.trace_dataset_loaded(
+                                        start_time,
+                                        num_rows,
+                                        Some(memory_size),
+                                    );
 
                                     if let Some(cache_provider) = &self.cache_provider {
                                         if let Err(e) = cache_provider
@@ -210,7 +201,8 @@ impl Refresher {
                                 self.notify_refresh_done(
                                     &mut ready_sender,
                                     status::ComponentStatus::Ready,
-                                );
+                                )
+                                .await;
                             };
                         }
                         Err(e) => {
@@ -221,6 +213,32 @@ impl Refresher {
                 }
                 None => break,
             };
+        }
+    }
+
+    fn trace_dataset_loaded(
+        &self,
+        start_time: SystemTime,
+        num_rows: usize,
+        memory_size: Option<usize>,
+    ) {
+        if let Ok(elapse) = util::humantime_elapsed(start_time) {
+            let dataset_name = &self.dataset_name;
+            let num_rows = util::pretty_print_number(num_rows);
+            let memory_size = match memory_size {
+                Some(memory_size) => format!(" ({})", util::human_readable_bytes(memory_size)),
+                None => String::new(),
+            };
+
+            if self.dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                tracing::debug!(
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}.",
+                );
+            } else {
+                tracing::info!(
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}."
+                );
+            }
         }
     }
 
@@ -535,7 +553,7 @@ impl Refresher {
         TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
     }
 
-    fn notify_refresh_done(
+    async fn notify_refresh_done(
         &self,
         ready_sender: &mut Option<oneshot::Sender<()>>,
         status: status::ComponentStatus,
@@ -543,11 +561,28 @@ impl Refresher {
         if let Some(sender) = ready_sender.take() {
             sender.send(()).ok();
         };
+
         self.mark_dataset_status(status);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+
+        let mut labels = vec![("dataset", self.dataset_name.to_string())];
+        if let Some(sql) = &self.refresh.read().await.sql {
+            labels.push(("sql", sql.to_string()));
+        };
+
+        metrics::gauge!("datasets_acceleration_last_refresh_time", &labels).set(now.as_secs_f64());
     }
 
     fn mark_dataset_status(&self, status: status::ComponentStatus) {
         status::update_dataset(&self.dataset_name, status);
+
+        if status == status::ComponentStatus::Error {
+            let labels = [("dataset", self.dataset_name.to_string())];
+            metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+        }
     }
 }
 
