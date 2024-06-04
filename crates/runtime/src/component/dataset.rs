@@ -15,22 +15,10 @@ limitations under the License.
 */
 
 use datafusion::sql::TableReference;
-use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
 };
-use std::{collections::HashMap, fs, time::Duration};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to load SQL file {file}: {source}"))]
-    UnableToLoadSqlFile {
-        file: String,
-        source: std::io::Error,
-    },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+use std::{collections::HashMap, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
@@ -77,10 +65,6 @@ pub struct Dataset {
     pub from: String,
     pub name: TableReference,
     pub mode: Mode,
-    /// Inline SQL that describes a view.
-    sql: Option<String>,
-    /// Reference to a SQL file that describes a view.
-    sql_ref: Option<String>,
     pub params: HashMap<String, String>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
@@ -105,8 +89,6 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             from: dataset.from,
             name: table_reference,
             mode: Mode::from(dataset.mode),
-            sql: dataset.sql,
-            sql_ref: dataset.sql_ref,
             params: dataset
                 .params
                 .as_ref()
@@ -130,8 +112,6 @@ impl Dataset {
             from,
             name: Self::parse_table_reference(name)?,
             mode: Mode::default(),
-            sql: None,
-            sql_ref: None,
             params: HashMap::default(),
             has_metadata_table: Self::have_metadata_table_by_default(),
             replication: None,
@@ -148,7 +128,7 @@ impl Dataset {
         false
     }
 
-    fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
+    pub(crate) fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
         match TableReference::parse_str(name) {
             table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
                 Ok(table_ref)
@@ -306,30 +286,6 @@ impl Dataset {
         }
 
         None
-    }
-
-    #[must_use]
-    pub fn is_view(&self) -> bool {
-        self.sql.is_some() || self.sql_ref.is_some()
-    }
-
-    #[must_use]
-    pub fn view_sql(&self) -> Option<Result<String>> {
-        if let Some(sql) = &self.sql {
-            return Some(Ok(sql.clone()));
-        }
-
-        if let Some(sql_ref) = &self.sql_ref {
-            return Some(Self::load_sql_ref(sql_ref));
-        }
-
-        None
-    }
-
-    fn load_sql_ref(sql_ref: &str) -> Result<String> {
-        let sql =
-            fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
-        Ok(sql)
     }
 
     #[must_use]

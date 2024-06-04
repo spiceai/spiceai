@@ -34,6 +34,7 @@ use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
+use component::view::View;
 use config::Config;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
@@ -121,7 +122,7 @@ pub enum Error {
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
-        source: crate::component::dataset::Error,
+        source: crate::component::view::Error,
     },
 
     #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
@@ -140,6 +141,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
+
+    #[snafu(display("Need to specify the view SQL string for {name} inline with `sql: CREATE VIEW...` or as a file reference with `sql_ref: my_view.sql`"))]
+    NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
         "A federated table was configured as read_write without setting replication.enabled = true"
@@ -310,7 +314,28 @@ impl Runtime {
             .collect()
     }
 
-    pub async fn load_datasets(&self) {
+    /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_views(app: &App, log_failures: bool) -> Vec<View> {
+        app.views
+            .iter()
+            .cloned()
+            .map(View::try_from)
+            .zip(&app.views)
+            .filter_map(|(view, spicepod_view)| match view {
+                Ok(view) => Some(view),
+                Err(e) => {
+                    if log_failures {
+                        //status::update_view(&spicepod_view.name, status::ComponentStatus::Error);
+                        metrics::counter!("views_load_error").increment(1);
+                        tracing::error!(view = &spicepod_view.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub async fn load_datasets_and_views(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
@@ -320,28 +345,37 @@ impl Runtime {
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds, &valid_datasets));
+            futures.push(self.load_dataset(ds));
         }
 
-        let app = self.app.read().await;
-
-        if let Some(app) = app.as_ref() {
-            if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
-                let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
-                let _ = stream.collect::<Vec<_>>().await;
-                return;
-            }
+        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+            let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
+            let _ = stream.collect::<Vec<_>>().await;
+            return;
         }
 
         let _ = join_all(futures).await;
+
+        // After all datasets have loaded, load the views.
+        self.load_views(app, &valid_datasets);
+    }
+
+    fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
+        let views: Vec<View> = Self::get_valid_views(app, true);
+
+        for view in &views {
+            if let Err(e) = self.load_view(view, valid_datasets) {
+                tracing::error!("Unable to load view: {e}");
+            };
+        }
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
-    pub async fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+    pub async fn load_dataset(&self, ds: &Dataset) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         loop {
-            let connector = match self.load_dataset_connector(ds, all_datasets).await {
+            let connector = match self.load_dataset_connector(ds).await {
                 Ok(connector) => connector,
                 Err(err) => {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
@@ -363,32 +397,38 @@ impl Runtime {
         }
     }
 
-    pub async fn load_dataset_connector(
-        &self,
-        ds: &Dataset,
-        all_datasets: &[Dataset],
-    ) -> Result<Arc<dyn DataConnector>> {
+    pub fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
+        let existing_tables = all_datasets
+            .iter()
+            .map(|d| d.name.clone())
+            .collect::<Vec<TableReference>>();
+
+        if !verify_dependent_tables(view, &existing_tables) {
+            return UnableToCreateViewSnafu {
+                reason: "One or more of the tables in the view's SQL statement do not exist"
+                    .to_string(),
+            }
+            .fail();
+        }
+
+        if let Ok(view_sql) = view.view_sql() {
+            let df = Arc::clone(&self.df);
+            df.register_view(view.name.clone(), view_sql)
+                .context(UnableToAttachViewSnafu)?;
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    pub async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
         let ds = ds.clone();
 
-        let existing_tables = all_datasets
-            .iter()
-            .map(|d| d.name.clone())
-            .collect::<Vec<TableReference>>();
-
         let secrets_provider = shared_secrets_provider.read().await;
-
-        if !verify_dependent_tables(&ds, &existing_tables) {
-            status::update_dataset(&ds.name, status::ComponentStatus::Error);
-            metrics::counter!("datasets_load_error").increment(1);
-            return UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .fail();
-        }
 
         let source = ds.source();
         let params = Arc::new(ds.params.clone());
@@ -506,9 +546,9 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+    pub async fn update_dataset(&self, ds: &Dataset) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
+        if let Ok(connector) = self.load_dataset_connector(ds).await {
             tracing::info!("Updating accelerated dataset {}...", &ds.name);
 
             // File accelerated datasets don't support hot reload.
@@ -635,15 +675,6 @@ impl Runtime {
         embedding: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Result<()> {
         let ds = ds.borrow();
-
-        // VIEW
-        if let Some(view_sql) = ds.view_sql() {
-            let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
-            df.register_table(ds, datafusion::Table::View(view_sql))
-                .await
-                .context(UnableToAttachViewSnafu)?;
-            return Ok(());
-        }
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
@@ -930,11 +961,11 @@ impl Runtime {
                         .find(|d| TableReference::parse_str(&d.name) == ds.name)
                     {
                         if TableReference::parse_str(&current_ds.name) != ds.name {
-                            self.update_dataset(ds, &valid_datasets).await;
+                            self.update_dataset(ds).await;
                         }
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds, &valid_datasets).await;
+                        self.load_dataset(ds).await;
                     }
                 }
 
@@ -1020,17 +1051,13 @@ impl Runtime {
     }
 }
 
-fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> bool {
-    if !ds.is_view() {
-        return true;
-    }
-
-    let dependent_tables = match get_view_dependent_tables(ds) {
+fn verify_dependent_tables(view: &View, existing_tables: &[TableReference]) -> bool {
+    let dependent_tables = match get_view_dependent_tables(view) {
         Ok(tables) => tables,
         Err(err) => {
             tracing::error!(
                 "Failed to get dependent tables for view {}: {}",
-                &ds.name,
+                &view.name,
                 err
             );
             return false;
@@ -1040,8 +1067,8 @@ fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> 
     for tbl in &dependent_tables {
         if !existing_tables.contains(tbl) {
             tracing::error!(
-                "Failed to load {}. Dependent table {} not found",
-                &ds.name,
+                "Failed to load view {}. Dependent table {} not found",
+                &view.name,
                 &tbl
             );
             return false;
@@ -1051,14 +1078,12 @@ fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> 
     true
 }
 
-fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<TableReference>> {
-    let ds = dataset.borrow();
+fn get_view_dependent_tables(view: impl Borrow<View>) -> Result<Vec<TableReference>> {
+    let view = view.borrow();
 
-    let Some(sql) = ds.view_sql() else {
+    let Ok(sql) = view.view_sql() else {
         return ExpectedSqlViewSnafu.fail();
     };
-
-    let sql = sql.context(InvalidSQLViewSnafu)?;
 
     let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;

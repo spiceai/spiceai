@@ -347,9 +347,6 @@ pub(crate) mod datasets {
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
         source: Option<String>,
-
-        #[serde(default)]
-        remove_views: bool,
     }
 
     #[derive(Debug, Deserialize)]
@@ -389,17 +386,13 @@ pub(crate) mod datasets {
         };
 
         let valid_datasets = Runtime::get_valid_datasets(readable_app, false);
-        let mut datasets: Vec<Dataset> = match filter.source {
+        let datasets: Vec<Dataset> = match filter.source {
             Some(source) => valid_datasets
                 .into_iter()
                 .filter(|d| d.source() == source)
                 .collect(),
             None => valid_datasets,
         };
-
-        if filter.remove_views {
-            datasets.retain(|d| !d.is_view());
-        }
 
         let resp = datasets
             .iter()

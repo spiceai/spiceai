@@ -136,7 +136,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_datasets_and_views() => {}
     }
 
     let mut rt = crate::modify_runtime_datafusion_options(rt);
