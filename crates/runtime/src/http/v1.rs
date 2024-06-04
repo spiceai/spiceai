@@ -1217,7 +1217,7 @@ pub(crate) mod assist {
     }
 
     async fn create_input_embeddings(
-        input: String,
+        input: &str,
         embeddings_to_run: Vec<String>,
         embeddings: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Result<HashMap<String, Vec<f32>>, Box<dyn std::error::Error>> {
@@ -1231,7 +1231,7 @@ pub(crate) mod assist {
             match model
                 .write()
                 .await
-                .embed(llms::embeddings::EmbeddingInput::String(input.clone()))
+                .embed(llms::embeddings::EmbeddingInput::String(input.to_string()))
                 .await
             {
                 Ok(embedding) => match embedding.first() {
@@ -1251,15 +1251,15 @@ pub(crate) mod assist {
     }
 
     fn combined_relevant_data_and_input(
-        relevant_data: HashMap<TableReference, Vec<String>>,
+        relevant_data: &HashMap<TableReference, Vec<String>>,
         input: String,
     ) -> String {
         let data = relevant_data.values().map(|v| v.join("\n")).join("\n");
-        format!("{}\n{}", data, input)
+        format!("{data}\n{input}")
     }
 
     /// Find the name of columns in the table reference that have associated embedding columns.
-    fn embedding_columns_in(tbl: Arc<dyn TableProvider>) -> Vec<String> {
+    fn embedding_columns_in(tbl: &Arc<dyn TableProvider>) -> Vec<String> {
         match tbl.as_any().downcast_ref::<EmbeddingTable>() {
             Some(embedding_table) => embedding_table.get_embedding_models_used(),
             None => vec![],
@@ -1279,7 +1279,7 @@ pub(crate) mod assist {
                         format!("Data source {} does not exist", data_source.clone()).into(),
                     )
                 }
-                Some(table) => match embedding_columns_in(table) {
+                Some(table) => match embedding_columns_in(&table) {
                     v if v.is_empty() => {
                         return Err(format!(
                             "Data source {} does not have an embedded column",
@@ -1293,10 +1293,9 @@ pub(crate) mod assist {
                 },
             }
         }
-        return Ok(embeddings_to_run);
+        Ok(embeddings_to_run)
     }
 
-    ///
     async fn vector_search(
         df: Arc<DataFusion>,
         embedded_inputs: HashMap<TableReference, Vec<Vec<f32>>>,
@@ -1349,7 +1348,8 @@ pub(crate) mod assist {
                         })
                         .collect::<Result<Vec<_>, &str>>()?;
 
-                    let outtt: Vec<String> = outt.iter().flat_map(|x| x.clone()).collect();
+                    let outtt: Vec<String> =
+                        outt.iter().flat_map(std::clone::Clone::clone).collect();
                     search_result.insert(tbl, outtt);
                 }
             };
@@ -1382,7 +1382,7 @@ pub(crate) mod assist {
             payload
                 .data_source
                 .iter()
-                .map(|t| TableReference::from(t))
+                .map(TableReference::from)
                 .collect(),
             Arc::clone(&df),
         )
@@ -1394,7 +1394,7 @@ pub(crate) mod assist {
 
         // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
         let embedded_inputs = match create_input_embeddings(
-            payload.text.clone(),
+            &payload.text.clone(),
             embeddings_to_run.values().flatten().cloned().collect(),
             Arc::clone(&embeddings),
         )
@@ -1409,7 +1409,7 @@ pub(crate) mod assist {
             .map(|(t, model_names)| {
                 let z: Vec<_> = model_names
                     .iter()
-                    .map(|m| embedded_inputs.get(m).unwrap().clone())
+                    .filter_map(|m| embedded_inputs.get(m).cloned())
                     .collect();
                 (t.clone(), z)
             })
@@ -1422,7 +1422,7 @@ pub(crate) mod assist {
         };
 
         // Using returned data, create input for LLM.
-        let model_input = combined_relevant_data_and_input(relevant_data, payload.text.clone());
+        let model_input = combined_relevant_data_and_input(&relevant_data, payload.text.clone());
 
         // Run LLM with input.
         match llms.read().await.get(&payload.model) {

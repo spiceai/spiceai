@@ -34,7 +34,14 @@ pub struct ArrayDistance {
     signature: Signature,
 }
 
+impl Default for ArrayDistance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArrayDistance {
+    #[must_use]
     pub fn new() -> Self {
         let valid_types = vec![
             DataType::new_fixed_size_list(DataType::Float32, FIXED_SIZE_LIST_WILDCARD, false),
@@ -60,6 +67,7 @@ impl ArrayDistance {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn convert_f64_to_f32(array: &PrimitiveArray<Float64Type>) -> PrimitiveArray<Float32Type> {
         let values = array.values();
         let converted_values: Vec<f32> = values.iter().map(|&x| x as f32).collect();
@@ -167,14 +175,11 @@ impl ScalarUDFImpl for ArrayDistance {
             .zip(v2.iter())
             .map(|(a, b)| {
                 if a.len() != b.len() {
-                    return Err(DataFusionError::Internal(
-                        format!(
-                            "arrays must have the same length {} != {}",
-                            a.len(),
-                            b.len()
-                        )
-                        .into(),
-                    ));
+                    return Err(DataFusionError::Internal(format!(
+                        "arrays must have the same length {} != {}",
+                        a.len(),
+                        b.len()
+                    )));
                 }
                 let mut sum: f32 = 0.0;
                 for i in 0..a.len() {
