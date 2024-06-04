@@ -1304,7 +1304,7 @@ pub(crate) mod assist {
         let mut search_result: HashMap<TableReference, Vec<String>> = HashMap::new();
 
         for (tbl, search_vectors) in embedded_inputs {
-            println!("Running vector search for table {tbl:#?}");
+            tracing::debug!("Running vector search for table {tbl:#?}");
 
             let provider = df
                 .get_table(tbl.clone())

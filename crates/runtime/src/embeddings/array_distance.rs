@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(dead_code)]
 use arrow::{
     array::{as_list_array, Array, Float32Array, Float64Array, PrimitiveArray},
     datatypes::{DataType, Float32Type, Float64Type},
@@ -71,7 +70,6 @@ impl ArrayDistance {
     fn convert_f64_to_f32(array: &PrimitiveArray<Float64Type>) -> PrimitiveArray<Float32Type> {
         let values = array.values();
         let converted_values: Vec<f32> = values.iter().map(|&x| x as f32).collect();
-        // let buffer = Buffer::from_slice_ref(&converted_values);
         Float32Array::from_iter_values(converted_values)
     }
 
