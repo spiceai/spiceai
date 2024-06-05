@@ -166,10 +166,14 @@ impl GraphQLClient {
 
         let graphql_error = &response["errors"][0];
         if !graphql_error.is_null() {
-            let line = graphql_error["locations"][0]["line"].as_u64().unwrap_or(0) as usize;
-            let column = graphql_error["locations"][0]["column"]
-                .as_u64()
-                .unwrap_or(0) as usize;
+            let line = usize::try_from(graphql_error["locations"][0]["line"].as_u64().unwrap_or(0))
+                .unwrap_or_default();
+            let column = usize::try_from(
+                graphql_error["locations"][0]["column"]
+                    .as_u64()
+                    .unwrap_or(0),
+            )
+            .unwrap_or_default();
             return Err(Error::GraphQLError {
                 message: graphql_error["message"]
                     .as_str()
