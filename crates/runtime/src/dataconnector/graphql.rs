@@ -109,6 +109,26 @@ struct GraphQLClient {
     auth: Option<Auth>,
 }
 
+fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
+    let query_lines: Vec<&str> = query.split('\n').collect();
+    let error_line = query_lines.get(line - 1).unwrap_or(&"");
+    let marker = " ".repeat(column - 1) + "^";
+    let context = if line > 1 {
+        format!(
+            "{:>4} | {}\n{:>4} | {}\n{:>4} | {}",
+            line - 1,
+            query_lines[line - 2],
+            line,
+            error_line,
+            "",
+            marker
+        )
+    } else {
+        format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
+    };
+    context
+}
+
 impl GraphQLClient {
     async fn execute(
         &self,
@@ -160,25 +180,7 @@ impl GraphQLClient {
                     .to_string(),
                 line,
                 column,
-                query: {
-                    let query_lines: Vec<&str> = self.query.split('\n').collect();
-                    let error_line = query_lines.get(line - 1).unwrap_or(&"");
-                    let marker = " ".repeat(column - 1) + "^";
-                    let context = if line > 1 {
-                        format!(
-                            "{:>4} | {}\n{:>4} | {}\n{:>4} | {}",
-                            line - 1,
-                            query_lines[line - 2],
-                            line,
-                            error_line,
-                            "",
-                            marker
-                        )
-                    } else {
-                        format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
-                    };
-                    context
-                },
+                query: format_query_with_context(&self.query, line, column),
             });
         }
 
