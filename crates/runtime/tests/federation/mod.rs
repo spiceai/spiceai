@@ -49,7 +49,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
-    rt.load_datasets_and_views().await;
+    rt.load_datasets().await;
 
     let mut rt = modify_runtime_datafusion_options(rt);
 

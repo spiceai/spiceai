@@ -51,7 +51,7 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
-    rt.load_datasets_and_views().await;
+    rt.load_datasets().await;
 
     let traces_table = rt
         .datafusion()

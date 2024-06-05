@@ -26,7 +26,7 @@ pub(crate) async fn setup_benchmark(
         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
-        () = rt.load_datasets_and_views() => {}
+        () = rt.load_datasets() => {}
     }
 
     let benchmark_results =

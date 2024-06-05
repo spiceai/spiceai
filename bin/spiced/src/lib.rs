@@ -142,7 +142,7 @@ pub async fn run(args: Args) -> Result<()> {
         }),
         Box::pin(rt.init_results_cache()),
         Box::pin(rt.start_extensions()),
-        Box::pin(rt.load_datasets_and_views()),
+        Box::pin(rt.load_datasets()),
     ];
 
     if cfg!(feature = "models") {

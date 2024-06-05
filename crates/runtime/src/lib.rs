@@ -327,7 +327,6 @@ impl Runtime {
                 Ok(view) => Some(view),
                 Err(e) => {
                     if log_failures {
-                        //status::update_view(&spicepod_view.name, status::ComponentStatus::Error);
                         metrics::counter!("views_load_error").increment(1);
                         tracing::error!(view = &spicepod_view.name, "{e}");
                     }
@@ -337,7 +336,7 @@ impl Runtime {
             .collect()
     }
 
-    pub async fn load_datasets_and_views(&self) {
+    pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;

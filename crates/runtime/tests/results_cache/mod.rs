@@ -61,7 +61,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
-    rt.load_datasets_and_views().await;
+    rt.load_datasets().await;
 
     assert!(
         execute_query_and_check_cache_status(&rt, "show tables", None)
