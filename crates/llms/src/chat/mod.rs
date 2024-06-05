@@ -81,6 +81,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+
+/// Convert a structured [`ChatCompletionRequestMessage`] to a basic string. Useful for basic 
+/// [`Chat::run`] but reduces optional configuration provided by callers.
 #[must_use]
 pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
     match message {
