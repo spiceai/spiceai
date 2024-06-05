@@ -693,7 +693,7 @@ impl DataFusion {
         Ok(())
     }
 
-    fn register_view(&self, table: TableReference, view: String) -> Result<()> {
+    pub(crate) fn register_view(&self, table: TableReference, view: String) -> Result<()> {
         let table_exists = self.ctx.table_exist(table.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
