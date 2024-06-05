@@ -21,6 +21,7 @@ pub mod inference;
 pub mod models;
 pub mod nsql;
 pub mod query;
+pub mod ready;
 pub mod spicepods;
 pub mod status;
 

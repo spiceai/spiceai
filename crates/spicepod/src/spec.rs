@@ -23,7 +23,8 @@ use crate::component::embeddings::Embeddings;
 use crate::component::runtime::Runtime;
 use crate::component::secrets::Secrets;
 use crate::component::{
-    dataset::Dataset, extension::Extension, llms::Llm, model::Model, ComponentOrReference,
+    dataset::Dataset, extension::Extension, llms::Llm, model::Model, view::View,
+    ComponentOrReference,
 };
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -67,6 +68,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub datasets: Vec<ComponentOrReference<Dataset>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub views: Vec<ComponentOrReference<View>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::module_name_repetitions)]
 
+use component::view::View;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -62,6 +63,8 @@ pub struct Spicepod {
 
     pub datasets: Vec<Dataset>,
 
+    pub views: Vec<View>,
+
     pub models: Vec<Model>,
 
     pub dependencies: Vec<String>,
@@ -99,6 +102,10 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_views =
+            component::resolve_component_references(fs, &path, &spicepod_definition.views, "view")
+                .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_models = component::resolve_component_references(
             fs,
             &path,
@@ -122,6 +129,7 @@ impl Spicepod {
         Ok(from_definition(
             spicepod_definition,
             resolved_datasets,
+            resolved_views,
             resolved_embeddings,
             resolved_models,
             resolved_llms,
@@ -154,6 +162,7 @@ impl Spicepod {
 fn from_definition(
     spicepod_definition: SpicepodDefinition,
     datasets: Vec<Dataset>,
+    views: Vec<View>,
     embeddings: Vec<Embeddings>,
     models: Vec<Model>,
     llms: Vec<Llm>,
@@ -164,6 +173,7 @@ fn from_definition(
         extensions: spicepod_definition.extensions,
         secrets: spicepod_definition.secrets,
         datasets,
+        views,
         models,
         llms,
         embeddings,

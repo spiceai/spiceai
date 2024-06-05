@@ -18,6 +18,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use arrow::datatypes::{DataType, Field, SchemaRef};
 
 use arrow::error::ArrowError;
+use async_openai::types::EmbeddingInput;
 use async_stream::stream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -30,7 +31,6 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
-use llms::embeddings::EmbeddingInput;
 use std::fmt;
 use tokio::sync::RwLock;
 
@@ -239,7 +239,7 @@ async fn get_embeddings(
             .filter_map(|s| s.map(ToString::to_string))
             .collect();
 
-        let embedded_data = model.embed(EmbeddingInput::StringBatch(column)).await?;
+        let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
         let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
         let processed = embedded_data.iter().flatten().copied().collect_vec();
 
