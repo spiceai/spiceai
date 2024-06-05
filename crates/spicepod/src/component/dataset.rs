@@ -52,14 +52,6 @@ pub struct Dataset {
     #[serde(default)]
     pub mode: Mode,
 
-    /// Inline SQL that describes a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql: Option<String>,
-
-    /// Reference to a SQL file that describes a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql_ref: Option<String>,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
@@ -94,8 +86,6 @@ impl Dataset {
             from,
             name,
             mode: Mode::default(),
-            sql: None,
-            sql_ref: None,
             params: None,
             has_metadata_table: None,
             replication: None,
@@ -114,8 +104,6 @@ impl WithDependsOn<Dataset> for Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
             mode: self.mode.clone(),
-            sql: self.sql.clone(),
-            sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,
             replication: self.replication.clone(),
