@@ -58,8 +58,23 @@ pub enum Error {
     #[snafu(display("Invalid object access. {message}"))]
     InvalidObjectAccess { message: String },
 
-    #[snafu(display("Query Error. {message}"))]
-    GraphQLError { message: String },
+    #[snafu(display(
+        r#"GraphQL Query Error:
+Details:
+- Error: {message}
+- Location: Line {line}, Column {column}
+- Query:
+
+{query}
+
+Please verify the syntax of your GraphQL query."#
+    ))]
+    GraphQLError {
+        message: String,
+        line: usize,
+        column: usize,
+        query: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -129,10 +144,41 @@ impl GraphQLClient {
             });
         }
 
-        let graphql_error_message = &response["errors"][0]["message"];
-        if !graphql_error_message.is_null() {
+        let graphql_error = &response["errors"][0];
+        if !graphql_error.is_null() {
+            let line = graphql_error["locations"][0]["line"].as_u64().unwrap_or(0) as usize;
+            let column = graphql_error["locations"][0]["column"]
+                .as_u64()
+                .unwrap_or(0) as usize;
             return Err(Error::GraphQLError {
-                message: graphql_error_message.to_string(),
+                message: graphql_error["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(" at [")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                line,
+                column,
+                query: {
+                    let query_lines: Vec<&str> = self.query.split('\n').collect();
+                    let error_line = query_lines.get(line - 1).unwrap_or(&"");
+                    let marker = " ".repeat(column - 1) + "^";
+                    let context = if line > 1 {
+                        format!(
+                            "{:>4} | {}\n{:>4} | {}\n{:>4} | {}",
+                            line - 1,
+                            query_lines[line - 2],
+                            line,
+                            error_line,
+                            "",
+                            marker
+                        )
+                    } else {
+                        format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
+                    };
+                    context
+                },
             });
         }
 
