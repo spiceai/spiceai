@@ -149,7 +149,7 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
                 rx.await.ok();
             })
             .await
-            .unwrap();
+            .unwrap_or_default();
     });
 
     Ok((tx, addr))
@@ -176,7 +176,7 @@ async fn test_graphql() -> Result<(), String> {
     tracing::debug!("Server started at {}", addr);
     let app = AppBuilder::new("graphql_integration_test")
         .with_dataset(make_graphql_dataset(
-            &format!("http://{}/graphql", addr.to_string()),
+            &format!("http://{addr}/graphql"),
             "test_graphql",
         ))
         .build();
@@ -234,7 +234,7 @@ async fn test_graphql() -> Result<(), String> {
         run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
     }
 
-    tx.send(()).map_err(|_| {
+    tx.send(()).map_err(|()| {
         tracing::error!("Failed to send shutdown signal");
         "Failed to send shutdown signal".to_string()
     })?;
