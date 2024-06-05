@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(clippy::module_name_repetitions)]
 use arrow::record_batch::RecordBatch;
 use llms::chat::{Chat, Error as LlmError};
 use llms::embeddings::Embed;

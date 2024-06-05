@@ -172,8 +172,7 @@ impl Chat for Openai {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .flatten())
+            .and_then(|c| c.message.content))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default

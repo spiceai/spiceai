@@ -42,6 +42,7 @@ pub trait Embed: Sync + Send {
 
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
+    #[allow(clippy::cast_possible_truncation)]
     async fn embed_request(
         &mut self,
         req: CreateEmbeddingRequest,

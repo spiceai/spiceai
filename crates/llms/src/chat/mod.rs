@@ -81,7 +81,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn chat_complete_message_to_content(message: &ChatCompletionRequestMessage) -> String {
+#[must_use] pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content, ..
@@ -105,15 +105,13 @@ pub fn chat_complete_message_to_content(message: &ChatCompletionRequestMessage) 
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
             content,
             ..
-        }) => content.clone(),
-        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+        }) | ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
         }) => content.clone(),
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
-        }) => content.clone().unwrap_or_default(),
-        ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
+        }) | ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
             ..
         }) => content.clone().unwrap_or_default(),
@@ -126,6 +124,7 @@ pub trait Chat: Sync + Send {
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
+    #[allow(deprecated)]
     async fn chat_request(
         &mut self,
         req: CreateChatCompletionRequest,
@@ -134,7 +133,7 @@ pub trait Chat: Sync + Send {
         let prompt = req
             .messages
             .iter()
-            .map(chat_complete_message_to_content)
+            .map(message_to_content)
             .collect::<Vec<String>>()
             .join("\n");
         let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
