@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::acceleration::{IndexType, RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use arrow::array::UInt64Array;
@@ -94,6 +95,7 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
+    indexes: HashMap<String, IndexType>,
 }
 
 fn validate_refresh_data_window(
@@ -124,6 +126,7 @@ pub struct Builder {
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    indexes: Vec<(String, IndexType)>,
 }
 
 impl Builder {
@@ -141,6 +144,7 @@ impl Builder {
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
             cache_provider: None,
+            indexes: vec![],
         }
     }
 
@@ -161,6 +165,21 @@ impl Builder {
         self.cache_provider = cache_provider;
         self
     }
+
+    pub fn add_index(&mut self, name: String, index_type: IndexType) -> &mut Self {
+        self.indexes.push((name, index_type));
+        self
+    }
+
+    // This will work with both a Vec<(String, IndexType)> and a HashMap<String, IndexType>
+    pub fn indexes<I>(&mut self, indexes: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (String, IndexType)>,
+    {
+        self.indexes.extend(indexes);
+        self
+    }
+
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -237,6 +256,7 @@ impl Builder {
                 zero_results_action: self.zero_results_action,
                 refresh_params,
                 refresher,
+                indexes: self.indexes.into_iter().collect(),
             },
             is_ready,
         )

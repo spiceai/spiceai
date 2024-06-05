@@ -432,6 +432,22 @@ pub mod acceleration {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub enum IndexType {
+        #[default]
+        Enabled,
+        Unique,
+    }
+
+    impl From<spicepod_acceleration::IndexType> for IndexType {
+        fn from(index_type: spicepod_acceleration::IndexType) -> Self {
+            match index_type {
+                spicepod_acceleration::IndexType::Enabled => IndexType::Enabled,
+                spicepod_acceleration::IndexType::Unique => IndexType::Unique,
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub struct Acceleration {
         pub enabled: bool,
@@ -459,6 +475,8 @@ pub mod acceleration {
         pub retention_check_enabled: bool,
 
         pub on_zero_results: ZeroResultsAction,
+
+        pub indexes: HashMap<String, IndexType>,
     }
 
     impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -487,6 +505,11 @@ pub mod acceleration {
                 retention_check_interval: acceleration.retention_check_interval,
                 retention_check_enabled: acceleration.retention_check_enabled,
                 on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
+                indexes: acceleration
+                    .indexes
+                    .into_iter()
+                    .map(|(k, v)| (k, IndexType::from(v)))
+                    .collect(),
             })
         }
     }
@@ -507,6 +530,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
+                indexes: HashMap::default(),
             }
         }
     }
