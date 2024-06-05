@@ -142,7 +142,7 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
-    #[snafu(display("Need to specify the view SQL string for {name} inline with `sql: CREATE VIEW...` or as a file reference with `sql_ref: my_view.sql`"))]
+    #[snafu(display("Need to specify the view SQL string for {name} inline with `sql: SELECT * FROM...` or as a file reference with `sql_ref: my_view.sql`"))]
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
