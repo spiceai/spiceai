@@ -96,15 +96,7 @@ pub struct Query {
 macro_rules! handle_error {
     ($self:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-
-        if let Err(err) = $self
-            .finish_with_error(snafu_error.to_string())
-            .write_query_history()
-            .await
-        {
-            tracing::error!("Error writing query history: {err}");
-        }
-
+        $self.finish_with_error(snafu_error.to_string()).await;
         return Err(snafu_error);
     }};
 }
@@ -203,14 +195,12 @@ impl Query {
         Ok(df.schema().into())
     }
 
-    #[must_use]
-    pub fn finish_with_error(mut self, error_message: String) -> Self {
+    pub async fn finish_with_error(mut self, error_message: String) {
         self.error_message = Some(error_message);
-        self.finish()
+        self.finish().await;
     }
 
-    #[must_use]
-    pub fn finish(mut self) -> Self {
+    pub async fn finish(mut self) {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -255,7 +245,9 @@ impl Query {
             metrics::counter!("query_failures", &labels).increment(1);
         }
 
-        self
+        if let Err(err) = self.write_query_history().await {
+            tracing::error!("Error writing query history: {err}");
+        };
     }
 
     #[must_use]
@@ -314,13 +306,11 @@ fn attach_query_context_to_stream(
             yield batch_result;
         }
 
-        if let Err(e) = ctx
+        ctx
             .schema(schema_copy)
             .rows_produced(num_records)
             .finish()
-            .write_query_history().await {
-                tracing::error!("Error writing query history: {e}");
-            }
+            .await;
     };
 
     Box::pin(RecordBatchStreamAdapter::new(

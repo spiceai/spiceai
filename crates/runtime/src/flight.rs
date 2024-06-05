@@ -159,13 +159,8 @@ impl Service {
         let schema = match query.get_schema().await {
             Ok(schema) => schema,
             Err(err) => {
-                if let Err(write_err) = query
-                    .finish_with_error(err.to_string())
-                    .write_query_history()
-                    .await
-                {
-                    tracing::error!("Error writing query history: {write_err}");
-                }
+                query.finish_with_error(err.to_string()).await;
+
                 return Err(handle_datafusion_error(err));
             }
         };
