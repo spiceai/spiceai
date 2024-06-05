@@ -142,7 +142,7 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
-    #[snafu(display("Need to specify the view SQL string for {name} inline with `sql: SELECT * FROM...` or as a file reference with `sql_ref: my_view.sql`"))]
+    #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
@@ -406,7 +406,7 @@ impl Runtime {
 
         if !verify_dependent_tables(view, &existing_tables) {
             return UnableToCreateViewSnafu {
-                reason: "One or more of the tables in the view's SQL statement do not exist"
+                reason: "One or more tables in the view's SQL statement do not exist."
                     .to_string(),
             }
             .fail();
