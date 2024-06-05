@@ -154,10 +154,10 @@ impl GraphQLClient {
                 .context(UnableToReadBatchSnafu)?
                 .collect::<Result<Vec<_>, _>>()
                 .context(UnableToCollectBatchSnafu)?;
-            res.push(batch);
+            res.extend(batch);
         }
 
-        Ok((res, schema))
+        Ok((vec![res], schema))
     }
 }
 
