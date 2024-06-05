@@ -43,6 +43,17 @@ jobs:
 
       - run: make lint
 
+      - name: Check if Cargo.lock is updated
+        run: |
+          git diff --exit-code --name-only origin/trunk Cargo.lock
+          if [ $? -eq 1 ]; then
+            echo "Cargo.lock is updated."
+            exit 0
+          else
+            echo "Please update Cargo.lock."
+            exit 1
+          fi
+
   build:
     name: Build Go & Rust
     runs-on: rust
