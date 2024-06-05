@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::array::StringArray;
+use async_openai::types::EmbeddingInput;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -64,7 +65,7 @@ async fn create_input_embeddings(
         match model
             .write()
             .await
-            .embed(llms::embeddings::EmbeddingInput::String(input.to_string()))
+            .embed(EmbeddingInput::String(input.to_string()))
             .await
         {
             Ok(embedding) => match embedding.first() {
@@ -255,18 +256,15 @@ pub(crate) async fn post(
 
     // Run LLM with input.
     match llms.read().await.get(&payload.model) {
-        Some(llm_model) => {
-            // TODO: We need to either 1. Separate LLMs from NQL, or create a LLM trait separately.
-            match llm_model.write().await.run(model_input).await {
-                Ok(Some(assist)) => (StatusCode::OK, Json(assist)).into_response(),
-                Ok(None) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("No response from LLM {}", payload.model),
-                )
-                    .into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            }
-        }
+        Some(llm_model) => match llm_model.write().await.run(model_input).await {
+            Ok(Some(assist)) => (StatusCode::OK, Json(assist)).into_response(),
+            Ok(None) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("No response from LLM {}", payload.model),
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Model {} not found", payload.model),

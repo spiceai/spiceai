@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::model::LLMModelStore;
+use crate::EmbeddingModelStore;
 use crate::{config, datafusion::DataFusion};
-use crate::{EmbeddingModelStore, OpenaiServerStore};
 use app::App;
 use axum::routing::patch;
 use model_components::model::Model;
@@ -43,7 +43,6 @@ pub(crate) fn routes(
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
-    openai_servers: Arc<RwLock<OpenaiServerStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {
@@ -75,7 +74,6 @@ pub(crate) fn routes(
             .route("/v1/assist", post(v1::assist::post))
             .layer(Extension(llms))
             .layer(Extension(models))
-            .layer(Extension(openai_servers))
             .layer(Extension(embeddings));
     }
 

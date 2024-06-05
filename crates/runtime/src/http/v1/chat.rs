@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::OpenaiServerStore;
 use async_openai::types::CreateChatCompletionRequest;
 use axum::{
     http::StatusCode,
@@ -25,19 +24,18 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
+use crate::model::LLMModelStore;
+
 pub(crate) async fn post(
-    Extension(openai_server_store): Extension<Arc<RwLock<OpenaiServerStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
     let model_id = req.model.clone();
-    match openai_server_store.read().await.get(&model_id) {
-        Some(model_lock) => {
-            let mut model = model_lock.write().await;
-            match model.chat(req).await {
-                Ok(response) => Json(response).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            }
-        }
-        None => (StatusCode::NOT_FOUND, "model not found").into_response(),
+    match llms.read().await.get(&model_id) {
+        Some(model) => match model.write().await.chat_request(req).await {
+            Ok(response) => Json(response).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }

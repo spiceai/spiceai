@@ -11,8 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use crate::embeddings::{Embed, EmbeddingInput, Error as EmbedError, Result as EmbedResult};
-use crate::nql::{Error as NqlError, Nql, Result as NqlResult};
+use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
+use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
@@ -23,21 +23,15 @@ use async_openai::types::{
 use async_openai::{
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseFormat, ChatCompletionResponseFormatType,
-        CreateChatCompletionRequestArgs, EmbeddingInput as OpenAiEmbeddingInput,
+        ChatCompletionRequestSystemMessageArgs, CreateChatCompletionRequestArgs, EmbeddingInput,
     },
     Client,
 };
 use async_trait::async_trait;
 use futures::future::try_join_all;
-use serde_json::Value;
-use server::Server;
 use snafu::ResultExt;
 
-pub mod server;
-
-const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
+pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
 pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
 pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
@@ -81,87 +75,70 @@ impl Openai {
             model,
         }
     }
-
-    /// Convert the Json object returned when using a `{ "type": "json_object" } ` response format.
-    /// Expected format is `"content": "{\"arbitrary_key\": \"arbitrary_value\"}"`
-    pub fn convert_json_object_to_sql(raw_json: &str) -> NqlResult<Option<String>> {
-        let result: Value = serde_json::from_str(raw_json)
-            .boxed()
-            .map_err(|source| NqlError::FailedToLoadModel { source })?;
-        Ok(result["sql"].as_str().map(std::string::ToString::to_string))
-    }
 }
 
 #[async_trait]
-impl Nql for Openai {
-    async fn run(&mut self, prompt: String) -> NqlResult<Option<String>> {
-        let messages: Vec<ChatCompletionRequestMessage> = vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Return JSON, with the requested SQL under 'sql'.")
-                .build()
-                .boxed()
-                .map_err(|source| NqlError::FailedToLoadTokenizer { source })?
-                .into(),
-            ChatCompletionRequestSystemMessageArgs::default()
+impl Chat for Openai {
+    async fn run(&mut self, prompt: String) -> ChatResult<Option<String>> {
+        let req = CreateChatCompletionRequestArgs::default()
+            .model(self.model.clone())
+            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
                 .content(prompt)
                 .build()
                 .boxed()
-                .map_err(|source| NqlError::FailedToLoadTokenizer { source })?
-                .into(),
-        ];
-
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(self.model.clone())
-            .response_format(ChatCompletionResponseFormat {
-                r#type: ChatCompletionResponseFormatType::JsonObject,
-            })
-            .messages(messages)
-            .max_tokens(MAX_COMPLETION_TOKENS)
+                .map_err(|source| ChatError::FailedToLoadTokenizer { source })?
+                .into()])
             .build()
             .boxed()
-            .map_err(|source| NqlError::FailedToLoadModel { source })?;
+            .map_err(|source| ChatError::FailedToLoadModel { source })?;
 
-        let response = self
-            .client
-            .chat()
-            .create(request)
+        let resp = self
+            .chat_request(req)
             .await
             .boxed()
-            .map_err(|source| NqlError::FailedToRunModel { source })?;
+            .map_err(|source| ChatError::FailedToRunModel { source })?;
 
-        if let Some(usage) = response.usage {
-            if usage.completion_tokens >= u32::from(MAX_COMPLETION_TOKENS) {
-                tracing::warn!(
-                    "Completion response may have been cut off after {} tokens",
-                    MAX_COMPLETION_TOKENS
-                );
-            }
-        }
-
-        match response
+        Ok(resp
             .choices
-            .iter()
-            .find_map(|c| c.message.content.clone())
-        {
-            Some(json_resp) => Self::convert_json_object_to_sql(&json_resp),
-            None => Ok(None),
-        }
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content))
+    }
+
+    /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
+    /// implementation will be constructed based on the trait's [`run`] method.
+    async fn chat_request(
+        &mut self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
+        self.client.chat().create(inner_req).await
     }
 }
 
 #[async_trait]
 impl Embed for Openai {
+    async fn embed_request(
+        &mut self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
+        self.client.embeddings().create(inner_req).await
+    }
+
     async fn embed(&mut self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
         // Batch requests to OpenAI endpoint because "any array must be 2048 dimensions or less".
         // https://platform.openai.com/docs/api-reference/embeddings/create#embeddings-create-input
         let embed_batches = match input {
-            EmbeddingInput::StringBatch(ref batch) => batch
+            EmbeddingInput::StringArray(ref batch) => batch
                 .chunks(2048)
-                .map(|chunk| EmbeddingInput::StringBatch(chunk.to_vec()))
+                .map(|chunk| EmbeddingInput::StringArray(chunk.to_vec()))
                 .collect(),
-            EmbeddingInput::TokensBatch(ref batch) => batch
+            EmbeddingInput::ArrayOfIntegerArray(ref batch) => batch
                 .chunks(2048)
-                .map(|chunk| EmbeddingInput::TokensBatch(chunk.to_vec()))
+                .map(|chunk| EmbeddingInput::ArrayOfIntegerArray(chunk.to_vec()))
                 .collect(),
             _ => vec![input],
         };
@@ -171,7 +148,7 @@ impl Embed for Openai {
             .map(|batch| {
                 CreateEmbeddingRequestArgs::default()
                     .model(self.model.clone())
-                    .input(to_openai_embedding_input(batch))
+                    .input(batch)
                     .build()
                     .boxed()
                     .map_err(|source| EmbedError::FailedToPrepareInput { source })
@@ -213,37 +190,5 @@ impl Embed for Openai {
             "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
             _ => 0, // unreachable. If not a valid model, it won't create embeddings.
         }
-    }
-}
-
-fn to_openai_embedding_input(input: EmbeddingInput) -> OpenAiEmbeddingInput {
-    match input {
-        EmbeddingInput::String(s) => OpenAiEmbeddingInput::String(s),
-        EmbeddingInput::Tokens(t) => OpenAiEmbeddingInput::IntegerArray(t),
-        EmbeddingInput::StringBatch(sb) => OpenAiEmbeddingInput::StringArray(sb),
-        EmbeddingInput::TokensBatch(tb) => OpenAiEmbeddingInput::ArrayOfIntegerArray(tb),
-    }
-}
-
-/// Default implementation of the OpenAI server using Openai.
-/// Note: The model provided by the client will be the name of the spicepod LLM, not the model specified in the params. Must alter incoming requests accordingly.
-#[async_trait]
-impl Server for Openai {
-    async fn chat(
-        &mut self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
-        self.client.chat().create(inner_req).await
-    }
-
-    async fn embed(
-        &mut self,
-        req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
-        let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
-        self.client.embeddings().create(inner_req).await
     }
 }
