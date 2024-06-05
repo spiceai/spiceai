@@ -154,15 +154,21 @@ impl FlightService for Service {
 
 impl Service {
     async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
-        let query = QueryBuilder::new(sql, datafusion, Protocol::Flight)
-            .protocol(Protocol::Flight)
-            .build();
+        let query = QueryBuilder::new(sql, datafusion, Protocol::Flight).build();
 
-        let schema = query
-            .get_schema(true)
-            .await
-            .map_err(handle_datafusion_error)?;
-
+        let schema = match query.get_schema().await {
+            Ok(schema) => schema,
+            Err(err) => {
+                if let Err(write_err) = query
+                    .finish_with_error(err.to_string())
+                    .write_query_history()
+                    .await
+                {
+                    tracing::error!("Error writing query history: {write_err}");
+                }
+                return Err(handle_datafusion_error(err));
+            }
+        };
         Ok(schema)
     }
 
