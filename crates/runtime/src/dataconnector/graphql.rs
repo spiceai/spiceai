@@ -113,7 +113,7 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
     let query_lines: Vec<&str> = query.split('\n').collect();
     let error_line = query_lines.get(line - 1).unwrap_or(&"");
     let marker = " ".repeat(column - 1) + "^";
-    let context = if line > 1 {
+    if line > 1 {
         format!(
             "{:>4} | {}\n{:>4} | {}\n{:>4} | {}",
             line - 1,
@@ -125,8 +125,7 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
         )
     } else {
         format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
-    };
-    context
+    }
 }
 
 impl GraphQLClient {
