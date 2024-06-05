@@ -46,6 +46,12 @@ pub enum Error {
     #[snafu(display("{source}"))]
     ReqwestInternal { source: reqwest::Error },
 
+    #[snafu(display("HTTP {status}: {message}"))]
+    ReqwestError {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+
     #[snafu(display("{source}"))]
     ArrowInternal { source: ArrowError },
 
@@ -107,15 +113,21 @@ impl GraphQLClient {
             _ => {}
         }
 
-        let response = request
-            .send()
-            .await
-            .context(ReqwestInternalSnafu)?
-            .error_for_status()
-            .context(ReqwestInternalSnafu)?;
+        let response = request.send().await.context(ReqwestInternalSnafu)?;
+        let status = response.status();
 
         let mut response: serde_json::Value =
             response.json().await.context(ReqwestInternalSnafu)?;
+
+        if status.is_client_error() | status.is_server_error() {
+            return Err(Error::ReqwestError {
+                status: status,
+                message: response["message"]
+                    .as_str()
+                    .unwrap_or("No message provided")
+                    .to_string(),
+            });
+        }
 
         let graphql_error_message = &response["errors"][0]["message"];
         if !graphql_error_message.is_null() {
