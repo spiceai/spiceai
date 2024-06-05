@@ -45,14 +45,8 @@ jobs:
 
       - name: Check if Cargo.lock is updated
         run: |
-          git diff --exit-code --name-only origin/trunk Cargo.lock
-          if [ $? -eq 1 ]; then
-            echo "Cargo.lock is updated."
-            exit 0
-          else
-            echo "Please update Cargo.lock."
-            exit 1
-          fi
+          # If this fails, run `cargo update` and commit the changes
+          cargo check --locked
 
   build:
     name: Build Go & Rust
