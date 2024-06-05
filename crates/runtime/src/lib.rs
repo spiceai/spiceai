@@ -404,8 +404,7 @@ impl Runtime {
 
         if !verify_dependent_tables(view, &existing_tables) {
             return UnableToCreateViewSnafu {
-                reason: "One or more tables in the view's SQL statement do not exist."
-                    .to_string(),
+                reason: "One or more tables in the view's SQL statement do not exist.".to_string(),
             }
             .fail();
         }
