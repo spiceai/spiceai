@@ -21,29 +21,10 @@ use std::fs;
 
 use super::dataset::Dataset;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to load SQL file {file}: {source}"))]
-    UnableToLoadSqlFile {
-        file: String,
-        source: std::io::Error,
-    },
-
-    #[snafu(display(
-        "The view is uninitialized, please report a bug at https://github.com/spiceai/spiceai"
-    ))]
-    Uninitialized,
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
     pub name: TableReference,
-    /// Inline SQL that describes a view.
-    sql: Option<String>,
-    /// Reference to a SQL file that describes a view.
-    sql_ref: Option<String>,
+    pub sql: String,
 }
 
 impl TryFrom<spicepod_view::View> for View {
@@ -52,44 +33,34 @@ impl TryFrom<spicepod_view::View> for View {
     fn try_from(view: spicepod_view::View) -> Result<Self, Self::Error> {
         let table_reference = Dataset::parse_table_reference(&view.name)?;
 
-        if view.sql.is_none() && view.sql_ref.is_none() {
+        let sql = if let Some(view_sql) = &view.sql {
+            view_sql.to_string()
+        } else if let Some(sql_ref) = &view.sql_ref {
+            Self::load_sql_ref(sql_ref)?
+        } else {
             return Err(crate::Error::NeedToSpecifySQLView {
                 name: table_reference.to_string(),
             });
-        }
+        };
 
         Ok(View {
             name: table_reference,
-            sql: view.sql,
-            sql_ref: view.sql_ref,
+            sql,
         })
     }
 }
 
 impl View {
-    pub fn try_new(name: &str) -> Result<Self, crate::Error> {
+    pub fn try_new(name: &str, sql: String) -> Result<Self, crate::Error> {
         Ok(Self {
             name: Dataset::parse_table_reference(name)?,
-            sql: None,
-            sql_ref: None,
+            sql,
         })
     }
 
-    pub fn view_sql(&self) -> Result<String> {
-        if let Some(sql) = &self.sql {
-            return Ok(sql.clone());
-        }
-
-        if let Some(sql_ref) = &self.sql_ref {
-            return Self::load_sql_ref(sql_ref);
-        }
-
-        Err(Error::Uninitialized)
-    }
-
-    fn load_sql_ref(sql_ref: &str) -> Result<String> {
-        let sql =
-            fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
+    fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
+        let sql = fs::read_to_string(sql_ref)
+            .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
         Ok(sql)
     }
 }

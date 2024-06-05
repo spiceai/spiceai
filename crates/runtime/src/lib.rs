@@ -120,19 +120,17 @@ pub enum Error {
         data_connector: String,
     },
 
-    #[snafu(display("Unable to create view: {source}"))]
-    InvalidSQLView {
-        source: crate::component::view::Error,
-    },
-
     #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
         data_connector: String,
     },
 
-    #[snafu(display("Expected a SQL view statement, received nothing."))]
-    ExpectedSqlView,
+    #[snafu(display("Unable to load SQL file {file}: {source}"))]
+    UnableToLoadSqlFile {
+        file: String,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
@@ -412,12 +410,9 @@ impl Runtime {
             .fail();
         }
 
-        if let Ok(view_sql) = view.view_sql() {
-            let df = Arc::clone(&self.df);
-            df.register_view(view.name.clone(), view_sql)
-                .context(UnableToAttachViewSnafu)?;
-            return Ok(());
-        }
+        let df = Arc::clone(&self.df);
+        df.register_view(view.name.clone(), view.sql.clone())
+            .context(UnableToAttachViewSnafu)?;
 
         Ok(())
     }
@@ -1090,11 +1085,7 @@ fn verify_dependent_tables(view: &View, existing_tables: &[TableReference]) -> b
 fn get_view_dependent_tables(view: impl Borrow<View>) -> Result<Vec<TableReference>> {
     let view = view.borrow();
 
-    let Ok(sql) = view.view_sql() else {
-        return ExpectedSqlViewSnafu.fail();
-    };
-
-    let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
+    let statements = DFParser::parse_sql_with_dialect(view.sql.as_str(), &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
 
     if statements.len() != 1 {
