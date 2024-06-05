@@ -43,6 +43,11 @@ jobs:
 
       - run: make lint
 
+      - name: Check if Cargo.lock is updated
+        run: |
+          # If this fails, run `cargo update` and commit the changes
+          cargo check --locked
+
   build:
     name: Build Go & Rust
     runs-on: rust

@@ -24,7 +24,9 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion, EmbeddingModelStore, LLMModelStore};
+use crate::{
+    config, datafusion::DataFusion, model::LLMModelStore, EmbeddingModelStore, OpenaiServerStore,
+};
 
 mod routes;
 mod v1;
@@ -48,13 +50,23 @@ pub(crate) async fn start<A>(
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    openai_servers: Arc<RwLock<OpenaiServerStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app, df, models, llms, embeddings, config, with_metrics);
+    let routes = routes::routes(
+        app,
+        df,
+        models,
+        llms,
+        embeddings,
+        openai_servers,
+        config,
+        with_metrics,
+    );
 
     let listener = TcpListener::bind(&bind_address)
         .await
