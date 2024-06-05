@@ -357,6 +357,8 @@ impl Runtime {
 
         // After all datasets have loaded, load the views.
         self.load_views(app, &valid_datasets);
+
+        self.df.mark_initial_load_complete();
     }
 
     fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {

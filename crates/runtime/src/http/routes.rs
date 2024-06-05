@@ -61,6 +61,7 @@ pub(crate) fn routes(
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
+        .route("/v1/ready", get(v1::ready::get))
         .route_layer(middleware::from_fn(track_metrics));
 
     if cfg!(feature = "models") {
