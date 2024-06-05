@@ -114,7 +114,7 @@ impl GraphQLClient {
         &self,
         schema: Option<SchemaRef>,
     ) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
-        let body = format!(r#"{{"query": {}}}"#, json!(self.query).to_string());
+        let body = format!(r#"{{"query": {}}}"#, json!(self.query));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
 
@@ -136,7 +136,7 @@ impl GraphQLClient {
 
         if status.is_client_error() | status.is_server_error() {
             return Err(Error::ReqwestError {
-                status: status,
+                status,
                 message: response["message"]
                     .as_str()
                     .unwrap_or("No message provided")
