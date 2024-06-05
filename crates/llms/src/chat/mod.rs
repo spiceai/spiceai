@@ -81,7 +81,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[must_use] pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
+#[must_use]
+pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content, ..
@@ -105,13 +106,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
             content,
             ..
-        }) | ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+        })
+        | ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
         }) => content.clone(),
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
-        }) | ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
+        })
+        | ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
             ..
         }) => content.clone().unwrap_or_default(),

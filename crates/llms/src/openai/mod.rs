@@ -13,7 +13,6 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
-use crate::nql::{Error as NqlError, Nql, Result as NqlResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
@@ -24,18 +23,15 @@ use async_openai::types::{
 use async_openai::{
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseFormat, ChatCompletionResponseFormatType,
-        CreateChatCompletionRequestArgs, EmbeddingInput,
+        ChatCompletionRequestSystemMessageArgs, CreateChatCompletionRequestArgs, EmbeddingInput,
     },
     Client,
 };
 use async_trait::async_trait;
 use futures::future::try_join_all;
-use serde_json::Value;
 use snafu::ResultExt;
 
-const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
+pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
 pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
 pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
@@ -77,72 +73,6 @@ impl Openai {
         Self {
             client: Client::with_config(cfg),
             model,
-        }
-    }
-
-    /// Convert the Json object returned when using a `{ "type": "json_object" } ` response format.
-    /// Expected format is `"content": "{\"arbitrary_key\": \"arbitrary_value\"}"`
-    pub fn convert_json_object_to_sql(raw_json: &str) -> NqlResult<Option<String>> {
-        let result: Value = serde_json::from_str(raw_json)
-            .boxed()
-            .map_err(|source| NqlError::FailedToLoadModel { source })?;
-        Ok(result["sql"].as_str().map(std::string::ToString::to_string))
-    }
-}
-
-#[async_trait]
-impl Nql for Openai {
-    async fn run(&mut self, prompt: String) -> NqlResult<Option<String>> {
-        let messages: Vec<ChatCompletionRequestMessage> = vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Return JSON, with the requested SQL under 'sql'.")
-                .build()
-                .boxed()
-                .map_err(|source| NqlError::FailedToLoadTokenizer { source })?
-                .into(),
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(prompt)
-                .build()
-                .boxed()
-                .map_err(|source| NqlError::FailedToLoadTokenizer { source })?
-                .into(),
-        ];
-
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(self.model.clone())
-            .response_format(ChatCompletionResponseFormat {
-                r#type: ChatCompletionResponseFormatType::JsonObject,
-            })
-            .messages(messages)
-            .max_tokens(MAX_COMPLETION_TOKENS)
-            .build()
-            .boxed()
-            .map_err(|source| NqlError::FailedToLoadModel { source })?;
-
-        let response = self
-            .client
-            .chat()
-            .create(request)
-            .await
-            .boxed()
-            .map_err(|source| NqlError::FailedToRunModel { source })?;
-
-        if let Some(usage) = response.usage {
-            if usage.completion_tokens >= u32::from(MAX_COMPLETION_TOKENS) {
-                tracing::warn!(
-                    "Completion response may have been cut off after {} tokens",
-                    MAX_COMPLETION_TOKENS
-                );
-            }
-        }
-
-        match response
-            .choices
-            .iter()
-            .find_map(|c| c.message.content.clone())
-        {
-            Some(json_resp) => Self::convert_json_object_to_sql(&json_resp),
-            None => Ok(None),
         }
     }
 }
