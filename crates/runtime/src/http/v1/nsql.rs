@@ -52,7 +52,7 @@ fn default_model() -> String {
 
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
-    Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Json(payload): Json<Request>,
 ) -> Response {
     // Get all public table CREATE TABLE statements to add to prompt.
@@ -89,7 +89,7 @@ pub(crate) async fn post(
 
     tracing::trace!("Running prompt: {nsql_query}");
 
-    let result = match nsql_models.read().await.get(&payload.model) {
+    let result = match llms.read().await.get(&payload.model) {
         Some(nql_model) => nql_model.write().await.run(nsql_query).await,
         None => {
             return (

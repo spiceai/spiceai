@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::array::StringArray;
+use async_openai::types::EmbeddingInput;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -64,7 +65,7 @@ async fn create_input_embeddings(
         match model
             .write()
             .await
-            .embed(llms::embeddings::EmbeddingInput::String(input.to_string()))
+            .embed(EmbeddingInput::String(input.to_string()))
             .await
         {
             Ok(embedding) => match embedding.first() {
