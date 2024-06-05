@@ -44,26 +44,17 @@ use super::{DataConnector, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to handle request: {source}"))]
-    UnableToHandleRequest { source: reqwest::Error },
+    #[snafu(display("{source}"))]
+    ReqwestInternal { source: reqwest::Error },
 
-    #[snafu(display("Failed to request data:\n {response}"))]
-    FailedToRequestData { response: String },
+    #[snafu(display("{source}"))]
+    ArrowInternal { source: ArrowError },
 
-    #[snafu(display("Unable to parse response: {source}"))]
-    UnableToParseResponse { source: reqwest::Error },
-
-    #[snafu(display("Unable to read batch: {source}"))]
-    UnableToReadBatch { source: ArrowError },
-
-    #[snafu(display("Unable to collect batch: {source}"))]
-    UnableToCollectBatch { source: ArrowError },
-
-    #[snafu(display("Unable to infer schema: {source}"))]
-    UnableToInferSchema { source: ArrowError },
-
-    #[snafu(display("Invalid object access: {message}"))]
+    #[snafu(display("Invalid object access. {message}"))]
     InvalidObjectAccess { message: String },
+
+    #[snafu(display("Schema Error. {message}"))]
+    GraphQLError { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -99,7 +90,10 @@ struct GraphQLClient {
 }
 
 impl GraphQLClient {
-    async fn execute(&self) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
+    async fn execute(
+        &self,
+        schema: Option<SchemaRef>,
+    ) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
         let body = format!(r#"{{"query": "{}"}}"#, self.query.lines().join(" "));
         let mut request = self.client.post(self.endpoint.clone()).body(body);
 
@@ -113,37 +107,42 @@ impl GraphQLClient {
             _ => {}
         }
 
-        let response = request.send().await.context(UnableToHandleRequestSnafu)?;
-        let status = response.status();
+        let response = request
+            .send()
+            .await
+            .context(ReqwestInternalSnafu)?
+            .error_for_status()
+            .context(ReqwestInternalSnafu)?;
 
         let mut response: serde_json::Value =
-            response.json().await.context(UnableToParseResponseSnafu)?;
+            response.json().await.context(ReqwestInternalSnafu)?;
 
-        if response["data"].is_null() || !status.is_success() {
-            return Err(Error::FailedToRequestData {
-                response: serde_json::to_string_pretty(&response).unwrap_or_default(),
+        let graphql_error_message = &response["errors"][0]["message"];
+        if !graphql_error_message.is_null() {
+            return Err(Error::GraphQLError {
+                message: graphql_error_message.to_string(),
             });
         }
 
         for key in self.json_path.split('.') {
-            response = response[key].clone();
+            response = response[key].take();
         }
 
         let unwrapped = match response {
             Value::Array(val) => Ok(val.clone()),
-            obj @ Value::Object(_) => Ok(vec![obj.clone()]),
+            obj @ Value::Object(_) => Ok(vec![obj]),
             Value::Null => Err(Error::InvalidObjectAccess {
-                message: "Found null value".to_string(),
+                message: "Null value access.".to_string(),
             }),
             _ => Err(Error::InvalidObjectAccess {
-                message: "Found primitive value".to_string(),
+                message: "Primitive value access.".to_string(),
             }),
         }?;
 
-        let schema = Arc::new(
+        let schema = schema.unwrap_or(Arc::new(
             infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
-                .context(UnableToInferSchemaSnafu)?,
-        );
+                .context(ArrowInternalSnafu)?,
+        ));
 
         let mut res = vec![];
         for v in unwrapped {
@@ -151,9 +150,9 @@ impl GraphQLClient {
             let batch = ReaderBuilder::new(Arc::clone(&schema))
                 .with_batch_size(1024)
                 .build(Cursor::new(buf.as_bytes()))
-                .context(UnableToReadBatchSnafu)?
+                .context(ArrowInternalSnafu)?
                 .collect::<Result<Vec<_>, _>>()
-                .context(UnableToCollectBatchSnafu)?;
+                .context(ArrowInternalSnafu)?;
             res.extend(batch);
         }
 
@@ -176,10 +175,10 @@ impl GraphQL {
         let query = self
             .params
             .get("query")
-            .ok_or("Query not found in params".into())
+            .ok_or("`query` not found in params".into())
             .context(super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
-                message: "Query not found",
+                message: "`query` not found in params",
             })?
             .to_owned();
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
@@ -191,7 +190,12 @@ impl GraphQL {
         let json_path = self
             .params
             .get("json_path")
-            .map_or("data".to_string(), ToOwned::to_owned);
+            .ok_or("`json_path` not found in params".into())
+            .context(super::InvalidConfigurationSnafu {
+                dataconnector: "GraphQL",
+                message: "`json_path` not found in params",
+            })?
+            .to_owned();
 
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
@@ -230,8 +234,8 @@ struct GraphQLTableProvider {
 
 impl GraphQLTableProvider {
     pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
-        let (_, schema) = client.execute().await.map_err(Into::into).context(
-            super::UnableToHandleRequestSnafu {
+        let (_, schema) = client.execute(None).await.map_err(Into::into).context(
+            super::InternalWithSourceSnafu {
                 dataconnector: "GraphQL",
             },
         )?;
@@ -261,7 +265,11 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (res, schema) = self.client.execute().await.map_err(to_execution_error)?;
+        let (res, schema) = self
+            .client
+            .execute(Some(Arc::clone(&self.schema)))
+            .await
+            .map_err(to_execution_error)?;
         let table = MemTable::try_new(schema, res)?;
 
         table.scan(state, projection, filters, limit).await

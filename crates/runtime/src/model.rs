@@ -13,10 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(clippy::module_name_repetitions)]
 use arrow::record_batch::RecordBatch;
+use llms::chat::{Chat, Error as LlmError};
 use llms::embeddings::Embed;
-use llms::nql::{Error as LlmError, Nql};
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
@@ -24,8 +24,10 @@ use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::DataFusion;
+pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
@@ -83,8 +85,10 @@ pub fn try_to_embedding(
     }
 }
 
-/// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
-pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
+/// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
+pub fn try_to_chat_model(
+    component: &spicepod::component::llms::Llm,
+) -> Result<Box<dyn Chat>, LlmError> {
     let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
         source: format!(
             "Unknown model source for spicepod component from: {}",
@@ -116,7 +120,7 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
             weights_path,
             tokenizer_path,
             tokenizer_config_path,
-        }) => llms::nql::create_local_model(
+        }) => llms::chat::create_local_model(
             &weights_path,
             tokenizer_path.as_deref(),
             tokenizer_config_path.as_ref(),
@@ -129,7 +133,7 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
         }) => {
             match component.get_model_id() {
                 Some(id) => {
-                    llms::nql::create_hf_model(
+                    llms::chat::create_hf_model(
                         &id,
                         model_type.map(|x| x.to_string()),
                         &weights_path,

@@ -8,22 +8,25 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.14-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/22)
+## [v0.14-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/27)
 
-- Query history (Arrow Flight)
-- Accelerated table indexes
+- Accelerated table primary key and indexes
 - MotherDuck data connector (alpha)
-- Generic Object-Store connector (alpha)
-- S3 data connector Iceberg support
+- GraphQL data connector (alpha)
 
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
 - CDC replication refresh mode
+- Generic Object-Store connector (alpha)
+- S3 data connector Iceberg support
 
-## v0.16-beta (June 2024)
+## v0.16-beta (July 2024)
 
 - Catalog Providers
   - Unity Catalog catalog provider (alpha)
+- ODBC data connector (beta)
+- Databricks data connector (beta)
+- S3 data connector (beta)
 - Dataset management improvements
 - Bugfixes and performance improvements
 

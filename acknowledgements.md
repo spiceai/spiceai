@@ -211,10 +211,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - metrics-util 0.16.3, MIT 
   <br/>https://github.com/metrics-rs/metrics
 
-- mistralrs 0.1.10, MIT 
+- mistralrs 0.1.11, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
-- mistralrs-core 0.1.10, MIT 
+- mistralrs-core 0.1.11, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
 - moka 0.12.7, Apache-2.0 OR MIT 
@@ -339,9 +339,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - time 0.3.36, Apache-2.0 OR MIT 
   <br/>https://github.com/time-rs/time
-
-- tokenizers 0.15.2, Apache-2.0 
-  <br/>https://github.com/huggingface/tokenizers
 
 - tokenizers 0.19.1, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers

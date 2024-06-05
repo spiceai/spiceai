@@ -10,6 +10,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::{
+        CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
+    },
+};
 use async_trait::async_trait;
 use snafu::Snafu;
 
@@ -27,18 +33,45 @@ pub enum Error {
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum EmbeddingInput {
-    String(String),
-    Tokens(Vec<u32>),
-    StringBatch(Vec<String>),
-    TokensBatch(Vec<Vec<u32>>),
-}
-
 #[async_trait]
 pub trait Embed: Sync + Send {
     async fn embed(&mut self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
     /// Returns the size of the embedding vector returned by the model.
     fn size(&self) -> i32;
+
+    /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
+    /// implementation will be constructed based on the trait's [`embed`] method.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn embed_request(
+        &mut self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let result = self.embed(req.input).await.map_err(|e| {
+            OpenAIError::ApiError(ApiError {
+                message: e.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })
+        })?;
+
+        Ok(CreateEmbeddingResponse {
+            object: "list".to_string(),
+            model: req.model.clone(),
+            data: result
+                .iter()
+                .enumerate()
+                .map(|(i, emb)| Embedding {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: emb.clone(),
+                })
+                .collect(),
+            usage: EmbeddingUsage {
+                prompt_tokens: 0,
+                total_tokens: 0,
+            },
+        })
+    }
 }

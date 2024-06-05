@@ -15,7 +15,7 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use super::{Error as NqlError, FailedToRunModelSnafu, Nql, Result};
+use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result};
 use async_trait::async_trait;
 use mistralrs::{
     Constraint, Device, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig,
@@ -47,12 +47,12 @@ impl MistralLlama {
         match extension {
             "ggml" => match tokenizer {
                 Some(tokenizer) => Self::from_ggml(tokenizer, model_weights, tokenizer_config),
-                None => Err(NqlError::FailedToLoadModel {
+                None => Err(ChatError::FailedToLoadModel {
                     source: "Tokenizer path is required for GGML model".into(),
                 }),
             },
             "gguf" => Self::from_gguf(tokenizer, model_weights, tokenizer_config),
-            _ => Err(NqlError::FailedToLoadModel {
+            _ => Err(ChatError::FailedToLoadModel {
                 source: format!("Unknown model type: {extension}").into(),
             }),
         }
@@ -65,7 +65,7 @@ impl MistralLlama {
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
             tokenizer.map(Into::into).unwrap_or_default(),
-            // Not needed for LLama2 / DuckDB NQL, but needed in `EricLBuehler/mistral.rs`.
+            // Not needed for LLama2 / DuckDB Chat, but needed in `EricLBuehler/mistral.rs`.
             tokenizer.map(Into::into).unwrap_or_default(),
             tokenizer_config.into(),
             vec![model_weights.into()],
@@ -101,7 +101,7 @@ impl MistralLlama {
             DeviceMapMetadata::dummy(),
             None,
         )
-        .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_ggml_pipeline(
@@ -127,7 +127,7 @@ impl MistralLlama {
             DeviceMapMetadata::dummy(),
             None,
         )
-        .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     pub fn from_gguf(
@@ -183,7 +183,7 @@ impl MistralLlama {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
         let loader_type = mistralrs::NormalLoaderType::from_str(arch).map_err(|_| {
-            NqlError::FailedToLoadModel {
+            ChatError::FailedToLoadModel {
                 source: format!("Unknown model type: {arch}").into(),
             }
         })?;
@@ -209,7 +209,7 @@ impl MistralLlama {
                 DeviceMapMetadata::dummy(),
                 None,
             )
-            .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })?;
+            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
         Self::from_pipeline(pipeline)
     }
@@ -219,7 +219,7 @@ impl MistralLlama {
         Ok(Self {
             pipeline: MistralRsBuilder::new(
                 p,
-                SchedulerMethod::Fixed(5.try_into().map_err(|_| NqlError::FailedToLoadModel {
+                SchedulerMethod::Fixed(5.try_into().map_err(|_| ChatError::FailedToLoadModel {
                     source: "Couldn't create schedule method".into(),
                 })?),
             )
@@ -249,7 +249,7 @@ impl MistralLlama {
 }
 
 #[async_trait]
-impl Nql for MistralLlama {
+impl Chat for MistralLlama {
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
         let r = self.to_request(prompt);
         self.pipeline
@@ -271,15 +271,15 @@ impl Nql for MistralLlama {
                     Ok(Some(cr.choices[0].text.clone()))
                 }
                 MistralRsponse::CompletionModelError(err_msg, _cr) => {
-                    Err(NqlError::FailedToRunModel {
+                    Err(ChatError::FailedToRunModel {
                         source: err_msg.into(),
                     })
                 }
-                _ => Err(NqlError::FailedToRunModel {
+                _ => Err(ChatError::FailedToRunModel {
                     source: "Unexpected error occurred".into(),
                 }),
             },
-            None => Err(NqlError::FailedToRunModel {
+            None => Err(ChatError::FailedToRunModel {
                 source: "Mistral pipeline unexpectedly closed".into(),
             }),
         }

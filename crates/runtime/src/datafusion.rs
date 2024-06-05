@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
@@ -24,8 +24,8 @@ use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
-use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
@@ -50,6 +50,7 @@ use tokio::time::{sleep, Instant};
 pub mod query;
 
 pub mod filter_converter;
+pub mod initial_load;
 pub mod refresh_sql;
 pub mod schema;
 
@@ -183,7 +184,10 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: RwLock<HashSet<TableReference>>,
-    pub cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+    cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+
+    /// Has the initial load of the data been completed? It is the responsibility of the caller to call `mark_initial_load_complete` when the initial load is complete.
+    initial_load_complete: Mutex<bool>,
 }
 
 impl DataFusion {
@@ -215,7 +219,7 @@ impl DataFusion {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
 
         let ctx = SessionContext::new_with_state(state);
-
+        ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
@@ -248,6 +252,7 @@ impl DataFusion {
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
+            initial_load_complete: Mutex::new(false),
         }
     }
 
@@ -693,7 +698,7 @@ impl DataFusion {
         Ok(())
     }
 
-    fn register_view(&self, table: TableReference, view: String) -> Result<()> {
+    pub(crate) fn register_view(&self, table: TableReference, view: String) -> Result<()> {
         let table_exists = self.ctx.table_exist(table.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();

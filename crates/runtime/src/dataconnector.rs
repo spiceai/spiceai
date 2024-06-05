@@ -64,8 +64,6 @@ pub mod flightsql;
 pub mod ftp;
 pub mod graphql;
 pub mod localhost;
-#[cfg(feature = "duckdb")]
-pub mod motherduck;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
@@ -164,8 +162,10 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Unable to handle request for {dataconnector}: {source}"))]
-    UnableToHandleRequest {
+    #[snafu(display(
+        "An internal error occurred in the {dataconnector} Data Connector: {source}"
+    ))]
+    InternalWithSource {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -253,8 +253,6 @@ pub async fn register_all() {
     register_connector_factory("postgres", postgres::Postgres::create).await;
     #[cfg(feature = "duckdb")]
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
-    #[cfg(feature = "duckdb")]
-    register_connector_factory("motherduck", motherduck::MotherDuck::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
     register_connector_factory("graphql", graphql::GraphQL::create).await;
