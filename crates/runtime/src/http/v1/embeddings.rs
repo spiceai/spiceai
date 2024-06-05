@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::OpenaiServerStore;
+use crate::EmbeddingModelStore;
 use async_openai::types::{CreateEmbeddingRequest, EmbeddingInput, EncodingFormat};
 use axum::{
     http::StatusCode,
@@ -29,7 +29,7 @@ use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
 pub(crate) async fn post(
-    Extension(openai_server_store): Extension<Arc<RwLock<OpenaiServerStore>>>,
+    Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     body: String,
 ) -> Response {
     let req: LocalCreateEmbeddingRequest = match serde_json::from_str(&body) {
@@ -40,11 +40,11 @@ pub(crate) async fn post(
     };
 
     let model_id = req.model.clone().to_string();
-    match openai_server_store.read().await.get(&model_id) {
+    match embeddings.read().await.get(&model_id) {
         Some(model_lock) => {
             let mut model = model_lock.write().await;
             match model
-                .embed(CreateEmbeddingRequest {
+                .embed_request(CreateEmbeddingRequest {
                     model: req.model,
                     input: to_openai_embedding_input(req.input),
                     encoding_format: req.encoding_format.map(to_openai_encoding_format),
