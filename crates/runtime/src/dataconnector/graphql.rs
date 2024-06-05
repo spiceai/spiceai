@@ -24,11 +24,10 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use itertools::Itertools;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 use crate::component::dataset::Dataset;
@@ -53,7 +52,7 @@ pub enum Error {
     #[snafu(display("Invalid object access. {message}"))]
     InvalidObjectAccess { message: String },
 
-    #[snafu(display("Schema Error. {message}"))]
+    #[snafu(display("Query Error. {message}"))]
     GraphQLError { message: String },
 }
 
@@ -94,7 +93,8 @@ impl GraphQLClient {
         &self,
         schema: Option<SchemaRef>,
     ) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
-        let body = format!(r#"{{"query": "{}"}}"#, self.query.lines().join(" "));
+        let body = format!(r#"{{"query": {}}}"#, json!(self.query).to_string());
+
         let mut request = self.client.post(self.endpoint.clone()).body(body);
 
         match &self.auth {
