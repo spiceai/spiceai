@@ -431,7 +431,11 @@ impl Refresher {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    async fn get_df(&self, ctx: SessionContext, column: &str) -> Result<DataFrame, DataFusionError> {
+    async fn get_df(
+        &self,
+        ctx: SessionContext,
+        column: &str,
+    ) -> Result<DataFrame, DataFusionError> {
         let expr = cast(
             col(column),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
