@@ -162,8 +162,10 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Unable to handle request for {dataconnector}: {source}"))]
-    UnableToHandleRequest {
+    #[snafu(display(
+        "An internal error occurred in the {dataconnector} Data Connector: {source}"
+    ))]
+    InternalWithSource {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
