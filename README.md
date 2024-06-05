@@ -85,7 +85,6 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
 | `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       |
-| `graphql`     | GraphQL                                                                                        | Alpha  | GraphQL                                                                                            |
 
 ### Supported Data Stores/Accelerators
 
