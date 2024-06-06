@@ -320,7 +320,10 @@ fn attach_query_context_to_stream(
                     yield batch_result
                 }
                 Err(e) => {
-                    ctx.finish_with_error(e.to_string(), ErrorCode::DataReadError).await;
+                    ctx
+                    .schema(schema_copy)
+                    .rows_produced(num_records)
+                    .finish_with_error(e.to_string(), ErrorCode::DataReadError).await;
                     yield batch_result;
                     return;
                 }
