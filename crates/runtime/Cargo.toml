@@ -104,6 +104,7 @@ tracing-subscriber.workspace = true
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
+spiceai-dataset-test = []
 duckdb = [
     "dep:duckdb",
     "r2d2",
