@@ -106,6 +106,7 @@ async-graphql-axum = "7.0.5"
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
+spiceai-dataset-test = []
 duckdb = [
     "dep:duckdb",
     "r2d2",
