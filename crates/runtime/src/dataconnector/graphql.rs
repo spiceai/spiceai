@@ -24,11 +24,10 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use itertools::Itertools;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 use crate::component::dataset::Dataset;
@@ -47,14 +46,35 @@ pub enum Error {
     #[snafu(display("{source}"))]
     ReqwestInternal { source: reqwest::Error },
 
+    #[snafu(display("HTTP {status}: {message}"))]
+    ReqwestError {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+
     #[snafu(display("{source}"))]
     ArrowInternal { source: ArrowError },
 
     #[snafu(display("Invalid object access. {message}"))]
     InvalidObjectAccess { message: String },
 
-    #[snafu(display("Schema Error. {message}"))]
-    GraphQLError { message: String },
+    #[snafu(display(
+        r#"GraphQL Query Error:
+Details:
+- Error: {message}
+- Location: Line {line}, Column {column}
+- Query:
+
+{query}
+
+Please verify the syntax of your GraphQL query."#
+    ))]
+    GraphQLError {
+        message: String,
+        line: usize,
+        column: usize,
+        query: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -89,12 +109,32 @@ struct GraphQLClient {
     auth: Option<Auth>,
 }
 
+fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
+    let query_lines: Vec<&str> = query.split('\n').collect();
+    let error_line = query_lines.get(line - 1).unwrap_or(&"");
+    let marker = " ".repeat(column - 1) + "^";
+    if line > 1 {
+        format!(
+            "{:>4} | {}\n{:>4} | {}\n{:>4} | {}",
+            line - 1,
+            query_lines[line - 2],
+            line,
+            error_line,
+            "",
+            marker
+        )
+    } else {
+        format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
+    }
+}
+
 impl GraphQLClient {
     async fn execute(
         &self,
         schema: Option<SchemaRef>,
     ) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
-        let body = format!(r#"{{"query": "{}"}}"#, self.query.lines().join(" "));
+        let body = format!(r#"{{"query": {}}}"#, json!(self.query));
+
         let mut request = self.client.post(self.endpoint.clone()).body(body);
 
         match &self.auth {
@@ -107,20 +147,43 @@ impl GraphQLClient {
             _ => {}
         }
 
-        let response = request
-            .send()
-            .await
-            .context(ReqwestInternalSnafu)?
-            .error_for_status()
-            .context(ReqwestInternalSnafu)?;
+        let response = request.send().await.context(ReqwestInternalSnafu)?;
+        let status = response.status();
 
         let mut response: serde_json::Value =
             response.json().await.context(ReqwestInternalSnafu)?;
 
-        let graphql_error_message = &response["errors"][0]["message"];
-        if !graphql_error_message.is_null() {
+        if status.is_client_error() | status.is_server_error() {
+            return Err(Error::ReqwestError {
+                status,
+                message: response["message"]
+                    .as_str()
+                    .unwrap_or("No message provided")
+                    .to_string(),
+            });
+        }
+
+        let graphql_error = &response["errors"][0];
+        if !graphql_error.is_null() {
+            let line = usize::try_from(graphql_error["locations"][0]["line"].as_u64().unwrap_or(0))
+                .unwrap_or_default();
+            let column = usize::try_from(
+                graphql_error["locations"][0]["column"]
+                    .as_u64()
+                    .unwrap_or(0),
+            )
+            .unwrap_or_default();
             return Err(Error::GraphQLError {
-                message: graphql_error_message.to_string(),
+                message: graphql_error["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(" at [")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                line,
+                column,
+                query: format_query_with_context(&self.query, line, column),
             });
         }
 
