@@ -29,3 +29,4 @@ jobs:
           echo '    key = "${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' >> ~/.spice/auth
 
       - run: make test-integration
+        if: ${{ secrets.SPICE_SECRET_SPICEAI_KEY != "" }}
