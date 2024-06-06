@@ -216,6 +216,10 @@ impl Query {
     }
 
     pub async fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
+        tracing::debug!(
+            "Query '{}' finished with error: {error_message}; code: {error_code}",
+            self.sql
+        );
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
         self.finish().await;
