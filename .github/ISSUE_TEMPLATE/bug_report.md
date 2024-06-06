@@ -43,9 +43,9 @@ E.g. `explain select 1`
 ```
 
 **spice, spiced, OS info**
-spice version:
-spiced version:
-OS info:
+- spice version:
+- spiced version:
+- OS info:
 
 **Have you tried this on the latest `trunk` branch?**
 
