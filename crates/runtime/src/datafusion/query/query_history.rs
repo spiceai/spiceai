@@ -175,8 +175,8 @@ impl Query {
             .boxed()
             .context(UnableToCreateRowSnafu)?;
 
-        let execution_status = match self.error_message {
-            Some(_) => -1,
+        let execution_status = match &self.error_code {
+            Some(code) => code.into(),
             None => 0,
         };
 

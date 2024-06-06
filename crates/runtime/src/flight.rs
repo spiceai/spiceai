@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::query::error_code::error_code_from_datafusion_error;
 use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -159,7 +160,8 @@ impl Service {
         let schema = match query.get_schema().await {
             Ok(schema) => schema,
             Err(err) => {
-                query.finish_with_error(err.to_string()).await;
+                let error_code = error_code_from_datafusion_error(&err);
+                query.finish_with_error(err.to_string(), error_code).await;
 
                 return Err(handle_datafusion_error(err));
             }
