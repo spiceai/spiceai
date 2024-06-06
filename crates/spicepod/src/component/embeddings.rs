@@ -104,4 +104,7 @@ pub struct ColumnEmbeddingConfig {
 
     #[serde(rename = "use", default)]
     pub model: String,
+
+    #[serde(rename = "column_pk", skip_serializing_if = "Option::is_none")]
+    pub primary_keys: Option<Vec<String>>,
 }
