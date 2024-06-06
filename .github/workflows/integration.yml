@@ -31,4 +31,4 @@ jobs:
       - run: make test-integration
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
-        if: ${{ env.SPICE_SECRET_SPICEAI_KEY != "" }}
+        if: ${{ env.SPICE_SECRET_SPICEAI_KEY != '' }}
