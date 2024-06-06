@@ -372,8 +372,10 @@ impl Refresher {
                 .context(super::FailedToFindLatestTimestampSnafu {
                     reason: "Failed to get latest timestamp due to time column not specified",
                 })?;
+
         let df = self
             .get_df(ctx, &column)
+            .await
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
             .collect()
@@ -429,13 +431,24 @@ impl Refresher {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn get_df(&self, ctx: SessionContext, column: &str) -> Result<DataFrame, DataFusionError> {
+    async fn get_df(
+        &self,
+        ctx: SessionContext,
+        column: &str,
+    ) -> Result<DataFrame, DataFusionError> {
         let expr = cast(
             col(column),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
         )
         .alias("a");
-        ctx.read_table(Arc::clone(&self.accelerator))?
+
+        let table_df = if let Some(sql) = &self.refresh.read().await.sql {
+            ctx.sql(sql.as_str()).await?
+        } else {
+            ctx.read_table(Arc::clone(&self.accelerator))?
+        };
+
+        table_df
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
