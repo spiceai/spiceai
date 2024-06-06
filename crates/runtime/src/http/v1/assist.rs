@@ -1,3 +1,4 @@
+use app::App;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -192,8 +193,8 @@ async fn vector_search(
                     .iter()
                     .map(|b| {
                         let z =
-                            b.column(0).as_any().downcast_ref::<StringArray>().ok_or(
-                                "Expected first column of SQL query to return a String type",
+                            b.column(b.num_columns() -1).as_any().downcast_ref::<StringArray>().ok_or(
+                                format!("Expected '{embedding_column}' to be last column of SQL query and return a String type"),
                             );
                         let zz = z.map(|s| {
                             s.iter()
@@ -202,7 +203,7 @@ async fn vector_search(
                         });
                         zz
                     })
-                    .collect::<Result<Vec<_>, &str>>()?;
+                    .collect::<Result<Vec<_>, String>>()?;
 
                 let outtt: Vec<String> = outt.iter().flat_map(std::clone::Clone::clone).collect();
 
@@ -219,28 +220,34 @@ async fn vector_search(
 fn create_assist_response(
     text: String,
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
-) -> AssistResponse {
-    let from_value: HashMap<String, Value> =
-        HashMap::from_iter(table_primary_keys.iter().map(|(tbl, pks)| {
+) -> Result<AssistResponse, Box<dyn std::error::Error>> {
+    let from_value_iter = table_primary_keys
+        .iter()
+        .map(|(tbl, pks)| {
             let buf = Vec::new();
             let mut writer = arrow_json::ArrayWriter::new(buf);
             for pk in pks {
-                let _ = writer.write_batches(&[pk]);
+                writer.write_batches(&[pk])?;
             }
-            let _ = writer.finish();
+            writer.finish()?;
+
             let res: Value = match String::from_utf8(writer.into_inner()) {
-                Ok(res) => serde_json::from_str(&res).unwrap(),
+                Ok(res) => serde_json::from_str(&res)?,
                 Err(e) => {
                     tracing::debug!("Error converting JSON buffer to string: {e}");
                     serde_json::Value::String(String::new())
                 }
             };
-            (tbl.to_string(), res)
-        }));
-    AssistResponse {
+            Ok((tbl.to_string(), res))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+    let from_value: HashMap<String, Value> =
+        HashMap::from_iter(from_value_iter.iter().map(|(k, v)| (k.clone(), v.clone())));
+    Ok(AssistResponse {
         text,
         from: from_value,
-    }
+    })
 }
 
 /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
@@ -282,6 +289,7 @@ fn create_assist_response(
 ///
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn post(
+    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
@@ -331,10 +339,24 @@ pub(crate) async fn post(
         .collect();
 
     // Retrieve primary keys
-    // TODO: Manually check spicepod.
     let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
+
+    // Explicit primary keys are defined in the spicepod configuration.
+    let explicit_primary_keys: HashMap<TableReference, Vec<String>> =
+        app.read().await.as_ref().map_or(HashMap::new(), |app| {
+            app.datasets
+                .iter()
+                .filter_map(|d| {
+                    d.embeddings
+                        .iter()
+                        .find_map(|e| e.primary_keys.clone())
+                        .map(|pks| (TableReference::parse_str(&d.name), pks))
+                })
+                .collect::<HashMap<TableReference, Vec<_>>>()
+        });
     for tbl in embeddings_to_run.keys() {
         if let Some(tbl_ref) = df.get_table(tbl.clone()).await {
+            // If we can derive the primary key(s) of the table from the [`TableProvider`] constraints, use that.
             if let Some(constraints) = tbl_ref.constraints() {
                 if let Some(pks) = constraints.iter().find_map(|c| match c {
                     Constraint::PrimaryKey(columns) => Some(columns),
@@ -356,6 +378,10 @@ pub(crate) async fn post(
                             .collect::<Vec<_>>(),
                     );
                 }
+
+            // Otherwise, if we have explicit primary keys defined in the spicepod configuration, use that.
+            } else if let Some(pks) = explicit_primary_keys.get(tbl) {
+                tbl_to_pks.insert(tbl.clone(), pks.clone());
             }
         }
     }
@@ -378,14 +404,12 @@ pub(crate) async fn post(
     // Run LLM with input.
     match llms.read().await.get(&payload.model) {
         Some(llm_model) => match llm_model.write().await.run(model_input).await {
-            Ok(Some(assist)) => (
-                StatusCode::OK,
-                Json(create_assist_response(
-                    assist,
-                    &relevant_data.retrieved_public_keys,
-                )),
-            )
-                .into_response(),
+            Ok(Some(assist)) => {
+                match create_assist_response(assist, &relevant_data.retrieved_public_keys) {
+                    Ok(assist_response) => (StatusCode::OK, Json(assist_response)).into_response(),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                }
+            }
             Ok(None) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("No response from LLM {}", payload.model),
