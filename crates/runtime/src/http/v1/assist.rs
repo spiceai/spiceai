@@ -30,8 +30,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::{
-    datafusion::DataFusion, embeddings::table::EmbeddingTable, model::LLMModelStore,
-    EmbeddingModelStore,
+    accelerated_table::AcceleratedTable, datafusion::DataFusion, embeddings::table::EmbeddingTable, model::LLMModelStore, EmbeddingModelStore
 };
 
 pub(crate) struct VectorSearchResponse {
@@ -111,8 +110,47 @@ fn combined_relevant_data_and_input(
 fn embedding_columns_in(tbl: &Arc<dyn TableProvider>) -> Vec<String> {
     match tbl.as_any().downcast_ref::<EmbeddingTable>() {
         Some(embedding_table) => embedding_table.get_embedding_models_used(),
-        None => vec![],
+        None => {
+            match tbl.as_any().downcast_ref::<AcceleratedTable>() {
+                Some(accelerated_table) => {
+                    embedding_columns_in(&accelerated_table.get_federated_table())
+                },
+                None => vec![]
+            }
+        },
     }
+}
+
+async fn find_relevant_embedding_column_from_manifest(
+    data_sources: Vec<TableReference>,
+    app_lock: Arc<RwLock<Option<App>>>,
+) -> Result<HashMap<TableReference, Vec<String>>, Box<dyn std::error::Error>> {
+    let app = app_lock.read().await;
+    let datasets = &app.as_ref().ok_or("App not found")?.datasets;
+    let found_tables: HashMap<TableReference, Vec<String>> = datasets.iter().filter_map(|d| {
+        let tbl = TableReference::parse_str(&d.name);
+        if !data_sources.contains(&tbl) {
+            return None;
+        }
+        Some((tbl, d.embeddings.iter().map(|c| c.column.clone()).collect_vec()))
+    }).collect();
+    Ok(found_tables)
+}
+
+/// This is an alternate implementation of `find_relevant_embedding_models` that uses a manifest to determine which embedding models to run.
+async fn find_relevant_embedding_models_from_manifest(
+    data_sources: Vec<TableReference>,
+    app_lock: Arc<RwLock<Option<App>>>,
+) -> Result<HashMap<TableReference, Vec<String>>, Box<dyn std::error::Error>> {
+    let app = app_lock.read().await;
+    let datasets = &app.as_ref().ok_or("App not found")?.datasets;
+    Ok(datasets.iter().filter_map(|d| {
+        let tbl = TableReference::parse_str(&d.name);
+        if !data_sources.contains(&tbl) {
+            return None;
+        }
+        Some((tbl, d.embeddings.iter().map(|c| c.model.clone()).collect_vec()))
+    }).collect::<HashMap<TableReference, Vec<String>>>())
 }
 
 /// For the data sources that assumedly exist in the [`DataFusion`] instance, find the embedding models used in each data source.
@@ -143,7 +181,20 @@ async fn find_relevant_embedding_models(
     Ok(embeddings_to_run)
 }
 
+/// Perform a basic vector search.
+///
+/// ## Arguments
+/// df: The [`DataFusion`] instance. Expected to have every [`TableReference`] in `embedded_inputs`.
+/// `embedded_inputs`: The embeddings to search for, for each embedding column the [`TableReference`]
+///     contains (in the correct order).
+/// `table_primary_keys`: Optional for each [`TableReference`], the primary keys of the table. If not
+///     provided, only the column underlying the embedding column will be returned.
+/// n: The number of results to return, per [`TableReference`].
+///
+/// ## Limitations
+/// - Only supports one embedding column per table.
 async fn vector_search(
+    app_lock: Arc<RwLock<Option<App>>>,
     df: Arc<DataFusion>,
     embedded_inputs: HashMap<TableReference, Vec<Vec<f32>>>,
     table_primary_keys: HashMap<TableReference, Vec<String>>,
@@ -154,24 +205,14 @@ async fn vector_search(
         retrieved_public_keys: HashMap::new(),
     };
 
+    let embedding_columns = find_relevant_embedding_column_from_manifest(embedded_inputs.keys().cloned().collect(), app_lock).await?;
+
     for (tbl, search_vectors) in embedded_inputs {
         tracing::debug!("Running vector search for table {tbl:#?}");
 
-        let provider = df
-            .get_table(tbl.clone())
-            .await
-            .ok_or(format!("Table {} not found", tbl.clone()))?;
-
-        let embedding_table = provider
-            .as_any()
-            .downcast_ref::<EmbeddingTable>()
-            .ok_or(format!("Table {tbl} is not an embedding table"))?;
-
         // Only support one embedding column per table.
-        let embedding_columns = embedding_table.get_embedding_columns();
-        let embedding_column = embedding_columns
-            .first()
-            .ok_or(format!("No embeddings found for table {tbl}"))?;
+        // let embedding_columns = embedding_table.get_embedding_columns();
+        let embedding_column = embedding_columns.get(&tbl).and_then(|x| x.first()).ok_or(format!("No embeddings found for table {tbl}"))?;
 
         if search_vectors.len() != 1 {
             return Err(format!("Only one embedding column per table currently supported. Table: {tbl} has {} embeddings", search_vectors.len()).into());
@@ -212,7 +253,10 @@ async fn vector_search(
             }
         };
     }
-
+    tracing::debug!(
+        "Relevant data from vector search: {:#?}",
+        response.retrieved_entries,
+    );
     Ok(response)
 }
 
@@ -248,6 +292,90 @@ fn create_assist_response(
         text,
         from: from_value,
     })
+}
+
+/// For each embedding column that a [`TableReference`] contains, calculate the embeddings vector between the query and the column.
+/// The returned `HashMap` is a mapping of [`TableReference`] to an (alphabetical by column name) in-order vector of embeddings.
+async fn calculate_embeddings_per_table(
+    query: String,
+    data_sources: Vec<TableReference>,
+    embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    app: Arc<RwLock<Option<App>>>,
+) -> Result<HashMap<TableReference, Vec<Vec<f32>>>, Box<dyn std::error::Error>> {
+    // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
+    let embeddings_to_run = find_relevant_embedding_models_from_manifest(data_sources, app).await?;
+    // let embeddings_to_run = find_relevant_embedding_models(data_sources, Arc::clone(&df)).await?;
+
+    // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
+    let embedded_inputs = create_input_embeddings(
+        &query.clone(),
+        embeddings_to_run.values().flatten().cloned().collect(),
+        embeddings,
+    )
+    .await?;
+
+    Ok(embeddings_to_run
+        .iter()
+        .map(|(t, model_names)| {
+            let z: Vec<_> = model_names
+                .iter()
+                .filter_map(|m| embedded_inputs.get(m).cloned())
+                .collect();
+            (t.clone(), z)
+        })
+        .collect())
+}
+
+/// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
+/// table from the [`TableProvider`] constraints, and if not provided, use the explicit primary
+/// keys defined in the spicepod configuration.
+async fn get_primary_keys(
+    app: Arc<RwLock<Option<App>>>,
+    df: Arc<DataFusion>,
+    tables: Vec<TableReference>,
+) -> Result<HashMap<TableReference, Vec<String>>, Box<dyn std::error::Error>> {
+    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
+
+    // Explicit primary keys are defined in the spicepod configuration.
+    let explicit_primary_keys: HashMap<TableReference, Vec<String>> =
+        app.read().await.as_ref().map_or(HashMap::new(), |app| {
+            app.datasets
+                .iter()
+                .filter_map(|d| {
+                    d.embeddings
+                        .iter()
+                        .find_map(|e| e.primary_keys.clone())
+                        .map(|pks| (TableReference::parse_str(&d.name), pks))
+                })
+                .collect::<HashMap<TableReference, Vec<_>>>()
+        });
+
+    for tbl in tables {
+        if let Some(tbl_ref) = df.get_table(tbl.clone()).await {
+            // If we can derive the primary key(s) of the table from the [`TableProvider`] constraints, use that.
+            if let Some(constraints) = tbl_ref.constraints() {
+                if let Some(pks) = constraints.iter().find_map(|c| match c {
+                    Constraint::PrimaryKey(columns) => Some(columns),
+                    Constraint::Unique(_) => None,
+                }) {
+                    let schema_projection = tbl_ref.schema().project(pks)?;
+                    tbl_to_pks.insert(
+                        tbl.clone(),
+                        schema_projection
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+
+            // Otherwise, if we have explicit primary keys defined in the spicepod configuration, use that.
+            } else if let Some(pks) = explicit_primary_keys.get(&tbl) {
+                tbl_to_pks.insert(tbl.clone(), pks.clone());
+            }
+        }
+    }
+    Ok(tbl_to_pks)
 }
 
 /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
@@ -300,102 +428,46 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
-    // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
-    let embeddings_to_run = match find_relevant_embedding_models(
+    let input_tables: Vec<TableReference> = payload
+        .data_source
+        .iter()
+        .map(TableReference::from)
+        .collect();
+
+    let per_table_embeddings = match calculate_embeddings_per_table(
+        payload.text.clone(),
+        input_tables.clone(),
+        Arc::clone(&embeddings),
+        Arc::clone(&app),
+    )
+    .await
+    {
+        Ok(per_table_embeddings) => per_table_embeddings,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // Retrieve primary keys
+    let tbl_to_pks = match get_primary_keys(
+        Arc::clone(&app),
+        Arc::clone(&df),
         payload
             .data_source
             .iter()
             .map(TableReference::from)
             .collect(),
-        Arc::clone(&df),
     )
     .await
     {
-        Ok(embeddings_to_run) => embeddings_to_run,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-
-    // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
-    let embedded_inputs = match create_input_embeddings(
-        &payload.text.clone(),
-        embeddings_to_run.values().flatten().cloned().collect(),
-        Arc::clone(&embeddings),
-    )
-    .await
-    {
-        Ok(embedded_inputs) => embedded_inputs,
+        Ok(tbl_to_pks) => tbl_to_pks,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let per_table_embeddings: HashMap<TableReference, _> = embeddings_to_run
-        .iter()
-        .map(|(t, model_names)| {
-            let z: Vec<_> = model_names
-                .iter()
-                .filter_map(|m| embedded_inputs.get(m).cloned())
-                .collect();
-            (t.clone(), z)
-        })
-        .collect();
-
-    // Retrieve primary keys
-    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
-
-    // Explicit primary keys are defined in the spicepod configuration.
-    let explicit_primary_keys: HashMap<TableReference, Vec<String>> =
-        app.read().await.as_ref().map_or(HashMap::new(), |app| {
-            app.datasets
-                .iter()
-                .filter_map(|d| {
-                    d.embeddings
-                        .iter()
-                        .find_map(|e| e.primary_keys.clone())
-                        .map(|pks| (TableReference::parse_str(&d.name), pks))
-                })
-                .collect::<HashMap<TableReference, Vec<_>>>()
-        });
-    for tbl in embeddings_to_run.keys() {
-        if let Some(tbl_ref) = df.get_table(tbl.clone()).await {
-            // If we can derive the primary key(s) of the table from the [`TableProvider`] constraints, use that.
-            if let Some(constraints) = tbl_ref.constraints() {
-                if let Some(pks) = constraints.iter().find_map(|c| match c {
-                    Constraint::PrimaryKey(columns) => Some(columns),
-                    Constraint::Unique(_) => None,
-                }) {
-                    let Ok(schema_projection) = tbl_ref.schema().project(pks) else {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Could not project primary keys for table {tbl}"),
-                        )
-                            .into_response();
-                    };
-                    tbl_to_pks.insert(
-                        tbl.clone(),
-                        schema_projection
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().clone())
-                            .collect::<Vec<_>>(),
-                    );
-                }
-
-            // Otherwise, if we have explicit primary keys defined in the spicepod configuration, use that.
-            } else if let Some(pks) = explicit_primary_keys.get(tbl) {
-                tbl_to_pks.insert(tbl.clone(), pks.clone());
-            }
-        }
-    }
-
     // Vector search to get relevant data from data sources.
     let relevant_data =
-        match vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await {
+        match vector_search(Arc::clone(&app), Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await {
             Ok(relevant_data) => relevant_data,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
-    tracing::debug!(
-        "Relevant data from vector search: {:#?}",
-        relevant_data.retrieved_entries
-    );
 
     // Using returned data, create input for LLM.
     let model_input =
