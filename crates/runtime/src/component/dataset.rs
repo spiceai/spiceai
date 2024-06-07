@@ -507,21 +507,6 @@ pub mod acceleration {
                 .join(";")
         }
 
-        #[must_use]
-        pub fn indexes_from_option_string(indexes_option_str: &str) -> HashMap<String, IndexType> {
-            indexes_option_str
-                .split(';')
-                .map(|index| {
-                    let parts: Vec<&str> = index.split(':').collect();
-                    if parts.len() == 2 {
-                        (parts[0].to_string(), IndexType::from(parts[1]))
-                    } else {
-                        (index.to_string(), IndexType::Enabled)
-                    }
-                })
-                .collect()
-        }
-
         pub fn index_columns(indexes_key: &str) -> Vec<&str> {
             // The key to an index can be either a single column or a compound index
             if indexes_key.starts_with('(') {
@@ -627,7 +612,18 @@ mod tests {
 
         let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
         assert!(indexes_str == "foo:enabled;bar:unique" || indexes_str == "bar:unique;foo:enabled");
-        let roundtrip_indexes_map = Acceleration::indexes_from_option_string(&indexes_str);
+        let roundtrip_indexes_map =
+            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+
+        let roundtrip_indexes_map = roundtrip_indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
+
+        let indexes_map = indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
 
         assert_eq!(indexes_map, roundtrip_indexes_map);
     }
@@ -644,7 +640,18 @@ mod tests {
             indexes_str == "(foo, bar):enabled;bar:unique"
                 || indexes_str == "bar:unique;(foo, bar):enabled"
         );
-        let roundtrip_indexes_map = Acceleration::indexes_from_option_string(&indexes_str);
+        let roundtrip_indexes_map =
+            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+
+        let roundtrip_indexes_map = roundtrip_indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
+
+        let indexes_map = indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
 
         assert_eq!(indexes_map, roundtrip_indexes_map);
     }

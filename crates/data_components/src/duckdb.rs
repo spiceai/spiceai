@@ -14,8 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
+use crate::{
+    delete::DeletionTableProviderAdapter,
+    util::indexes::{self, IndexType},
+    Read, ReadWrite,
+};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow_sql_gen::statement::IndexBuilder;
 use async_trait::async_trait;
 use datafusion::{
     datasource::{provider::TableProviderFactory, TableProvider},
@@ -35,7 +40,7 @@ use duckdb::{
 };
 use snafu::prelude::*;
 use sql_provider_datafusion::{expr::Engine, SqlTable};
-use std::{cmp, sync::Arc};
+use std::{cmp, collections::HashMap, sync::Arc};
 
 use self::write::DuckDBTableWriter;
 
@@ -64,6 +69,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create duckdb table: {source}"))]
     UnableToCreateDuckDBTable { source: duckdb::Error },
+
+    #[snafu(display("Unable to create index on duckdb table: {source}"))]
+    UnableToCreateIndexOnDuckDBTable { source: duckdb::Error },
 
     #[snafu(display("Unable to insert into duckdb table: {source}"))]
     UnableToInsertToDuckDBTable { source: duckdb::Error },
@@ -144,6 +152,17 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let mode = options.remove("mode").unwrap_or_default();
         let mode: Mode = mode.as_str().into();
 
+        let indexes_option_str = options.remove("indexes");
+        let indexes = match indexes_option_str {
+            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+            None => HashMap::new(),
+        };
+
+        let indexes: Vec<(Vec<&str>, IndexType)> = indexes
+            .iter()
+            .map(|(key, ty)| (indexes::index_columns(key), *ty))
+            .collect();
+
         let pool: Arc<DuckDbConnectionPool> = Arc::new(match &mode {
             Mode::File => {
                 // open duckdb at given path or create a new one
@@ -175,6 +194,12 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             .map_err(to_datafusion_error)?;
 
         duckdb.create_table(&tx).map_err(to_datafusion_error)?;
+
+        for index in indexes {
+            duckdb
+                .create_index(&tx, index.0, index.1 == IndexType::Unique)
+                .map_err(to_datafusion_error)?;
+        }
 
         tx.commit()
             .context(UnableToCommitDuckDBTransactionSnafu)
@@ -321,6 +346,25 @@ impl DuckDB {
         transaction
             .execute(&sql, arrow_params_ref)
             .context(UnableToCreateDuckDBTableSnafu)?;
+
+        Ok(())
+    }
+
+    fn create_index(
+        &self,
+        transaction: &Transaction<'_>,
+        columns: Vec<&str>,
+        unique: bool,
+    ) -> Result<()> {
+        let mut index_builder = IndexBuilder::new(&self.table_name, columns);
+        if unique {
+            index_builder = index_builder.unique();
+        }
+        let sql = index_builder.build_postgres();
+
+        transaction
+            .execute(&sql, [])
+            .context(UnableToCreateIndexOnDuckDBTableSnafu)?;
 
         Ok(())
     }
