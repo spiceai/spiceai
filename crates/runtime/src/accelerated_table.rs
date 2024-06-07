@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::component::dataset::acceleration::{IndexType, RefreshMode, ZeroResultsAction};
+use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use arrow::array::UInt64Array;
