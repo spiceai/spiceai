@@ -95,7 +95,6 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
-    indexes: HashMap<String, IndexType>,
 }
 
 fn validate_refresh_data_window(
@@ -126,7 +125,6 @@ pub struct Builder {
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    indexes: Vec<(String, IndexType)>,
 }
 
 impl Builder {
@@ -144,7 +142,6 @@ impl Builder {
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
             cache_provider: None,
-            indexes: vec![],
         }
     }
 
@@ -163,20 +160,6 @@ impl Builder {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
-        self
-    }
-
-    pub fn add_index(&mut self, name: String, index_type: IndexType) -> &mut Self {
-        self.indexes.push((name, index_type));
-        self
-    }
-
-    // This will work with both a Vec<(String, IndexType)> and a HashMap<String, IndexType>
-    pub fn indexes<I>(&mut self, indexes: I) -> &mut Self
-    where
-        I: IntoIterator<Item = (String, IndexType)>,
-    {
-        self.indexes.extend(indexes);
         self
     }
 
@@ -256,7 +239,6 @@ impl Builder {
                 zero_results_action: self.zero_results_action,
                 refresh_params,
                 refresher,
-                indexes: self.indexes.into_iter().collect(),
             },
             is_ready,
         )
