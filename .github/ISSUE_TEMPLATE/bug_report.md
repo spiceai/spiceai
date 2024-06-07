@@ -21,7 +21,7 @@ Steps to reproduce the behavior:
 A clear and concise description of what you expected to happen.
 
 **Spicepod**
-Add the relevant spicepod section about the problem here.
+Add the relevant `spicepod.yml` section.
 
 **Output of the `describe table`**
 Add any relevant `describe table` output here.
