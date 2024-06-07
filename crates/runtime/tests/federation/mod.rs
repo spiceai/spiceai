@@ -34,6 +34,7 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
 }
 
 #[tokio::test]
+#[cfg(feature = "spiceai-dataset-test")]
 #[allow(clippy::too_many_lines)]
 async fn single_source_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
