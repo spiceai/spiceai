@@ -100,6 +100,8 @@ bollard = "0.16.1"
 metrics-util = "0.16.3"
 anyhow = "1.0.86"
 tracing-subscriber.workspace = true
+async-graphql = "7.0.5"
+async-graphql-axum = "7.0.5"
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
