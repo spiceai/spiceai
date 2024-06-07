@@ -13,7 +13,7 @@ runs:
     - name: Ensure datasets loaded
       shell: bash
       run: |
-        response=$(curl http://localhost:3000/v1/datasets)
+        response=$(curl http://localhost:8080/v1/datasets)
         echo $response | jq
         length=$(echo $response | jq 'if type=="array" then length else empty end')
         if [[ $length -ne 1 ]]; then
@@ -27,7 +27,7 @@ runs:
         response=$(curl -X POST \
           -H "Content-Type: text/plain" \
           -d "show tables;" \
-          http://localhost:3000/v1/sql
+          http://localhost:8080/v1/sql
         )
         echo $response | jq
         table_exists=$(echo $response | jq '[.[] | select(.table_name == "${{ inputs.name }}")]' | jq 'length')

@@ -40,7 +40,7 @@ spec:
             [
               "/usr/local/bin/spiced",
               "--http",
-              "0.0.0.0:3000",
+              "0.0.0.0:8080",
               "--metrics",
               "0.0.0.0:9000",
               "--flight",
@@ -53,7 +53,7 @@ spec:
             {{- .Values.additionalEnv | toYaml | nindent 12 }}
             {{- end }}
           ports:
-            - containerPort: 3000
+            - containerPort: 8080
               name: http
             - containerPort: 9000
               name: metrics
@@ -64,15 +64,15 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 3000
+              port: 8080
           readinessProbe:
             httpGet:
               path: /health
-              port: 3000
+              port: 8080
           startupProbe:
             httpGet:
               path: /health
-              port: 3000
+              port: 8080
           volumeMounts:
             {{- if .Values.volumeMounts }}
             {{- .Values.volumeMounts | toYaml | nindent 12 }}
@@ -99,7 +99,7 @@ metadata:
     app: {{ .Release.Name }}
 spec:
   ports:
-    - port: 3000
+    - port: 8080
       name: http
     - port: 9000
       name: metrics

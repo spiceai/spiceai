@@ -73,7 +73,7 @@ docker:
 .PHONY: docker-run
 docker-run:
 	docker stop spiceai && docker rm spiceai || true
-	docker run --name spiceai -p 3000:3000 -p 50051:50051 spiceai-rust:local-dev
+	docker run --name spiceai -p 8080:8080 -p 50051:50051 spiceai-rust:local-dev
 
 .PHONY: deps-licenses
 dep-licenses:

@@ -40,7 +40,7 @@ type RuntimeContext struct {
 
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
-		httpEndpoint: "http://127.0.0.1:3000",
+		httpEndpoint: "http://127.0.0.1:8080",
 	}
 	err := rtcontext.Init()
 	if err != nil {
