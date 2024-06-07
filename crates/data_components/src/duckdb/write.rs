@@ -247,6 +247,14 @@ mod tests {
                 false,
             ),
             arrow::datatypes::Field::new("time_int", DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "time_with_zone",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Second,
+                    Some("Etc/UTC".to_string().into()),
+                ),
+                false,
+            ),
         ]));
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
         let external_table = CreateExternalTable {
@@ -280,9 +288,22 @@ mod tests {
         ]);
         let arr2 = TimestampSecondArray::from(vec![0, 1354360271, 1354360272]);
         let arr3 = Int64Array::from(vec![0, 1354360271, 1354360272]);
+        let arr4 = arrow::compute::cast(
+            &arr2,
+            &DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Second,
+                Some("Etc/UTC".to_string().into()),
+            ),
+        )
+        .expect("casting works");
         let data = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(arr1), Arc::new(arr2), Arc::new(arr3)],
+            vec![
+                Arc::new(arr1),
+                Arc::new(arr2),
+                Arc::new(arr3),
+                Arc::new(arr4),
+            ],
         )
         .expect("data should be created");
 
@@ -346,7 +367,7 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let insertion = table
-            .insert_into(&ctx.state(), exec, false)
+            .insert_into(&ctx.state(), Arc::<MockExec>::clone(&exec), false)
             .await
             .expect("insertion should be successful");
 
@@ -358,6 +379,40 @@ mod tests {
             .expect("table should be returned as deletion provider");
 
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
+            Some(1354360272000),
+            None,
+        )));
+        let plan = delete_table
+            .delete_from(&ctx.state(), &vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
+
+        let insertion = table
+            .insert_into(&ctx.state(), exec, false)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let delete_table = get_deletion_provider(Arc::clone(&table))
+            .expect("table should be returned as deletion provider");
+
+        let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
