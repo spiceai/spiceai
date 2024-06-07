@@ -324,6 +324,8 @@ fn attach_query_context_to_stream(
                     .schema(schema_copy)
                     .rows_produced(num_records)
                     .finish_with_error(e.to_string(), ErrorCode::DataReadError).await;
+                    // yielding error here terminates stream processing; `return` statement` below is used
+                    // to tell rust that we stop execution and it is safe to consume ctx here and it won't be used below
                     yield batch_result;
                     return;
                 }
