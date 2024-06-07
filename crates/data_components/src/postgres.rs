@@ -90,6 +90,11 @@ pub enum Error {
         source: tokio_postgres::error::Error,
     },
 
+    #[snafu(display("Unable to create an index for the Postgres table: {source}"))]
+    UnableToCreateIndexForPostgresTable {
+        source: tokio_postgres::error::Error,
+    },
+
     #[snafu(display("Unable to commit the Postgres transaction: {source}"))]
     UnableToCommitPostgresTransaction {
         source: tokio_postgres::error::Error,
@@ -405,7 +410,7 @@ impl Postgres {
         transaction
             .execute(&sql, &[])
             .await
-            .context(UnableToCreatePostgresTableSnafu)?;
+            .context(UnableToCreateIndexForPostgresTableSnafu)?;
 
         Ok(())
     }

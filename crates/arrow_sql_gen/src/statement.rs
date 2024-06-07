@@ -550,6 +550,7 @@ impl IndexBuilder {
         for column in self.columns {
             index.col(Alias::new(column).into_iden().into_index_column());
         }
+        index.if_not_exists();
         index.to_string(query_builder)
     }
 }
@@ -706,7 +707,7 @@ mod tests {
         let sql = IndexBuilder::new("users", vec!["id", "name"]).build_postgres();
         assert_eq!(
             sql,
-            r#"CREATE INDEX "i_users_id_name" ON "users" ("id", "name")"#
+            r#"CREATE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
         );
     }
 
@@ -717,7 +718,7 @@ mod tests {
             .build_postgres();
         assert_eq!(
             sql,
-            r#"CREATE UNIQUE INDEX "i_users_id_name" ON "users" ("id", "name")"#
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
         );
     }
 }
