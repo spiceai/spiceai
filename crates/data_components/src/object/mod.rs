@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    path::{PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 pub mod metadata;
 pub mod text;
@@ -118,28 +115,28 @@ pub(crate) fn parse_prefix_and_regex(
 mod tests {
 
     #[test]
-    fn parse_prefix_and_regex() {
+    fn parse_prefix_and_regex() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use super::*;
 
-        let url = Url::parse("file:///tmp/").unwrap();
-        let (prefix, regex) = parse_prefix_and_regex(&url, None).unwrap();
+        let url = Url::parse("file:///tmp/")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, None)?;
         assert_eq!(prefix, "tmp");
         assert_eq!(regex, None);
 
-        let url = Url::parse("file:///tmp/").unwrap();
-        let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string())).unwrap();
+        let url = Url::parse("file:///tmp/")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string()))?;
         assert_eq!(prefix, "tmp");
         assert_eq!(regex, Some(r"^.*\txt$".to_string()));
 
-        let url =
-            Url::parse("sftp://username:password@sftp.example.com:22/path/to/file.txt").unwrap();
-        let (prefix, regex) = parse_prefix_and_regex(&url, None).unwrap();
+        let url = Url::parse("sftp://username:password@sftp.example.com:22/path/to/file.txt")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, None)?;
         assert_eq!(prefix, "/path/to/");
         assert_eq!(regex, Some("file.txt".to_string()));
 
-        let url = Url::parse("ftp://username:password@ftp.example.com:21/path/to/file").unwrap();
-        let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string())).unwrap();
+        let url = Url::parse("ftp://username:password@ftp.example.com:21/path/to/file")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string()))?;
         assert_eq!(prefix, "/path/to/file");
         assert_eq!(regex, Some(r"^.*\txt$".to_string()));
+        Ok(())
     }
 }
