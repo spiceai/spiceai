@@ -45,18 +45,18 @@ impl From<&ErrorCode> for i8 {
     }
 }
 
-#[must_use]
-#[allow(clippy::module_name_repetitions)]
-pub fn error_code_from_datafusion_error(error: &DataFusionError) -> ErrorCode {
-    match error {
-        DataFusionError::SQL(..) => ErrorCode::SyntaxError,
-        DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
-            ErrorCode::QueryPlanningError
+impl From<&DataFusionError> for ErrorCode {
+    fn from(error: &DataFusionError) -> Self {
+        match error {
+            DataFusionError::SQL(..) => ErrorCode::SyntaxError,
+            DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
+                ErrorCode::QueryPlanningError
+            }
+            DataFusionError::ObjectStore(..) | DataFusionError::External(..) => {
+                ErrorCode::DataReadError
+            }
+            DataFusionError::Context(_, err) => ErrorCode::from(err.as_ref()),
+            _ => ErrorCode::UnexpectedError,
         }
-        DataFusionError::ObjectStore(..) | DataFusionError::External(..) => {
-            ErrorCode::DataReadError
-        }
-        DataFusionError::Context(_, err) => error_code_from_datafusion_error(err),
-        _ => ErrorCode::UnexpectedError,
     }
 }

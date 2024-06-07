@@ -27,7 +27,7 @@ use datafusion::{
     execution::{context::SQLOptions, SendableRecordBatchStream},
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
 };
-use error_code::{error_code_from_datafusion_error, ErrorCode};
+use error_code::ErrorCode;
 use snafu::Snafu;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -116,7 +116,7 @@ impl Query {
         let plan = match session.create_logical_plan(&ctx.sql).await {
             Ok(plan) => plan,
             Err(e) => {
-                let error_code = error_code_from_datafusion_error(&e);
+                let error_code = ErrorCode::from(&e);
                 handle_error!(ctx, error_code, e, UnableToExecuteQuery)
             }
         };
@@ -167,7 +167,7 @@ impl Query {
         let df = match ctx.df.ctx.execute_logical_plan(plan).await {
             Ok(df) => df,
             Err(e) => {
-                let error_code = error_code_from_datafusion_error(&e);
+                let error_code = ErrorCode::from(&e);
                 handle_error!(ctx, error_code, e, UnableToExecuteQuery)
             }
         };
@@ -177,7 +177,7 @@ impl Query {
         let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
             Ok(stream) => stream,
             Err(e) => {
-                let error_code = error_code_from_datafusion_error(&e);
+                let error_code = ErrorCode::from(&e);
                 handle_error!(ctx, error_code, e, UnableToExecuteQuery)
             }
         };
