@@ -31,6 +31,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::execution_plan::schema_cast::SchemaCastScanExec;
+
 use super::TableScanParams;
 
 /// `FallbackOnZeroResultsScanExec` takes an input `ExecutionPlan` and a fallback `TableProvider`.
@@ -145,8 +147,9 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         }
 
         // The input execution plan may not support all of the push down filters, so wrap it with a `FilterExec`.
-        let filtered_input =
-            super::filter_plan(Arc::clone(&self.input), &self.fallback_scan_params)?;
+
+        let schema_cast = SchemaCastScanExec::new(Arc::clone(&self.input), self.schema());
+        let filtered_input = super::filter_plan(Arc::new(schema_cast), &self.fallback_scan_params)?;
 
         let mut input_stream = filtered_input.execute(0, Arc::clone(&context))?;
         let schema = input_stream.schema();
