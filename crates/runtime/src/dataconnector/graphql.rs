@@ -24,8 +24,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use opentelemetry_proto::tonic::resource;
-use regex::{NoExpand, Regex};
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
@@ -137,19 +136,28 @@ impl GraphQLClient {
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
-    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>)> {
+    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>, usize)> {
+        let count_pattern = format!(r#"\(.*first:.*?(\d+).*\)"#,);
+        let regex_count = Regex::new(&count_pattern).unwrap();
+        let captures = regex_count.captures(&self.query);
+        let count = captures
+            .map(|c| c.get(1).map(|m| m.as_str().to_owned()))
+            .flatten()
+            .unwrap();
+        let mut count = count.parse::<usize>().unwrap();
+        let mut limit_reached = false;
+
+        if let Some(limit) = limit {
+            if limit < count {
+                count = limit;
+                limit_reached = true;
+            }
+        }
+
         let query = match (cursor, self.paginated_resource_name.as_ref()) {
             (Some(cursor), Some(resource)) => {
                 let pattern = format!(r#"{resource}\s*\(.*\)"#,);
                 let regex = Regex::new(&pattern).unwrap();
-                let count_pattern = format!(r#"{resource}\s*\(.*first:.*?(\d+).*\)"#,);
-
-                let regex_count = Regex::new(&count_pattern).unwrap();
-                let captures = regex_count.captures(&self.query);
-                let count = captures
-                    .map(|c| c.get(1).map(|m| m.as_str().to_owned()))
-                    .flatten()
-                    .unwrap();
 
                 let new_query = regex.replace(
                     &self.query,
@@ -215,8 +223,8 @@ impl GraphQLClient {
 
         let pointer = format!("/{}", self.json_path.replace(".", "/"));
 
-        let next_cursor = match &self.paginated_resource_name {
-            Some(resource) => {
+        let next_cursor = match (&self.paginated_resource_name, limit_reached) {
+            (Some(resource), false) => {
                 let page_info = {
                     // trim path to paginated resource
                     let pattern = format!(r"^(.*?{resource})");
@@ -245,7 +253,7 @@ impl GraphQLClient {
                     None
                 }
             }
-            None => None,
+            _ => None,
         };
 
         let response = response
@@ -281,7 +289,7 @@ impl GraphQLClient {
             res.extend(batch);
         }
 
-        Ok((res, schema, next_cursor))
+        Ok((res, schema, next_cursor, count))
     }
 }
 
@@ -326,7 +334,7 @@ impl GraphQL {
         // Check if the name of the query is in the json_path
         let paginated_resource_name = {
             let pagination_pattern =
-                r"(?xsm)(\w*)\(first:.*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}";
+                r"(?xsm)(\w*)\s*\(first:.*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}";
             let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
             match regex.captures(query.as_str()) {
                 Some(captures) => {
@@ -381,7 +389,7 @@ struct GraphQLTableProvider {
 
 impl GraphQLTableProvider {
     pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
-        let (_, schema, _) = client
+        let (_, schema, _, _) = client
             .execute(None, None, None)
             .await
             .map_err(Into::into)
@@ -414,18 +422,23 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (first_batch, _, mut next_cursor) = self
+        let (first_batch, _, mut next_cursor, mut count) = self
             .client
             .execute(Some(Arc::clone(&self.schema)), limit, None)
             .await
             .map_err(to_execution_error)?;
         let mut res = vec![first_batch];
         while let Some(next_cursor_val) = next_cursor {
-            let (next_batch, _, new_cursor) = self
+            let (next_batch, _, new_cursor, new_count) = self
                 .client
-                .execute(Some(Arc::clone(&self.schema)), limit, Some(next_cursor_val))
+                .execute(
+                    Some(Arc::clone(&self.schema)),
+                    limit.map(|l| l - count),
+                    Some(next_cursor_val),
+                )
                 .await
                 .map_err(to_execution_error)?;
+            count = new_count;
             next_cursor = new_cursor;
             res.push(next_batch);
         }
