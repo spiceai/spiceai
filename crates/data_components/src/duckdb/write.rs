@@ -249,7 +249,10 @@ mod tests {
             arrow::datatypes::Field::new("time_int", DataType::Int64, false),
             arrow::datatypes::Field::new(
                 "time_with_zone",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("Etc/UTC".to_string().into())),
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Second,
+                    Some("Etc/UTC".to_string().into()),
+                ),
                 false,
             ),
         ]));
@@ -285,10 +288,22 @@ mod tests {
         ]);
         let arr2 = TimestampSecondArray::from(vec![0, 1354360271, 1354360272]);
         let arr3 = Int64Array::from(vec![0, 1354360271, 1354360272]);
-        let arr4 = arrow::compute::cast(&arr2, &DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("Etc/UTC".to_string().into()))).expect("casting works");
+        let arr4 = arrow::compute::cast(
+            &arr2,
+            &DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Second,
+                Some("Etc/UTC".to_string().into()),
+            ),
+        )
+        .expect("casting works");
         let data = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(arr1), Arc::new(arr2), Arc::new(arr3), Arc::new(arr4)],
+            vec![
+                Arc::new(arr1),
+                Arc::new(arr2),
+                Arc::new(arr3),
+                Arc::new(arr4),
+            ],
         )
         .expect("data should be created");
 
