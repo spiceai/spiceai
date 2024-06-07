@@ -27,6 +27,7 @@ use datafusion::{
     execution::{context::SQLOptions, SendableRecordBatchStream},
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
 };
+use error_code::ErrorCode;
 use snafu::Snafu;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -36,6 +37,8 @@ pub mod builder;
 pub mod query_history;
 #[allow(clippy::module_name_repetitions)]
 pub use builder::QueryBuilder;
+
+pub mod error_code;
 
 use async_stream::stream;
 use futures::StreamExt;
@@ -60,7 +63,7 @@ pub enum Error {
     SchemaMismatch { source: arrow_tools::schema::Error },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Protocol {
     Http,
     Flight,
@@ -88,15 +91,18 @@ pub struct Query {
     results_cache_hit: Option<bool>,
     restricted_sql_options: Option<SQLOptions>,
     error_message: Option<String>,
+    error_code: Option<ErrorCode>,
     timer: Instant,
     datasets: Arc<HashSet<String>>,
     protocol: Protocol,
 }
 
 macro_rules! handle_error {
-    ($self:expr, $error:expr, $target_error:ident) => {{
+    ($self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-        $self.finish_with_error(snafu_error.to_string()).await;
+        $self
+            .finish_with_error(snafu_error.to_string(), $error_code)
+            .await;
         return Err(snafu_error);
     }};
 }
@@ -109,14 +115,17 @@ impl Query {
 
         let plan = match session.create_logical_plan(&ctx.sql).await {
             Ok(plan) => plan,
-            Err(e) => handle_error!(ctx, e, UnableToExecuteQuery),
+            Err(e) => {
+                let error_code = ErrorCode::from(&e);
+                handle_error!(ctx, error_code, e, UnableToExecuteQuery)
+            }
         };
 
         if let Some(cache_provider) = &ctx.df.cache_provider() {
             if let Some(cached_result) = match cache_provider.get(&plan).await {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => None,
-                Err(e) => handle_error!(ctx, e, FailedToAccessCache),
+                Err(e) => handle_error!(ctx, ErrorCode::InternalError, e, FailedToAccessCache),
             } {
                 ctx = ctx
                     .datasets(cached_result.input_tables)
@@ -128,7 +137,9 @@ impl Query {
                     None,
                 ) {
                     Ok(stream) => stream,
-                    Err(e) => handle_error!(ctx, e, UnableToCreateMemoryStream),
+                    Err(e) => {
+                        handle_error!(ctx, ErrorCode::InternalError, e, UnableToCreateMemoryStream)
+                    }
                 };
 
                 return Ok(QueryResult::new(
@@ -142,7 +153,7 @@ impl Query {
 
         if let Some(restricted_sql_options) = ctx.restricted_sql_options {
             if let Err(e) = restricted_sql_options.verify_plan(&plan) {
-                handle_error!(ctx, e, UnableToExecuteQuery)
+                handle_error!(ctx, ErrorCode::QueryPlanningError, e, UnableToExecuteQuery)
             }
         }
 
@@ -152,20 +163,26 @@ impl Query {
 
         let df = match ctx.df.ctx.execute_logical_plan(plan).await {
             Ok(df) => df,
-            Err(e) => handle_error!(ctx, e, UnableToExecuteQuery),
+            Err(e) => {
+                let error_code = ErrorCode::from(&e);
+                handle_error!(ctx, error_code, e, UnableToExecuteQuery)
+            }
         };
 
         let df_schema: Arc<Schema> = df.schema().clone().into();
 
         let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
             Ok(stream) => stream,
-            Err(e) => handle_error!(ctx, e, UnableToCollectResults),
+            Err(e) => {
+                let error_code = ErrorCode::from(&e);
+                handle_error!(ctx, error_code, e, UnableToExecuteQuery)
+            }
         };
 
         let res_schema = res_stream.schema();
 
         if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-            handle_error!(ctx, e, SchemaMismatch)
+            handle_error!(ctx, ErrorCode::InternalError, e, SchemaMismatch)
         };
 
         if cache_is_enabled_for_plan(&plan_copy) {
@@ -195,8 +212,13 @@ impl Query {
         Ok(df.schema().into())
     }
 
-    pub async fn finish_with_error(mut self, error_message: String) {
+    pub async fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
+        tracing::debug!(
+            "Query '{}' finished with error: {error_message}; code: {error_code}",
+            self.sql
+        );
         self.error_message = Some(error_message);
+        self.error_code = Some(error_code);
         self.finish().await;
     }
 
@@ -226,7 +248,7 @@ impl Query {
             tags.push("error");
         }
 
-        let labels = [
+        let mut labels = vec![
             ("tags", tags.join(",")),
             (
                 "datasets",
@@ -241,7 +263,8 @@ impl Query {
 
         metrics::histogram!("query_duration_seconds", &labels).record(duration.as_secs_f32());
 
-        if self.error_message.is_some() {
+        if let Some(err) = &self.error_code {
+            labels.push(("err_code", err.to_string()));
             metrics::counter!("query_failures", &labels).increment(1);
         }
 
@@ -269,12 +292,6 @@ impl Query {
     }
 
     #[must_use]
-    fn error(mut self, message: String) -> Self {
-        self.error_message = Some(message);
-        self
-    }
-
-    #[must_use]
     fn datasets(mut self, datasets: Arc<HashSet<String>>) -> Self {
         self.datasets = datasets;
         self
@@ -282,6 +299,13 @@ impl Query {
 }
 
 #[must_use]
+/// Attaches a query context to a stream of record batches.
+///
+/// Processes a stream of record batches, updating the query context
+/// with the number of records returned and saving query details at the end.
+///
+/// Note: If an error occurs during stream processing, the query context
+/// is finalized with error details, and further streaming is terminated.
 fn attach_query_context_to_stream(
     ctx: Query,
     mut stream: SendableRecordBatchStream,
@@ -290,7 +314,6 @@ fn attach_query_context_to_stream(
     let schema_copy = Arc::clone(&schema);
 
     let mut num_records = 0u64;
-    let mut ctx = ctx;
 
     let updated_stream = stream! {
         while let Some(batch_result) = stream.next().await {
@@ -298,12 +321,17 @@ fn attach_query_context_to_stream(
             match &batch_result {
                 Ok(batch) => {
                     num_records += batch.num_rows() as u64;
+                    yield batch_result
                 }
                 Err(e) => {
-                    ctx = ctx.error(e.to_string());
+                    ctx
+                    .schema(schema_copy)
+                    .rows_produced(num_records)
+                    .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError).await;
+                    yield batch_result;
+                    return;
                 }
             }
-            yield batch_result;
         }
 
         ctx
