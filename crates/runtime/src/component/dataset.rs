@@ -506,21 +506,6 @@ pub mod acceleration {
                 .collect::<Vec<String>>()
                 .join(";")
         }
-
-        pub fn index_columns(indexes_key: &str) -> Vec<&str> {
-            // The key to an index can be either a single column or a compound index
-            if indexes_key.starts_with('(') {
-                // Compound index
-                let end = indexes_key.find(')').unwrap_or(indexes_key.len());
-                indexes_key[1..end]
-                    .split(',')
-                    .map(|i| i.trim())
-                    .collect::<Vec<&str>>()
-            } else {
-                // Single column index
-                vec![indexes_key]
-            }
-        }
     }
 
     impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -654,17 +639,5 @@ mod tests {
             .collect::<HashMap<String, String>>();
 
         assert_eq!(indexes_map, roundtrip_indexes_map);
-    }
-
-    #[test]
-    fn test_get_index_columns() {
-        let index_columns = Acceleration::index_columns("foo");
-        assert_eq!(index_columns, vec!["foo"]);
-
-        let index_columns = Acceleration::index_columns("(foo, bar)");
-        assert_eq!(index_columns, vec!["foo", "bar"]);
-
-        let index_columns = Acceleration::index_columns("(foo,bar)");
-        assert_eq!(index_columns, vec!["foo", "bar"]);
     }
 }
