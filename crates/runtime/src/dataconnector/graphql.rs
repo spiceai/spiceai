@@ -24,6 +24,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
@@ -106,6 +107,7 @@ struct GraphQLClient {
     endpoint: Url,
     query: String,
     json_path: String,
+    paginated_resource_name: Option<String>,
     auth: Option<Auth>,
 }
 
@@ -132,7 +134,16 @@ impl GraphQLClient {
     async fn execute(
         &self,
         schema: Option<SchemaRef>,
-    ) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>)> {
+        // let query = match cursor {
+        //     Some(cursor) => {
+
+        //     },
+        //     None => &self.query,
+        // };
+
         let body = format!(r#"{{"query": {}}}"#, json!(self.query));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
@@ -150,8 +161,7 @@ impl GraphQLClient {
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let status = response.status();
 
-        let mut response: serde_json::Value =
-            response.json().await.context(ReqwestInternalSnafu)?;
+        let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
 
         if status.is_client_error() | status.is_server_error() {
             return Err(Error::ReqwestError {
@@ -187,9 +197,44 @@ impl GraphQLClient {
             });
         }
 
-        for key in self.json_path.split('.') {
-            response = response[key].take();
-        }
+        let pointer = format!("/{}", self.json_path.replace(".", "/"));
+
+        let next_cursor = match &self.paginated_resource_name {
+            Some(query) => {
+                let page_info = {
+                    let pattern = format!(r"^(.*?{query})");
+                    let regex = Regex::new(pattern.as_str()).unwrap();
+                    let captures = regex.captures(&pointer);
+                    let path = captures.map_or(None, |c| {
+                        c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo")
+                    });
+
+                    match path {
+                        Some(path) => response.pointer(path.as_str()).unwrap_or(&Value::Null),
+                        None => &Value::Null,
+                    }
+                };
+                let end_cursor = page_info
+                    .pointer("/endCursor")
+                    .map(|v| v.as_str().to_owned())
+                    .flatten()
+                    .map(|v| v.to_string());
+                let has_next_page = page_info
+                    .pointer("/hasNextPage")
+                    .map(|v| v.as_bool().unwrap_or(false));
+                if has_next_page.unwrap_or(false) {
+                    end_cursor
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        let response = response
+            .pointer(pointer.as_str())
+            .unwrap_or(&Value::Null)
+            .to_owned();
 
         let unwrapped = match response {
             Value::Array(val) => Ok(val.clone()),
@@ -219,7 +264,7 @@ impl GraphQLClient {
             res.extend(batch);
         }
 
-        Ok((vec![res], schema))
+        Ok((res, schema, next_cursor))
     }
 }
 
@@ -260,6 +305,27 @@ impl GraphQL {
             })?
             .to_owned();
 
+        // Check if first: and pageInfo are in the query and on the same level, capture the name of the query
+        // Check if the name of the query is in the json_path
+        let paginated_resource_name = {
+            let pagination_pattern = r"(?xsm)(\w*)\(first:.*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}
+            ";
+            let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
+            match regex.captures(query.as_str()) {
+                Some(captures) => {
+                    let query_name = captures.get(1).map(|m| m.as_str().to_owned());
+                    query_name.map_or(None, |name| {
+                        if json_path.contains(&name) {
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    })
+                }
+                None => None,
+            }
+        };
+
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
         headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -285,6 +351,7 @@ impl GraphQL {
             query,
             endpoint,
             json_path,
+            paginated_resource_name,
             auth,
         })
     }
@@ -297,11 +364,13 @@ struct GraphQLTableProvider {
 
 impl GraphQLTableProvider {
     pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
-        let (_, schema) = client.execute(None).await.map_err(Into::into).context(
-            super::InternalWithSourceSnafu {
+        let (_, schema, _) = client
+            .execute(None, None, None)
+            .await
+            .map_err(Into::into)
+            .context(super::InternalWithSourceSnafu {
                 dataconnector: "GraphQL",
-            },
-        )?;
+            })?;
 
         Ok(Self { client, schema })
     }
@@ -328,12 +397,23 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (res, schema) = self
+        let (first_batch, _, mut next_cursor) = self
             .client
-            .execute(Some(Arc::clone(&self.schema)))
+            .execute(Some(Arc::clone(&self.schema)), limit, None)
             .await
             .map_err(to_execution_error)?;
-        let table = MemTable::try_new(schema, res)?;
+        let mut res = vec![first_batch];
+        // while let Some(next_cursor_val) = next_cursor {
+        //     let (next_batch, _, new_cursor) = self
+        //         .client
+        //         .execute(Some(Arc::clone(&self.schema)), limit, Some(next_cursor_val))
+        //         .await
+        //         .map_err(to_execution_error)?;
+        //     next_cursor = new_cursor;
+        //     res.push(next_batch);
+        // }
+
+        let table = MemTable::try_new(Arc::clone(&self.schema), res)?;
 
         table.scan(state, projection, filters, limit).await
     }
