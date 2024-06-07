@@ -448,6 +448,24 @@ pub mod acceleration {
         }
     }
 
+    impl From<&str> for IndexType {
+        fn from(index_type: &str) -> Self {
+            match index_type.to_lowercase().as_str() {
+                "unique" => IndexType::Unique,
+                _ => IndexType::Enabled,
+            }
+        }
+    }
+
+    impl Display for IndexType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                IndexType::Enabled => write!(f, "enabled"),
+                IndexType::Unique => write!(f, "unique"),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub struct Acceleration {
         pub enabled: bool,
@@ -477,6 +495,47 @@ pub mod acceleration {
         pub on_zero_results: ZeroResultsAction,
 
         pub indexes: HashMap<String, IndexType>,
+    }
+
+    impl Acceleration {
+        #[must_use]
+        pub fn indexes_to_option_string(indexes: &HashMap<String, IndexType>) -> String {
+            indexes
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<String>>()
+                .join(";")
+        }
+
+        #[must_use]
+        pub fn indexes_from_option_string(indexes_option_str: &str) -> HashMap<String, IndexType> {
+            indexes_option_str
+                .split(';')
+                .map(|index| {
+                    let parts: Vec<&str> = index.split(':').collect();
+                    if parts.len() == 2 {
+                        (parts[0].to_string(), IndexType::from(parts[1]))
+                    } else {
+                        (index.to_string(), IndexType::Enabled)
+                    }
+                })
+                .collect()
+        }
+
+        pub fn index_columns(indexes_key: &str) -> Vec<&str> {
+            // The key to an index can be either a single column or a compound index
+            if indexes_key.starts_with('(') {
+                // Compound index
+                let end = indexes_key.find(')').unwrap_or(indexes_key.len());
+                indexes_key[1..end]
+                    .split(',')
+                    .map(|i| i.trim())
+                    .collect::<Vec<&str>>()
+            } else {
+                // Single column index
+                vec![indexes_key]
+            }
+        }
     }
 
     impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -550,5 +609,55 @@ pub mod replication {
                 enabled: replication.enabled,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::acceleration::{Acceleration, IndexType};
+
+    #[test]
+    fn test_indexes_roundtrip() {
+        let indexes_map = HashMap::from([
+            ("foo".to_string(), IndexType::Enabled),
+            ("bar".to_string(), IndexType::Unique),
+        ]);
+
+        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        assert!(indexes_str == "foo:enabled;bar:unique" || indexes_str == "bar:unique;foo:enabled");
+        let roundtrip_indexes_map = Acceleration::indexes_from_option_string(&indexes_str);
+
+        assert_eq!(indexes_map, roundtrip_indexes_map);
+    }
+
+    #[test]
+    fn test_compound_indexes_roundtrip() {
+        let indexes_map = HashMap::from([
+            ("(foo, bar)".to_string(), IndexType::Enabled),
+            ("bar".to_string(), IndexType::Unique),
+        ]);
+
+        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        assert!(
+            indexes_str == "(foo, bar):enabled;bar:unique"
+                || indexes_str == "bar:unique;(foo, bar):enabled"
+        );
+        let roundtrip_indexes_map = Acceleration::indexes_from_option_string(&indexes_str);
+
+        assert_eq!(indexes_map, roundtrip_indexes_map);
+    }
+
+    #[test]
+    fn test_get_index_columns() {
+        let index_columns = Acceleration::index_columns("foo");
+        assert_eq!(index_columns, vec!["foo"]);
+
+        let index_columns = Acceleration::index_columns("(foo, bar)");
+        assert_eq!(index_columns, vec!["foo", "bar"]);
+
+        let index_columns = Acceleration::index_columns("(foo,bar)");
+        assert_eq!(index_columns, vec!["foo", "bar"]);
     }
 }
