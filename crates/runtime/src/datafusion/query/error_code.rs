@@ -16,11 +16,12 @@ limitations under the License.
 
 use datafusion::error::DataFusionError;
 
+#[derive(Clone)]
 pub enum ErrorCode {
     SyntaxError,
     QueryPlanningError,
-    DataReadError,
-    UnexpectedError,
+    QueryExecutionError,
+    InternalError,
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -28,8 +29,8 @@ impl std::fmt::Display for ErrorCode {
         match self {
             ErrorCode::SyntaxError => write!(f, "SyntaxError"),
             ErrorCode::QueryPlanningError => write!(f, "QueryPlanningError"),
-            ErrorCode::DataReadError => write!(f, "DataReadError"),
-            ErrorCode::UnexpectedError => write!(f, "UnexpectedError"),
+            ErrorCode::QueryExecutionError => write!(f, "QueryExecutionError"),
+            ErrorCode::InternalError => write!(f, "InternalError"),
         }
     }
 }
@@ -39,8 +40,8 @@ impl From<&ErrorCode> for i8 {
         match code {
             ErrorCode::SyntaxError => -10,
             ErrorCode::QueryPlanningError => -20,
-            ErrorCode::DataReadError => -30,
-            ErrorCode::UnexpectedError => -120,
+            ErrorCode::QueryExecutionError => -30,
+            ErrorCode::InternalError => -120,
         }
     }
 }
@@ -52,11 +53,11 @@ impl From<&DataFusionError> for ErrorCode {
             DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
                 ErrorCode::QueryPlanningError
             }
-            DataFusionError::ObjectStore(..) | DataFusionError::External(..) => {
-                ErrorCode::DataReadError
-            }
+            DataFusionError::ObjectStore(..)
+            | DataFusionError::External(..)
+            | DataFusionError::Execution(..) => ErrorCode::QueryExecutionError,
             DataFusionError::Context(_, err) => ErrorCode::from(err.as_ref()),
-            _ => ErrorCode::UnexpectedError,
+            _ => ErrorCode::InternalError,
         }
     }
 }

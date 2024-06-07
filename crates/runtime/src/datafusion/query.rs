@@ -63,7 +63,7 @@ pub enum Error {
     SchemaMismatch { source: arrow_tools::schema::Error },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Protocol {
     Http,
     Flight,
@@ -125,7 +125,7 @@ impl Query {
             if let Some(cached_result) = match cache_provider.get(&plan).await {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => None,
-                Err(e) => handle_error!(ctx, ErrorCode::UnexpectedError, e, FailedToAccessCache),
+                Err(e) => handle_error!(ctx, ErrorCode::InternalError, e, FailedToAccessCache),
             } {
                 ctx = ctx
                     .datasets(cached_result.input_tables)
@@ -137,12 +137,9 @@ impl Query {
                     None,
                 ) {
                     Ok(stream) => stream,
-                    Err(e) => handle_error!(
-                        ctx,
-                        ErrorCode::UnexpectedError,
-                        e,
-                        UnableToCreateMemoryStream
-                    ),
+                    Err(e) => {
+                        handle_error!(ctx, ErrorCode::InternalError, e, UnableToCreateMemoryStream)
+                    }
                 };
 
                 return Ok(QueryResult::new(
@@ -185,7 +182,7 @@ impl Query {
         let res_schema = res_stream.schema();
 
         if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-            handle_error!(ctx, ErrorCode::UnexpectedError, e, SchemaMismatch)
+            handle_error!(ctx, ErrorCode::InternalError, e, SchemaMismatch)
         };
 
         if cache_is_enabled_for_plan(&plan_copy) {
@@ -302,6 +299,13 @@ impl Query {
 }
 
 #[must_use]
+/// Attaches a query context to a stream of record batches.
+///
+/// Processes a stream of record batches, updating the query context
+/// with the number of records returned and saving query details at the end.
+///
+/// Note: If an error occurs during stream processing, the query context
+/// is finalized with error details, and further streaming is terminated.
 fn attach_query_context_to_stream(
     ctx: Query,
     mut stream: SendableRecordBatchStream,
@@ -323,9 +327,7 @@ fn attach_query_context_to_stream(
                     ctx
                     .schema(schema_copy)
                     .rows_produced(num_records)
-                    .finish_with_error(e.to_string(), ErrorCode::DataReadError).await;
-                    // yielding error here terminates stream processing; `return` statement` below is used
-                    // to tell rust that we stop execution and it is safe to consume ctx here and it won't be used below
+                    .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError).await;
                     yield batch_result;
                     return;
                 }
