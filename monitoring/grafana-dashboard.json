@@ -528,9 +528,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (datasets, quantile) (query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\",datasets!~\"runtime.*\"}) > 0",
+          "expr": "sum by (protocol, quantile)(query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\"}>0)",
           "instant": false,
-          "legendFormat": "{{datasets}}(P{{quantile}})",
+          "legendFormat": "{{protocol}} (P{{quantile}})",
           "range": true,
           "refId": "A"
         }
@@ -554,8 +554,8 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 50,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -573,7 +573,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "none"
+              "mode": "normal"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -622,9 +622,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (datasets, protocol, tags)(increase(query_failures{pod=~\"${pods}\"}[$__rate_interval])) > 0",
+          "expr": "sum by (err_code) ((query_failures{pod=~\"${pods}\"} - (query_failures{pod=~\"${pods}\"} offset $__rate_interval))>0)",
           "instant": false,
-          "legendFormat": "",
+          "legendFormat": "{{err_code}}",
           "range": true,
           "refId": "A"
         }
@@ -708,6 +708,100 @@
       ],
       "title": "Time Since Last Refresh",
       "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (dataset) (increase(datasets_acceleration_refresh_errors{pod=~\"${pods}\"}[$__rate_interval])>0)\n",
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Refresh Failures",
+      "type": "timeseries"
     },
     {
       "collapsed": false,
