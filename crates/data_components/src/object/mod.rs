@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{PathBuf},
+    sync::Arc,
+};
 
 pub mod metadata;
 pub mod text;
@@ -68,18 +71,14 @@ impl ObjectStoreContext {
     }
 }
 
-pub(crate) fn get_prefix(
-    url: &Url,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn get_prefix(url: &Url) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     match url.scheme() {
-        "ftp" | "sftp" => {
-            Ok(PathBuf::from(url.path()))
-        }
+        "ftp" | "sftp" => Ok(PathBuf::from(url.path())),
         _ => {
-            let (_, obj_prefix) = object_store::parse_url(&url)?;
+            let (_, obj_prefix) = object_store::parse_url(url)?;
             let obj_prefix_path = PathBuf::from(&obj_prefix.to_string()); // Convert to std::path::PathBuf
             Ok(obj_prefix_path)
-        },
+        }
     }
 }
 
@@ -91,21 +90,29 @@ pub(crate) fn parse_prefix_and_regex(
 
     if let Some(_ext) = prefix.extension() {
         // Prefix is not collection, but a single file
-        let filename = prefix.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let filename = prefix
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         Ok((
             prefix
-                .to_string_lossy().to_string().strip_suffix(filename.as_str())
+                .to_string_lossy()
+                .to_string()
+                .strip_suffix(filename.as_str())
                 .unwrap_or_default()
                 .to_string(),
             Some(filename.to_string()),
         ))
     } else if let Some(ext) = extension {
-        Ok((prefix.to_string_lossy().to_string(), Some(format!(r"^.*\{ext}$"))))
+        Ok((
+            prefix.to_string_lossy().to_string(),
+            Some(format!(r"^.*\{ext}$")),
+        ))
     } else {
         Ok((prefix.to_string_lossy().to_string(), None))
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -124,7 +131,8 @@ mod tests {
         assert_eq!(prefix, "tmp");
         assert_eq!(regex, Some(r"^.*\txt$".to_string()));
 
-        let url = Url::parse("sftp://username:password@sftp.example.com:22/path/to/file.txt").unwrap();
+        let url =
+            Url::parse("sftp://username:password@sftp.example.com:22/path/to/file.txt").unwrap();
         let (prefix, regex) = parse_prefix_and_regex(&url, None).unwrap();
         assert_eq!(prefix, "/path/to/");
         assert_eq!(regex, Some("file.txt".to_string()));
@@ -133,7 +141,5 @@ mod tests {
         let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string())).unwrap();
         assert_eq!(prefix, "/path/to/file");
         assert_eq!(regex, Some(r"^.*\txt$".to_string()));
-
     }
-
 }
