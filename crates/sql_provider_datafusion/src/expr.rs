@@ -48,11 +48,11 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             let right = to_sql_with_engine(&binary_expr.right, engine)?;
 
             if let Some(Engine::DuckDB) = engine {
-                // TODO: DuckDB doesn't support comparison between timestamp_s /timestamp_ms with timestampz as of v0.10.2
+                // TODO: DuckDB doesn't support comparison between timestamp_s /timestamp_ms with timestampz as of v1
                 // Revisit in future DuckDB versions
                 if right.starts_with("TO_TIMESTAMP") && !left.starts_with("TO_TIMESTAMP") {
                     return Ok(format!(
-                        "TO_TIMESTAMP(EPOCH({})) {} {}",
+                        "TO_TIMESTAMP(EPOCH_MS({}) / 1000) {} {}",
                         left, binary_expr.op, right
                     ));
                 }

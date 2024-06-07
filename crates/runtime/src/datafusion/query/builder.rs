@@ -85,6 +85,7 @@ impl QueryBuilder {
             results_cache_hit: None,
             restricted_sql_options: self.restricted_sql_options,
             error_message: None,
+            error_code: None,
             datasets: Arc::new(HashSet::default()),
             timer: Instant::now(),
             protocol: self.protocol,
