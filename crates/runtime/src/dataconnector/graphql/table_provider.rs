@@ -30,6 +30,7 @@ use futures::TryFutureExt;
 
 use super::client::GraphQLClient;
 
+#[allow(clippy::module_name_repetitions)]
 pub struct GraphQLTableProvider {
     client: GraphQLClient,
     schema: SchemaRef,

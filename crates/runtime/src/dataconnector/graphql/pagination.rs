@@ -41,14 +41,13 @@ impl PaginationParameters {
 
                 match (resource_name, count) {
                     (Some(resource_name), Some(count)) => {
-                        let pattern = format!(r"^(.*?{})", resource_name);
+                        let pattern = format!(r"^(.*?{resource_name})");
                         let regex = unsafe { Regex::new(pattern.as_str()).unwrap_unchecked() };
 
                         let captures = regex.captures(&pointer);
 
-                        let page_info_path = captures.map_or(None, |c| {
-                            c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo")
-                        });
+                        let page_info_path = captures
+                            .and_then(|c| c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo"));
 
                         page_info_path.map(|page_info_path| Self {
                             resource_name,
@@ -82,7 +81,7 @@ impl PaginationParameters {
                     }
                 }
                 let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
-                let regex = Regex::new(&pattern).unwrap();
+                let regex = unsafe { Regex::new(&pattern).unwrap_unchecked() };
 
                 let new_query = regex.replace(
                     query,
@@ -109,7 +108,7 @@ impl PaginationParameters {
         let page_info = response
             .pointer(&self.page_info_path)
             .unwrap_or(&Value::Null);
-        let end_cursor = page_info["endCursor"].as_str().map(|x| x.to_string());
+        let end_cursor = page_info["endCursor"].as_str().map(ToString::to_string);
         let has_next_page = page_info["hasNextPage"].as_bool().unwrap_or(false);
 
         if has_next_page {

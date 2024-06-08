@@ -31,7 +31,7 @@ pub enum Error {
     ReqwestInternal { source: reqwest::Error },
 
     #[snafu(display("HTTP {status}: {message}"))]
-    ReqwestError {
+    InvalidReqwestStatus {
         status: reqwest::StatusCode,
         message: String,
     },
@@ -53,7 +53,7 @@ Details:
 
 Please verify the syntax of your GraphQL query."#
     ))]
-    GraphQLError {
+    InvalidGraphQLQuery {
         message: String,
         line: usize,
         column: usize,
@@ -68,6 +68,7 @@ pub enum Auth {
     Bearer(String),
 }
 
+#[allow(clippy::module_name_repetitions)]
 pub struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
@@ -131,8 +132,7 @@ impl GraphQLClient {
         let next_cursor = self
             .pagination_parameters
             .as_ref()
-            .map(|x| x.get_next_cursor_from_response(&response, limit_reached))
-            .unwrap_or(None);
+            .and_then(|x| x.get_next_cursor_from_response(&response, limit_reached));
 
         let unwrapped = match exctracted_data {
             Value::Array(val) => Ok(val.clone()),
@@ -178,7 +178,7 @@ impl GraphQLClient {
             let (next_batch, _, new_cursor) = self
                 .execute(
                     Some(Arc::clone(&schema)),
-                    limit.map(|l| l - self.pagination_parameters.as_ref().unwrap().count),
+                    limit.map(|l| l - self.pagination_parameters.as_ref().map_or(0, |x| x.count)),
                     Some(next_cursor_val),
                 )
                 .await?;
@@ -200,7 +200,7 @@ fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> Re
 
 fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
     if status.is_client_error() | status.is_server_error() {
-        return Err(Error::ReqwestError {
+        return Err(Error::InvalidReqwestStatus {
             status,
             message: response["message"]
                 .as_str()
@@ -222,7 +222,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                 .unwrap_or(0),
         )
         .unwrap_or_default();
-        return Err(Error::GraphQLError {
+        return Err(Error::InvalidGraphQLQuery {
             message: graphql_error["message"]
                 .as_str()
                 .unwrap_or_default()
