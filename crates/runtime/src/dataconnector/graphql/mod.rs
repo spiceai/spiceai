@@ -16,21 +16,16 @@ limitations under the License.
 
 mod client;
 mod pagination;
+mod table_provider;
 
-use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use futures::TryFutureExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
 use url::Url;
 
 use crate::component::dataset::Dataset;
-use datafusion::datasource::{MemTable, TableProvider, TableType};
+use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -39,6 +34,7 @@ use std::{collections::HashMap, future::Future};
 
 use self::client::{Auth, GraphQLClient};
 use self::pagination::PaginationParameters;
+use self::table_provider::GraphQLTableProvider;
 
 use super::{DataConnector, DataConnectorFactory};
 
@@ -121,52 +117,6 @@ impl GraphQL {
             pagination_parameters,
             auth,
         ))
-    }
-}
-
-struct GraphQLTableProvider {
-    client: GraphQLClient,
-    schema: SchemaRef,
-}
-
-impl GraphQLTableProvider {
-    pub async fn new(client: GraphQLClient) -> client::Result<Self> {
-        let (_, schema, _) = client.execute(None, None, None).await?;
-
-        Ok(Self { client, schema })
-    }
-}
-
-#[async_trait]
-impl TableProvider for GraphQLTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        state: &SessionState,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let res = self
-            .client
-            .execute_paginated(Arc::clone(&self.schema), limit)
-            .map_err(|e| DataFusionError::Execution(format!("{e}")))
-            .await?;
-
-        let table = MemTable::try_new(Arc::clone(&self.schema), res)?;
-
-        table.scan(state, projection, filters, limit).await
     }
 }
 
