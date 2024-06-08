@@ -14,75 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod client;
 mod pagination;
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
-use arrow::error::ArrowError;
-use arrow_json::reader::infer_json_schema_from_iterator;
-use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use regex::Regex;
+use futures::TryFutureExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
-use serde_json::{json, Value};
 use url::Url;
 
 use crate::component::dataset::Dataset;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use snafu::prelude::*;
 use std::any::Any;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
+use self::client::{Auth, GraphQLClient};
 use self::pagination::PaginationParameters;
 
 use super::{DataConnector, DataConnectorFactory};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("{source}"))]
-    ReqwestInternal { source: reqwest::Error },
-
-    #[snafu(display("HTTP {status}: {message}"))]
-    ReqwestError {
-        status: reqwest::StatusCode,
-        message: String,
-    },
-
-    #[snafu(display("{source}"))]
-    ArrowInternal { source: ArrowError },
-
-    #[snafu(display("Invalid object access. {message}"))]
-    InvalidObjectAccess { message: String },
-
-    #[snafu(display(
-        r#"GraphQL Query Error:
-Details:
-- Error: {message}
-- Location: Line {line}, Column {column}
-- Query:
-
-{query}
-
-Please verify the syntax of your GraphQL query."#
-    ))]
-    GraphQLError {
-        message: String,
-        line: usize,
-        column: usize,
-        query: String,
-    },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct GraphQL {
     secret: Option<Secret>,
@@ -99,208 +57,6 @@ impl DataConnectorFactory for GraphQL {
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
     }
-}
-
-enum Auth {
-    Basic(String, Option<String>),
-    Bearer(String),
-}
-
-struct GraphQLClient {
-    client: reqwest::Client,
-    endpoint: Url,
-    query: String,
-    json_path: String,
-    pagination_parameters: Option<PaginationParameters>,
-    auth: Option<Auth>,
-}
-
-fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
-    let query_lines: Vec<&str> = query.split('\n').collect();
-    let error_line = query_lines.get(line - 1).unwrap_or(&"");
-    let marker = " ".repeat(column - 1) + "^";
-    if line > 1 {
-        format!(
-            "{:>4} | {}\n{:>4} | {}\n{:>4} | {}",
-            line - 1,
-            query_lines[line - 2],
-            line,
-            error_line,
-            "",
-            marker
-        )
-    } else {
-        format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
-    }
-}
-
-impl GraphQLClient {
-    async fn execute(
-        &self,
-        schema: Option<SchemaRef>,
-        limit: Option<usize>,
-        cursor: Option<String>,
-    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>)> {
-        let mut limit_reached = false;
-
-        let query = match (cursor, self.pagination_parameters.as_ref()) {
-            (Some(cursor), Some(params)) => {
-                let mut count = self
-                    .pagination_parameters
-                    .as_ref()
-                    .map(|p| p.count)
-                    .unwrap_or_default();
-
-                if let Some(limit) = limit {
-                    if limit < count {
-                        count = limit;
-                        limit_reached = true;
-                    }
-                }
-                let pattern = format!(r#"{}\s*\(.*\)"#, params.resource_name);
-                let regex = Regex::new(&pattern).unwrap();
-
-                let new_query = regex.replace(
-                    &self.query,
-                    format!(
-                        r#"{} (first: {count}, after: "{cursor}")"#,
-                        params.resource_name
-                    )
-                    .as_str(),
-                );
-                new_query.to_string()
-            }
-            _ => self.query.clone(),
-        };
-
-        let body = format!(r#"{{"query": {}}}"#, json!(query));
-
-        let mut request = self.client.post(self.endpoint.clone()).body(body);
-
-        match &self.auth {
-            Some(Auth::Basic(user, pass)) => {
-                request = request.basic_auth(user, pass.clone());
-            }
-            Some(Auth::Bearer(token)) => {
-                request = request.bearer_auth(token);
-            }
-            _ => {}
-        }
-
-        let response = request.send().await.context(ReqwestInternalSnafu)?;
-        let status = response.status();
-
-        let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
-
-        if status.is_client_error() | status.is_server_error() {
-            return Err(Error::ReqwestError {
-                status,
-                message: response["message"]
-                    .as_str()
-                    .unwrap_or("No message provided")
-                    .to_string(),
-            });
-        }
-
-        let graphql_error = &response["errors"][0];
-        if !graphql_error.is_null() {
-            let line = usize::try_from(graphql_error["locations"][0]["line"].as_u64().unwrap_or(0))
-                .unwrap_or_default();
-            let column = usize::try_from(
-                graphql_error["locations"][0]["column"]
-                    .as_u64()
-                    .unwrap_or(0),
-            )
-            .unwrap_or_default();
-            return Err(Error::GraphQLError {
-                message: graphql_error["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .split(" at [")
-                    .next()
-                    .unwrap_or_default()
-                    .to_string(),
-                line,
-                column,
-                query: format_query_with_context(&self.query, line, column),
-            });
-        }
-
-        let pointer = format!("/{}", self.json_path.replace(".", "/"));
-
-        let next_cursor = match (&self.pagination_parameters, limit_reached) {
-            (Some(params), false) => {
-                let page_info = {
-                    // trim path to paginated resource
-                    let pattern = format!(r"^(.*?{})", params.resource_name);
-                    let regex = Regex::new(pattern.as_str()).unwrap();
-                    let captures = regex.captures(&pointer);
-                    let path = captures.map_or(None, |c| {
-                        c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo")
-                    });
-
-                    match path {
-                        Some(path) => response.pointer(path.as_str()).unwrap_or(&Value::Null),
-                        None => &Value::Null,
-                    }
-                };
-                let end_cursor = page_info
-                    .pointer("/endCursor")
-                    .map(|v| v.as_str().to_owned())
-                    .flatten()
-                    .map(|v| v.to_string());
-                let has_next_page = page_info
-                    .pointer("/hasNextPage")
-                    .map(|v| v.as_bool().unwrap_or(false));
-                if has_next_page.unwrap_or(false) {
-                    end_cursor
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        let response = response
-            .pointer(pointer.as_str())
-            .unwrap_or(&Value::Null)
-            .to_owned();
-
-        let unwrapped = match response {
-            Value::Array(val) => Ok(val.clone()),
-            obj @ Value::Object(_) => Ok(vec![obj]),
-            Value::Null => Err(Error::InvalidObjectAccess {
-                message: "Null value access.".to_string(),
-            }),
-            _ => Err(Error::InvalidObjectAccess {
-                message: "Primitive value access.".to_string(),
-            }),
-        }?;
-
-        let schema = schema.unwrap_or(Arc::new(
-            infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
-                .context(ArrowInternalSnafu)?,
-        ));
-
-        let mut res = vec![];
-        for v in unwrapped {
-            let buf = v.to_string();
-            let batch = ReaderBuilder::new(Arc::clone(&schema))
-                .with_batch_size(1024)
-                .build(Cursor::new(buf.as_bytes()))
-                .context(ArrowInternalSnafu)?
-                .collect::<Result<Vec<_>, _>>()
-                .context(ArrowInternalSnafu)?;
-            res.extend(batch);
-        }
-
-        Ok((res, schema, next_cursor))
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn to_execution_error(e: Error) -> DataFusionError {
-    DataFusionError::Execution(format!("{e}"))
 }
 
 impl GraphQL {
@@ -351,20 +107,20 @@ impl GraphQL {
 
         client_builder = client_builder.default_headers(headers);
 
-        Ok(GraphQLClient {
-            client: client_builder.build().map_err(|e| {
+        Ok(GraphQLClient::new(
+            client_builder.build().map_err(|e| {
                 super::DataConnectorError::InvalidConfiguration {
                     dataconnector: "GraphQL".to_string(),
                     message: "Failed to set token".to_string(),
                     source: e.into(),
                 }
             })?,
-            query,
             endpoint,
+            query,
             json_path,
             pagination_parameters,
             auth,
-        })
+        ))
     }
 }
 
@@ -374,14 +130,8 @@ struct GraphQLTableProvider {
 }
 
 impl GraphQLTableProvider {
-    pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
-        let (_, schema, _) = client
-            .execute(None, None, None)
-            .await
-            .map_err(Into::into)
-            .context(super::InternalWithSourceSnafu {
-                dataconnector: "GraphQL",
-            })?;
+    pub async fn new(client: GraphQLClient) -> client::Result<Self> {
+        let (_, schema, _) = client.execute(None, None, None).await?;
 
         Ok(Self { client, schema })
     }
@@ -408,26 +158,11 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (first_batch, _, mut next_cursor) = self
+        let res = self
             .client
-            .execute(Some(Arc::clone(&self.schema)), limit, None)
-            .await
-            .map_err(to_execution_error)?;
-        let mut res = vec![first_batch];
-
-        while let Some(next_cursor_val) = next_cursor {
-            let (next_batch, _, new_cursor) = self
-                .client
-                .execute(
-                    Some(Arc::clone(&self.schema)),
-                    limit.map(|l| l - self.client.pagination_parameters.as_ref().unwrap().count),
-                    Some(next_cursor_val),
-                )
-                .await
-                .map_err(to_execution_error)?;
-            next_cursor = new_cursor;
-            res.push(next_batch);
-        }
+            .execute_paginated(Arc::clone(&self.schema), limit)
+            .map_err(|e| DataFusionError::Execution(format!("{e}")))
+            .await?;
 
         let table = MemTable::try_new(Arc::clone(&self.schema), res)?;
 
@@ -447,6 +182,13 @@ impl DataConnector for GraphQL {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.get_client(dataset)?;
 
-        Ok(Arc::new(GraphQLTableProvider::new(client).await?))
+        Ok(Arc::new(
+            GraphQLTableProvider::new(client)
+                .await
+                .map_err(Into::into)
+                .context(super::InternalWithSourceSnafu {
+                    dataconnector: "GraphQL".to_string(),
+                })?,
+        ))
     }
 }
