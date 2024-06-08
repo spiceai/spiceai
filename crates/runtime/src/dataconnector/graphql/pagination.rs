@@ -120,6 +120,7 @@ impl PaginationParameters {
 
 #[cfg(test)]
 mod tests {
+
     use super::PaginationParameters;
 
     #[test]
@@ -232,5 +233,61 @@ mod tests {
         }"#;
         assert_eq!(limit_reached, true);
         assert_eq!(new_query, expected_query);
+    }
+
+    #[test]
+    fn test_pagination_get_next_cursor_from_response() {
+        let query = r"query {
+            users(first: 10) {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }";
+        let pointer = r"/data/users";
+        let pagination_parameters =
+            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
+
+        let response = serde_json::from_str(
+            r#"{
+            "data": {
+                "users": {
+                    "pageInfo": {
+                        "hasNextPage": true,
+                        "endCursor": "new_cursor"
+                    }
+                }
+            }
+        }"#,
+        )
+        .expect("Invalid json");
+
+        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response, false);
+        assert_eq!(
+            next_cursor,
+            Some("new_cursor".to_string()),
+            "Expected next cursor to be new_cursor"
+        );
+
+        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response, true);
+        assert_eq!(
+            next_cursor, None,
+            "Next cursor should be None if we reached the limit"
+        );
+
+        let response = serde_json::from_str(
+            r#"{
+            "data": {
+                "users": {
+
+                }
+            }
+        }"#,
+        )
+        .expect("Invalid json");
+        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response, false);
+        assert_eq!(next_cursor, None, "Should be None if no value returned");
     }
 }
