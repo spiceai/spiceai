@@ -26,7 +26,7 @@ pub struct PaginationParameters {
 }
 
 impl PaginationParameters {
-    pub fn parse(query: &str, json_path: &str) -> Option<Self> {
+    pub fn parse(query: &str, pointer: &str) -> Option<Self> {
         let pagination_pattern = r"(?xsm)(\w*)\s*\([^)]*first:\s*(\d+).*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}";
         let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
         match regex.captures(query) {
@@ -37,7 +37,6 @@ impl PaginationParameters {
                     .map(|m| m.as_str().parse::<usize>())
                     .transpose()
                     .unwrap_or(None);
-                let pointer = format!("/{}", json_path.replace('.', "/"));
 
                 match (resource_name, count) {
                     (Some(resource_name), Some(count)) => {

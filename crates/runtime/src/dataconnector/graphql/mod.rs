@@ -86,8 +86,9 @@ impl GraphQL {
                 message: "`json_path` not found in params",
             })?
             .to_owned();
+        let pointer = format!("/{}", json_path.replace('.', "/"));
 
-        let pagination_parameters = PaginationParameters::parse(&query, &json_path);
+        let pagination_parameters = PaginationParameters::parse(&query, &pointer);
 
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
@@ -113,7 +114,7 @@ impl GraphQL {
             })?,
             endpoint,
             query,
-            json_path,
+            pointer,
             pagination_parameters,
             auth,
         ))

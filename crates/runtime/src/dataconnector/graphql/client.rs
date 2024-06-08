@@ -73,7 +73,7 @@ pub struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
     query: String,
-    json_path: String,
+    pointer: String,
     pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
 }
@@ -83,7 +83,7 @@ impl GraphQLClient {
         client: reqwest::Client,
         endpoint: Url,
         query: String,
-        json_path: String,
+        pointer: String,
         pagination_parameters: Option<PaginationParameters>,
         auth: Option<Auth>,
     ) -> Self {
@@ -91,7 +91,7 @@ impl GraphQLClient {
             client,
             endpoint,
             query,
-            json_path,
+            pointer,
             pagination_parameters,
             auth,
         }
@@ -123,10 +123,8 @@ impl GraphQLClient {
         handle_http_error(status, &response)?;
         handle_graphql_query_error(&response, &query)?;
 
-        let pointer = format!("/{}", self.json_path.replace('.', "/"));
-
         let exctracted_data = response
-            .pointer(pointer.as_str())
+            .pointer(self.pointer.as_str())
             .unwrap_or(&Value::Null)
             .to_owned();
         let next_cursor = self
