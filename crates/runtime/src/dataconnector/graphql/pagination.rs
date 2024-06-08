@@ -132,8 +132,8 @@ mod tests {
         }
         }
     }";
-        let json_path = r"data.users";
-        let pagination_parameters = PaginationParameters::parse(query, json_path);
+        let pointer = r"/data/users";
+        let pagination_parameters = PaginationParameters::parse(query, &pointer);
         assert_eq!(
             pagination_parameters,
             Some(PaginationParameters {
@@ -142,5 +142,14 @@ mod tests {
                 page_info_path: "/data/users/pageInfo".to_owned(),
             })
         );
+
+        let query = r"query {
+            users(first: 10) {
+                name
+              }
+          }";
+        let pointer = r"/data/users";
+        let pagination_parameters = PaginationParameters::parse(query, &pointer);
+        assert_eq!(pagination_parameters, None);
     }
 }
