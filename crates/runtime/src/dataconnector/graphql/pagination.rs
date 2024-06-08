@@ -16,6 +16,7 @@ limitations under the License.
 
 use regex::Regex;
 
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     pub resource_name: String,
@@ -31,7 +32,9 @@ impl PaginationParameters {
                 let resource_name = captures.get(1).map(|m| m.as_str().to_owned());
                 let count = captures
                     .get(2)
-                    .map(|m| m.as_str().parse::<usize>().unwrap());
+                    .map(|m| m.as_str().parse::<usize>())
+                    .transpose()
+                    .unwrap_or(None);
 
                 match (resource_name, count) {
                     (Some(resource_name), Some(count)) => {
@@ -57,15 +60,15 @@ mod tests {
 
     #[test]
     fn basic_test_pagination_parse() {
-        let query = r#"query {
+        let query = r"query {
       users(first: 10) {
         pageInfo {
           hasNextPage
           endCursor
         }
         }
-    }"#;
-        let json_path = r#"data.users"#;
+    }";
+        let json_path = r"data.users";
         let pagination_parameters = PaginationParameters::parse(query, json_path);
         assert_eq!(
             pagination_parameters,
