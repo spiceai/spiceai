@@ -162,8 +162,8 @@ impl QueryRoot {
     async fn paginated_users(&self, first: usize, after: Option<String>) -> UsersPaginated {
         let users_service = UserService::new();
         let users = users_service.paginated_users(first, after);
-        let last_id = users_service.users().last().expect("No user").id.clone();
-        let last_fetched = users.last().expect("No users").id.clone();
+        let last_id = unsafe { users_service.users().last().unwrap_unchecked().id.clone() };
+        let last_fetched = unsafe { users.last().unwrap_unchecked().id.clone() };
 
         let page_info = PageInfo {
             has_next_page: last_fetched < last_id,

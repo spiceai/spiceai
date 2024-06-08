@@ -153,7 +153,7 @@ mod tests {
         let pagination_parameters = PaginationParameters::parse(query, pointer);
         assert_eq!(pagination_parameters, None);
 
-        let query = r#"query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }"#;
+        let query = r"query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }";
         let pointer = r"/data/paginatedUsers/users";
         let pagination_parameters = PaginationParameters::parse(query, pointer);
         assert_eq!(
