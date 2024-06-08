@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod pagination;
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -39,6 +41,8 @@ use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
+
+use self::pagination::PaginationParameters;
 
 use super::{DataConnector, DataConnectorFactory};
 
@@ -107,7 +111,7 @@ struct GraphQLClient {
     endpoint: Url,
     query: String,
     json_path: String,
-    paginated_resource_name: Option<String>,
+    pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
 }
 
@@ -137,14 +141,11 @@ impl GraphQLClient {
         limit: Option<usize>,
         cursor: Option<String>,
     ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>, usize)> {
-        let count_pattern = format!(r#"\(.*first:.*?(\d+).*\)"#,);
-        let regex_count = Regex::new(&count_pattern).unwrap();
-        let captures = regex_count.captures(&self.query);
-        let count = captures
-            .map(|c| c.get(1).map(|m| m.as_str().to_owned()))
-            .flatten()
-            .unwrap();
-        let mut count = count.parse::<usize>().unwrap();
+        let mut count = self
+            .pagination_parameters
+            .as_ref()
+            .map(|p| p.count)
+            .unwrap_or_default();
         let mut limit_reached = false;
 
         if let Some(limit) = limit {
@@ -154,14 +155,18 @@ impl GraphQLClient {
             }
         }
 
-        let query = match (cursor, self.paginated_resource_name.as_ref()) {
-            (Some(cursor), Some(resource)) => {
-                let pattern = format!(r#"{resource}\s*\(.*\)"#,);
+        let query = match (cursor, self.pagination_parameters.as_ref()) {
+            (Some(cursor), Some(params)) => {
+                let pattern = format!(r#"{}\s*\(.*\)"#, params.resource_name);
                 let regex = Regex::new(&pattern).unwrap();
 
                 let new_query = regex.replace(
                     &self.query,
-                    format!(r#"{resource} (first: {count}, after: "{cursor}")"#).as_str(),
+                    format!(
+                        r#"{} (first: {count}, after: "{cursor}")"#,
+                        params.resource_name
+                    )
+                    .as_str(),
                 );
                 new_query.to_string()
             }
@@ -223,11 +228,11 @@ impl GraphQLClient {
 
         let pointer = format!("/{}", self.json_path.replace(".", "/"));
 
-        let next_cursor = match (&self.paginated_resource_name, limit_reached) {
-            (Some(resource), false) => {
+        let next_cursor = match (&self.pagination_parameters, limit_reached) {
+            (Some(params), false) => {
                 let page_info = {
                     // trim path to paginated resource
-                    let pattern = format!(r"^(.*?{resource})");
+                    let pattern = format!(r"^(.*?{})", params.resource_name);
                     let regex = Regex::new(pattern.as_str()).unwrap();
                     let captures = regex.captures(&pointer);
                     let path = captures.map_or(None, |c| {
@@ -330,26 +335,7 @@ impl GraphQL {
             })?
             .to_owned();
 
-        // Check if first: and pageInfo are in the query and on the same level, capture the name of the query
-        // Check if the name of the query is in the json_path
-        let paginated_resource_name = {
-            let pagination_pattern =
-                r"(?xsm)(\w*)\s*\(first:.*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}";
-            let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
-            match regex.captures(query.as_str()) {
-                Some(captures) => {
-                    let query_name = captures.get(1).map(|m| m.as_str().to_owned());
-                    query_name.map_or(None, |name| {
-                        if json_path.contains(&name) {
-                            Some(name)
-                        } else {
-                            None
-                        }
-                    })
-                }
-                None => None,
-            }
-        };
+        let pagination_parameters = PaginationParameters::parse(&query, &json_path);
 
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
@@ -376,7 +362,7 @@ impl GraphQL {
             query,
             endpoint,
             json_path,
-            paginated_resource_name,
+            pagination_parameters,
             auth,
         })
     }
@@ -428,6 +414,7 @@ impl TableProvider for GraphQLTableProvider {
             .await
             .map_err(to_execution_error)?;
         let mut res = vec![first_batch];
+
         while let Some(next_cursor_val) = next_cursor {
             let (next_batch, _, new_cursor, new_count) = self
                 .client
