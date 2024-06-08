@@ -167,7 +167,7 @@ mod tests {
         }";
         let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, &pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -179,7 +179,7 @@ mod tests {
                 }
             }
         }"#;
-        assert_eq!(limit_reached, false);
+        assert!(!limit_reached);
         assert_eq!(new_query, expected_query);
 
         let query = r#"query {
@@ -205,7 +205,7 @@ mod tests {
                 }
             }
         }"#;
-        assert_eq!(limit_reached, false);
+        assert!(!limit_reached);
         assert_eq!(new_query, expected_query);
 
         let query = r"query {
@@ -231,7 +231,7 @@ mod tests {
                 }
             }
         }"#;
-        assert_eq!(limit_reached, true);
+        assert!(limit_reached);
         assert_eq!(new_query, expected_query);
     }
 
