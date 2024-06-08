@@ -275,7 +275,7 @@ impl AcceleratedTable {
     }
 
     #[must_use] pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
-        Arc::clone(&self.accelerator)
+        Arc::clone(&self.federated)
     }
 
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
