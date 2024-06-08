@@ -274,7 +274,8 @@ impl AcceleratedTable {
         Ok(())
     }
 
-    #[must_use] pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
+    #[must_use]
+    pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.federated)
     }
 

@@ -337,7 +337,6 @@ impl DataFusion {
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
 
-                    println!("But i am an accelerated table!!");
                     self.ctx
                         .register_table(dataset.name.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
