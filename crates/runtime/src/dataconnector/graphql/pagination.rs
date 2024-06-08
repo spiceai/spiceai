@@ -123,7 +123,7 @@ mod tests {
     use super::PaginationParameters;
 
     #[test]
-    fn basic_test_pagination_parse() {
+    fn test_pagination_parse() {
         let query = r"query {
       users(first: 10) {
         pageInfo {
@@ -151,5 +151,86 @@ mod tests {
         let pointer = r"/data/users";
         let pagination_parameters = PaginationParameters::parse(query, &pointer);
         assert_eq!(pagination_parameters, None);
+    }
+
+    #[test]
+    fn test_pagination_apply() {
+        let query = r"query {
+            users(first: 10) {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }";
+        let pointer = r"/data/users";
+        let pagination_parameters =
+            PaginationParameters::parse(query, &pointer).expect("Failed to get pagination params");
+        let (new_query, limit_reached) =
+            pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
+        let expected_query = r#"query {
+            users (first: 10, after: "new_cursor") {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }"#;
+        assert_eq!(limit_reached, false);
+        assert_eq!(new_query, expected_query);
+
+        let query = r#"query {
+            users(after: "user_cursor", first: 10) {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }"#;
+        let pointer = r"/data/users";
+        let pagination_parameters =
+            PaginationParameters::parse(query, &pointer).expect("Failed to get pagination params");
+        let (new_query, limit_reached) =
+            pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
+        let expected_query = r#"query {
+            users (first: 10, after: "new_cursor") {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }"#;
+        assert_eq!(limit_reached, false);
+        assert_eq!(new_query, expected_query);
+
+        let query = r"query {
+            users(first: 10) {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }";
+        let pointer = r"/data/users";
+        let pagination_parameters =
+            PaginationParameters::parse(query, &pointer).expect("Failed to get pagination params");
+        let (new_query, limit_reached) =
+            pagination_parameters.apply(query, Some(5), Some("new_cursor".to_string()));
+        let expected_query = r#"query {
+            users (first: 5, after: "new_cursor") {
+                name
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }"#;
+        assert_eq!(limit_reached, true);
+        assert_eq!(new_query, expected_query);
     }
 }
