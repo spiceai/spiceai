@@ -107,10 +107,9 @@ fn combined_relevant_data_and_input(
     format!("{data}\n{input}")
 }
 
-
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
 /// This includes if the [`TableProvider`] is an [`AcceleratedTable`] with a [`EmbeddingTable`] underneath.
-fn get_embedding_table(tbl: Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTable>> {
+fn get_embedding_table(tbl: &Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTable>> {
     if let Some(embedding_table) = tbl.as_any().downcast_ref::<EmbeddingTable>() {
         return Some(Arc::new(embedding_table.clone()));
     }
@@ -126,22 +125,6 @@ fn get_embedding_table(tbl: Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTable
     None
 }
 
-fn embedding_models_in(tbl: Arc<dyn TableProvider>) -> Vec<String> {
-    if let Some(embedding_table) = get_embedding_table(tbl) {
-        embedding_table.get_embedding_models_used()
-    } else {
-        vec![]
-    }
-}
-
-fn embedding_columns_in(tbl: Arc<dyn TableProvider>) -> Vec<String> {
-    if let Some(embedding_table) = get_embedding_table(tbl) {
-        embedding_table.get_embedding_columns()
-    } else {
-        vec![]
-    }
-}
-
 /// For the data sources that assumedly exist in the [`DataFusion`] instance, find the embedding models used in each data source.
 async fn find_relevant_embedding_models(
     data_sources: Vec<TableReference>,
@@ -153,7 +136,10 @@ async fn find_relevant_embedding_models(
             None => {
                 return Err(format!("Data source {} does not exist", data_source.clone()).into())
             }
-            Some(table) => match embedding_models_in(table) {
+            Some(table) => match get_embedding_table(&table)
+                .map(|e| e.get_embedding_models_used())
+                .unwrap_or_default()
+            {
                 v if v.is_empty() => {
                     return Err(format!(
                         "Data source {} does not have an embedded column",
@@ -201,9 +187,8 @@ async fn vector_search(
             .get_table(tbl.clone())
             .await
             .ok_or(format!("Table {} not found", tbl.clone()))?;
-        let embedding_columns = embedding_columns_in(table_provider);
-        let embedding_column = embedding_columns
-            .first()
+        let embedding_column = get_embedding_table(&table_provider)
+            .and_then(|e| e.get_embedding_columns().first().cloned())
             .ok_or(format!("No embeddings found for table {tbl}"))?;
 
         if search_vectors.len() != 1 {
@@ -296,7 +281,7 @@ async fn calculate_embeddings_per_table(
 ) -> Result<HashMap<TableReference, Vec<Vec<f32>>>, Box<dyn std::error::Error>> {
     // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
     let embeddings_to_run = find_relevant_embedding_models(data_sources, df).await?;
-    
+
     // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
     let embedded_inputs = create_input_embeddings(
         &query.clone(),
@@ -436,7 +421,6 @@ pub(crate) async fn post(
         Ok(per_table_embeddings) => per_table_embeddings,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    println!("Per table embeddings: {per_table_embeddings:#?}");
 
     // Retrieve primary keys
     let tbl_to_pks = match get_primary_keys(
@@ -455,17 +439,11 @@ pub(crate) async fn post(
     };
 
     // Vector search to get relevant data from data sources.
-    let relevant_data = match vector_search(
-        Arc::clone(&df),
-        per_table_embeddings,
-        tbl_to_pks,
-        3,
-    )
-    .await
-    {
-        Ok(relevant_data) => relevant_data,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let relevant_data =
+        match vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await {
+            Ok(relevant_data) => relevant_data,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
     // Using returned data, create input for LLM.
     let model_input =
