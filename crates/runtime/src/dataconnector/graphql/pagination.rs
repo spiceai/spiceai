@@ -152,6 +152,18 @@ mod tests {
         let pointer = r"/data/users";
         let pagination_parameters = PaginationParameters::parse(query, pointer);
         assert_eq!(pagination_parameters, None);
+
+        let query = r#"query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }"#;
+        let pointer = r"/data/paginatedUsers/users";
+        let pagination_parameters = PaginationParameters::parse(query, pointer);
+        assert_eq!(
+            pagination_parameters,
+            Some(PaginationParameters {
+                resource_name: "paginatedUsers".to_owned(),
+                count: 2,
+                page_info_path: "/data/paginatedUsers/pageInfo".to_owned(),
+            })
+        );
     }
 
     #[test]
