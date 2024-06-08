@@ -140,23 +140,23 @@ impl GraphQLClient {
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
-    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>, usize)> {
-        let mut count = self
-            .pagination_parameters
-            .as_ref()
-            .map(|p| p.count)
-            .unwrap_or_default();
+    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>)> {
         let mut limit_reached = false;
-
-        if let Some(limit) = limit {
-            if limit < count {
-                count = limit;
-                limit_reached = true;
-            }
-        }
 
         let query = match (cursor, self.pagination_parameters.as_ref()) {
             (Some(cursor), Some(params)) => {
+                let mut count = self
+                    .pagination_parameters
+                    .as_ref()
+                    .map(|p| p.count)
+                    .unwrap_or_default();
+
+                if let Some(limit) = limit {
+                    if limit < count {
+                        count = limit;
+                        limit_reached = true;
+                    }
+                }
                 let pattern = format!(r#"{}\s*\(.*\)"#, params.resource_name);
                 let regex = Regex::new(&pattern).unwrap();
 
@@ -294,7 +294,7 @@ impl GraphQLClient {
             res.extend(batch);
         }
 
-        Ok((res, schema, next_cursor, count))
+        Ok((res, schema, next_cursor))
     }
 }
 
@@ -375,7 +375,7 @@ struct GraphQLTableProvider {
 
 impl GraphQLTableProvider {
     pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
-        let (_, schema, _, _) = client
+        let (_, schema, _) = client
             .execute(None, None, None)
             .await
             .map_err(Into::into)
@@ -408,7 +408,7 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (first_batch, _, mut next_cursor, mut count) = self
+        let (first_batch, _, mut next_cursor) = self
             .client
             .execute(Some(Arc::clone(&self.schema)), limit, None)
             .await
@@ -416,16 +416,15 @@ impl TableProvider for GraphQLTableProvider {
         let mut res = vec![first_batch];
 
         while let Some(next_cursor_val) = next_cursor {
-            let (next_batch, _, new_cursor, new_count) = self
+            let (next_batch, _, new_cursor) = self
                 .client
                 .execute(
                     Some(Arc::clone(&self.schema)),
-                    limit.map(|l| l - count),
+                    limit.map(|l| l - self.client.pagination_parameters.as_ref().unwrap().count),
                     Some(next_cursor_val),
                 )
                 .await
                 .map_err(to_execution_error)?;
-            count = new_count;
             next_cursor = new_cursor;
             res.push(next_batch);
         }
