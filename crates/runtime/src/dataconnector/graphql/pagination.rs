@@ -1,6 +1,6 @@
 use regex::Regex;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     pub resource_name: String,
     pub count: usize,
@@ -32,5 +32,31 @@ impl PaginationParameters {
             }
             None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PaginationParameters;
+
+    #[test]
+    fn basic_test_pagination_parse() {
+        let query = r#"query {
+      users(first: 10) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        }
+    }"#;
+        let json_path = r#"data.users"#;
+        let pagination_parameters = PaginationParameters::parse(query, json_path);
+        assert_eq!(
+            pagination_parameters,
+            Some(PaginationParameters {
+                resource_name: "users".to_owned(),
+                count: 10
+            })
+        );
     }
 }
