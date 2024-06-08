@@ -15,12 +15,14 @@ limitations under the License.
 */
 
 use regex::Regex;
+use serde_json::Value;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     pub resource_name: String,
     pub count: usize,
+    page_info_path: String,
 }
 
 impl PaginationParameters {
@@ -35,21 +37,85 @@ impl PaginationParameters {
                     .map(|m| m.as_str().parse::<usize>())
                     .transpose()
                     .unwrap_or(None);
+                let pointer = format!("/{}", json_path.replace('.', "/"));
 
                 match (resource_name, count) {
                     (Some(resource_name), Some(count)) => {
-                        if !json_path.contains(&resource_name) {
-                            return None;
-                        }
-                        Some(Self {
+                        let pattern = format!(r"^(.*?{})", resource_name);
+                        let regex = unsafe { Regex::new(pattern.as_str()).unwrap_unchecked() };
+
+                        let captures = regex.captures(&pointer);
+
+                        let page_info_path = captures.map_or(None, |c| {
+                            c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo")
+                        });
+
+                        page_info_path.map(|page_info_path| Self {
                             resource_name,
                             count,
+                            page_info_path,
                         })
                     }
                     _ => None,
                 }
             }
             None => None,
+        }
+    }
+
+    pub fn apply(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> (String, bool) {
+        let mut limit_reached = false;
+
+        match cursor {
+            Some(cursor) => {
+                let mut count = self.count;
+
+                if let Some(limit) = limit {
+                    if limit < count {
+                        count = limit;
+                        limit_reached = true;
+                    }
+                }
+                let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
+                let regex = Regex::new(&pattern).unwrap();
+
+                let new_query = regex.replace(
+                    query,
+                    format!(
+                        r#"{} (first: {count}, after: "{cursor}")"#,
+                        self.resource_name
+                    )
+                    .as_str(),
+                );
+                (new_query.to_string(), limit_reached)
+            }
+            _ => (query.to_string(), false),
+        }
+    }
+
+    pub fn get_next_cursor_from_response(
+        &self,
+        response: &Value,
+        limit_reached: bool,
+    ) -> Option<String> {
+        if limit_reached {
+            return None;
+        }
+        let page_info = response
+            .pointer(&self.page_info_path)
+            .unwrap_or(&Value::Null);
+        let end_cursor = page_info["endCursor"].as_str().map(|x| x.to_string());
+        let has_next_page = page_info["hasNextPage"].as_bool().unwrap_or(false);
+
+        if has_next_page {
+            end_cursor
+        } else {
+            None
         }
     }
 }
@@ -74,7 +140,8 @@ mod tests {
             pagination_parameters,
             Some(PaginationParameters {
                 resource_name: "users".to_owned(),
-                count: 10
+                count: 10,
+                page_info_path: "/data/users/pageInfo".to_owned(),
             })
         );
     }
