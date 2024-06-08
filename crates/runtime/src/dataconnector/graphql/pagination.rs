@@ -43,7 +43,7 @@ impl PaginationParameters {
                         let pattern = format!(r"^(.*?{resource_name})");
                         let regex = unsafe { Regex::new(pattern.as_str()).unwrap_unchecked() };
 
-                        let captures = regex.captures(&pointer);
+                        let captures = regex.captures(pointer);
 
                         let page_info_path = captures
                             .and_then(|c| c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo"));
@@ -133,7 +133,7 @@ mod tests {
         }
     }";
         let pointer = r"/data/users";
-        let pagination_parameters = PaginationParameters::parse(query, &pointer);
+        let pagination_parameters = PaginationParameters::parse(query, pointer);
         assert_eq!(
             pagination_parameters,
             Some(PaginationParameters {
@@ -149,7 +149,7 @@ mod tests {
               }
           }";
         let pointer = r"/data/users";
-        let pagination_parameters = PaginationParameters::parse(query, &pointer);
+        let pagination_parameters = PaginationParameters::parse(query, pointer);
         assert_eq!(pagination_parameters, None);
     }
 
@@ -192,7 +192,7 @@ mod tests {
         }"#;
         let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, &pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -218,7 +218,7 @@ mod tests {
         }";
         let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, &pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, Some(5), Some("new_cursor".to_string()));
         let expected_query = r#"query {
