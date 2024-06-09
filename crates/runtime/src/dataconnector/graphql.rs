@@ -78,16 +78,15 @@ Please verify the syntax of your GraphQL query."#
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, PartialEq, Eq)]
-pub struct PaginationParameters {
-    pub resource_name: String,
-    pub count: usize,
+struct PaginationParameters {
+    resource_name: String,
+    count: usize,
     page_info_path: String,
 }
 
 impl PaginationParameters {
-    pub fn parse(query: &str, pointer: &str) -> Option<Self> {
+    fn parse(query: &str, pointer: &str) -> Option<Self> {
         let pagination_pattern = r"(?xsm)(\w*)\s*\([^)]*first:\s*(\d+).*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}";
         let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
         match regex.captures(query) {
@@ -122,12 +121,7 @@ impl PaginationParameters {
         }
     }
 
-    pub fn apply(
-        &self,
-        query: &str,
-        limit: Option<usize>,
-        cursor: Option<String>,
-    ) -> (String, bool) {
+    fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
         let mut limit_reached = false;
 
         match cursor {
@@ -157,7 +151,7 @@ impl PaginationParameters {
         }
     }
 
-    pub fn get_next_cursor_from_response(
+    fn get_next_cursor_from_response(
         &self,
         response: &Value,
         limit_reached: bool,
@@ -179,13 +173,12 @@ impl PaginationParameters {
     }
 }
 
-pub enum Auth {
+enum Auth {
     Basic(String, Option<String>),
     Bearer(String),
 }
 
-#[allow(clippy::module_name_repetitions)]
-pub struct GraphQLClient {
+struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
     query: String,
@@ -195,7 +188,7 @@ pub struct GraphQLClient {
 }
 
 impl GraphQLClient {
-    pub fn new(
+    fn new(
         client: reqwest::Client,
         endpoint: Url,
         query: String,
@@ -215,7 +208,7 @@ impl GraphQLClient {
 }
 
 impl GraphQLClient {
-    pub async fn execute(
+    async fn execute(
         &self,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
@@ -279,7 +272,7 @@ impl GraphQLClient {
         Ok((res, schema, next_cursor))
     }
 
-    pub async fn execute_paginated(
+    async fn execute_paginated(
         &self,
         schema: SchemaRef,
         limit: Option<usize>,
@@ -377,14 +370,13 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
     }
 }
 
-#[allow(clippy::module_name_repetitions)]
-pub struct GraphQLTableProvider {
+struct GraphQLTableProvider {
     client: GraphQLClient,
     schema: SchemaRef,
 }
 
 impl GraphQLTableProvider {
-    pub async fn new(client: GraphQLClient) -> Result<Self> {
+    async fn new(client: GraphQLClient) -> Result<Self> {
         let (_, schema, _) = client.execute(None, None, None).await?;
 
         Ok(Self { client, schema })
