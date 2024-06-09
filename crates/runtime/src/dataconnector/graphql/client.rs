@@ -198,13 +198,19 @@ fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> Re
 
 fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
     if status.is_client_error() | status.is_server_error() {
-        return Err(Error::InvalidReqwestStatus {
-            status,
-            message: response["message"]
-                .as_str()
-                .unwrap_or("No message provided")
-                .to_string(),
-        });
+        let message = vec![
+            &response["message"],
+            &response["error"]["message"],
+            &response["errors"][0]["message"],
+        ]
+        .iter()
+        .map(|x| x.as_str())
+        .find(|x| x.is_some())
+        .flatten()
+        .unwrap_or("No message provided")
+        .to_string();
+
+        return Err(Error::InvalidReqwestStatus { status, message });
     }
     Ok(())
 }
@@ -252,5 +258,51 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
         )
     } else {
         format!("{:>4} | {}\n{:>4} | {}", line, error_line, "", marker)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::StatusCode;
+
+    use super::handle_http_error;
+
+    #[test]
+    fn test_handle_http_error() {
+        let message = "test message";
+        let response = serde_json::from_str(&format!(r#"{{"message": "{message}"}}"#))
+            .expect("Failed to consturuct json");
+        let status = StatusCode::BAD_REQUEST;
+        let result = handle_http_error(status, &response);
+        match result {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => {
+                assert!(e.to_string().contains(message));
+            }
+        }
+
+        let response =
+            serde_json::from_str(&format!(r#"{{ "error": {{"message": "{message}"}} }}"#))
+                .expect("Failed to consturuct json");
+        let status = StatusCode::BAD_REQUEST;
+        let result = handle_http_error(status, &response);
+        match result {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => {
+                assert!(e.to_string().contains(message));
+            }
+        }
+
+        let response =
+            serde_json::from_str(&format!(r#"{{ "errors": [{{"message": "{message}"}}] }}"#))
+                .expect("Failed to consturuct json");
+        let status = StatusCode::BAD_REQUEST;
+        let result = handle_http_error(status, &response);
+        match result {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => {
+                assert!(e.to_string().contains(message));
+            }
+        }
     }
 }
