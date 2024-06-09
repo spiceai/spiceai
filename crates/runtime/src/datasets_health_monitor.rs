@@ -85,7 +85,7 @@ impl DatasetsHealthMonitor {
 
         let dataset_name = &dataset.name.to_string();
 
-        tracing::debug!("Registering dataset {dataset_name:?} for periodic availability check");
+        tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
         let table_provider = self.get_table_provider(dataset_name).await?;
 
@@ -102,7 +102,7 @@ impl DatasetsHealthMonitor {
     }
 
     pub async fn deregister_dataset(&self, dataset_name: &String) {
-        tracing::debug!("Removing dataset {dataset_name:?} from periodic availability check");
+        tracing::debug!("Removing dataset {dataset_name} from periodic availability check");
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.remove(dataset_name);
     }
@@ -174,6 +174,7 @@ async fn update_dataset_availability_info(
     dataset_name: &String,
     test_result: AvailabilityVerificationResult,
 ) {
+    let labels = [("dataset", dataset_name.to_string())];
     match test_result {
         AvailabilityVerificationResult::Available => {
             tracing::debug!("Successfully verified access to federated dataset {dataset_name}");
@@ -181,11 +182,11 @@ async fn update_dataset_availability_info(
             if let Some(dataset) = monitored_datasets_lock.get_mut(dataset_name) {
                 Arc::make_mut(dataset).last_available_time = SystemTime::now();
             }
+            // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
+            metrics::gauge!("datasets_unavailable_time", &labels).set(0);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
             tracing::warn!("Availability verification for dataset {dataset_name} failed: {err}");
-
-            let labels = [("dataset", dataset_name.to_string())];
             metrics::gauge!("datasets_unavailable_time", &labels).set(
                 last_available_time
                     .duration_since(UNIX_EPOCH)
