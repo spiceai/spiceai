@@ -41,6 +41,7 @@ use crate::EmbeddingModelStore;
 pub enum Error {}
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
+#[derive(Clone)]
 pub struct EmbeddingTable {
     base_table: Arc<dyn TableProvider>,
 
