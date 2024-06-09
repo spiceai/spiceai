@@ -198,14 +198,14 @@ fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> Re
 
 fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
     if status.is_client_error() | status.is_server_error() {
-        let message = vec![
+        let message = [
             &response["message"],
             &response["error"]["message"],
             &response["errors"][0]["message"],
         ]
         .iter()
         .map(|x| x.as_str())
-        .find(|x| x.is_some())
+        .find(Option::is_some)
         .flatten()
         .unwrap_or("No message provided")
         .to_string();
@@ -275,7 +275,7 @@ mod tests {
         let status = StatusCode::BAD_REQUEST;
         let result = handle_http_error(status, &response);
         match result {
-            Ok(_) => panic!("Expected error"),
+            Ok(()) => panic!("Expected error"),
             Err(e) => {
                 assert!(e.to_string().contains(message));
             }
@@ -287,7 +287,7 @@ mod tests {
         let status = StatusCode::BAD_REQUEST;
         let result = handle_http_error(status, &response);
         match result {
-            Ok(_) => panic!("Expected error"),
+            Ok(()) => panic!("Expected error"),
             Err(e) => {
                 assert!(e.to_string().contains(message));
             }
@@ -299,7 +299,7 @@ mod tests {
         let status = StatusCode::BAD_REQUEST;
         let result = handle_http_error(status, &response);
         match result {
-            Ok(_) => panic!("Expected error"),
+            Ok(()) => panic!("Expected error"),
             Err(e) => {
                 assert!(e.to_string().contains(message));
             }
