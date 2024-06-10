@@ -10,20 +10,19 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## [v0.14-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/27)
 
-- Accelerated table primary key and indexes
-- MotherDuck data connector (alpha)
 - GraphQL data connector (alpha)
 
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
+- Accelerated table primary key and indexes
 - CDC replication refresh mode
 - Generic Object-Store connector (alpha)
-- S3 data connector Iceberg support
 
 ## v0.16-beta (July 2024)
 
 - Catalog Providers
-  - Unity Catalog catalog provider (alpha)
+- MotherDuck data connector (alpha)
+- Unity Catalog catalog provider (alpha)
 - ODBC data connector (beta)
 - Databricks data connector (beta)
 - S3 data connector (beta)
@@ -39,7 +38,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - AWS Glue catalog provider (alpha)
 
 ## Features being considered
-
+- S3 data connector Iceberg support
 - Intelligent (AI-powered) accelerators
 - Kafka data connector
 - GraphQL API
