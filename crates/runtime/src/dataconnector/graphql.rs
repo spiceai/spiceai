@@ -87,7 +87,7 @@ struct PaginationParameters {
 
 impl PaginationParameters {
     fn parse(query: &str, pointer: &str) -> Option<Self> {
-        let pagination_pattern = r"(?xsm)(\w*)\s*\([^)]*first:\s*(\d+).*\).*\{.*pageInfo.*\{.*hasNextPage.*endCursor.*?\}.*?\}";
+        let pagination_pattern = r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}";
         let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
         match regex.captures(query) {
             Some(captures) => {
@@ -124,31 +124,27 @@ impl PaginationParameters {
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
         let mut limit_reached = false;
 
-        match cursor {
-            Some(cursor) => {
-                let mut count = self.count;
+        let mut count = self.count;
 
-                if let Some(limit) = limit {
-                    if limit < count {
-                        count = limit;
-                        limit_reached = true;
-                    }
-                }
-                let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
-                let regex = unsafe { Regex::new(&pattern).unwrap_unchecked() };
-
-                let new_query = regex.replace(
-                    query,
-                    format!(
-                        r#"{} (first: {count}, after: "{cursor}")"#,
-                        self.resource_name
-                    )
-                    .as_str(),
-                );
-                (new_query.to_string(), limit_reached)
+        if let Some(limit) = limit {
+            if limit <= count {
+                count = limit;
+                limit_reached = true;
             }
-            _ => (query.to_string(), false),
         }
+        let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
+        let regex = unsafe { Regex::new(&pattern).unwrap_unchecked() };
+
+        let replace_query = match cursor {
+            Some(cursor) => format!(
+                r#"{} (first: {count}, after: "{cursor}")"#,
+                self.resource_name
+            ),
+            None => format!(r#"{} (first: {count})"#, self.resource_name),
+        };
+
+        let new_query = regex.replace(query, replace_query.as_str());
+        (new_query.to_string(), limit_reached)
     }
 
     fn get_next_cursor_from_response(
@@ -280,14 +276,14 @@ impl GraphQLClient {
         let (first_batch, _, mut next_cursor) =
             self.execute(Some(Arc::clone(&schema)), limit, None).await?;
         let mut res = vec![first_batch];
+        let mut limit = limit;
 
         while let Some(next_cursor_val) = next_cursor {
+            limit = limit.map(|l| {
+                l.saturating_sub(self.pagination_parameters.as_ref().map_or(0, |x| x.count))
+            });
             let (next_batch, _, new_cursor) = self
-                .execute(
-                    Some(Arc::clone(&schema)),
-                    limit.map(|l| l - self.pagination_parameters.as_ref().map_or(0, |x| x.count)),
-                    Some(next_cursor_val),
-                )
+                .execute(Some(Arc::clone(&schema)), limit, Some(next_cursor_val))
                 .await?;
             next_cursor = new_cursor;
             res.push(next_batch);
@@ -539,6 +535,25 @@ mod tests {
         }
         }
     }";
+        let pointer = r"/data/users";
+        let pagination_parameters = PaginationParameters::parse(query, pointer);
+        assert_eq!(
+            pagination_parameters,
+            Some(PaginationParameters {
+                resource_name: "users".to_owned(),
+                count: 10,
+                page_info_path: "/data/users/pageInfo".to_owned(),
+            })
+        );
+
+        let query = r"query {
+            users(first: 10) {
+              pageInfo {
+                endCursor
+                hasNextPage
+              }
+              }
+          }";
         let pointer = r"/data/users";
         let pagination_parameters = PaginationParameters::parse(query, pointer);
         assert_eq!(
