@@ -132,7 +132,7 @@ impl DataSink for DuckDBDataSink {
             })?;
         }
 
-        let tx = duckdb_conn
+        let mut tx = duckdb_conn
             .conn
             .transaction()
             .context(super::UnableToBeginTransactionSnafu)
@@ -145,8 +145,9 @@ impl DataSink for DuckDBDataSink {
         }
 
         for batch in data_batches {
-            self.duckdb
-                .insert_batch(&tx, &batch)
+            tx = self
+                .duckdb
+                .insert_batch(duckdb_conn, tx, &batch)
                 .map_err(to_datafusion_error)?;
         }
 
