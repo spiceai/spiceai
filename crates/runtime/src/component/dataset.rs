@@ -565,11 +565,8 @@ pub mod acceleration {
                 .join(", ")
         }
 
-        pub fn validate_indexes(
-            indexes: &HashMap<String, IndexType>,
-            schema: &SchemaRef,
-        ) -> Result<()> {
-            for column in indexes.keys() {
+        pub fn validate_indexes(&self, schema: &SchemaRef) -> Result<()> {
+            for column in self.indexes.keys() {
                 let index_columns = Self::index_columns(column);
                 for index_column in index_columns {
                     if schema.field_with_name(index_column).is_err() {
@@ -589,8 +586,6 @@ pub mod acceleration {
             if self.indexes.is_empty() {
                 return Ok(None);
             }
-
-            Self::validate_indexes(&self.indexes, &schema)?;
 
             let mut table_constraints: Vec<TableConstraint> = Vec::new();
 
