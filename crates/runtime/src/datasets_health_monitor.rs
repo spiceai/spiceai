@@ -20,26 +20,32 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, TimestampNanosecondArray};
+use chrono::{DateTime, Utc};
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, execution::context::SessionContext,
-    sql::TableReference,
+    datasource::{provider_as_source, TableProvider}, error::DataFusionError, execution::context::SessionContext, logical_expr::{col, lit, LogicalPlanBuilder}, sql::TableReference
 };
 use futures::{future::join_all, stream::TryStreamExt};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 
-use crate::component::dataset::Dataset;
+use crate::{
+    component::dataset::Dataset,
+    datafusion::{query::query_history::DEFAULT_QUERY_HISTORY_TABLE, SPICE_RUNTIME_SCHEMA},
+};
 
-const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
-const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 10 * 60; // 10 minutes
+const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 6; // every minute
+const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 1 * 6; // 10 minutes
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get table: {source}"))]
-    UnableToGetTable { source: DataFusionError },
+    #[snafu(display("Unable to get table provider for {table_name}: {source}"))]
+    UnableToGetTable {
+        source: DataFusionError,
+        table_name: String,
+    },
 }
 
 #[derive(Clone)]
@@ -83,11 +89,13 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
-        let dataset_name = &dataset.name.to_string();
+        let dataset_name = dataset.name.to_string();
 
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
-        let table_provider = self.get_table_provider(dataset_name).await?;
+        let table_provider = self
+            .get_table_provider(TableReference::bare(dataset_name.to_string()))
+            .await?;
 
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.insert(
@@ -107,18 +115,30 @@ impl DatasetsHealthMonitor {
         monitored_datasets.remove(dataset_name);
     }
 
-    async fn get_table_provider(&self, dataset_name: &str) -> Result<Arc<dyn TableProvider>> {
+    async fn get_table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let table_name = table_reference.to_string();
         let table = self
             .df_ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(table_reference)
             .await
-            .context(UnableToGetTableSnafu)?;
+            .context(UnableToGetTableSnafu { table_name })?;
 
         Ok(table)
     }
 
-    pub fn start(&self) {
+    pub async fn start(&self) -> Result<()> {
         tracing::debug!("Starting datasets availability monitoring");
+
+        let query_history = self
+            .get_table_provider(TableReference::partial(
+                SPICE_RUNTIME_SCHEMA,
+                DEFAULT_QUERY_HISTORY_TABLE,
+            ))
+            .await?;
+
         let monitored_datasets = Arc::clone(&self.monitored_datasets);
         let df_ctx = Arc::clone(&self.df_ctx);
         tokio::spawn(async move {
@@ -136,11 +156,36 @@ impl DatasetsHealthMonitor {
                     .into_iter()
                     .map(|item| {
                         let ctx = Arc::clone(&df_ctx);
+                        let query_history = Arc::clone(&query_history);
                         let monitored_datasets = Arc::clone(&monitored_datasets);
                         tokio::spawn(async move {
+                            tracing::trace!(
+                                "Looking for recent queries for dataset {}",
+                                &item.name
+                            );
+                            if let Ok(Some(most_recent_query_time)) =
+                                most_recent_query_time(query_history, &ctx, &item.name).await 
+                            {
+                                // If most recent query in the last 10 minutes, we consider the dataset available
+                                if SystemTime::now()
+                                    .duration_since(most_recent_query_time)
+                                    .unwrap_or_default()
+                                    .as_secs()
+                                    < DATASET_UNAVAILABLE_THRESHOLD_SECONDS
+                                {
+                                    update_dataset_availability_info(
+                                        &monitored_datasets,
+                                        &item.name,
+                                        AvailabilityVerificationResult::Available,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+
                             tracing::trace!("Verifying connectivity for dataset {}", &item.name);
                             let connectivity_test_result =
-                                match test_connectivity(&item.table_provider, ctx).await {
+                                match test_connectivity(&item.table_provider, &ctx).await {
                                     Ok(()) => AvailabilityVerificationResult::Available,
                                     Err(err) => AvailabilityVerificationResult::Unavailable(
                                         item.last_available_time,
@@ -166,7 +211,10 @@ impl DatasetsHealthMonitor {
                 .await;
             }
         });
+
+        Ok(())
     }
+
 }
 
 async fn update_dataset_availability_info(
@@ -216,7 +264,7 @@ async fn datasets_for_availability_check(
 
 async fn test_connectivity(
     table_provider: &Arc<dyn TableProvider>,
-    ctx: Arc<SessionContext>,
+    ctx: &Arc<SessionContext>,
 ) -> std::result::Result<(), DataFusionError> {
     let plan = table_provider
         .scan(&ctx.state(), None, &[], Some(1))
@@ -227,4 +275,36 @@ async fn test_connectivity(
     stream.try_collect::<Vec<RecordBatch>>().await?;
 
     Ok(())
+}
+
+async fn most_recent_query_time(
+    query_history: Arc<dyn TableProvider>,
+    ctx: &Arc<SessionContext>,
+    dataset_name: &str,
+) -> std::result::Result<Option<SystemTime>, DataFusionError> {
+
+    let plan = LogicalPlanBuilder::scan(dataset_name, provider_as_source(query_history), None)?
+        .filter(col("datasets").like(lit(dataset_name)))?
+        .filter(col("execution_status").eq(lit(0)))?
+        .filter(col("results_cache_hit").eq(lit(false)))?
+        .project(vec![col("end_time")])?  
+        .sort(vec![col("end_time").sort(true, false)])?
+        .limit(0, Some(1))?
+        .build()?;
+
+    let res = ctx.execute_logical_plan(plan).await?.collect().await?;
+    
+    if res.is_empty() {
+        return Ok(None);
+    }
+
+    let end_time_column = res[0].column(0);
+
+    if let Some(timestamp_array) = end_time_column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        if let Some(most_recent_time) = timestamp_array.value_as_datetime(0) {
+            return Ok(Some(UNIX_EPOCH + std::time::Duration::from_nanos(most_recent_time.timestamp_nanos() as u64)));
+        }
+    }
+        
+    Ok(None)
 }

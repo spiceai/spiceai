@@ -15,20 +15,19 @@ limitations under the License.
 */
 
 use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
+    collections::HashSet, hash::Hash, string, sync::Arc, time::{Duration, SystemTime}
 };
 
 use crate::component::dataset::TimeFormat;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use arrow::{
     array::{
-        BooleanArray, Float32Array, Int8Array, RecordBatch, StringArray, TimestampNanosecondArray,
-        UInt64Array,
+        ArrayRef, BooleanArray, Float32Array, GenericListArray, Int8Array, ListArray, ListBuilder, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array
     },
-    datatypes::{DataType, Field, Schema, TimeUnit},
+    datatypes::{DataType, Field, Schema, TimeUnit, Utf8Type},
 };
-use datafusion::sql::TableReference;
+use arrow_ipc::Utf8;
+use datafusion::{parquet::basic::StringType, sql::TableReference};
 
 use snafu::{ResultExt, Snafu};
 
@@ -87,6 +86,12 @@ fn table_schema() -> Schema {
         Field::new("execution_time", DataType::Float32, false),
         Field::new("execution_status", DataType::Int8, false),
         Field::new("rows_produced", DataType::UInt64, false),
+        // Field::new(
+        //     "datasets",
+        //     DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        //     true,
+        // ),
+        Field::new("datasets", DataType::Utf8, true),
         Field::new("results_cache_hit", DataType::Boolean, false),
         Field::new("error_message", DataType::Utf8, true),
     ])
@@ -180,6 +185,10 @@ impl Query {
             None => 0,
         };
 
+        let datasets  = self.datasets.iter()
+            .map(string::ToString::to_string)
+            .collect::<Vec<String>>();
+
         RecordBatch::try_new(
             Arc::new(table_schema()),
             vec![
@@ -195,6 +204,8 @@ impl Query {
                 Arc::new(Float32Array::from(vec![self.execution_time])),
                 Arc::new(Int8Array::from(vec![execution_status])),
                 Arc::new(UInt64Array::from(vec![self.rows_produced])),
+                // Arc::new(to_arrow_list_array(&datasets)),
+                Arc::new(StringArray::from(vec![datasets.join(",")])),
                 Arc::new(BooleanArray::from(vec![self
                     .results_cache_hit
                     .unwrap_or(false)])),
@@ -219,3 +230,15 @@ impl Query {
         }
     }
 }
+
+// fn to_arrow_list_array(items: &Vec<String>) -> ListArray {
+//     let mut string_builder = arrow::array::StringBuilder::new();
+//     for item in items {
+//         string_builder.append_value(&item);
+//     }
+
+//     let mut list_builder = ListBuilder::new(string_builder);
+//     list_builder.append(true);
+
+//     list_builder.finish()
+// }

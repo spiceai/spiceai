@@ -918,9 +918,11 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start_datasets_health_monitor(&self) {
+    pub async fn start_datasets_health_monitor(&self) {
         if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
-            datasets_health_monitor.start();
+            if let Err(err) = datasets_health_monitor.start().await {
+                tracing::warn!("Failed to start datasets availability monitoring: {err}");
+            }
         }
     }
 

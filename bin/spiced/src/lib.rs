@@ -128,8 +128,6 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!("{err}");
     }
 
-    rt.start_datasets_health_monitor();
-
     let cloned_rt = rt.clone();
     let server_thread =
         tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
@@ -144,6 +142,9 @@ pub async fn run(args: Args) -> Result<()> {
             if let Err(err) = rt.init_query_history().await {
                 tracing::warn!("Creating internal query history table: {err}");
             };
+
+            // must be started after query history table is created
+            rt.start_datasets_health_monitor().await;
         }),
         Box::pin(rt.init_results_cache()),
         Box::pin(rt.start_extensions()),
