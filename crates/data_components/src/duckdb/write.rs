@@ -185,6 +185,9 @@ impl DuckDBDataSink {
 
         if self.overwrite {
             tracing::debug!("Deleting all data from table.");
+
+            // There is a known limitation in DuckDB for doing a delete, then an insert in the
+            // same transaction with a uniqueness constraint: https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking
             self.duckdb
                 .delete_all_table_data(tx)
                 .map_err(to_datafusion_error)?;

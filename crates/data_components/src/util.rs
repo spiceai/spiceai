@@ -2,6 +2,7 @@ use datafusion::logical_expr::Expr;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::{self, Engine};
 
+pub mod constraints;
 pub mod indexes;
 
 #[derive(Debug, Snafu)]
