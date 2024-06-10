@@ -88,7 +88,7 @@ struct PaginationParameters {
 impl PaginationParameters {
     fn parse(query: &str, pointer: &str) -> Option<Self> {
         let pagination_pattern = r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}";
-        let regex = unsafe { Regex::new(pagination_pattern).unwrap_unchecked() };
+        let regex = Regex::new(pagination_pattern).expect("Invalid regex pagination pattern");
         match regex.captures(query) {
             Some(captures) => {
                 let resource_name = captures.get(1).map(|m| m.as_str().to_owned());
@@ -101,7 +101,8 @@ impl PaginationParameters {
                 match (resource_name, count) {
                     (Some(resource_name), Some(count)) => {
                         let pattern = format!(r"^(.*?{resource_name})");
-                        let regex = unsafe { Regex::new(pattern.as_str()).unwrap_unchecked() };
+                        let regex = Regex::new(pattern.as_str())
+                            .expect("Invalid regex resource path pattern");
 
                         let captures = regex.captures(pointer);
 
@@ -133,7 +134,7 @@ impl PaginationParameters {
             }
         }
         let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
-        let regex = unsafe { Regex::new(&pattern).unwrap_unchecked() };
+        let regex = Regex::new(&pattern).expect("Invalid regex query resource pattern");
 
         let replace_query = match cursor {
             Some(cursor) => format!(
