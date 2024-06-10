@@ -29,6 +29,7 @@ use futures::future::join_all;
 use futures::Future;
 use runtime::config::Config as RuntimeConfig;
 
+use runtime::datasets_health_monitor::DatasetsHealthMonitor;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
@@ -117,6 +118,8 @@ pub async fn run(args: Args) -> Result<()> {
     // mutable reference
     rt.with_pods_watcher(pods_watcher);
 
+    rt.with_datasets_health_monitor(DatasetsHealthMonitor::new(Arc::clone(&rt.datafusion().ctx)));
+
     if let Err(err) = rt
         .start_metrics(args.metrics)
         .await
@@ -124,6 +127,8 @@ pub async fn run(args: Args) -> Result<()> {
     {
         tracing::warn!("{err}");
     }
+
+    rt.start_datasets_health_monitor();
 
     let cloned_rt = rt.clone();
     let server_thread =
