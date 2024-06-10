@@ -69,26 +69,8 @@ async fn validate_batch_with_constraint(
         .map(|col| schema.field(*col))
         .collect::<Vec<_>>();
 
-    // let unique_field_names = unique_fields
-    //     .iter()
-    //     .map(|f| f.name().to_string())
-    //     .collect::<Vec<_>>();
-
     let ctx = SessionContext::new();
     let df = ctx.read_batches(batches).context(DataFusionSnafu)?;
-
-    // let table_provider = df.into_view();
-    // ctx.register_table("table_name", table_provider)
-    //     .context(UnableToCreateDataFrameSnafu)?;
-
-    // let sql = format!(
-    //     "SELECT COUNT(1), {} FROM table_name GROUP BY {} HAVING COUNT(1) > 1",
-    //     unique_field_names.join(", "),
-    //     unique_field_names.join(", ")
-    // );
-    // println!("SQL: {sql}");
-
-    // let df = ctx.sql(&sql).await.context(UnableToCreateDataFrameSnafu)?;
 
     let Ok(count_name) = count(lit(COUNT_STAR_EXPANSION)).display_name() else {
         unreachable!()
@@ -96,7 +78,7 @@ async fn validate_batch_with_constraint(
 
     // This is equivalent to:
     // ```sql
-    // SELECT COUNT(*), <unique_field_names> FROM mem_table GROUP BY <unique_field_names> HAVING COUNT(*) > 1
+    // SELECT COUNT(1), <unique_field_names> FROM mem_table GROUP BY <unique_field_names> HAVING COUNT(1) > 1
     // ```
     let num_rows = df
         .aggregate(
@@ -109,12 +91,6 @@ async fn validate_batch_with_constraint(
         .count()
         .await
         .context(DataFusionSnafu)?;
-
-    // let df = df
-    //     .explain(false, false)
-    //     .context(UnableToPlanProjectionSnafu)?;
-
-    // df.show().await.context(UnableToShowResultsSnafu)?;
 
     if num_rows > 0 {
         BatchViolatesUniquenessConstraintSnafu {
@@ -142,7 +118,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_batch_with_constraints() -> Result<(), Box<dyn std::error::Error>> {
-        let parquet_bytes = std::fs::File::open("/Users/phillip/data/eth.recent_logs.parquet")?;
+        let parquet_bytes = reqwest::get("https://public-data.spiceai.org/eth.recent_logs.parquet")
+            .await?
+            .bytes()
+            .await?;
 
         let parquet_reader = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)?.build()?;
 
@@ -164,6 +143,15 @@ mod tests {
         assert_eq!(
             result.expect_err("this returned an error").to_string(),
             "Incoming data violates uniqueness constraint on column(s): block_number"
+        );
+
+        let invalid_constraints =
+            get_constraints(&["block_number", "transaction_hash"], Arc::clone(&schema));
+        let result = super::validate_batch_with_constraints(&records, &invalid_constraints).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("this returned an error").to_string(),
+            "Incoming data violates uniqueness constraint on column(s): block_number, transaction_hash"
         );
 
         Ok(())
