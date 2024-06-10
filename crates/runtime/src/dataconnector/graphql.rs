@@ -230,12 +230,12 @@ impl GraphQLClient {
             .unwrap_or(&Value::Null)
             .to_owned();
 
-        let next_cursor = match limit_reached {
-            true => None,
-            false => self
-                .pagination_parameters
+        let next_cursor = if limit_reached {
+            None
+        } else {
+            self.pagination_parameters
                 .as_ref()
-                .and_then(|x| x.get_next_cursor_from_response(&response)),
+                .and_then(|x| x.get_next_cursor_from_response(&response))
         };
 
         let unwrapped = match exctracted_data {
