@@ -317,27 +317,57 @@ async fn test_graphql_pagination() -> Result<(), String> {
         () = rt.load_datasets() => {}
     }
 
-    let queries: QueryTests = vec![(
-        "SELECT * FROM test_graphql",
-        vec![
-            "+---------------+------------------------------------------------------+",
-            "| plan_type     | plan                                                 |",
-            "+---------------+------------------------------------------------------+",
-            "| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |",
-            "| physical_plan | MemoryExec: partitions=2, partition_sizes=[2, 2]     |",
-            "|               |                                                      |",
-            "+---------------+------------------------------------------------------+",
-        ],
-        Some(Box::new(|result_batches| {
-            let mut total = 0;
-            for batch in result_batches {
-                assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
-                total += batch.num_rows();
-            }
-            assert_eq!(total, 4);
-        })),
-    )];
+    let queries: QueryTests = vec![
+        (
+            "SELECT * FROM test_graphql",
+            vec![
+                "+---------------+------------------------------------------------------+",
+                "| plan_type     | plan                                                 |",
+                "+---------------+------------------------------------------------------+",
+                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |",
+                "| physical_plan | MemoryExec: partitions=2, partition_sizes=[2, 2]     |",
+                "|               |                                                      |",
+                "+---------------+------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                let mut total = 0;
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                    total += batch.num_rows();
+                }
+                assert_eq!(total, 4);
+            })),
+        ),
+        (
+            "SELECT * FROM test_graphql where id = '4' limit 1",
+            vec![
+                "+---------------+------------------------------------------------------------+",
+                "| plan_type     | plan                                                       |",
+                "+---------------+------------------------------------------------------------+",
+                "| logical_plan  | Limit: skip=0, fetch=1                                     |",
+                "|               |   Filter: test_graphql.id = Utf8(\"4\")                      |",
+                "|               |     TableScan: test_graphql projection=[id, name, posts]   |",
+                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                           |",
+                "|               |   CoalescePartitionsExec                                   |",
+                "|               |     LocalLimitExec: fetch=1                                |",
+                "|               |       CoalesceBatchesExec: target_batch_size=8192          |",
+                "|               |         FilterExec: id@0 = 4                               |",
+                "|               |           MemoryExec: partitions=2, partition_sizes=[2, 2] |",
+                "|               |                                                            |",
+                "+---------------+------------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                let mut total = 0;
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                    total += batch.num_rows();
+                }
+                assert_eq!(total, 1);
+            })),
+        ),
+    ];
 
     for (query, expected_plan, validate_result) in queries {
         run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
