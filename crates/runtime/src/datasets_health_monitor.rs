@@ -98,6 +98,8 @@ impl DatasetsHealthMonitor {
             )),
         );
 
+        report_dataset_unavailable_time(dataset_name, None);
+
         Ok(())
     }
 
@@ -174,7 +176,6 @@ async fn update_dataset_availability_info(
     dataset_name: &String,
     test_result: AvailabilityVerificationResult,
 ) {
-    let labels = [("dataset", dataset_name.to_string())];
     match test_result {
         AvailabilityVerificationResult::Available => {
             tracing::debug!("Successfully verified access to federated dataset {dataset_name}");
@@ -182,17 +183,30 @@ async fn update_dataset_availability_info(
             if let Some(dataset) = monitored_datasets_lock.get_mut(dataset_name) {
                 Arc::make_mut(dataset).last_available_time = SystemTime::now();
             }
-            // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
-            metrics::gauge!("datasets_unavailable_time", &labels).set(0);
+            report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
             tracing::warn!("Availability verification for dataset {dataset_name} failed: {err}");
+            report_dataset_unavailable_time(dataset_name, Some(last_available_time));
+        }
+    }
+}
+
+fn report_dataset_unavailable_time(dataset_name: &String, last_available_time: Option<SystemTime>) {
+    let labels = [("dataset", dataset_name.to_string())];
+
+    match last_available_time {
+        Some(last_available_time) => {
             metrics::gauge!("datasets_unavailable_time", &labels).set(
                 last_available_time
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs_f64(),
             );
+        }
+        None => {
+            // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
+            metrics::gauge!("datasets_unavailable_time", &labels).set(0);
         }
     }
 }
