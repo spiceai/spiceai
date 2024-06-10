@@ -32,7 +32,7 @@ use itertools::Itertools;
 use llms::chat::Chat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 use futures::{FutureExt, Stream, StreamExt};
@@ -292,7 +292,6 @@ async fn prepare_and_run_vector_search(
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
     payload: Request,
 ) -> Result<VectorSearchResponse, Box<dyn std::error::Error>> {
-    
     let input_tables: Vec<TableReference> = payload
         .data_source
         .iter()
@@ -323,7 +322,7 @@ async fn prepare_and_run_vector_search(
     let relevant_data = vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await?;
     Ok(relevant_data)
 }
-    
+
 /// For each embedding column that a [`TableReference`] contains, calculate the embeddings vector between the query and the column.
 /// The returned `HashMap` is a mapping of [`TableReference`] to an (alphabetical by column name) in-order vector of embeddings.
 async fn calculate_embeddings_per_table(
@@ -482,12 +481,14 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
-    let relevant_data =  match prepare_and_run_vector_search(
+    let relevant_data = match prepare_and_run_vector_search(
         Arc::clone(&app),
         Arc::clone(&df),
         Arc::clone(&embeddings),
         payload.clone(),
-    ).await {
+    )
+    .await
+    {
         Ok(relevant_data) => relevant_data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -499,7 +500,9 @@ pub(crate) async fn post(
 
     // Run LLM with input.
     match llms.read().await.get(&payload.model) {
-        Some(llm_model) => context_aware_chat(&llm_model, &relevant_data, payload.text.clone()).await,
+        Some(llm_model) => {
+            context_aware_chat(llm_model, &relevant_data, payload.text.clone()).await
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Model {} not found", payload.model),
@@ -507,7 +510,6 @@ pub(crate) async fn post(
             .into_response(),
     }
 }
-
 
 pub async fn sse_post(
     Extension(app): Extension<Arc<RwLock<Option<App>>>>,
@@ -525,20 +527,23 @@ pub async fn sse_post(
     //     }).keep_alive(KeepAlive::default());
     // }
 
-    let relevant_data =  match prepare_and_run_vector_search(
+    let relevant_data = match prepare_and_run_vector_search(
         Arc::clone(&app),
         Arc::clone(&df),
         Arc::clone(&embeddings),
         payload.clone(),
-    ).await {
+    )
+    .await
+    {
         Ok(relevant_data) => relevant_data,
         Err(e) => {
             println!("Error from prepare_and_run_vector_search: {e}");
-            unimplemented!("Help")} // return Sse::new(stream! {}).keep_alive(KeepAlive::default())}
-        //     yield Err(axum::Error::new(Box::new(
-        //         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Model {e} not found"))
-        //     ) as Box<dyn Error + Send + Sync>))
-        // }).keep_alive(KeepAlive::default());}
+            unimplemented!("Help")
+        } // return Sse::new(stream! {}).keep_alive(KeepAlive::default())}
+          //     yield Err(axum::Error::new(Box::new(
+          //         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Model {e} not found"))
+          //     ) as Box<dyn Error + Send + Sync>))
+          // }).keep_alive(KeepAlive::default());}
     };
 
     tracing::debug!(
@@ -546,25 +551,36 @@ pub async fn sse_post(
         relevant_data.retrieved_entries
     );
 
-    let model_input =combined_relevant_data_and_input(&relevant_data.retrieved_entries, &payload.text.clone());
+    let model_input =
+        combined_relevant_data_and_input(&relevant_data.retrieved_entries, &payload.text.clone());
     match llms.read().await.get(&payload.model.clone()) {
         Some(llm_model) => {
-            let mut model_stream = llm_model.write().await.stream(model_input).await;
-            let vector_data = match create_assist_response_from(&relevant_data.retrieved_public_keys) {
-                Ok(vector_data) => vector_data,
-                Err(e) => {unimplemented!("Help")} // return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            let mut model_stream = match llm_model.write().await.stream(model_input).await {
+                Ok(model_stream) => model_stream,
+                Err(e) => {
+                    unimplemented!("Help")
+                } // return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             };
-        
-            Sse::new(Box::pin(stream!{
+            let vector_data =
+                match create_assist_response_from(&relevant_data.retrieved_public_keys) {
+                    Ok(vector_data) => vector_data,
+                    Err(e) => {
+                        unimplemented!("Help")
+                    } // return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                };
+
+            Sse::new(Box::pin(stream! {
                 yield Event::default().json_data(vector_data);
                 while let Some(msg) = model_stream.next().await {
                     yield Ok(Event::default().data(msg.unwrap().unwrap()));
                 }
-            })).keep_alive(KeepAlive::default())
-        },
-        None => {unimplemented!("Help")}
-        // Sse::new(stream!{yield Event::default().data(
-        //     format!("Model {} not found", payload.model)
-        // )}).keep_alive(KeepAlive::default())
+            }))
+            .keep_alive(KeepAlive::default())
+        }
+        None => {
+            unimplemented!("Help")
+        } // Sse::new(stream!{yield Event::default().data(
+          //     format!("Model {} not found", payload.model)
+          // )}).keep_alive(KeepAlive::default())
     }
 }

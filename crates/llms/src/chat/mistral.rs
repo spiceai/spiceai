@@ -250,7 +250,6 @@ impl MistralLlama {
 
 #[async_trait]
 impl Chat for MistralLlama {
-
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
         let r = self.to_request(prompt);
         self.pipeline
