@@ -16,18 +16,26 @@ limitations under the License.
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use async_openai::types::EmbeddingInput;
+use async_stream::stream;
 use axum::{
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Extension, Json,
 };
+
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 
 use itertools::Itertools;
+use llms::chat::Chat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, error::Error, sync::Arc};
 use tokio::sync::RwLock;
+
+use futures::{FutureExt, Stream, StreamExt};
 
 use crate::{
     datafusion::DataFusion, embeddings::table::EmbeddingTable, model::LLMModelStore,
@@ -49,7 +57,7 @@ pub(crate) struct AssistResponse {
     pub from: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct Request {
     pub text: String,
@@ -216,11 +224,9 @@ async fn vector_search(
     Ok(response)
 }
 
-#[allow(clippy::from_iter_instead_of_collect)]
-fn create_assist_response(
-    text: String,
+fn create_assist_response_from(
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
-) -> Result<AssistResponse, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
     let from_value_iter = table_primary_keys
         .iter()
         .map(|(tbl, pks)| {
@@ -244,10 +250,133 @@ fn create_assist_response(
 
     let from_value: HashMap<String, Value> =
         HashMap::from_iter(from_value_iter.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    Ok(from_value)
+}
+
+#[allow(clippy::from_iter_instead_of_collect)]
+fn create_assist_response(
+    text: String,
+    table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
+) -> Result<AssistResponse, Box<dyn std::error::Error>> {
     Ok(AssistResponse {
         text,
-        from: from_value,
+        from: create_assist_response_from(table_primary_keys)?,
     })
+}
+
+
+async fn prepare_and_run_vector_search(
+    app: Arc<RwLock<Option<App>>>,
+    df: Arc<DataFusion>,
+    embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    llms: Arc<RwLock<LLMModelStore>>,
+    payload: Request,
+) -> Result<VectorSearchResponse, Box<dyn std::error::Error>> {
+    // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
+    let embeddings_to_run = find_relevant_embedding_models(
+        payload
+            .data_source
+            .iter()
+            .map(TableReference::from)
+            .collect(),
+        Arc::clone(&df),
+    )
+    .await?;
+
+    // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
+    let embedded_inputs = create_input_embeddings(
+        &payload.text.clone(),
+        embeddings_to_run.values().flatten().cloned().collect(),
+        Arc::clone(&embeddings),
+    )
+    .await?;
+
+    let per_table_embeddings: HashMap<TableReference, _> = embeddings_to_run
+        .iter()
+        .map(|(t, model_names)| {
+            let z: Vec<_> = model_names
+                .iter()
+                .filter_map(|m| embedded_inputs.get(m).cloned())
+                .collect();
+            (t.clone(), z)
+        })
+        .collect();
+
+    // Retrieve primary keys
+    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
+
+    // Explicit primary keys are defined in the spicepod configuration.
+    let explicit_primary_keys: HashMap<TableReference, Vec<String>> =
+        app.read().await.as_ref().map_or(HashMap::new(), |app| {
+            app.datasets
+                .iter()
+                .filter_map(|d| {
+                    d.embeddings
+                        .iter()
+                        .find_map(|e| e.primary_keys.clone())
+                        .map(|pks| (TableReference::parse_str(&d.name), pks))
+                })
+                .collect::<HashMap<TableReference, Vec<_>>>()
+        });
+    for tbl in embeddings_to_run.keys() {
+        if let Some(tbl_ref) = df.get_table(tbl.clone()).await {
+            // If we can derive the primary key(s) of the table from the [`TableProvider`] constraints, use that.
+            if let Some(constraints) = tbl_ref.constraints() {
+                if let Some(pks) = constraints.iter().find_map(|c| match c {
+                    Constraint::PrimaryKey(columns) => Some(columns),
+                    Constraint::Unique(_) => None,
+                }) {
+                    let schema_projection = match tbl_ref.schema().project(pks) {
+                        Ok(schema_projection) => schema_projection,
+                        Err(e) => {
+                            return Err(Box::new(e))
+                        }
+                    };
+                    tbl_to_pks.insert(
+                        tbl.clone(),
+                        schema_projection
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+
+            // Otherwise, if we have explicit primary keys defined in the spicepod configuration, use that.
+            } else if let Some(pks) = explicit_primary_keys.get(tbl) {
+                tbl_to_pks.insert(tbl.clone(), pks.clone());
+            }
+        }
+    }
+
+    // Vector search to get relevant data from data sources.
+    vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await
+}
+
+async fn context_aware_chat(
+    model: &RwLock<Box<dyn Chat>>,
+    vector_search_data: &VectorSearchResponse,
+    user_input: String,
+) -> Response {
+    // Using returned data, create input for LLM.
+    let model_input =
+        combined_relevant_data_and_input(&vector_search_data.retrieved_entries, &user_input);
+
+    match model.write().await.run(model_input).await {
+        Ok(Some(assist)) => {
+            match create_assist_response(assist, &vector_search_data.retrieved_public_keys) {
+                Ok(assist_response) => (StatusCode::OK, Json(assist_response)).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Ok(None) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No response from LLM".to_string(),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
@@ -300,127 +429,89 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
-    // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
-    let embeddings_to_run = match find_relevant_embedding_models(
-        payload
-            .data_source
-            .iter()
-            .map(TableReference::from)
-            .collect(),
+    let relevant_data =  match prepare_and_run_vector_search(
+        Arc::clone(&app),
         Arc::clone(&df),
-    )
-    .await
-    {
-        Ok(embeddings_to_run) => embeddings_to_run,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-
-    // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
-    let embedded_inputs = match create_input_embeddings(
-        &payload.text.clone(),
-        embeddings_to_run.values().flatten().cloned().collect(),
         Arc::clone(&embeddings),
-    )
-    .await
-    {
-        Ok(embedded_inputs) => embedded_inputs,
+        Arc::clone(&llms),
+        payload.clone(),
+    ).await {
+        Ok(relevant_data) => relevant_data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let per_table_embeddings: HashMap<TableReference, _> = embeddings_to_run
-        .iter()
-        .map(|(t, model_names)| {
-            let z: Vec<_> = model_names
-                .iter()
-                .filter_map(|m| embedded_inputs.get(m).cloned())
-                .collect();
-            (t.clone(), z)
-        })
-        .collect();
-
-    // Retrieve primary keys
-    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
-
-    // Explicit primary keys are defined in the spicepod configuration.
-    let explicit_primary_keys: HashMap<TableReference, Vec<String>> =
-        app.read().await.as_ref().map_or(HashMap::new(), |app| {
-            app.datasets
-                .iter()
-                .filter_map(|d| {
-                    d.embeddings
-                        .iter()
-                        .find_map(|e| e.primary_keys.clone())
-                        .map(|pks| (TableReference::parse_str(&d.name), pks))
-                })
-                .collect::<HashMap<TableReference, Vec<_>>>()
-        });
-    for tbl in embeddings_to_run.keys() {
-        if let Some(tbl_ref) = df.get_table(tbl.clone()).await {
-            // If we can derive the primary key(s) of the table from the [`TableProvider`] constraints, use that.
-            if let Some(constraints) = tbl_ref.constraints() {
-                if let Some(pks) = constraints.iter().find_map(|c| match c {
-                    Constraint::PrimaryKey(columns) => Some(columns),
-                    Constraint::Unique(_) => None,
-                }) {
-                    let Ok(schema_projection) = tbl_ref.schema().project(pks) else {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Could not project primary keys for table {tbl}"),
-                        )
-                            .into_response();
-                    };
-                    tbl_to_pks.insert(
-                        tbl.clone(),
-                        schema_projection
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().clone())
-                            .collect::<Vec<_>>(),
-                    );
-                }
-
-            // Otherwise, if we have explicit primary keys defined in the spicepod configuration, use that.
-            } else if let Some(pks) = explicit_primary_keys.get(tbl) {
-                tbl_to_pks.insert(tbl.clone(), pks.clone());
-            }
-        }
-    }
-
-    // Vector search to get relevant data from data sources.
-    let relevant_data =
-        match vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await {
-            Ok(relevant_data) => relevant_data,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
     tracing::debug!(
         "Relevant data from vector search: {:#?}",
         relevant_data.retrieved_entries
     );
 
-    // Using returned data, create input for LLM.
-    let model_input =
-        combined_relevant_data_and_input(&relevant_data.retrieved_entries, &payload.text);
-
     // Run LLM with input.
     match llms.read().await.get(&payload.model) {
-        Some(llm_model) => match llm_model.write().await.run(model_input).await {
-            Ok(Some(assist)) => {
-                match create_assist_response(assist, &relevant_data.retrieved_public_keys) {
-                    Ok(assist_response) => (StatusCode::OK, Json(assist_response)).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-                }
-            }
-            Ok(None) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("No response from LLM {}", payload.model),
-            )
-                .into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
+        Some(llm_model) => context_aware_chat(&llm_model, &relevant_data, payload.text.clone()).await,
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Model {} not found", payload.model),
         )
             .into_response(),
+    }
+}
+
+
+async fn sse_post(
+    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(df): Extension<Arc<DataFusion>>,
+    Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Json(payload): Json<Request>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    // For now, force the user to specify which data.
+    // if payload.data_source.is_empty() {
+    //     return Sse::new(stream! {
+    //         yield Err(axum::Error::new(Box::new(
+    //             std::io::Error::new(std::io::ErrorKind::InvalidInput, "No data sources provided")
+    //         ) as Box<dyn Error + Send + Sync>))
+    //     }).keep_alive(KeepAlive::default());
+    // }
+
+    let relevant_data =  match prepare_and_run_vector_search(
+        Arc::clone(&app),
+        Arc::clone(&df),
+        Arc::clone(&embeddings),
+        Arc::clone(&llms),
+        payload.clone(),
+    ).await {
+        Ok(relevant_data) => relevant_data,
+        Err(e) => {unimplemented!("Help")} // return Sse::new(stream! {}).keep_alive(KeepAlive::default())}
+        //     yield Err(axum::Error::new(Box::new(
+        //         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Model {e} not found"))
+        //     ) as Box<dyn Error + Send + Sync>))
+        // }).keep_alive(KeepAlive::default());}
+    };
+
+    tracing::debug!(
+        "Relevant data from vector search: {:#?}",
+        relevant_data.retrieved_entries
+    );
+
+    let model_input =combined_relevant_data_and_input(&relevant_data.retrieved_entries, &payload.text.clone());
+    match llms.read().await.get(&payload.model.clone()) {
+        Some(llm_model) => {
+            let mut model_stream = llm_model.write().await.stream(model_input).await;
+            let vector_data = match create_assist_response_from(&relevant_data.retrieved_public_keys) {
+                Ok(vector_data) => vector_data,
+                Err(e) => {unimplemented!("Help")} // return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            };
+        
+            Sse::new(Box::pin(stream!{
+                yield Event::default().json_data(vector_data);
+                while let Some(msg) = model_stream.next().await {
+                    yield Ok(Event::default().data(msg.unwrap().unwrap()));
+                }
+            })).keep_alive(KeepAlive::default())
+        },
+        None => {unimplemented!("Help")}
+        // Sse::new(stream!{yield Event::default().data(
+        //     format!("Model {} not found", payload.model)
+        // )}).keep_alive(KeepAlive::default())
     }
 }

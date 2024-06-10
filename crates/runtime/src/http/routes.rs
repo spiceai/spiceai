@@ -70,6 +70,7 @@ pub(crate) fn routes(
             .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql", post(v1::nsql::post))
             .route("/v1/chat/completions", post(v1::chat::post))
+            .route("/v1/stream/chat/completions", post(v1::chat::sse_post))
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/assist", post(v1::assist::post))
             .layer(Extension(llms))

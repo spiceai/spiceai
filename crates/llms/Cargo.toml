@@ -16,6 +16,7 @@ snafu.workspace = true
 dirs = "5.0.1"
 serde_json.workspace = true
 async-openai = "0.21.0"
+async-stream.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }

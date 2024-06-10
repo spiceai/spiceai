@@ -11,20 +11,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::path::Path;
+use std::{path::Path, pin::Pin};
 
 use async_trait::async_trait;
+use futures::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+use async_stream::stream;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoice, ChatCompletionRequestAssistantMessage, ChatCompletionRequestFunctionMessage,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
-        CreateChatCompletionRequest, CreateChatCompletionResponse, Role,
+        ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage, ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, Role
     },
 };
 
@@ -126,6 +124,64 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 #[async_trait]
 pub trait Chat: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
+
+    // BoxStream<'a, Result<Option<String>>> { // } 
+    async fn stream<'a>(&mut self, prompt: String) -> Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>> {
+        let resp = self.run(prompt).await;
+        Box::pin(stream! {
+            yield resp
+        })
+    }
+
+    #[allow(deprecated)]
+    async fn chat_stream(
+        &mut self,
+        req: CreateChatCompletionRequest,
+    ) -> ChatCompletionResponseStream {
+        let model_id = req.model.clone();
+        let prompt = req
+            .messages
+            .iter()
+            .map(message_to_content)
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let mut stream = self.stream(prompt).await;
+        let strm = stream!{
+            let mut i  = 0;
+            while let Some(msg) = stream.next().await {
+                let choice = ChatChoiceStream {
+                    delta: ChatCompletionStreamResponseDelta {
+                        content: Some(msg?.unwrap_or_default()),
+                        tool_calls: None,
+                        role: Some(Role::System),
+                        function_call: None,
+                    },
+                    index: i,
+                    finish_reason: None,
+                    logprobs: None,
+                };
+    
+            yield Ok(CreateChatCompletionStreamResponse {
+                id: "42".to_string(),
+                choices: vec![choice],
+                model: model_id.clone(),
+                created: 0,
+                system_fingerprint: None,
+                object: "list".to_string(),
+            }
+            .into());
+            i+=1;
+        }};
+
+        Box::pin(strm.map_err(|e: Error| OpenAIError::ApiError(ApiError {
+            message: e.to_string(),
+            r#type: None,
+            param: None,
+            code: None,
+        })))
+        
+    }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
