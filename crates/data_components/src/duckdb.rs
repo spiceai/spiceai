@@ -258,6 +258,16 @@ impl DuckDB {
         self.pool.connect().await.context(DbConnectionSnafu)
     }
 
+    fn connect_sync(
+        &self,
+    ) -> Result<
+        Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
+    > {
+        Arc::clone(&self.pool)
+            .connect_sync()
+            .context(DbConnectionSnafu)
+    }
+
     fn duckdb_conn<'a>(
         db_connection: &'a mut Box<
             dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>,
@@ -282,38 +292,7 @@ impl DuckDB {
         result
     }
 
-    fn insert_batch<'a>(
-        &self,
-        duckdb_conn: &'a mut DuckDbConnection,
-        mut transaction: Transaction<'a>,
-        batch: &RecordBatch,
-    ) -> Result<Transaction<'a>> {
-        let result = self.try_insert_batch(&transaction, batch);
-
-        match result {
-            Ok(_) => return Ok(transaction),
-            Err(e)
-                if e.to_string()
-                    .contains("Current transaction is aborted (please ROLLBACK)") =>
-            {
-                transaction
-                    .rollback()
-                    .context(UnableToRollbackTransactionSnafu)?;
-
-                transaction = duckdb_conn
-                    .conn
-                    .transaction()
-                    .context(UnableToBeginTransactionSnafu)?;
-
-                self.try_insert_batch(&transaction, batch)?;
-
-                Ok(transaction)
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    fn try_insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
+    fn insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
         let mut appender = transaction
             .appender(&self.table_name)
             .context(UnableToGetAppenderToDuckDBTableSnafu)?;

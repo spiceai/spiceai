@@ -31,6 +31,8 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
 };
+use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+use duckdb::Transaction;
 use futures::StreamExt;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::Engine;
@@ -113,9 +115,7 @@ impl DataSink for DuckDBDataSink {
         data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        let mut num_rows = 0;
-
-        let mut db_conn = self.duckdb.connect().await.map_err(to_datafusion_error)?;
+        let mut db_conn = self.duckdb.connect_sync().map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
         let data_batches_result = data
@@ -126,30 +126,41 @@ impl DataSink for DuckDBDataSink {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-        for data_batch in &data_batches {
-            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
-                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
-            })?;
-        }
-
-        let mut tx = duckdb_conn
+        let tx = duckdb_conn
             .conn
             .transaction()
             .context(super::UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        if self.overwrite {
-            self.duckdb
-                .delete_all_table_data(&tx)
-                .map_err(to_datafusion_error)?;
-        }
+        let num_rows = match self.try_write_all(&tx, &data_batches) {
+            Ok(num_rows) => num_rows,
+            Err(e)
+                if e.to_string()
+                    .contains("Current transaction is aborted (please ROLLBACK)") =>
+            {
+                tx.rollback()
+                    .context(super::UnableToRollbackTransactionSnafu)
+                    .map_err(to_datafusion_error)?;
 
-        for batch in data_batches {
-            tx = self
-                .duckdb
-                .insert_batch(duckdb_conn, tx, &batch)
-                .map_err(to_datafusion_error)?;
-        }
+                let mut db_conn = self.duckdb.connect_sync().map_err(to_datafusion_error)?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
+
+                let tx = duckdb_conn
+                    .conn
+                    .transaction()
+                    .context(super::UnableToBeginTransactionSnafu)
+                    .map_err(to_datafusion_error)?;
+
+                let num_rows = self.try_write_all(&tx, &data_batches)?;
+
+                tx.commit()
+                    .context(super::UnableToCommitDuckDBTransactionSnafu)
+                    .map_err(to_datafusion_error)?;
+
+                return Ok(num_rows);
+            }
+            Err(e) => return Err(e),
+        };
 
         tx.commit()
             .context(super::UnableToCommitDuckDBTransactionSnafu)
@@ -162,6 +173,34 @@ impl DataSink for DuckDBDataSink {
 impl DuckDBDataSink {
     fn new(duckdb: Arc<DuckDB>, overwrite: bool) -> Self {
         Self { duckdb, overwrite }
+    }
+
+    fn try_write_all(
+        &self,
+        tx: &Transaction<'_>,
+        data_batches: &Vec<RecordBatch>,
+    ) -> datafusion::common::Result<u64> {
+        let mut num_rows = 0;
+
+        for data_batch in data_batches {
+            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
+                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
+            })?;
+        }
+
+        if self.overwrite {
+            self.duckdb
+                .delete_all_table_data(&tx)
+                .map_err(to_datafusion_error)?;
+        }
+
+        for batch in data_batches {
+            self.duckdb
+                .insert_batch(&tx, batch)
+                .map_err(to_datafusion_error)?;
+        }
+
+        Ok(num_rows)
     }
 }
 
