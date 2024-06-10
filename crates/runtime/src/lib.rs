@@ -102,6 +102,9 @@ pub enum Error {
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
+    #[snafu(display("Failed to start heartbeat"))]
+    UnableToStartHeartbeat {},
+
     #[snafu(display("{source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -880,14 +883,18 @@ impl Runtime {
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;
 
+            let df = Arc::clone(&self.df);
+
             if let Some(metrics_table) = metrics_table {
                 recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
             } else {
                 tracing::debug!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&Arc::clone(&self.df))
+                MetricsRecorder::register_metrics_table(&df)
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
+
+            tokio::spawn(Runtime::start_heartbeat(df));
 
             recorder.start(&self.df);
         }
@@ -925,6 +932,23 @@ impl Runtime {
                 tracing::info!("Goodbye!");
                 Ok(())
             },
+        }
+    }
+
+    async fn start_heartbeat(datafusion: Arc<DataFusion>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            interval.tick().await;
+
+            let tables = datafusion
+                .get_public_table_names()
+                .unwrap_or(vec![])
+                .join(",");
+
+            let labels = vec![("datasets", tables)];
+
+            metrics::counter!("heartbeat", &labels).increment(1);
         }
     }
 
