@@ -193,6 +193,12 @@ impl AcceleratorExternalTableBuilder {
         }
 
         if !self.indexes.is_empty() {
+            if let Err(e) = Acceleration::validate_indexes(&self.indexes, &self.schema) {
+                InvalidConfigurationSnafu {
+                    msg: format!("{e}"),
+                }
+                .fail()?;
+            };
             let indexes_option_str = Acceleration::indexes_to_option_string(&self.indexes);
             options.insert("indexes".to_string(), indexes_option_str);
         }
