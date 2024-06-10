@@ -457,7 +457,7 @@ pub(crate) async fn post(
 }
 
 
-async fn sse_post(
+pub async fn sse_post(
     Extension(app): Extension<Arc<RwLock<Option<App>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
@@ -481,7 +481,9 @@ async fn sse_post(
         payload.clone(),
     ).await {
         Ok(relevant_data) => relevant_data,
-        Err(e) => {unimplemented!("Help")} // return Sse::new(stream! {}).keep_alive(KeepAlive::default())}
+        Err(e) => {
+            println!("Error from prepare_and_run_vector_search: {e}");
+            unimplemented!("Help")} // return Sse::new(stream! {}).keep_alive(KeepAlive::default())}
         //     yield Err(axum::Error::new(Box::new(
         //         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Model {e} not found"))
         //     ) as Box<dyn Error + Send + Sync>))
