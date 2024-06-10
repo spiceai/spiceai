@@ -29,6 +29,7 @@ pub mod model;
 pub mod params;
 pub mod runtime;
 pub mod secrets;
+pub mod view;
 
 pub trait WithDependsOn<T> {
     fn depends_on(&self, depends_on: &[String]) -> T;

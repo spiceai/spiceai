@@ -92,6 +92,8 @@ datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
+async-openai = "0.21.0"
+derive_builder = "0.20.0"
 
 [dev-dependencies]
 bollard = "0.16.1"
@@ -102,6 +104,7 @@ tracing-subscriber.workspace = true
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
+spiceai-dataset-test = []
 duckdb = [
     "dep:duckdb",
     "r2d2",

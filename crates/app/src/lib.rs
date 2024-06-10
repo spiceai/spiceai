@@ -28,6 +28,7 @@ use spicepod::{
         model::Model,
         runtime::{ResultsCache, Runtime},
         secrets::{Secrets, SpiceSecretStore},
+        view::View,
     },
     Spicepod,
 };
@@ -41,6 +42,8 @@ pub struct App {
     pub extensions: HashMap<String, Extension>,
 
     pub datasets: Vec<Dataset>,
+
+    pub views: Vec<View>,
 
     pub models: Vec<Model>,
 
@@ -69,6 +72,7 @@ pub struct AppBuilder {
     secrets: Secrets,
     extensions: HashMap<String, Extension>,
     datasets: Vec<Dataset>,
+    views: Vec<View>,
     models: Vec<Model>,
     llms: Vec<Llm>,
     embeddings: Vec<Embeddings>,
@@ -83,6 +87,7 @@ impl AppBuilder {
             secrets: Secrets::default(),
             extensions: HashMap::new(),
             datasets: vec![],
+            views: vec![],
             models: vec![],
             llms: vec![],
             embeddings: vec![],
@@ -96,6 +101,7 @@ impl AppBuilder {
         self.secrets = spicepod.secrets.clone();
         self.extensions.extend(spicepod.extensions.clone());
         self.datasets.extend(spicepod.datasets.clone());
+        self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.llms.extend(spicepod.llms.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
@@ -118,6 +124,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_dataset(mut self, dataset: Dataset) -> AppBuilder {
         self.datasets.push(dataset);
+        self
+    }
+
+    #[must_use]
+    pub fn with_view(mut self, view: View) -> AppBuilder {
+        self.views.push(view);
         self
     }
 
@@ -152,6 +164,7 @@ impl AppBuilder {
             secrets: self.secrets,
             extensions: self.extensions,
             datasets: self.datasets,
+            views: self.views,
             models: self.models,
             llms: self.llms,
             embeddings: self.embeddings,
@@ -168,12 +181,17 @@ impl AppBuilder {
         let runtime = spicepod_root.runtime.clone();
         let extensions = spicepod_root.extensions.clone();
         let mut datasets: Vec<Dataset> = vec![];
+        let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut llms: Vec<Llm> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
 
         for dataset in &spicepod_root.datasets {
             datasets.push(dataset.clone());
+        }
+
+        for view in &spicepod_root.views {
+            views.push(view.clone());
         }
 
         for model in &spicepod_root.models {
@@ -200,6 +218,9 @@ impl AppBuilder {
             for dataset in &dependent_spicepod.datasets {
                 datasets.push(dataset.clone());
             }
+            for view in &dependent_spicepod.views {
+                views.push(view.clone());
+            }
             for model in &dependent_spicepod.models {
                 models.push(model.clone());
             }
@@ -219,6 +240,7 @@ impl AppBuilder {
             secrets,
             extensions,
             datasets,
+            views,
             models,
             embeddings,
             llms,

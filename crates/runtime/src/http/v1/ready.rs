@@ -13,7 +13,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-pub mod array_distance;
-pub mod connector;
-pub mod execution_plan;
-pub mod table;
+
+use std::sync::Arc;
+
+use crate::datafusion::DataFusion;
+use axum::{
+    http::status,
+    response::{IntoResponse, Response},
+    Extension,
+};
+
+pub(crate) async fn get(Extension(df): Extension<Arc<DataFusion>>) -> Response {
+    if df.is_initial_load_complete() {
+        return (status::StatusCode::OK, "Ready").into_response();
+    }
+    (status::StatusCode::SERVICE_UNAVAILABLE, "Not Ready").into_response()
+}

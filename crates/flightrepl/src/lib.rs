@@ -32,7 +32,7 @@ use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use futures::{StreamExt, TryStreamExt};
-use llms::nql::NSQLRuntime;
+use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
@@ -67,7 +67,7 @@ async fn send_nsql_request(
     client: &Client,
     base_url: String,
     query: String,
-    runtime: NSQLRuntime,
+    runtime: LlmRuntime,
 ) -> Result<String, reqwest::Error> {
     client
         .post(format!("{base_url}/v1/nsql"))
@@ -294,7 +294,7 @@ async fn get_and_display_nql_records(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
-    let resp = send_nsql_request(&Client::new(), endpoint, query, NSQLRuntime::Openai).await?;
+    let resp = send_nsql_request(&Client::new(), endpoint, query, LlmRuntime::Openai).await?;
 
     let jsonl_resp = json_array_to_jsonl(&resp)?;
 
