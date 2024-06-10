@@ -161,6 +161,7 @@ impl Builder {
         self.cache_provider = cache_provider;
         self
     }
+
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -272,6 +273,11 @@ impl AcceleratedTable {
         }
 
         Ok(())
+    }
+
+    #[must_use]
+    pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.federated)
     }
 
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {

@@ -32,26 +32,39 @@ use crate::{init_tracing, run_query_and_check_results, ValidateFn};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
-#[derive(SimpleObject)]
+#[derive(SimpleObject, Clone, Debug)]
 struct Post {
     id: String,
     title: String,
     content: String,
 }
 
-#[derive(SimpleObject)]
+#[derive(SimpleObject, Clone, Debug)]
 struct User {
     id: String,
     name: String,
     posts: Vec<Post>,
 }
 
-struct QueryRoot;
+#[derive(SimpleObject, Clone, Debug)]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: String,
+}
 
-#[Object]
-impl QueryRoot {
-    async fn users(&self) -> Vec<User> {
-        vec![
+#[derive(SimpleObject, Clone)]
+struct UsersPaginated {
+    users: Vec<User>,
+    page_info: PageInfo,
+}
+
+struct UserService {
+    users: Vec<User>,
+}
+
+impl UserService {
+    fn new() -> Self {
+        let users = vec![
             User {
                 id: "1".to_string(),
                 name: "John Doe".to_string(),
@@ -116,7 +129,47 @@ impl QueryRoot {
                     },
                 ],
             },
-        ]
+        ];
+
+        Self { users }
+    }
+
+    fn users(&self) -> Vec<User> {
+        self.users.clone()
+    }
+
+    fn paginated_users(&self, first: usize, after: Option<String>) -> Vec<User> {
+        match after {
+            Some(after_id) => self
+                .users()
+                .into_iter()
+                .skip_while(|user| user.id <= after_id)
+                .take(first)
+                .collect(),
+            None => self.users().into_iter().take(first).collect(),
+        }
+    }
+}
+
+struct QueryRoot;
+
+#[Object]
+impl QueryRoot {
+    async fn users(&self) -> Vec<User> {
+        UserService::new().users()
+    }
+
+    async fn paginated_users(&self, first: usize, after: Option<String>) -> UsersPaginated {
+        let users_service = UserService::new();
+        let users = users_service.paginated_users(first, after);
+        let last_id = unsafe { users_service.users().last().unwrap_unchecked().id.clone() };
+        let last_fetched = unsafe { users.last().unwrap_unchecked().id.clone() };
+
+        let page_info = PageInfo {
+            has_next_page: last_fetched < last_id,
+            end_cursor: last_fetched,
+        };
+        UsersPaginated { users, page_info }
     }
 }
 
@@ -155,14 +208,11 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
     Ok((tx, addr))
 }
 
-fn make_graphql_dataset(path: &str, name: &str) -> Dataset {
+fn make_graphql_dataset(path: &str, name: &str, query: &str, json_path: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
     let params = HashMap::from([
-        ("json_path".to_string(), "data.users".to_string()),
-        (
-            "query".to_string(),
-            "query { users { id name posts { id title content } } }".to_string(),
-        ),
+        ("json_path".to_string(), json_path.to_string()),
+        ("query".to_string(), query.to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -178,6 +228,8 @@ async fn test_graphql() -> Result<(), String> {
         .with_dataset(make_graphql_dataset(
             &format!("http://{addr}/graphql"),
             "test_graphql",
+            "query { users { id name posts { id title content } } }",
+            "data.users",
         ))
         .build();
     let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
@@ -226,6 +278,93 @@ async fn test_graphql() -> Result<(), String> {
                     assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
                     assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                 }
+            })),
+        ),
+    ];
+
+    for (query, expected_plan, validate_result) in queries {
+        run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
+    }
+
+    tx.send(()).map_err(|()| {
+        tracing::error!("Failed to send shutdown signal");
+        "Failed to send shutdown signal".to_string()
+    })?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_graphql_pagination() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let (tx, addr) = start_server().await?;
+    tracing::debug!("Server started at {}", addr);
+    let app = AppBuilder::new("graphql_integration_test")
+        .with_dataset(make_graphql_dataset(
+            &format!("http://{addr}/graphql"),
+            "test_graphql",
+            "query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
+            "data.paginatedUsers.users",
+        ))
+        .build();
+    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            return Err("Timed out waiting for datasets to load".to_string());
+        }
+        () = rt.load_datasets() => {}
+    }
+
+    let queries: QueryTests = vec![
+        (
+            "SELECT * FROM test_graphql",
+            vec![
+                "+---------------+------------------------------------------------------+",
+                "| plan_type     | plan                                                 |",
+                "+---------------+------------------------------------------------------+",
+                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |",
+                "| physical_plan | MemoryExec: partitions=2, partition_sizes=[2, 2]     |",
+                "|               |                                                      |",
+                "+---------------+------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                let mut total = 0;
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                    total += batch.num_rows();
+                }
+                assert_eq!(total, 4);
+            })),
+        ),
+        (
+            "SELECT * FROM test_graphql where id = '4' limit 1",
+            vec![
+                "+---------------+------------------------------------------------------------+",
+                "| plan_type     | plan                                                       |",
+                "+---------------+------------------------------------------------------------+",
+                "| logical_plan  | Limit: skip=0, fetch=1                                     |",
+                "|               |   Filter: test_graphql.id = Utf8(\"4\")                      |",
+                "|               |     TableScan: test_graphql projection=[id, name, posts]   |",
+                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                           |",
+                "|               |   CoalescePartitionsExec                                   |",
+                "|               |     LocalLimitExec: fetch=1                                |",
+                "|               |       CoalesceBatchesExec: target_batch_size=8192          |",
+                "|               |         FilterExec: id@0 = 4                               |",
+                "|               |           MemoryExec: partitions=2, partition_sizes=[2, 2] |",
+                "|               |                                                            |",
+                "+---------------+------------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                let mut total = 0;
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                    total += batch.num_rows();
+                }
+                assert_eq!(total, 1);
             })),
         ),
     ];

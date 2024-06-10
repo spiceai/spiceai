@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 pub mod metadata;
 pub mod text;
@@ -68,26 +68,75 @@ impl ObjectStoreContext {
     }
 }
 
+pub(crate) fn get_prefix(url: &Url) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    match url.scheme() {
+        "ftp" | "sftp" => Ok(PathBuf::from(url.path())),
+        _ => {
+            let (_, obj_prefix) = object_store::parse_url(url)?;
+            let obj_prefix_path = PathBuf::from(&obj_prefix.to_string()); // Convert to std::path::PathBuf
+            Ok(obj_prefix_path)
+        }
+    }
+}
+
 pub(crate) fn parse_prefix_and_regex(
     url: &Url,
     extension: Option<String>,
 ) -> Result<(String, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
-    let (_store, prefix) = object_store::parse_url(url)?;
+    let prefix = get_prefix(url)?;
 
     if let Some(_ext) = prefix.extension() {
         // Prefix is not collection, but a single file
-        let filename = prefix.filename().unwrap_or_default();
+        let filename = prefix
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         Ok((
             prefix
+                .to_string_lossy()
                 .to_string()
-                .strip_suffix(filename)
+                .strip_suffix(filename.as_str())
                 .unwrap_or_default()
                 .to_string(),
             Some(filename.to_string()),
         ))
     } else if let Some(ext) = extension {
-        Ok((prefix.to_string(), Some(format!(r"^.*\{ext}$"))))
+        Ok((
+            prefix.to_string_lossy().to_string(),
+            Some(format!(r"^.*\{ext}$")),
+        ))
     } else {
-        Ok((prefix.to_string(), None))
+        Ok((prefix.to_string_lossy().to_string(), None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn parse_prefix_and_regex() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use super::*;
+
+        let url = Url::parse("file:///tmp/")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, None)?;
+        assert_eq!(prefix, "tmp");
+        assert_eq!(regex, None);
+
+        let url = Url::parse("file:///tmp/")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string()))?;
+        assert_eq!(prefix, "tmp");
+        assert_eq!(regex, Some(r"^.*\txt$".to_string()));
+
+        let url = Url::parse("sftp://username:password@sftp.example.com:22/path/to/file.txt")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, None)?;
+        assert_eq!(prefix, "/path/to/");
+        assert_eq!(regex, Some("file.txt".to_string()));
+
+        let url = Url::parse("ftp://username:password@ftp.example.com:21/path/to/file")?;
+        let (prefix, regex) = parse_prefix_and_regex(&url, Some("txt".to_string()))?;
+        assert_eq!(prefix, "/path/to/file");
+        assert_eq!(regex, Some(r"^.*\txt$".to_string()));
+        Ok(())
     }
 }
