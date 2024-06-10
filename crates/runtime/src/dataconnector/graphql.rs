@@ -17,16 +17,15 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
+use async_stream::stream;
 use async_trait::async_trait;
-use data_components::arrow::write::MemTable;
 use datafusion::{
-    datasource::{TableProvider, TableType},
+    datasource::{streaming::StreamingTable, TableProvider, TableType},
     error::DataFusionError,
-    execution::context::SessionState,
+    execution::{context::SessionState, SendableRecordBatchStream},
     logical_expr::Expr,
-    physical_plan::ExecutionPlan,
+    physical_plan::{stream::RecordBatchStreamAdapter, streaming::PartitionStream, ExecutionPlan},
 };
-use futures::TryFutureExt;
 use regex::Regex;
 use reqwest::{
     header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT},
@@ -78,7 +77,7 @@ Please verify the syntax of your GraphQL query."#
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct PaginationParameters {
     resource_name: String,
     count: usize,
@@ -166,11 +165,13 @@ impl PaginationParameters {
     }
 }
 
+#[derive(Clone)]
 enum Auth {
     Basic(String, Option<String>),
     Bearer(String),
 }
 
+#[derive(Clone)]
 struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
@@ -269,28 +270,60 @@ impl GraphQLClient {
         Ok((res, schema, next_cursor))
     }
 
-    async fn execute_paginated(
-        &self,
-        schema: SchemaRef,
-        limit: Option<usize>,
-    ) -> Result<Vec<Vec<RecordBatch>>> {
-        let (first_batch, _, mut next_cursor) =
-            self.execute(Some(Arc::clone(&schema)), limit, None).await?;
-        let mut res = vec![first_batch];
-        let mut limit = limit;
-
-        while let Some(next_cursor_val) = next_cursor {
-            limit = limit.map(|l| {
-                l.saturating_sub(self.pagination_parameters.as_ref().map_or(0, |x| x.count))
-            });
-            let (next_batch, _, new_cursor) = self
-                .execute(Some(Arc::clone(&schema)), limit, Some(next_cursor_val))
-                .await?;
-            next_cursor = new_cursor;
-            res.push(next_batch);
+    async fn execute_paginated(&self, schema: SchemaRef, limit: Option<usize>) -> GraphQLPartition {
+        GraphQLPartition {
+            schema,
+            limit,
+            client: self.clone(),
         }
+    }
+}
 
-        Ok(res)
+struct GraphQLPartition {
+    schema: SchemaRef,
+    client: GraphQLClient,
+    limit: Option<usize>,
+}
+
+impl PartitionStream for GraphQLPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _: Arc<datafusion::execution::TaskContext>) -> SendableRecordBatchStream {
+        let stream = {
+            let schema_ref = Arc::clone(&self.schema);
+            let client = self.client.clone();
+            let limit = self.limit.clone();
+            stream! {
+                let (first_batch, _, mut next_cursor) =
+                client.execute(Some(Arc::clone(&schema_ref)), limit, None).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                for batch in first_batch {
+                    yield Ok(batch);
+                }
+                let mut limit = limit;
+
+                while let Some(next_cursor_val) = next_cursor {
+                    limit = limit.map(|l| {
+                        l.saturating_sub(client.pagination_parameters.as_ref().map_or(0, |x| x.count))
+                    });
+                    let (next_batch, _, new_cursor) =
+                        client
+                        .execute(Some(Arc::clone(&schema_ref)), limit, Some(next_cursor_val))
+                        .await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                    next_cursor = new_cursor;
+                    for batch in next_batch {
+                        println!("{:?}", batch);
+                        yield Ok(batch);
+                    }
+                }
+            }
+        };
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        ))
     }
 }
 
@@ -404,10 +437,12 @@ impl TableProvider for GraphQLTableProvider {
         let res = self
             .client
             .execute_paginated(Arc::clone(&self.schema), limit)
-            .map_err(|e| DataFusionError::Execution(format!("{e}")))
-            .await?;
+            .await;
 
-        let table = MemTable::try_new(Arc::clone(&self.schema), res)?;
+        let partitions: Vec<Arc<dyn PartitionStream>> =
+            vec![Arc::new(res) as Arc<dyn PartitionStream>];
+
+        let table = StreamingTable::try_new(Arc::clone(&self.schema), partitions)?;
 
         table.scan(state, projection, filters, limit).await
     }
