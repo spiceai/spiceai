@@ -2,6 +2,8 @@ use datafusion::logical_expr::Expr;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::{self, Engine};
 
+pub mod indexes;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to generate SQL: {source}"))]
