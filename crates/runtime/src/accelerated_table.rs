@@ -161,6 +161,7 @@ impl Builder {
         self.cache_provider = cache_provider;
         self
     }
+
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;

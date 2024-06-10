@@ -118,7 +118,7 @@ impl WithDependsOn<Dataset> for Dataset {
 
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
-    use std::fmt::Display;
+    use std::{collections::HashMap, fmt::Display};
 
     use crate::component::params::Params;
 
@@ -167,6 +167,23 @@ pub mod acceleration {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum IndexType {
+        #[default]
+        Enabled,
+        Unique,
+    }
+
+    impl Display for IndexType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                IndexType::Enabled => write!(f, "enabled"),
+                IndexType::Unique => write!(f, "unique"),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default = "default_true")]
@@ -207,6 +224,9 @@ pub mod acceleration {
 
         #[serde(default)]
         pub on_zero_results: ZeroResultsAction,
+
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub indexes: HashMap<String, IndexType>,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -234,6 +254,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
+                indexes: HashMap::default(),
             }
         }
     }

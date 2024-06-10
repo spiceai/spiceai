@@ -19,7 +19,9 @@ use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
-use arrow_sql_gen::statement::{CreateTableBuilder, Error as SqlGenError, InsertBuilder};
+use arrow_sql_gen::statement::{
+    CreateTableBuilder, Error as SqlGenError, IndexBuilder, InsertBuilder,
+};
 use async_trait::async_trait;
 use bb8_postgres::{
     tokio_postgres::{types::ToSql, Transaction},
@@ -43,9 +45,13 @@ use sql_provider_datafusion::{
     expr::{self, Engine},
     SqlTable,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
+use crate::{
+    delete::DeletionTableProviderAdapter,
+    util::indexes::{self, IndexType},
+    Read, ReadWrite,
+};
 
 use self::write::PostgresTableWriter;
 
@@ -81,6 +87,11 @@ pub enum Error {
 
     #[snafu(display("Unable to create the Postgres table: {source}"))]
     UnableToCreatePostgresTable {
+        source: tokio_postgres::error::Error,
+    },
+
+    #[snafu(display("Unable to create an index for the Postgres table: {source}"))]
+    UnableToCreateIndexForPostgresTable {
         source: tokio_postgres::error::Error,
     },
 
@@ -196,8 +207,19 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let name = cmd.name.to_string();
-        let options = cmd.options.clone();
+        let mut options = cmd.options.clone();
         let schema: Schema = cmd.schema.as_ref().into();
+
+        let indexes_option_str = options.remove("indexes");
+        let indexes = match indexes_option_str {
+            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+            None => HashMap::new(),
+        };
+
+        let indexes: Vec<(Vec<&str>, IndexType)> = indexes
+            .iter()
+            .map(|(key, ty)| (indexes::index_columns(key), *ty))
+            .collect();
 
         let params = Arc::new(options);
 
@@ -229,6 +251,13 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             .create_table(Arc::clone(&schema), &tx)
             .await
             .map_err(to_datafusion_error)?;
+
+        for index in indexes {
+            postgres
+                .create_index(&tx, index.0, index.1 == IndexType::Unique)
+                .await
+                .map_err(to_datafusion_error)?;
+        }
 
         tx.commit()
             .await
@@ -362,6 +391,26 @@ impl Postgres {
             .execute(&sql, &[])
             .await
             .context(UnableToCreatePostgresTableSnafu)?;
+
+        Ok(())
+    }
+
+    async fn create_index(
+        &self,
+        transaction: &Transaction<'_>,
+        columns: Vec<&str>,
+        unique: bool,
+    ) -> Result<()> {
+        let mut index_builder = IndexBuilder::new(&self.table_name, columns);
+        if unique {
+            index_builder = index_builder.unique();
+        }
+        let sql = index_builder.build_postgres();
+
+        transaction
+            .execute(&sql, &[])
+            .await
+            .context(UnableToCreateIndexForPostgresTableSnafu)?;
 
         Ok(())
     }
