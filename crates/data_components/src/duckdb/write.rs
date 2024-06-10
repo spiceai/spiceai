@@ -31,7 +31,6 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
 };
-use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use duckdb::Transaction;
 use futures::StreamExt;
 use snafu::prelude::*;
@@ -126,7 +125,7 @@ impl DataSink for DuckDBDataSink {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-        let tx = duckdb_conn
+        let mut tx = duckdb_conn
             .conn
             .transaction()
             .context(super::UnableToBeginTransactionSnafu)
@@ -138,26 +137,22 @@ impl DataSink for DuckDBDataSink {
                 if e.to_string()
                     .contains("Current transaction is aborted (please ROLLBACK)") =>
             {
+                tracing::debug!("Transaction aborted, rolling back and trying again.");
                 tx.rollback()
                     .context(super::UnableToRollbackTransactionSnafu)
                     .map_err(to_datafusion_error)?;
 
-                let mut db_conn = self.duckdb.connect_sync().map_err(to_datafusion_error)?;
+                db_conn = self.duckdb.connect_sync().map_err(to_datafusion_error)?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
-                let tx = duckdb_conn
+                tx = duckdb_conn
                     .conn
                     .transaction()
                     .context(super::UnableToBeginTransactionSnafu)
                     .map_err(to_datafusion_error)?;
 
-                let num_rows = self.try_write_all(&tx, &data_batches)?;
-
-                tx.commit()
-                    .context(super::UnableToCommitDuckDBTransactionSnafu)
-                    .map_err(to_datafusion_error)?;
-
-                return Ok(num_rows);
+                tracing::debug!("Retrying try_write_all.");
+                self.try_write_all(&tx, &data_batches)?
             }
             Err(e) => return Err(e),
         };
@@ -189,14 +184,16 @@ impl DuckDBDataSink {
         }
 
         if self.overwrite {
+            tracing::debug!("Deleting all data from table.");
             self.duckdb
-                .delete_all_table_data(&tx)
+                .delete_all_table_data(tx)
                 .map_err(to_datafusion_error)?;
         }
 
-        for batch in data_batches {
+        for (i, batch) in data_batches.iter().enumerate() {
+            tracing::debug!("Inserting batch #{i}/{} into table.", data_batches.len());
             self.duckdb
-                .insert_batch(&tx, batch)
+                .insert_batch(tx, batch)
                 .map_err(to_datafusion_error)?;
         }
 

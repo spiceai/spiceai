@@ -15,10 +15,34 @@ limitations under the License.
 */
 
 use datafusion::sql::TableReference;
+use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
 };
 use std::{collections::HashMap, time::Duration};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Column for index {index} not found in schema. Valid columns: {valid_columns}"
+    ))]
+    IndexColumnNotFound {
+        index: String,
+        valid_columns: String,
+    },
+
+    #[snafu(display("Unable to get table constraints: {source}"))]
+    UnableToGetTableConstraints {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to convert a SchemaRef to a DFSchema: {source}"))]
+    UnableToConvertSchemaRefToDFSchema {
+        source: datafusion::error::DataFusionError,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
@@ -77,7 +101,7 @@ pub struct Dataset {
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {
     type Error = crate::Error;
 
-    fn try_from(dataset: spicepod_dataset::Dataset) -> Result<Self, Self::Error> {
+    fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -107,7 +131,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
 }
 
 impl Dataset {
-    pub fn try_new(from: String, name: &str) -> Result<Self, crate::Error> {
+    pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(Dataset {
             from,
             name: Self::parse_table_reference(name)?,
@@ -128,7 +152,9 @@ impl Dataset {
         false
     }
 
-    pub(crate) fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
+    pub(crate) fn parse_table_reference(
+        name: &str,
+    ) -> std::result::Result<TableReference, crate::Error> {
         match TableReference::parse_str(name) {
             table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
                 Ok(table_ref)
@@ -313,8 +339,16 @@ impl Dataset {
 }
 
 pub mod acceleration {
+    use super::Result;
+    use arrow::datatypes::SchemaRef;
+    use data_components::util::indexes::index_columns;
+    use datafusion::{
+        common::{Constraints, DFSchema},
+        sql::sqlparser::ast::TableConstraint,
+    };
+    use snafu::prelude::*;
     use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
-    use std::{collections::HashMap, fmt::Display};
+    use std::{collections::HashMap, fmt::Display, sync::Arc};
 
     #[derive(Debug, Clone, PartialEq, Default)]
     pub enum RefreshMode {
@@ -410,7 +444,7 @@ pub mod acceleration {
     impl TryFrom<&str> for Engine {
         type Error = crate::Error;
 
-        fn try_from(engine: &str) -> Result<Self, Self::Error> {
+        fn try_from(engine: &str) -> std::result::Result<Self, Self::Error> {
             match engine.to_lowercase().as_str() {
                 "arrow" => Ok(Engine::Arrow),
                 "duckdb" => Ok(Engine::DuckDB),
@@ -427,7 +461,7 @@ pub mod acceleration {
     impl TryFrom<String> for Engine {
         type Error = crate::Error;
 
-        fn try_from(engine: String) -> Result<Self, Self::Error> {
+        fn try_from(engine: String) -> std::result::Result<Self, Self::Error> {
             Engine::try_from(engine.as_str())
         }
     }
@@ -506,6 +540,88 @@ pub mod acceleration {
                 .collect::<Vec<String>>()
                 .join(";")
         }
+
+        pub fn index_columns(indexes_key: &str) -> Vec<&str> {
+            // The key to an index can be either a single column or a compound index
+            if indexes_key.starts_with('(') {
+                // Compound index
+                let end = indexes_key.find(')').unwrap_or(indexes_key.len());
+                indexes_key[1..end]
+                    .split(',')
+                    .map(str::trim)
+                    .collect::<Vec<&str>>()
+            } else {
+                // Single column index
+                vec![indexes_key]
+            }
+        }
+
+        fn valid_columns(schema: &SchemaRef) -> String {
+            schema
+                .all_fields()
+                .into_iter()
+                .map(|f| f.name().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+
+        pub fn validate_indexes(&self, schema: &SchemaRef) -> Result<()> {
+            for column in self.indexes.keys() {
+                let index_columns = Self::index_columns(column);
+                for index_column in index_columns {
+                    if schema.field_with_name(index_column).is_err() {
+                        return super::IndexColumnNotFoundSnafu {
+                            index: index_column.to_string(),
+                            valid_columns: Self::valid_columns(schema),
+                        }
+                        .fail();
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        pub fn table_constraints(&self, schema: SchemaRef) -> Result<Option<Constraints>> {
+            if self.indexes.is_empty() {
+                return Ok(None);
+            }
+
+            self.validate_indexes(&schema)?;
+
+            let mut table_constraints: Vec<TableConstraint> = Vec::new();
+
+            self.indexes.iter().for_each(|(column, index_type)| {
+                match index_type {
+                    IndexType::Enabled => {}
+                    IndexType::Unique => {
+                        let tc = TableConstraint::Unique {
+                            columns: index_columns(column).into_iter().map(Into::into).collect(),
+                            name: None,
+                            index_name: None,
+                            index_type_display:
+                                datafusion::sql::sqlparser::ast::KeyOrIndexDisplay::None,
+                            index_options: vec![],
+                            characteristics: None,
+                            index_type: None,
+                        };
+
+                        table_constraints.push(tc);
+                    }
+                };
+            });
+
+            Ok(Some(
+                Constraints::new_from_table_constraints(
+                    &table_constraints,
+                    &Arc::new(
+                        DFSchema::try_from(schema)
+                            .context(super::UnableToConvertSchemaRefToDFSchemaSnafu)?,
+                    ),
+                )
+                .context(super::UnableToGetTableConstraintsSnafu)?,
+            ))
+        }
     }
 
     impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -513,7 +629,7 @@ pub mod acceleration {
 
         fn try_from(
             acceleration: spicepod_acceleration::Acceleration,
-        ) -> Result<Self, Self::Error> {
+        ) -> std::result::Result<Self, Self::Error> {
             Ok(Acceleration {
                 enabled: acceleration.enabled,
                 mode: Mode::from(acceleration.mode),
@@ -639,5 +755,17 @@ mod tests {
             .collect::<HashMap<String, String>>();
 
         assert_eq!(indexes_map, roundtrip_indexes_map);
+    }
+
+    #[test]
+    fn test_get_index_columns() {
+        let index_columns_vec = Acceleration::index_columns("foo");
+        assert_eq!(index_columns_vec, vec!["foo"]);
+
+        let index_columns_vec = Acceleration::index_columns("(foo, bar)");
+        assert_eq!(index_columns_vec, vec!["foo", "bar"]);
+
+        let index_columns_vec = Acceleration::index_columns("(foo,bar)");
+        assert_eq!(index_columns_vec, vec!["foo", "bar"]);
     }
 }
