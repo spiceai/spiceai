@@ -67,6 +67,12 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-odbc 9.0.0, MIT 
   <br/>https://github.com/pacman82/arrow-odbc
 
+- async-graphql 7.0.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/async-graphql/async-graphql
+
+- async-graphql-axum 7.0.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/async-graphql/async-graphql
+
 - async-openai 0.21.0, MIT 
   <br/>https://github.com/64bit/async-openai
 
@@ -166,10 +172,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - deltalake 0.17.3, Apache-2.0 
   <br/>https://github.com/delta-io/delta.rs
 
+- derive_builder 0.20.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/colin-kiegel/rust-derive-builder
+
 - dirs 5.0.1, Apache-2.0 OR MIT 
   <br/>https://github.com/soc/dirs-rs
 
-- duckdb 0.10.2, MIT 
+- duckdb 1.0.0, MIT 
   <br/>https://github.com/wangfenjin/duckdb-rs
 
 - fundu 2.0.0, MIT 
