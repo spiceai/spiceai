@@ -88,7 +88,8 @@ struct PaginationParameters {
 impl PaginationParameters {
     fn parse(query: &str, pointer: &str) -> Option<Self> {
         let pagination_pattern = r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}";
-        let regex = Regex::new(pagination_pattern).expect("Invalid regex pagination pattern");
+        let regex = Regex::new(pagination_pattern)
+            .unwrap_or_else(|_| panic!("Invalid regex pagination pattern"));
         match regex.captures(query) {
             Some(captures) => {
                 let resource_name = captures.get(1).map(|m| m.as_str().to_owned());
@@ -102,7 +103,7 @@ impl PaginationParameters {
                     (Some(resource_name), Some(count)) => {
                         let pattern = format!(r"^(.*?{resource_name})");
                         let regex = Regex::new(pattern.as_str())
-                            .expect("Invalid regex resource path pattern");
+                            .unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
 
                         let captures = regex.captures(pointer);
 
@@ -134,28 +135,23 @@ impl PaginationParameters {
             }
         }
         let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
-        let regex = Regex::new(&pattern).expect("Invalid regex query resource pattern");
+        let regex =
+            Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
 
-        let replace_query = match cursor {
-            Some(cursor) => format!(
+        let replace_query = if let Some(cursor) = cursor {
+            format!(
                 r#"{} (first: {count}, after: "{cursor}")"#,
                 self.resource_name
-            ),
-            None => format!(r#"{} (first: {count})"#, self.resource_name),
+            )
+        } else {
+            format!(r#"{} (first: {count})"#, self.resource_name)
         };
 
         let new_query = regex.replace(query, replace_query.as_str());
         (new_query.to_string(), limit_reached)
     }
 
-    fn get_next_cursor_from_response(
-        &self,
-        response: &Value,
-        limit_reached: bool,
-    ) -> Option<String> {
-        if limit_reached {
-            return None;
-        }
+    fn get_next_cursor_from_response(&self, response: &Value) -> Option<String> {
         let page_info = response
             .pointer(&self.page_info_path)
             .unwrap_or(&Value::Null);
@@ -233,10 +229,14 @@ impl GraphQLClient {
             .pointer(self.pointer.as_str())
             .unwrap_or(&Value::Null)
             .to_owned();
-        let next_cursor = self
-            .pagination_parameters
-            .as_ref()
-            .and_then(|x| x.get_next_cursor_from_response(&response, limit_reached));
+
+        let next_cursor = match limit_reached {
+            true => None,
+            false => self
+                .pagination_parameters
+                .as_ref()
+                .and_then(|x| x.get_next_cursor_from_response(&response)),
+        };
 
         let unwrapped = match exctracted_data {
             Value::Array(val) => Ok(val.clone()),
@@ -698,17 +698,11 @@ mod tests {
         )
         .expect("Invalid json");
 
-        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response, false);
+        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response);
         assert_eq!(
             next_cursor,
             Some("new_cursor".to_string()),
             "Expected next cursor to be new_cursor"
-        );
-
-        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response, true);
-        assert_eq!(
-            next_cursor, None,
-            "Next cursor should be None if we reached the limit"
         );
 
         let response = serde_json::from_str(
@@ -721,7 +715,7 @@ mod tests {
         }"#,
         )
         .expect("Invalid json");
-        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response, false);
+        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response);
         assert_eq!(next_cursor, None, "Should be None if no value returned");
     }
 
