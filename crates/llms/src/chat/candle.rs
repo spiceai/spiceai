@@ -21,7 +21,7 @@ use candle_transformers::{generation::LogitsProcessor, models::quantized_llama::
 use snafu::ResultExt;
 use tokenizers::Tokenizer;
 
-use super::{Error as NqlError, FailedToLoadModelSnafu, FailedToLoadTokenizerSnafu, Nql, Result};
+use super::{Chat, Error as ChatError, FailedToLoadModelSnafu, FailedToLoadTokenizerSnafu, Result};
 use candle_core::{quantized::gguf_file, Tensor};
 
 struct InferenceHyperparams {
@@ -57,7 +57,7 @@ pub struct CandleLlama {
 }
 
 #[async_trait]
-impl Nql for CandleLlama {
+impl Chat for CandleLlama {
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
         // tknzr.clone() is bad
         Self::perform_inference(
@@ -122,7 +122,7 @@ impl CandleLlama {
         let eos_token = match tos.tokenizer().get_vocab(true).get("</s>") {
             Some(token) => *token,
             None => {
-                return Err(NqlError::FailedToTokenize {
+                return Err(ChatError::FailedToTokenize {
                     source: "Failed to get eos_token".into(),
                 }
                 .into());
@@ -157,7 +157,7 @@ impl CandleLlama {
 
     fn load_gguf_model_weights(model_weights_path: String) -> Result<ModelWeights> {
         let mut file = std::fs::File::open(model_weights_path.clone()).map_err(|_| {
-            NqlError::LocalModelNotFound {
+            ChatError::LocalModelNotFound {
                 expected_path: model_weights_path.clone(),
             }
         })?;

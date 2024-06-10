@@ -52,14 +52,6 @@ pub struct Dataset {
     #[serde(default)]
     pub mode: Mode,
 
-    /// Inline SQL that describes a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql: Option<String>,
-
-    /// Reference to a SQL file that describes a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql_ref: Option<String>,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
@@ -94,8 +86,6 @@ impl Dataset {
             from,
             name,
             mode: Mode::default(),
-            sql: None,
-            sql_ref: None,
             params: None,
             has_metadata_table: None,
             replication: None,
@@ -114,8 +104,6 @@ impl WithDependsOn<Dataset> for Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
             mode: self.mode.clone(),
-            sql: self.sql.clone(),
-            sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,
             replication: self.replication.clone(),
@@ -130,7 +118,7 @@ impl WithDependsOn<Dataset> for Dataset {
 
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
-    use std::fmt::Display;
+    use std::{collections::HashMap, fmt::Display};
 
     use crate::component::params::Params;
 
@@ -179,6 +167,23 @@ pub mod acceleration {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum IndexType {
+        #[default]
+        Enabled,
+        Unique,
+    }
+
+    impl Display for IndexType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                IndexType::Enabled => write!(f, "enabled"),
+                IndexType::Unique => write!(f, "unique"),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default = "default_true")]
@@ -219,6 +224,9 @@ pub mod acceleration {
 
         #[serde(default)]
         pub on_zero_results: ZeroResultsAction,
+
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub indexes: HashMap<String, IndexType>,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -246,6 +254,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
+                indexes: HashMap::default(),
             }
         }
     }

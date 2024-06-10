@@ -29,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 mod docker;
 // Run all tests in the `federation` module
 mod federation;
+mod graphql;
 mod refresh_sql;
 mod results_cache;
 

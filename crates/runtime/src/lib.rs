@@ -34,16 +34,17 @@ use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
+use component::view::View;
 use config::Config;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
 use llms::embeddings::Embed;
-use llms::nql::Nql;
 use metrics::SetRecorderError;
-use model::{try_to_embedding, try_to_nql};
+use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
@@ -78,6 +79,8 @@ pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
+
+pub mod datasets_health_monitor;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -119,19 +122,17 @@ pub enum Error {
         data_connector: String,
     },
 
-    #[snafu(display("Unable to create view: {source}"))]
-    InvalidSQLView {
-        source: crate::component::dataset::Error,
-    },
-
     #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
         data_connector: String,
     },
 
-    #[snafu(display("Expected a SQL view statement, received nothing."))]
-    ExpectedSqlView,
+    #[snafu(display("Unable to load SQL file {file}: {source}"))]
+    UnableToLoadSqlFile {
+        file: String,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
@@ -140,6 +141,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
+
+    #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
+    NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
         "A federated table was configured as read_write without setting replication.enabled = true"
@@ -195,7 +199,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 #[derive(Clone)]
@@ -207,6 +210,7 @@ pub struct Runtime {
     pub embeds: Arc<RwLock<EmbeddingModelStore>>,
     pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    pub datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
 
     extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
@@ -231,6 +235,7 @@ impl Runtime {
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             extensions: Arc::new(RwLock::new(vec![])),
+            datasets_health_monitor: None,
         };
 
         let mut extensions: Vec<Box<dyn Extension>> = vec![];
@@ -265,6 +270,10 @@ impl Runtime {
 
     pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
         self.pods_watcher = Arc::new(RwLock::new(Some(pods_watcher)));
+    }
+
+    pub fn with_datasets_health_monitor(&mut self, datasets_health_monitor: DatasetsHealthMonitor) {
+        self.datasets_health_monitor = Some(Arc::new(datasets_health_monitor));
     }
 
     pub async fn load_secrets(&self) {
@@ -310,6 +319,26 @@ impl Runtime {
             .collect()
     }
 
+    /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_views(app: &App, log_failures: bool) -> Vec<View> {
+        app.views
+            .iter()
+            .cloned()
+            .map(View::try_from)
+            .zip(&app.views)
+            .filter_map(|(view, spicepod_view)| match view {
+                Ok(view) => Some(view),
+                Err(e) => {
+                    if log_failures {
+                        metrics::counter!("views_load_error").increment(1);
+                        tracing::error!(view = &spicepod_view.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
@@ -320,28 +349,39 @@ impl Runtime {
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds, &valid_datasets));
+            futures.push(self.load_dataset(ds));
         }
 
-        let app = self.app.read().await;
-
-        if let Some(app) = app.as_ref() {
-            if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
-                let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
-                let _ = stream.collect::<Vec<_>>().await;
-                return;
-            }
+        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+            let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
+            let _ = stream.collect::<Vec<_>>().await;
+            return;
         }
 
         let _ = join_all(futures).await;
+
+        // After all datasets have loaded, load the views.
+        self.load_views(app, &valid_datasets);
+
+        self.df.mark_initial_load_complete();
+    }
+
+    fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
+        let views: Vec<View> = Self::get_valid_views(app, true);
+
+        for view in &views {
+            if let Err(e) = self.load_view(view, valid_datasets) {
+                tracing::error!("Unable to load view: {e}");
+            };
+        }
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
-    pub async fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+    pub async fn load_dataset(&self, ds: &Dataset) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         loop {
-            let connector = match self.load_dataset_connector(ds, all_datasets).await {
+            let connector = match self.load_dataset_connector(ds).await {
                 Ok(connector) => connector,
                 Err(err) => {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
@@ -363,32 +403,34 @@ impl Runtime {
         }
     }
 
-    pub async fn load_dataset_connector(
-        &self,
-        ds: &Dataset,
-        all_datasets: &[Dataset],
-    ) -> Result<Arc<dyn DataConnector>> {
+    pub fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
+        let existing_tables = all_datasets
+            .iter()
+            .map(|d| d.name.clone())
+            .collect::<Vec<TableReference>>();
+
+        if !verify_dependent_tables(view, &existing_tables) {
+            return UnableToCreateViewSnafu {
+                reason: "One or more tables in the view's SQL statement do not exist.".to_string(),
+            }
+            .fail();
+        }
+
+        let df = Arc::clone(&self.df);
+        df.register_view(view.name.clone(), view.sql.clone())
+            .context(UnableToAttachViewSnafu)?;
+
+        Ok(())
+    }
+
+    pub async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
         let ds = ds.clone();
 
-        let existing_tables = all_datasets
-            .iter()
-            .map(|d| d.name.clone())
-            .collect::<Vec<TableReference>>();
-
         let secrets_provider = shared_secrets_provider.read().await;
-
-        if !verify_dependent_tables(&ds, &existing_tables) {
-            status::update_dataset(&ds.name, status::ComponentStatus::Error);
-            metrics::counter!("datasets_load_error").increment(1);
-            return UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .fail();
-        }
 
         let source = ds.source();
         let params = Arc::new(ds.params.clone());
@@ -452,6 +494,14 @@ impl Runtime {
         {
             Ok(()) => {
                 tracing::info!("Registered dataset {}", &ds.name);
+                if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
+                    if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
+                        tracing::warn!(
+                            "Unable to add dataset {} for availability monitoring: {err}",
+                            &ds.name
+                        );
+                    };
+                }
                 let engine = ds.acceleration.map_or_else(
                     || "None".to_string(),
                     |acc| {
@@ -484,8 +534,14 @@ impl Runtime {
         }
     }
 
-    pub fn remove_dataset(&self, ds: &Dataset) {
+    pub async fn remove_dataset(&self, ds: &Dataset) {
         if self.df.table_exists(ds.name.clone()) {
+            if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
+                datasets_health_monitor
+                    .deregister_dataset(&ds.name.to_string())
+                    .await;
+            }
+
             if let Err(e) = self.df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
@@ -506,9 +562,9 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+    pub async fn update_dataset(&self, ds: &Dataset) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
+        if let Ok(connector) = self.load_dataset_connector(ds).await {
             tracing::info!("Updating accelerated dataset {}...", &ds.name);
 
             // File accelerated datasets don't support hot reload.
@@ -523,7 +579,7 @@ impl Runtime {
                 tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
 
-            self.remove_dataset(ds);
+            self.remove_dataset(ds).await;
 
             if let Ok(()) = self
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
@@ -636,15 +692,6 @@ impl Runtime {
     ) -> Result<()> {
         let ds = ds.borrow();
 
-        // VIEW
-        if let Some(view_sql) = ds.view_sql() {
-            let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
-            df.register_table(ds, datafusion::Table::View(view_sql))
-                .await
-                .context(UnableToAttachViewSnafu)?;
-            return Ok(());
-        }
-
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         // Only wrap data connector when necessary.
@@ -722,7 +769,7 @@ impl Runtime {
         if let Some(app) = app_lock.as_ref() {
             for in_llm in &app.llms {
                 status::update_llm(&in_llm.name, status::ComponentStatus::Initializing);
-                match try_to_nql(in_llm) {
+                match try_to_chat_model(in_llm) {
                     Ok(l) => {
                         let mut llm_map = self.llms.write().await;
                         llm_map.insert(in_llm.name.clone(), l.into());
@@ -871,6 +918,12 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn start_datasets_health_monitor(&self) {
+        if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
+            datasets_health_monitor.start();
+        }
+    }
+
     pub async fn start_servers(
         &self,
         config: Config,
@@ -930,11 +983,11 @@ impl Runtime {
                         .find(|d| TableReference::parse_str(&d.name) == ds.name)
                     {
                         if TableReference::parse_str(&current_ds.name) != ds.name {
-                            self.update_dataset(ds, &valid_datasets).await;
+                            self.update_dataset(ds).await;
                         }
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds, &valid_datasets).await;
+                        self.load_dataset(ds).await;
                     }
                 }
 
@@ -971,7 +1024,7 @@ impl Runtime {
                             }
                         };
                         status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds);
+                        self.remove_dataset(&ds).await;
                     }
                 }
 
@@ -1020,17 +1073,13 @@ impl Runtime {
     }
 }
 
-fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> bool {
-    if !ds.is_view() {
-        return true;
-    }
-
-    let dependent_tables = match get_view_dependent_tables(ds) {
+fn verify_dependent_tables(view: &View, existing_tables: &[TableReference]) -> bool {
+    let dependent_tables = match get_view_dependent_tables(view) {
         Ok(tables) => tables,
         Err(err) => {
             tracing::error!(
                 "Failed to get dependent tables for view {}: {}",
-                &ds.name,
+                &view.name,
                 err
             );
             return false;
@@ -1040,8 +1089,8 @@ fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> 
     for tbl in &dependent_tables {
         if !existing_tables.contains(tbl) {
             tracing::error!(
-                "Failed to load {}. Dependent table {} not found",
-                &ds.name,
+                "Failed to load view {}. Dependent table {} not found",
+                &view.name,
                 &tbl
             );
             return false;
@@ -1051,16 +1100,10 @@ fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> 
     true
 }
 
-fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<TableReference>> {
-    let ds = dataset.borrow();
+fn get_view_dependent_tables(view: impl Borrow<View>) -> Result<Vec<TableReference>> {
+    let view = view.borrow();
 
-    let Some(sql) = ds.view_sql() else {
-        return ExpectedSqlViewSnafu.fail();
-    };
-
-    let sql = sql.context(InvalidSQLViewSnafu)?;
-
-    let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
+    let statements = DFParser::parse_sql_with_dialect(view.sql.as_str(), &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
 
     if statements.len() != 1 {

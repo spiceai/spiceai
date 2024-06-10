@@ -41,6 +41,7 @@ use crate::EmbeddingModelStore;
 pub enum Error {}
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
+#[derive(Clone)]
 pub struct EmbeddingTable {
     base_table: Arc<dyn TableProvider>,
 
@@ -100,6 +101,18 @@ impl EmbeddingTable {
 
     /// For a given projection of the entire [`Schema`], find which [`Self::embedded_columns`] need to be computed.
     /// If `projection.is_none()`, all embedding columns are in projection, and therefore needed.
+    ///
+    /// Any project index (in `projection`) that is greater than the number of columns in the base
+    /// table is an embedding column. The relation of underlying column to embedding column is, for example, as follows:
+    ///
+    /// | projection idx | 0 | 1 | 2 | 3 | 4 | 5 |      6      |      7      |
+    /// |  column name   | A | B | C | D | E | F | `B_embedding` | `E_embedding` |
+    ///
+    ///     - 6 Base columns A, B, C, D, E, F
+    ///     - 2 Embedding columns B_embedding, E_embedding
+    ///     - Any projection index >=6 is an embedding column.
+    ///
+    /// The order of embedding columns in [`Self::Schema`] is alphabetical.
     fn columns_to_embed(&self, projection: Option<&Vec<usize>>) -> Vec<String> {
         match projection {
             None => self.embedded_columns.keys().cloned().collect_vec(),
@@ -111,10 +124,10 @@ impl EmbeddingTable {
                 column_idx
                     .iter()
                     .filter_map(|&c| {
-                        if c > base_cols {
-                            None
-                        } else {
+                        if c >= base_cols {
                             x.get(c - base_cols).copied()
+                        } else {
+                            None
                         }
                     })
                     .cloned()

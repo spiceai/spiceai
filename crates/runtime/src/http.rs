@@ -24,7 +24,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion, EmbeddingModelStore, LLMModelStore};
+use crate::{config, datafusion::DataFusion, model::LLMModelStore, EmbeddingModelStore};
 
 mod routes;
 mod v1;

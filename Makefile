@@ -35,6 +35,10 @@ nextest:
 
 .PHONY: test-integration
 test-integration:
+	@cargo test -p runtime --test integration --features mysql,spiceai-dataset-test -- --nocapture
+
+.PHONY: test-integration-without-spiceai-dataset
+test-integration-without-spiceai-dataset:
 	@cargo test -p runtime --test integration --features mysql -- --nocapture
 
 .PHONY: test-bench

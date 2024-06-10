@@ -15,22 +15,10 @@ limitations under the License.
 */
 
 use datafusion::sql::TableReference;
-use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
 };
-use std::{collections::HashMap, fs, time::Duration};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to load SQL file {file}: {source}"))]
-    UnableToLoadSqlFile {
-        file: String,
-        source: std::io::Error,
-    },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+use std::{collections::HashMap, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
@@ -77,10 +65,6 @@ pub struct Dataset {
     pub from: String,
     pub name: TableReference,
     pub mode: Mode,
-    /// Inline SQL that describes a view.
-    sql: Option<String>,
-    /// Reference to a SQL file that describes a view.
-    sql_ref: Option<String>,
     pub params: HashMap<String, String>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
@@ -105,8 +89,6 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             from: dataset.from,
             name: table_reference,
             mode: Mode::from(dataset.mode),
-            sql: dataset.sql,
-            sql_ref: dataset.sql_ref,
             params: dataset
                 .params
                 .as_ref()
@@ -130,8 +112,6 @@ impl Dataset {
             from,
             name: Self::parse_table_reference(name)?,
             mode: Mode::default(),
-            sql: None,
-            sql_ref: None,
             params: HashMap::default(),
             has_metadata_table: Self::have_metadata_table_by_default(),
             replication: None,
@@ -148,7 +128,7 @@ impl Dataset {
         false
     }
 
-    fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
+    pub(crate) fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
         match TableReference::parse_str(name) {
             table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
                 Ok(table_ref)
@@ -309,30 +289,6 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn is_view(&self) -> bool {
-        self.sql.is_some() || self.sql_ref.is_some()
-    }
-
-    #[must_use]
-    pub fn view_sql(&self) -> Option<Result<String>> {
-        if let Some(sql) = &self.sql {
-            return Some(Ok(sql.clone()));
-        }
-
-        if let Some(sql_ref) = &self.sql_ref {
-            return Some(Self::load_sql_ref(sql_ref));
-        }
-
-        None
-    }
-
-    fn load_sql_ref(sql_ref: &str) -> Result<String> {
-        let sql =
-            fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
-        Ok(sql)
-    }
-
-    #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -476,6 +432,40 @@ pub mod acceleration {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub enum IndexType {
+        #[default]
+        Enabled,
+        Unique,
+    }
+
+    impl From<spicepod_acceleration::IndexType> for IndexType {
+        fn from(index_type: spicepod_acceleration::IndexType) -> Self {
+            match index_type {
+                spicepod_acceleration::IndexType::Enabled => IndexType::Enabled,
+                spicepod_acceleration::IndexType::Unique => IndexType::Unique,
+            }
+        }
+    }
+
+    impl From<&str> for IndexType {
+        fn from(index_type: &str) -> Self {
+            match index_type.to_lowercase().as_str() {
+                "unique" => IndexType::Unique,
+                _ => IndexType::Enabled,
+            }
+        }
+    }
+
+    impl Display for IndexType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                IndexType::Enabled => write!(f, "enabled"),
+                IndexType::Unique => write!(f, "unique"),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub struct Acceleration {
         pub enabled: bool,
@@ -503,6 +493,19 @@ pub mod acceleration {
         pub retention_check_enabled: bool,
 
         pub on_zero_results: ZeroResultsAction,
+
+        pub indexes: HashMap<String, IndexType>,
+    }
+
+    impl Acceleration {
+        #[must_use]
+        pub fn indexes_to_option_string(indexes: &HashMap<String, IndexType>) -> String {
+            indexes
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<String>>()
+                .join(";")
+        }
     }
 
     impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -531,6 +534,11 @@ pub mod acceleration {
                 retention_check_interval: acceleration.retention_check_interval,
                 retention_check_enabled: acceleration.retention_check_enabled,
                 on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
+                indexes: acceleration
+                    .indexes
+                    .into_iter()
+                    .map(|(k, v)| (k, IndexType::from(v)))
+                    .collect(),
             })
         }
     }
@@ -551,6 +559,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
+                indexes: HashMap::default(),
             }
         }
     }
@@ -570,5 +579,65 @@ pub mod replication {
                 enabled: replication.enabled,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::acceleration::{Acceleration, IndexType};
+
+    #[test]
+    fn test_indexes_roundtrip() {
+        let indexes_map = HashMap::from([
+            ("foo".to_string(), IndexType::Enabled),
+            ("bar".to_string(), IndexType::Unique),
+        ]);
+
+        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        assert!(indexes_str == "foo:enabled;bar:unique" || indexes_str == "bar:unique;foo:enabled");
+        let roundtrip_indexes_map =
+            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+
+        let roundtrip_indexes_map = roundtrip_indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
+
+        let indexes_map = indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
+
+        assert_eq!(indexes_map, roundtrip_indexes_map);
+    }
+
+    #[test]
+    fn test_compound_indexes_roundtrip() {
+        let indexes_map = HashMap::from([
+            ("(foo, bar)".to_string(), IndexType::Enabled),
+            ("bar".to_string(), IndexType::Unique),
+        ]);
+
+        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        assert!(
+            indexes_str == "(foo, bar):enabled;bar:unique"
+                || indexes_str == "bar:unique;(foo, bar):enabled"
+        );
+        let roundtrip_indexes_map =
+            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+
+        let roundtrip_indexes_map = roundtrip_indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
+
+        let indexes_map = indexes_map
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect::<HashMap<String, String>>();
+
+        assert_eq!(indexes_map, roundtrip_indexes_map);
     }
 }
