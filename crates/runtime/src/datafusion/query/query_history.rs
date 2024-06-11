@@ -86,12 +86,11 @@ fn table_schema() -> Schema {
         Field::new("execution_time", DataType::Float32, false),
         Field::new("execution_status", DataType::Int8, false),
         Field::new("rows_produced", DataType::UInt64, false),
-        // Field::new(
-        //     "datasets",
-        //     DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-        //     true,
-        // ),
-        Field::new("datasets", DataType::Utf8, true),
+        Field::new(
+            "datasets",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
         Field::new("results_cache_hit", DataType::Boolean, false),
         Field::new("error_message", DataType::Utf8, true),
     ])
@@ -204,8 +203,7 @@ impl Query {
                 Arc::new(Float32Array::from(vec![self.execution_time])),
                 Arc::new(Int8Array::from(vec![execution_status])),
                 Arc::new(UInt64Array::from(vec![self.rows_produced])),
-                // Arc::new(to_arrow_list_array(&datasets)),
-                Arc::new(StringArray::from(vec![datasets.join(",")])),
+                Arc::new(to_arrow_list_array(&datasets)),
                 Arc::new(BooleanArray::from(vec![self
                     .results_cache_hit
                     .unwrap_or(false)])),
@@ -231,14 +229,14 @@ impl Query {
     }
 }
 
-// fn to_arrow_list_array(items: &Vec<String>) -> ListArray {
-//     let mut string_builder = arrow::array::StringBuilder::new();
-//     for item in items {
-//         string_builder.append_value(&item);
-//     }
+fn to_arrow_list_array(items: &Vec<String>) -> ListArray {
+    let mut string_builder = arrow::array::StringBuilder::new();
+    for item in items {
+        string_builder.append_value(&item);
+    }
 
-//     let mut list_builder = ListBuilder::new(string_builder);
-//     list_builder.append(true);
+    let mut list_builder = ListBuilder::new(string_builder);
+    list_builder.append(true);
 
-//     list_builder.finish()
-// }
+    list_builder.finish()
+}

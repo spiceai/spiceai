@@ -22,7 +22,7 @@ use std::{
 
 use arrow::array::{RecordBatch, TimestampNanosecondArray};
 use datafusion::{
-    datasource::{provider_as_source, TableProvider}, error::DataFusionError, execution::context::SessionContext, logical_expr::{col, lit, LogicalPlanBuilder}, sql::TableReference
+    datasource::{provider_as_source, TableProvider}, error::DataFusionError, execution::context::SessionContext, logical_expr::{col, lit, LogicalPlanBuilder}, prelude::array_has, sql::TableReference
 };
 use futures::{future::join_all, stream::TryStreamExt};
 use snafu::{ResultExt, Snafu};
@@ -294,7 +294,7 @@ async fn most_recent_query_time(
 ) -> std::result::Result<Option<SystemTime>, DataFusionError> {
 
     let plan = LogicalPlanBuilder::scan(dataset_name, provider_as_source(query_history), None)?
-        .filter(col("datasets").like(lit(dataset_name)))?
+        .filter(array_has(col("datasets"), lit(dataset_name)))?
         .filter(col("execution_status").eq(lit(0)))?
         .filter(col("results_cache_hit").eq(lit(false)))?
         .project(vec![col("end_time")])?  
