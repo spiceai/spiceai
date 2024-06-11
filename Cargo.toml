@@ -24,7 +24,7 @@ default-members = ["bin/spiced"]
 resolver = "2"
 
 [workspace.package]
-version = "0.13.3-alpha"
+version = "0.14.0-alpha"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
