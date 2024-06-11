@@ -11,7 +11,7 @@ description = "Spice OSS Flight Publisher"
 [dependencies]
 arrow.workspace = true
 arrow-flight.workspace = true
-parquet = "51.0.0"
+parquet = "52.0.0"
 clap = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tonic = { workspace = true, features = [

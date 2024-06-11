@@ -18,7 +18,7 @@ use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexT
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
+    common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
@@ -207,12 +207,9 @@ impl AcceleratorExternalTableBuilder {
             name: self.table_name.clone(),
             location: String::new(),
             file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
             table_partition_cols: vec![],
             if_not_exists: true,
             definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
             options,
