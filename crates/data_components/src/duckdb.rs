@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::{
     delete::DeletionTableProviderAdapter,
-    util::indexes::{self, IndexType},
+    util::{
+        constraints,
+        indexes::{self, IndexType},
+    },
     Read, ReadWrite,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
@@ -106,6 +109,9 @@ pub enum Error {
 
     #[snafu(display("The table '{table_name}' doesn't exist in the DuckDB server"))]
     TableDoesntExist { table_name: String },
+
+    #[snafu(display("Constraint Violation: {source}"))]
+    ConstraintViolation { source: constraints::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -261,6 +267,11 @@ impl DuckDB {
             pool,
             constraints,
         }
+    }
+
+    #[must_use]
+    pub fn constraints(&self) -> &Constraints {
+        &self.constraints
     }
 
     async fn connect(

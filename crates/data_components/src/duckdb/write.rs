@@ -18,6 +18,7 @@ use std::{any::Any, fmt, sync::Arc};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
+use crate::util::constraints;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -125,37 +126,19 @@ impl DataSink for DuckDBDataSink {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut tx = duckdb_conn
+        let constraints = self.duckdb.constraints();
+        constraints::validate_batch_with_constraints(&data_batches, constraints)
+            .await
+            .context(super::ConstraintViolationSnafu)
+            .map_err(to_datafusion_error)?;
+
+        let tx = duckdb_conn
             .conn
             .transaction()
             .context(super::UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        let num_rows = match self.try_write_all(&tx, &data_batches) {
-            Ok(num_rows) => num_rows,
-            Err(e)
-                if e.to_string()
-                    .contains("Current transaction is aborted (please ROLLBACK)") =>
-            {
-                tracing::debug!("Transaction aborted, rolling back and trying again.");
-                tx.rollback()
-                    .context(super::UnableToRollbackTransactionSnafu)
-                    .map_err(to_datafusion_error)?;
-
-                db_conn = self.duckdb.connect_sync().map_err(to_datafusion_error)?;
-                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
-
-                tx = duckdb_conn
-                    .conn
-                    .transaction()
-                    .context(super::UnableToBeginTransactionSnafu)
-                    .map_err(to_datafusion_error)?;
-
-                tracing::debug!("Retrying try_write_all.");
-                self.try_write_all(&tx, &data_batches)?
-            }
-            Err(e) => return Err(e),
-        };
+        let num_rows = self.try_write_all(&tx, &data_batches)?;
 
         tx.commit()
             .context(super::UnableToCommitDuckDBTransactionSnafu)

@@ -21,6 +21,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::{col, count, lit, utils::COUNT_STAR_EXPANSION},
 };
+use futures::future;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -47,8 +48,15 @@ pub async fn validate_batch_with_constraints(
         return Ok(());
     }
 
+    let mut futures = Vec::new();
     for constraint in &**constraints {
-        validate_batch_with_constraint(batches.to_vec(), constraint.clone()).await?;
+        let fut = validate_batch_with_constraint(batches.to_vec(), constraint.clone());
+        futures.push(fut);
+    }
+
+    let results = future::join_all(futures).await;
+    for result in results {
+        result?;
     }
 
     Ok(())
