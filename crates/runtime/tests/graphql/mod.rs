@@ -187,7 +187,7 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
         .route("/graphql", post(graphql_handler))
         .layer(Extension(schema));
 
-    let tcp_listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| {
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
         tracing::error!("Failed to bind to address: {e}");
         e.to_string()
     })?;
@@ -263,15 +263,15 @@ async fn test_graphql() -> Result<(), String> {
         (
             "SELECT posts[1]['title'] from test_graphql",
             vec![
-                "+---------------+--------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                     |",
-                "+---------------+--------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8(\"title\")) AS test_graphql.posts[Int64(1)][title] |",
-                "|               |   TableScan: test_graphql projection=[posts]                                                                             |",
-                "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]]                |",
-                "|               |   MemoryExec: partitions=1, partition_sizes=[4]                                                                          |",
-                "|               |                                                                                                                          |",
-                "+---------------+--------------------------------------------------------------------------------------------------------------------------+"
+                "+---------------+-----------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                      |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8(\"title\"))                         |",
+                "|               |   TableScan: test_graphql projection=[posts]                                                              |",
+                "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]] |",
+                "|               |   MemoryExec: partitions=1, partition_sizes=[4]                                                           |",
+                "|               |                                                                                                           |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 for batch in result_batches {
