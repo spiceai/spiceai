@@ -17,7 +17,10 @@ limitations under the License.
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray, TimestampMillisecondBuilder,
+};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -51,6 +54,12 @@ pub enum Error {
 
     #[snafu(display("Error executing query: {source}"))]
     SnowflakeArrowError { source: arrow::error::ArrowError },
+
+    #[snafu(display("Failed to cast snowflake timestamp to arrow timestamp: {reason}"))]
+    UnableToCastSnowflakeTimestamp { reason: String },
+
+    #[snafu(display("Failed to create record batch: {source}"))]
+    FailedToCreateRecordBatch { source: arrow::error::ArrowError },
 }
 
 pub struct SnowflakeConnection {
@@ -92,7 +101,10 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
 
         match res {
             snowflake_api::QueryResult::Arrow(record_batches) => {
-                let schema = record_batches[0].schema();
+                let record_batch = snowflake_schema_cast(&record_batches[0])
+                    .boxed()
+                    .context(super::UnableToGetSchemaSnafu)?;
+                let schema = record_batch.schema();
                 return Ok(Arc::clone(&schema));
             }
             snowflake_api::QueryResult::Empty => Err(super::Error::UnableToGetSchema {
@@ -111,13 +123,20 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
     ) -> Result<SendableRecordBatchStream> {
         let sql = sql.to_string();
 
-        let mut stream = self
+        let stream = self
             .api
             .exec_streamed(&sql)
             .await
             .context(SnowflakeQuerySnafu)?;
 
-        let Some(first_batch) = stream.next().await else {
+        let mut transformed_stream = stream.map(|batch| {
+            batch.and_then(|batch| {
+                snowflake_schema_cast(&batch)
+                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+            })
+        });
+
+        let Some(first_batch) = transformed_stream.next().await else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
                 stream::empty(),
@@ -125,13 +144,18 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
         };
 
         let batch = first_batch.context(SnowflakeArrowSnafu)?;
+
         let schema = batch.schema();
 
         // add first batch back to stream
         let run_once = stream::once(async move { Ok(batch) });
         let stream_adapter = RecordBatchStreamAdapter::new(
             schema,
-            Box::pin(run_once.chain(stream).map_err(to_execution_error)),
+            Box::pin(
+                run_once
+                    .chain(transformed_stream)
+                    .map_err(to_execution_error),
+            ),
         );
 
         return Ok(Box::pin(stream_adapter));
@@ -144,4 +168,70 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
+}
+
+/// Converts `Snowflake` specific types to standard Arrow types.
+///
+/// # Errors
+///
+/// Returns an error if there is a failure in converting Snowflake to Arrow types.
+pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, Error> {
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+
+    for (idx, field) in record_batch.schema().fields().iter().enumerate() {
+        let column = record_batch.column(idx);
+        if let Some(sf_logical_type) = field.metadata().get("logicalType") {
+            if sf_logical_type.to_lowercase().as_str() == "timestamp_ntz" {
+                fields.push(Arc::new(Field::new(
+                    field.name(),
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    field.is_nullable(),
+                )));
+                columns.push(cast_sf_timestamp_ntz_to_arrow_timestamp(column)?);
+                continue;
+            }
+        }
+        fields.push(Arc::clone(field));
+        columns.push(Arc::clone(column));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).context(FailedToCreateRecordBatchSnafu)
+}
+
+fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRef, Error> {
+    let struct_array = column.as_any().downcast_ref::<StructArray>().context(
+        UnableToCastSnowflakeTimestampSnafu {
+            reason: "value is not a struct",
+        },
+    )?;
+    let epoch_array = struct_array
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .context(UnableToCastSnowflakeTimestampSnafu {
+            reason: "epoch is missing",
+        })?;
+    let fraction_array = struct_array
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .context(UnableToCastSnowflakeTimestampSnafu {
+            reason: "fraction is missing",
+        })?;
+
+    let mut builder = TimestampMillisecondBuilder::new();
+
+    for idx in 0..struct_array.len() {
+        if struct_array.is_null(idx) {
+            builder.append_null();
+        } else {
+            let epoch = epoch_array.value(idx);
+            let fraction = i64::from(fraction_array.value(idx));
+            let timestamp = epoch * 1_000 + fraction / 1_000_000;
+            builder.append_value(timestamp);
+        }
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
