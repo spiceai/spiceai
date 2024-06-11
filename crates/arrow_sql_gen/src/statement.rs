@@ -497,6 +497,64 @@ impl InsertBuilder {
     }
 }
 
+pub struct IndexBuilder {
+    table_name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+impl IndexBuilder {
+    #[must_use]
+    pub fn new(table_name: &str, columns: Vec<&str>) -> Self {
+        Self {
+            table_name: table_name.to_string(),
+            columns: columns.into_iter().map(ToString::to_string).collect(),
+            unique: false,
+        }
+    }
+
+    #[must_use]
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
+    #[must_use]
+    fn index_name(&self) -> String {
+        format!("i_{}_{}", self.table_name, self.columns.join("_"))
+    }
+
+    #[must_use]
+    pub fn build_postgres(self) -> String {
+        self.build(PostgresQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_sqlite(self) -> String {
+        self.build(SqliteQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_mysql(self) -> String {
+        self.build(MysqlQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build<T: GenericBuilder>(self, query_builder: T) -> String {
+        let mut index = Index::create();
+        index.table(Alias::new(&self.table_name));
+        index.name(self.index_name());
+        if self.unique {
+            index.unique();
+        }
+        for column in self.columns {
+            index.col(Alias::new(column).into_iden().into_index_column());
+        }
+        index.if_not_exists();
+        index.to_string(query_builder)
+    }
+}
+
 fn insert_timestamp_into_row_values(
     timestamp: Result<OffsetDateTime, time::error::ComponentRange>,
     row_values: &mut Vec<SimpleExpr>,
@@ -641,6 +699,26 @@ mod tests {
         assert_eq!(
             sql,
             "INSERT INTO \"arrays\" (\"list\") VALUES (CAST(ARRAY [1,2,3] AS int4[])), (CAST(ARRAY [4,5,6] AS int4[])), (CAST(ARRAY [7,8,9] AS int4[]))"
+        );
+    }
+
+    #[test]
+    fn test_create_index() {
+        let sql = IndexBuilder::new("users", vec!["id", "name"]).build_postgres();
+        assert_eq!(
+            sql,
+            r#"CREATE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
+        );
+    }
+
+    #[test]
+    fn test_create_unique_index() {
+        let sql = IndexBuilder::new("users", vec!["id", "name"])
+            .unique()
+            .build_postgres();
+        assert_eq!(
+            sql,
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
         );
     }
 }

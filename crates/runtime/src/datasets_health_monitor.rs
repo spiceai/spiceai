@@ -20,22 +20,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use arrow::array::{RecordBatch, TimestampNanosecondArray};
-use chrono::{DateTime, Utc};
+use arrow::array::RecordBatch;
 use datafusion::{
-    datasource::{provider_as_source, TableProvider}, error::DataFusionError, execution::context::SessionContext, logical_expr::{col, lit, LogicalPlanBuilder}, sql::TableReference
+    datasource::TableProvider, error::DataFusionError, execution::context::SessionContext,
+    sql::TableReference,
 };
 use futures::{future::join_all, stream::TryStreamExt};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 
-use crate::{
-    component::dataset::Dataset,
-    datafusion::{query::query_history::DEFAULT_QUERY_HISTORY_TABLE, SPICE_RUNTIME_SCHEMA},
-};
+use crate::component::dataset::Dataset;
 
-const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 6; // every minute
-const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 1 * 6; // 10 minutes
+const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
+const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 10 * 60; // 10 minutes
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -89,7 +86,7 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
-        let dataset_name = dataset.name.to_string();
+        let dataset_name = &dataset.name.to_string();
 
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
@@ -105,6 +102,8 @@ impl DatasetsHealthMonitor {
                 table_provider,
             )),
         );
+
+        report_dataset_unavailable_time(dataset_name, None);
 
         Ok(())
     }
@@ -222,7 +221,6 @@ async fn update_dataset_availability_info(
     dataset_name: &String,
     test_result: AvailabilityVerificationResult,
 ) {
-    let labels = [("dataset", dataset_name.to_string())];
     match test_result {
         AvailabilityVerificationResult::Available => {
             tracing::debug!("Successfully verified access to federated dataset {dataset_name}");
@@ -230,17 +228,30 @@ async fn update_dataset_availability_info(
             if let Some(dataset) = monitored_datasets_lock.get_mut(dataset_name) {
                 Arc::make_mut(dataset).last_available_time = SystemTime::now();
             }
-            // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
-            metrics::gauge!("datasets_unavailable_time", &labels).set(0);
+            report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
             tracing::warn!("Availability verification for dataset {dataset_name} failed: {err}");
+            report_dataset_unavailable_time(dataset_name, Some(last_available_time));
+        }
+    }
+}
+
+fn report_dataset_unavailable_time(dataset_name: &String, last_available_time: Option<SystemTime>) {
+    let labels = [("dataset", dataset_name.to_string())];
+
+    match last_available_time {
+        Some(last_available_time) => {
             metrics::gauge!("datasets_unavailable_time", &labels).set(
                 last_available_time
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs_f64(),
             );
+        }
+        None => {
+            // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
+            metrics::gauge!("datasets_unavailable_time", &labels).set(0);
         }
     }
 }
@@ -264,7 +275,7 @@ async fn datasets_for_availability_check(
 
 async fn test_connectivity(
     table_provider: &Arc<dyn TableProvider>,
-    ctx: &Arc<SessionContext>,
+    ctx: Arc<SessionContext>,
 ) -> std::result::Result<(), DataFusionError> {
     let plan = table_provider
         .scan(&ctx.state(), None, &[], Some(1))

@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::acceleration::{self, Engine, Mode};
+use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
+    common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
@@ -116,8 +116,9 @@ pub struct AcceleratorExternalTableBuilder {
     schema: SchemaRef,
     engine: Engine,
     mode: Mode,
-    params: Option<HashMap<String, String>>,
+    options: Option<HashMap<String, String>>,
     secret: Option<Secret>,
+    indexes: HashMap<String, IndexType>,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -128,9 +129,16 @@ impl AcceleratorExternalTableBuilder {
             schema,
             engine,
             mode: Mode::Memory,
-            params: None,
+            options: None,
             secret: None,
+            indexes: HashMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn indexes(mut self, indexes: HashMap<String, IndexType>) -> Self {
+        self.indexes = indexes;
+        self
     }
 
     #[must_use]
@@ -140,8 +148,8 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn params(mut self, params: HashMap<String, String>) -> Self {
-        self.params = Some(params);
+    pub fn options(mut self, options: HashMap<String, String>) -> Self {
+        self.options = Some(options);
         self
     }
 
@@ -171,17 +179,22 @@ impl AcceleratorExternalTableBuilder {
     pub fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
 
-        let mut params = self.params.unwrap_or_default();
+        let mut options = self.options.unwrap_or_default();
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
         let mode = self.mode;
-        params.insert("mode".to_string(), mode.to_string());
+        options.insert("mode".to_string(), mode.to_string());
 
         if let Some(secret) = self.secret {
             for (k, v) in secret.iter() {
-                params.insert(k.to_string(), v.expose_secret().to_string());
+                options.insert(k.to_string(), v.expose_secret().to_string());
             }
+        }
+
+        if !self.indexes.is_empty() {
+            let indexes_option_str = Acceleration::indexes_to_option_string(&self.indexes);
+            options.insert("indexes".to_string(), indexes_option_str);
         }
 
         let external_table = CreateExternalTable {
@@ -194,15 +207,12 @@ impl AcceleratorExternalTableBuilder {
             name: self.table_name.clone(),
             location: String::new(),
             file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
             table_partition_cols: vec![],
             if_not_exists: true,
             definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
-            options: params,
+            options,
             constraints: Constraints::empty(),
             column_defaults: HashMap::default(),
         };
@@ -229,7 +239,8 @@ pub async fn create_accelerator_table(
 
     let external_table = AcceleratorExternalTableBuilder::new(table_name, schema, engine)
         .mode(acceleration_settings.mode)
-        .params(acceleration_settings.params.clone())
+        .options(acceleration_settings.params.clone())
+        .indexes(acceleration_settings.indexes.clone())
         .secret(acceleration_secret)
         .build()?;
 
