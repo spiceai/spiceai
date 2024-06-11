@@ -20,19 +20,18 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, TimestampNanosecondArray};
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, execution::context::SessionContext,
-    sql::TableReference,
+    datasource::{provider_as_source, TableProvider}, error::DataFusionError, execution::context::SessionContext, logical_expr::{col, lit, LogicalPlanBuilder}, sql::TableReference
 };
 use futures::{future::join_all, stream::TryStreamExt};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, datafusion::{query::query_history::DEFAULT_QUERY_HISTORY_TABLE, SPICE_RUNTIME_SCHEMA}};
 
-const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
-const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 10 * 60; // 10 minutes
+const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 6;// 60; // every minute
+const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 6;//10 * 60; // 10 minutes
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -184,7 +183,7 @@ impl DatasetsHealthMonitor {
 
                             tracing::trace!("Verifying connectivity for dataset {}", &item.name);
                             let connectivity_test_result =
-                                match test_connectivity(&item.table_provider, &ctx).await {
+                                match test_connectivity(&item.table_provider, ctx).await {
                                     Ok(()) => AvailabilityVerificationResult::Available,
                                     Err(err) => AvailabilityVerificationResult::Unavailable(
                                         item.last_available_time,

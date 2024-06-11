@@ -128,8 +128,6 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!("{err}");
     }
 
-    rt.start_datasets_health_monitor();
-
     let cloned_rt = rt.clone();
     let server_thread =
         tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
