@@ -126,8 +126,7 @@ impl DataSink for DuckDBDataSink {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-        let constraints = self.duckdb.constraints();
-        constraints::validate_batch_with_constraints(&data_batches, constraints)
+        constraints::validate_batch_with_constraints(&data_batches, self.duckdb.constraints())
             .await
             .context(super::ConstraintViolationSnafu)
             .map_err(to_datafusion_error)?;
