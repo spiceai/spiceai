@@ -42,10 +42,10 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4b6489ffd8d138b138c2049966b19d073867885f" }
-arrow = "51.0.0"
-arrow-flight = "51.0.0"
-duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "845e61d8c661a07904df9f6c810e61a3c4711ab1" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "be2c2c1f74823956e609a23ca38657cd76c2fcfe" }
+arrow = "52.0.0"
+arrow-flight = "52.0.0"
+duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "506c2ddb81e86ef13b75f7fa8817abefb04a123d" }
 tonic = "0.11.0"
 futures = "0.3.30"
 r2d2 = "0.8.10"
@@ -68,10 +68,10 @@ uuid = "1.6.1"
 pem = "3.0.4"
 fundu = "2.0.0"
 odbc-api = { version = "7.0.0" }
-arrow-odbc = { version = "9.0.0" }
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
+arrow-odbc = { version = "11.1.0" }
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 ssh2 = { version = "0.9.4" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "bf5fac66ca196ca52221df1ac90f38879d9b6ea8" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "bf5fac66ca196ca52221df1ac90f38879d9b6ea8" }
-object_store = { version = "0.9.1" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "4ea973e9feebfdb776bcfb6daeef91e897b0375f" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "4ea973e9feebfdb776bcfb6daeef91e897b0375f" }
+object_store = { version = "0.10.1" }

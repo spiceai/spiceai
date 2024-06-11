@@ -315,7 +315,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         &self.properties
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
