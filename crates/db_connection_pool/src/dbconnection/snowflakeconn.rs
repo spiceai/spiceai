@@ -235,3 +235,78 @@ fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRe
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        ArrayBuilder, ArrayRef, Int32Builder, Int64Builder, StructBuilder,
+        TimestampMillisecondArray,
+    };
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_cast_sf_timestamp_ntz_to_arrow_timestamp() {
+        let timestamp_ntz_array = create_timestamp_ntz_array(
+            vec![Some(1_696_164_330), None, Some(1_714_647_301)],
+            vec![Some(0), None, Some(739_000_000)],
+        );
+        let result = cast_sf_timestamp_ntz_to_arrow_timestamp(&timestamp_ntz_array)
+            .expect("Should cast Snowflake timestamp to Arrow timestamp");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("Should downcast to TimestampMillisecondArray");
+
+        let expected_timestamps = [Some(1_696_164_330_000), None, Some(1_714_647_301_739)];
+
+        assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
+        assert!(result.is_null(1));
+        assert_eq!(result.value(2), expected_timestamps[2].unwrap_or_default());
+    }
+
+    fn create_timestamp_ntz_array(
+        epochs: Vec<Option<i64>>,
+        fractions: Vec<Option<i32>>,
+    ) -> ArrayRef {
+        let fields = vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+        ];
+
+        let mut builder = StructBuilder::new(
+            fields.clone(),
+            vec![
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+
+        for (epoch, fraction) in epochs.into_iter().zip(fractions.into_iter()) {
+            if let (Some(epoch_val), Some(fraction_val)) = (epoch, fraction) {
+                builder
+                    .field_builder::<Int64Builder>(0)
+                    .expect("Should return a field builder")
+                    .append_value(epoch_val);
+                builder
+                    .field_builder::<Int32Builder>(1)
+                    .expect("Should return a field builder")
+                    .append_value(fraction_val);
+                builder.append(true);
+            } else {
+                builder.append(false);
+                builder
+                    .field_builder::<Int64Builder>(0)
+                    .expect("Should return a field builder")
+                    .append_null();
+                builder
+                    .field_builder::<Int32Builder>(1)
+                    .expect("Should return a field builder")
+                    .append_null();
+            }
+        }
+
+        Arc::new(builder.finish()) as ArrayRef
+    }
+}
