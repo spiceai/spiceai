@@ -3,6 +3,8 @@
   
   on:
     push:
+      branches:
+        - trunk
       paths:
         - "**/Cargo.toml"
     pull_request:

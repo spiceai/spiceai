@@ -254,7 +254,7 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use datafusion::{
-        common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
+        common::{Constraints, TableReference, ToDFSchema},
         datasource::provider::TableProviderFactory,
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
@@ -277,12 +277,9 @@ mod tests {
             name: TableReference::bare("test_table"),
             location: String::new(),
             file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
             table_partition_cols: vec![],
             if_not_exists: true,
             definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
             options: HashMap::new(),

@@ -24,7 +24,6 @@ use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
-use arrow_odbc::Quirks;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
@@ -204,16 +203,6 @@ fn build_odbc_reader<C: Cursor>(
     bind_as_usize("max_num_rows_per_batch", &mut |s| {
         builder.with_max_num_rows_per_batch(s);
     });
-
-    params
-        .get("enable_db2_length_quirk")
-        .and_then(|q| q.parse::<bool>().ok())
-        .into_iter()
-        .for_each(|b| {
-            builder.with_shims(Quirks {
-                indicators_returned_from_bulk_fetch_are_memory_garbage: b,
-            });
-        });
 
     Ok(builder.build(cursor).context(ArrowODBCSnafu)?)
 }

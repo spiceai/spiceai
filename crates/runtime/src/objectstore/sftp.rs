@@ -26,11 +26,10 @@ use bytes::Bytes;
 use chrono::DateTime;
 use futures::stream::BoxStream;
 use object_store::{
-    path::Path, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartId,
-    ObjectMeta, ObjectStore, PutOptions, PutResult,
+    path::Path, Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 use ssh2::Session;
-use tokio::io::AsyncWrite;
 
 #[derive(Debug)]
 pub struct SFTPObjectStore {
@@ -82,18 +81,20 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
 
 #[async_trait]
 impl ObjectStore for SFTPObjectStore {
-    async fn put_opts(&self, _: &Path, _: Bytes, _: PutOptions) -> object_store::Result<PutResult> {
-        unimplemented!()
-    }
-
-    async fn put_multipart(
+    async fn put_opts(
         &self,
         _: &Path,
-    ) -> object_store::Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        _: PutPayload,
+        _: PutOptions,
+    ) -> object_store::Result<PutResult> {
         unimplemented!()
     }
 
-    async fn abort_multipart(&self, _: &Path, _: &MultipartId) -> object_store::Result<()> {
+    async fn put_multipart_opts(
+        &self,
+        _location: &Path,
+        _opts: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         unimplemented!()
     }
 
@@ -177,6 +178,7 @@ impl ObjectStore for SFTPObjectStore {
             payload: GetResultPayload::Stream(Box::pin(stream)),
             meta: object_meta,
             range: Range { start, end },
+            attributes: Attributes::default(),
         })
     }
 

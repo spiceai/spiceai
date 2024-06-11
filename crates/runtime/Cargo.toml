@@ -21,7 +21,7 @@ metrics.workspace = true
 datafusion.workspace = true
 arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-arrow-ipc = "51.0.0"
+arrow-ipc = "52.0.0"
 tonic.workspace = true
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
 tonic-health = "0.9.0"
@@ -56,7 +56,7 @@ indexmap = "2.2.2"
 regex = "1.10.3"
 reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
-arrow-json = "51.0.0"
+arrow-json = "52.0.0"
 async-trait.workspace = true
 itertools = "0.12"
 object_store = { workspace = true, features = ["aws"] }
