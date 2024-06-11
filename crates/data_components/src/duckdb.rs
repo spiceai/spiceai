@@ -83,9 +83,6 @@ pub enum Error {
     #[snafu(display("Unable to get appender to duckdb table: {source}"))]
     UnableToGetAppenderToDuckDBTable { source: duckdb::Error },
 
-    #[snafu(display("Unable to rollback the transaction: {source}"))]
-    UnableToRollbackTransaction { source: duckdb::Error },
-
     #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
     UnableToDeleteDuckdbData { source: duckdb::Error },
 
