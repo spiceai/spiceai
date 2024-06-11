@@ -21,6 +21,7 @@ use crate::duckdb::DuckDB;
 use crate::util::constraints;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
+use datafusion::common::Constraints;
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
@@ -65,6 +66,10 @@ impl TableProvider for DuckDBTableWriter {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(self.duckdb.constraints())
     }
 
     async fn scan(

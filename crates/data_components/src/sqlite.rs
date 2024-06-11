@@ -18,6 +18,7 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
@@ -37,7 +38,10 @@ use tokio_rusqlite::Connection;
 
 use crate::{
     delete::DeletionTableProviderAdapter,
-    util::indexes::{self, IndexType},
+    util::{
+        constraints,
+        indexes::{self, IndexType},
+    },
 };
 
 use self::write::SqliteTableWriter;
@@ -76,6 +80,9 @@ pub enum Error {
 
     #[snafu(display("There is a dangling reference to the Sqlite struct in TableProviderFactory.create. This is a bug."))]
     DanglingReferenceToSqlite,
+
+    #[snafu(display("Constraint Violation: {source}"))]
+    ConstraintViolation { source: constraints::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -150,6 +157,7 @@ impl TableProviderFactory for SqliteTableFactory {
             name.clone(),
             Arc::clone(&schema),
             Arc::clone(&pool),
+            cmd.constraints.clone(),
         ));
 
         let mut db_conn = sqlite.connect().await.map_err(to_datafusion_error)?;
@@ -208,16 +216,28 @@ pub struct Sqlite {
     table_name: String,
     schema: SchemaRef,
     pool: Arc<SqliteConnectionPool>,
+    constraints: Constraints,
 }
 
 impl Sqlite {
     #[must_use]
-    pub fn new(table_name: String, schema: SchemaRef, pool: Arc<SqliteConnectionPool>) -> Self {
+    pub fn new(
+        table_name: String,
+        schema: SchemaRef,
+        pool: Arc<SqliteConnectionPool>,
+        constraints: Constraints,
+    ) -> Self {
         Self {
             table_name,
             schema,
             pool,
+            constraints,
         }
+    }
+
+    #[must_use]
+    pub fn constraints(&self) -> &Constraints {
+        &self.constraints
     }
 
     async fn connect(
