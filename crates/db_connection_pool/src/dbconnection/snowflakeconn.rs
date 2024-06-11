@@ -206,6 +206,12 @@ fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRe
             reason: "value is not a struct",
         },
     )?;
+    if struct_array.columns().len() < 2 {
+        return UnableToCastSnowflakeTimestampSnafu {
+            reason: "value is not a struct with 2 columns",
+        }
+        .fail();
+    }
     let epoch_array = struct_array
         .column(0)
         .as_any()
@@ -264,6 +270,26 @@ mod tests {
         assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
         assert!(result.is_null(1));
         assert_eq!(result.value(2), expected_timestamps[2].unwrap_or_default());
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_ntz_to_arrow_timestamp_invalid_input() {
+        let epoch_array = Arc::new(Int64Array::from(vec![
+            Some(1_696_164_330),
+            None,
+            Some(1_714_647_301),
+        ])) as ArrayRef;
+
+        let timestamp_ntz_no_fraction = StructArray::from(vec![(
+            Arc::new(Field::new("epoch", DataType::Int64, true)),
+            epoch_array,
+        )]);
+
+        let result = cast_sf_timestamp_ntz_to_arrow_timestamp(
+            &(Arc::new(timestamp_ntz_no_fraction) as ArrayRef),
+        );
+
+        assert!(result.is_err());
     }
 
     fn create_timestamp_ntz_array(
