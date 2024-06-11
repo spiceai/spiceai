@@ -248,7 +248,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         Ok(Box::pin(stream_adapter))
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

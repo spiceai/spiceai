@@ -21,14 +21,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::AsyncReadExt;
-use object_store::GetRange;
 use object_store::{
-    path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta,
-    ObjectStore, PutOptions, PutResult,
+    path::Path, GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta, ObjectStore,
+    PutOptions, PutResult,
 };
+use object_store::{Attributes, GetRange, MultipartUpload, PutMultipartOpts, PutPayload};
 use suppaftp::types::FileType;
 use suppaftp::AsyncFtpStream;
-use tokio::io::AsyncWrite;
 
 #[derive(Debug)]
 pub struct FTPObjectStore {
@@ -160,18 +159,20 @@ fn pipe_stream(
 
 #[async_trait]
 impl ObjectStore for FTPObjectStore {
-    async fn put_opts(&self, _: &Path, _: Bytes, _: PutOptions) -> object_store::Result<PutResult> {
-        unimplemented!()
-    }
-
-    async fn put_multipart(
+    async fn put_opts(
         &self,
-        _: &Path,
-    ) -> object_store::Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        _location: &Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
         unimplemented!()
     }
 
-    async fn abort_multipart(&self, _: &Path, _: &MultipartId) -> object_store::Result<()> {
+    async fn put_multipart_opts(
+        &self,
+        _location: &Path,
+        _opts: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         unimplemented!()
     }
 
@@ -222,6 +223,7 @@ impl ObjectStore for FTPObjectStore {
                 data_to_read,
             )),
             range: Range { start, end },
+            attributes: Attributes::default(),
         })
     }
 
