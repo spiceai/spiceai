@@ -142,7 +142,10 @@ impl DataSink for DuckDBDataSink {
             .context(super::UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        let num_rows = self.try_write_all(&tx, &data_batches)?;
+        let num_rows = match **self.duckdb.constraints() {
+            [] => self.try_write_all_no_constraints(&tx, &data_batches)?,
+            _ => self.try_write_all_with_constraints(&tx, &data_batches)?,
+        };
 
         tx.commit()
             .context(super::UnableToCommitDuckDBTransactionSnafu)
@@ -157,7 +160,63 @@ impl DuckDBDataSink {
         Self { duckdb, overwrite }
     }
 
-    fn try_write_all(
+    /// If there are constraints on the `DuckDB` table, we need to create an empty copy of the target table, write to that table copy and then depending on
+    /// if the mode is overwrite or not, insert into the target table or drop the target table and rename the current table.
+    fn try_write_all_with_constraints(
+        &self,
+        tx: &Transaction<'_>,
+        data_batches: &Vec<RecordBatch>,
+    ) -> datafusion::common::Result<u64> {
+        // We want to clone the current table into our insert table
+        let Some(ref orig_table_creator) = self.duckdb.table_creator else {
+            return Err(DataFusionError::Execution(
+                "Expected table with constraints to have a table creator".to_string(),
+            ));
+        };
+        let mut insert_table = orig_table_creator
+            .create_empty_clone()
+            .map_err(to_datafusion_error)?;
+
+        let mut num_rows = 0;
+
+        for data_batch in data_batches {
+            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
+                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
+            })?;
+        }
+
+        for (i, batch) in data_batches.iter().enumerate() {
+            tracing::debug!(
+                "Inserting batch #{i}/{} into cloned table.",
+                data_batches.len()
+            );
+            insert_table
+                .insert_batch(tx, batch)
+                .map_err(to_datafusion_error)?;
+        }
+
+        let Some(insert_table_creator) = insert_table.table_creator.take() else {
+            unreachable!()
+        };
+
+        if self.overwrite {
+            insert_table_creator
+                .replace_table(tx, orig_table_creator)
+                .map_err(to_datafusion_error)?;
+        } else {
+            insert_table
+                .insert_table_into(tx, &self.duckdb)
+                .map_err(to_datafusion_error)?;
+            insert_table_creator
+                .delete_table(tx)
+                .map_err(to_datafusion_error)?;
+        }
+
+        Ok(num_rows)
+    }
+
+    /// If there are no constraints on the `DuckDB` table, we can do a simple single transaction write.
+    fn try_write_all_no_constraints(
         &self,
         tx: &Transaction<'_>,
         data_batches: &Vec<RecordBatch>,
@@ -172,9 +231,6 @@ impl DuckDBDataSink {
 
         if self.overwrite {
             tracing::debug!("Deleting all data from table.");
-
-            // There is a known limitation in DuckDB for doing a delete, then an insert in the
-            // same transaction with a uniqueness constraint: https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking
             self.duckdb
                 .delete_all_table_data(tx)
                 .map_err(to_datafusion_error)?;
