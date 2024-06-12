@@ -204,7 +204,7 @@ pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 #[derive(Clone)]
 pub struct Runtime {
-    pub instance_name: String,
+    instance_name: String,
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
