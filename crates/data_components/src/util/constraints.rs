@@ -54,10 +54,7 @@ pub async fn validate_batch_with_constraints(
         futures.push(fut);
     }
 
-    let results = future::join_all(futures).await;
-    for result in results {
-        result?;
-    }
+    future::try_join_all(futures).await?;
 
     Ok(())
 }
