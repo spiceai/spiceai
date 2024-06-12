@@ -18,8 +18,10 @@ use std::{any::Any, fmt, sync::Arc};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
+use crate::util::constraints;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
+use datafusion::common::Constraints;
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
@@ -31,6 +33,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
 };
+use duckdb::Transaction;
 use futures::StreamExt;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::Engine;
@@ -63,6 +66,10 @@ impl TableProvider for DuckDBTableWriter {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(self.duckdb.constraints())
     }
 
     async fn scan(
@@ -113,9 +120,7 @@ impl DataSink for DuckDBDataSink {
         data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        let mut num_rows = 0;
-
-        let mut db_conn = self.duckdb.connect().await.map_err(to_datafusion_error)?;
+        let mut db_conn = self.duckdb.connect_sync().map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
         let data_batches_result = data
@@ -126,11 +131,10 @@ impl DataSink for DuckDBDataSink {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-        for data_batch in &data_batches {
-            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
-                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
-            })?;
-        }
+        constraints::validate_batch_with_constraints(&data_batches, self.duckdb.constraints())
+            .await
+            .context(super::ConstraintViolationSnafu)
+            .map_err(to_datafusion_error)?;
 
         let tx = duckdb_conn
             .conn
@@ -138,17 +142,7 @@ impl DataSink for DuckDBDataSink {
             .context(super::UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        if self.overwrite {
-            self.duckdb
-                .delete_all_table_data(&tx)
-                .map_err(to_datafusion_error)?;
-        }
-
-        for batch in data_batches {
-            self.duckdb
-                .insert_batch(&tx, &batch)
-                .map_err(to_datafusion_error)?;
-        }
+        let num_rows = self.try_write_all(&tx, &data_batches)?;
 
         tx.commit()
             .context(super::UnableToCommitDuckDBTransactionSnafu)
@@ -161,6 +155,39 @@ impl DataSink for DuckDBDataSink {
 impl DuckDBDataSink {
     fn new(duckdb: Arc<DuckDB>, overwrite: bool) -> Self {
         Self { duckdb, overwrite }
+    }
+
+    fn try_write_all(
+        &self,
+        tx: &Transaction<'_>,
+        data_batches: &Vec<RecordBatch>,
+    ) -> datafusion::common::Result<u64> {
+        let mut num_rows = 0;
+
+        for data_batch in data_batches {
+            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
+                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
+            })?;
+        }
+
+        if self.overwrite {
+            tracing::debug!("Deleting all data from table.");
+
+            // There is a known limitation in DuckDB for doing a delete, then an insert in the
+            // same transaction with a uniqueness constraint: https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking
+            self.duckdb
+                .delete_all_table_data(tx)
+                .map_err(to_datafusion_error)?;
+        }
+
+        for (i, batch) in data_batches.iter().enumerate() {
+            tracing::debug!("Inserting batch #{i}/{} into table.", data_batches.len());
+            self.duckdb
+                .insert_batch(tx, batch)
+                .map_err(to_datafusion_error)?;
+        }
+
+        Ok(num_rows)
     }
 }
 

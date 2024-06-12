@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{TableProvider, TableType},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
@@ -31,7 +32,10 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::{
+    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
+    util::constraints,
+};
 
 use super::{to_datafusion_error, Postgres};
 
@@ -61,6 +65,10 @@ impl TableProvider for PostgresTableWriter {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(self.postgres.constraints())
     }
 
     async fn scan(
@@ -192,6 +200,14 @@ impl DataSink for PostgresDataSink {
             };
 
             num_rows += batch_num_rows as u64;
+
+            constraints::validate_batch_with_constraints(
+                &[batch.clone()],
+                self.postgres.constraints(),
+            )
+            .await
+            .context(super::ConstraintViolationSnafu)
+            .map_err(to_datafusion_error)?;
 
             self.postgres
                 .insert_batch(&tx, batch)

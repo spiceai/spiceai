@@ -28,6 +28,7 @@ use bb8_postgres::{
     PostgresConnectionManager,
 };
 use datafusion::{
+    common::Constraints,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
@@ -49,7 +50,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     delete::DeletionTableProviderAdapter,
-    util::indexes::{self, IndexType},
+    util::{
+        constraints,
+        indexes::{self, IndexType},
+    },
     Read, ReadWrite,
 };
 
@@ -130,6 +134,9 @@ pub enum Error {
 
     #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
     TableDoesntExist { table_name: String },
+
+    #[snafu(display("Constraint Violation: {source}"))]
+    ConstraintViolation { source: constraints::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -178,7 +185,7 @@ impl ReadWrite for PostgresTableFactory {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
         let table_name = table_reference.to_string();
-        let postgres = Postgres::new(table_name, Arc::clone(&self.pool));
+        let postgres = Postgres::new(table_name, Arc::clone(&self.pool), Constraints::empty());
 
         Ok(PostgresTableWriter::create(read_provider, postgres))
     }
@@ -231,7 +238,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         );
 
         let schema = Arc::new(schema);
-        let postgres = Postgres::new(name.clone(), Arc::clone(&pool));
+        let postgres = Postgres::new(name.clone(), Arc::clone(&pool), cmd.constraints.clone());
 
         let mut db_conn = pool
             .connect()
@@ -288,12 +295,26 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 pub struct Postgres {
     table_name: String,
     pool: Arc<PostgresConnectionPool>,
+    constraints: Constraints,
 }
 
 impl Postgres {
     #[must_use]
-    pub fn new(table_name: String, pool: Arc<PostgresConnectionPool>) -> Self {
-        Self { table_name, pool }
+    pub fn new(
+        table_name: String,
+        pool: Arc<PostgresConnectionPool>,
+        constraints: Constraints,
+    ) -> Self {
+        Self {
+            table_name,
+            pool,
+            constraints,
+        }
+    }
+
+    #[must_use]
+    pub fn constraints(&self) -> &Constraints {
+        &self.constraints
     }
 
     async fn connect(&self) -> Result<Box<DynPostgresConnection>> {

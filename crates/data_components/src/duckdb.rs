@@ -16,13 +16,17 @@ limitations under the License.
 
 use crate::{
     delete::DeletionTableProviderAdapter,
-    util::indexes::{self, IndexType},
+    util::{
+        constraints,
+        indexes::{self, IndexType},
+    },
     Read, ReadWrite,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::IndexBuilder;
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
@@ -76,6 +80,9 @@ pub enum Error {
     #[snafu(display("Unable to insert into duckdb table: {source}"))]
     UnableToInsertToDuckDBTable { source: duckdb::Error },
 
+    #[snafu(display("Unable to get appender to duckdb table: {source}"))]
+    UnableToGetAppenderToDuckDBTable { source: duckdb::Error },
+
     #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
     UnableToDeleteDuckdbData { source: duckdb::Error },
 
@@ -99,6 +106,9 @@ pub enum Error {
 
     #[snafu(display("The table '{table_name}' doesn't exist in the DuckDB server"))]
     TableDoesntExist { table_name: String },
+
+    #[snafu(display("Constraint Violation: {source}"))]
+    ConstraintViolation { source: constraints::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -182,7 +192,12 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         });
 
         let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
-        let duckdb = DuckDB::new(name.clone(), Arc::clone(&schema), Arc::clone(&pool));
+        let duckdb = DuckDB::new(
+            name.clone(),
+            Arc::clone(&schema),
+            Arc::clone(&pool),
+            cmd.constraints.clone(),
+        );
 
         let mut db_conn = duckdb.connect().await.map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
@@ -232,16 +247,28 @@ pub struct DuckDB {
     table_name: String,
     schema: SchemaRef,
     pool: Arc<DuckDbConnectionPool>,
+    constraints: Constraints,
 }
 
 impl DuckDB {
     #[must_use]
-    pub fn new(table_name: String, schema: SchemaRef, pool: Arc<DuckDbConnectionPool>) -> Self {
+    pub fn new(
+        table_name: String,
+        schema: SchemaRef,
+        pool: Arc<DuckDbConnectionPool>,
+        constraints: Constraints,
+    ) -> Self {
         Self {
             table_name,
             schema,
             pool,
+            constraints,
         }
+    }
+
+    #[must_use]
+    pub fn constraints(&self) -> &Constraints {
+        &self.constraints
     }
 
     async fn connect(
@@ -250,6 +277,16 @@ impl DuckDB {
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
     > {
         self.pool.connect().await.context(DbConnectionSnafu)
+    }
+
+    fn connect_sync(
+        &self,
+    ) -> Result<
+        Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
+    > {
+        Arc::clone(&self.pool)
+            .connect_sync()
+            .context(DbConnectionSnafu)
     }
 
     fn duckdb_conn<'a>(
@@ -279,7 +316,7 @@ impl DuckDB {
     fn insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
         let mut appender = transaction
             .appender(&self.table_name)
-            .context(UnableToInsertToDuckDBTableSnafu)?;
+            .context(UnableToGetAppenderToDuckDBTableSnafu)?;
 
         for batch in Self::split_batch(batch) {
             appender
@@ -418,6 +455,7 @@ impl ReadWrite for DuckDBTableFactory {
             table_name,
             Arc::clone(&read_provider).schema(),
             Arc::clone(&self.pool),
+            Constraints::empty(),
         );
 
         Ok(DuckDBTableWriter::create(read_provider, duckdb))
