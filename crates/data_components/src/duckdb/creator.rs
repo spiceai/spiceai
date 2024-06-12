@@ -13,11 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::datatypes::SchemaRef;
-use arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow_sql_gen::statement::IndexBuilder;
 use datafusion::common::{Constraint, Constraints};
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::Transaction;
+use duckdb::{vtab::arrow_recordbatch_to_query_params, ToSql, Transaction};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
@@ -96,8 +96,7 @@ impl TableCreator {
             self.create_index(&tx, index.0, index.1 == IndexType::Unique)?;
         }
 
-        tx.commit()
-            .context(super::UnableToCommitDuckDBTransactionSnafu)?;
+        tx.commit().context(super::UnableToCommitTransactionSnafu)?;
 
         let constraints = self.constraints.clone().unwrap_or(Constraints::empty());
 
@@ -191,10 +190,7 @@ impl TableCreator {
         transaction: &Transaction<'_>,
         primary_keys: Vec<String>,
     ) -> super::Result<()> {
-        let create_table_statement =
-            CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name)
-                .primary_keys(primary_keys);
-        let sql = create_table_statement.build_postgres();
+        let sql = self.get_table_create_statement()?;
         tracing::debug!("{sql}");
 
         transaction
@@ -202,6 +198,54 @@ impl TableCreator {
             .context(super::UnableToCreateDuckDBTableSnafu)?;
 
         Ok(())
+    }
+
+    /// DuckDB CREATE TABLE statements aren't supported by sea-query - so we create a temporary table
+    /// from an Arrow schema and ask DuckDB for the CREATE TABLE statement.
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn get_table_create_statement(&self) -> super::Result<String> {
+        let mut db_conn = Arc::clone(&self.pool)
+            .connect_sync()
+            .context(super::DbConnectionSnafu)?;
+        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
+
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(super::UnableToBeginTransactionSnafu)?;
+
+        let empty_record = RecordBatch::new_empty(Arc::clone(&self.schema));
+
+        let arrow_params = arrow_recordbatch_to_query_params(empty_record);
+        let arrow_params_vec: Vec<&dyn ToSql> = arrow_params
+            .iter()
+            .map(|p| p as &dyn ToSql)
+            .collect::<Vec<_>>();
+        let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
+        let sql = format!(
+            r#"CREATE TABLE IF NOT EXISTS "{name}" AS SELECT * FROM arrow(?, ?)"#,
+            name = self.table_name
+        );
+        tracing::debug!("{sql}");
+
+        tx.execute(&sql, arrow_params_ref)
+            .context(super::UnableToCreateDuckDBTableSnafu)?;
+
+        let create_stmt = tx
+            .query_row(
+                &format!(
+                    "select sql from duckdb_tables() where table_name = '{}'",
+                    self.table_name
+                ),
+                [],
+                |r| r.get::<usize, String>(0),
+            )
+            .context(super::UnableToQueryDataSnafu)?;
+
+        tx.rollback()
+            .context(super::UnableToRollbackTransactionSnafu)?;
+
+        Ok(create_stmt)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -272,7 +316,7 @@ impl TableCreator {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use arrow::array::RecordBatch;
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
@@ -378,7 +422,7 @@ mod tests {
         }
     }
 
-    fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
+    pub(crate) fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
         let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
             (_, Some(log)) => EnvFilter::new(log),
             (Some(level), None) => EnvFilter::new(level),

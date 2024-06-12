@@ -148,7 +148,7 @@ impl DataSink for DuckDBDataSink {
         };
 
         tx.commit()
-            .context(super::UnableToCommitDuckDBTransactionSnafu)
+            .context(super::UnableToCommitTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
         Ok(num_rows)
@@ -303,7 +303,10 @@ impl DeletionSink for DuckDBDeletionSink {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
+    use crate::{
+        delete::get_deletion_provider,
+        duckdb::{creator::tests::init_tracing, DuckDBTableProviderFactory},
+    };
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -322,6 +325,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
+        let _guard = init_tracing(None);
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
             arrow::datatypes::Field::new(
