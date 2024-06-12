@@ -82,7 +82,7 @@ impl ExecutionPlan for EmbeddingTableExec {
         &self.properties
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_plan.children()
     }
 

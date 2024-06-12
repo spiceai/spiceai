@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
+use arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
@@ -32,10 +33,16 @@ use db_connection_pool::{
 use rusqlite::{ToSql, Transaction};
 use snafu::prelude::*;
 use sql_provider_datafusion::{expr::Engine, SqlTable};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio_rusqlite::Connection;
 
-use crate::delete::DeletionTableProviderAdapter;
+use crate::{
+    delete::DeletionTableProviderAdapter,
+    util::{
+        constraints,
+        indexes::{self, IndexType},
+    },
+};
 
 use self::write::SqliteTableWriter;
 
@@ -73,6 +80,9 @@ pub enum Error {
 
     #[snafu(display("There is a dangling reference to the Sqlite struct in TableProviderFactory.create. This is a bug."))]
     DanglingReferenceToSqlite,
+
+    #[snafu(display("Constraint Violation: {source}"))]
+    ConstraintViolation { source: constraints::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -112,6 +122,23 @@ impl TableProviderFactory for SqliteTableFactory {
         let mode = options.remove("mode").unwrap_or_default();
         let mode: Mode = mode.as_str().into();
 
+        let indexes_option_str = options.remove("indexes");
+        let indexes = match indexes_option_str {
+            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+            None => HashMap::new(),
+        };
+
+        let indexes = indexes
+            .into_iter()
+            .map(|(key, value)| {
+                let columns = indexes::index_columns(&key)
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect();
+                (columns, value)
+            })
+            .collect::<Vec<(Vec<String>, IndexType)>>();
+
         let db_path = cmd
             .options
             .get(self.db_path_param.as_str())
@@ -130,6 +157,7 @@ impl TableProviderFactory for SqliteTableFactory {
             name.clone(),
             Arc::clone(&schema),
             Arc::clone(&pool),
+            cmd.constraints.clone(),
         ));
 
         let mut db_conn = sqlite.connect().await.map_err(to_datafusion_error)?;
@@ -143,6 +171,13 @@ impl TableProviderFactory for SqliteTableFactory {
                 .call(move |conn| {
                     let transaction = conn.transaction()?;
                     sqlite_in_conn.create_table(&transaction)?;
+                    for index in indexes {
+                        sqlite_in_conn.create_index(
+                            &transaction,
+                            index.0.iter().map(AsRef::as_ref).collect(),
+                            index.1 == IndexType::Unique,
+                        )?;
+                    }
                     transaction.commit()?;
                     Ok(())
                 })
@@ -181,16 +216,28 @@ pub struct Sqlite {
     table_name: String,
     schema: SchemaRef,
     pool: Arc<SqliteConnectionPool>,
+    constraints: Constraints,
 }
 
 impl Sqlite {
     #[must_use]
-    pub fn new(table_name: String, schema: SchemaRef, pool: Arc<SqliteConnectionPool>) -> Self {
+    pub fn new(
+        table_name: String,
+        schema: SchemaRef,
+        pool: Arc<SqliteConnectionPool>,
+        constraints: Constraints,
+    ) -> Self {
         Self {
             table_name,
             schema,
             pool,
+            constraints,
         }
+    }
+
+    #[must_use]
+    pub fn constraints(&self) -> &Constraints {
+        &self.constraints
     }
 
     async fn connect(
@@ -274,6 +321,23 @@ impl Sqlite {
         let create_table_statement =
             CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name);
         let sql = create_table_statement.build_sqlite();
+
+        transaction.execute(&sql, [])?;
+
+        Ok(())
+    }
+
+    fn create_index(
+        &self,
+        transaction: &Transaction<'_>,
+        columns: Vec<&str>,
+        unique: bool,
+    ) -> rusqlite::Result<()> {
+        let mut index_builder = IndexBuilder::new(&self.table_name, columns);
+        if unique {
+            index_builder = index_builder.unique();
+        }
+        let sql = index_builder.build_sqlite();
 
         transaction.execute(&sql, [])?;
 

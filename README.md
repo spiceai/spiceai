@@ -210,7 +210,7 @@ sql> show tables
 | spice         | runtime      | query_history | BASE TABLE |
 +---------------+--------------+---------------+------------+
 
-Time: 0.007505084 seconds. 1 rows.
+Time: 0.007505084 seconds. 3 rows.
 ```
 
 Enter a query to display the longest taxi trips:

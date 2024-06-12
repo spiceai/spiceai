@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
@@ -33,7 +34,10 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::Engine;
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::{
+    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
+    util::constraints,
+};
 
 use super::{to_datafusion_error, Sqlite};
 
@@ -63,6 +67,10 @@ impl TableProvider for SqliteTableWriter {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(self.sqlite.constraints())
     }
 
     async fn scan(
@@ -125,6 +133,11 @@ impl DataSink for SqliteDataSink {
         let data_batches: Vec<RecordBatch> = data_batches_result
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+
+        constraints::validate_batch_with_constraints(&data_batches, self.sqlite.constraints())
+            .await
+            .context(super::ConstraintViolationSnafu)
+            .map_err(to_datafusion_error)?;
 
         for data_batch in &data_batches {
             num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
@@ -241,7 +254,7 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use datafusion::{
-        common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
+        common::{Constraints, TableReference, ToDFSchema},
         datasource::provider::TableProviderFactory,
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
@@ -264,12 +277,9 @@ mod tests {
             name: TableReference::bare("test_table"),
             location: String::new(),
             file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
             table_partition_cols: vec![],
             if_not_exists: true,
             definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
             options: HashMap::new(),

@@ -99,6 +99,10 @@ install: build
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
 
+.PHONY: install-with-odbc
+install-with-odbc:
+	make install SPICED_NON_DEFAULT_FEATURES="odbc"
+
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin

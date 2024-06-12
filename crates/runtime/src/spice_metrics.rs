@@ -108,6 +108,7 @@ impl MetricsRecorder {
 
     async fn tick(
         socket_addr: &SocketAddr,
+        instance_name: String,
         datafusion: &Arc<DataFusion>,
         remote_schema: &Arc<Option<Arc<Schema>>>,
     ) -> Result<(), Error> {
@@ -125,7 +126,8 @@ impl MetricsRecorder {
         let sample_size = scrape.samples.len();
 
         let mut timestamps: Vec<i64> = Vec::with_capacity(sample_size);
-        let mut metrics: Vec<String> = Vec::with_capacity(sample_size);
+        let mut instances: Vec<String> = Vec::with_capacity(sample_size);
+        let mut names: Vec<String> = Vec::with_capacity(sample_size);
         let mut values: Vec<f64> = Vec::with_capacity(sample_size);
         let mut labels: Vec<String> = Vec::with_capacity(sample_size);
 
@@ -144,9 +146,15 @@ impl MetricsRecorder {
             } else {
                 timestamps.push(timestamp.timestamp_micros() * 1000);
             }
-            metrics.push(sample.metric);
+            instances.push(instance_name.clone());
+            names.push(sample.metric);
             values.push(value);
-            labels.push(sample.labels.to_string());
+
+            if let Ok(labels_json) = serde_json::to_string(&*sample.labels) {
+                labels.push(labels_json);
+            } else {
+                labels.push("{}".to_string());
+            }
         }
 
         let mut schema = get_metrics_schema();
@@ -156,7 +164,8 @@ impl MetricsRecorder {
                 Arc::new(
                     TimestampNanosecondArray::from(timestamps).with_timezone(Arc::from("UTC")),
                 ),
-                Arc::new(StringArray::from(metrics)),
+                Arc::new(StringArray::from(instances)),
+                Arc::new(StringArray::from(names)),
                 Arc::new(Float64Array::from(values)),
                 Arc::new(StringArray::from(labels)),
             ],
@@ -184,14 +193,16 @@ impl MetricsRecorder {
         Ok(())
     }
 
-    pub fn start(&self, datafusion: &Arc<DataFusion>) {
+    pub fn start(&self, instance_name: String, datafusion: &Arc<DataFusion>) {
         let addr = Arc::clone(&self.socket_addr);
         let df = Arc::clone(datafusion);
         let schema = Arc::clone(&self.remote_schema);
 
         spawn(async move {
             loop {
-                if let Err(err) = MetricsRecorder::tick(&addr, &df, &schema).await {
+                if let Err(err) =
+                    MetricsRecorder::tick(&addr, instance_name.clone(), &df, &schema).await
+                {
                     tracing::error!("{err}");
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -211,6 +222,7 @@ pub fn get_metrics_schema() -> Arc<Schema> {
             ),
             false,
         ),
+        Field::new("instance", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Float64, false),
         Field::new("labels", DataType::Utf8, false),
