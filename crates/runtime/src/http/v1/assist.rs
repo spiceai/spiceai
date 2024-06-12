@@ -36,7 +36,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::instrument;
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::StreamExt;
 
 use crate::{
     accelerated_table::AcceleratedTable, datafusion::DataFusion, embeddings::table::EmbeddingTable,
@@ -252,6 +252,7 @@ async fn vector_search(
     Ok(response)
 }
 
+#[allow(clippy::from_iter_instead_of_collect)]
 fn create_assist_response_from(
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
 ) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
@@ -282,7 +283,6 @@ fn create_assist_response_from(
     Ok(from_value)
 }
 
-#[allow(clippy::from_iter_instead_of_collect)]
 fn create_assist_response(
     text: String,
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
@@ -430,8 +430,20 @@ async fn context_aware_stream(
 
     Sse::new(Box::pin(stream! {
         yield Event::default().json_data(vector_data);
-        while let Some(msg) = model_stream.next().await {
-            yield Ok(Event::default().data(msg.unwrap().unwrap()));
+        while let Some(msg_result) = model_stream.next().await {
+            match msg_result {
+                Err(e) => {
+                    yield Err(axum::Error::new(e.to_string()));
+                    break;
+                }
+                Ok(msg_opt) => {
+                    if let Some(msg) = msg_opt {
+                        yield Ok(Event::default().data(msg));
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     }))
     .keep_alive(KeepAlive::default())
