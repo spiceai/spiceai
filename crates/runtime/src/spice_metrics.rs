@@ -149,7 +149,12 @@ impl MetricsRecorder {
             instances.push(instance_name.clone());
             names.push(sample.metric);
             values.push(value);
-            labels.push(sample.labels.to_string());
+
+            if let Ok(labels_json) = serde_json::to_string(&*sample.labels) {
+                labels.push(labels_json);
+            } else {
+                labels.push("{}".to_string());
+            }
         }
 
         let mut schema = get_metrics_schema();
