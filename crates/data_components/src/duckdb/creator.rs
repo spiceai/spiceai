@@ -322,13 +322,19 @@ mod tests {
     #[tokio::test]
     async fn test_table_creator() {
         let _guard = init_tracing(None);
-        let pool = get_mem_duckdb();
         let batches = get_logs_batches().await;
 
         let schema = batches[0].schema();
 
-        let constraints = get_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
-        let created_table = TableCreator::new("eth.logs".to_string(), schema, Arc::clone(&pool))
+        for overwrite in &[false, true] {
+            let pool = get_mem_duckdb();
+            let constraints =
+                get_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+            let created_table = TableCreator::new(
+                "eth.logs".to_string(),
+                Arc::clone(&schema),
+                Arc::clone(&pool),
+            )
             .constraints(constraints)
             .indexes(
                 vec![
@@ -344,31 +350,32 @@ mod tests {
             .create()
             .expect("to create table");
 
-        let arc_created_table = Arc::new(created_table);
+            let arc_created_table = Arc::new(created_table);
 
-        let duckdb_sink = DuckDBDataSink::new(arc_created_table, true);
-        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
-        let rows_written = data_sink
-            .write_all(
-                get_stream_from_batches(batches),
-                &Arc::new(TaskContext::default()),
-            )
-            .await
-            .expect("to write all");
+            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite);
+            let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+            let rows_written = data_sink
+                .write_all(
+                    get_stream_from_batches(batches.clone()),
+                    &Arc::new(TaskContext::default()),
+                )
+                .await
+                .expect("to write all");
 
-        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
-        let conn = pool_conn
-            .as_any_mut()
-            .downcast_mut::<DuckDbConnection>()
-            .expect("to downcast to duckdb connection");
-        let num_rows = conn
-            .get_underlying_conn_mut()
-            .query_row(r#"SELECT COUNT(1) FROM "eth.logs""#, [], |r| {
-                r.get::<usize, u64>(0)
-            })
-            .expect("to get count");
+            let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+            let conn = pool_conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("to downcast to duckdb connection");
+            let num_rows = conn
+                .get_underlying_conn_mut()
+                .query_row(r#"SELECT COUNT(1) FROM "eth.logs""#, [], |r| {
+                    r.get::<usize, u64>(0)
+                })
+                .expect("to get count");
 
-        assert_eq!(num_rows, rows_written);
+            assert_eq!(num_rows, rows_written);
+        }
     }
 
     fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
