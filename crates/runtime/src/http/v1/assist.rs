@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::instrument;
 
 use futures::{FutureExt, Stream, StreamExt};
 
@@ -69,6 +70,12 @@ pub struct Request {
     /// Which datasources in the [`DataFusion`] instance to retrieve data from.
     #[serde(rename = "from", default)]
     pub data_source: Vec<String>,
+
+    /// If true, provide the result as a SSE stream. Otherwise, provide the result as a JSON response after the entire LLM inference is complete.
+    /// For a stream, the first event will be the primary keys of the relevant data, and the
+    /// following events will be the LLM completions (as streamed from the underlying LLM).
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_model() -> String {
@@ -286,6 +293,7 @@ fn create_assist_response(
     })
 }
 
+#[instrument(skip_all, fields(text=%payload.text, data_source=%payload.data_source.join(", "), model=%payload.model))]
 async fn prepare_and_run_vector_search(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<DataFusion>,
@@ -406,15 +414,35 @@ async fn get_primary_keys(
     Ok(tbl_to_pks)
 }
 
+async fn context_aware_stream(
+    model: &RwLock<Box<dyn Chat>>,
+    vector_search_data: &VectorSearchResponse,
+    model_input: String,
+) -> Response {
+    let mut model_stream = match model.write().await.stream(model_input).await {
+        Ok(model_stream) => model_stream,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let vector_data = match create_assist_response_from(&vector_search_data.retrieved_public_keys) {
+        Ok(vector_data) => vector_data,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    Sse::new(Box::pin(stream! {
+        yield Event::default().json_data(vector_data);
+        while let Some(msg) = model_stream.next().await {
+            yield Ok(Event::default().data(msg.unwrap().unwrap()));
+        }
+    }))
+    .keep_alive(KeepAlive::default())
+    .into_response()
+}
+
 async fn context_aware_chat(
     model: &RwLock<Box<dyn Chat>>,
     vector_search_data: &VectorSearchResponse,
-    user_input: String,
+    model_input: String,
 ) -> Response {
-    // Using returned data, create input for LLM.
-    let model_input =
-        combined_relevant_data_and_input(&vector_search_data.retrieved_entries, &user_input);
-
     match model.write().await.run(model_input).await {
         Ok(Some(assist)) => {
             match create_assist_response(assist, &vector_search_data.retrieved_public_keys) {
@@ -501,86 +529,20 @@ pub(crate) async fn post(
     // Run LLM with input.
     match llms.read().await.get(&payload.model) {
         Some(llm_model) => {
-            context_aware_chat(llm_model, &relevant_data, payload.text.clone()).await
+            let model_input = combined_relevant_data_and_input(
+                &relevant_data.retrieved_entries,
+                &payload.text.clone(),
+            );
+            if payload.stream {
+                context_aware_stream(llm_model, &relevant_data, model_input).await
+            } else {
+                context_aware_chat(llm_model, &relevant_data, model_input).await
+            }
         }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Model {} not found", payload.model),
         )
             .into_response(),
-    }
-}
-
-pub async fn sse_post(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
-    Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
-    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
-    Json(payload): Json<Request>,
-) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
-    // For now, force the user to specify which data.
-    // if payload.data_source.is_empty() {
-    //     return Sse::new(stream! {
-    //         yield Err(axum::Error::new(Box::new(
-    //             std::io::Error::new(std::io::ErrorKind::InvalidInput, "No data sources provided")
-    //         ) as Box<dyn Error + Send + Sync>))
-    //     }).keep_alive(KeepAlive::default());
-    // }
-
-    let relevant_data = match prepare_and_run_vector_search(
-        Arc::clone(&app),
-        Arc::clone(&df),
-        Arc::clone(&embeddings),
-        payload.clone(),
-    )
-    .await
-    {
-        Ok(relevant_data) => relevant_data,
-        Err(e) => {
-            println!("Error from prepare_and_run_vector_search: {e}");
-            unimplemented!("Help")
-        } // return Sse::new(stream! {}).keep_alive(KeepAlive::default())}
-          //     yield Err(axum::Error::new(Box::new(
-          //         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Model {e} not found"))
-          //     ) as Box<dyn Error + Send + Sync>))
-          // }).keep_alive(KeepAlive::default());}
-    };
-
-    tracing::debug!(
-        "Relevant data from vector search: {:#?}",
-        relevant_data.retrieved_entries
-    );
-
-    let model_input =
-        combined_relevant_data_and_input(&relevant_data.retrieved_entries, &payload.text.clone());
-    match llms.read().await.get(&payload.model.clone()) {
-        Some(llm_model) => {
-            let mut model_stream = match llm_model.write().await.stream(model_input).await {
-                Ok(model_stream) => model_stream,
-                Err(e) => {
-                    unimplemented!("Help")
-                } // return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            };
-            let vector_data =
-                match create_assist_response_from(&relevant_data.retrieved_public_keys) {
-                    Ok(vector_data) => vector_data,
-                    Err(e) => {
-                        unimplemented!("Help")
-                    } // return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-                };
-
-            Sse::new(Box::pin(stream! {
-                yield Event::default().json_data(vector_data);
-                while let Some(msg) = model_stream.next().await {
-                    yield Ok(Event::default().data(msg.unwrap().unwrap()));
-                }
-            }))
-            .keep_alive(KeepAlive::default())
-        }
-        None => {
-            unimplemented!("Help")
-        } // Sse::new(stream!{yield Event::default().data(
-          //     format!("Model {} not found", payload.model)
-          // )}).keep_alive(KeepAlive::default())
     }
 }
