@@ -287,7 +287,45 @@ async fn single_source_federation_push_down() -> Result<(), String> {
                     assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
                 }
             })),
-        )
+        ),
+        (
+            "SELECT MAX(blocks_number) FROM (SELECT b1.number as blocks_number from blocks b1)",
+            vec![
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                              |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                         |",
+                "|               |  Projection: MAX(blocks_number)                                                                                                                                                                   |",
+                "|               |   Aggregate: groupBy=[[]], aggr=[[MAX(blocks_number)]]                                                                                                                                            |",
+                "|               |     Projection: b1.number AS blocks_number                                                                                                                                                        |",
+                "|               |       SubqueryAlias: b1                                                                                                                                                                           |",
+                "|               |         TableScan: eth.recent_blocks                                                                                                                                                              |",
+                "| physical_plan | SchemaCastScanExec                                                                                                                                                                                |",
+                "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                            |",
+                "|               |     VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT MAX(blocks_number) FROM (SELECT b1.number AS blocks_number FROM eth.recent_blocks AS b1) |",
+                "|               |                                                                                                                                                                                                   |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(has_one_int_val)),
+        ),
+        (
+            "SELECT MAX(blocks.number) FROM blocks",
+            vec![
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                          |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                     |",
+                "|               |  Projection: MAX(eth.recent_blocks.number)                                                                                                                    |",
+                "|               |   Aggregate: groupBy=[[]], aggr=[[MAX(eth.recent_blocks.number)]]                                                                                             |",
+                "|               |     TableScan: eth.recent_blocks                                                                                                                              |",
+                "| physical_plan | SchemaCastScanExec                                                                                                                                            |",
+                "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                        |",
+                "|               |     VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT MAX(eth.recent_blocks.number) FROM eth.recent_blocks |",
+                "|               |                                                                                                                                                               |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(has_one_int_val)),
+        ),
     ];
 
     for (query, expected_plan, validate_result) in queries {
