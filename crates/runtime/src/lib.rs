@@ -55,6 +55,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 pub use util::shutdown_signal;
+use uuid::Uuid;
 
 use crate::extension::{Extension, ExtensionFactory};
 pub mod accelerated_table;
@@ -203,6 +204,7 @@ pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 #[derive(Clone)]
 pub struct Runtime {
+    instance_name: String,
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
@@ -225,7 +227,14 @@ impl Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
+        let hash = Uuid::new_v4().to_string()[..8].to_string();
+        let name = match &app {
+            Some(app) => app.name.clone(),
+            None => "spice".to_string(),
+        };
+
         let mut rt = Runtime {
+            instance_name: format!("{name}-{hash}").to_string(),
             app: Arc::new(RwLock::new(app)),
             df: Arc::new(DataFusion::new()),
             models: Arc::new(RwLock::new(HashMap::new())),
@@ -912,7 +921,7 @@ impl Runtime {
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
 
-            recorder.start(&self.df);
+            recorder.start(self.instance_name.clone(), &self.df);
         }
 
         Ok(())
