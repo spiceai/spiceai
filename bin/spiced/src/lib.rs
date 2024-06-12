@@ -120,14 +120,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.with_datasets_health_monitor(DatasetsHealthMonitor::new(Arc::clone(&rt.datafusion().ctx)));
 
-    if let Err(err) = rt
-        .start_metrics(args.metrics)
-        .await
-        .context(UnableToStartServersSnafu)
-    {
-        tracing::warn!("{err}");
-    }
-
     rt.start_datasets_health_monitor();
 
     let cloned_rt = rt.clone();
@@ -135,6 +127,16 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
 
     rt.load_secrets().await;
+
+    rt.start_extensions().await;
+
+    if let Err(err) = rt
+        .start_metrics(args.metrics)
+        .await
+        .context(UnableToStartServersSnafu)
+    {
+        tracing::warn!("{err}");
+    }
 
     #[cfg(feature = "models")]
     rt.load_embeddings().await; // Must be loaded before datasets
@@ -146,7 +148,7 @@ pub async fn run(args: Args) -> Result<()> {
             };
         }),
         Box::pin(rt.init_results_cache()),
-        Box::pin(rt.start_extensions()),
+        // Box::pin(rt.start_extensions()),
         Box::pin(rt.load_datasets()),
     ];
 
