@@ -162,6 +162,8 @@ impl DuckDBDataSink {
 
     /// If there are constraints on the `DuckDB` table, we need to create an empty copy of the target table, write to that table copy and then depending on
     /// if the mode is overwrite or not, insert into the target table or drop the target table and rename the current table.
+    ///
+    /// See: <https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking>
     fn try_write_all_with_constraints(
         &self,
         tx: &Transaction<'_>,
@@ -204,6 +206,7 @@ impl DuckDBDataSink {
                 .replace_table(tx, orig_table_creator)
                 .map_err(to_datafusion_error)?;
         } else {
+            // Specific on-conflict handling will be done here.
             insert_table
                 .insert_table_into(tx, &self.duckdb)
                 .map_err(to_datafusion_error)?;
