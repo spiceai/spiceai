@@ -11,13 +11,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::{path::Path, pin::Pin};
-
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+use std::{path::Path, pin::Pin};
 
 use async_openai::{
     error::{ApiError, OpenAIError},
@@ -163,6 +164,11 @@ pub trait Chat: Sync + Send {
                 code: None,
             })
         })?;
+        let strm_id: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(10)
+            .map(char::from)
+            .collect();
         let strm = stream! {
             let mut i  = 0;
             while let Some(msg) = stream.next().await {
@@ -179,7 +185,7 @@ pub trait Chat: Sync + Send {
                 };
 
             yield Ok(CreateChatCompletionStreamResponse {
-                id: "42".to_string(),
+                id: format!("{}-{}-{i}", model_id.clone(), strm_id),
                 choices: vec![choice],
                 model: model_id.clone(),
                 created: 0,
@@ -236,7 +242,15 @@ pub trait Chat: Sync + Send {
         };
 
         Ok(CreateChatCompletionResponse {
-            id: "42".to_string(),
+            id: format!(
+                "{}-{}",
+                model_id.clone(),
+                thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(10)
+                    .map(char::from)
+                    .collect::<String>()
+            ),
             choices,
             model: model_id,
             created: 0,
