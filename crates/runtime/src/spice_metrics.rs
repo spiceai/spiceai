@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::net::SocketAddr;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,8 +24,6 @@ use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{self, try_cast_to};
 use chrono::Utc;
 use datafusion::sql::TableReference;
-use prometheus_parse::Labels;
-use serde::Serialize;
 use snafu::prelude::*;
 use tokio::spawn;
 
@@ -153,7 +150,7 @@ impl MetricsRecorder {
             names.push(sample.metric);
             values.push(value);
 
-            if let Ok(labels_json) = serde_json::to_string(sample.labels.deref()) {
+            if let Ok(labels_json) = serde_json::to_string(&*sample.labels) {
                 labels.push(labels_json);
             } else {
                 labels.push("{}".to_string());
