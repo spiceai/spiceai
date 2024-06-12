@@ -270,3 +270,118 @@ impl TableCreator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::RecordBatch;
+    use datafusion::{
+        execution::{SendableRecordBatchStream, TaskContext},
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+        physical_plan::{insert::DataSink, memory::MemoryStream},
+    };
+    use db_connection_pool::{
+        dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
+    };
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::EnvFilter;
+
+    use crate::{duckdb::write::DuckDBDataSink, util::constraints::tests::get_constraints};
+
+    use super::*;
+
+    fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
+        Arc::new(
+            DuckDbConnectionPool::new_memory(&duckdb::AccessMode::ReadWrite)
+                .expect("to get a memory duckdb connection pool"),
+        )
+    }
+
+    async fn get_logs_batches() -> Vec<RecordBatch> {
+        let parquet_bytes = reqwest::get("https://public-data.spiceai.org/eth.recent_logs.parquet")
+            .await
+            .expect("to get parquet file")
+            .bytes()
+            .await
+            .expect("to get parquet bytes");
+
+        let parquet_reader = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
+            .expect("to get parquet reader builder")
+            .build()
+            .expect("to build parquet reader");
+
+        parquet_reader
+            .collect::<Result<Vec<_>, arrow::error::ArrowError>>()
+            .expect("to get records")
+    }
+
+    fn get_stream_from_batches(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = batches[0].schema();
+        Box::pin(MemoryStream::try_new(batches, schema, None).expect("to get stream"))
+    }
+
+    #[tokio::test]
+    async fn test_table_creator() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+        let batches = get_logs_batches().await;
+
+        let schema = batches[0].schema();
+
+        let constraints = get_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+        let created_table = TableCreator::new("eth.logs".to_string(), schema, Arc::clone(&pool))
+            .constraints(constraints)
+            .indexes(
+                vec![
+                    ("block_number".to_string(), IndexType::Enabled),
+                    (
+                        "(log_index, transaction_hash)".to_string(),
+                        IndexType::Unique,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .create()
+            .expect("to create table");
+
+        let arc_created_table = Arc::new(created_table);
+
+        let duckdb_sink = DuckDBDataSink::new(arc_created_table, true);
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+        let rows_written = data_sink
+            .write_all(
+                get_stream_from_batches(batches),
+                &Arc::new(TaskContext::default()),
+            )
+            .await
+            .expect("to write all");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let num_rows = conn
+            .get_underlying_conn_mut()
+            .query_row(r#"SELECT COUNT(1) FROM "eth.logs""#, [], |r| {
+                r.get::<usize, u64>(0)
+            })
+            .expect("to get count");
+
+        assert_eq!(num_rows, rows_written);
+    }
+
+    fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
+        let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
+            (_, Some(log)) => EnvFilter::new(log),
+            (Some(level), None) => EnvFilter::new(level),
+            _ => EnvFilter::new("INFO,data_components=TRACE"),
+        };
+
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_env_filter(filter)
+            .with_ansi(true)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+}

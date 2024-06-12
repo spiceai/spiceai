@@ -100,7 +100,7 @@ impl TableProvider for DuckDBTableWriter {
 }
 
 #[derive(Clone)]
-struct DuckDBDataSink {
+pub(crate) struct DuckDBDataSink {
     duckdb: Arc<DuckDB>,
     overwrite: bool,
 }
@@ -156,7 +156,7 @@ impl DataSink for DuckDBDataSink {
 }
 
 impl DuckDBDataSink {
-    fn new(duckdb: Arc<DuckDB>, overwrite: bool) -> Self {
+    pub(crate) fn new(duckdb: Arc<DuckDB>, overwrite: bool) -> Self {
         Self { duckdb, overwrite }
     }
 
