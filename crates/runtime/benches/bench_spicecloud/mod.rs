@@ -19,8 +19,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         // Error: "query `tpch_q1` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q1", include_str!("tpch_q1.sql")),
-        // Error: "query `tpch_q2` to results: External error: This feature is not implemented: Unsupported Expr conversion: OuterReferenceColumn(Int32, Column { relation: Some(Partial { schema: \"tpch\", table: \"part\" }), name: \"p_partkey\" })"
-        // ("tpch_q2", include_str!("tpch_q2.sql")),
+        ("tpch_q2", include_str!("tpch_q2.sql")),
         // Error: "query `tpch_q3` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q3", include_str!("tpch_q3.sql")),
         // Error: "query `tpch_q4` to results: External error: This feature is not implemented: Unsupported scalar: IntervalMonthDayNano(\"237684487542793012780631851008\")"
@@ -62,10 +61,9 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         // ("tpch_q18", include_str!("tpch_q18.sql")),
         // Error: "query `tpch_q19` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q19", include_str!("tpch_q19.sql")),
-        // Error: "query `tpch_q20` to results: External error: This feature is not implemented: Unsupported Expr conversion: OuterReferenceColumn(Int32, Column { relation: Some(Partial { schema: \"tpch\", table: \"partsupp\" }), name: \"ps_partkey\" })"
+        // Error: "query `tpch_q20` to results: External error: This feature is not implemented: Unsupported scalar: IntervalMonthDayNano(\"IntervalMonthDayNano { months: 12, days: 0, nanoseconds: 0 }\")"
         // ("tpch_q20", include_str!("tpch_q20.sql")),
-        // Error: "query `tpch_q21` to results: External error: This feature is not implemented: Unsupported Expr conversion: OuterReferenceColumn(Int32, Column { relation: Some(Bare { table: \"l1\" }), name: \"l_orderkey\" })"
-        // ("tpch_q21", include_str!("tpch_q21.sql")),
+        ("tpch_q21", include_str!("tpch_q21.sql")),
         // Error: "query `tpch_q22` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(19, 6)"
         // ("tpch_q22", include_str!("tpch_q22.sql")),
         ("tpch_simple_q1", include_str!("tpch_simple_q1.sql")),
