@@ -11,13 +11,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use std::pin::Pin;
+
 use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateEmbeddingRequest,
-    CreateEmbeddingRequestArgs, CreateEmbeddingResponse,
+    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse,
 };
 
 use async_openai::{
@@ -27,8 +29,10 @@ use async_openai::{
     },
     Client,
 };
+use async_stream::stream;
 use async_trait::async_trait;
 use futures::future::try_join_all;
+use futures::{Stream, StreamExt};
 use snafu::ResultExt;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
@@ -103,6 +107,50 @@ impl Chat for Openai {
             .into_iter()
             .next()
             .and_then(|c| c.message.content))
+    }
+
+    async fn stream<'a>(
+        &mut self,
+        prompt: String,
+    ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
+        let req = CreateChatCompletionRequestArgs::default()
+            .model(self.model.clone())
+            .stream(true)
+            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                .content(prompt)
+                .build()
+                .boxed()
+                .map_err(|source| ChatError::FailedToLoadTokenizer { source })?
+                .into()])
+            .build()
+            .boxed()
+            .map_err(|source| ChatError::FailedToLoadModel { source })?;
+        let mut chat_stream = self
+            .chat_stream(req)
+            .await
+            .boxed()
+            .map_err(|source| ChatError::FailedToRunModel { source })?;
+        Ok(Box::pin(stream! {
+            while let Some(msg) = chat_stream.next().await {
+                match msg {
+                    Ok(resp) => {
+                        yield Ok(resp.choices.into_iter().next().and_then(|c| c.delta.content));
+                    }
+                    Err(e) => {
+                        yield Err(ChatError::FailedToRunModel { source: Box::new(e) });
+                    }
+                }
+            }
+        }))
+    }
+
+    async fn chat_stream(
+        &mut self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let mut inner_req = req.clone();
+        inner_req.model.clone_from(&self.model);
+        self.client.chat().create_stream(inner_req).await
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default

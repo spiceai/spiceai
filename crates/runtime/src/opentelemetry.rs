@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::i64::MAX;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -190,7 +189,7 @@ impl MetricsService for Service {
         } else {
             Some(ExportMetricsPartialSuccess {
                 error_message: "Some data points were rejected".to_string(),
-                rejected_data_points: rejected_data_points.try_into().unwrap_or(MAX),
+                rejected_data_points: rejected_data_points.try_into().unwrap_or(i64::MAX),
             })
         };
         Ok(Response::new(ExportMetricsServiceResponse {
