@@ -150,9 +150,10 @@ impl MetricsRecorder {
             names.push(sample.metric);
             values.push(value);
 
-            properties.push(match sample.labels.is_empty() {
-                true => None,
-                false => serde_json::to_string(&*sample.labels).ok(),
+            properties.push(if sample.labels.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&*sample.labels).ok()
             });
         }
 
