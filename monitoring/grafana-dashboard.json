@@ -913,8 +913,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "fixedColor": "dark-green",
-            "mode": "shades"
+            "fixedColor": "dark-green"
           },
           "custom": {
             "axisCenteredZero": false,
