@@ -16,17 +16,27 @@ limitations under the License.
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use async_openai::types::EmbeddingInput;
+use async_stream::stream;
 use axum::{
+    extract::Query,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Extension, Json,
 };
+
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 
+use llms::chat::Chat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::instrument;
+
+use futures::StreamExt;
 
 use crate::{
     accelerated_table::AcceleratedTable, datafusion::DataFusion, embeddings::table::EmbeddingTable,
@@ -48,7 +58,7 @@ pub(crate) struct AssistResponse {
     pub from: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct Request {
     pub text: String,
@@ -64,6 +74,16 @@ pub struct Request {
 
 fn default_model() -> String {
     "embed".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct QueryParams {
+    /// If true, provide the result as a SSE stream. Otherwise, provide the result as a JSON response after the entire LLM inference is complete.
+    /// For a stream, the first event will be the primary keys of the relevant data, and the
+    /// following events will be the LLM completions (as streamed from the underlying LLM).
+    #[serde(default)]
+    pub stream: bool,
 }
 
 async fn create_input_embeddings(
@@ -242,10 +262,9 @@ async fn vector_search(
 }
 
 #[allow(clippy::from_iter_instead_of_collect)]
-fn create_assist_response(
-    text: String,
+fn create_assist_response_from(
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
-) -> Result<AssistResponse, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
     let from_value_iter = table_primary_keys
         .iter()
         .map(|(tbl, pks)| {
@@ -269,10 +288,55 @@ fn create_assist_response(
 
     let from_value: HashMap<String, Value> =
         HashMap::from_iter(from_value_iter.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    Ok(from_value)
+}
+
+fn create_assist_response(
+    text: String,
+    table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
+) -> Result<AssistResponse, Box<dyn std::error::Error>> {
     Ok(AssistResponse {
         text,
-        from: from_value,
+        from: create_assist_response_from(table_primary_keys)?,
     })
+}
+
+#[instrument(skip_all, fields(text=%payload.text, data_source=%payload.data_source.join(", "), model=%payload.model))]
+async fn prepare_and_run_vector_search(
+    app: Arc<RwLock<Option<App>>>,
+    df: Arc<DataFusion>,
+    embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    payload: Request,
+) -> Result<VectorSearchResponse, Box<dyn std::error::Error>> {
+    let input_tables: Vec<TableReference> = payload
+        .data_source
+        .iter()
+        .map(TableReference::from)
+        .collect();
+
+    let per_table_embeddings = calculate_embeddings_per_table(
+        payload.text.clone(),
+        input_tables.clone(),
+        Arc::clone(&embeddings),
+        Arc::clone(&df),
+    )
+    .await?;
+
+    // Retrieve primary keys
+    let tbl_to_pks = get_primary_keys(
+        Arc::clone(&app),
+        Arc::clone(&df),
+        payload
+            .data_source
+            .iter()
+            .map(TableReference::from)
+            .collect(),
+    )
+    .await?;
+
+    // Get relevant data from data sources.
+    vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await
 }
 
 /// For each embedding column that a [`TableReference`] contains, calculate the embeddings vector between the query and the column.
@@ -358,6 +422,63 @@ async fn get_primary_keys(
     Ok(tbl_to_pks)
 }
 
+async fn context_aware_stream(
+    model: &RwLock<Box<dyn Chat>>,
+    vector_search_data: &VectorSearchResponse,
+    model_input: String,
+) -> Response {
+    let mut model_stream = match model.write().await.stream(model_input).await {
+        Ok(model_stream) => model_stream,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let vector_data = match create_assist_response_from(&vector_search_data.retrieved_public_keys) {
+        Ok(vector_data) => vector_data,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    Sse::new(Box::pin(stream! {
+        yield Event::default().json_data(vector_data);
+        while let Some(msg_result) = model_stream.next().await {
+            match msg_result {
+                Err(e) => {
+                    yield Err(axum::Error::new(e.to_string()));
+                    break;
+                }
+                Ok(msg_opt) => {
+                    if let Some(msg) = msg_opt {
+                        yield Ok(Event::default().data(msg));
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }))
+    .keep_alive(KeepAlive::default())
+    .into_response()
+}
+
+async fn context_aware_chat(
+    model: &RwLock<Box<dyn Chat>>,
+    vector_search_data: &VectorSearchResponse,
+    model_input: String,
+) -> Response {
+    match model.write().await.run(model_input).await {
+        Ok(Some(assist)) => {
+            match create_assist_response(assist, &vector_search_data.retrieved_public_keys) {
+                Ok(assist_response) => (StatusCode::OK, Json(assist_response)).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Ok(None) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No response from LLM".to_string(),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
 /// Logic:
 /// 1. If user did not provide which/what data source to use, figure this out (?).
@@ -401,6 +522,7 @@ pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Query(params): Query<QueryParams>,
     Json(payload): Json<Request>,
 ) -> Response {
     // For now, force the user to specify which data.
@@ -408,67 +530,36 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
-    let input_tables: Vec<TableReference> = payload
-        .data_source
-        .iter()
-        .map(TableReference::from)
-        .collect();
-
-    let per_table_embeddings = match calculate_embeddings_per_table(
-        payload.text.clone(),
-        input_tables.clone(),
-        Arc::clone(&embeddings),
-        Arc::clone(&df),
-    )
-    .await
-    {
-        Ok(per_table_embeddings) => per_table_embeddings,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    // Retrieve primary keys
-    let tbl_to_pks = match get_primary_keys(
+    let relevant_data = match prepare_and_run_vector_search(
         Arc::clone(&app),
         Arc::clone(&df),
-        payload
-            .data_source
-            .iter()
-            .map(TableReference::from)
-            .collect(),
+        Arc::clone(&embeddings),
+        payload.clone(),
     )
     .await
     {
-        Ok(tbl_to_pks) => tbl_to_pks,
+        Ok(relevant_data) => relevant_data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // Vector search to get relevant data from data sources.
-    let relevant_data =
-        match vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await {
-            Ok(relevant_data) => relevant_data,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
-
-    // Using returned data, create input for LLM.
-    let model_input =
-        combined_relevant_data_and_input(&relevant_data.retrieved_entries, &payload.text);
+    tracing::debug!(
+        "Relevant data from vector search: {:#?}",
+        relevant_data.retrieved_entries
+    );
 
     // Run LLM with input.
     match llms.read().await.get(&payload.model) {
-        Some(llm_model) => match llm_model.write().await.run(model_input).await {
-            Ok(Some(assist)) => {
-                match create_assist_response(assist, &relevant_data.retrieved_public_keys) {
-                    Ok(assist_response) => (StatusCode::OK, Json(assist_response)).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-                }
+        Some(llm_model) => {
+            let model_input = combined_relevant_data_and_input(
+                &relevant_data.retrieved_entries,
+                &payload.text.clone(),
+            );
+            if params.stream {
+                context_aware_stream(llm_model, &relevant_data, model_input).await
+            } else {
+                context_aware_chat(llm_model, &relevant_data, model_input).await
             }
-            Ok(None) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("No response from LLM {}", payload.model),
-            )
-                .into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Model {} not found", payload.model),
