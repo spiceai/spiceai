@@ -59,8 +59,11 @@ impl CreateTableBuilder {
     }
 
     #[must_use]
-    pub fn primary_keys(mut self, keys: Vec<&str>) -> Self {
-        self.primary_keys = keys.into_iter().map(ToString::to_string).collect();
+    pub fn primary_keys<T>(mut self, keys: Vec<T>) -> Self
+    where
+        T: Into<String>,
+    {
+        self.primary_keys = keys.into_iter().map(Into::into).collect();
         self
     }
 
@@ -520,7 +523,7 @@ impl IndexBuilder {
     }
 
     #[must_use]
-    fn index_name(&self) -> String {
+    pub fn index_name(&self) -> String {
         format!("i_{}_{}", self.table_name, self.columns.join("_"))
     }
 
