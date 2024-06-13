@@ -16,6 +16,7 @@ snafu.workspace = true
 dirs = "5.0.1"
 serde_json.workspace = true
 async-openai = "0.21.0"
+async-stream.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -32,6 +33,7 @@ mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "2f3469c52cea
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "2f3469c52cea2167d4c5ed32623b879001ab4a4d", optional=true, package="mistralrs-core" }
 candle-core-rs = { package="candle-core", git = "https://github.com/spiceai/candle.git", rev = "38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54", optional=true }
 tokio = { workspace = true, optional=true }
+rand = "0.8.5"
 
 [features]
 default = []
