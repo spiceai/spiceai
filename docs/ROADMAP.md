@@ -52,22 +52,22 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
 
-## v1.0-stable Data Connector Support
+### v1.0-stable Data Connector Support
   | Name          | Status              |
   | ------------- | ------------------- |
   | `databricks`  | Stable              |
   | `postgres`    | Stable              |
   | `spiceai`     | Stable              |
   | `s3`          | Stable              |
-  | `dremio`      | Alpha               |
-  | `mysql`       | Alpha               |
-  | `duckdb`      | Beta                |
-  | `clickhouse`  | Alpha               |
   | `odbc`        | Stable              |
+  | `duckdb`      | Beta                |
   | `spark`       | Beta                |
-  | `flightsql`   | Alpha               |
   | `snowflake`   | Beta                |
   | `ftp`, `sftp` | Beta                |
+  | `clickhouse`  | Alpha               |
+  | `dremio`      | Alpha               |
+  | `mysql`       | Alpha               |
+  | `flightsql`   | Alpha               |
   | `graphql`     | Alpha               |
   | `motherduck`  | Alpha               |
 
