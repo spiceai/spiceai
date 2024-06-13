@@ -129,7 +129,7 @@ impl MetricsRecorder {
         let mut instances: Vec<String> = Vec::with_capacity(sample_size);
         let mut names: Vec<String> = Vec::with_capacity(sample_size);
         let mut values: Vec<f64> = Vec::with_capacity(sample_size);
-        let mut labels: Vec<String> = Vec::with_capacity(sample_size);
+        let mut properties: Vec<Option<String>> = Vec::with_capacity(sample_size);
 
         for sample in scrape.samples {
             let value: f64 = match sample.value {
@@ -150,11 +150,11 @@ impl MetricsRecorder {
             names.push(sample.metric);
             values.push(value);
 
-            if let Ok(labels_json) = serde_json::to_string(&*sample.labels) {
-                labels.push(labels_json);
+            properties.push(if sample.labels.is_empty() {
+                None
             } else {
-                labels.push("{}".to_string());
-            }
+                serde_json::to_string(&*sample.labels).ok()
+            });
         }
 
         let mut schema = get_metrics_schema();
@@ -167,7 +167,7 @@ impl MetricsRecorder {
                 Arc::new(StringArray::from(instances)),
                 Arc::new(StringArray::from(names)),
                 Arc::new(Float64Array::from(values)),
-                Arc::new(StringArray::from(labels)),
+                Arc::new(StringArray::from(properties)),
             ],
         )
         .context(UnableToCreateRecordBatchSnafu)?;
@@ -225,7 +225,7 @@ pub fn get_metrics_schema() -> Arc<Schema> {
         Field::new("instance", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Float64, false),
-        Field::new("labels", DataType::Utf8, false),
+        Field::new("properties", DataType::Utf8, true),
     ];
 
     Arc::new(Schema::new(fields))
