@@ -243,6 +243,9 @@ impl TableCreator {
             )
             .context(super::UnableToQueryDataSnafu)?;
 
+        // DuckDB doesn't add IF NOT EXISTS to CREATE TABLE statements, so we add it here.
+        let create_stmt = create_stmt.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+
         tx.rollback()
             .context(super::UnableToRollbackTransactionSnafu)?;
 
