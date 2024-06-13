@@ -196,6 +196,11 @@ pub enum Error {
 
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
+
+    #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
+    InvalidSpicepodDataset {
+        source: crate::component::dataset::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
