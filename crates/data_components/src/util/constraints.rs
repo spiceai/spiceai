@@ -111,7 +111,7 @@ async fn validate_batch_with_constraint(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::SchemaRef;
@@ -162,7 +162,7 @@ mod tests {
         Ok(())
     }
 
-    fn get_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
+    pub(crate) fn get_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
         Constraints::new_from_table_constraints(
             &[TableConstraint::Unique {
                 name: None,
