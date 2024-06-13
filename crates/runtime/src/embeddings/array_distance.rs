@@ -23,7 +23,8 @@ use datafusion::{
     },
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
-use std::{any::Any, sync::Arc};
+use itertools::Itertools;
+use std::{any::Any, ops::Index, sync::Arc};
 
 // See: https://github.com/apache/datafusion/blob/888504a8da6d20f9caf3ecb6cd1a6b7d1956e23e/datafusion/expr/src/signature.rs#L36
 pub const FIXED_SIZE_LIST_WILDCARD: i32 = i32::MIN;
@@ -39,28 +40,47 @@ impl Default for ArrayDistance {
     }
 }
 
+/// [`ArrayDistance`] is a scalar UDF that calculates the Euclidean distance between elements in
+/// [`DataType::FixedSizeList`] arrays with a numeric inner type. Limited support for
+/// [`DataType::List`] is also provided.
+///
+/// For two [`DataType::FixedSizeList`], the inputs must have the same length, and have compatible
+/// inner types. Compatible inner types are
+///   - Both inputs are [`DataType::Float16`], [`DataType::Float32`], or [`DataType::Float64`].
+/// The output will be the same type as both inputs.
+///   - Two inputs of unequal type which are within: [`DataType::Float16`], [`DataType::Float32`],
+/// and [`DataType::Float64`]. The output will be the less precise of the two inputs.
+///   
+/// Either [`DataType::FixedSizeList`] input may contain null elements (the resulting output for
+/// that index will be null), however, all elements in a [`DataType::FixedSizeList`] must be
+/// non-null.
+///
+/// When using an [`DataType::List`] input, only one of the two inputs can be so (i.e. the other
+///  must be a [`DataType::FixedSizeList`]). The [`DataType::List`] will be converted to a
+/// [`DataType::FixedSizeList`] of identical length. It can, like two [`DataType::FixedSizeList`],
+/// have compatible inner types.
 impl ArrayDistance {
     #[must_use]
     pub fn new() -> Self {
-        let valid_types = vec![
-            DataType::new_fixed_size_list(DataType::Float32, FIXED_SIZE_LIST_WILDCARD, false),
-            DataType::new_fixed_size_list(DataType::Float32, FIXED_SIZE_LIST_WILDCARD, true),
-        ];
+        let valid_types = [true, false]
+            .iter()
+            .cartesian_product([DataType::Float16, DataType::Float32, DataType::Float64])
+            .flat_map(|(nullable, type_)| {
+                vec![
+                    DataType::new_fixed_size_list(
+                        type_.clone(),
+                        FIXED_SIZE_LIST_WILDCARD,
+                        *nullable,
+                    ),
+                    DataType::new_list(type_.clone(), *nullable),
+                    DataType::new_large_list(type_.clone(), *nullable),
+                ]
+            })
+            .collect_vec();
 
         Self {
             signature: Signature::new(
-                TypeSignature::OneOf(vec![
-                    TypeSignature::Uniform(2, valid_types),
-                    // Temporary fix for coercing an SQL constant array like `array_distance(x, [1.0, 2.0, 3.0])`.
-                    TypeSignature::Exact(vec![
-                        DataType::new_fixed_size_list(
-                            DataType::Float32,
-                            FIXED_SIZE_LIST_WILDCARD,
-                            false,
-                        ),
-                        DataType::new_list(DataType::Float64, true),
-                    ]),
-                ]),
+                TypeSignature::Uniform(2, valid_types),
                 Volatility::Immutable,
             ),
         }
@@ -101,40 +121,46 @@ impl ScalarUDFImpl for ArrayDistance {
         &self.signature
     }
 
-    /// [`ArrayDistance`] expects two arguments of type `FixedSizeList<Float32>`. The two
-    /// arguments must have the same size, but may be any size together.
     fn return_type(&self, args: &[DataType]) -> DataFusionResult<DataType> {
         if args.len() != 2 {
             return plan_err!("array_distance takes exactly two arguments");
         }
 
-        match (args[0].clone(), args[1].clone()) {
+        // Check that the two inputs are compatible and return their type
+        let (f1, f2) = match (args[0].clone(), args[1].clone()) {
             (DataType::FixedSizeList(f1, size1), DataType::FixedSizeList(f2, size2)) => {
-                if f1.data_type() != &DataType::Float32 {
-                    return plan_err!("array_distance requires first arguments to be of type FixedSizeList<Float32>");
-                } else if f2.data_type() != &DataType::Float32 {
-                    return plan_err!("array_distance requires second arguments to be of type FixedSizeList<Float32>");
-                }
                 if size1 != size2 {
-                    return plan_err!(
-                        "array_distance requires both arguments to be of the same size"
-                    );
+                    return plan_err!("FixedSizeList arrays must have the same length");
                 }
-
-                Ok(DataType::Float32)
-            }
-            // Temporary fix for coercing an SQL constant array like `array_distance(x, [1.0, 2.0, 3.0])`.
-            (DataType::FixedSizeList(_f1, _size1), DataType::List(_f2)) => Ok(DataType::Float32),
-            (DataType::FixedSizeList(_f1, _size1), _) => {
-                plan_err!("array_distance requires the second argument to be of type FixedSizeList")
-            }
-            (_, DataType::FixedSizeList(_f1, _size1)) => {
-                plan_err!("array_distance requires the first argument to be of type FixedSizeList")
-            }
+                (f1.data_type(), f2.data_type())
+            },
+            (DataType::FixedSizeList(f1, _size1), DataType::List(f2)) | 
+            (DataType::List(f1), DataType::FixedSizeList(f2, _size1)) | 
+            (DataType::LargeList(f1), DataType::FixedSizeList(f2, _size1)) | 
+            (DataType::FixedSizeList(f1, _size1), DataType::LargeList(f2)) 
+            => {
+                (f1.data_type(), f2.data_type())
+            },
             _ => {
-                plan_err!("array_distance requires the first argument to be of type FixedSizeList")
+                return plan_err!("Invalid combination of input types for 'array_distance'")
             }
+        };
+
+        if !f1.is_floating() || !f2.is_floating() {
+            return plan_err!("array_distance only supports floating point types");
         }
+
+        // Return the less precise of the Three types
+        let float_types = [DataType::Float16, DataType::Float32, DataType::Float64];
+        match [f1, f2].iter().filter_map(|&f| {
+            float_types.iter().position(|t| t == f)
+        }).min() {
+            Some(i) => {
+                Ok(float_types[i].clone())
+            }
+            None => plan_err!("Unexpected types in 'array_distance'"),
+        }
+
     }
 
     // Basic implementation of the Euclidean distance between two arrays
@@ -267,7 +293,7 @@ mod tests {
             field2,
             offsets,
             Arc::new(Float64Array::try_new(
-                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
+                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 11.1].into(),
                 None,
             )?),
             None,
