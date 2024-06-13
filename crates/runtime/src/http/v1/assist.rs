@@ -18,6 +18,7 @@ use arrow::array::{RecordBatch, StringArray};
 use async_openai::types::EmbeddingInput;
 use async_stream::stream;
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -70,16 +71,20 @@ pub struct Request {
     /// Which datasources in the [`DataFusion`] instance to retrieve data from.
     #[serde(rename = "from", default)]
     pub data_source: Vec<String>,
+}
 
+fn default_model() -> String {
+    "embed".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct QueryParams {
     /// If true, provide the result as a SSE stream. Otherwise, provide the result as a JSON response after the entire LLM inference is complete.
     /// For a stream, the first event will be the primary keys of the relevant data, and the
     /// following events will be the LLM completions (as streamed from the underlying LLM).
     #[serde(default)]
     pub stream: bool,
-}
-
-fn default_model() -> String {
-    "embed".to_string()
 }
 
 async fn create_input_embeddings(
@@ -326,9 +331,8 @@ async fn prepare_and_run_vector_search(
     )
     .await?;
 
-    // Vector search to get relevant data from data sources.
-    let relevant_data = vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await?;
-    Ok(relevant_data)
+    // Get relevant data from data sources.
+    vector_search(Arc::clone(&df), per_table_embeddings, tbl_to_pks, 3).await
 }
 
 /// For each embedding column that a [`TableReference`] contains, calculate the embeddings vector between the query and the column.
@@ -514,6 +518,7 @@ pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Query(params): Query<QueryParams>,
     Json(payload): Json<Request>,
 ) -> Response {
     // For now, force the user to specify which data.
@@ -545,7 +550,7 @@ pub(crate) async fn post(
                 &relevant_data.retrieved_entries,
                 &payload.text.clone(),
             );
-            if payload.stream {
+            if params.stream {
                 context_aware_stream(llm_model, &relevant_data, model_input).await
             } else {
                 context_aware_chat(llm_model, &relevant_data, model_input).await

@@ -132,15 +132,12 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 pub trait Chat: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
 
-    // BoxStream<'a, Result<Option<String>>> { // }
     async fn stream<'a>(
         &mut self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         let resp = self.run(prompt).await;
-        Ok(Box::pin(stream! {
-            yield resp
-        }))
+        Ok(Box::pin(stream! { yield resp }))
     }
 
     #[allow(deprecated)]
