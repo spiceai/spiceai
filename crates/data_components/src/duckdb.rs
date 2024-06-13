@@ -44,7 +44,7 @@ use duckdb::{
 };
 use snafu::prelude::*;
 use sql_provider_datafusion::{expr::Engine, SqlTable};
-use std::{cmp, collections::HashMap, sync::Arc};
+use std::{cmp, collections::HashMap, sync::Arc, time::SystemTime};
 
 use self::write::DuckDBTableWriter;
 

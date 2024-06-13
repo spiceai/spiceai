@@ -68,6 +68,27 @@ pub struct SqlTable<T: 'static, P: 'static> {
     dialect: Option<Arc<dyn Dialect + Send + Sync>>,
 }
 
+// Jeadie: What happens if I had a view at the bottom, like in the execution plan for this [`SqlTable`]? Datafusion would not be able to federate anything underneath it (i.e. the view's logical/execution plan ).
+// So if I had the ability for a  `SqlTable` to be a view, then at least it could resolve a single scan of the view for anything above in the logical plan (and projections of the view), even if the internal logical plan of the view must be "unoptimised". 
+/// Can we use a [`ViewTable`].
+
+// Jeadie: We could support views/ CTEs here and then resolve them in our scan. 
+// Would keep the complexity of the SQL "table" at the table level, but would hinder any chance of federating two physical scans into one.
+// i.e.
+///  view1: SELECT a, b, c FROM func1()
+///  view2: SELECT b, c, d FROM func1()
+/// 
+/// Then
+///  `SELECT * from view1 UNION ALL SELECT * from view2`
+/// 
+/// Would resolve to two separate physical scans of func1() instead of one. Optimally it could be one scan and two column projections.
+/// 
+/// The [`SQLFederationProvider`] used when `acceleration.enabled: false` adds the TableReference into the projection values, e.g. 
+///     `SELECT "read_parquet('cleaned_sales_data.parquet')".order_number, "read_parquet('cleaned_sales_data.parquet')".quantity_ordered,...`
+/// 
+/// whilst the `acceleration.enabled: true` is implemented without this need, via `SqlTable`'s ExecutionPlan, `SqlExec`,
+///     `SELECT "order_number", "quantity_ordered",...` 
+/// This limits our ability to "stuff" the SQL going to the underlying connection with a CTE/view (i.e. prepending a `WITH (...), SELECT...` )
 impl<T, P> SqlTable<T, P> {
     pub async fn new(
         name: &'static str,
@@ -279,7 +300,7 @@ impl<T, P> SqlExec<T, P> {
 
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference.to_quoted_string(),
+            table_reference = self.table_reference.to_string(),
         ))
     }
 }
@@ -332,7 +353,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
-        tracing::debug!("SqlExec sql: {sql}");
+        println!("SqlExec sql: {sql}");
 
         let fut = get_stream(Arc::clone(&self.pool), sql);
 
@@ -346,9 +367,10 @@ async fn get_stream<T: 'static, P: 'static>(
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     sql: String,
 ) -> DataFusionResult<SendableRecordBatchStream> {
+    println!("get_stream: {sql}");
     let conn = pool.connect().await.map_err(to_execution_error)?;
 
-    query_arrow(conn, sql).await.map_err(to_execution_error)
+    query_arrow(conn, sql.clone()).await.map_err(to_execution_error)
 }
 
 #[allow(clippy::needless_pass_by_value)]

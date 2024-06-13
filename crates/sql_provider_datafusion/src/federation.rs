@@ -69,6 +69,7 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
         query: &str,
         schema: SchemaRef,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        println!("[SQLExecutor]: Executing query: {}", query);
         let fut = get_stream(Arc::clone(&self.pool), query.to_string());
 
         let stream = futures::stream::once(fut).try_flatten();
