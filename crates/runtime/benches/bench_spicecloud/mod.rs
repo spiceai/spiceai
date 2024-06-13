@@ -48,8 +48,8 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         // ("tpch_q12", include_str!("tpch_q12.sql")),
         // Error: "query `tpch_q13` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.customer' not found ...
         // ("tpch_q13", include_str!("tpch_q13.sql")),
-        // Error: "query `tpch_q14` to results: federation_optimizer_rule\ncaused by\nfederate_sql\ncaused by\nSchema error: No field named \"SUM(CASE WHEN part.p_type LIKE Utf8(\"\"PROMO%\"\")  THEN tpch.lineitem.l_extendedprice * Int64(1) - tpch.lineitem.l_discount ELSE Int64(0) END)\". Valid fields are \"SUM(CASE WHEN tpch.part.p_type LIKE Utf8(\"\"PROMO%\"\")  THEN tpch.lineitem.l_extendedprice * Int64(1) - tpch.lineitem.l_discount ELSE Int64(0) END)\", \"SUM(tpch.lineitem.l_extendedprice * Int64(1) - tpch.lineitem.l_discount)\"."
-        // ("tpch_q14", include_str!("tpch_q14.sql")),
+        // Error: "query `tpch_q14` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
+        //("tpch_q14", include_str!("tpch_q14.sql")),
 
         // tpch_q15 has a view creation which we don't support by design
 
