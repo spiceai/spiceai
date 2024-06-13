@@ -8,53 +8,16 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.14-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/27)
+## [v0.14-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/34)
 
 - Accelerated table primary key and indexes
-
-
-- Data Connector Status
-  | Name          | Status |
-  | ------------- | ------ |
-  | `databricks`  | Alpha  |
-  | `postgres`    | Alpha  |
-  | `spiceai`     | Alpha  |
-  | `s3`          | Alpha  |
-  | `dremio`      | Alpha  |
-  | `mysql`       | Alpha  |
-  | `duckdb`      | Alpha  |
-  | `clickhouse`  | Alpha  |
-  | `odbc`        | Alpha  |
-  | `spark`       | Alpha  |
-  | `flightsql`   | Alpha  |
-  | `snowflake`   | Alpha  |
-  | `ftp`, `sftp` | Alpha  |
+- GraphQL data connector (alpha)
 
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
 - CDC replication refresh mode
 - MotherDuck data connector (alpha)
-- GraphQL data connector (alpha)
 - Generic Object-Store connector (alpha)
-
-- Data Connector Status
-  | Name          | Status |
-  | ------------- | ------ |
-  | `databricks`  | Alpha  |
-  | `postgres`    | Alpha  |
-  | `spiceai`     | Alpha  |
-  | `s3`          | Alpha  |
-  | `dremio`      | Alpha  |
-  | `mysql`       | Alpha  |
-  | `duckdb`      | Alpha  |
-  | `clickhouse`  | Alpha  |
-  | `odbc`        | Alpha  |
-  | `spark`       | Alpha  |
-  | `flightsql`   | Alpha  |
-  | `snowflake`   | Alpha  |
-  | `ftp`, `sftp` | Alpha  |
-  | `graphql`     | Alpha  |
-  | `motherduck`  | Alpha  |
 
 ## v0.16-beta (July 2024)
 
@@ -62,83 +25,44 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   - Unity Catalog catalog provider (alpha)
 - Dataset management improvements
 - Bugfixes and performance improvements
-
-- Data Connector Status
-  | Name          | Status |
-  | ------------- | ------ |
-  | `databricks`  | Beta   |
-  | `postgres`    | Alpha  |
-  | `spiceai`     | Beta   |
-  | `s3`          | Beta   |
-  | `dremio`      | Alpha  |
-  | `mysql`       | Alpha  |
-  | `duckdb`      | Beta   |
-  | `clickhouse`  | Alpha  |
-  | `odbc`        | Beta   |
-  | `spark`       | Alpha  |
-  | `flightsql`   | Alpha  |
-  | `snowflake`   | Alpha  |
-  | `ftp`, `sftp` | Beta   |
-  | `graphql`     | Alpha  |
-  | `motherduck`  | Alpha  |
+- Databricks data connector (Beta)
+- Spice AI data connector (Beta)
+- PostgreSQL data connector (Beta)
+- S3 data connector (Beta)
+- DuckDB data connector (Beta)
+- ODBC Data Connector (Beta)
+- FTP/SFTP Data Connector (Beta)
 
 ## v0.17-rc (August 2024)
 - Bugfixes and performance improvements
-
-- Data Connector Status
-  | Name          | Status              |
-  | ------------- | ------------------- |
-  | `databricks`  | Release Candidate   |
-  | `postgres`    | Alpha               |
-  | `spiceai`     | Release Candidate   |
-  | `s3`          | Release Candidate   |
-  | `dremio`      | Alpha               |
-  | `mysql`       | Alpha               |
-  | `duckdb`      | Release Candidate   |
-  | `clickhouse`  | Alpha               |
-  | `odbc`        | Release Candidate   |
-  | `spark`       | Alpha               |
-  | `flightsql`   | Alpha               |
-  | `snowflake`   | Alpha               |
-  | `ftp`, `sftp` | Release Candidate   |
-  | `graphql`     | Alpha               |
-  | `motherduck`  | Alpha               |
+- Databricks data connector (Release Candidate)
+- Spice AI data connector (Release Candidate)
+- S3 data connector (Release Candidate)
+- DuckDB data connector (Release Candidate)
+- ODBC Data Connector (Release Candidate)
+- FTP/SFTP Data Connector (Release Candidate)
+- PostgreSQL data connector (Release Candidate)
 
 ## v1.0-stable (Sep 2024)
 
 - Bugfixes and performance improvements
+- Databricks data connector (Stable)
+- Spice AI data connector (Stable)
+- S3 data connector (Stable)
+- DuckDB data connector (Stable)
+- ODBC Data Connector (Stable)
+- FTP/SFTP Data Connector (Stable)
+- PostgreSQL Data Connector (Stable)
+- Snowflake Data Connector (Beta)
 
-- Data Connector Status
+## v1.0-stable Data Connector Support
   | Name          | Status              |
   | ------------- | ------------------- |
   | `databricks`  | Stable              |
-  | `postgres`    | Alpha               |
+  | `postgres`    | Stable              |
   | `spiceai`     | Stable              |
   | `s3`          | Stable              |
   | `dremio`      | Alpha               |
-  | `mysql`       | Alpha               |
-  | `duckdb`      | Stable              |
-  | `clickhouse`  | Alpha               |
-  | `odbc`        | Stable              |
-  | `spark`       | Alpha               |
-  | `flightsql`   | Alpha               |
-  | `snowflake`   | Alpha               |
-  | `ftp`, `sftp` | Stable              |
-  | `graphql`     | Alpha               |
-  | `motherduck`  | Alpha               |
-
-## v1.1 (Oct 2024)
-
-- AWS Glue catalog provider (alpha)
-  
-- Data Connector Status
-  | Name          | Status              |
-  | ------------- | ------------------- |
-  | `databricks`  | Stable              |
-  | `postgres`    | Beta                |
-  | `spiceai`     | Stable              |
-  | `s3`          | Stable              |
-  | `dremio`      | Beta                |
   | `mysql`       | Alpha               |
   | `duckdb`      | Stable              |
   | `clickhouse`  | Alpha               |
@@ -150,13 +74,16 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   | `graphql`     | Alpha               |
   | `motherduck`  | Alpha               |
 
+## v1.1 (Oct 2024)
+
+- AWS Glue catalog provider (alpha)
+
 ## Features being considered
 
 - S3 data connector Iceberg support
 - Intelligent (AI-powered) accelerators
 - Kafka data connector
 - GraphQL API
-- GraphQL data connector
 - BigQuery data connector
 - Key/Value API
   - RocksDB data accelerator
