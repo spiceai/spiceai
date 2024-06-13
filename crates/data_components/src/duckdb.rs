@@ -98,8 +98,8 @@ pub enum Error {
     #[snafu(display("Unable to begin duckdb transaction: {source}"))]
     UnableToBeginTransaction { source: duckdb::Error },
 
-    #[snafu(display("Unable to commit the Postgres transaction: {source}"))]
-    UnableToCommitDuckDBTransaction { source: duckdb::Error },
+    #[snafu(display("Unable to rollback transaction: {source}"))]
+    UnableToRollbackTransaction { source: duckdb::Error },
 
     #[snafu(display("Unable to delete all data from the Postgres table: {source}"))]
     UnableToDeleteAllTableData { source: duckdb::Error },

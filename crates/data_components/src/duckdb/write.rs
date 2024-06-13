@@ -148,7 +148,7 @@ impl DataSink for DuckDBDataSink {
         };
 
         tx.commit()
-            .context(super::UnableToCommitDuckDBTransactionSnafu)
+            .context(super::UnableToCommitTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
         Ok(num_rows)
@@ -162,6 +162,8 @@ impl DuckDBDataSink {
 
     /// If there are constraints on the `DuckDB` table, we need to create an empty copy of the target table, write to that table copy and then depending on
     /// if the mode is overwrite or not, insert into the target table or drop the target table and rename the current table.
+    ///
+    /// See: <https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking>
     fn try_write_all_with_constraints(
         &self,
         tx: &Transaction<'_>,
@@ -204,6 +206,7 @@ impl DuckDBDataSink {
                 .replace_table(tx, orig_table_creator)
                 .map_err(to_datafusion_error)?;
         } else {
+            // Specific on-conflict handling will be done here.
             insert_table
                 .insert_table_into(tx, &self.duckdb)
                 .map_err(to_datafusion_error)?;
@@ -303,7 +306,10 @@ impl DeletionSink for DuckDBDeletionSink {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
+    use crate::{
+        delete::get_deletion_provider,
+        duckdb::{creator::tests::init_tracing, DuckDBTableProviderFactory},
+    };
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -322,6 +328,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
+        let _guard = init_tracing(None);
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
             arrow::datatypes::Field::new(
