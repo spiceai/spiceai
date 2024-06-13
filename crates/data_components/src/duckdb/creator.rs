@@ -330,7 +330,10 @@ pub(crate) mod tests {
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
-    use crate::{duckdb::write::DuckDBDataSink, util::constraints::tests::get_constraints};
+    use crate::{
+        duckdb::write::DuckDBDataSink,
+        util::constraints::tests::{get_pk_constraints, get_unique_constraints},
+    };
 
     use super::*;
 
@@ -374,7 +377,7 @@ pub(crate) mod tests {
         for overwrite in &[false, true] {
             let pool = get_mem_duckdb();
             let constraints =
-                get_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+                get_unique_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
             let created_table = TableCreator::new(
                 "eth.logs".to_string(),
                 Arc::clone(&schema),
@@ -420,6 +423,73 @@ pub(crate) mod tests {
                 .expect("to get count");
 
             assert_eq!(num_rows, rows_written);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_table_creator_primary_key() {
+        let _guard = init_tracing(None);
+        let batches = get_logs_batches().await;
+
+        let schema = batches[0].schema();
+
+        for overwrite in &[false, true] {
+            let pool = get_mem_duckdb();
+            let constraints =
+                get_pk_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+            let created_table = TableCreator::new(
+                "eth.logs".to_string(),
+                Arc::clone(&schema),
+                Arc::clone(&pool),
+            )
+            .constraints(constraints)
+            .indexes(
+                vec![("block_number".to_string(), IndexType::Enabled)]
+                    .into_iter()
+                    .collect(),
+            )
+            .create()
+            .expect("to create table");
+
+            let arc_created_table = Arc::new(created_table);
+
+            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite);
+            let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+            let rows_written = data_sink
+                .write_all(
+                    get_stream_from_batches(batches.clone()),
+                    &Arc::new(TaskContext::default()),
+                )
+                .await
+                .expect("to write all");
+
+            let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+            let conn = pool_conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("to downcast to duckdb connection");
+            let num_rows = conn
+                .get_underlying_conn_mut()
+                .query_row(r#"SELECT COUNT(1) FROM "eth.logs""#, [], |r| {
+                    r.get::<usize, u64>(0)
+                })
+                .expect("to get count");
+
+            assert_eq!(num_rows, rows_written);
+
+            let create_stmt = conn
+                .get_underlying_conn_mut()
+                .query_row(
+                    "select sql from duckdb_tables() where table_name = 'eth.logs'",
+                    [],
+                    |r| r.get::<usize, String>(0),
+                )
+                .expect("to get create table statement");
+
+            assert_eq!(
+                create_stmt,
+                r#"CREATE TABLE "eth.logs"(log_index BIGINT, transaction_hash VARCHAR, transaction_index BIGINT, address VARCHAR, "data" VARCHAR, topics VARCHAR[], block_timestamp BIGINT, block_hash VARCHAR, block_number BIGINT, PRIMARY KEY(log_index, transaction_hash));"#
+            );
         }
     }
 
