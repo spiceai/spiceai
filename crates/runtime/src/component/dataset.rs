@@ -546,6 +546,23 @@ pub mod acceleration {
                 .join(";")
         }
 
+        /// Parses column references from a string into a vector of each individual column reference.
+        ///
+        /// "foo" -> vec!["foo"]
+        /// "(foo, bar)" -> vec!["foo", "bar"]
+        /// "(foo, bar" -> Err(The column reference "(foo,bar" is missing a closing parenthensis.)
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use runtime::component::dataset::acceleration::Acceleration;
+        ///
+        /// let index_columns_vec = Acceleration::index_key_columns("foo").expect("valid columns");
+        /// assert_eq!(index_columns_vec, vec!["foo"]);
+        ///
+        /// let index_columns_vec = Acceleration::index_key_columns("(foo, bar)").expect("valid columns");
+        /// assert_eq!(index_columns_vec, vec!["foo", "bar"]);
+        /// ```
         pub fn index_key_columns(columns: &str) -> Result<Vec<&str>> {
             // The index/primary key can be either a single column or a compound index
             if columns.starts_with('(') {
@@ -592,7 +609,7 @@ pub mod acceleration {
         }
 
         pub fn table_constraints(&self, schema: SchemaRef) -> Result<Option<Constraints>> {
-            if self.indexes.is_empty() {
+            if self.indexes.is_empty() && self.primary_key.is_empty() {
                 return Ok(None);
             }
 
@@ -617,6 +634,24 @@ pub mod acceleration {
                     }
                 };
             });
+
+            if !self.primary_key.is_empty() {
+                let tc = TableConstraint::PrimaryKey {
+                    columns: self
+                        .primary_key
+                        .iter()
+                        .map(String::as_str)
+                        .map(Into::into)
+                        .collect(),
+                    name: None,
+                    index_name: None,
+                    index_options: vec![],
+                    characteristics: None,
+                    index_type: None,
+                };
+
+                table_constraints.push(tc);
+            }
 
             Ok(Some(
                 Constraints::new_from_table_constraints(

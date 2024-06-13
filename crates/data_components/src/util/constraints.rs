@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::module_name_repetitions)]
 
-use arrow::array::RecordBatch;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use datafusion::{
     common::{Constraint, Constraints},
     execution::context::SessionContext,
@@ -108,6 +108,23 @@ async fn validate_batch_with_constraint(
     }
 
     Ok(())
+}
+
+pub(crate) fn get_primary_keys_from_constraints(
+    constraints: &Constraints,
+    schema: &SchemaRef,
+) -> Vec<String> {
+    let mut primary_keys: Vec<String> = Vec::new();
+    for constraint in constraints.clone() {
+        if let Constraint::PrimaryKey(cols) = constraint {
+            cols.iter()
+                .map(|col| schema.field(*col).name())
+                .for_each(|col| {
+                    primary_keys.push(col.to_string());
+                });
+        }
+    }
+    primary_keys
 }
 
 #[cfg(test)]

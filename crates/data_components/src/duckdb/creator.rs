@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::IndexBuilder;
-use datafusion::common::{Constraint, Constraints};
+use datafusion::common::Constraints;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::{vtab::arrow_recordbatch_to_query_params, ToSql, Transaction};
 use snafu::prelude::*;
@@ -23,7 +23,10 @@ use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 use super::DuckDB;
-use crate::util::indexes::{self, IndexType};
+use crate::util::{
+    constraints::get_primary_keys_from_constraints,
+    indexes::{self, IndexType},
+};
 
 /// Responsible for creating a `DuckDB` table along with any constraints and indexes
 pub(crate) struct TableCreator {
@@ -67,17 +70,10 @@ impl TableCreator {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(mut self) -> super::Result<DuckDB> {
         assert!(!self.created, "Table already created");
-        let mut primary_keys: Vec<String> = Vec::new();
-        if let Some(constraints) = &self.constraints {
-            for constraint in constraints.clone() {
-                if let Constraint::PrimaryKey(cols) = constraint.clone() {
-                    cols.iter()
-                        .map(|col| self.schema.field(*col).name())
-                        .for_each(|col| {
-                            primary_keys.push(col.to_string());
-                        });
-                }
-            }
+        let primary_keys = if let Some(constraints) = &self.constraints {
+            get_primary_keys_from_constraints(constraints, &self.schema)
+        } else {
+            Vec::new()
         };
 
         let mut db_conn = Arc::clone(&self.pool)
@@ -190,7 +186,12 @@ impl TableCreator {
         transaction: &Transaction<'_>,
         primary_keys: Vec<String>,
     ) -> super::Result<()> {
-        let sql = self.get_table_create_statement()?;
+        let mut sql = self.get_table_create_statement()?;
+
+        if !primary_keys.is_empty() {
+            let primary_key_clause = format!(", PRIMARY KEY ({}));", primary_keys.join(", "));
+            sql = sql.replace(");", &primary_key_clause);
+        }
         tracing::debug!("{sql}");
 
         transaction
