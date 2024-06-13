@@ -43,6 +43,9 @@ pub enum Error {
 
     #[snafu(display(r#"The column reference "{column_ref}" is missing a closing parenthensis."#))]
     MissingClosingParenthesisInColumnReference { column_ref: String },
+
+    #[snafu(display("Only one `on_conflict` target can be specified, or all `on_conflict` targets must be specified and set to `drop`."))]
+    OnConflictTargetMismatch { column: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -344,7 +347,7 @@ impl Dataset {
 pub mod acceleration {
     use super::Result;
     use arrow::datatypes::SchemaRef;
-    use data_components::util::indexes::index_columns;
+    use data_components::util::index_key_columns;
     use datafusion::{
         common::{Constraints, DFSchema},
         sql::sqlparser::ast::TableConstraint,
@@ -469,7 +472,7 @@ pub mod acceleration {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub enum IndexType {
         #[default]
         Enabled,
@@ -499,6 +502,40 @@ pub mod acceleration {
             match self {
                 IndexType::Enabled => write!(f, "enabled"),
                 IndexType::Unique => write!(f, "unique"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub enum OnConflictBehavior {
+        #[default]
+        Drop,
+        Upsert,
+    }
+
+    impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
+        fn from(index_type: spicepod_acceleration::OnConflictBehavior) -> Self {
+            match index_type {
+                spicepod_acceleration::OnConflictBehavior::Drop => OnConflictBehavior::Drop,
+                spicepod_acceleration::OnConflictBehavior::Upsert => OnConflictBehavior::Upsert,
+            }
+        }
+    }
+
+    impl From<&str> for OnConflictBehavior {
+        fn from(index_type: &str) -> Self {
+            match index_type.to_lowercase().as_str() {
+                "upsert" => OnConflictBehavior::Upsert,
+                _ => OnConflictBehavior::Drop,
+            }
+        }
+    }
+
+    impl Display for OnConflictBehavior {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OnConflictBehavior::Drop => write!(f, "drop"),
+                OnConflictBehavior::Upsert => write!(f, "upsert"),
             }
         }
     }
@@ -534,13 +571,18 @@ pub mod acceleration {
         pub indexes: HashMap<String, IndexType>,
 
         pub primary_key: Vec<String>,
+
+        pub on_conflict: HashMap<String, OnConflictBehavior>,
     }
 
     impl Acceleration {
         #[must_use]
-        pub fn indexes_to_option_string(indexes: &HashMap<String, IndexType>) -> String {
-            indexes
-                .iter()
+        pub fn hashmap_to_option_string<K, V>(map: &HashMap<K, V>) -> String
+        where
+            K: Display,
+            V: Display,
+        {
+            map.iter()
                 .map(|(k, v)| format!("{k}:{v}"))
                 .collect::<Vec<String>>()
                 .join(";")
@@ -608,6 +650,22 @@ pub mod acceleration {
             Ok(())
         }
 
+        fn on_conflict_targets(&self) -> Result<Vec<Vec<&str>>> {
+            let mut on_conflict_targets: Vec<Vec<&str>> = Vec::new();
+            for (column, index_type) in &self.indexes {
+                if *index_type == IndexType::Unique {
+                    on_conflict_targets.push(Self::index_key_columns(column)?);
+                }
+            }
+            if !self.primary_key.is_empty() {
+                on_conflict_targets.push(self.primary_key.iter().map(String::as_str).collect());
+            }
+
+            Ok(on_conflict_targets)
+        }
+
+        pub fn validate_on_conflict(&self) -> Result<()> {}
+
         pub fn table_constraints(&self, schema: SchemaRef) -> Result<Option<Constraints>> {
             if self.indexes.is_empty() && self.primary_key.is_empty() {
                 return Ok(None);
@@ -620,7 +678,10 @@ pub mod acceleration {
                     IndexType::Enabled => {}
                     IndexType::Unique => {
                         let tc = TableConstraint::Unique {
-                            columns: index_columns(column).into_iter().map(Into::into).collect(),
+                            columns: index_key_columns(column)
+                                .into_iter()
+                                .map(Into::into)
+                                .collect(),
                             name: None,
                             index_name: None,
                             index_type_display:
@@ -707,6 +768,11 @@ pub mod acceleration {
                     .map(|(k, v)| (k, IndexType::from(v)))
                     .collect(),
                 primary_key,
+                on_conflict: acceleration
+                    .on_conflict
+                    .into_iter()
+                    .map(|(k, v)| (k, OnConflictBehavior::from(v)))
+                    .collect(),
             })
         }
     }
@@ -729,6 +795,7 @@ pub mod acceleration {
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
                 indexes: HashMap::default(),
                 primary_key: Vec::default(),
+                on_conflict: HashMap::default(),
             }
         }
     }
@@ -764,10 +831,10 @@ mod tests {
             ("bar".to_string(), IndexType::Unique),
         ]);
 
-        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        let indexes_str = Acceleration::hashmap_to_option_string(&indexes_map);
         assert!(indexes_str == "foo:enabled;bar:unique" || indexes_str == "bar:unique;foo:enabled");
-        let roundtrip_indexes_map =
-            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+        let roundtrip_indexes_map: HashMap<String, IndexType> =
+            data_components::util::hashmap_from_option_string(&indexes_str);
 
         let roundtrip_indexes_map = roundtrip_indexes_map
             .into_iter()
@@ -789,13 +856,13 @@ mod tests {
             ("bar".to_string(), IndexType::Unique),
         ]);
 
-        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        let indexes_str = Acceleration::hashmap_to_option_string(&indexes_map);
         assert!(
             indexes_str == "(foo, bar):enabled;bar:unique"
                 || indexes_str == "bar:unique;(foo, bar):enabled"
         );
-        let roundtrip_indexes_map =
-            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+        let roundtrip_indexes_map: HashMap<String, IndexType> =
+            data_components::util::hashmap_from_option_string(&indexes_str);
 
         let roundtrip_indexes_map = roundtrip_indexes_map
             .into_iter()

@@ -23,10 +23,7 @@ use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 use super::DuckDB;
-use crate::util::{
-    constraints::get_primary_keys_from_constraints,
-    indexes::{self, IndexType},
-};
+use crate::util::{self, constraints::get_primary_keys_from_constraints, indexes::IndexType};
 
 /// Responsible for creating a `DuckDB` table along with any constraints and indexes
 pub(crate) struct TableCreator {
@@ -63,7 +60,7 @@ impl TableCreator {
     fn indexes_vec(&self) -> Vec<(Vec<&str>, IndexType)> {
         self.indexes
             .iter()
-            .map(|(key, ty)| (indexes::index_columns(key), *ty))
+            .map(|(key, ty)| (util::index_key_columns(key), *ty))
             .collect()
     }
 

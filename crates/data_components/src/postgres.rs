@@ -51,8 +51,9 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
+        self,
         constraints::{self, get_primary_keys_from_constraints},
-        indexes::{self, IndexType},
+        indexes::IndexType,
     },
     Read, ReadWrite,
 };
@@ -218,14 +219,14 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let schema: Schema = cmd.schema.as_ref().into();
 
         let indexes_option_str = options.remove("indexes");
-        let indexes = match indexes_option_str {
-            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+        let indexes: HashMap<String, IndexType> = match indexes_option_str {
+            Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
 
         let indexes: Vec<(Vec<&str>, IndexType)> = indexes
             .iter()
-            .map(|(key, ty)| (indexes::index_columns(key), *ty))
+            .map(|(key, ty)| (util::index_key_columns(key), *ty))
             .collect();
 
         let params = Arc::new(options);

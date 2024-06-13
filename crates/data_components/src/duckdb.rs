@@ -16,10 +16,7 @@ limitations under the License.
 
 use crate::{
     delete::DeletionTableProviderAdapter,
-    util::{
-        constraints,
-        indexes::{self},
-    },
+    util::{self, constraints},
     Read, ReadWrite,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
@@ -167,7 +164,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
 
         let indexes_option_str = options.remove("indexes");
         let indexes = match indexes_option_str {
-            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+            Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
 

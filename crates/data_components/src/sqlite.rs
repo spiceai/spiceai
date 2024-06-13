@@ -39,8 +39,9 @@ use tokio_rusqlite::Connection;
 use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
+        self,
         constraints::{self, get_primary_keys_from_constraints},
-        indexes::{self, IndexType},
+        indexes::IndexType,
     },
 };
 
@@ -123,15 +124,15 @@ impl TableProviderFactory for SqliteTableFactory {
         let mode: Mode = mode.as_str().into();
 
         let indexes_option_str = options.remove("indexes");
-        let indexes = match indexes_option_str {
-            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+        let indexes: HashMap<String, IndexType> = match indexes_option_str {
+            Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
 
         let indexes = indexes
             .into_iter()
             .map(|(key, value)| {
-                let columns = indexes::index_columns(&key)
+                let columns = util::index_key_columns(&key)
                     .into_iter()
                     .map(ToString::to_string)
                     .collect();
