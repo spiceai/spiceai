@@ -40,6 +40,9 @@ pub enum Error {
     UnableToConvertSchemaRefToDFSchema {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display(r#"The column reference "{column_ref}" is missing a closing parenthensis."#))]
+    MissingClosingParenthesisInColumnReference { column_ref: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -529,6 +532,8 @@ pub mod acceleration {
         pub on_zero_results: ZeroResultsAction,
 
         pub indexes: HashMap<String, IndexType>,
+
+        pub primary_key: Vec<String>,
     }
 
     impl Acceleration {
@@ -541,18 +546,39 @@ pub mod acceleration {
                 .join(";")
         }
 
-        pub fn index_columns(indexes_key: &str) -> Vec<&str> {
-            // The key to an index can be either a single column or a compound index
-            if indexes_key.starts_with('(') {
+        /// Parses column references from a string into a vector of each individual column reference.
+        ///
+        /// "foo" -> vec!["foo"]
+        /// "(foo, bar)" -> vec!["foo", "bar"]
+        /// "(foo, bar" -> Err(The column reference "(foo,bar" is missing a closing parenthensis.)
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use runtime::component::dataset::acceleration::Acceleration;
+        ///
+        /// let index_columns_vec = Acceleration::index_key_columns("foo").expect("valid columns");
+        /// assert_eq!(index_columns_vec, vec!["foo"]);
+        ///
+        /// let index_columns_vec = Acceleration::index_key_columns("(foo, bar)").expect("valid columns");
+        /// assert_eq!(index_columns_vec, vec!["foo", "bar"]);
+        /// ```
+        pub fn index_key_columns(columns: &str) -> Result<Vec<&str>> {
+            // The index/primary key can be either a single column or a compound index
+            if columns.starts_with('(') {
                 // Compound index
-                let end = indexes_key.find(')').unwrap_or(indexes_key.len());
-                indexes_key[1..end]
+                let end = columns.find(')').context(
+                    super::MissingClosingParenthesisInColumnReferenceSnafu {
+                        column_ref: columns.to_string(),
+                    },
+                )?;
+                Ok(columns[1..end]
                     .split(',')
                     .map(str::trim)
-                    .collect::<Vec<&str>>()
+                    .collect::<Vec<&str>>())
             } else {
                 // Single column index
-                vec![indexes_key]
+                Ok(vec![columns])
             }
         }
 
@@ -567,7 +593,7 @@ pub mod acceleration {
 
         pub fn validate_indexes(&self, schema: &SchemaRef) -> Result<()> {
             for column in self.indexes.keys() {
-                let index_columns = Self::index_columns(column);
+                let index_columns = Self::index_key_columns(column)?;
                 for index_column in index_columns {
                     if schema.field_with_name(index_column).is_err() {
                         return super::IndexColumnNotFoundSnafu {
@@ -583,7 +609,7 @@ pub mod acceleration {
         }
 
         pub fn table_constraints(&self, schema: SchemaRef) -> Result<Option<Constraints>> {
-            if self.indexes.is_empty() {
+            if self.indexes.is_empty() && self.primary_key.is_empty() {
                 return Ok(None);
             }
 
@@ -609,6 +635,24 @@ pub mod acceleration {
                 };
             });
 
+            if !self.primary_key.is_empty() {
+                let tc = TableConstraint::PrimaryKey {
+                    columns: self
+                        .primary_key
+                        .iter()
+                        .map(String::as_str)
+                        .map(Into::into)
+                        .collect(),
+                    name: None,
+                    index_name: None,
+                    index_options: vec![],
+                    characteristics: None,
+                    index_type: None,
+                };
+
+                table_constraints.push(tc);
+            }
+
             Ok(Some(
                 Constraints::new_from_table_constraints(
                     &table_constraints,
@@ -628,6 +672,15 @@ pub mod acceleration {
         fn try_from(
             acceleration: spicepod_acceleration::Acceleration,
         ) -> std::result::Result<Self, Self::Error> {
+            let primary_key = match acceleration.primary_key {
+                Some(pk) => Acceleration::index_key_columns(&pk)
+                    .map_err(|e| Self::Error::InvalidSpicepodDataset { source: e })?
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                None => Vec::default(),
+            };
+
             Ok(Acceleration {
                 enabled: acceleration.enabled,
                 mode: Mode::from(acceleration.mode),
@@ -653,6 +706,7 @@ pub mod acceleration {
                     .into_iter()
                     .map(|(k, v)| (k, IndexType::from(v)))
                     .collect(),
+                primary_key,
             })
         }
     }
@@ -674,6 +728,7 @@ pub mod acceleration {
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
                 indexes: HashMap::default(),
+                primary_key: Vec::default(),
             }
         }
     }
@@ -757,13 +812,21 @@ mod tests {
 
     #[test]
     fn test_get_index_columns() {
-        let index_columns_vec = Acceleration::index_columns("foo");
+        let index_columns_vec = Acceleration::index_key_columns("foo").expect("valid columns");
         assert_eq!(index_columns_vec, vec!["foo"]);
 
-        let index_columns_vec = Acceleration::index_columns("(foo, bar)");
+        let index_columns_vec =
+            Acceleration::index_key_columns("(foo, bar)").expect("valid columns");
         assert_eq!(index_columns_vec, vec!["foo", "bar"]);
 
-        let index_columns_vec = Acceleration::index_columns("(foo,bar)");
+        let index_columns_vec =
+            Acceleration::index_key_columns("(foo,bar)").expect("valid columns");
         assert_eq!(index_columns_vec, vec!["foo", "bar"]);
+
+        let err = Acceleration::index_key_columns("(foo,bar").expect_err("invalid columns");
+        assert_eq!(
+            err.to_string(),
+            "The column reference \"(foo,bar\" is missing a closing parenthensis."
+        );
     }
 }

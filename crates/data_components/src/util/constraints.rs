@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::module_name_repetitions)]
 
-use arrow::array::RecordBatch;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use datafusion::{
     common::{Constraint, Constraints},
     execution::context::SessionContext,
@@ -110,6 +110,23 @@ async fn validate_batch_with_constraint(
     Ok(())
 }
 
+pub(crate) fn get_primary_keys_from_constraints(
+    constraints: &Constraints,
+    schema: &SchemaRef,
+) -> Vec<String> {
+    let mut primary_keys: Vec<String> = Vec::new();
+    for constraint in constraints.clone() {
+        if let Constraint::PrimaryKey(cols) = constraint {
+            cols.iter()
+                .map(|col| schema.field(*col).name())
+                .for_each(|col| {
+                    primary_keys.push(col.to_string());
+                });
+        }
+    }
+    primary_keys
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
@@ -133,7 +150,8 @@ pub(crate) mod tests {
         let records = parquet_reader.collect::<Result<Vec<_>, arrow::error::ArrowError>>()?;
         let schema = records[0].schema();
 
-        let constraints = get_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+        let constraints =
+            get_unique_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
 
         let result = super::validate_batch_with_constraints(&records, &constraints).await;
         assert!(
@@ -142,7 +160,7 @@ pub(crate) mod tests {
             result.expect_err("this returned an error")
         );
 
-        let invalid_constraints = get_constraints(&["block_number"], Arc::clone(&schema));
+        let invalid_constraints = get_unique_constraints(&["block_number"], Arc::clone(&schema));
         let result = super::validate_batch_with_constraints(&records, &invalid_constraints).await;
         assert!(result.is_err());
         assert_eq!(
@@ -151,7 +169,7 @@ pub(crate) mod tests {
         );
 
         let invalid_constraints =
-            get_constraints(&["block_number", "transaction_hash"], Arc::clone(&schema));
+            get_unique_constraints(&["block_number", "transaction_hash"], Arc::clone(&schema));
         let result = super::validate_batch_with_constraints(&records, &invalid_constraints).await;
         assert!(result.is_err());
         assert_eq!(
@@ -162,12 +180,27 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    pub(crate) fn get_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
+    pub(crate) fn get_unique_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
         Constraints::new_from_table_constraints(
             &[TableConstraint::Unique {
                 name: None,
                 index_name: None,
                 index_type_display: datafusion::sql::sqlparser::ast::KeyOrIndexDisplay::None,
+                index_type: None,
+                columns: cols.iter().map(|col| Ident::new(*col)).collect(),
+                index_options: vec![],
+                characteristics: None,
+            }],
+            &Arc::new(DFSchema::try_from(schema).expect("valid schema")),
+        )
+        .expect("valid constraints")
+    }
+
+    pub(crate) fn get_pk_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
+        Constraints::new_from_table_constraints(
+            &[TableConstraint::PrimaryKey {
+                name: None,
+                index_name: None,
                 index_type: None,
                 columns: cols.iter().map(|col| Ident::new(*col)).collect(),
                 index_options: vec![],
