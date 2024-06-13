@@ -87,7 +87,7 @@ impl DatasetsHealthMonitor {
 
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
-        let table_provider = self.get_table_provider(dataset_name).await?;
+        let table_provider = self.get_table_provider(dataset.name.clone()).await?;
 
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.insert(
@@ -109,10 +109,13 @@ impl DatasetsHealthMonitor {
         monitored_datasets.remove(dataset_name);
     }
 
-    async fn get_table_provider(&self, dataset_name: &str) -> Result<Arc<dyn TableProvider>> {
+    async fn get_table_provider(
+        &self,
+        table_ref: TableReference,
+    ) -> Result<Arc<dyn TableProvider>> {
         let table = self
             .df_ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(table_ref)
             .await
             .context(UnableToGetTableSnafu)?;
 
