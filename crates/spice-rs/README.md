@@ -16,7 +16,7 @@ cargo add spiceai
 
 ### Usage with locally running [spice runtime](https://github.com/spiceai/spiceai)
 
-Follow the [quiqstart guide](https://github.com/spiceai/spiceai?tab=readme-ov-file#%EF%B8%8F-quickstart-local-machine) to install and run spice locally
+Follow the [quickstart guide](https://github.com/spiceai/spiceai?tab=readme-ov-file#%EF%B8%8F-quickstart-local-machine) to install and run spice locally
 
 ```rust
 use spiceai::ClientBuilder;
