@@ -188,7 +188,7 @@ impl TableCreator {
     ) -> super::Result<()> {
         let mut sql = self.get_table_create_statement()?;
 
-        if !primary_keys.is_empty() {
+        if !primary_keys.is_empty() && !sql.contains("PRIMARY KEY") {
             let primary_key_clause = format!(", PRIMARY KEY ({}));", primary_keys.join(", "));
             sql = sql.replace(");", &primary_key_clause);
         }
