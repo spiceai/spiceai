@@ -2780,7 +2780,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=52c4d04fbd8b8c5531ff2306e09b2c77791eb5ca#52c4d04fbd8b8c5531ff2306e09b2c77791eb5ca"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=e85aa9652326c9d1649f6535620990e12efa37a2#e85aa9652326c9d1649f6535620990e12efa37a2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2791,7 +2791,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=52c4d04fbd8b8c5531ff2306e09b2c77791eb5ca#52c4d04fbd8b8c5531ff2306e09b2c77791eb5ca"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=e85aa9652326c9d1649f6535620990e12efa37a2#e85aa9652326c9d1649f6535620990e12efa37a2"
 dependencies = [
  "async-trait",
  "datafusion",

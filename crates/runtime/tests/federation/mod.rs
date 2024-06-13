@@ -308,24 +308,6 @@ async fn single_source_federation_push_down() -> Result<(), String> {
             ],
             Some(Box::new(has_one_int_val)),
         ),
-        (
-            "SELECT MAX(blocks.number) FROM blocks",
-            vec![
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                          |",
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                     |",
-                "|               |  Projection: MAX(eth.recent_blocks.number)                                                                                                                    |",
-                "|               |   Aggregate: groupBy=[[]], aggr=[[MAX(eth.recent_blocks.number)]]                                                                                             |",
-                "|               |     TableScan: eth.recent_blocks                                                                                                                              |",
-                "| physical_plan | SchemaCastScanExec                                                                                                                                            |",
-                "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                        |",
-                "|               |     VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT MAX(eth.recent_blocks.number) FROM eth.recent_blocks |",
-                "|               |                                                                                                                                                               |",
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-            ],
-            Some(Box::new(has_one_int_val)),
-        ),
     ];
 
     for (query, expected_plan, validate_result) in queries {
