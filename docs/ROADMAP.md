@@ -29,18 +29,14 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Spice AI data connector (Beta)
 - PostgreSQL data connector (Beta)
 - S3 data connector (Beta)
-- DuckDB data connector (Beta)
 - ODBC Data Connector (Beta)
-- FTP/SFTP Data Connector (Beta)
 
 ## [v0.17-rc (August 2024)](https://github.com/spiceai/spiceai/milestone/32)
 - Bugfixes and performance improvements
 - Databricks data connector (Release Candidate)
 - Spice AI data connector (Release Candidate)
 - S3 data connector (Release Candidate)
-- DuckDB data connector (Release Candidate)
 - ODBC Data Connector (Release Candidate)
-- FTP/SFTP Data Connector (Release Candidate)
 - PostgreSQL data connector (Release Candidate)
 
 ## [v1.0-stable (Sep 2024)](https://github.com/spiceai/spiceai/milestone/33)
@@ -49,11 +45,12 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Databricks data connector (Stable)
 - Spice AI data connector (Stable)
 - S3 data connector (Stable)
-- DuckDB data connector (Stable)
+- DuckDB data connector (Beta)
 - ODBC Data Connector (Stable)
-- FTP/SFTP Data Connector (Stable)
+- FTP/SFTP Data Connector (Beta)
 - PostgreSQL Data Connector (Stable)
 - Snowflake Data Connector (Beta)
+- Spark Data Connector (Beta)
 
 ## v1.0-stable Data Connector Support
   | Name          | Status              |
@@ -64,13 +61,13 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   | `s3`          | Stable              |
   | `dremio`      | Alpha               |
   | `mysql`       | Alpha               |
-  | `duckdb`      | Stable              |
+  | `duckdb`      | Beta                |
   | `clickhouse`  | Alpha               |
   | `odbc`        | Stable              |
-  | `spark`       | Alpha               |
+  | `spark`       | Beta                |
   | `flightsql`   | Alpha               |
   | `snowflake`   | Beta                |
-  | `ftp`, `sftp` | Stable              |
+  | `ftp`, `sftp` | Beta                |
   | `graphql`     | Alpha               |
   | `motherduck`  | Alpha               |
 
