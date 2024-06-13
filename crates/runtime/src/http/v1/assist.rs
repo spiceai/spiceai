@@ -23,7 +23,6 @@ use axum::{
 };
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
@@ -103,8 +102,13 @@ fn combined_relevant_data_and_input(
     relevant_data: &HashMap<TableReference, Vec<String>>,
     input: &str,
 ) -> String {
-    let data = relevant_data.values().map(|v| v.join("\n")).join("\n");
-    format!("{data}\n{input}")
+    let data = relevant_data
+        .iter()
+        .map(|(_table_ref, rows)| format!("Table: \n{}\n", rows.join("\n")))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    format!("Here is the relevant data from multiple sources:\n\n{data}\nQuestion:\n{input}\n")
 }
 
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
