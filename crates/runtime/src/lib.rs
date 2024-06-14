@@ -54,6 +54,7 @@ use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing_util::dataset_registered_trace;
 pub use util::shutdown_signal;
 use uuid::Uuid;
 
@@ -80,6 +81,7 @@ pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
+mod tracing_util;
 
 pub mod datasets_health_monitor;
 
@@ -507,7 +509,10 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Registered dataset {}", &ds.name);
+                tracing::info!(
+                    "{}",
+                    dataset_registered_trace(&ds, self.df.cache_provider().is_some())
+                );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
                         tracing::warn!(
