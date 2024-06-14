@@ -149,9 +149,9 @@ mod tests {
         assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["foo"]);
 
         let column_ref = ColumnReference::try_from("(foo, bar)").expect("valid columns");
-        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["foo", "bar"]);
+        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["bar", "foo"]);
 
         let column_ref = ColumnReference::try_from("(foo,bar)").expect("valid columns");
-        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["foo", "bar"]);
+        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["bar", "foo"]);
     }
 }
