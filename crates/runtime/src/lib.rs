@@ -401,7 +401,7 @@ impl Runtime {
                 Ok(connector) => connector,
                 Err(err) => {
                     let ds_name = &ds.name;
-                    status::update_dataset(&ds_name, status::ComponentStatus::Error);
+                    status::update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     sleep(Duration::from_secs(1)).await;
