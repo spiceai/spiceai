@@ -53,6 +53,7 @@ use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing_util::dataset_registered_trace;
 pub use util::shutdown_signal;
 use uuid::Uuid;
 
@@ -79,6 +80,7 @@ pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
+mod tracing_util;
 
 pub mod datasets_health_monitor;
 
@@ -195,6 +197,11 @@ pub enum Error {
 
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
+
+    #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
+    InvalidSpicepodDataset {
+        source: crate::component::dataset::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -392,9 +399,10 @@ impl Runtime {
             let connector = match self.load_dataset_connector(ds).await {
                 Ok(connector) => connector,
                 Err(err) => {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                    let ds_name = &ds.name;
+                    status::update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -451,9 +459,10 @@ impl Runtime {
         {
             Ok(data_connector) => data_connector,
             Err(err) => {
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                let ds_name = &ds.name;
+                status::update_dataset(ds_name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -501,7 +510,10 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Registered dataset {}", &ds.name);
+                tracing::info!(
+                    "{}",
+                    dataset_registered_trace(&ds, self.df.cache_provider().is_some())
+                );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
                         tracing::warn!(

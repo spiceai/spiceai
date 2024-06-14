@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::IndexBuilder;
-use datafusion::common::{Constraint, Constraints};
+use datafusion::common::Constraints;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::{vtab::arrow_recordbatch_to_query_params, ToSql, Transaction};
 use snafu::prelude::*;
@@ -23,7 +23,10 @@ use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 use super::DuckDB;
-use crate::util::indexes::{self, IndexType};
+use crate::util::{
+    constraints::get_primary_keys_from_constraints,
+    indexes::{self, IndexType},
+};
 
 /// Responsible for creating a `DuckDB` table along with any constraints and indexes
 pub(crate) struct TableCreator {
@@ -67,17 +70,10 @@ impl TableCreator {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(mut self) -> super::Result<DuckDB> {
         assert!(!self.created, "Table already created");
-        let mut primary_keys: Vec<String> = Vec::new();
-        if let Some(constraints) = &self.constraints {
-            for constraint in constraints.clone() {
-                if let Constraint::PrimaryKey(cols) = constraint.clone() {
-                    cols.iter()
-                        .map(|col| self.schema.field(*col).name())
-                        .for_each(|col| {
-                            primary_keys.push(col.to_string());
-                        });
-                }
-            }
+        let primary_keys = if let Some(constraints) = &self.constraints {
+            get_primary_keys_from_constraints(constraints, &self.schema)
+        } else {
+            Vec::new()
         };
 
         let mut db_conn = Arc::clone(&self.pool)
@@ -190,7 +186,12 @@ impl TableCreator {
         transaction: &Transaction<'_>,
         primary_keys: Vec<String>,
     ) -> super::Result<()> {
-        let sql = self.get_table_create_statement()?;
+        let mut sql = self.get_table_create_statement()?;
+
+        if !primary_keys.is_empty() && !sql.contains("PRIMARY KEY") {
+            let primary_key_clause = format!(", PRIMARY KEY ({}));", primary_keys.join(", "));
+            sql = sql.replace(");", &primary_key_clause);
+        }
         tracing::debug!("{sql}");
 
         transaction
@@ -241,6 +242,9 @@ impl TableCreator {
                 |r| r.get::<usize, String>(0),
             )
             .context(super::UnableToQueryDataSnafu)?;
+
+        // DuckDB doesn't add IF NOT EXISTS to CREATE TABLE statements, so we add it here.
+        let create_stmt = create_stmt.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
 
         tx.rollback()
             .context(super::UnableToRollbackTransactionSnafu)?;
@@ -329,7 +333,10 @@ pub(crate) mod tests {
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
-    use crate::{duckdb::write::DuckDBDataSink, util::constraints::tests::get_constraints};
+    use crate::{
+        duckdb::write::DuckDBDataSink,
+        util::constraints::tests::{get_pk_constraints, get_unique_constraints},
+    };
 
     use super::*;
 
@@ -373,7 +380,7 @@ pub(crate) mod tests {
         for overwrite in &[false, true] {
             let pool = get_mem_duckdb();
             let constraints =
-                get_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+                get_unique_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
             let created_table = TableCreator::new(
                 "eth.logs".to_string(),
                 Arc::clone(&schema),
@@ -419,6 +426,73 @@ pub(crate) mod tests {
                 .expect("to get count");
 
             assert_eq!(num_rows, rows_written);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_table_creator_primary_key() {
+        let _guard = init_tracing(None);
+        let batches = get_logs_batches().await;
+
+        let schema = batches[0].schema();
+
+        for overwrite in &[false, true] {
+            let pool = get_mem_duckdb();
+            let constraints =
+                get_pk_constraints(&["log_index", "transaction_hash"], Arc::clone(&schema));
+            let created_table = TableCreator::new(
+                "eth.logs".to_string(),
+                Arc::clone(&schema),
+                Arc::clone(&pool),
+            )
+            .constraints(constraints)
+            .indexes(
+                vec![("block_number".to_string(), IndexType::Enabled)]
+                    .into_iter()
+                    .collect(),
+            )
+            .create()
+            .expect("to create table");
+
+            let arc_created_table = Arc::new(created_table);
+
+            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite);
+            let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+            let rows_written = data_sink
+                .write_all(
+                    get_stream_from_batches(batches.clone()),
+                    &Arc::new(TaskContext::default()),
+                )
+                .await
+                .expect("to write all");
+
+            let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+            let conn = pool_conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("to downcast to duckdb connection");
+            let num_rows = conn
+                .get_underlying_conn_mut()
+                .query_row(r#"SELECT COUNT(1) FROM "eth.logs""#, [], |r| {
+                    r.get::<usize, u64>(0)
+                })
+                .expect("to get count");
+
+            assert_eq!(num_rows, rows_written);
+
+            let create_stmt = conn
+                .get_underlying_conn_mut()
+                .query_row(
+                    "select sql from duckdb_tables() where table_name = 'eth.logs'",
+                    [],
+                    |r| r.get::<usize, String>(0),
+                )
+                .expect("to get create table statement");
+
+            assert_eq!(
+                create_stmt,
+                r#"CREATE TABLE "eth.logs"(log_index BIGINT, transaction_hash VARCHAR, transaction_index BIGINT, address VARCHAR, "data" VARCHAR, topics VARCHAR[], block_timestamp BIGINT, block_hash VARCHAR, block_number BIGINT, PRIMARY KEY(log_index, transaction_hash));"#
+            );
         }
     }
 
