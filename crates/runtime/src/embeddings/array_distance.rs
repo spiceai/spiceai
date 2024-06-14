@@ -13,8 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+
 use arrow::{
-    array::{Array, ArrayRef, FixedSizeListArray, Float64Array},
+    array::{Array, ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array},
     compute::{binary, cast, sum},
     datatypes::{ArrowPrimitiveType, DataType, Float16Type, Float32Type, Float64Type},
 };
@@ -85,8 +87,7 @@ impl ArrayDistance {
         }
     }
 
-    /// Returns the less precise Float16/32/64 of the two input types. If either input is not a float
-    ///  type, returns None.
+    /// Returns the less precise Float16/32/64 of the two input types.
     fn least_precise_float_type(t1: &DataType, t2: &DataType) -> DataFusionResult<DataType> {
         let float_types = [DataType::Float16, DataType::Float32, DataType::Float64];
         let i1 = float_types
@@ -133,10 +134,6 @@ impl ArrayDistance {
         }
     }
 
-    fn is_fixed_size_list(array: &Arc<dyn Array>) -> bool {
-        matches!(array.data_type(), DataType::FixedSizeList(_, _))
-    }
-
     fn cast_to_fixed_size_list(
         array: &Arc<dyn Array>,
         data_type: &DataType,
@@ -179,7 +176,7 @@ impl ArrayDistance {
             | (DataType::LargeList(f1) | DataType::List(f1), DataType::FixedSizeList(f2, length)) =>
             {
                 let output_type = Self::least_precise_float_type(f1.data_type(), f2.data_type())?;
-                Ok(if Self::is_fixed_size_list(v1) {
+                Ok(if matches!(v1.data_type(), DataType::FixedSizeList(_, _)) {
                     (
                         Arc::clone(v1),
                         Self::cast_to_fixed_size_list(v2, &output_type, *length)?,
@@ -234,9 +231,12 @@ impl ScalarUDFImpl for ArrayDistance {
         let arrays = ColumnarValue::values_to_arrays(args)?;
         let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
 
-        let result: DataFusionResult<Vec<Option<f64>>> = Self::downcast_to_fixed_size_list(&v1)?
-            .iter()
-            .zip(Self::downcast_to_fixed_size_list(&v2)?.iter())
+        let z1 = Self::downcast_to_fixed_size_list(&v1)?;
+        let z2 = Self::downcast_to_fixed_size_list(&v2)?;
+        let output_type = z1.value_type();
+
+        let result: DataFusionResult<Vec<Option<f64>>> = z1.iter()
+            .zip(z2.iter())
             .map(|(a, b)| match (a, b) {
                 (Some(a), Some(b)) => {
                     let z: Float64Array = binary(
@@ -251,7 +251,28 @@ impl ScalarUDFImpl for ArrayDistance {
             })
             .collect();
 
-        Ok(ColumnarValue::Array(Arc::new(Float64Array::from(result?))))
+        let arr = match output_type {
+            #[cfg(feature = "f16_and_f128")]
+            DataType::Float16 => {
+                Arc::new(Float16Array::from(result.iter().map(|&opt| opt.map(f16::from_f64)).collect_vec())) as Arc<dyn Array>
+            }
+            DataType::Float32 => {
+                Arc::new(Float32Array::from(result.iter().map(|&opt| opt.iter().map(|v| v.and_then(|f| Some(f as f32))).collect_vec()).collect::<Vec<Option<f32>>>())) as Arc<dyn Array>
+            }
+            DataType::Float64 => {
+                Arc::new(Float64Array::from(result?)) as Arc<dyn Array>
+            }
+            _ => unreachable!(),
+        };
+        let arr = match output_type {
+            #[cfg(feature = "f16_and_f128")]
+            DataType::Float16 => Float16Array::from(result?),
+            DataType::Float32 => Float32Array::from(result?),
+            DataType::Float64 => Float64Array::from(result?),
+            _ => unreachable!(),
+        };
+
+        Ok(ColumnarValue::Array(Arc::new(arr)))
     }
 }
 
