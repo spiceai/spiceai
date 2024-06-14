@@ -21,6 +21,7 @@ use crate::{
         column_reference::{self, ColumnReference},
         constraints,
         indexes::IndexType,
+        on_conflict::{self, OnConflict},
     },
     Read, ReadWrite,
 };
@@ -117,6 +118,9 @@ pub enum Error {
 
     #[snafu(display("Error parsing column reference: {source}"))]
     UnableToParseColumnReference { source: column_reference::Error },
+
+    #[snafu(display("Error parsing on_conflict: {source}"))]
+    UnableToParseOnConflict { source: on_conflict::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -192,6 +196,15 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             indexes.push((columns, index_type));
         }
 
+        let mut on_conflict: Option<OnConflict> = None;
+        if let Some(on_conflict_str) = options.remove("on_conflict") {
+            on_conflict = Some(
+                OnConflict::try_from(on_conflict_str.as_str())
+                    .context(UnableToParseOnConflictSnafu)
+                    .map_err(to_datafusion_error)?,
+            );
+        }
+
         let pool: Arc<DuckDbConnectionPool> = Arc::new(match &mode {
             Mode::File => {
                 // open duckdb at given path or create a new one
@@ -228,7 +241,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             Some(Engine::DuckDB),
         ));
 
-        let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb);
+        let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb, on_conflict);
 
         let deleted_table_provider = DeletionTableProviderAdapter::new(read_write_provider);
 
@@ -243,6 +256,7 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 pub struct DuckDB {
     table_name: String,
     pool: Arc<DuckDbConnectionPool>,
+    schema: SchemaRef,
     constraints: Constraints,
     table_creator: Option<TableCreator>,
 }
@@ -252,11 +266,13 @@ impl DuckDB {
     pub fn existing_table(
         table_name: String,
         pool: Arc<DuckDbConnectionPool>,
+        schema: SchemaRef,
         constraints: Constraints,
     ) -> Self {
         Self {
             table_name,
             pool,
+            schema,
             constraints,
             table_creator: None,
         }
@@ -309,11 +325,22 @@ impl DuckDB {
         result
     }
 
-    fn insert_table_into(&self, tx: &Transaction<'_>, table_to_insert_into: &DuckDB) -> Result<()> {
-        let insert_sql = format!(
+    fn insert_table_into(
+        &self,
+        tx: &Transaction<'_>,
+        table_to_insert_into: &DuckDB,
+        on_conflict: Option<&OnConflict>,
+    ) -> Result<()> {
+        let mut insert_sql = format!(
             r#"INSERT INTO "{}" SELECT * FROM "{}""#,
             table_to_insert_into.table_name, self.table_name
         );
+
+        if let Some(on_conflict) = on_conflict {
+            let on_conflict_sql = on_conflict.build_on_conflict_statement(&self.schema);
+            insert_sql.push_str(&format!(" {on_conflict_sql}"));
+        }
+        tracing::debug!("{insert_sql}");
 
         tx.execute(&insert_sql, [])
             .context(UnableToInsertToDuckDBTableSnafu)?;
@@ -321,7 +348,11 @@ impl DuckDB {
         Ok(())
     }
 
-    fn insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
+    fn insert_batch_no_constraints(
+        &self,
+        transaction: &Transaction<'_>,
+        batch: &RecordBatch,
+    ) -> Result<()> {
         let mut appender = transaction
             .appender(&self.table_name)
             .context(UnableToGetAppenderToDuckDBTableSnafu)?;
@@ -416,11 +447,16 @@ impl ReadWrite for DuckDBTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
+        let schema = read_provider.schema();
 
         let table_name = table_reference.to_string();
-        let duckdb =
-            DuckDB::existing_table(table_name, Arc::clone(&self.pool), Constraints::empty());
+        let duckdb = DuckDB::existing_table(
+            table_name,
+            Arc::clone(&self.pool),
+            schema,
+            Constraints::empty(),
+        );
 
-        Ok(DuckDBTableWriter::create(read_provider, duckdb))
+        Ok(DuckDBTableWriter::create(read_provider, duckdb, None))
     }
 }

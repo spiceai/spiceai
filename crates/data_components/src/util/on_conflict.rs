@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::module_name_repetitions)]
+use arrow::datatypes::SchemaRef;
+use itertools::Itertools;
 use snafu::prelude::*;
 use std::fmt::Display;
 
@@ -36,6 +38,40 @@ pub enum OnConflict {
     DoNothingAll,
     DoNothing(ColumnReference),
     Upsert(ColumnReference),
+}
+
+impl OnConflict {
+    #[must_use]
+    pub fn build_on_conflict_statement(&self, schema: &SchemaRef) -> String {
+        match self {
+            OnConflict::DoNothingAll => "ON CONFLICT DO NOTHING".to_string(),
+            OnConflict::DoNothing(column) => {
+                format!(
+                    r#"ON CONFLICT ("{}") DO NOTHING"#,
+                    column.iter().join(r#"", ""#)
+                )
+            }
+            OnConflict::Upsert(column) => {
+                let non_constraint_columns = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| !column.contains(f.name()))
+                    .map(|f| f.name().to_string())
+                    .collect::<Vec<String>>();
+                let mut update_cols = String::new();
+                for (i, col) in non_constraint_columns.iter().enumerate() {
+                    update_cols.push_str(&format!(r#""{col}" = EXCLUDED."{col}""#));
+                    if i < non_constraint_columns.len() - 1 {
+                        update_cols.push_str(", ");
+                    }
+                }
+                format!(
+                    r#"ON CONFLICT ("{}") DO UPDATE SET {update_cols}"#,
+                    column.iter().join(r#"", ""#)
+                )
+            }
+        }
+    }
 }
 
 impl Display for OnConflict {
@@ -81,6 +117,10 @@ impl TryFrom<&str> for OnConflict {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use crate::util::{column_reference::ColumnReference, on_conflict::OnConflict};
 
     #[test]
@@ -127,6 +167,31 @@ mod tests {
         assert_eq!(
             OnConflict::try_from(on_conflict.as_str()).expect("valid on conflict"),
             OnConflict::Upsert(ColumnReference::new(vec!["col2".to_string()]))
+        );
+    }
+
+    #[test]
+    fn test_build_on_conflict_statement() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col1", DataType::Int64, false),
+            Field::new("col2", DataType::Int64, false),
+        ]));
+        let on_conflict = OnConflict::DoNothingAll;
+        assert_eq!(
+            on_conflict.build_on_conflict_statement(&schema),
+            "ON CONFLICT DO NOTHING".to_string()
+        );
+
+        let on_conflict = OnConflict::DoNothing(ColumnReference::new(vec!["col1".to_string()]));
+        assert_eq!(
+            on_conflict.build_on_conflict_statement(&schema),
+            r#"ON CONFLICT ("col1") DO NOTHING"#.to_string()
+        );
+
+        let on_conflict = OnConflict::Upsert(ColumnReference::new(vec!["col2".to_string()]));
+        assert_eq!(
+            on_conflict.build_on_conflict_statement(&schema),
+            r#"ON CONFLICT ("col2") DO UPDATE SET "col1" = EXCLUDED."col1""#.to_string()
         );
     }
 }

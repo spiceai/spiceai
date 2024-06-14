@@ -50,6 +50,11 @@ impl ColumnReference {
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
+
+    #[must_use]
+    pub fn contains(&self, column: &String) -> bool {
+        self.columns.contains(column)
+    }
 }
 
 impl Default for ColumnReference {

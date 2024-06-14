@@ -96,8 +96,12 @@ impl TableCreator {
 
         let constraints = self.constraints.clone().unwrap_or(Constraints::empty());
 
-        let mut duckdb =
-            DuckDB::existing_table(self.table_name.clone(), Arc::clone(&self.pool), constraints);
+        let mut duckdb = DuckDB::existing_table(
+            self.table_name.clone(),
+            Arc::clone(&self.pool),
+            Arc::clone(&self.schema),
+            constraints,
+        );
 
         self.created = true;
 
@@ -407,7 +411,7 @@ pub(crate) mod tests {
 
             let arc_created_table = Arc::new(created_table);
 
-            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite);
+            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite, None);
             let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
             let rows_written = data_sink
                 .write_all(
@@ -463,7 +467,7 @@ pub(crate) mod tests {
 
             let arc_created_table = Arc::new(created_table);
 
-            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite);
+            let duckdb_sink = DuckDBDataSink::new(arc_created_table, *overwrite, None);
             let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
             let rows_written = data_sink
                 .write_all(
