@@ -227,6 +227,9 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub indexes: HashMap<String, IndexType>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub primary_key: Option<String>,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -255,6 +258,7 @@ pub mod acceleration {
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
                 indexes: HashMap::default(),
+                primary_key: None,
             }
         }
     }

@@ -39,7 +39,7 @@ use tokio_rusqlite::Connection;
 use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
-        constraints,
+        constraints::{self, get_primary_keys_from_constraints},
         indexes::{self, IndexType},
     },
 };
@@ -163,6 +163,8 @@ impl TableProviderFactory for SqliteTableFactory {
         let mut db_conn = sqlite.connect().await.map_err(to_datafusion_error)?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
+        let primary_keys = get_primary_keys_from_constraints(&cmd.constraints, &schema);
+
         let table_exists = sqlite.table_exists(sqlite_conn).await;
         if !table_exists {
             let sqlite_in_conn = Arc::clone(&sqlite);
@@ -170,7 +172,7 @@ impl TableProviderFactory for SqliteTableFactory {
                 .conn
                 .call(move |conn| {
                     let transaction = conn.transaction()?;
-                    sqlite_in_conn.create_table(&transaction)?;
+                    sqlite_in_conn.create_table(&transaction, primary_keys)?;
                     for index in indexes {
                         sqlite_in_conn.create_index(
                             &transaction,
@@ -317,9 +319,14 @@ impl Sqlite {
         Ok(count)
     }
 
-    fn create_table(&self, transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    fn create_table(
+        &self,
+        transaction: &Transaction<'_>,
+        primary_keys: Vec<String>,
+    ) -> rusqlite::Result<()> {
         let create_table_statement =
-            CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name);
+            CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name)
+                .primary_keys(primary_keys);
         let sql = create_table_statement.build_sqlite();
 
         transaction.execute(&sql, [])?;

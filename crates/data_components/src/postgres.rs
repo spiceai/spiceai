@@ -51,7 +51,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
-        constraints,
+        constraints::{self, get_primary_keys_from_constraints},
         indexes::{self, IndexType},
     },
     Read, ReadWrite,
@@ -254,8 +254,10 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             .context(UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
+        let primary_keys = get_primary_keys_from_constraints(&cmd.constraints, &schema);
+
         postgres
-            .create_table(Arc::clone(&schema), &tx)
+            .create_table(Arc::clone(&schema), &tx, primary_keys)
             .await
             .map_err(to_datafusion_error)?;
 
@@ -404,8 +406,14 @@ impl Postgres {
         Ok(deleted as u64)
     }
 
-    async fn create_table(&self, schema: SchemaRef, transaction: &Transaction<'_>) -> Result<()> {
-        let create_table_statement = CreateTableBuilder::new(schema, &self.table_name);
+    async fn create_table(
+        &self,
+        schema: SchemaRef,
+        transaction: &Transaction<'_>,
+        primary_keys: Vec<String>,
+    ) -> Result<()> {
+        let create_table_statement =
+            CreateTableBuilder::new(schema, &self.table_name).primary_keys(primary_keys);
         let sql = create_table_statement.build_postgres();
 
         transaction
