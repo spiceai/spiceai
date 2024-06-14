@@ -43,6 +43,7 @@ use crate::{
         column_reference::{self, ColumnReference},
         constraints::{self, get_primary_keys_from_constraints},
         indexes::IndexType,
+        on_conflict::{self, OnConflict},
     },
 };
 
@@ -88,6 +89,9 @@ pub enum Error {
 
     #[snafu(display("Error parsing column reference: {source}"))]
     UnableToParseColumnReference { source: column_reference::Error },
+
+    #[snafu(display("Error parsing on_conflict: {source}"))]
+    UnableToParseOnConflict { source: on_conflict::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -147,6 +151,15 @@ impl TableProviderFactory for SqliteTableFactory {
         for (columns, index_type) in unparsed_indexes {
             let columns = columns?;
             indexes.push((columns, index_type));
+        }
+
+        let mut on_conflict: Option<OnConflict> = None;
+        if let Some(on_conflict_str) = options.remove("on_conflict") {
+            on_conflict = Some(
+                OnConflict::try_from(on_conflict_str.as_str())
+                    .context(UnableToParseOnConflictSnafu)
+                    .map_err(to_datafusion_error)?,
+            );
         }
 
         let db_path = cmd
@@ -212,7 +225,7 @@ impl TableProviderFactory for SqliteTableFactory {
             .context(DanglingReferenceToSqliteSnafu)
             .map_err(to_datafusion_error)?;
 
-        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite);
+        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite, on_conflict);
 
         let delete_adapter = DeletionTableProviderAdapter::new(read_write_provider);
         Ok(Arc::new(delete_adapter))
@@ -294,8 +307,15 @@ impl Sqlite {
         &self,
         transaction: &Transaction<'_>,
         batch: RecordBatch,
+        on_conflict: Option<&OnConflict>,
     ) -> rusqlite::Result<()> {
-        let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
+        let mut insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
+
+        if let Some(on_conflict) = on_conflict {
+            let sea_query_on_conflict = on_conflict.build_sea_query_on_conflict(&self.schema);
+            insert_table_builder.on_conflict(sea_query_on_conflict);
+        }
+
         let sql = insert_table_builder
             .build_sqlite()
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;

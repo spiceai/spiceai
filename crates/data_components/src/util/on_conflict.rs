@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::module_name_repetitions)]
 use arrow::datatypes::SchemaRef;
+use arrow_sql_gen::sea_query::{self, Alias};
 use itertools::Itertools;
 use snafu::prelude::*;
 use std::fmt::Display;
@@ -69,6 +70,40 @@ impl OnConflict {
                     r#"ON CONFLICT ("{}") DO UPDATE SET {update_cols}"#,
                     column.iter().join(r#"", ""#)
                 )
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn build_sea_query_on_conflict(&self, schema: &SchemaRef) -> sea_query::OnConflict {
+        match self {
+            OnConflict::DoNothingAll => {
+                let mut on_conflict = sea_query::OnConflict::new();
+                on_conflict.do_nothing();
+                on_conflict
+            }
+            OnConflict::DoNothing(column) => {
+                let mut on_conflict = sea_query::OnConflict::columns::<Vec<Alias>, Alias>(
+                    column.iter().map(Alias::new).collect(),
+                );
+                on_conflict.do_nothing();
+                on_conflict
+            }
+            OnConflict::Upsert(column) => {
+                let mut on_conflict = sea_query::OnConflict::columns::<Vec<Alias>, Alias>(
+                    column.iter().map(Alias::new).collect(),
+                );
+
+                let non_constraint_columns = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| !column.contains(f.name()))
+                    .map(|f| Alias::new(f.name()))
+                    .collect::<Vec<Alias>>();
+
+                on_conflict.update_columns(non_constraint_columns);
+
+                on_conflict
             }
         }
     }

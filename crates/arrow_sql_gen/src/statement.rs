@@ -25,8 +25,8 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
-    SqliteQueryBuilder, Table,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
+    SimpleExpr, SqliteQueryBuilder, Table,
 };
 
 #[derive(Debug, Snafu)]
@@ -143,6 +143,7 @@ macro_rules! push_list_values {
 pub struct InsertBuilder {
     table_name: String,
     record_batches: Vec<RecordBatch>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl InsertBuilder {
@@ -151,7 +152,12 @@ impl InsertBuilder {
         Self {
             table_name: table_name.to_string(),
             record_batches,
+            on_conflict: None,
         }
+    }
+
+    pub fn on_conflict(&mut self, on_conflict: OnConflict) {
+        self.on_conflict = Some(on_conflict);
     }
 
     /// Create an Insert statement from a `RecordBatch`.
@@ -495,6 +501,9 @@ impl InsertBuilder {
 
         for record_batch in &self.record_batches {
             self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
+        }
+        if let Some(on_conflict) = &self.on_conflict {
+            insert_stmt.on_conflict(on_conflict.clone());
         }
         Ok(insert_stmt.to_string(query_builder))
     }
