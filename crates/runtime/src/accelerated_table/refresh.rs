@@ -29,6 +29,7 @@ use snafu::prelude::*;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
+use tokio::time::{sleep, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Clone, Debug)]
@@ -498,21 +499,51 @@ impl Refresher {
         let mut ctx = self.get_refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
-        match get_data(
-            &mut ctx,
-            dataset_name.clone(),
-            Arc::clone(&federated),
-            refresh.sql.clone(),
-            filters,
-        )
-        .await
-        .map(|data| DataUpdate {
-            schema: data.0,
-            data: data.1,
-            update_type,
-        }) {
-            Ok(data) => Ok(data),
-            Err(e) => Err(super::Error::UnableToGetDataFromConnector { source: e }),
+
+        let mut get_data_attempt: usize = 0;
+        let get_data_max_duration = Duration::from_secs(600);
+        let retry_interval_seconds = [1, 3, 5, 10, 20, 30];
+        let start_time = Instant::now();
+
+        loop {
+            get_data_attempt += 1;
+
+            let get_data_result = get_data(
+                &mut ctx,
+                dataset_name.clone(),
+                Arc::clone(&federated),
+                refresh.sql.clone(),
+                filters.clone(),
+            )
+            .await;
+
+            match get_data_result {
+                Ok(data) => {
+                    return Ok(DataUpdate {
+                        schema: data.0,
+                        data: data.1,
+                        update_type,
+                    });
+                }
+                Err(e) => {
+                    if start_time.elapsed() >= get_data_max_duration {
+                        return Err(super::Error::UnableToGetDataFromConnector {
+                            source: e,
+                            num_attempts: get_data_attempt,
+                        });
+                    }
+
+                    let next_attempt_wait_time = if get_data_attempt >= retry_interval_seconds.len()
+                    {
+                        retry_interval_seconds[retry_interval_seconds.len() - 1]
+                    } else {
+                        retry_interval_seconds[get_data_attempt]
+                    };
+
+                    tracing::warn!("Failed to get refresh data for dataset {dataset_name}: {e}. Retrying in {next_attempt_wait_time} seconds...");
+                    sleep(Duration::from_secs(next_attempt_wait_time)).await;
+                }
+            }
         }
     }
 
