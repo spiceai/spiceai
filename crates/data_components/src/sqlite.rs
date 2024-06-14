@@ -309,15 +309,13 @@ impl Sqlite {
         batch: RecordBatch,
         on_conflict: Option<&OnConflict>,
     ) -> rusqlite::Result<()> {
-        let mut insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
+        let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
 
-        if let Some(on_conflict) = on_conflict {
-            let sea_query_on_conflict = on_conflict.build_sea_query_on_conflict(&self.schema);
-            insert_table_builder.on_conflict(sea_query_on_conflict);
-        }
+        let sea_query_on_conflict =
+            on_conflict.map(|oc| oc.build_sea_query_on_conflict(&self.schema));
 
         let sql = insert_table_builder
-            .build_sqlite()
+            .build_sqlite(sea_query_on_conflict)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
 
         transaction.execute(&sql, [])?;

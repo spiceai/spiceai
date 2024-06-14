@@ -55,6 +55,7 @@ use crate::{
         column_reference::{self, ColumnReference},
         constraints::{self, get_primary_keys_from_constraints},
         indexes::IndexType,
+        on_conflict::{self, OnConflict},
     },
     Read, ReadWrite,
 };
@@ -142,6 +143,9 @@ pub enum Error {
 
     #[snafu(display("Error parsing column reference: {source}"))]
     UnableToParseColumnReference { source: column_reference::Error },
+
+    #[snafu(display("Error parsing on_conflict: {source}"))]
+    UnableToParseOnConflict { source: on_conflict::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -188,11 +192,17 @@ impl ReadWrite for PostgresTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
+        let schema = read_provider.schema();
 
         let table_name = table_reference.to_string();
-        let postgres = Postgres::new(table_name, Arc::clone(&self.pool), Constraints::empty());
+        let postgres = Postgres::new(
+            table_name,
+            Arc::clone(&self.pool),
+            schema,
+            Constraints::empty(),
+        );
 
-        Ok(PostgresTableWriter::create(read_provider, postgres))
+        Ok(PostgresTableWriter::create(read_provider, postgres, None))
     }
 }
 
@@ -244,6 +254,15 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             indexes.push((columns, index_type));
         }
 
+        let mut on_conflict: Option<OnConflict> = None;
+        if let Some(on_conflict_str) = options.remove("on_conflict") {
+            on_conflict = Some(
+                OnConflict::try_from(on_conflict_str.as_str())
+                    .context(UnableToParseOnConflictSnafu)
+                    .map_err(to_datafusion_error)?,
+            );
+        }
+
         let params = Arc::new(options);
 
         let pool = Arc::new(
@@ -254,7 +273,12 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         );
 
         let schema = Arc::new(schema);
-        let postgres = Postgres::new(name.clone(), Arc::clone(&pool), cmd.constraints.clone());
+        let postgres = Postgres::new(
+            name.clone(),
+            Arc::clone(&pool),
+            Arc::clone(&schema),
+            cmd.constraints.clone(),
+        );
 
         let mut db_conn = pool
             .connect()
@@ -299,8 +323,11 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             Some(Engine::Postgres),
         ));
 
-        let delete_adapter =
-            DeletionTableProviderAdapter::new(PostgresTableWriter::create(read_provider, postgres));
+        let delete_adapter = DeletionTableProviderAdapter::new(PostgresTableWriter::create(
+            read_provider,
+            postgres,
+            on_conflict,
+        ));
         Ok(Arc::new(delete_adapter))
     }
 }
@@ -313,6 +340,7 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 pub struct Postgres {
     table_name: String,
     pool: Arc<PostgresConnectionPool>,
+    schema: SchemaRef,
     constraints: Constraints,
 }
 
@@ -321,11 +349,13 @@ impl Postgres {
     pub fn new(
         table_name: String,
         pool: Arc<PostgresConnectionPool>,
+        schema: SchemaRef,
         constraints: Constraints,
     ) -> Self {
         Self {
             table_name,
             pool,
+            schema,
             constraints,
         }
     }
@@ -377,10 +407,19 @@ impl Postgres {
         row.get(0)
     }
 
-    async fn insert_batch(&self, transaction: &Transaction<'_>, batch: RecordBatch) -> Result<()> {
+    async fn insert_batch(
+        &self,
+        transaction: &Transaction<'_>,
+        batch: RecordBatch,
+        on_conflict: Option<OnConflict>,
+    ) -> Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
+
+        let sea_query_on_conflict =
+            on_conflict.map(|oc| oc.build_sea_query_on_conflict(&self.schema));
+
         let sql = insert_table_builder
-            .build_postgres()
+            .build_postgres(sea_query_on_conflict)
             .context(UnableToCreateInsertStatementSnafu)?;
 
         transaction

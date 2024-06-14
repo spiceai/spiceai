@@ -143,7 +143,6 @@ macro_rules! push_list_values {
 pub struct InsertBuilder {
     table_name: String,
     record_batches: Vec<RecordBatch>,
-    on_conflict: Option<OnConflict>,
 }
 
 impl InsertBuilder {
@@ -152,12 +151,7 @@ impl InsertBuilder {
         Self {
             table_name: table_name.to_string(),
             record_batches,
-            on_conflict: None,
         }
-    }
-
-    pub fn on_conflict(&mut self, on_conflict: OnConflict) {
-        self.on_conflict = Some(on_conflict);
     }
 
     /// Create an Insert statement from a `RecordBatch`.
@@ -462,31 +456,35 @@ impl InsertBuilder {
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid postgres insert statement.
-    pub fn build_postgres(self) -> Result<String> {
-        self.build(PostgresQueryBuilder)
+    pub fn build_postgres(self, on_conflict: Option<OnConflict>) -> Result<String> {
+        self.build(PostgresQueryBuilder, on_conflict)
     }
 
     ///
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid sqlite insert statement.
-    pub fn build_sqlite(self) -> Result<String> {
-        self.build(SqliteQueryBuilder)
+    pub fn build_sqlite(self, on_conflict: Option<OnConflict>) -> Result<String> {
+        self.build(SqliteQueryBuilder, on_conflict)
     }
 
     ///
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid `MySQL` insert statement.
-    pub fn build_mysql(self) -> Result<String> {
-        self.build(MysqlQueryBuilder)
+    pub fn build_mysql(self, on_conflict: Option<OnConflict>) -> Result<String> {
+        self.build(MysqlQueryBuilder, on_conflict)
     }
 
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid insert statement. Upon
     /// error, no further `RecordBatch` is processed.
-    pub fn build<T: GenericBuilder>(&self, query_builder: T) -> Result<String> {
+    pub fn build<T: GenericBuilder>(
+        &self,
+        query_builder: T,
+        on_conflict: Option<OnConflict>,
+    ) -> Result<String> {
         let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
             .fields()
@@ -502,8 +500,8 @@ impl InsertBuilder {
         for record_batch in &self.record_batches {
             self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
         }
-        if let Some(on_conflict) = &self.on_conflict {
-            insert_stmt.on_conflict(on_conflict.clone());
+        if let Some(on_conflict) = on_conflict {
+            insert_stmt.on_conflict(on_conflict);
         }
         Ok(insert_stmt.to_string(query_builder))
     }
@@ -669,7 +667,7 @@ mod tests {
         let record_batches = vec![batch1, batch2];
 
         let sql = InsertBuilder::new("users", record_batches)
-            .build_postgres()
+            .build_postgres(None)
             .expect("Failed to build insert statement");
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
@@ -706,7 +704,7 @@ mod tests {
             .expect("Unable to build record batch");
 
         let sql = InsertBuilder::new("arrays", vec![batch])
-            .build_postgres()
+            .build_postgres(None)
             .expect("Failed to build insert statement");
         assert_eq!(
             sql,
