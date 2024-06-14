@@ -28,14 +28,6 @@ use std::{any::Any, sync::Arc};
 // See: https://github.com/apache/datafusion/blob/888504a8da6d20f9caf3ecb6cd1a6b7d1956e23e/datafusion/expr/src/signature.rs#L36
 pub const FIXED_SIZE_LIST_WILDCARD: i32 = i32::MIN;
 
-pub trait ArrowFloatType: ArrowPrimitiveType {}
-
-impl ArrowFloatType for Float16Type {}
-
-impl ArrowFloatType for Float32Type {}
-
-impl ArrowFloatType for Float64Type {}
-
 #[derive(Debug)]
 pub struct ArrayDistance {
     signature: Signature,
