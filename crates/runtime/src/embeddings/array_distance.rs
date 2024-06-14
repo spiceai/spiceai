@@ -454,7 +454,7 @@ mod tests {
         let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
         let array = array_vec[0]
             .as_any()
-            .downcast_ref::<Float64Array>()
+            .downcast_ref::<Float32Array>()
             .ok_or("failed downcast of result")?;
         assert_eq!(array.len(), 3);
         assert_eq!(array.value(0), 0.0);
