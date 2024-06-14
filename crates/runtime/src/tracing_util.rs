@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::{
-    acceleration::{Acceleration, Mode, ZeroResultsAction},
+    acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
     Dataset,
 };
 
@@ -45,6 +45,10 @@ fn dataset_acceleration_info(acceleration: &Acceleration) -> String {
 
     if acceleration.mode == Mode::File {
         info.push_str(":file");
+    }
+
+    if acceleration.refresh_mode == RefreshMode::Append {
+        info.push_str(", append");
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
@@ -99,6 +103,7 @@ mod tests {
             enabled: true,
             engine: Engine::DuckDB,
             mode: Mode::File,
+            refresh_mode: RefreshMode::Append,
             refresh_check_interval: Some("30s".to_string()),
             retention_check_interval: Some("1hr".to_string()),
             retention_check_enabled: true,
@@ -111,6 +116,6 @@ mod tests {
         ds.acceleration = Some(acceleration);
 
         let info = dataset_registered_trace(&ds, false);
-        assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, 30s refresh, 1hr retention, fallback on source on empty result).");
+        assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result).");
     }
 }
