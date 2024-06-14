@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-
 use arrow::{
-    array::{Array, ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array},
+    array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array},
     compute::{binary, cast, sum},
-    datatypes::{ArrowPrimitiveType, DataType, Float16Type, Float32Type, Float64Type},
+    datatypes::{ArrowPrimitiveType, DataType, Float64Type},
 };
+
+#[cfg(feature = "f16_and_f128")]
+use arrow::array::Float16Array;
+
 use datafusion::{
     common::{plan_err, DataFusionError, Result as DataFusionResult},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
@@ -227,6 +230,7 @@ impl ScalarUDFImpl for ArrayDistance {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(args)?;
         let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
@@ -235,7 +239,8 @@ impl ScalarUDFImpl for ArrayDistance {
         let z2 = Self::downcast_to_fixed_size_list(&v2)?;
         let output_type = z1.value_type();
 
-        let result: DataFusionResult<Vec<Option<f64>>> = z1.iter()
+        let result: DataFusionResult<Vec<Option<f64>>> = z1
+            .iter()
             .zip(z2.iter())
             .map(|(a, b)| match (a, b) {
                 (Some(a), Some(b)) => {
@@ -251,28 +256,30 @@ impl ScalarUDFImpl for ArrayDistance {
             })
             .collect();
 
-        let arr = match output_type {
+        let arr: ArrayRef = match output_type {
             #[cfg(feature = "f16_and_f128")]
-            DataType::Float16 => {
-                Arc::new(Float16Array::from(result.iter().map(|&opt| opt.map(f16::from_f64)).collect_vec())) as Arc<dyn Array>
-            }
-            DataType::Float32 => {
-                Arc::new(Float32Array::from(result.iter().map(|&opt| opt.iter().map(|v| v.and_then(|f| Some(f as f32))).collect_vec()).collect::<Vec<Option<f32>>>())) as Arc<dyn Array>
-            }
-            DataType::Float64 => {
-                Arc::new(Float64Array::from(result?)) as Arc<dyn Array>
-            }
-            _ => unreachable!(),
-        };
-        let arr = match output_type {
-            #[cfg(feature = "f16_and_f128")]
-            DataType::Float16 => Float16Array::from(result?),
-            DataType::Float32 => Float32Array::from(result?),
-            DataType::Float64 => Float64Array::from(result?),
+            DataType::Float16 => Arc::new(Float16Array::from(
+                result
+                    .iter()
+                    .flat_map(|opt| opt.map(f16::from_f64))
+                    .collect_vec(),
+            )),
+            DataType::Float32 => Arc::new(Float32Array::from(
+                result
+                    .iter()
+                    .flat_map(|opt| {
+                        opt.iter()
+                            // Explicitly Okay with precision loss. Was either f32 to begin with, or the other input is only f32.
+                            .map(|v| v.and_then(|f| Some(f as f32)))
+                            .collect_vec()
+                    })
+                    .collect::<Vec<Option<f32>>>(),
+            )),
+            DataType::Float64 => Arc::new(Float64Array::from(result?)),
             _ => unreachable!(),
         };
 
-        Ok(ColumnarValue::Array(Arc::new(arr)))
+        Ok(ColumnarValue::Array(arr))
     }
 }
 
@@ -281,7 +288,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{Array, FixedSizeListArray, Float32Array, Float64Array, ListArray},
+        array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, ListArray},
         buffer::{OffsetBuffer, ScalarBuffer},
         datatypes::{DataType, Field},
     };
@@ -301,6 +308,87 @@ mod tests {
 
         let field = Arc::new(Field::new("item", DataType::Float32, false));
         let values = Float32Array::try_new(
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
+            None,
+        )?;
+
+        let list_array =
+            FixedSizeListArray::try_new(Arc::clone(&field), 3_i32, Arc::new(values), None)?;
+
+        let arc_list = Arc::new(list_array) as Arc<dyn Array>;
+
+        let col_array = array_distance.invoke(&[
+            ColumnarValue::Array(Arc::clone(&arc_list)),
+            ColumnarValue::Array(Arc::clone(&arc_list)),
+        ])?;
+
+        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
+        let array = array_vec[0]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or("failed downcast of result")?;
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), 0.0);
+        assert_eq!(array.value(1), 0.0);
+        assert_eq!(array.value(2), 0.0);
+
+        Ok(())
+    }
+
+    #[allow(clippy::float_cmp)]
+    #[tokio::test]
+    async fn test_f32_f64() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = SessionContext::new();
+        let array_distance = ScalarUDF::from(ArrayDistance::new());
+        ctx.register_udf(array_distance.clone());
+
+        let f32 = FixedSizeListArray::try_new(
+            Arc::clone(&Arc::new(Field::new("item", DataType::Float32, false))),
+            3_i32,
+            Arc::new(Float32Array::try_new(
+                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
+                None,
+            )?),
+            None,
+        )?;
+
+        let f64 = FixedSizeListArray::try_new(
+            Arc::clone(&Arc::new(Field::new("item", DataType::Float64, false))),
+            3_i32,
+            Arc::new(Float64Array::try_new(
+                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
+                None,
+            )?),
+            None,
+        )?;
+
+        let col_array = array_distance.invoke(&[
+            ColumnarValue::Array(Arc::clone(&Arc::new(f32)) as ArrayRef),
+            ColumnarValue::Array(Arc::clone(&Arc::new(f64)) as ArrayRef),
+        ])?;
+
+        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
+        let array = array_vec[0]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or("failed downcast of result")?;
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), 0.0);
+        assert_eq!(array.value(1), 0.0);
+        assert_eq!(array.value(2), 0.0);
+
+        Ok(())
+    }
+
+    #[allow(clippy::float_cmp)]
+    #[tokio::test]
+    async fn test_f64_f64() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = SessionContext::new();
+        let array_distance = ScalarUDF::from(ArrayDistance::new());
+        ctx.register_udf(array_distance.clone());
+
+        let field = Arc::new(Field::new("item", DataType::Float64, false));
+        let values = Float64Array::try_new(
             vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
             None,
         )?;
