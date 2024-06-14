@@ -40,6 +40,7 @@ use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
         self,
+        column_reference::{self, ColumnReference},
         constraints::{self, get_primary_keys_from_constraints},
         indexes::IndexType,
     },
@@ -84,6 +85,9 @@ pub enum Error {
 
     #[snafu(display("Constraint Violation: {source}"))]
     ConstraintViolation { source: constraints::Error },
+
+    #[snafu(display("Error parsing column reference: {source}"))]
+    UnableToParseColumnReference { source: column_reference::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -124,21 +128,26 @@ impl TableProviderFactory for SqliteTableFactory {
         let mode: Mode = mode.as_str().into();
 
         let indexes_option_str = options.remove("indexes");
-        let indexes: HashMap<String, IndexType> = match indexes_option_str {
+        let unparsed_indexes: HashMap<String, IndexType> = match indexes_option_str {
             Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
 
-        let indexes = indexes
+        let unparsed_indexes = unparsed_indexes
             .into_iter()
             .map(|(key, value)| {
-                let columns = util::index_key_columns(&key)
-                    .into_iter()
-                    .map(ToString::to_string)
-                    .collect();
+                let columns = ColumnReference::try_from(key.as_str())
+                    .context(UnableToParseColumnReferenceSnafu)
+                    .map_err(to_datafusion_error);
                 (columns, value)
             })
-            .collect::<Vec<(Vec<String>, IndexType)>>();
+            .collect::<Vec<(Result<ColumnReference, DataFusionError>, IndexType)>>();
+
+        let mut indexes: Vec<(ColumnReference, IndexType)> = Vec::new();
+        for (columns, index_type) in unparsed_indexes {
+            let columns = columns?;
+            indexes.push((columns, index_type));
+        }
 
         let db_path = cmd
             .options
@@ -177,7 +186,7 @@ impl TableProviderFactory for SqliteTableFactory {
                     for index in indexes {
                         sqlite_in_conn.create_index(
                             &transaction,
-                            index.0.iter().map(AsRef::as_ref).collect(),
+                            index.0.iter().collect(),
                             index.1 == IndexType::Unique,
                         )?;
                     }

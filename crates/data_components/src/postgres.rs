@@ -52,6 +52,7 @@ use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
         self,
+        column_reference::{self, ColumnReference},
         constraints::{self, get_primary_keys_from_constraints},
         indexes::IndexType,
     },
@@ -138,6 +139,9 @@ pub enum Error {
 
     #[snafu(display("Constraint Violation: {source}"))]
     ConstraintViolation { source: constraints::Error },
+
+    #[snafu(display("Error parsing column reference: {source}"))]
+    UnableToParseColumnReference { source: column_reference::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -219,15 +223,26 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let schema: Schema = cmd.schema.as_ref().into();
 
         let indexes_option_str = options.remove("indexes");
-        let indexes: HashMap<String, IndexType> = match indexes_option_str {
+        let unparsed_indexes: HashMap<String, IndexType> = match indexes_option_str {
             Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
 
-        let indexes: Vec<(Vec<&str>, IndexType)> = indexes
-            .iter()
-            .map(|(key, ty)| (util::index_key_columns(key), *ty))
-            .collect();
+        let unparsed_indexes = unparsed_indexes
+            .into_iter()
+            .map(|(key, value)| {
+                let columns = ColumnReference::try_from(key.as_str())
+                    .context(UnableToParseColumnReferenceSnafu)
+                    .map_err(to_datafusion_error);
+                (columns, value)
+            })
+            .collect::<Vec<(Result<ColumnReference, DataFusionError>, IndexType)>>();
+
+        let mut indexes: Vec<(ColumnReference, IndexType)> = Vec::new();
+        for (columns, index_type) in unparsed_indexes {
+            let columns = columns?;
+            indexes.push((columns, index_type));
+        }
 
         let params = Arc::new(options);
 
@@ -264,7 +279,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
 
         for index in indexes {
             postgres
-                .create_index(&tx, index.0, index.1 == IndexType::Unique)
+                .create_index(&tx, index.0.iter().collect(), index.1 == IndexType::Unique)
                 .await
                 .map_err(to_datafusion_error)?;
         }

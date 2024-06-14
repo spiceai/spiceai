@@ -3,6 +3,7 @@ use snafu::prelude::*;
 use sql_provider_datafusion::expr::{self, Engine};
 use std::{collections::HashMap, hash::Hash};
 
+pub mod column_reference;
 pub mod constraints;
 pub mod indexes;
 pub mod on_conflict;
@@ -39,19 +40,4 @@ where
             }
         })
         .collect()
-}
-
-pub fn index_key_columns(indexes_key: &str) -> Vec<&str> {
-    // The key to an index/primary key/on conflict reference can be either a single column or a compound index
-    if indexes_key.starts_with('(') {
-        // Compound index
-        let end = indexes_key.find(')').unwrap_or(indexes_key.len());
-        indexes_key[1..end]
-            .split(',')
-            .map(str::trim)
-            .collect::<Vec<&str>>()
-    } else {
-        // Single column index
-        vec![indexes_key]
-    }
 }

@@ -46,7 +46,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::util::index_key_columns;
 
     #[test]
     fn test_index_type_from_str() {
@@ -64,17 +63,5 @@ mod tests {
         assert_eq!(indexes.len(), 2);
         assert_eq!(indexes.get("index1"), Some(&IndexType::Unique));
         assert_eq!(indexes.get("index2"), Some(&IndexType::Enabled));
-    }
-
-    #[test]
-    fn test_get_index_columns() {
-        let index_columns_vec = index_key_columns("foo");
-        assert_eq!(index_columns_vec, vec!["foo"]);
-
-        let index_columns_vec = index_key_columns("(foo, bar)");
-        assert_eq!(index_columns_vec, vec!["foo", "bar"]);
-
-        let index_columns_vec = index_key_columns("(foo,bar)");
-        assert_eq!(index_columns_vec, vec!["foo", "bar"]);
     }
 }

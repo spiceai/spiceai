@@ -16,7 +16,12 @@ limitations under the License.
 
 use crate::{
     delete::DeletionTableProviderAdapter,
-    util::{self, constraints},
+    util::{
+        self,
+        column_reference::{self, ColumnReference},
+        constraints,
+        indexes::IndexType,
+    },
     Read, ReadWrite,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
@@ -109,6 +114,9 @@ pub enum Error {
 
     #[snafu(display("Constraint Violation: {source}"))]
     ConstraintViolation { source: constraints::Error },
+
+    #[snafu(display("Error parsing column reference: {source}"))]
+    UnableToParseColumnReference { source: column_reference::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -163,10 +171,26 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let mode: Mode = mode.as_str().into();
 
         let indexes_option_str = options.remove("indexes");
-        let indexes = match indexes_option_str {
+        let unparsed_indexes: HashMap<String, IndexType> = match indexes_option_str {
             Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
+
+        let unparsed_indexes = unparsed_indexes
+            .into_iter()
+            .map(|(key, value)| {
+                let columns = ColumnReference::try_from(key.as_str())
+                    .context(UnableToParseColumnReferenceSnafu)
+                    .map_err(to_datafusion_error);
+                (columns, value)
+            })
+            .collect::<Vec<(Result<ColumnReference, DataFusionError>, IndexType)>>();
+
+        let mut indexes: Vec<(ColumnReference, IndexType)> = Vec::new();
+        for (columns, index_type) in unparsed_indexes {
+            let columns = columns?;
+            indexes.push((columns, index_type));
+        }
 
         let pool: Arc<DuckDbConnectionPool> = Arc::new(match &mode {
             Mode::File => {

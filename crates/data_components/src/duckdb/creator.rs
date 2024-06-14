@@ -19,11 +19,14 @@ use datafusion::common::Constraints;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::{vtab::arrow_recordbatch_to_query_params, ToSql, Transaction};
 use snafu::prelude::*;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::DuckDB;
-use crate::util::{self, constraints::get_primary_keys_from_constraints, indexes::IndexType};
+use crate::util::{
+    column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
+    indexes::IndexType,
+};
 
 /// Responsible for creating a `DuckDB` table along with any constraints and indexes
 pub(crate) struct TableCreator {
@@ -31,7 +34,7 @@ pub(crate) struct TableCreator {
     schema: SchemaRef,
     pool: Arc<DuckDbConnectionPool>,
     constraints: Option<Constraints>,
-    indexes: HashMap<String, IndexType>,
+    indexes: Vec<(ColumnReference, IndexType)>,
     created: bool,
 }
 
@@ -42,7 +45,7 @@ impl TableCreator {
             schema,
             pool,
             constraints: None,
-            indexes: HashMap::new(),
+            indexes: Vec::new(),
             created: false,
         }
     }
@@ -52,7 +55,7 @@ impl TableCreator {
         self
     }
 
-    pub fn indexes(mut self, indexes: HashMap<String, IndexType>) -> Self {
+    pub fn indexes(mut self, indexes: Vec<(ColumnReference, IndexType)>) -> Self {
         self.indexes = indexes;
         self
     }
@@ -60,7 +63,7 @@ impl TableCreator {
     fn indexes_vec(&self) -> Vec<(Vec<&str>, IndexType)> {
         self.indexes
             .iter()
-            .map(|(key, ty)| (util::index_key_columns(key), *ty))
+            .map(|(key, ty)| (key.iter().collect(), *ty))
             .collect()
     }
 
@@ -386,9 +389,13 @@ pub(crate) mod tests {
             .constraints(constraints)
             .indexes(
                 vec![
-                    ("block_number".to_string(), IndexType::Enabled),
                     (
-                        "(log_index, transaction_hash)".to_string(),
+                        ColumnReference::try_from("block_number").expect("valid column ref"),
+                        IndexType::Enabled,
+                    ),
+                    (
+                        ColumnReference::try_from("(log_index, transaction_hash)")
+                            .expect("valid column ref"),
                         IndexType::Unique,
                     ),
                 ]
@@ -444,9 +451,12 @@ pub(crate) mod tests {
             )
             .constraints(constraints)
             .indexes(
-                vec![("block_number".to_string(), IndexType::Enabled)]
-                    .into_iter()
-                    .collect(),
+                vec![(
+                    ColumnReference::try_from("block_number").expect("valid column ref"),
+                    IndexType::Enabled,
+                )]
+                .into_iter()
+                .collect(),
             )
             .create()
             .expect("to create table");

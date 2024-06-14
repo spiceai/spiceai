@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::acceleration::{
-    self, Acceleration, Engine, IndexType, Mode, OnConflictBehavior,
-};
+use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use data_components::util::{column_reference::ColumnReference, on_conflict::OnConflict};
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
@@ -120,9 +119,9 @@ pub struct AcceleratorExternalTableBuilder {
     mode: Mode,
     options: Option<HashMap<String, String>>,
     secret: Option<Secret>,
-    indexes: HashMap<String, IndexType>,
+    indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
-    on_conflict: HashMap<String, OnConflictBehavior>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -137,19 +136,19 @@ impl AcceleratorExternalTableBuilder {
             secret: None,
             indexes: HashMap::new(),
             constraints: None,
-            on_conflict: HashMap::new(),
+            on_conflict: None,
         }
     }
 
     #[must_use]
-    pub fn indexes(mut self, indexes: HashMap<String, IndexType>) -> Self {
+    pub fn indexes(mut self, indexes: HashMap<ColumnReference, IndexType>) -> Self {
         self.indexes = indexes;
         self
     }
 
     #[must_use]
-    pub fn on_conflict(mut self, on_conflict: HashMap<String, OnConflictBehavior>) -> Self {
-        self.on_conflict = on_conflict;
+    pub fn on_conflict(mut self, on_conflict: OnConflict) -> Self {
+        self.on_conflict = Some(on_conflict);
         self
     }
 
@@ -215,9 +214,8 @@ impl AcceleratorExternalTableBuilder {
             options.insert("indexes".to_string(), indexes_option_str);
         }
 
-        if !self.on_conflict.is_empty() {
-            let on_conflict_option_str = Acceleration::hashmap_to_option_string(&self.on_conflict);
-            options.insert("on_conflict".to_string(), on_conflict_option_str);
+        if let Some(on_conflict) = self.on_conflict {
+            options.insert("on_conflict".to_string(), on_conflict.to_string());
         }
 
         let constraints = match self.constraints {
@@ -272,20 +270,22 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
-    if let Err(e) = acceleration_settings.validate_on_conflict() {
-        InvalidConfigurationSnafu {
-            msg: format!("{e}"),
-        }
-        .fail()?;
-    };
-
     let mut external_table_builder =
         AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
             .options(acceleration_settings.params.clone())
             .indexes(acceleration_settings.indexes.clone())
-            .on_conflict(acceleration_settings.on_conflict.clone())
             .secret(acceleration_secret);
+
+    if let Some(on_conflict) =
+        acceleration_settings
+            .on_conflict()
+            .map_err(|e| Error::InvalidConfiguration {
+                msg: format!("on_conflict invalid: {e}"),
+            })?
+    {
+        external_table_builder = external_table_builder.on_conflict(on_conflict);
+    };
 
     match acceleration_settings.table_constraints(Arc::clone(&schema)) {
         Ok(Some(constraints)) => {
