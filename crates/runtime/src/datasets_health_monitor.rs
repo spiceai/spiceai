@@ -87,7 +87,7 @@ impl DatasetsHealthMonitor {
 
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
-        let table_provider = self.get_table_provider(dataset_name).await?;
+        let table_provider = self.get_table_provider(dataset.name.clone()).await?;
 
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.insert(
@@ -109,10 +109,13 @@ impl DatasetsHealthMonitor {
         monitored_datasets.remove(dataset_name);
     }
 
-    async fn get_table_provider(&self, dataset_name: &str) -> Result<Arc<dyn TableProvider>> {
+    async fn get_table_provider(
+        &self,
+        table_ref: TableReference,
+    ) -> Result<Arc<dyn TableProvider>> {
         let table = self
             .df_ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(table_ref)
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -241,4 +244,49 @@ async fn test_connectivity(
     stream.try_collect::<Vec<RecordBatch>>().await?;
 
     Ok(())
+}
+
+// add test
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::component::dataset::Dataset;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::{
+        catalog::schema::{MemorySchemaProvider, SchemaProvider},
+        datasource::MemTable,
+    };
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_register_dataset_with_schema() {
+        let ctx = create_test_session_context();
+
+        let dataset =
+            Dataset::try_new("spiceai".to_string(), "foo.dataset_name").expect("to create dataset");
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let table_provider = MemTable::try_new(schema, vec![]).expect("to create table provider");
+        ctx.register_table(dataset.name.clone(), Arc::new(table_provider))
+            .expect("to register table provider");
+
+        let monitor = DatasetsHealthMonitor::new(Arc::clone(&ctx));
+
+        assert!(monitor.register_dataset(&dataset).await.is_ok());
+
+        monitor.deregister_dataset(&dataset.name.to_string()).await;
+    }
+
+    fn create_test_session_context() -> Arc<SessionContext> {
+        let ctx = Arc::new(SessionContext::new());
+
+        let catalog = ctx
+            .catalog("datafusion")
+            .expect("default catalog is datafusion");
+
+        let foo_schema = Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
+        catalog
+            .register_schema("foo", Arc::clone(&foo_schema))
+            .expect("to register schema");
+        ctx
+    }
 }
