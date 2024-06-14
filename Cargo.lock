@@ -5287,6 +5287,7 @@ name = "llms"
 version = "0.14.0-alpha"
 dependencies = [
  "async-openai",
+ "async-stream",
  "async-trait",
  "candle-core 0.5.0",
  "candle-core 0.5.1",
@@ -5296,6 +5297,7 @@ dependencies = [
  "futures",
  "mistralrs",
  "mistralrs-core",
+ "rand",
  "serde",
  "serde_json",
  "snafu 0.8.2",
