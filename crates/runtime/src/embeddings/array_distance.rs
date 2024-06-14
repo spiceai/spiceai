@@ -14,20 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::{
-    array::{as_list_array, Array, Float32Array, Float64Array, PrimitiveArray},
-    datatypes::{DataType, Float32Type, Float64Type},
+    array::{Array, ArrayRef, FixedSizeListArray, Float64Array},
+    compute::{binary, cast, sum},
+    datatypes::{ArrowPrimitiveType, DataType, Float16Type, Float32Type, Float64Type},
 };
 use datafusion::{
-    common::{
-        cast::as_fixed_size_list_array, plan_err, DataFusionError, Result as DataFusionResult,
-    },
+    common::{plan_err, DataFusionError, Result as DataFusionResult},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
 use itertools::Itertools;
-use std::{any::Any, ops::Index, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 // See: https://github.com/apache/datafusion/blob/888504a8da6d20f9caf3ecb6cd1a6b7d1956e23e/datafusion/expr/src/signature.rs#L36
 pub const FIXED_SIZE_LIST_WILDCARD: i32 = i32::MIN;
+
+pub trait ArrowFloatType: ArrowPrimitiveType {}
+
+impl ArrowFloatType for Float16Type {}
+
+impl ArrowFloatType for Float32Type {}
+
+impl ArrowFloatType for Float64Type {}
 
 #[derive(Debug)]
 pub struct ArrayDistance {
@@ -86,27 +93,116 @@ impl ArrayDistance {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    fn convert_f64_to_f32(array: &PrimitiveArray<Float64Type>) -> PrimitiveArray<Float32Type> {
-        let values = array.values();
-        let converted_values: Vec<f32> = values.iter().map(|&x| x as f32).collect();
-        Float32Array::from_iter_values(converted_values)
+    /// Returns the less precise Float16/32/64 of the two input types. If either input is not a float
+    ///  type, returns None.
+    fn least_precise_float_type(t1: &DataType, t2: &DataType) -> DataFusionResult<DataType> {
+        let float_types = [DataType::Float16, DataType::Float32, DataType::Float64];
+        let i1 = float_types
+            .iter()
+            .position(|t| t == t1)
+            .ok_or_else(|| DataFusionError::Internal(format!("{t1} is not a float type")))?;
+        let i2 = float_types
+            .iter()
+            .position(|t| t == t2)
+            .ok_or_else(|| DataFusionError::Internal(format!("{t2} is not a float type")))?;
+
+        float_types
+            .get(i1.min(i2))
+            .cloned()
+            .ok_or_else(|| DataFusionError::Internal("Unexpected error".into()))
     }
 
-    fn to_float32_array(input: &Arc<dyn Array>) -> Result<Vec<Float32Array>, DataFusionError> {
-        as_fixed_size_list_array(input)?
-            .iter()
-            .map(|v| {
-                v.ok_or_else(|| DataFusionError::Internal("no null entries allowed".into()))
-                    .and_then(|vv| {
-                        let binding = Arc::clone(&vv);
-                        match binding.as_any().downcast_ref::<Float32Array>() {
-                            Some(a) => Ok(a.clone()),
-                            None => Err(DataFusionError::Internal("downcast failed".into())),
-                        }
+    /// Casts the [`ArrayRef`] to a [`FixedSizeListArray`].
+    fn downcast_to_fixed_size_list(value: &ArrayRef) -> DataFusionResult<FixedSizeListArray> {
+        value
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .cloned()
+            .ok_or_else(|| DataFusionError::Internal("downcast unexpectedly failed".into()))
+    }
+
+    /// Casts the input to a [`Float64Array`].
+    fn cast_to_float64_array(value: &ArrayRef) -> DataFusionResult<Float64Array> {
+        cast(value, &Float64Type::DATA_TYPE)
+            .map_err(|e| DataFusionError::Internal(e.to_string()))?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .cloned()
+            .ok_or_else(|| DataFusionError::Internal("downcast to Float64Array failed".into()))
+    }
+
+    fn ensure_same_length(l1: i32, l2: i32) -> DataFusionResult<()> {
+        if l1 == l2 {
+            Ok(())
+        } else {
+            Err(DataFusionError::Internal(
+                "FixedSizeList arrays must have the same length".into(),
+            ))
+        }
+    }
+
+    fn is_fixed_size_list(array: &Arc<dyn Array>) -> bool {
+        matches!(array.data_type(), DataType::FixedSizeList(_, _))
+    }
+
+    fn cast_to_fixed_size_list(
+        array: &Arc<dyn Array>,
+        data_type: &DataType,
+        length: i32,
+    ) -> DataFusionResult<Arc<dyn Array>> {
+        cast(
+            array,
+            &DataType::new_fixed_size_list(data_type.clone(), length, true),
+        )
+        .map_err(|e| DataFusionError::Internal(e.to_string()))
+    }
+
+    /// Ensures both inputs are [`DataType::FixedSizeList`] with the same length and compatible inner Float types.
+    fn cast_input_args(
+        v1: &Arc<dyn Array>,
+        v2: &Arc<dyn Array>,
+    ) -> DataFusionResult<(Arc<dyn Array>, Arc<dyn Array>)> {
+        match (v1.data_type(), v2.data_type()) {
+            (DataType::FixedSizeList(f1, l1), DataType::FixedSizeList(f2, l2)) => {
+                Self::ensure_same_length(*l1, *l2)?;
+                if f1.data_type() == f2.data_type() {
+                    Ok((Arc::clone(v1), Arc::clone(v2)))
+                } else {
+                    let output_type =
+                        Self::least_precise_float_type(f1.data_type(), f2.data_type())?;
+                    Ok(if *f1.data_type() == output_type {
+                        (
+                            Arc::clone(v1),
+                            Self::cast_to_fixed_size_list(v2, &output_type, *l2)?,
+                        )
+                    } else {
+                        (
+                            Self::cast_to_fixed_size_list(v1, &output_type, *l1)?,
+                            Arc::clone(v2),
+                        )
                     })
-            })
-            .collect::<Result<Vec<Float32Array>, DataFusionError>>()
+                }
+            }
+            (DataType::FixedSizeList(f1, length), DataType::LargeList(f2) | DataType::List(f2))
+            | (DataType::LargeList(f1) | DataType::List(f1), DataType::FixedSizeList(f2, length)) =>
+            {
+                let output_type = Self::least_precise_float_type(f1.data_type(), f2.data_type())?;
+                Ok(if Self::is_fixed_size_list(v1) {
+                    (
+                        Arc::clone(v1),
+                        Self::cast_to_fixed_size_list(v2, &output_type, *length)?,
+                    )
+                } else {
+                    (
+                        Self::cast_to_fixed_size_list(v1, &output_type, *length)?,
+                        Arc::clone(v2),
+                    )
+                })
+            }
+            _ => Err(DataFusionError::Internal(
+                "At least one of the two inputs must be a [`DataType::FixedSizeList`]".into(),
+            )),
+        }
     }
 }
 
@@ -126,94 +222,44 @@ impl ScalarUDFImpl for ArrayDistance {
             return plan_err!("array_distance takes exactly two arguments");
         }
 
-        // Check that the two inputs are compatible and return their type
-        let (f1, f2) = match (args[0].clone(), args[1].clone()) {
+        match (args[0].clone(), args[1].clone()) {
             (DataType::FixedSizeList(f1, size1), DataType::FixedSizeList(f2, size2)) => {
                 if size1 != size2 {
                     return plan_err!("FixedSizeList arrays must have the same length");
                 }
-                (f1.data_type(), f2.data_type())
-            },
-            (DataType::FixedSizeList(f1, _size1), DataType::List(f2)) | 
-            (DataType::List(f1), DataType::FixedSizeList(f2, _size1)) | 
-            (DataType::LargeList(f1), DataType::FixedSizeList(f2, _size1)) | 
-            (DataType::FixedSizeList(f1, _size1), DataType::LargeList(f2)) 
-            => {
-                (f1.data_type(), f2.data_type())
-            },
-            _ => {
-                return plan_err!("Invalid combination of input types for 'array_distance'")
+                Self::least_precise_float_type(f1.data_type(), f2.data_type())
             }
-        };
 
-        if !f1.is_floating() || !f2.is_floating() {
-            return plan_err!("array_distance only supports floating point types");
-        }
-
-        // Return the less precise of the Three types
-        let float_types = [DataType::Float16, DataType::Float32, DataType::Float64];
-        match [f1, f2].iter().filter_map(|&f| {
-            float_types.iter().position(|t| t == f)
-        }).min() {
-            Some(i) => {
-                Ok(float_types[i].clone())
+            (DataType::FixedSizeList(f1, _), DataType::List(f2) | DataType::LargeList(f2))
+            | (DataType::List(f1) | DataType::LargeList(f1), DataType::FixedSizeList(f2, _)) => {
+                Self::least_precise_float_type(f1.data_type(), f2.data_type())
             }
-            None => plan_err!("Unexpected types in 'array_distance'"),
+            _ => plan_err!("Invalid combination of input types for 'array_distance'"),
         }
-
     }
 
-    // Basic implementation of the Euclidean distance between two arrays
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        let args = ColumnarValue::values_to_arrays(args)?;
+        let arrays = ColumnarValue::values_to_arrays(args)?;
+        let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
 
-        let v1: Vec<Float32Array> = Self::to_float32_array(&args[0])?;
-        let v2: Vec<Float32Array> = match args[1].data_type() {
-            DataType::FixedSizeList(_, _) => Self::to_float32_array(&args[1])?,
-            DataType::List(_) => {
-                let lis = as_list_array(&args[1]);
-                lis.iter()
-                    .map(|v| {
-                        v.ok_or_else(|| DataFusionError::Internal("no null entries allowed".into()))
-                            .and_then(|vv| {
-                                let binding = Arc::clone(&vv);
-                                match binding.as_any().downcast_ref::<Float64Array>() {
-                                    Some(a) => Ok(Self::convert_f64_to_f32(a)),
-                                    None => {
-                                        Err(DataFusionError::Internal("downcast failed".into()))
-                                    }
-                                }
-                            })
-                    })
-                    .collect::<Result<Vec<Float32Array>, DataFusionError>>()?
-            }
-            _ => {
-                return Err(DataFusionError::Internal(
-                    "second argument must be of type FixedSizeList or List".into(),
-                ));
-            }
-        };
-
-        let z = v1
+        let result: DataFusionResult<Vec<Option<f64>>> = Self::downcast_to_fixed_size_list(&v1)?
             .iter()
-            .zip(v2.iter())
-            .map(|(a, b)| {
-                if a.len() != b.len() {
-                    return Err(DataFusionError::Internal(format!(
-                        "arrays must have the same length {} != {}",
-                        a.len(),
-                        b.len()
-                    )));
+            .zip(Self::downcast_to_fixed_size_list(&v2)?.iter())
+            .map(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => {
+                    let z: Float64Array = binary(
+                        &Self::cast_to_float64_array(&a)?,
+                        &Self::cast_to_float64_array(&b)?,
+                        |x, y| (x - y).powi(2),
+                    )
+                    .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+                    Ok(sum(&z))
                 }
-                let mut sum: f32 = 0.0;
-                for i in 0..a.len() {
-                    sum += (a.value(i) - b.value(i)).powi(2);
-                }
-                Ok(sum.sqrt())
+                _ => Ok(None),
             })
-            .collect::<DataFusionResult<Vec<f32>>>()?;
+            .collect();
 
-        Ok(ColumnarValue::Array(Arc::new(Float32Array::from(z))))
+        Ok(ColumnarValue::Array(Arc::new(Float64Array::from(result?))))
     }
 }
 
@@ -259,7 +305,7 @@ mod tests {
         let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
         let array = array_vec[0]
             .as_any()
-            .downcast_ref::<Float32Array>()
+            .downcast_ref::<Float64Array>()
             .ok_or("failed downcast of result")?;
         assert_eq!(array.len(), 3);
         assert_eq!(array.value(0), 0.0);
@@ -307,7 +353,7 @@ mod tests {
         let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
         let array = array_vec[0]
             .as_any()
-            .downcast_ref::<Float32Array>()
+            .downcast_ref::<Float64Array>()
             .ok_or("failed downcast of result")?;
         assert_eq!(array.len(), 3);
         assert_eq!(array.value(0), 0.0);
