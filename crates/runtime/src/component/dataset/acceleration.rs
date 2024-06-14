@@ -235,7 +235,7 @@ pub struct Acceleration {
 
     pub primary_key: Option<ColumnReference>,
 
-    on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
+    pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 }
 
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
