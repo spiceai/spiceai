@@ -156,7 +156,15 @@ impl DataSink for DuckDBDataSink {
 
         let num_rows = match **self.duckdb.constraints() {
             [] => self.try_write_all_no_constraints(&tx, &data_batches)?,
-            _ => self.try_write_all_with_constraints(&tx, &data_batches)?,
+            _ => match self.try_write_all_with_constraints(&tx, &data_batches) {
+                Ok(num_rows) => num_rows,
+                Err(e) => {
+                    tx.commit()
+                        .context(super::UnableToCommitTransactionSnafu)
+                        .map_err(to_datafusion_error)?;
+                    return Err(e);
+                }
+            },
         };
 
         tx.commit()
@@ -195,9 +203,6 @@ impl DuckDBDataSink {
                 "Expected table with constraints to have a table creator".to_string(),
             ));
         };
-        let mut insert_table = orig_table_creator
-            .create_empty_clone()
-            .map_err(to_datafusion_error)?;
 
         let mut num_rows = 0;
 
@@ -207,32 +212,42 @@ impl DuckDBDataSink {
             })?;
         }
 
+        let mut insert_table = orig_table_creator
+            .create_empty_clone()
+            .map_err(to_datafusion_error)?;
+
+        let Some(insert_table_creator) = insert_table.table_creator.take() else {
+            unreachable!()
+        };
+
         for (i, batch) in data_batches.iter().enumerate() {
             tracing::debug!(
                 "Inserting batch #{i}/{} into cloned table.",
                 data_batches.len()
             );
-            insert_table
+            if let Err(e) = insert_table
                 .insert_batch_no_constraints(tx, batch)
-                .map_err(to_datafusion_error)?;
+                .map_err(to_datafusion_error)
+            {
+                insert_table_creator
+                    .delete_table(tx)
+                    .map_err(to_datafusion_error)?;
+                return Err(e);
+            };
         }
-
-        let Some(insert_table_creator) = insert_table.table_creator.take() else {
-            unreachable!()
-        };
 
         if self.overwrite {
             insert_table_creator
                 .replace_table(tx, orig_table_creator)
                 .map_err(to_datafusion_error)?;
         } else {
-            // Specific on-conflict handling will be done here.
-            insert_table
+            let insert_result = insert_table
                 .insert_table_into(tx, &self.duckdb, self.on_conflict.as_ref())
-                .map_err(to_datafusion_error)?;
+                .map_err(to_datafusion_error);
             insert_table_creator
                 .delete_table(tx)
                 .map_err(to_datafusion_error)?;
+            insert_result?;
         }
 
         Ok(num_rows)
