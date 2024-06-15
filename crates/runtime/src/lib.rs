@@ -999,7 +999,7 @@ impl Runtime {
 
                 // check for new and updated datasets
                 let valid_datasets = Self::get_valid_datasets(&new_app, true);
-                let existing_datasets = Runtime::get_valid_datasets(current_app, false);
+                let existing_datasets = Self::get_valid_datasets(current_app, false);
 
                 for ds in &valid_datasets {
                     if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
