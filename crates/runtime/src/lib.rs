@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 #![allow(clippy::missing_errors_doc)]
 
 use std::borrow::Borrow;
@@ -400,9 +399,10 @@ impl Runtime {
             let connector = match self.load_dataset_connector(ds).await {
                 Ok(connector) => connector,
                 Err(err) => {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                    let ds_name = &ds.name;
+                    status::update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -459,9 +459,10 @@ impl Runtime {
         {
             Ok(data_connector) => data_connector,
             Err(err) => {
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                let ds_name = &ds.name;
+                status::update_dataset(ds_name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }

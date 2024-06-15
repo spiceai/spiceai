@@ -13,6 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(unused_attributes)] // This is for the `f16_and_f128` feature.
+#![feature(f16_and_f128)]
 pub mod array_distance;
 pub mod connector;
 pub mod execution_plan;

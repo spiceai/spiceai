@@ -178,7 +178,7 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-06-03T23:21:29.721705Z  INFO runtime: Registered dataset taxi_trips
+2024-06-03T23:21:29.721705Z  INFO runtime: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow, 10s refresh), results cache enabled.
 2024-06-03T23:21:29.722839Z  INFO runtime::accelerated_table::refresh: Loading data for dataset taxi_trips
 2024-06-03T23:21:50.813510Z  INFO runtime::accelerated_table::refresh: Loaded 2,964,624 rows (421.71 MiB) for dataset taxi_trips in 21s 90ms.
 ```
@@ -333,7 +333,7 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-06-03T23:25:59.514395Z  INFO runtime: Registered dataset eth_recent_blocks
+2024-06-03T23:25:59.514395Z  INFO runtime: Dataset eth_recent_blocks registered (spice.ai/eth.recent_blocks), acceleration (arrow, 10s refresh), results cache enabled.
 2024-06-03T23:25:59.514624Z  INFO runtime::accelerated_table::refresh: Loading data for dataset eth_recent_blocks
 2024-06-03T23:26:00.758813Z  INFO runtime::accelerated_table::refresh: Loaded 143 rows (6.22 MiB) for dataset eth_recent_blocks in 1s 244ms.
 ```
