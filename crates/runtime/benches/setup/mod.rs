@@ -3,7 +3,7 @@ use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::{
     dataset::{replication::Replication, Dataset, Mode},
-    secrets::SpiceSecretStore,
+    secrets::SecretStoreKey,
 };
 use std::{process::Command, sync::Arc};
 use tracing_subscriber::EnvFilter;
@@ -47,7 +47,7 @@ pub(crate) async fn write_benchmark_results(
 
 fn build_app(upload_results_dataset: &Option<String>) -> App {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test")
-        .with_secret_store(SpiceSecretStore::File)
+        .with_secret_store(SecretStoreKey::File)
         .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
         .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
         .with_dataset(make_spiceai_dataset("tpch.part", "part"))

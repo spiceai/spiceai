@@ -27,7 +27,7 @@ use spicepod::{
         llms::Llm,
         model::Model,
         runtime::{ResultsCache, Runtime},
-        secrets::{Secrets, SpiceSecretStore},
+        secrets::{SecretStore, SecretStoreKey},
         view::View,
     },
     Spicepod,
@@ -37,7 +37,7 @@ use spicepod::{
 pub struct App {
     pub name: String,
 
-    pub secrets: Secrets,
+    pub secrets: Vec<SecretStore>,
 
     pub extensions: HashMap<String, Extension>,
 
@@ -69,7 +69,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct AppBuilder {
     name: String,
-    secrets: Secrets,
+    secrets: Vec<SecretStore>,
     extensions: HashMap<String, Extension>,
     datasets: Vec<Dataset>,
     views: Vec<View>,
@@ -84,7 +84,7 @@ impl AppBuilder {
     pub fn new(name: impl Into<String>) -> AppBuilder {
         AppBuilder {
             name: name.into(),
-            secrets: Secrets::default(),
+            secrets: vec![],
             extensions: HashMap::new(),
             datasets: vec![],
             views: vec![],
@@ -98,7 +98,7 @@ impl AppBuilder {
 
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
-        self.secrets = spicepod.secrets.clone();
+        self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
@@ -116,8 +116,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
-        self.secrets = Secrets { store: secret };
+    pub fn with_secret_store(mut self, secret: SecretStore) -> AppBuilder {
+        self.secrets.push(secret);
         self
     }
 
@@ -177,14 +177,34 @@ impl AppBuilder {
         let path = path.into();
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
-        let secrets = spicepod_root.secrets.clone();
         let runtime = spicepod_root.runtime.clone();
         let extensions = spicepod_root.extensions.clone();
+        let mut secrets: Vec<SecretStore> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut llms: Vec<Llm> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+
+        if spicepod_root.secrets.is_empty() {
+            // Default to file and env secrets
+            secrets.push({
+                SecretStore {
+                    from: SecretStoreKey::File,
+                    params: None,
+                }
+            });
+            secrets.push({
+                SecretStore {
+                    from: SecretStoreKey::Env,
+                    params: None,
+                }
+            });
+        } else {
+            for secret in &spicepod_root.secrets {
+                secrets.push(secret.clone());
+            }
+        }
 
         for dataset in &spicepod_root.datasets {
             datasets.push(dataset.clone());

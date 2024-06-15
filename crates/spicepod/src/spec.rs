@@ -21,7 +21,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::embeddings::Embeddings;
 use crate::component::runtime::Runtime;
-use crate::component::secrets::Secrets;
+use crate::component::secrets::SecretStore;
 use crate::component::{
     dataset::Dataset, extension::Extension, llms::Llm, model::Model, view::View,
     ComponentOrReference,
@@ -47,6 +47,10 @@ pub struct SpicepodDefinition {
 
     pub kind: SpicepodKind,
 
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+
     /// Optional runtime configuration
     #[serde(default)]
     pub runtime: Runtime,
@@ -57,13 +61,13 @@ pub struct SpicepodDefinition {
     pub extensions: HashMap<String, Extension>,
 
     /// Optional spicepod secrets configuration
-    /// Default value is `store: file`
+    /// Default value is
+    /// secrets:
+    ///   - store: file
+    ///   - store: env
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
-    pub secrets: Secrets,
-
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    #[serde(default)]
-    pub metadata: HashMap<String, Value>,
+    pub secrets: Vec<ComponentOrReference<SecretStore>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

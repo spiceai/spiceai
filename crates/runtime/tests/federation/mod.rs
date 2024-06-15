@@ -20,7 +20,7 @@ use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
-use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
+use spicepod::component::{dataset::Dataset, secrets::SecretStoreKey};
 
 use crate::{
     init_tracing, modify_runtime_datafusion_options, run_query_and_check_results, ValidateFn,
@@ -40,7 +40,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("basic_federation_push_down")
-        .with_secret_store(SpiceSecretStore::File)
+        .with_secret_store(SecretStoreKey::File)
         .with_dataset(make_spiceai_dataset("eth.recent_blocks", "blocks"))
         .with_dataset(make_spiceai_dataset("eth.blocks", "full_blocks"))
         .with_dataset(make_spiceai_dataset("eth.recent_transactions", "tx"))

@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use super::WithDependsOn;
 
 /// The secrets configuration for a Spicepod.
 ///
@@ -24,21 +28,25 @@ use serde::{Deserialize, Serialize};
 ///   store: file
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Secrets {
-    pub store: SpiceSecretStore,
+pub struct SecretStore {
+    pub from: SecretStoreKey,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<HashMap<String, String>>,
 }
 
-impl Default for Secrets {
-    fn default() -> Self {
-        Self {
-            store: SpiceSecretStore::File,
+impl WithDependsOn<SecretStore> for SecretStore {
+    fn depends_on(&self, depends_on: &[String]) -> SecretStore {
+        SecretStore {
+            from: self.from.clone(),
+            params: self.params.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum SpiceSecretStore {
+pub enum SecretStoreKey {
     File,
     Env,
     Kubernetes,

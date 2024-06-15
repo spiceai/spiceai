@@ -33,6 +33,7 @@ use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
+use component::secret::{self, SecretStore};
 use component::view::View;
 use config::Config;
 use datafusion::query::query_history;
@@ -217,7 +218,6 @@ pub struct Runtime {
     pub llms: Arc<RwLock<LLMModelStore>>,
     pub embeds: Arc<RwLock<EmbeddingModelStore>>,
     pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
-    pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     pub datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
 
     extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
@@ -247,7 +247,6 @@ impl Runtime {
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(None)),
-            secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             extensions: Arc::new(RwLock::new(vec![])),
             datasets_health_monitor: None,
@@ -291,21 +290,41 @@ impl Runtime {
         self.datasets_health_monitor = Some(Arc::new(datasets_health_monitor));
     }
 
+    fn secrets_iter(app: &App) -> impl Iterator<Item = Result<SecretStore>> + '_ {
+        app.secrets.iter().cloned().map(SecretStore::try_from)
+    }
+
+    /// Returns a list of valid secret stores from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_secret_stores(app: &App, log_failures: bool) -> Vec<SecretStore> {
+        Self::secrets_iter(app)
+            .zip(&app.secrets)
+            .filter_map(|(ss, spicepod_ss)| match ss {
+                Ok(ss) => Some(ss),
+                Err(e) => {
+                    if log_failures {
+                        metrics::counter!("secrets_load_error").increment(1);
+                        tracing::error!(secret = &spicepod_ss.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub async fn load_secrets(&self) {
-        measure_scope_ms!("load_secrets");
-        let mut secret_store = self.secrets_provider.write().await;
-
         let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
-                return;
-            };
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
 
-            secret_store.store = secret_store_type;
-        }
+        measure_scope_ms!("load_secrets");
 
-        if let Err(e) = secret_store.load_secrets().await {
-            tracing::warn!("Unable to load secrets: {}", e);
+        let valid_secret_stores = Self::get_valid_secret_stores(app, true);
+        let mut futures = vec![];
+        for ss in &valid_secret_stores {
+            if let Err(e) = ss.load_secrets().await {
+                tracing::warn!("Unable to load secret store {}: {}", ss.key, e);
+            }
         }
     }
 

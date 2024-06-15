@@ -27,7 +27,7 @@ use component::embeddings::Embeddings;
 use component::llms::Llm;
 use component::model::Model;
 use component::runtime::Runtime;
-use component::secrets::Secrets;
+use component::secrets::SecretStore;
 use component::{dataset::Dataset, extension::Extension};
 
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -59,7 +59,7 @@ pub struct Spicepod {
 
     pub extensions: HashMap<String, Extension>,
 
-    pub secrets: Secrets,
+    pub secrets: Vec<SecretStore>,
 
     pub datasets: Vec<Dataset>,
 
@@ -94,6 +94,15 @@ impl Spicepod {
 
         let spicepod_definition: SpicepodDefinition =
             serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
+        let resolved_secrets = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.secrets,
+            "secret",
+        )
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_datasets = component::resolve_component_references(
             fs,
             &path,
@@ -128,6 +137,7 @@ impl Spicepod {
 
         Ok(from_definition(
             spicepod_definition,
+            resolved_secrets,
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
@@ -161,6 +171,7 @@ impl Spicepod {
 #[must_use]
 fn from_definition(
     spicepod_definition: SpicepodDefinition,
+    secrets: Vec<SecretStore>,
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
@@ -171,7 +182,7 @@ fn from_definition(
         name: spicepod_definition.name,
         version: spicepod_definition.version,
         extensions: spicepod_definition.extensions,
-        secrets: spicepod_definition.secrets,
+        secrets,
         datasets,
         views,
         models,

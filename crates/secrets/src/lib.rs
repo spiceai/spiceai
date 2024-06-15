@@ -29,7 +29,7 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 
 use crate::file::FileSecretStore;
-use spicepod::component::secrets::SpiceSecretStore;
+use spicepod::component::secrets::SecretStoreKey;
 
 pub use secrecy::ExposeSecret;
 
@@ -97,15 +97,15 @@ pub enum SecretStoreType {
 }
 
 #[must_use]
-pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStoreType> {
+pub fn spicepod_secret_store_type(store: &SecretStoreKey) -> Option<SecretStoreType> {
     match store {
-        SpiceSecretStore::File => Some(SecretStoreType::File),
-        SpiceSecretStore::Env => Some(SecretStoreType::Env),
+        SecretStoreKey::File => Some(SecretStoreType::File),
+        SecretStoreKey::Env => Some(SecretStoreType::Env),
         #[cfg(feature = "keyring-secret-store")]
-        SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
-        SpiceSecretStore::Kubernetes => Some(SecretStoreType::Kubernetes),
+        SecretStoreKey::Keyring => Some(SecretStoreType::Keyring),
+        SecretStoreKey::Kubernetes => Some(SecretStoreType::Kubernetes),
         #[cfg(feature = "aws-secrets-manager")]
-        SpiceSecretStore::AwsSecretsManager => Some(SecretStoreType::AwsSecretsManager),
+        SecretStoreKey::AwsSecretsManager => Some(SecretStoreType::AwsSecretsManager),
         #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
         _ => None,
     }
