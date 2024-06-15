@@ -31,6 +31,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
