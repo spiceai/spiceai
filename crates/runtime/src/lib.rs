@@ -584,33 +584,36 @@ impl Runtime {
 
     pub async fn update_dataset(&self, ds: &Dataset) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        if let Ok(connector) = self.load_dataset_connector(ds).await {
-            tracing::info!("Updating accelerated dataset {}...", &ds.name);
+        match self.load_dataset_connector(ds).await {
+            Ok(connector) => {
+                // File accelerated datasets don't support hot reload.
+                if ds.is_accelerated() {
+                    tracing::info!("Updating accelerated dataset {}...", &ds.name);
+                    if let Ok(()) = &self
+                        .reload_accelerated_dataset(ds, Arc::clone(&connector))
+                        .await
+                    {
+                        status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+                        return;
+                    }
+                    tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
+                }
 
-            // File accelerated datasets don't support hot reload.
-            if ds.is_accelerated() {
-                if let Ok(()) = &self
-                    .reload_accelerated_dataset(ds, Arc::clone(&connector))
+                self.remove_dataset(ds).await;
+
+                if let Ok(()) = self
+                    .register_loaded_dataset(ds, Arc::clone(&connector), None)
                     .await
                 {
                     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-                    return;
+                } else {
+                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 }
-                tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
-
-            self.remove_dataset(ds).await;
-
-            if let Ok(()) = self
-                .register_loaded_dataset(ds, Arc::clone(&connector), None)
-                .await
-            {
-                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-            } else {
+            Err(e) => {
+                tracing::error!("Unable to update dataset {}: {e}", ds.name);
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
             }
-        } else {
-            status::update_dataset(&ds.name, status::ComponentStatus::Error);
         }
     }
 
@@ -996,13 +999,11 @@ impl Runtime {
 
                 // check for new and updated datasets
                 let valid_datasets = Self::get_valid_datasets(&new_app, true);
+                let existing_datasets = Runtime::get_valid_datasets(current_app, false);
+
                 for ds in &valid_datasets {
-                    if let Some(current_ds) = current_app
-                        .datasets
-                        .iter()
-                        .find(|d| TableReference::parse_str(&d.name) == ds.name)
-                    {
-                        if TableReference::parse_str(&current_ds.name) != ds.name {
+                    if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
+                        if ds != current_ds {
                             self.update_dataset(ds).await;
                         }
                     } else {
