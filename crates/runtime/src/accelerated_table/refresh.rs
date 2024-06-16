@@ -547,7 +547,7 @@ impl Refresher {
             }
         })
         .await
-        .map_err(|e| super::Error::UnableToGetDataFromConnector { source: e })
+        .context(super::UnableToGetDataFromConnectorSnafu)
     }
 
     fn get_refresh_df_context(&self) -> SessionContext {
