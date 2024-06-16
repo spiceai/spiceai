@@ -15,6 +15,9 @@ use crate::{
 use arrow::array::TimestampNanosecondArray;
 use arrow::datatypes::DataType;
 use async_stream::stream;
+use backoff::exponential::ExponentialBackoff;
+use backoff::future::retry;
+use backoff::SystemClock;
 use cache::QueryResultsCacheProvider;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
@@ -29,7 +32,6 @@ use snafu::prelude::*;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Clone, Debug)]
@@ -492,24 +494,24 @@ impl Refresher {
 
     async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
         let refresh = self.refresh.read().await;
-        let update_type = match refresh.mode {
-            RefreshMode::Full => UpdateType::Overwrite,
-            RefreshMode::Append => UpdateType::Append,
-        };
-        let mut ctx = self.get_refresh_df_context();
+
+        let ctx = self.get_refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
-        let mut get_data_attempt: usize = 0;
-        let get_data_max_duration = Duration::from_secs(600);
-        let retry_interval_seconds = [1, 3, 5, 10, 20, 30];
-        let start_time = Instant::now();
+        let retry_strategy: ExponentialBackoff<SystemClock> = ExponentialBackoff {
+            max_elapsed_time: refresh.check_interval,
+            initial_interval: Duration::from_secs(1),
+            multiplier: 2.0,
+            max_interval: Duration::from_secs(300),
+            ..ExponentialBackoff::default()
+        };
 
-        loop {
-            get_data_attempt += 1;
+        retry(retry_strategy, || async {
+            let mut ctx_clone = ctx.clone();
 
             let get_data_result = get_data(
-                &mut ctx,
+                &mut ctx_clone,
                 dataset_name.clone(),
                 Arc::clone(&federated),
                 refresh.sql.clone(),
@@ -518,33 +520,29 @@ impl Refresher {
             .await;
 
             match get_data_result {
-                Ok(data) => {
-                    return Ok(DataUpdate {
-                        schema: data.0,
-                        data: data.1,
-                        update_type,
-                    });
-                }
+                Ok(data) => Ok(DataUpdate {
+                    schema: data.0,
+                    data: data.1,
+                    update_type: match refresh.mode {
+                        RefreshMode::Full => UpdateType::Overwrite,
+                        RefreshMode::Append => UpdateType::Append,
+                    },
+                }),
                 Err(e) => {
-                    if start_time.elapsed() >= get_data_max_duration {
-                        return Err(super::Error::UnableToGetDataFromConnector {
-                            source: e,
-                            num_attempts: get_data_attempt,
-                        });
-                    }
-
-                    let next_attempt_wait_time = if get_data_attempt >= retry_interval_seconds.len()
-                    {
-                        retry_interval_seconds[retry_interval_seconds.len() - 1]
-                    } else {
-                        retry_interval_seconds[get_data_attempt]
-                    };
-
-                    tracing::warn!("Failed to get refresh data for dataset {dataset_name}: {e}. Retrying in {next_attempt_wait_time} seconds...");
-                    sleep(Duration::from_secs(next_attempt_wait_time)).await;
+                    tracing::warn!(
+                        "Failed to get refresh data for dataset {}: {}",
+                        dataset_name,
+                        e
+                    );
+                    Err(backoff::Error::Transient {
+                        err: e,
+                        retry_after: None,
+                    })
                 }
             }
-        }
+        })
+        .await
+        .map_err(|e| super::Error::UnableToGetDataFromConnector { source: e })
     }
 
     fn get_refresh_df_context(&self) -> SessionContext {

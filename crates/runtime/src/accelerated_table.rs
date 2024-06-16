@@ -54,11 +54,8 @@ pub mod refresh;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get data from connector after {num_attempts} attempts: {source}"))]
-    UnableToGetDataFromConnector {
-        source: dataconnector::Error,
-        num_attempts: usize,
-    },
+    #[snafu(display("Unable to get data from connector: {source}"))]
+    UnableToGetDataFromConnector { source: dataconnector::Error },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
