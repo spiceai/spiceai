@@ -3001,6 +3001,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion_udf"
+version = "0.14.0-alpha"
+dependencies = [
+ "arrow",
+ "datafusion",
+]
+
+[[package]]
 name = "db_connection_pool"
 version = "0.14.0-alpha"
 dependencies = [

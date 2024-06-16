@@ -7,6 +7,7 @@ members = [
     "crates/app",
     "crates/arrow_sql_gen",
     "crates/arrow_tools",
+    "crates/datafusion_udf",
     "crates/sql_provider_datafusion",
     "crates/flightrepl",
     "crates/llms",
