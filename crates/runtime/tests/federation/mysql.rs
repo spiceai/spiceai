@@ -105,7 +105,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
     let _: Vec<Row> = conn.exec(create_table_stmt, Params::Empty).await?;
 
     tracing::debug!("INSERT INTO lineitem...");
-    let insert_stmt = InsertBuilder::new("lineitem", tpch_lineitem).build_mysql()?;
+    let insert_stmt = InsertBuilder::new("lineitem", tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 
