@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
 use crate::util::constraints;
+use crate::util::on_conflict::OnConflict;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::Constraints;
@@ -43,13 +44,19 @@ use super::to_datafusion_error;
 pub struct DuckDBTableWriter {
     read_provider: Arc<dyn TableProvider>,
     duckdb: Arc<DuckDB>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl DuckDBTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, duckdb: DuckDB) -> Arc<Self> {
+    pub fn create(
+        read_provider: Arc<dyn TableProvider>,
+        duckdb: DuckDB,
+        on_conflict: Option<OnConflict>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             duckdb: Arc::new(duckdb),
+            on_conflict,
         })
     }
 }
@@ -92,7 +99,11 @@ impl TableProvider for DuckDBTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(DuckDBDataSink::new(Arc::clone(&self.duckdb), overwrite)),
+            Arc::new(DuckDBDataSink::new(
+                Arc::clone(&self.duckdb),
+                overwrite,
+                self.on_conflict.clone(),
+            )),
             self.schema(),
             None,
         )) as _)
@@ -103,6 +114,7 @@ impl TableProvider for DuckDBTableWriter {
 pub(crate) struct DuckDBDataSink {
     duckdb: Arc<DuckDB>,
     overwrite: bool,
+    on_conflict: Option<OnConflict>,
 }
 
 #[async_trait]
@@ -144,7 +156,15 @@ impl DataSink for DuckDBDataSink {
 
         let num_rows = match **self.duckdb.constraints() {
             [] => self.try_write_all_no_constraints(&tx, &data_batches)?,
-            _ => self.try_write_all_with_constraints(&tx, &data_batches)?,
+            _ => match self.try_write_all_with_constraints(&tx, &data_batches) {
+                Ok(num_rows) => num_rows,
+                Err(e) => {
+                    tx.commit()
+                        .context(super::UnableToCommitTransactionSnafu)
+                        .map_err(to_datafusion_error)?;
+                    return Err(e);
+                }
+            },
         };
 
         tx.commit()
@@ -156,8 +176,16 @@ impl DataSink for DuckDBDataSink {
 }
 
 impl DuckDBDataSink {
-    pub(crate) fn new(duckdb: Arc<DuckDB>, overwrite: bool) -> Self {
-        Self { duckdb, overwrite }
+    pub(crate) fn new(
+        duckdb: Arc<DuckDB>,
+        overwrite: bool,
+        on_conflict: Option<OnConflict>,
+    ) -> Self {
+        Self {
+            duckdb,
+            overwrite,
+            on_conflict,
+        }
     }
 
     /// If there are constraints on the `DuckDB` table, we need to create an empty copy of the target table, write to that table copy and then depending on
@@ -175,9 +203,6 @@ impl DuckDBDataSink {
                 "Expected table with constraints to have a table creator".to_string(),
             ));
         };
-        let mut insert_table = orig_table_creator
-            .create_empty_clone()
-            .map_err(to_datafusion_error)?;
 
         let mut num_rows = 0;
 
@@ -187,32 +212,42 @@ impl DuckDBDataSink {
             })?;
         }
 
+        let mut insert_table = orig_table_creator
+            .create_empty_clone()
+            .map_err(to_datafusion_error)?;
+
+        let Some(insert_table_creator) = insert_table.table_creator.take() else {
+            unreachable!()
+        };
+
         for (i, batch) in data_batches.iter().enumerate() {
             tracing::debug!(
                 "Inserting batch #{i}/{} into cloned table.",
                 data_batches.len()
             );
-            insert_table
-                .insert_batch(tx, batch)
-                .map_err(to_datafusion_error)?;
+            if let Err(e) = insert_table
+                .insert_batch_no_constraints(tx, batch)
+                .map_err(to_datafusion_error)
+            {
+                insert_table_creator
+                    .delete_table(tx)
+                    .map_err(to_datafusion_error)?;
+                return Err(e);
+            };
         }
-
-        let Some(insert_table_creator) = insert_table.table_creator.take() else {
-            unreachable!()
-        };
 
         if self.overwrite {
             insert_table_creator
                 .replace_table(tx, orig_table_creator)
                 .map_err(to_datafusion_error)?;
         } else {
-            // Specific on-conflict handling will be done here.
-            insert_table
-                .insert_table_into(tx, &self.duckdb)
-                .map_err(to_datafusion_error)?;
+            let insert_result = insert_table
+                .insert_table_into(tx, &self.duckdb, self.on_conflict.as_ref())
+                .map_err(to_datafusion_error);
             insert_table_creator
                 .delete_table(tx)
                 .map_err(to_datafusion_error)?;
+            insert_result?;
         }
 
         Ok(num_rows)
@@ -242,7 +277,7 @@ impl DuckDBDataSink {
         for (i, batch) in data_batches.iter().enumerate() {
             tracing::debug!("Inserting batch #{i}/{} into table.", data_batches.len());
             self.duckdb
-                .insert_batch(tx, batch)
+                .insert_batch_no_constraints(tx, batch)
                 .map_err(to_datafusion_error)?;
         }
 

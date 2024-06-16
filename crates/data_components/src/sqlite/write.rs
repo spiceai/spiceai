@@ -36,7 +36,7 @@ use sql_provider_datafusion::expr::Engine;
 
 use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
-    util::constraints,
+    util::{constraints, on_conflict::OnConflict},
 };
 
 use super::{to_datafusion_error, Sqlite};
@@ -44,13 +44,19 @@ use super::{to_datafusion_error, Sqlite};
 pub struct SqliteTableWriter {
     read_provider: Arc<dyn TableProvider>,
     sqlite: Arc<Sqlite>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl SqliteTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, sqlite: Sqlite) -> Arc<Self> {
+    pub fn create(
+        read_provider: Arc<dyn TableProvider>,
+        sqlite: Sqlite,
+        on_conflict: Option<OnConflict>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             sqlite: Arc::new(sqlite),
+            on_conflict,
         })
     }
 }
@@ -93,7 +99,11 @@ impl TableProvider for SqliteTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(SqliteDataSink::new(Arc::clone(&self.sqlite), overwrite)),
+            Arc::new(SqliteDataSink::new(
+                Arc::clone(&self.sqlite),
+                overwrite,
+                self.on_conflict.clone(),
+            )),
             self.schema(),
             None,
         )) as _)
@@ -104,6 +114,7 @@ impl TableProvider for SqliteTableWriter {
 struct SqliteDataSink {
     sqlite: Arc<Sqlite>,
     overwrite: bool,
+    on_conflict: Option<OnConflict>,
 }
 
 #[async_trait]
@@ -147,6 +158,7 @@ impl DataSink for SqliteDataSink {
 
         let overwrite = self.overwrite;
         let sqlite = Arc::clone(&self.sqlite);
+        let on_conflict = self.on_conflict.clone();
         sqlite_conn
             .conn
             .call(move |conn| {
@@ -158,7 +170,7 @@ impl DataSink for SqliteDataSink {
 
                 for batch in data_batches {
                     if batch.num_rows() > 0 {
-                        sqlite.insert_batch(&transaction, batch)?;
+                        sqlite.insert_batch(&transaction, batch, on_conflict.as_ref())?;
                     }
                 }
 
@@ -175,8 +187,12 @@ impl DataSink for SqliteDataSink {
 }
 
 impl SqliteDataSink {
-    fn new(sqlite: Arc<Sqlite>, overwrite: bool) -> Self {
-        Self { sqlite, overwrite }
+    fn new(sqlite: Arc<Sqlite>, overwrite: bool, on_conflict: Option<OnConflict>) -> Self {
+        Self {
+            sqlite,
+            overwrite,
+            on_conflict,
+        }
     }
 }
 
