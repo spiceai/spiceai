@@ -534,6 +534,9 @@ impl Refresher {
                         dataset_name,
                         e
                     );
+                    let labels = [("dataset", dataset_name.to_string())];
+                    metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+
                     Err(backoff::Error::Transient {
                         err: e,
                         retry_after: None,
