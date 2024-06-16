@@ -110,7 +110,8 @@ async fn validate_batch_with_constraint(
     Ok(())
 }
 
-pub(crate) fn get_primary_keys_from_constraints(
+#[must_use]
+pub fn get_primary_keys_from_constraints(
     constraints: &Constraints,
     schema: &SchemaRef,
 ) -> Vec<String> {

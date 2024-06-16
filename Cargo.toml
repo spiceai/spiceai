@@ -75,3 +75,4 @@ ssh2 = { version = "0.9.4" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "e85aa9652326c9d1649f6535620990e12efa37a2" }
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "e85aa9652326c9d1649f6535620990e12efa37a2" }
 object_store = { version = "0.10.1" }
+itertools = "0.12"

@@ -303,7 +303,10 @@ impl Refresher {
                         tracing::error!("Error reading data for dataset {dataset_name}: {e}");
                         yield Err(super::Error::UnableToScanTableProvider { source: e });
                     }
-                    None => break,
+                    None => {
+                        tracing::warn!("Append stream ended for dataset {dataset_name}");
+                        break;
+                    },
                 }
             }
         }
@@ -352,7 +355,6 @@ impl Refresher {
                             Ok(data) => yield Ok((Some(start), data)),
                             Err(e) => yield Err(e),
                         }
-
                     }
                     Err(e) => {
                         tracing::error!("No latest timestamp is found: {e}");
