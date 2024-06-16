@@ -39,8 +39,11 @@ use tokio_rusqlite::Connection;
 use crate::{
     delete::DeletionTableProviderAdapter,
     util::{
+        self,
+        column_reference::{self, ColumnReference},
         constraints::{self, get_primary_keys_from_constraints},
-        indexes::{self, IndexType},
+        indexes::IndexType,
+        on_conflict::{self, OnConflict},
     },
 };
 
@@ -83,6 +86,12 @@ pub enum Error {
 
     #[snafu(display("Constraint Violation: {source}"))]
     ConstraintViolation { source: constraints::Error },
+
+    #[snafu(display("Error parsing column reference: {source}"))]
+    UnableToParseColumnReference { source: column_reference::Error },
+
+    #[snafu(display("Error parsing on_conflict: {source}"))]
+    UnableToParseOnConflict { source: on_conflict::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -123,21 +132,35 @@ impl TableProviderFactory for SqliteTableFactory {
         let mode: Mode = mode.as_str().into();
 
         let indexes_option_str = options.remove("indexes");
-        let indexes = match indexes_option_str {
-            Some(indexes_str) => indexes::indexes_from_option_string(&indexes_str),
+        let unparsed_indexes: HashMap<String, IndexType> = match indexes_option_str {
+            Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
             None => HashMap::new(),
         };
 
-        let indexes = indexes
+        let unparsed_indexes = unparsed_indexes
             .into_iter()
             .map(|(key, value)| {
-                let columns = indexes::index_columns(&key)
-                    .into_iter()
-                    .map(ToString::to_string)
-                    .collect();
+                let columns = ColumnReference::try_from(key.as_str())
+                    .context(UnableToParseColumnReferenceSnafu)
+                    .map_err(to_datafusion_error);
                 (columns, value)
             })
-            .collect::<Vec<(Vec<String>, IndexType)>>();
+            .collect::<Vec<(Result<ColumnReference, DataFusionError>, IndexType)>>();
+
+        let mut indexes: Vec<(ColumnReference, IndexType)> = Vec::new();
+        for (columns, index_type) in unparsed_indexes {
+            let columns = columns?;
+            indexes.push((columns, index_type));
+        }
+
+        let mut on_conflict: Option<OnConflict> = None;
+        if let Some(on_conflict_str) = options.remove("on_conflict") {
+            on_conflict = Some(
+                OnConflict::try_from(on_conflict_str.as_str())
+                    .context(UnableToParseOnConflictSnafu)
+                    .map_err(to_datafusion_error)?,
+            );
+        }
 
         let db_path = cmd
             .options
@@ -176,7 +199,7 @@ impl TableProviderFactory for SqliteTableFactory {
                     for index in indexes {
                         sqlite_in_conn.create_index(
                             &transaction,
-                            index.0.iter().map(AsRef::as_ref).collect(),
+                            index.0.iter().collect(),
                             index.1 == IndexType::Unique,
                         )?;
                     }
@@ -202,7 +225,7 @@ impl TableProviderFactory for SqliteTableFactory {
             .context(DanglingReferenceToSqliteSnafu)
             .map_err(to_datafusion_error)?;
 
-        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite);
+        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite, on_conflict);
 
         let delete_adapter = DeletionTableProviderAdapter::new(read_write_provider);
         Ok(Arc::new(delete_adapter))
@@ -284,10 +307,15 @@ impl Sqlite {
         &self,
         transaction: &Transaction<'_>,
         batch: RecordBatch,
+        on_conflict: Option<&OnConflict>,
     ) -> rusqlite::Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
+
+        let sea_query_on_conflict =
+            on_conflict.map(|oc| oc.build_sea_query_on_conflict(&self.schema));
+
         let sql = insert_table_builder
-            .build_sqlite()
+            .build_sqlite(sea_query_on_conflict)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
 
         transaction.execute(&sql, [])?;
