@@ -33,10 +33,7 @@ pub(crate) async fn post(
     match embeddings.read().await.get(&model_id) {
         Some(model_lock) => {
             let mut model = model_lock.write().await;
-            match model
-                .embed_request(req)
-                .await
-            {
+            match model.embed_request(req).await {
                 Ok(response) => Json(response).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
