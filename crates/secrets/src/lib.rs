@@ -198,11 +198,13 @@ impl SecretsProvider {
     ///
     /// Will return `None` if the secret store is not initialized or pass error from the secret store.
     pub async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>> {
-        if let Some(ref secret_store) = self.secret_store {
-            secret_store.get_secret(secret_name).await
-        } else {
-            Ok(None)
+        // iterate through in reverse order to give priority to the last secret store
+        for secret_store in self.secret_stores.iter().rev() {
+            if let Some(secret) = secret_store.get_secret(secret_name).await? {
+                return Ok(Some(secret));
+            }
         }
+        Ok(None)
     }
 }
 
