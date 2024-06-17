@@ -52,19 +52,19 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - anyhow 1.0.86, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/anyhow
 
-- arrow 51.0.0, Apache-2.0 
+- arrow 52.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-flight 51.0.0, Apache-2.0 
+- arrow-flight 52.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-ipc 51.0.0, Apache-2.0 
+- arrow-ipc 52.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-json 51.0.0, Apache-2.0 
+- arrow-json 52.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-odbc 9.0.0, MIT 
+- arrow-odbc 11.1.0, MIT 
   <br/>https://github.com/pacman82/arrow-odbc
 
 - async-graphql 7.0.5, Apache-2.0 OR MIT 
@@ -148,6 +148,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.8.6, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
+- chrono-tz 0.9.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/chronotope/chrono-tz
+
 - clap 4.5.4, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
@@ -160,7 +163,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dashmap 5.5.3, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 38.0.0, Apache-2.0 
+- datafusion 39.0.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-federation 0.1.3, Apache-2.0 
@@ -169,7 +172,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-federation-sql 0.1.3, Apache-2.0 
   <br/>
 
-- deltalake 0.17.3, Apache-2.0 
+- deltalake 0.18.0, Apache-2.0 
   <br/>https://github.com/delta-io/delta.rs
 
 - derive_builder 0.20.0, Apache-2.0 OR MIT 
@@ -203,6 +206,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/rust-itertools/itertools
 
 - itertools 0.12.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-itertools/itertools
+
+- itertools 0.13.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
 
 - keyring 2.3.2, Apache-2.0 OR MIT 
@@ -244,6 +250,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - object_store 0.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs/tree/master/object_store
 
+- object_store 0.10.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/apache/arrow-rs/tree/master/object_store
+
 - odbc-api 7.0.0, MIT 
   <br/>https://github.com/pacman82/odbc-api
 
@@ -253,7 +262,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - opentelemetry-proto 0.4.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
-- parquet 51.0.0, Apache-2.0 
+- parquet 52.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - pem 1.1.1, MIT 
@@ -286,7 +295,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - r2d2 0.8.10, Apache-2.0 OR MIT 
   <br/>https://github.com/sfackler/r2d2
 
-- regex 1.10.4, Apache-2.0 OR MIT 
+- rand 0.8.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-random/rand
+
+- regex 1.10.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/regex
 
 - reqwest 0.11.27, Apache-2.0 OR MIT 
@@ -334,7 +346,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - snafu 0.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/shepmaster/snafu
 
-- snowflake-api 0.8.0, Apache-2.0 
+- snowflake-api 0.9.0, Apache-2.0 
   <br/>https://github.com/mycelial/snowflake-rs
 
 - spark-connect-rs 0.0.1-beta.4, Apache-2.0 
