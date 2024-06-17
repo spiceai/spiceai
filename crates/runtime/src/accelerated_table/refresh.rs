@@ -5,6 +5,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::datafusion::{schema, SPICE_RUNTIME_SCHEMA};
+use crate::execution_plan::schema_cast::EnsureSchema;
 use crate::object_store_registry::default_runtime_env;
 use crate::{
     dataconnector::get_data,
@@ -479,7 +480,7 @@ impl Refresher {
         if let Some(sql) = &self.refresh.read().await.sql {
             ctx.sql(sql.as_str()).await
         } else {
-            ctx.read_table(Arc::clone(&self.accelerator))
+            ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
         }
     }
 
@@ -619,7 +620,7 @@ impl Refresher {
 
         if let Err(e) = ctx.register_table(
             TableReference::parse_str(&acc_dataset_name),
-            Arc::clone(&self.accelerator),
+            Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
         }
