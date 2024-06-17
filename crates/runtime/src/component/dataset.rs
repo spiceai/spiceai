@@ -50,6 +50,12 @@ pub enum Error {
         column_ref: String,
         source: column_reference::Error,
     },
+
+    #[snafu(display("Error parsing {field} as duration: {source}"))]
+    UnableToParseFieldAsDuration {
+        field: String,
+        source: fundu::ParseError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
