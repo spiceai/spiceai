@@ -68,7 +68,7 @@ impl TableCreator {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    pub fn create(mut self) -> super::Result<DuckDB> {
+    pub fn create_with_tx(mut self, tx: &Transaction<'_>) -> super::Result<DuckDB> {
         assert!(!self.created, "Table already created");
         let primary_keys = if let Some(constraints) = &self.constraints {
             get_primary_keys_from_constraints(constraints, &self.schema)
@@ -76,23 +76,11 @@ impl TableCreator {
             Vec::new()
         };
 
-        let mut db_conn = Arc::clone(&self.pool)
-            .connect_sync()
-            .context(super::DbConnectionSnafu)?;
-        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
-
-        let tx = duckdb_conn
-            .conn
-            .transaction()
-            .context(super::UnableToBeginTransactionSnafu)?;
-
-        self.create_table(&tx, primary_keys)?;
+        self.create_table(tx, primary_keys)?;
 
         for index in self.indexes_vec() {
-            self.create_index(&tx, index.0, index.1 == IndexType::Unique)?;
+            self.create_index(tx, index.0, index.1 == IndexType::Unique)?;
         }
-
-        tx.commit().context(super::UnableToCommitTransactionSnafu)?;
 
         let constraints = self.constraints.clone().unwrap_or(Constraints::empty());
 
@@ -110,9 +98,30 @@ impl TableCreator {
         Ok(duckdb)
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub fn create(self) -> super::Result<DuckDB> {
+        assert!(!self.created, "Table already created");
+
+        let mut db_conn = Arc::clone(&self.pool)
+            .connect_sync()
+            .context(super::DbConnectionSnafu)?;
+        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
+
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(super::UnableToBeginTransactionSnafu)?;
+
+        let duckdb = self.create_with_tx(&tx)?;
+
+        tx.commit().context(super::UnableToCommitTransactionSnafu)?;
+
+        Ok(duckdb)
+    }
+
     /// Creates a copy of the `DuckDB` table with the same schema and constraints
     #[tracing::instrument(level = "debug", skip_all)]
-    pub fn create_empty_clone(&self) -> super::Result<DuckDB> {
+    pub fn create_empty_clone(&self, tx: &Transaction<'_>) -> super::Result<DuckDB> {
         assert!(self.created, "Table must be created before cloning");
 
         let new_table_name = format!(
@@ -135,7 +144,7 @@ impl TableCreator {
             created: false,
         };
 
-        new_table_creator.create()
+        new_table_creator.create_with_tx(tx)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
