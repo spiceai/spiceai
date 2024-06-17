@@ -104,11 +104,7 @@ impl VectorSearch {
             .await?;
 
         let table_primary_keys = self
-            .get_primary_keys_with_overrides(
-                // TODO: Support explicit primary keys in the configuration.
-                &self.explicit_primary_keys,
-                tables.clone(),
-            )
+            .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.clone())
             .await?;
 
         let mut response = VectorSearchResult {
@@ -146,14 +142,12 @@ impl VectorSearch {
                     let mut select_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
                     select_keys.push(embedding_column.clone());
 
-                    let sql_query = format!(
-                        "SELECT {} FROM {tbl} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {}", select_keys.join(", "), n
-                    );
-
                     let result = self
                         .df
                         .ctx
-                        .sql(&sql_query)
+                        .sql(&format!(
+                            "SELECT {} FROM {tbl} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {}", select_keys.join(", "), n
+                        ))
                         .await
                         .boxed()
                         .context(DataFusionSnafu)?;

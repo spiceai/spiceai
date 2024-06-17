@@ -210,6 +210,7 @@ impl DataFusion {
                 "datafusion.execution.listing_table_ignore_subdirectory",
                 false,
             );
+
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
