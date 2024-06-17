@@ -270,7 +270,7 @@ impl Refresher {
     fn get_append_stream(
         &self,
     ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> {
-        let ctx = self.get_refresh_df_context();
+        let ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
@@ -351,10 +351,9 @@ impl Refresher {
                     "append_dataset_duration_ms",
                     vec![("dataset", dataset_name.to_string())],
                 );
-                match self.get_timestamp_for_append_query().await {
+                match self.timestamp_for_append_query().await {
                     Ok(timestamp) => {
                         let start = SystemTime::now();
-
                         match self.get_full_or_incremental_append_update(timestamp).await {
                             Ok(data) => match self.except_existing_records(data).await {
                                 Ok(data) => yield Ok((Some(start), data)),
@@ -372,7 +371,7 @@ impl Refresher {
         }
     }
 
-    async fn get_refresh_append_overlap(&self) -> u128 {
+    async fn refresh_append_overlap(&self) -> u128 {
         self.refresh
             .read()
             .await
@@ -382,8 +381,8 @@ impl Refresher {
     }
 
     #[allow(clippy::cast_sign_loss)]
-    async fn get_timestamp_for_append_query(&self) -> super::Result<Option<u128>> {
-        let ctx = self.get_refresh_df_context();
+    async fn timestamp_for_append_query(&self) -> super::Result<Option<u128>> {
+        let ctx = self.refresh_df_context();
         let refresh = self.refresh.read().await;
 
         let column =
@@ -395,7 +394,7 @@ impl Refresher {
                 })?;
 
         let df = self
-            .get_timestamp_df(ctx, &column)
+            .max_timestamp_df(ctx, &column)
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
@@ -448,7 +447,7 @@ impl Refresher {
             }
         };
 
-        let refresh_append_value = self.get_refresh_append_overlap().await;
+        let refresh_append_value = self.refresh_append_overlap().await;
 
         if refresh_append_value > value {
             Ok(Some(0))
@@ -458,7 +457,7 @@ impl Refresher {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    async fn get_timestamp_df(
+    async fn max_timestamp_df(
         &self,
         ctx: SessionContext,
         column: &str,
@@ -469,14 +468,14 @@ impl Refresher {
         )
         .alias("a");
 
-        self.get_df(ctx)
+        self.accelerator_df(ctx)
             .await?
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
 
-    async fn get_df(&self, ctx: SessionContext) -> Result<DataFrame, DataFusionError> {
+    async fn accelerator_df(&self, ctx: SessionContext) -> Result<DataFrame, DataFusionError> {
         if let Some(sql) = &self.refresh.read().await.sql {
             ctx.sql(sql.as_str()).await
         } else {
@@ -486,7 +485,7 @@ impl Refresher {
 
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records(&self, update: DataUpdate) -> super::Result<DataUpdate> {
-        let Some(value) = self.get_timestamp_for_append_query().await? else {
+        let Some(value) = self.timestamp_for_append_query().await? else {
             return Ok(update);
         };
 
@@ -504,7 +503,7 @@ impl Refresher {
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let existing_df = self
-            .get_df(ctx.clone())
+            .accelerator_df(ctx.clone())
             .await
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(
@@ -574,7 +573,7 @@ impl Refresher {
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
         };
-        let mut ctx = self.get_refresh_df_context();
+        let mut ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
         match get_data(
@@ -595,7 +594,7 @@ impl Refresher {
         }
     }
 
-    fn get_refresh_df_context(&self) -> SessionContext {
+    fn refresh_df_context(&self) -> SessionContext {
         let ctx = SessionContext::new_with_config_rt(
             SessionConfig::new().set_bool(
                 "datafusion.execution.listing_table_ignore_subdirectory",
