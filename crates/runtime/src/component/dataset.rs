@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_components::util::column_reference;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::component::{
@@ -41,8 +42,14 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display(r#"The column reference "{column_ref}" is missing a closing parenthensis."#))]
-    MissingClosingParenthesisInColumnReference { column_ref: String },
+    #[snafu(display("Only one `on_conflict` target can be specified, or all `on_conflict` targets must be specified and set to `drop`. {extra_detail}"))]
+    OnConflictTargetMismatch { extra_detail: String },
+
+    #[snafu(display("Error parsing column reference {column_ref}: {source}"))]
+    UnableToParseColumnReference {
+        column_ref: String,
+        source: column_reference::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -341,398 +348,7 @@ impl Dataset {
     }
 }
 
-pub mod acceleration {
-    use super::Result;
-    use arrow::datatypes::SchemaRef;
-    use data_components::util::indexes::index_columns;
-    use datafusion::{
-        common::{Constraints, DFSchema},
-        sql::sqlparser::ast::TableConstraint,
-    };
-    use snafu::prelude::*;
-    use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
-    use std::{collections::HashMap, fmt::Display, sync::Arc};
-
-    #[derive(Debug, Clone, PartialEq, Default)]
-    pub enum RefreshMode {
-        #[default]
-        Full,
-        Append,
-    }
-
-    impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
-        fn from(refresh_mode: spicepod_acceleration::RefreshMode) -> Self {
-            match refresh_mode {
-                spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
-                spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Default)]
-    pub enum Mode {
-        #[default]
-        Memory,
-        File,
-    }
-
-    impl From<spicepod_acceleration::Mode> for Mode {
-        fn from(mode: spicepod_acceleration::Mode) -> Self {
-            match mode {
-                spicepod_acceleration::Mode::Memory => Mode::Memory,
-                spicepod_acceleration::Mode::File => Mode::File,
-            }
-        }
-    }
-
-    impl Display for Mode {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Mode::Memory => write!(f, "memory"),
-                Mode::File => write!(f, "file"),
-            }
-        }
-    }
-
-    /// Behavior when a query on an accelerated table returns zero results.
-    #[derive(Debug, Clone, PartialEq, Default)]
-    pub enum ZeroResultsAction {
-        /// Return an empty result set. This is the default.
-        #[default]
-        ReturnEmpty,
-        /// Fallback to querying the source table.
-        UseSource,
-    }
-
-    impl From<spicepod_acceleration::ZeroResultsAction> for ZeroResultsAction {
-        fn from(zero_results_action: spicepod_acceleration::ZeroResultsAction) -> Self {
-            match zero_results_action {
-                spicepod_acceleration::ZeroResultsAction::ReturnEmpty => {
-                    ZeroResultsAction::ReturnEmpty
-                }
-                spicepod_acceleration::ZeroResultsAction::UseSource => ZeroResultsAction::UseSource,
-            }
-        }
-    }
-
-    impl Display for ZeroResultsAction {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                ZeroResultsAction::ReturnEmpty => write!(f, "return_empty"),
-                ZeroResultsAction::UseSource => write!(f, "use_source"),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-    pub enum Engine {
-        #[default]
-        Arrow,
-        DuckDB,
-        Sqlite,
-        PostgreSQL,
-    }
-
-    impl Display for Engine {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Engine::Arrow => write!(f, "arrow"),
-                Engine::DuckDB => write!(f, "duckdb"),
-                Engine::Sqlite => write!(f, "sqlite"),
-                Engine::PostgreSQL => write!(f, "postgres"),
-            }
-        }
-    }
-
-    impl TryFrom<&str> for Engine {
-        type Error = crate::Error;
-
-        fn try_from(engine: &str) -> std::result::Result<Self, Self::Error> {
-            match engine.to_lowercase().as_str() {
-                "arrow" => Ok(Engine::Arrow),
-                "duckdb" => Ok(Engine::DuckDB),
-                "sqlite" => Ok(Engine::Sqlite),
-                "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
-                _ => crate::AcceleratorEngineNotAvailableSnafu {
-                    name: engine.to_string(),
-                }
-                .fail(),
-            }
-        }
-    }
-
-    impl TryFrom<String> for Engine {
-        type Error = crate::Error;
-
-        fn try_from(engine: String) -> std::result::Result<Self, Self::Error> {
-            Engine::try_from(engine.as_str())
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Default)]
-    pub enum IndexType {
-        #[default]
-        Enabled,
-        Unique,
-    }
-
-    impl From<spicepod_acceleration::IndexType> for IndexType {
-        fn from(index_type: spicepod_acceleration::IndexType) -> Self {
-            match index_type {
-                spicepod_acceleration::IndexType::Enabled => IndexType::Enabled,
-                spicepod_acceleration::IndexType::Unique => IndexType::Unique,
-            }
-        }
-    }
-
-    impl From<&str> for IndexType {
-        fn from(index_type: &str) -> Self {
-            match index_type.to_lowercase().as_str() {
-                "unique" => IndexType::Unique,
-                _ => IndexType::Enabled,
-            }
-        }
-    }
-
-    impl Display for IndexType {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                IndexType::Enabled => write!(f, "enabled"),
-                IndexType::Unique => write!(f, "unique"),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Acceleration {
-        pub enabled: bool,
-
-        pub mode: Mode,
-
-        pub engine: Engine,
-
-        pub refresh_mode: RefreshMode,
-
-        pub refresh_check_interval: Option<String>,
-
-        pub refresh_sql: Option<String>,
-
-        pub refresh_data_window: Option<String>,
-
-        pub params: HashMap<String, String>,
-
-        pub engine_secret: Option<String>,
-
-        pub retention_period: Option<String>,
-
-        pub retention_check_interval: Option<String>,
-
-        pub retention_check_enabled: bool,
-
-        pub on_zero_results: ZeroResultsAction,
-
-        pub indexes: HashMap<String, IndexType>,
-
-        pub primary_key: Vec<String>,
-    }
-
-    impl Acceleration {
-        #[must_use]
-        pub fn indexes_to_option_string(indexes: &HashMap<String, IndexType>) -> String {
-            indexes
-                .iter()
-                .map(|(k, v)| format!("{k}:{v}"))
-                .collect::<Vec<String>>()
-                .join(";")
-        }
-
-        /// Parses column references from a string into a vector of each individual column reference.
-        ///
-        /// "foo" -> vec!["foo"]
-        /// "(foo, bar)" -> vec!["foo", "bar"]
-        /// "(foo, bar" -> Err(The column reference "(foo,bar" is missing a closing parenthensis.)
-        ///
-        /// # Examples
-        ///
-        /// ```
-        /// use runtime::component::dataset::acceleration::Acceleration;
-        ///
-        /// let index_columns_vec = Acceleration::index_key_columns("foo").expect("valid columns");
-        /// assert_eq!(index_columns_vec, vec!["foo"]);
-        ///
-        /// let index_columns_vec = Acceleration::index_key_columns("(foo, bar)").expect("valid columns");
-        /// assert_eq!(index_columns_vec, vec!["foo", "bar"]);
-        /// ```
-        pub fn index_key_columns(columns: &str) -> Result<Vec<&str>> {
-            // The index/primary key can be either a single column or a compound index
-            if columns.starts_with('(') {
-                // Compound index
-                let end = columns.find(')').context(
-                    super::MissingClosingParenthesisInColumnReferenceSnafu {
-                        column_ref: columns.to_string(),
-                    },
-                )?;
-                Ok(columns[1..end]
-                    .split(',')
-                    .map(str::trim)
-                    .collect::<Vec<&str>>())
-            } else {
-                // Single column index
-                Ok(vec![columns])
-            }
-        }
-
-        fn valid_columns(schema: &SchemaRef) -> String {
-            schema
-                .all_fields()
-                .into_iter()
-                .map(|f| f.name().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-
-        pub fn validate_indexes(&self, schema: &SchemaRef) -> Result<()> {
-            for column in self.indexes.keys() {
-                let index_columns = Self::index_key_columns(column)?;
-                for index_column in index_columns {
-                    if schema.field_with_name(index_column).is_err() {
-                        return super::IndexColumnNotFoundSnafu {
-                            index: index_column.to_string(),
-                            valid_columns: Self::valid_columns(schema),
-                        }
-                        .fail();
-                    }
-                }
-            }
-
-            Ok(())
-        }
-
-        pub fn table_constraints(&self, schema: SchemaRef) -> Result<Option<Constraints>> {
-            if self.indexes.is_empty() && self.primary_key.is_empty() {
-                return Ok(None);
-            }
-
-            let mut table_constraints: Vec<TableConstraint> = Vec::new();
-
-            self.indexes.iter().for_each(|(column, index_type)| {
-                match index_type {
-                    IndexType::Enabled => {}
-                    IndexType::Unique => {
-                        let tc = TableConstraint::Unique {
-                            columns: index_columns(column).into_iter().map(Into::into).collect(),
-                            name: None,
-                            index_name: None,
-                            index_type_display:
-                                datafusion::sql::sqlparser::ast::KeyOrIndexDisplay::None,
-                            index_options: vec![],
-                            characteristics: None,
-                            index_type: None,
-                        };
-
-                        table_constraints.push(tc);
-                    }
-                };
-            });
-
-            if !self.primary_key.is_empty() {
-                let tc = TableConstraint::PrimaryKey {
-                    columns: self
-                        .primary_key
-                        .iter()
-                        .map(String::as_str)
-                        .map(Into::into)
-                        .collect(),
-                    name: None,
-                    index_name: None,
-                    index_options: vec![],
-                    characteristics: None,
-                    index_type: None,
-                };
-
-                table_constraints.push(tc);
-            }
-
-            Ok(Some(
-                Constraints::new_from_table_constraints(
-                    &table_constraints,
-                    &Arc::new(
-                        DFSchema::try_from(schema)
-                            .context(super::UnableToConvertSchemaRefToDFSchemaSnafu)?,
-                    ),
-                )
-                .context(super::UnableToGetTableConstraintsSnafu)?,
-            ))
-        }
-    }
-
-    impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
-        type Error = crate::Error;
-
-        fn try_from(
-            acceleration: spicepod_acceleration::Acceleration,
-        ) -> std::result::Result<Self, Self::Error> {
-            let primary_key = match acceleration.primary_key {
-                Some(pk) => Acceleration::index_key_columns(&pk)
-                    .map_err(|e| Self::Error::InvalidSpicepodDataset { source: e })?
-                    .into_iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>(),
-                None => Vec::default(),
-            };
-
-            Ok(Acceleration {
-                enabled: acceleration.enabled,
-                mode: Mode::from(acceleration.mode),
-                engine: Engine::try_from(
-                    acceleration.engine.unwrap_or_else(|| "arrow".to_string()),
-                )?,
-                refresh_mode: RefreshMode::from(acceleration.refresh_mode),
-                refresh_check_interval: acceleration.refresh_check_interval,
-                refresh_sql: acceleration.refresh_sql,
-                refresh_data_window: acceleration.refresh_data_window,
-                params: acceleration
-                    .params
-                    .as_ref()
-                    .map(Params::as_string_map)
-                    .unwrap_or_default(),
-                engine_secret: acceleration.engine_secret,
-                retention_period: acceleration.retention_period,
-                retention_check_interval: acceleration.retention_check_interval,
-                retention_check_enabled: acceleration.retention_check_enabled,
-                on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
-                indexes: acceleration
-                    .indexes
-                    .into_iter()
-                    .map(|(k, v)| (k, IndexType::from(v)))
-                    .collect(),
-                primary_key,
-            })
-        }
-    }
-
-    impl Default for Acceleration {
-        fn default() -> Self {
-            Self {
-                enabled: true,
-                mode: Mode::Memory,
-                engine: Engine::default(),
-                refresh_mode: RefreshMode::Full,
-                refresh_check_interval: None,
-                refresh_sql: None,
-                refresh_data_window: None,
-                params: HashMap::default(),
-                engine_secret: None,
-                retention_period: None,
-                retention_check_interval: None,
-                retention_check_enabled: false,
-                on_zero_results: ZeroResultsAction::ReturnEmpty,
-                indexes: HashMap::default(),
-                primary_key: Vec::default(),
-            }
-        }
-    }
-}
+pub mod acceleration;
 
 pub mod replication {
     use spicepod::component::dataset::replication as spicepod_replication;
@@ -755,6 +371,8 @@ pub mod replication {
 mod tests {
     use std::collections::HashMap;
 
+    use data_components::util::column_reference::ColumnReference;
+
     use super::acceleration::{Acceleration, IndexType};
 
     #[test]
@@ -764,10 +382,10 @@ mod tests {
             ("bar".to_string(), IndexType::Unique),
         ]);
 
-        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        let indexes_str = Acceleration::hashmap_to_option_string(&indexes_map);
         assert!(indexes_str == "foo:enabled;bar:unique" || indexes_str == "bar:unique;foo:enabled");
-        let roundtrip_indexes_map =
-            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+        let roundtrip_indexes_map: HashMap<String, IndexType> =
+            data_components::util::hashmap_from_option_string(&indexes_str);
 
         let roundtrip_indexes_map = roundtrip_indexes_map
             .into_iter()
@@ -789,13 +407,13 @@ mod tests {
             ("bar".to_string(), IndexType::Unique),
         ]);
 
-        let indexes_str = Acceleration::indexes_to_option_string(&indexes_map);
+        let indexes_str = Acceleration::hashmap_to_option_string(&indexes_map);
         assert!(
             indexes_str == "(foo, bar):enabled;bar:unique"
                 || indexes_str == "bar:unique;(foo, bar):enabled"
         );
-        let roundtrip_indexes_map =
-            data_components::util::indexes::indexes_from_option_string(&indexes_str);
+        let roundtrip_indexes_map: HashMap<String, IndexType> =
+            data_components::util::hashmap_from_option_string(&indexes_str);
 
         let roundtrip_indexes_map = roundtrip_indexes_map
             .into_iter()
@@ -812,18 +430,16 @@ mod tests {
 
     #[test]
     fn test_get_index_columns() {
-        let index_columns_vec = Acceleration::index_key_columns("foo").expect("valid columns");
-        assert_eq!(index_columns_vec, vec!["foo"]);
+        let column_ref = ColumnReference::try_from("foo").expect("valid columns");
+        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["foo"]);
 
-        let index_columns_vec =
-            Acceleration::index_key_columns("(foo, bar)").expect("valid columns");
-        assert_eq!(index_columns_vec, vec!["foo", "bar"]);
+        let column_ref = ColumnReference::try_from("(foo, bar)").expect("valid columns");
+        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["bar", "foo"]);
 
-        let index_columns_vec =
-            Acceleration::index_key_columns("(foo,bar)").expect("valid columns");
-        assert_eq!(index_columns_vec, vec!["foo", "bar"]);
+        let column_ref = ColumnReference::try_from("(foo,bar)").expect("valid columns");
+        assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["bar", "foo"]);
 
-        let err = Acceleration::index_key_columns("(foo,bar").expect_err("invalid columns");
+        let err = ColumnReference::try_from("(foo,bar").expect_err("invalid columns");
         assert_eq!(
             err.to_string(),
             "The column reference \"(foo,bar\" is missing a closing parenthensis."

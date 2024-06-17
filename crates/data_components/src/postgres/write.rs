@@ -34,7 +34,7 @@ use snafu::prelude::*;
 
 use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
-    util::constraints,
+    util::{constraints, on_conflict::OnConflict},
 };
 
 use super::{to_datafusion_error, Postgres};
@@ -42,13 +42,19 @@ use super::{to_datafusion_error, Postgres};
 pub struct PostgresTableWriter {
     read_provider: Arc<dyn TableProvider>,
     postgres: Arc<Postgres>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl PostgresTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, postgres: Postgres) -> Arc<Self> {
+    pub fn create(
+        read_provider: Arc<dyn TableProvider>,
+        postgres: Postgres,
+        on_conflict: Option<OnConflict>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             postgres: Arc::new(postgres),
+            on_conflict,
         })
     }
 }
@@ -91,7 +97,11 @@ impl TableProvider for PostgresTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(PostgresDataSink::new(Arc::clone(&self.postgres), overwrite)),
+            Arc::new(PostgresDataSink::new(
+                Arc::clone(&self.postgres),
+                overwrite,
+                self.on_conflict.clone(),
+            )),
             self.schema(),
             None,
         )) as _)
@@ -155,6 +165,7 @@ impl DeletionSink for PostgresDeletionSink {
 struct PostgresDataSink {
     postgres: Arc<Postgres>,
     overwrite: bool,
+    on_conflict: Option<OnConflict>,
 }
 
 #[async_trait]
@@ -210,7 +221,7 @@ impl DataSink for PostgresDataSink {
             .map_err(to_datafusion_error)?;
 
             self.postgres
-                .insert_batch(&tx, batch)
+                .insert_batch(&tx, batch, self.on_conflict.clone())
                 .await
                 .map_err(to_datafusion_error)?;
         }
@@ -225,10 +236,11 @@ impl DataSink for PostgresDataSink {
 }
 
 impl PostgresDataSink {
-    fn new(postgres: Arc<Postgres>, overwrite: bool) -> Self {
+    fn new(postgres: Arc<Postgres>, overwrite: bool, on_conflict: Option<OnConflict>) -> Self {
         Self {
             postgres,
             overwrite,
+            on_conflict,
         }
     }
 }
