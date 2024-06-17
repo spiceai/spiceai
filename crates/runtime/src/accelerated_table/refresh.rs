@@ -20,10 +20,9 @@ use data_components::arrow::write::MemTable;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
-use datafusion::logical_expr::{cast, col, lit, Expr, Operator};
+use datafusion::logical_expr::{cast, col, Expr, Operator};
 use datafusion::physical_plan::{collect, ExecutionPlanProperties};
 use datafusion::prelude::DataFrame;
-use datafusion::scalar::ScalarValue;
 use datafusion::{datasource::TableProvider, execution::context::SessionContext};
 use futures::Stream;
 use futures::{stream::BoxStream, StreamExt};
@@ -490,11 +489,10 @@ impl Refresher {
             return Ok(update);
         };
 
-        let column = self.refresh.read().await.time_column.clone().context(
-            super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get latest timestamp due to time column not specified",
-            },
-        )?;
+        let refresh = self.refresh.read().await;
+        let Some(filter_converter) = self.get_filter_converter(&refresh) else {
+            return Ok(update);
+        };
 
         let ctx = SessionContext::new();
         let mem_table = MemTable::try_new(self.accelerator.schema(), vec![update.clone().data])
@@ -507,16 +505,7 @@ impl Refresher {
             .accelerator_df(ctx.clone())
             .await
             .context(super::UnableToScanTableProviderSnafu)?
-            .filter(
-                cast(
-                    col(column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                )
-                .gt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(value as i64),
-                    None,
-                ))),
-            )
+            .filter(filter_converter.convert(value, Operator::Gt))
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let data = update_df
@@ -1161,7 +1150,7 @@ mod tests {
         test(
             vec![4, 5, 6, 7, 8, 9, 10],
             vec![1, 2, 3, 9],
-            8, // 1, 2, 3, 6, 7, 8, 9, 10
+            7, // 1, 2, 3, 7, 8, 9, 10
             Some(Duration::from_secs(3)),
             "should apply late arrival within the append overlap period and new data onto existing data",
         )
