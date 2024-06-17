@@ -39,6 +39,7 @@ pub struct Refresh {
     pub(crate) sql: Option<String>,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
+    pub(crate) append_overlap: Option<Duration>,
 }
 
 impl Refresh {
@@ -51,6 +52,7 @@ impl Refresh {
         sql: Option<String>,
         mode: RefreshMode,
         period: Option<Duration>,
+        append_overlap: Option<Duration>,
     ) -> Self {
         Self {
             time_column,
@@ -59,6 +61,7 @@ impl Refresh {
             sql,
             mode,
             period,
+            append_overlap,
         }
     }
 }
@@ -72,6 +75,7 @@ impl Default for Refresh {
             sql: None,
             mode: RefreshMode::Full,
             period: None,
+            append_overlap: None,
         }
     }
 }
@@ -650,7 +654,7 @@ mod tests {
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         ) as Arc<dyn TableProvider>;
 
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
+        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
 
         let refresher = Refresher::new(
             TableReference::bare("test"),
@@ -829,6 +833,7 @@ mod tests {
                 None,
                 RefreshMode::Append,
                 None,
+                None,
             );
 
             let refresher = Refresher::new(
@@ -976,6 +981,7 @@ mod tests {
                 None,
                 None,
                 RefreshMode::Append,
+                None,
                 None,
             );
 

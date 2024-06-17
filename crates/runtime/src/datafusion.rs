@@ -540,6 +540,7 @@ impl DataFusion {
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode,
                 dataset.refresh_data_window(),
+                None,
             ),
         );
         accelerated_table_builder.retention(Retention::new(
