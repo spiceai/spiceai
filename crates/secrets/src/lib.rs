@@ -112,16 +112,21 @@ pub fn spicepod_secret_store_type(store: &SecretStoreType) -> Option<SecretStore
 
 #[allow(clippy::module_name_repetitions)]
 pub struct SecretsProvider {
-    pub store: SecretStoreType,
+    pub stores: Vec<SecretStoreType>,
 
-    secret_store: Option<Box<dyn SecretStore + Send + Sync>>,
+    secret_stores: Vec<Box<dyn SecretStore + Send + Sync>>,
 }
 
 impl Default for SecretsProvider {
     fn default() -> Self {
         Self {
-            store: SecretStoreType::File,
-            secret_store: None,
+            stores: {
+                let mut stores = Vec::new();
+                stores.push(SecretStoreType::File);
+                stores.push(SecretStoreType::Env);
+                stores
+            },
+            secret_stores: vec![],
         }
     }
 }
@@ -138,48 +143,53 @@ impl SecretsProvider {
     ///
     /// Returns an error if the secrets cannot be loaded.
     pub async fn load_secrets(&mut self) -> Result<()> {
-        match self.store {
-            SecretStoreType::File => {
-                let mut file_secret_store = FileSecretStore::new();
-
-                file_secret_store
-                    .load_secrets()
-                    .context(UnableToLoadSecretsSnafu)?;
-
-                self.secret_store = Some(Box::new(file_secret_store));
+        self.stores.iter().for_each(|store| {
+            let secret_store = match store {
+                SecretStoreType::File => {
+                    let mut file_secret_store = FileSecretStore::new();
+    
+                    file_secret_store
+                        .load_secrets()
+                        .context(UnableToLoadSecretsSnafu)?;
+    
+                    Some(Box::new(file_secret_store));
+                }
+                SecretStoreType::Env => {
+                    let mut env_secret_store = env::EnvSecretStore::new();
+    
+                    env_secret_store.load_secrets();
+    
+                    Some(Box::new(env_secret_store));
+                }
+                #[cfg(feature = "keyring-secret-store")]
+                SecretStoreType::Keyring => {
+                    Some(Box::new(keyring::KeyringSecretStore::new()));
+                }
+                SecretStoreType::Kubernetes => {
+                    let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
+    
+                    kubernetes_secret_store
+                        .init()
+                        .context(UnableToLoadSecretsSnafu)?;
+    
+                    Some(Box::new(kubernetes_secret_store));
+                }
+                #[cfg(feature = "aws-secrets-manager")]
+                SecretStoreType::AwsSecretsManager => {
+                    let secret_store = aws_secrets_manager::AwsSecretsManager::new();
+    
+                    secret_store
+                        .init()
+                        .await
+                        .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+    
+                    Some(Box::new(secret_store));
+                }
             }
-            SecretStoreType::Env => {
-                let mut env_secret_store = env::EnvSecretStore::new();
 
-                env_secret_store.load_secrets();
-
-                self.secret_store = Some(Box::new(env_secret_store));
-            }
-            #[cfg(feature = "keyring-secret-store")]
-            SecretStoreType::Keyring => {
-                self.secret_store = Some(Box::new(keyring::KeyringSecretStore::new()));
-            }
-            SecretStoreType::Kubernetes => {
-                let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
-
-                kubernetes_secret_store
-                    .init()
-                    .context(UnableToLoadSecretsSnafu)?;
-
-                self.secret_store = Some(Box::new(kubernetes_secret_store));
-            }
-            #[cfg(feature = "aws-secrets-manager")]
-            SecretStoreType::AwsSecretsManager => {
-                let secret_store = aws_secrets_manager::AwsSecretsManager::new();
-
-                secret_store
-                    .init()
-                    .await
-                    .context(UnableToInitializeAwsSecretsManagerSnafu)?;
-
-                self.secret_store = Some(Box::new(secret_store));
-            }
-        }
+            self.secret_stores.push(secret_store);
+        });
+        
 
         Ok(())
     }

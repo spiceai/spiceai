@@ -218,6 +218,7 @@ pub struct Runtime {
     pub llms: Arc<RwLock<LLMModelStore>>,
     pub embeds: Arc<RwLock<EmbeddingModelStore>>,
     pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
+    pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     pub datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
 
     extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
@@ -247,6 +248,7 @@ impl Runtime {
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(None)),
+            secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             extensions: Arc::new(RwLock::new(vec![])),
             datasets_health_monitor: None,
@@ -470,25 +472,34 @@ impl Runtime {
 
     pub async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
 
         let ds = ds.clone();
 
+        let secrets_provider = shared_secrets_provider.read().await;
+
         let source = ds.source();
         let params = Arc::new(ds.params.clone());
-        let data_connector: Arc<dyn DataConnector> =
-            match Runtime::get_dataconnector_from_source(&source, Arc::clone(&params)).await {
-                Ok(data_connector) => data_connector,
-                Err(err) => {
-                    let ds_name = &ds.name;
-                    status::update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: ds.name.clone(),
-                    }
-                    .fail();
+        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
+            &source,
+            &secrets_provider,
+            Arc::clone(&params),
+        )
+        .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let ds_name = &ds.name;
+                status::update_dataset(ds_name, status::ComponentStatus::Error);
+                metrics::counter!("datasets_load_error").increment(1);
+                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
                 }
-            };
+                .fail();
+            }
+        };
 
         Ok(data_connector)
     }
@@ -664,6 +675,7 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
+        secrets_provider: &secrets::SecretsProvider,
         params: Arc<HashMap<String, String>>,
     ) -> Result<Arc<dyn DataConnector>> {
         let secret = secrets_provider.get_secret(source).await.context(
