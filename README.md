@@ -44,7 +44,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 | Query Federation           | Native with query push-down        | Supported with push-down         | Supported with limited push-down | Limited                 |
 | Materialization            | Arrow/SQLite/DuckDB/PostgreSQL     | Intermediate Storage             | Reflections (Iceberg)            | Views & MergeTree       |
 | Query Result Caching       | Supported                          | Supported                        | Supported                        | Supported               |
-| Typical Configuration      | Single-Binary/Sidecar/Microservice | Coodinator+Executor w/ Zookeeper | Coodinator+Executor              | Clickhouse Keeper+Nodes |
+| Typical Configuration      | Single-Binary/Sidecar/Microservice | Coodinator+Executor w/ Zookeeper | Coodinator+Executor w/ Zookeeper              | Clickhouse Keeper+Nodes |
 
 ### Before Spice
 
