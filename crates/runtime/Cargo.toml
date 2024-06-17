@@ -92,7 +92,7 @@ datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
-async-openai = "0.21.0"
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 derive_builder = "0.20.0"
 
 [dev-dependencies]
