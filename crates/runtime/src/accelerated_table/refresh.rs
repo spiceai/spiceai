@@ -469,9 +469,8 @@ impl Refresher {
         )
         .alias("a");
 
-        let table_df = self.get_df(ctx).await?;
-
-        table_df
+        self.get_df(ctx)
+            .await?
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
