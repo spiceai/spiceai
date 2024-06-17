@@ -328,16 +328,19 @@ impl Runtime {
                 tracing::warn!("Unable to load secret store {}: {}", ss.key, e);
             }
         }
+
+        self.secrets_provider.write().await.secret_stores = valid_secret_stores;
     }
 
-    // Iterates the list of secret stores in order and gets the first matching secret.
-    fn get_secret(&self, key: &str) -> Option<Secret> {
-        for ss in self.app.secrets.iter() {
-            if let Some(secret) = ss.get_secret(key) {
-                return Some(secret);
+    /// Will return `None` if the secret store is not initialized or pass error from the secret store.
+    pub async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>> {
+        // iterate through in reverse order to give priority to the last secret store
+        for secret_store in self.secret_stores.iter().rev() {
+            if let Some(secret) = secret_store.get_secret(secret_name).await? {
+                return Ok(Some(secret));
             }
         }
-        None
+        Ok(None)
     }
 
     fn datasets_iter(app: &App) -> impl Iterator<Item = Result<Dataset>> + '_ {
