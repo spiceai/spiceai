@@ -502,7 +502,7 @@ impl Refresher {
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let existing_df = self
-            .accelerator_df(ctx.clone())
+            .accelerator_df(self.refresh_df_context())
             .await
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
