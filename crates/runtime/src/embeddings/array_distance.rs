@@ -194,10 +194,9 @@ impl ArrayDistance {
                     })
                 }
             }
-            (DataType::FixedSizeList(f1, length), DataType::LargeList(f2))
-            | (DataType::FixedSizeList(f1, length), DataType::List(f2))
-            | (DataType::LargeList(f2), DataType::FixedSizeList(f1, length))
-            | (DataType::List(f2), DataType::FixedSizeList(f1, length)) => {
+            (DataType::FixedSizeList(f1, length), DataType::LargeList(f2) | DataType::List(f2))
+            | (DataType::LargeList(f2) | DataType::List(f2), DataType::FixedSizeList(f1, length)) =>
+            {
                 let output_type = Self::least_precise_float_type(f1.data_type(), f2.data_type())?;
                 Ok(if matches!(v1.data_type(), DataType::FixedSizeList(_, _)) {
                     (
