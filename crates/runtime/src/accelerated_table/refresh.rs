@@ -5,6 +5,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::datafusion::{schema, SPICE_RUNTIME_SCHEMA};
+use crate::execution_plan::schema_cast::EnsureSchema;
 use crate::object_store_registry::default_runtime_env;
 use crate::{
     dataconnector::get_data,
@@ -19,6 +20,7 @@ use backoff::exponential::ExponentialBackoff;
 use backoff::future::retry;
 use backoff::SystemClock;
 use cache::QueryResultsCacheProvider;
+use data_components::arrow::write::MemTable;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
@@ -42,6 +44,7 @@ pub struct Refresh {
     pub(crate) sql: Option<String>,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
+    pub(crate) append_overlap: Option<Duration>,
 }
 
 impl Refresh {
@@ -54,6 +57,7 @@ impl Refresh {
         sql: Option<String>,
         mode: RefreshMode,
         period: Option<Duration>,
+        append_overlap: Option<Duration>,
     ) -> Self {
         Self {
             time_column,
@@ -62,6 +66,7 @@ impl Refresh {
             sql,
             mode,
             period,
+            append_overlap,
         }
     }
 }
@@ -75,6 +80,7 @@ impl Default for Refresh {
             sql: None,
             mode: RefreshMode::Full,
             period: None,
+            append_overlap: None,
         }
     }
 }
@@ -268,7 +274,7 @@ impl Refresher {
     fn get_append_stream(
         &self,
     ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> {
-        let ctx = self.get_refresh_df_context();
+        let ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
@@ -342,17 +348,21 @@ impl Refresher {
         let dataset_name = self.dataset_name.clone();
 
         let mut refresh_stream = ReceiverStream::new(receiver);
+
         stream! {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
                     "append_dataset_duration_ms",
                     vec![("dataset", dataset_name.to_string())],
                 );
-                match self.get_latest_timestamp().await {
+                match self.timestamp_nanos_for_append_query().await {
                     Ok(timestamp) => {
                         let start = SystemTime::now();
                         match self.get_full_or_incremental_append_update(timestamp).await {
-                            Ok(data) => yield Ok((Some(start), data)),
+                            Ok(data) => match self.except_existing_records_from(data).await {
+                                Ok(data) => yield Ok((Some(start), data)),
+                                Err(e) => yield Err(e),
+                            },
                             Err(e) => yield Err(e),
                         }
                     }
@@ -365,9 +375,18 @@ impl Refresher {
         }
     }
 
+    async fn refresh_append_overlap_nanos(&self) -> u128 {
+        self.refresh
+            .read()
+            .await
+            .append_overlap
+            .map(|f| f.as_nanos())
+            .unwrap_or_default()
+    }
+
     #[allow(clippy::cast_sign_loss)]
-    async fn get_latest_timestamp(&self) -> super::Result<Option<u128>> {
-        let ctx = self.get_refresh_df_context();
+    async fn timestamp_nanos_for_append_query(&self) -> super::Result<Option<u128>> {
+        let ctx = self.refresh_df_context();
         let refresh = self.refresh.read().await;
 
         let column =
@@ -379,7 +398,7 @@ impl Refresher {
                 })?;
 
         let df = self
-            .get_df(ctx, &column)
+            .max_timestamp_df(ctx, &column)
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
@@ -432,11 +451,17 @@ impl Refresher {
             }
         };
 
-        Ok(Some(value))
+        let refresh_append_value = self.refresh_append_overlap_nanos().await;
+
+        if refresh_append_value > value {
+            Ok(Some(0))
+        } else {
+            Ok(Some(value - refresh_append_value))
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    async fn get_df(
+    async fn max_timestamp_df(
         &self,
         ctx: SessionContext,
         column: &str,
@@ -447,16 +472,58 @@ impl Refresher {
         )
         .alias("a");
 
-        let table_df = if let Some(sql) = &self.refresh.read().await.sql {
-            ctx.sql(sql.as_str()).await?
-        } else {
-            ctx.read_table(Arc::clone(&self.accelerator))?
-        };
-
-        table_df
+        self.accelerator_df(ctx)
+            .await?
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
+    }
+
+    async fn accelerator_df(&self, ctx: SessionContext) -> Result<DataFrame, DataFusionError> {
+        if let Some(sql) = &self.refresh.read().await.sql {
+            ctx.sql(sql.as_str()).await
+        } else {
+            ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    async fn except_existing_records_from(&self, update: DataUpdate) -> super::Result<DataUpdate> {
+        let Some(value) = self.timestamp_nanos_for_append_query().await? else {
+            return Ok(update);
+        };
+
+        let refresh = self.refresh.read().await;
+        let Some(filter_converter) = self.get_filter_converter(&refresh) else {
+            return Ok(update);
+        };
+
+        let ctx = SessionContext::new();
+        let mem_table = MemTable::try_new(self.accelerator.schema(), vec![update.clone().data])
+            .context(super::UnableToCreateMemTableFromUpdateSnafu)?;
+        let update_df = ctx
+            .read_table(Arc::new(mem_table))
+            .context(super::UnableToScanTableProviderSnafu)?;
+
+        let existing_df = self
+            .accelerator_df(self.refresh_df_context())
+            .await
+            .context(super::UnableToScanTableProviderSnafu)?
+            .filter(filter_converter.convert(value, Operator::Gt))
+            .context(super::UnableToScanTableProviderSnafu)?;
+
+        let data = update_df
+            .except(existing_df)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .collect()
+            .await
+            .context(super::UnableToScanTableProviderSnafu)?;
+
+        Ok(DataUpdate {
+            schema: update.schema,
+            data,
+            update_type: update.update_type,
+        })
     }
 
     pub async fn get_full_or_incremental_append_update(
@@ -497,7 +564,7 @@ impl Refresher {
     async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
         let refresh = self.refresh.read().await;
 
-        let ctx = self.get_refresh_df_context();
+        let ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
@@ -550,7 +617,7 @@ impl Refresher {
         .context(super::UnableToGetDataFromConnectorSnafu)
     }
 
-    fn get_refresh_df_context(&self) -> SessionContext {
+    fn refresh_df_context(&self) -> SessionContext {
         let ctx = SessionContext::new_with_config_rt(
             SessionConfig::new().set_bool(
                 "datafusion.execution.listing_table_ignore_subdirectory",
@@ -585,7 +652,7 @@ impl Refresher {
 
         if let Err(e) = ctx.register_table(
             TableReference::parse_str(&acc_dataset_name),
-            Arc::clone(&self.accelerator),
+            Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
         }
@@ -682,7 +749,7 @@ mod tests {
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         ) as Arc<dyn TableProvider>;
 
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
+        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
 
         let refresher = Refresher::new(
             TableReference::bare("test"),
@@ -861,6 +928,7 @@ mod tests {
                 None,
                 RefreshMode::Append,
                 None,
+                None,
             );
 
             let refresher = Refresher::new(
@@ -976,6 +1044,7 @@ mod tests {
             source_data: Vec<u64>,
             existing_data: Vec<u64>,
             expected_size: usize,
+            append_overlap: Option<Duration>,
             message: &str,
         ) {
             let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
@@ -1009,6 +1078,7 @@ mod tests {
                 None,
                 RefreshMode::Append,
                 None,
+                append_overlap,
             );
 
             let refresher = Refresher::new(
@@ -1062,6 +1132,7 @@ mod tests {
             vec![1, 2, 3],
             vec![],
             3,
+            None,
             "should insert all data into empty accelerator",
         )
         .await;
@@ -1069,6 +1140,7 @@ mod tests {
             vec![1, 2, 3],
             vec![2, 3, 4, 5],
             4,
+            None,
             "should not insert any stale data and keep original size",
         )
         .await;
@@ -1076,6 +1148,7 @@ mod tests {
             vec![],
             vec![1, 2, 3, 4],
             4,
+            None,
             "should keep original data of accelerator when no new data is found",
         )
         .await;
@@ -1083,6 +1156,7 @@ mod tests {
             vec![5, 6],
             vec![1, 2, 3, 4],
             6,
+            None,
             "should apply new data onto existing data",
         )
         .await;
@@ -1092,7 +1166,26 @@ mod tests {
             vec![4, 4],
             vec![1, 2, 3, 4],
             4,
+            None,
             "should not apply same timestamp data",
+        )
+        .await;
+
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            10,
+            Some(Duration::from_secs(10)),
+            "should apply late arrival and new data onto existing data",
+        )
+        .await;
+
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            7, // 1, 2, 3, 7, 8, 9, 10
+            Some(Duration::from_secs(3)),
+            "should apply late arrival within the append overlap period and new data onto existing data",
         )
         .await;
     }

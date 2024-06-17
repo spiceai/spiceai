@@ -16,8 +16,12 @@ limitations under the License.
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_stream::stream;
+use axum::async_trait;
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -133,5 +137,41 @@ impl ExecutionPlan for SchemaCastScanExec {
                 }
             },
         )))
+    }
+}
+
+pub struct EnsureSchema {
+    input: Arc<dyn TableProvider>,
+}
+
+impl EnsureSchema {
+    pub fn new(input: Arc<dyn TableProvider>) -> Self {
+        Self { input }
+    }
+}
+
+#[async_trait]
+impl TableProvider for EnsureSchema {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.input.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &SessionState,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let input = self.input.scan(state, projection, filters, limit).await?;
+        Ok(Arc::new(SchemaCastScanExec::new(input, self.schema())))
     }
 }
