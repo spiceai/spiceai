@@ -192,12 +192,14 @@ impl AppBuilder {
                 SecretStore {
                     store: SecretStoreType::File,
                     params: None,
+                    depends_on: Vec::default(),
                 }
             });
             secrets.push({
                 SecretStore {
                     store: SecretStoreType::Env,
                     params: None,
+                    depends_on: Vec::default(),
                 }
             });
         } else {

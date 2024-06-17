@@ -33,6 +33,10 @@ pub struct SecretStore {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "dependsOn", default)]
+    pub depends_on: Vec<String>,
 }
 
 impl WithDependsOn<SecretStore> for SecretStore {
@@ -40,6 +44,7 @@ impl WithDependsOn<SecretStore> for SecretStore {
         SecretStore {
             store: self.store.clone(),
             params: self.params.clone(),
+            depends_on: depends_on.to_vec(),
         }
     }
 }
