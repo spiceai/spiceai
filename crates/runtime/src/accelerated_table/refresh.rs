@@ -351,7 +351,7 @@ impl Refresher {
                     "append_dataset_duration_ms",
                     vec![("dataset", dataset_name.to_string())],
                 );
-                match self.get_refresh_append_timestamp().await {
+                match self.get_timestamp_for_append_query().await {
                     Ok(timestamp) => {
                         let start = SystemTime::now();
 
@@ -382,7 +382,7 @@ impl Refresher {
     }
 
     #[allow(clippy::cast_sign_loss)]
-    async fn get_refresh_append_timestamp(&self) -> super::Result<Option<u128>> {
+    async fn get_timestamp_for_append_query(&self) -> super::Result<Option<u128>> {
         let ctx = self.get_refresh_df_context();
         let refresh = self.refresh.read().await;
 
@@ -486,7 +486,7 @@ impl Refresher {
 
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records(&self, update: DataUpdate) -> super::Result<DataUpdate> {
-        let Some(value) = self.get_refresh_append_timestamp().await? else {
+        let Some(value) = self.get_timestamp_for_append_query().await? else {
             return Ok(update);
         };
 
