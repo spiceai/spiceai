@@ -225,6 +225,9 @@ pub mod acceleration {
         pub refresh_data_window: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_append_overlap: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +274,7 @@ pub mod acceleration {
                 refresh_check_interval: None,
                 refresh_sql: None,
                 refresh_data_window: None,
+                refresh_append_overlap: None,
                 params: None,
                 engine_secret: None,
                 retention_period: None,

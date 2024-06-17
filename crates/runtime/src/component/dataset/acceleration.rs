@@ -16,7 +16,7 @@ limitations under the License.
 
 use data_components::util::column_reference::ColumnReference;
 use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashMap, fmt::Display, time::Duration};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -219,6 +219,8 @@ pub struct Acceleration {
 
     pub refresh_data_window: Option<String>,
 
+    pub refresh_append_overlap: Option<Duration>,
+
     pub params: HashMap<String, String>,
 
     pub engine_secret: Option<String>,
@@ -253,6 +255,20 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             })
         };
 
+        let try_parse_duration = |field: &str, duration: Option<String>| {
+            let Some(duration) = duration else {
+                return Ok(None);
+            };
+            fundu::parse_duration(&duration).map(Some).map_err(|e| {
+                crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: field.into(),
+                    },
+                }
+            })
+        };
+
         let primary_key = match acceleration.primary_key {
             Some(pk) => Some(try_parse_column_reference(pk.as_str())?),
             None => None,
@@ -271,14 +287,36 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
+        let engine = Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?;
+
+        if engine == Engine::Arrow && !indexes.is_empty() {
+            tracing::warn!(
+                "Indexes are not supported for Arrow engine acceleration. Ignoring indexes."
+            );
+        }
+        if engine == Engine::Arrow && primary_key.is_some() {
+            tracing::warn!(
+                "Primary key is not supported for Arrow engine acceleration. Ignoring primary_key."
+            );
+        }
+        if engine == Engine::Arrow && !on_conflict.is_empty() {
+            tracing::warn!(
+                "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
+            );
+        }
+
         Ok(Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
-            engine: Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?,
+            engine,
             refresh_mode: RefreshMode::from(acceleration.refresh_mode),
             refresh_check_interval: acceleration.refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
+            refresh_append_overlap: try_parse_duration(
+                "refresh_append_overlap",
+                acceleration.refresh_append_overlap,
+            )?,
             params: acceleration
                 .params
                 .as_ref()
@@ -306,6 +344,7 @@ impl Default for Acceleration {
             refresh_check_interval: None,
             refresh_sql: None,
             refresh_data_window: None,
+            refresh_append_overlap: None,
             params: HashMap::default(),
             engine_secret: None,
             retention_period: None,
