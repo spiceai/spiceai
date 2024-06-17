@@ -61,10 +61,10 @@ pub struct SpicepodDefinition {
     pub extensions: HashMap<String, Extension>,
 
     /// Optional spicepod secrets configuration
-    /// Default value is
+    /// Default value is applied in order of declaration
     /// secrets:
     ///   - store: file
-    ///   - store: env
+    ///   - store: env # Overrides file
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub secrets: Vec<ComponentOrReference<SecretStore>>,

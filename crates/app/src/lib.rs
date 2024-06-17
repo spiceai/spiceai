@@ -27,7 +27,7 @@ use spicepod::{
         llms::Llm,
         model::Model,
         runtime::{ResultsCache, Runtime},
-        secrets::{SecretStore, SecretStoreKey},
+        secrets::{SecretStore, SecretStoreType},
         view::View,
     },
     Spicepod,
@@ -190,13 +190,13 @@ impl AppBuilder {
             // Default to file and env secrets
             secrets.push({
                 SecretStore {
-                    from: SecretStoreKey::File,
+                    store: SecretStoreType::File,
                     params: None,
                 }
             });
             secrets.push({
                 SecretStore {
-                    from: SecretStoreKey::Env,
+                    store: SecretStoreType::Env,
                     params: None,
                 }
             });

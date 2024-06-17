@@ -25,11 +25,11 @@ use super::WithDependsOn;
 /// Example:
 /// ```yaml
 /// secrets:
-///   store: file
+///   - store: file
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SecretStore {
-    pub from: SecretStoreKey,
+    pub store: SecretStoreType,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
@@ -38,7 +38,7 @@ pub struct SecretStore {
 impl WithDependsOn<SecretStore> for SecretStore {
     fn depends_on(&self, depends_on: &[String]) -> SecretStore {
         SecretStore {
-            from: self.from.clone(),
+            store: self.store.clone(),
             params: self.params.clone(),
         }
     }
@@ -46,7 +46,7 @@ impl WithDependsOn<SecretStore> for SecretStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum SecretStoreKey {
+pub enum SecretStoreType {
     File,
     Env,
     Kubernetes,
