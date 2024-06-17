@@ -62,6 +62,11 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Unable to create MemTable from data update: {source}"))]
+    UnableToCreateMemTableFromUpdate {
+        source: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to trigger table refresh: {source}"))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<()>,

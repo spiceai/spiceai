@@ -156,15 +156,7 @@ impl DataSink for DuckDBDataSink {
 
         let num_rows = match **self.duckdb.constraints() {
             [] => self.try_write_all_no_constraints(&tx, &data_batches)?,
-            _ => match self.try_write_all_with_constraints(&tx, &data_batches) {
-                Ok(num_rows) => num_rows,
-                Err(e) => {
-                    tx.commit()
-                        .context(super::UnableToCommitTransactionSnafu)
-                        .map_err(to_datafusion_error)?;
-                    return Err(e);
-                }
-            },
+            _ => self.try_write_all_with_constraints(&tx, &data_batches)?,
         };
 
         tx.commit()
@@ -213,7 +205,7 @@ impl DuckDBDataSink {
         }
 
         let mut insert_table = orig_table_creator
-            .create_empty_clone()
+            .create_empty_clone(tx)
             .map_err(to_datafusion_error)?;
 
         let Some(insert_table_creator) = insert_table.table_creator.take() else {
@@ -225,15 +217,9 @@ impl DuckDBDataSink {
                 "Inserting batch #{i}/{} into cloned table.",
                 data_batches.len()
             );
-            if let Err(e) = insert_table
+            insert_table
                 .insert_batch_no_constraints(tx, batch)
-                .map_err(to_datafusion_error)
-            {
-                insert_table_creator
-                    .delete_table(tx)
-                    .map_err(to_datafusion_error)?;
-                return Err(e);
-            };
+                .map_err(to_datafusion_error)?;
         }
 
         if self.overwrite {
@@ -241,13 +227,12 @@ impl DuckDBDataSink {
                 .replace_table(tx, orig_table_creator)
                 .map_err(to_datafusion_error)?;
         } else {
-            let insert_result = insert_table
+            insert_table
                 .insert_table_into(tx, &self.duckdb, self.on_conflict.as_ref())
-                .map_err(to_datafusion_error);
+                .map_err(to_datafusion_error)?;
             insert_table_creator
                 .delete_table(tx)
                 .map_err(to_datafusion_error)?;
-            insert_result?;
         }
 
         Ok(num_rows)
