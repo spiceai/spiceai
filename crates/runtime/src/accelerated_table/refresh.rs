@@ -23,6 +23,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::logical_expr::{cast, col, lit, Expr, Operator};
 use datafusion::physical_plan::{collect, ExecutionPlanProperties};
 use datafusion::prelude::DataFrame;
+use datafusion::scalar::ScalarValue;
 use datafusion::{datasource::TableProvider, execution::context::SessionContext};
 use futures::Stream;
 use futures::{stream::BoxStream, StreamExt};
@@ -355,7 +356,7 @@ impl Refresher {
                     Ok(timestamp) => {
                         let start = SystemTime::now();
                         match self.get_full_or_incremental_append_update(timestamp).await {
-                            Ok(data) => match self.except_existing_records(data).await {
+                            Ok(data) => match self.except_existing_records_from(data).await {
                                 Ok(data) => yield Ok((Some(start), data)),
                                 Err(e) => yield Err(e),
                             },
@@ -484,7 +485,7 @@ impl Refresher {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    async fn except_existing_records(&self, update: DataUpdate) -> super::Result<DataUpdate> {
+    async fn except_existing_records_from(&self, update: DataUpdate) -> super::Result<DataUpdate> {
         let Some(value) = self.timestamp_for_append_query().await? else {
             return Ok(update);
         };
@@ -511,10 +512,10 @@ impl Refresher {
                     col(column),
                     DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 )
-                .gt_eq(cast(
-                    lit(value as u64),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                )),
+                .gt_eq(lit(ScalarValue::TimestampNanosecond(
+                    Some(value as i64),
+                    None,
+                ))),
             )
             .context(super::UnableToScanTableProviderSnafu)?;
 
