@@ -343,15 +343,17 @@ impl Refresher {
         let dataset_name = self.dataset_name.clone();
 
         let mut refresh_stream = ReceiverStream::new(receiver);
+
         stream! {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
                     "append_dataset_duration_ms",
                     vec![("dataset", dataset_name.to_string())],
                 );
-                match self.get_latest_timestamp().await {
+                match self.get_refresh_append_timestamp().await {
                     Ok(timestamp) => {
                         let start = SystemTime::now();
+
                         match self.get_full_or_incremental_append_update(timestamp).await {
                             Ok(data) => yield Ok((Some(start), data)),
                             Err(e) => yield Err(e),
@@ -366,8 +368,16 @@ impl Refresher {
         }
     }
 
+    async fn get_refresh_append_overlap(&self) -> u128 {
+        self.refresh
+            .read()
+            .await
+            .append_overlap
+            .map_or(0, |f| f.as_nanos())
+    }
+
     #[allow(clippy::cast_sign_loss)]
-    async fn get_latest_timestamp(&self) -> super::Result<Option<u128>> {
+    async fn get_refresh_append_timestamp(&self) -> super::Result<Option<u128>> {
         let ctx = self.get_refresh_df_context();
         let refresh = self.refresh.read().await;
 
@@ -432,6 +442,8 @@ impl Refresher {
                 _ => (),
             }
         };
+
+        value -= self.get_refresh_append_overlap().await;
 
         Ok(Some(value))
     }

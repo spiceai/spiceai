@@ -219,6 +219,8 @@ pub struct Acceleration {
 
     pub refresh_data_window: Option<String>,
 
+    pub refresh_append_overlap: Option<String>,
+
     pub params: HashMap<String, String>,
 
     pub engine_secret: Option<String>,
@@ -279,6 +281,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_check_interval: acceleration.refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
+            refresh_append_overlap: acceleration.refresh_append_overlap,
             params: acceleration
                 .params
                 .as_ref()
@@ -306,6 +309,7 @@ impl Default for Acceleration {
             refresh_check_interval: None,
             refresh_sql: None,
             refresh_data_window: None,
+            refresh_append_overlap: None,
             params: HashMap::default(),
             engine_secret: None,
             retention_period: None,
