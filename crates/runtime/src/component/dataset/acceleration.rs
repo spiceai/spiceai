@@ -16,7 +16,7 @@ limitations under the License.
 
 use data_components::util::column_reference::ColumnReference;
 use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashMap, fmt::Display, time::Duration};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -219,7 +219,7 @@ pub struct Acceleration {
 
     pub refresh_data_window: Option<String>,
 
-    pub refresh_append_overlap: Option<String>,
+    pub refresh_append_overlap: Option<Duration>,
 
     pub params: HashMap<String, String>,
 
@@ -255,6 +255,20 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             })
         };
 
+        let try_parse_duration = |field: &str, duration: Option<String>| {
+            let Some(duration) = duration else {
+                return Ok(None);
+            };
+            fundu::parse_duration(&duration).map(Some).map_err(|e| {
+                crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: field.into(),
+                    },
+                }
+            })
+        };
+
         let primary_key = match acceleration.primary_key {
             Some(pk) => Some(try_parse_column_reference(pk.as_str())?),
             None => None,
@@ -281,7 +295,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_check_interval: acceleration.refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
-            refresh_append_overlap: acceleration.refresh_append_overlap,
+            refresh_append_overlap: try_parse_duration(
+                "refresh_append_overlap",
+                acceleration.refresh_append_overlap,
+            )?,
             params: acceleration
                 .params
                 .as_ref()

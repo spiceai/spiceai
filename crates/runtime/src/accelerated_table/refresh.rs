@@ -352,7 +352,7 @@ impl Refresher {
                     "append_dataset_duration_ms",
                     vec![("dataset", dataset_name.to_string())],
                 );
-                match self.timestamp_for_append_query().await {
+                match self.timestamp_nanos_for_append_query().await {
                     Ok(timestamp) => {
                         let start = SystemTime::now();
                         match self.get_full_or_incremental_append_update(timestamp).await {
@@ -372,7 +372,7 @@ impl Refresher {
         }
     }
 
-    async fn refresh_append_overlap(&self) -> u128 {
+    async fn refresh_append_overlap_nanos(&self) -> u128 {
         self.refresh
             .read()
             .await
@@ -382,7 +382,7 @@ impl Refresher {
     }
 
     #[allow(clippy::cast_sign_loss)]
-    async fn timestamp_for_append_query(&self) -> super::Result<Option<u128>> {
+    async fn timestamp_nanos_for_append_query(&self) -> super::Result<Option<u128>> {
         let ctx = self.refresh_df_context();
         let refresh = self.refresh.read().await;
 
@@ -448,7 +448,7 @@ impl Refresher {
             }
         };
 
-        let refresh_append_value = self.refresh_append_overlap().await;
+        let refresh_append_value = self.refresh_append_overlap_nanos().await;
 
         if refresh_append_value > value {
             Ok(Some(0))
@@ -486,7 +486,7 @@ impl Refresher {
 
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records_from(&self, update: DataUpdate) -> super::Result<DataUpdate> {
-        let Some(value) = self.timestamp_for_append_query().await? else {
+        let Some(value) = self.timestamp_nanos_for_append_query().await? else {
             return Ok(update);
         };
 

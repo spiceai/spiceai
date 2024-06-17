@@ -50,6 +50,12 @@ pub enum Error {
         column_ref: String,
         source: column_reference::Error,
     },
+
+    #[snafu(display("Error parsing {field} as duration: {source}"))]
+    UnableToParseFieldAsDuration {
+        field: String,
+        source: fundu::ParseError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -324,23 +330,6 @@ impl Dataset {
         None
     }
 
-    #[must_use]
-    pub fn refresh_append_overlap(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_append_overlap) = &acceleration.refresh_append_overlap {
-                if let Ok(duration) = fundu::parse_duration(refresh_append_overlap) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse refresh append overlap for dataset {}: {}",
-                    self.name,
-                    refresh_append_overlap
-                );
-            }
-        }
-
-        None
-    }
 
     #[must_use]
     pub fn mode(&self) -> Mode {
