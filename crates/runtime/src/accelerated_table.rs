@@ -62,7 +62,7 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to create mem table from data update: {source}"))]
+    #[snafu(display("Unable to create MemTable from data update: {source}"))]
     UnableToCreateMemTableFromUpdate {
         source: datafusion::error::DataFusionError,
     },

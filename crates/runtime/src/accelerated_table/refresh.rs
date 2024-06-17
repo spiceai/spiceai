@@ -377,7 +377,8 @@ impl Refresher {
             .read()
             .await
             .append_overlap
-            .map_or(0, |f| f.as_nanos())
+            .map(|f| f.as_nanos())
+            .unwrap_or_default()
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -486,54 +487,51 @@ impl Refresher {
 
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records(&self, update: DataUpdate) -> super::Result<DataUpdate> {
+        let Some(value) = self.get_refresh_append_timestamp().await? else {
+            return Ok(update);
+        };
+
         let column = self.refresh.read().await.time_column.clone().context(
             super::FailedToFindLatestTimestampSnafu {
                 reason: "Failed to get latest timestamp due to time column not specified",
             },
         )?;
 
-        let expr = cast(
-            col(column),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        );
-
         let ctx = SessionContext::new();
-        let existing_df = self
-            .get_df(ctx.clone())
-            .await
-            .context(super::UnableToScanTableProviderSnafu)?;
-
         let mem_table = MemTable::try_new(self.accelerator.schema(), vec![update.clone().data])
             .context(super::UnableToCreateMemTableFromUpdateSnafu)?;
         let update_df = ctx
             .read_table(Arc::new(mem_table))
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        match self.get_refresh_append_timestamp().await {
-            Ok(Some(value)) => {
-                let data = update_df
-                    .except(
-                        existing_df
-                            .filter(expr.gt_eq(cast(
-                                lit(value as u64),
-                                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                            )))
-                            .context(super::UnableToScanTableProviderSnafu)?,
-                    )
-                    .context(super::UnableToScanTableProviderSnafu)?
-                    .collect()
-                    .await
-                    .context(super::UnableToScanTableProviderSnafu)?;
+        let existing_df = self
+            .get_df(ctx.clone())
+            .await
+            .context(super::UnableToScanTableProviderSnafu)?
+            .filter(
+                cast(
+                    col(column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                )
+                .gt_eq(cast(
+                    lit(value as u64),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                )),
+            )
+            .context(super::UnableToScanTableProviderSnafu)?;
 
-                Ok(DataUpdate {
-                    schema: update.schema,
-                    data,
-                    update_type: update.update_type,
-                })
-            }
-            Ok(None) => Ok(update),
-            Err(e) => Err(e),
-        }
+        let data = update_df
+            .except(existing_df)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .collect()
+            .await
+            .context(super::UnableToScanTableProviderSnafu)?;
+
+        Ok(DataUpdate {
+            schema: update.schema,
+            data,
+            update_type: update.update_type,
+        })
     }
 
     pub async fn get_full_or_incremental_append_update(
