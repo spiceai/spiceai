@@ -287,28 +287,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine = Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?;
-
-        if engine == Engine::Arrow && !indexes.is_empty() {
-            tracing::warn!(
-                "Indexes are not supported for Arrow engine acceleration. Ignoring indexes."
-            );
-        }
-        if engine == Engine::Arrow && primary_key.is_some() {
-            tracing::warn!(
-                "Primary key is not supported for Arrow engine acceleration. Ignoring primary_key."
-            );
-        }
-        if engine == Engine::Arrow && !on_conflict.is_empty() {
-            tracing::warn!(
-                "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
-            );
-        }
-
         Ok(Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
-            engine,
+            engine: Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?,
             refresh_mode: RefreshMode::from(acceleration.refresh_mode),
             refresh_check_interval: acceleration.refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
