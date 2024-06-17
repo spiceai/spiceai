@@ -330,7 +330,6 @@ impl Dataset {
         None
     }
 
-
     #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
