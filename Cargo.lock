@@ -3006,6 +3006,7 @@ version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "datafusion",
+ "tokio",
 ]
 
 [[package]]
@@ -7623,6 +7624,7 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-federation",
+ "datafusion_udf",
  "db_connection_pool",
  "derive_builder",
  "dirs",

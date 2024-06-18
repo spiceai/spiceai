@@ -11,3 +11,6 @@ exclude.workspace = true
 [dependencies]
 datafusion.workspace = true
 arrow.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

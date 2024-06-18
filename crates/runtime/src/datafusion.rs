@@ -220,6 +220,8 @@ impl DataFusion {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
+        ctx.register_udf(datafusion_udf::Greatest::new().into());
+        ctx.register_udf(datafusion_udf::Least::new().into());
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
