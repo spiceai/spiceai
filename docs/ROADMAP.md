@@ -2,7 +2,7 @@
 
 A living doc that describes the Spice.ai roadmap, updated based on community and customer feedback.
 
-If you have a feature request or suggestion, please [get in touch](https://github.com/spiceai/spiceai#community)!
+If you have a feature request or suggestion, please [get in touch](https://github.com/spiceai/spiceai?tab=readme-ov-file#-connect-with-us)!
 
 ## Known bugs
 
