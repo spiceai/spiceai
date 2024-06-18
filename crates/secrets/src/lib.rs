@@ -25,6 +25,7 @@ pub mod kubernetes;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use file::FileSecretStore;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
@@ -94,17 +95,20 @@ pub enum SecretStoreType {
 }
 
 #[must_use]
-pub fn spicepod_secret_store_type(store: &SecretStoreType) -> Option<SecretStoreType> {
+pub fn spicepod_secret_store_type(
+    store: &spicepod::component::secrets::SecretStoreType,
+) -> SecretStoreType {
     match store {
-        SecretStoreType::File => Some(SecretStoreType::File),
-        SecretStoreType::Env => Some(SecretStoreType::Env),
+        spicepod::component::secrets::SecretStoreType::File => SecretStoreType::File,
+        spicepod::component::secrets::SecretStoreType::Env => SecretStoreType::Env,
         #[cfg(feature = "keyring-secret-store")]
-        SecretStoreType::Keyring => Some(SecretStoreType::Keyring),
-        SecretStoreType::Kubernetes => Some(SecretStoreType::Kubernetes),
+        spicepod::component::secrets::SecretStoreType::Keyring => SecretStoreType::Keyring,
+        spicepod::component::secrets::SecretStoreType::Kubernetes => SecretStoreType::Kubernetes,
         #[cfg(feature = "aws-secrets-manager")]
-        SecretStoreType::AwsSecretsManager => Some(SecretStoreType::AwsSecretsManager),
-        #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
-        _ => None,
+        spicepod::component::secrets::SecretStoreType::AwsSecretsManager => {
+            SecretStoreType::AwsSecretsManager
+        } // #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
+          // _ => None,
     }
 }
 
@@ -132,4 +136,93 @@ pub fn get_secret_or_param(
     };
 
     None
+}
+
+#[allow(clippy::module_name_repetitions)]
+pub struct SecretsProvider {
+    pub store: SecretStoreType,
+    secret_stores: Vec<Box<dyn SecretStore + Send + Sync>>,
+}
+
+impl Default for SecretsProvider {
+    fn default() -> Self {
+        Self {
+            store: SecretStoreType::File,
+            secret_stores: Vec::new(),
+        }
+    }
+}
+
+impl SecretsProvider {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Loads the secrets from the secret stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secrets cannot be loaded.
+    pub async fn load_secrets(&mut self, secret_store_types: Vec<SecretStoreType>) -> Result<()> {
+        for store_type in secret_store_types {
+            let secret_store: Box<dyn SecretStore + Send + Sync> = match store_type {
+                SecretStoreType::File => {
+                    let mut file_secret_store = FileSecretStore::new();
+
+                    file_secret_store
+                        .load_secrets()
+                        .context(UnableToLoadSecretsSnafu)?;
+
+                    Box::new(file_secret_store)
+                }
+                SecretStoreType::Env => {
+                    let mut env_secret_store = env::EnvSecretStore::new();
+
+                    env_secret_store.load_secrets();
+
+                    Box::new(env_secret_store)
+                }
+                #[cfg(feature = "keyring-secret-store")]
+                SecretStoreType::Keyring => Box::new(keyring::KeyringSecretStore::new()),
+                SecretStoreType::Kubernetes => {
+                    let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
+
+                    kubernetes_secret_store
+                        .init()
+                        .context(UnableToLoadSecretsSnafu)?;
+
+                    Box::new(kubernetes_secret_store)
+                }
+                #[cfg(feature = "aws-secrets-manager")]
+                SecretStoreType::AwsSecretsManager => {
+                    let secret_store = aws_secrets_manager::AwsSecretsManager::new();
+
+                    secret_store
+                        .init()
+                        .await
+                        .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+
+                    Box::new(secret_store)
+                }
+            };
+
+            self.secret_stores.push(secret_store);
+        }
+
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Will return `None` if the secret store is not initialized or pass error from the secret store.
+    pub async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>> {
+        for secret_store in self.secret_stores.iter().rev() {
+            if let Some(secret) = secret_store.get_secret(secret_name).await? {
+                return Ok(Some(secret));
+            }
+        }
+
+        Ok(None)
+    }
 }

@@ -33,7 +33,6 @@ use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
-use component::secret::{self, SecretStore};
 use component::view::View;
 use config::Config;
 use datafusion::query::query_history;
@@ -47,7 +46,7 @@ use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
-use secrets::{spicepod_secret_store_type, Secret};
+use secrets::{spicepod_secret_store_type, AnyErrorResult, Secret};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
@@ -203,6 +202,9 @@ pub enum Error {
     InvalidSpicepodDataset {
         source: crate::component::dataset::Error,
     },
+
+    #[snafu(display("Unable to load secret stores"))]
+    UnableToLoadSecretStores { source: secrets::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -292,26 +294,26 @@ impl Runtime {
         self.datasets_health_monitor = Some(Arc::new(datasets_health_monitor));
     }
 
-    fn secrets_iter(app: &App) -> impl Iterator<Item = Result<SecretStore>> + '_ {
-        app.secrets.iter().cloned().map(SecretStore::try_from)
-    }
+    // fn secrets_iter(app: &App) -> impl Iterator<Item = Result<SecretStore>> + '_ {
+    //     app.secrets.iter().cloned().map(SecretStore::try_from)
+    // }
 
-    /// Returns a list of valid secret stores from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_secret_stores(app: &App, log_failures: bool) -> Vec<SecretStore> {
-        Self::secrets_iter(app)
-            .zip(&app.secrets)
-            .filter_map(|(ss, spicepod_ss)| match ss {
-                Ok(ss) => Some(ss),
-                Err(e) => {
-                    if log_failures {
-                        metrics::counter!("secrets_load_error").increment(1);
-                        tracing::error!(secret = &spicepod_ss.name, "{e}");
-                    }
-                    None
-                }
-            })
-            .collect()
-    }
+    // /// Returns a list of valid secret stores from the given App, skipping any that fail to parse and logging an error for them.
+    // fn get_valid_secret_stores(app: &App, log_failures: bool) -> Vec<SecretStore> {
+    //     Self::secrets_iter(app)
+    //         .zip(&app.secrets)
+    //         .filter_map(|(ss, spicepod_ss)| match ss {
+    //             Ok(ss) => Some(ss),
+    //             Err(e) => {
+    //                 if log_failures {
+    //                     metrics::counter!("secrets_load_error").increment(1);
+    //                     tracing::error!(secret = &spicepod_ss.name, "{e}");
+    //                 }
+    //                 None
+    //             }
+    //         })
+    //         .collect()
+    // }
 
     pub async fn load_secrets(&self) {
         let app_lock = self.app.read().await;
@@ -319,27 +321,44 @@ impl Runtime {
             return;
         };
 
+        let secret_store_types = app
+            .secrets
+            .iter()
+            .map(|s| spicepod_secret_store_type(&s.store.clone()))
+            .collect::<Vec<_>>();
+
         measure_scope_ms!("load_secrets");
 
-        let valid_secret_stores = Self::get_valid_secret_stores(app, true);
-        let mut futures = vec![];
-        for ss in &valid_secret_stores {
-            if let Err(e) = ss.load_secrets().await {
-                tracing::warn!("Unable to load secret store {}: {}", ss.key, e);
-            }
-        }
+        self.secrets_provider
+            .write()
+            .await
+            .load_secrets(secret_store_types)
+            .await
+            .context(UnableToLoadSecretStoresSnafu);
 
-        self.secrets_provider.write().await.secret_stores = valid_secret_stores;
+        // let valid_secret_stores = Self::get_valid_secret_stores(app, true);
+        // let mut futures = vec![];
+        // for ss in &valid_secret_stores {
+        //     if let Err(e) = ss.load_secrets().await {
+        //         tracing::warn!("Unable to load secret store {}: {}", ss.key, e);
+        //     }
+        // }
+
+        // self.secrets_provider.write().await.secret_stores = valid_secret_stores;
     }
 
     /// Will return `None` if the secret store is not initialized or pass error from the secret store.
     pub async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>> {
-        // iterate through in reverse order to give priority to the last secret store
-        for secret_store in self.secret_stores.iter().rev() {
-            if let Some(secret) = secret_store.get_secret(secret_name).await? {
-                return Ok(Some(secret));
-            }
+        if let Some(secret) = self
+            .secrets_provider
+            .read()
+            .await
+            .get_secret(secret_name)
+            .await?
+        {
+            return Ok(Some(secret));
         }
+
         Ok(None)
     }
 
@@ -517,6 +536,8 @@ impl Runtime {
         let ds = ds.clone();
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
 
         // test dataset connectivity by attempting to get a read provider
         if let Err(err) = data_connector.read_provider(&ds).await {
