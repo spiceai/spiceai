@@ -16,13 +16,13 @@ limitations under the License.
 
 use super::{DataConnector, DataConnectorFactory};
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use data_components::flightsql::FlightSQLFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;

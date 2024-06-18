@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -53,9 +53,18 @@ where
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let mut params = (*params).clone();
+        if let Some(secret) = secret {
+            secret.insert_to_params(
+                &mut params,
+                "odbc_connection_string_key",
+                "odbc_connection_string",
+            );
+        }
+
         Box::pin(async move {
             let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
-                ODBCPool::new(params, &secret).context(UnableToCreateODBCConnectionPoolSnafu)?,
+                ODBCPool::new(Arc::new(params)).context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
             let odbc_factory = ODBCTableFactory::new(pool);

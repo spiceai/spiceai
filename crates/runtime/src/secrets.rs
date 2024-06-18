@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
-use crate::file::FileSecretStore;
+use crate::secrets::file::FileSecretStore;
 use spicepod::component::secrets::SpiceSecretStore;
 
 pub use secrecy::ExposeSecret;
@@ -39,9 +39,7 @@ pub enum Error {
     UnableToLoadSecrets { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
-    UnableToInitializeAwsSecretsManager {
-        source: crate::aws_secrets_manager::Error,
-    },
+    UnableToInitializeAwsSecretsManager { source: aws_secrets_manager::Error },
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue {},
 }
@@ -83,6 +81,22 @@ impl Secret {
 
     pub fn add(&mut self, key: String, value: String) {
         self.data.insert(key, SecretString::from(value));
+    }
+
+    pub fn insert_to_params(
+        &self,
+        params: &mut HashMap<String, String>,
+        secret_param_key: &str,
+        param_key: &str,
+    ) {
+        let secret_param_val = match params.get(secret_param_key) {
+            Some(val) => val,
+            None => param_key,
+        };
+
+        if let Some(secret_val) = self.get(secret_param_val) {
+            params.insert(param_key.to_string(), secret_val.to_string());
+        }
     }
 }
 

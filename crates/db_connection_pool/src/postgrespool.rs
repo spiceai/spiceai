@@ -25,7 +25,6 @@ use bb8_postgres::{
 use native_tls::{Certificate, TlsConnector};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use postgres_native_tls::MakeTlsConnector;
-use secrets::{get_secret_or_param, Secret};
 use snafu::{prelude::*, ResultExt};
 use tokio_postgres;
 
@@ -91,17 +90,12 @@ impl PostgresConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: Arc<HashMap<String, String>>, secret: Option<Secret>) -> Result<Self> {
+    pub async fn new(params: Arc<HashMap<String, String>>) -> Result<Self> {
         let mut connection_string = String::new();
         let mut ssl_mode = "verify-full".to_string();
         let mut ssl_rootcert_path: Option<PathBuf> = None;
 
-        if let Some(pg_connection_string) = get_secret_or_param(
-            &params,
-            &secret,
-            "pg_connection_string_key",
-            "pg_connection_string",
-        ) {
+        if let Some(pg_connection_string) = params.get("pg_connection_string") {
             let (str, mode, cert_path) = parse_connection_string(pg_connection_string.as_str());
             connection_string = str;
             ssl_mode = mode;
@@ -123,7 +117,7 @@ impl PostgresConnectionPool {
             if let Some(pg_db) = params.get("pg_db") {
                 connection_string.push_str(format!("dbname={pg_db} ").as_str());
             }
-            if let Some(pg_pass) = get_secret_or_param(&params, &secret, "pg_pass_key", "pg_pass") {
+            if let Some(pg_pass) = params.get("pg_pass") {
                 connection_string.push_str(format!("password={pg_pass} ").as_str());
             }
             if let Some(pg_port) = params.get("pg_port") {

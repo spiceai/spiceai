@@ -18,7 +18,6 @@ use super::Error;
 use super::ModelSource;
 use async_trait::async_trait;
 use regex::Regex;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -28,16 +27,8 @@ pub struct Huggingface {}
 
 #[async_trait]
 impl ModelSource for Huggingface {
-    async fn pull(
-        &self,
-        secret: Secret,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> super::Result<String> {
-        let name = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("name"))
-            .map(ToString::to_string);
+    async fn pull(&self, params: Arc<HashMap<String, String>>) -> super::Result<String> {
+        let name = params.get("name").map(ToString::to_string);
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
@@ -46,11 +37,7 @@ impl ModelSource for Huggingface {
             .build());
         };
 
-        let files_param = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("files"))
-            .map(ToString::to_string);
+        let files_param = params.get("files").map(ToString::to_string);
 
         let files = match files_param {
             Some(files) => files.split(',').map(ToString::to_string).collect(),
@@ -60,11 +47,7 @@ impl ModelSource for Huggingface {
         // it is not copying local model into .spice folder
         let local_path = super::ensure_model_path(name.as_str())?;
 
-        let remote_path = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("path"))
-            .map(ToString::to_string);
+        let remote_path = params.get("path").map(ToString::to_string);
 
         let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
@@ -129,7 +112,12 @@ impl ModelSource for Huggingface {
             let client = reqwest::Client::new();
             let response = client
                 .get(download_url)
-                .bearer_auth(secret.get("token").unwrap_or_default())
+                .bearer_auth(
+                    params
+                        .get("token")
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
                 .send()
                 .await
                 .context(super::UnableToFetchModelSnafu {})?;

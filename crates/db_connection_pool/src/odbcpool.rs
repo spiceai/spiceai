@@ -18,7 +18,6 @@ use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use async_trait::async_trait;
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
-use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
@@ -64,14 +63,11 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub fn new(params: Arc<HashMap<String, String>>, secret: &Option<Secret>) -> Result<Self> {
-        let connection_string = get_secret_or_param(
-            &params,
-            secret,
-            "odbc_connection_string_key",
-            "odbc_connection_string",
-        )
-        .context(MissingConnectionStringSnafu)?;
+    pub fn new(params: Arc<HashMap<String, String>>) -> Result<Self> {
+        let connection_string = params
+            .get("odbc_connection_string")
+            .map(ToString::to_string)
+            .context(MissingConnectionStringSnafu)?;
         Ok(Self {
             params,
             connection_string,

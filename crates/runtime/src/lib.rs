@@ -46,6 +46,7 @@ use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
+use secrecy::ExposeSecret;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
@@ -76,6 +77,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
 pub mod timing;
@@ -879,7 +881,14 @@ impl Runtime {
             }
         };
 
-        match Model::load(m.clone(), secret).await {
+        let mut params: HashMap<String, String> = HashMap::new();
+        if let Some(secret) = secret {
+            for (k, v) in secret.iter() {
+                params.insert(k.to_string(), v.expose_secret().to_string());
+            }
+        }
+
+        match Model::load(m.clone(), params).await {
             Ok(in_m) => {
                 let mut model_map = self.models.write().await;
                 model_map.insert(m.name.clone(), in_m);

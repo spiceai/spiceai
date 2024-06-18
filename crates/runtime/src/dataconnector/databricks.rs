@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrets::Secret;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -69,16 +70,20 @@ pub struct Databricks {
 }
 
 impl Databricks {
-    pub async fn new(
-        secret: Arc<Option<Secret>>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Result<Self> {
+    pub async fn new(secret: Option<Secret>, params: Arc<HashMap<String, String>>) -> Result<Self> {
+        let mut params = (*params).clone();
         let mode = params.get("mode").cloned().unwrap_or_default();
         let format = params.get("format").cloned().unwrap_or_default();
 
         if mode.as_str() == "s3" {
+            if let Some(secret) = secret {
+                for (key, value) in secret.iter() {
+                    params.insert(key.to_string(), value.expose_secret().to_string());
+                }
+            }
+
             if format == "deltalake" {
-                let databricks_delta = DatabricksDelta::new(secret, Arc::clone(&params));
+                let databricks_delta = DatabricksDelta::new(Arc::new(params));
                 Ok(Self {
                     read_provider: Arc::new(databricks_delta.clone()),
                     read_write_provider: Arc::new(databricks_delta),
@@ -145,7 +150,7 @@ impl DataConnectorFactory for Databricks {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let databricks = Databricks::new(Arc::new(secret), Arc::clone(&params)).await?;
+            let databricks = Databricks::new(secret, Arc::clone(&params)).await?;
             Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
     }

@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::postgrespool::{self, PostgresConnectionPool};
-use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -44,8 +44,18 @@ impl DataConnectorFactory for Postgres {
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let mut params = (*params).clone();
+        if let Some(secret) = secret {
+            secret.insert_to_params(
+                &mut params,
+                "pg_connection_string_key",
+                "pg_connection_string",
+            );
+            secret.insert_to_params(&mut params, "pg_pass_key", "pg_pass");
+        }
+
         Box::pin(async move {
-            match PostgresConnectionPool::new(params, secret).await {
+            match PostgresConnectionPool::new(Arc::new(params)).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)

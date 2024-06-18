@@ -16,7 +16,6 @@ limitations under the License.
 
 use async_trait::async_trait;
 use pkcs8::{LineEnding, SecretDocument};
-use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
 use std::{collections::HashMap, fs, sync::Arc};
@@ -73,43 +72,38 @@ pub struct SnowflakeConnectionPool {
     join_push_down: JoinPushDown,
 }
 
-fn get_param(
-    params: &HashMap<String, String>,
-    secret: &Option<Secret>,
-    param_name: &str,
-) -> Option<String> {
-    get_secret_or_param(params, secret, &format!("{param_name}_key"), param_name)
-}
-
 impl SnowflakeConnectionPool {
     // Creates a new instance of `SnowflakeConnectionPool`.
     ///
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: &HashMap<String, String>, secret: &Option<Secret>) -> Result<Self> {
-        let username = get_param(params, secret, "username")
+    pub async fn new(params: &HashMap<String, String>) -> Result<Self> {
+        let username = params
+            .get("username")
             .context(MissingRequiredSecretSnafu { name: "username" })?;
 
-        let account = get_param(params, secret, "account")
+        let account = params
+            .get("account")
             .context(MissingRequiredSecretSnafu { name: "account" })?;
         // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
         let account = account.replace('.', "-");
 
-        let warehouse = get_param(params, secret, "snowflake_warehouse");
-        let role = get_param(params, secret, "snowflake_role");
+        let warehouse = params.get("snowflake_warehouse").map(ToString::to_string);
+        let role = params.get("snowflake_role").map(ToString::to_string);
 
-        let auth_type = get_param(params, secret, "snowflake_auth_type")
-            .unwrap_or_else(|| "snowflake".to_string())
+        let auth_type = params
+            .get("snowflake_auth_type")
+            .map_or_else(|| "snowflake".to_string(), ToString::to_string)
             .to_lowercase();
 
         let api = match auth_type.as_str() {
             "snowflake" => init_snowflake_api_with_password_auth(
-                &account, &username, &warehouse, &role, params, secret,
+                &account, username, &warehouse, &role, params,
             )?,
-            "keypair" => init_snowflake_api_with_keypair_auth(
-                &account, &username, &warehouse, &role, params, secret,
-            )?,
+            "keypair" => {
+                init_snowflake_api_with_keypair_auth(&account, username, &warehouse, &role, params)?
+            }
             _ => InvalidParameterValueSnafu {
                 param_key: "snowflake_auth_type",
                 param_value: auth_type,
@@ -160,9 +154,9 @@ fn init_snowflake_api_with_password_auth(
     warehouse: &Option<String>,
     role: &Option<String>,
     params: &HashMap<String, String>,
-    secret: &Option<Secret>,
 ) -> Result<SnowflakeApi> {
-    let password = get_param(params, secret, "password")
+    let password = params
+        .get("password")
         .context(MissingRequiredSecretSnafu { name: "password" })?;
     let api = SnowflakeApi::with_password_auth(
         account,
@@ -171,7 +165,7 @@ fn init_snowflake_api_with_password_auth(
         None,
         username,
         role.as_deref(),
-        &password,
+        password,
     )
     .context(UnableToConnectSnafu)?;
 
@@ -184,16 +178,16 @@ fn init_snowflake_api_with_keypair_auth(
     warehouse: &Option<String>,
     role: &Option<String>,
     params: &HashMap<String, String>,
-    secret: &Option<Secret>,
 ) -> Result<SnowflakeApi> {
-    let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(
-        MissingRequiredSecretSnafu {
-            name: "snowflake_private_key_path",
-        },
-    )?;
+    let private_key_path =
+        params
+            .get("snowflake_private_key_path")
+            .context(MissingRequiredSecretSnafu {
+                name: "snowflake_private_key_path",
+            })?;
 
     let mut private_key_pem: String =
-        fs::read_to_string(&private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
+        fs::read_to_string(private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
             file_path: private_key_path,
         })?;
 
@@ -201,13 +195,14 @@ fn init_snowflake_api_with_keypair_auth(
         SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
 
     if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
-        let passphrase = get_param(params, secret, "snowflake_private_key_passphrase").context(
-            MissingRequiredSecretSnafu {
-                name: "snowflake_private_key_passphrase",
-            },
-        )?;
+        let passphrase =
+            params
+                .get("snowflake_private_key_passphrase")
+                .context(MissingRequiredSecretSnafu {
+                    name: "snowflake_private_key_passphrase",
+                })?;
 
-        private_key_pem = decode_pkcs8_encrypted_data(&data, &passphrase)?;
+        private_key_pem = decode_pkcs8_encrypted_data(&data, passphrase)?;
     }
 
     let api = SnowflakeApi::with_certificate_auth(

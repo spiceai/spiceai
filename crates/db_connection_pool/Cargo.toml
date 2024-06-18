@@ -21,7 +21,6 @@ bb8-postgres = { workspace = true, optional = true }
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 arrow.workspace = true
 pem = { workspace = true, optional = true }
-secrets = { path = "../secrets" }
 rusqlite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }

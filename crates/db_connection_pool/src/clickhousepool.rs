@@ -24,7 +24,6 @@ use std::{
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use secrets::{get_secret_or_param, Secret};
 use snafu::{ResultExt, Snafu};
 use url::Url;
 
@@ -102,8 +101,8 @@ impl ClickhouseConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: Arc<HashMap<String, String>>, secret: Option<Secret>) -> Result<Self> {
-        let (options, compute_context) = get_config_from_params(&params, &secret).await?;
+    pub async fn new(params: Arc<HashMap<String, String>>) -> Result<Self> {
+        let (options, compute_context) = get_config_from_params(&params).await?;
 
         let pool = Pool::new(options);
 
@@ -118,27 +117,20 @@ const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returns a Clickhouse `Options` based on user-provided parameters.
 /// Also returns the sanitized connection string for use as a federation `compute_context`.
-async fn get_config_from_params(
-    params: &HashMap<String, String>,
-    secret: &'_ Option<Secret>,
-) -> Result<(Options, String)> {
+async fn get_config_from_params(params: &HashMap<String, String>) -> Result<(Options, String)> {
     let connection_string =
-        if let Some(clickhouse_connection_string) = get_secret_or_param(
-            params,
-            secret,
-            "clickhouse_connection_string_key",
-            "clickhouse_connection_string",
-        ) {
-            clickhouse_connection_string
+        if let Some(clickhouse_connection_string) = params.get("clickhouse_connection_string") {
+            clickhouse_connection_string.to_string()
         } else {
             let user = params.get("clickhouse_user").ok_or(
                 Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_user".to_string(),
                 },
             )?;
-            let password =
-                get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass")
-                    .unwrap_or_default();
+            let password = params
+                .get("clickhouse_pass")
+                .map(ToString::to_string)
+                .unwrap_or_default();
             let host = params.get("clickhouse_host").ok_or(
                 Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_tcp_host".to_string(),
@@ -163,7 +155,7 @@ async fn get_config_from_params(
                 },
             )?;
 
-            format!("tcp://{user}:{password}@{host}:{port}/{db}",)
+            format!("tcp://{user}:{password}@{host}:{port}/{db}")
         };
 
     let mut sanitized_connection_string =

@@ -244,7 +244,7 @@ mod tests {
         use odbc_api::Cursor;
 
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(Arc::new(HashMap::new()), &None).expect("Must create ODBC pool");
+        let pool = ODBCPool::new(Arc::new(HashMap::new())).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(

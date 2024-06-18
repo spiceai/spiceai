@@ -17,7 +17,6 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
@@ -73,11 +72,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// processing by `ModelRuntime`.
 #[async_trait]
 pub trait ModelSource: Send + Sync {
-    async fn pull(
-        &self,
-        secret: Secret,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<String>;
+    async fn pull(&self, params: Arc<HashMap<String, String>>) -> Result<String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

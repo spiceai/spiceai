@@ -28,7 +28,7 @@ async fn test_postgres_types() {
         ("pg_sslmode".to_string(), "disable".into()),
     ]));
     let pool: Arc<dyn DbConnectionPool<_, _> + Send + Sync> = Arc::new(
-        PostgresConnectionPool::new(params, None)
+        PostgresConnectionPool::new(params)
             .await
             .expect("Postgres connection pool should be created"),
     );

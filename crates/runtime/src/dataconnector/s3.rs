@@ -17,7 +17,7 @@ limitations under the License.
 use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
 
 use crate::component::dataset::Dataset;
-use secrets::Secret;
+use crate::secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
