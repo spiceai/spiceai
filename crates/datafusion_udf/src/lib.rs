@@ -5,7 +5,7 @@ use datafusion::{
         type_coercion::functions::data_types, Accumulator, ColumnarValue, ScalarUDFImpl, Signature,
         Volatility,
     },
-    physical_plan::{expressions::MaxAccumulator, expressions::MinAccumulator},
+    physical_plan::expressions::{MaxAccumulator, MinAccumulator},
     scalar::ScalarValue,
 };
 
@@ -33,6 +33,8 @@ impl Greatest {
 }
 
 pub static SUPPORTED_COMPARISON_TYPES: &[DataType] = &[
+    DataType::Null,
+    DataType::Boolean,
     DataType::UInt8,
     DataType::UInt16,
     DataType::UInt32,
@@ -43,6 +45,17 @@ pub static SUPPORTED_COMPARISON_TYPES: &[DataType] = &[
     DataType::Int64,
     DataType::Float32,
     DataType::Float64,
+    DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+    DataType::LargeUtf8,
+    DataType::Utf8,
+    DataType::Date32,
+    DataType::Date64,
+    DataType::Interval(arrow::datatypes::IntervalUnit::DayTime),
+    DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+    DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth),
 ];
 
 impl ScalarUDFImpl for Greatest {
