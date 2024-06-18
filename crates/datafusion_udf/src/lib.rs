@@ -91,10 +91,9 @@ impl ScalarUDFImpl for Greatest {
     }
 
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        let try_new = |data_type: &DataType| {
+        accumulator_min_max(self, args, |data_type: &DataType| {
             MaxAccumulator::try_new(data_type).map(|x| Box::new(x) as Box<dyn Accumulator>)
-        };
-        accumulator_min_max(self, args, try_new)
+        })
     }
 }
 
@@ -154,10 +153,9 @@ impl ScalarUDFImpl for Least {
     }
 
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        let try_new = |data_type: &DataType| {
+        accumulator_min_max(self, args, |data_type: &DataType| {
             MinAccumulator::try_new(data_type).map(|x| Box::new(x) as Box<dyn Accumulator>)
-        };
-        accumulator_min_max(self, args, try_new)
+        })
     }
 }
 
@@ -175,12 +173,10 @@ fn accumulator_min_max(
             .collect::<Vec<_>>(),
     )?;
 
-    let mut columns = vec![];
-
-    for arg in args {
-        let casted = arg.cast_to(&return_type, None)?;
-        columns.push(casted);
-    }
+    let columns = args
+        .iter()
+        .map(|arg| arg.cast_to(&return_type, None))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let arrays = ColumnarValue::values_to_arrays(&columns)?;
     let size = arrays.first().map_or(0, |x| x.len());
@@ -196,9 +192,9 @@ fn accumulator_min_max(
         values.push(acc.evaluate()?);
     }
 
-    let array = ScalarValue::iter_to_array(values.into_iter())?;
-
-    Ok(ColumnarValue::from(array))
+    Ok(ColumnarValue::from(ScalarValue::iter_to_array(
+        values.into_iter(),
+    )?))
 }
 
 #[cfg(test)]
