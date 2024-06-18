@@ -9,29 +9,6 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-#[derive(Debug)]
-pub struct Greatest {
-    signature: Signature,
-}
-
-impl Default for Greatest {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Greatest {
-    #[must_use]
-    pub fn new() -> Self {
-        Greatest {
-            signature: Signature::variadic(
-                SUPPORTED_COMPARISON_TYPES.to_vec(),
-                Volatility::Immutable,
-            ),
-        }
-    }
-}
-
 pub static SUPPORTED_COMPARISON_TYPES: &[DataType] = &[
     DataType::Null,
     DataType::Boolean,
@@ -57,6 +34,29 @@ pub static SUPPORTED_COMPARISON_TYPES: &[DataType] = &[
     DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
     DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth),
 ];
+
+#[derive(Debug)]
+pub struct Greatest {
+    signature: Signature,
+}
+
+impl Default for Greatest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Greatest {
+    #[must_use]
+    pub fn new() -> Self {
+        Greatest {
+            signature: Signature::variadic(
+                SUPPORTED_COMPARISON_TYPES.to_vec(),
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
 
 impl ScalarUDFImpl for Greatest {
     fn as_any(&self) -> &dyn std::any::Any {
