@@ -8,11 +8,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.14-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/34)
-
-- Accelerated table primary key and indexes
-- GraphQL data connector (alpha)
-
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
 - CDC replication refresh mode
@@ -32,6 +27,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - ODBC Data Connector (Beta)
 
 ## [v0.17-rc (August 2024)](https://github.com/spiceai/spiceai/milestone/32)
+
 - Bugfixes and performance improvements
 - Databricks data connector (Release Candidate)
 - Spice AI data connector (Release Candidate)
@@ -53,23 +49,24 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Spark Data Connector (Beta)
 
 ### v1.0-stable Data Connector Support
-  | Name          | Status              |
-  | ------------- | ------------------- |
-  | `databricks`  | Stable              |
-  | `postgres`    | Stable              |
-  | `spiceai`     | Stable              |
-  | `s3`          | Stable              |
-  | `odbc`        | Stable              |
-  | `duckdb`      | Beta                |
-  | `spark`       | Beta                |
-  | `snowflake`   | Beta                |
-  | `ftp`, `sftp` | Beta                |
-  | `clickhouse`  | Alpha               |
-  | `dremio`      | Alpha               |
-  | `mysql`       | Alpha               |
-  | `flightsql`   | Alpha               |
-  | `graphql`     | Alpha               |
-  | `motherduck`  | Alpha               |
+
+| Name          | Status |
+| ------------- | ------ |
+| `databricks`  | Stable |
+| `postgres`    | Stable |
+| `spiceai`     | Stable |
+| `s3`          | Stable |
+| `odbc`        | Stable |
+| `duckdb`      | Beta   |
+| `spark`       | Beta   |
+| `snowflake`   | Beta   |
+| `ftp`, `sftp` | Beta   |
+| `clickhouse`  | Alpha  |
+| `dremio`      | Alpha  |
+| `mysql`       | Alpha  |
+| `flightsql`   | Alpha  |
+| `graphql`     | Alpha  |
+| `motherduck`  | Alpha  |
 
 ## v1.1 (Oct 2024)
 
