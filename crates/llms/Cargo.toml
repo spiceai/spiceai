@@ -15,7 +15,7 @@ snafu.workspace = true
 
 dirs = "5.0.1"
 serde_json.workspace = true
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
+async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
