@@ -3,17 +3,17 @@
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/kZnTfneP5u)
-[![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://twitter.com/intent/follow?screen_name=spice_ai)
+[![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://x.com/intent/follow?screen_name=spice_ai)
 
 ## What is Spice?
 
-**Spice** is a portable runtime providing developers with a unified SQL interface to materialize, accelerate, and query data sourced from any database, data warehouse, or data lake.
+**Spice** is a portable runtime offering developers a unified SQL interface to materialize, accelerate, and query data from any database, data warehouse, or data lake.
 
 📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
 
-Spice connects, fuses, and delivers data to applications and AI, acting as an application-specific, tier-optimized Database CDN.
+Spice connects, fuses, and delivers data to applications, machine-learning models, and AI-backends, functioning as an application-specific, tier-optimized Database CDN.
 
-The Spice runtime is written in Rust and is built-with industry leading technologies like [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQlite, and DuckDB.
+The Spice runtime, written in Rust, is built-with industry leading technologies such as [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQLite, and DuckDB.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
@@ -22,15 +22,29 @@ The Spice runtime is written in Rust and is built-with industry leading technolo
 
 ## Why Spice?
 
-Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, accelerated with in-memory Arrow, with SQLite/DuckDB, or with attached PostgreSQL for high-performance, low-latency queries. Accelerated engines run tier-native in your infrastructure giving you flexibility and control over cost and performance.
+Spice makes it easy and fast to query data from one or more sources using SQL. You can co-locate a managed dataset with your application or machine learning model, and accelerate it with Arrow in-memory, SQLite/DuckDB, or with attached PostgreSQL for fast, high-concurrency, low-latency queries. Accelerated engines give you flexibility and control over query cost and performance.
 
 ### How is Spice different?
 
-1. Tier-optimized Acceleration with **both OLAP (Arrow/DuckDB) and OLTP (SQLite/PostgreSQL)** databases at dataset granularity compared to other OLAP only or OLTP only systems.
+1. **Application-focused:** Spice is designed to integrate at the application level; 1:1 or 1:N application to Spice mapping, whereas most other data systems are designed for multiple applications to share a single database or data warehouse. It's not uncommon to have many Spice instances, even down to one for each tenant or customer.
 
-2. **Separation of materialization and storage/compute** compared with monolith data systems and data lakes. Keep compute colocated with source data while bringing a materialized working set next to your application, dashboard, or data/ML pipeline.
+2. **Dual-Engine Acceleration:** Spice supports both **OLAP** (Arrow/DuckDB) and **OLTP** (SQLite/PostgreSQL) databases at the dataset level, unlike other systems that only support one type.
 
-3. **Edge to cloud native**. Designed to be deployed standalone, as a container sidecar, as a microservice, in a cluster across laptops, the Edge, On-Prem, to a POP, and to all public clouds. Spice instances can also be chained, and deployed distributed across tiers of infrastructure.
+3. **Separation of Materialization and Storage/Compute:** Spice separates storage and compute, allowing you to keep data close to its source and bring a materialized working set next to your application, dashboard, or data/ML pipeline.
+
+4. **Edge to Cloud Native**. Spice is designed to be deployed anywhere, from a standalone instance to a Kubernetes container sidecar, microservice, or cluster at the Edge/POP, On-Prem, or in public clouds. You can also chain Spice instances and deploy them across multiple infrastructure tiers.
+
+### How does Spice compare?
+
+|                            | Spice                              | Trino/Presto                     | Dremio                           | Clickhouse              |
+| -------------------------- | ---------------------------------- | -------------------------------- | -------------------------------- | ----------------------- |
+| Primary Use-Case           | Data & AI Applications             | Big Data Analytics               | Interative Analytics             | Real-Time Analytics     |
+| Typical Deployment         | Colocated with application         | Cloud Cluster                    | Cloud Cluster                    | On-Prem/Cloud Cluster   |
+| Application-to-Data System | One-to-One/Many                    | Many-to-One                      | Many-to-One                      | Many-to-One             |
+| Query Federation           | Native with query push-down        | Supported with push-down         | Supported with limited push-down | Limited                 |
+| Materialization            | Arrow/SQLite/DuckDB/PostgreSQL     | Intermediate Storage             | Reflections (Iceberg)            | Views & MergeTree       |
+| Query Result Caching       | Supported                          | Supported                        | Supported                        | Supported               |
+| Typical Configuration      | Single-Binary/Sidecar/Microservice | Coodinator+Executor w/ Zookeeper | Coodinator+Executor w/ Zookeeper              | Clickhouse Keeper+Nodes |
 
 ### Before Spice
 
@@ -85,6 +99,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
 | `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       |
+| `graphql`     | GraphQL                                                                                        | Alpha  | JSON                                                                                               |
 
 ### Supported Data Stores/Accelerators
 

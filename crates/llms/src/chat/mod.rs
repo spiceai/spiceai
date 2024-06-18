@@ -102,9 +102,9 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
-                        async_openai::types::ChatCompletionRequestMessageContentPart::Image(i) => {
-                            i.image_url.url.clone()
-                        }
+                        async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(
+                            i,
+                        ) => i.image_url.url.clone(),
                     })
                     .collect();
                 x.join("\n")
@@ -188,6 +188,7 @@ pub trait Chat: Sync + Send {
                 created: 0,
                 system_fingerprint: None,
                 object: "list".to_string(),
+                usage: None,
             });
             i+=1;
         }};
