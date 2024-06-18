@@ -78,7 +78,6 @@ tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
 data_components = { path = "../data_components" }
-datafusion_udf = { path = "../datafusion_udf" }
 mysql_async = { workspace = true, optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 ns_lookup = { path = "../ns_lookup" }
@@ -93,7 +92,7 @@ datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
-async-openai.workspace = true
+async-openai = "0.21.0"
 derive_builder = "0.20.0"
 
 [dev-dependencies]
