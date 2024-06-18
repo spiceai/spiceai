@@ -76,7 +76,21 @@ async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: TableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-    let dataframe = spark_session.table(table_reference.to_string().as_str())?;
+    let spark_table_reference = match table_reference {
+        TableReference::Bare { ref table } => format!("`{table}`"),
+        TableReference::Partial {
+            ref table,
+            ref schema,
+        } => format!("`{schema}`.`{table}`"),
+        TableReference::Full {
+            ref catalog,
+            ref schema,
+            ref table,
+        } => {
+            format!("`{catalog}`.`{schema}`.`{table}`")
+        }
+    };
+    let dataframe = spark_session.table(spark_table_reference.as_str())?;
     let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
     Ok(Arc::new(SparkConnectTableProvider {
         dataframe,
