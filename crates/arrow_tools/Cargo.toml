@@ -11,3 +11,4 @@ exclude.workspace = true
 [dependencies]
 arrow.workspace = true
 snafu.workspace = true
+serde_json.workspace = true

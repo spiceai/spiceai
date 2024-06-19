@@ -20,7 +20,13 @@ sea-query = { version = "0.30.7", features = [
     "with-rust_decimal",
     "with-bigdecimal",
     "with-time",
+    "with-json",
 ] }
+
+sea-query-postgres = { version = "0.3.0", features = [
+    "with-json",
+] }
+
 snafu.workspace = true
 tokio-postgres = { workspace = true, features = ["with-chrono-0_4", "with-uuid-1"], optional = true }
 bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0" }
@@ -30,6 +36,7 @@ tokio.workspace = true
 rusqlite = { workspace = true, optional = true }
 chrono = "0.4.35"
 chrono-tz = "0.8.6"
+serde_json.workspace = true
 
 mysql_async = { workspace = true, optional = true }
 clickhouse-rs = { workspace = true, optional = true }

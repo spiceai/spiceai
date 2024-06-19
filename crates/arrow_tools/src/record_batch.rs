@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{new_null_array, Array, RecordBatch},
+    array::{new_null_array, Array, ArrayBuilder, ArrayRef, BooleanBuilder, Int32Builder, Int64Builder, RecordBatch, StringArray, StringBuilder, StructBuilder},
     compute::cast,
-    datatypes::SchemaRef,
+    datatypes::{DataType, Fields, SchemaRef}, error::ArrowError,
 };
+use serde_json::Value;
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -61,9 +62,19 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
                 if field.contains(existing_field) {
                     Ok(Arc::clone(column))
                 } else {
-                    {
-                        return cast(&*Arc::clone(column), field.data_type())
-                            .context(UnableToConvertRecordBatchSnafu);
+                    {                        
+                        match (column.data_type(), field.data_type()) {
+                            (DataType::Utf8, DataType::Struct(fields)) => {
+                                return cast_string_to_struct(&*Arc::clone(column), fields)
+                                    .context(UnableToConvertRecordBatchSnafu);
+
+                            },
+                            _ => {
+                                return cast(&*Arc::clone(column), field.data_type())
+                                .context(UnableToConvertRecordBatchSnafu);
+                            }
+
+                        }
                     }
                 }
             } else if field.is_nullable() {
@@ -78,6 +89,80 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
         .collect::<Result<Vec<Arc<dyn Array>>>>()?;
 
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
+}
+
+fn cast_string_to_struct(array: &dyn Array, struct_fields: &Fields) -> Result<ArrayRef, ArrowError> {
+
+    let string_array = array.as_any().downcast_ref::<StringArray>()
+        .ok_or_else(|| ArrowError::CastError("Failed to downcast to StringArray".to_string()))?;
+
+    let field_builders: Vec<Box<dyn ArrayBuilder>> = struct_fields.iter().map(|field| {
+        match field.data_type() {
+            DataType::Utf8 => Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            DataType::Boolean => Box::new(BooleanBuilder::new()) as Box<dyn ArrayBuilder>,
+            DataType::Int32 => Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+            DataType::Int64 => Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+            // TODO add more types
+            _ => unimplemented!(),
+        }
+    }).collect();
+
+    let mut struct_builder = StructBuilder::new(struct_fields.to_vec(), field_builders);
+
+    for i in 0..string_array.len() {
+
+        // TODO: support for nulls
+
+        let string_value = string_array.value(i);
+        let json_value: Value = serde_json::from_str(&string_value).unwrap();
+
+        struct_builder.append(true);
+
+        for idx in 0..struct_fields.len() {
+            let field_name = struct_fields[idx].name();
+            match struct_fields[idx].data_type() {
+                DataType::Utf8 => {
+                    let value = json_value[field_name].as_str().unwrap();
+                    struct_builder
+                        .field_builder::<StringBuilder>(idx)
+                        .expect("Should return a field builder")
+                        .append_value(value);
+                },
+                DataType::Boolean => {
+                    let value = json_value[field_name].as_bool().unwrap();
+
+                    struct_builder
+                        .field_builder::<BooleanBuilder>(idx)
+                        .expect("Should return a field builder")
+                        .append_value(value);
+                },
+                DataType::Int64 => {
+                    let value = json_value[field_name].as_i64().unwrap();
+
+                    struct_builder
+                        .field_builder::<Int64Builder>(idx)
+                        .expect("Should return a field builder")
+                        .append_value(value);
+                },
+                DataType::Int32 => {
+                    if let Some(value) = json_value[field_name].as_i64() { 
+                        if let Ok(value) = i32::try_from(value) {
+                            let builder = struct_builder
+                                .field_builder::<Int32Builder>(idx)
+                                .expect("Should return a field builder");
+                
+                            builder.append_value(value); // append the value to the builder
+                        } 
+                    }
+                },
+                // TODO add more types
+                _ => unimplemented!(),
+            }
+        }
+    }
+
+    Ok(Arc::new(struct_builder.finish()))
+
 }
 
 #[cfg(test)]

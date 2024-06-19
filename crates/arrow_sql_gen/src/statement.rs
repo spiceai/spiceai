@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::{
-    array::{array, Array, RecordBatch},
-    datatypes::{DataType, SchemaRef, TimeUnit},
+    array::{array, Array, RecordBatch, StructArray},
+    datatypes::{DataType, Fields, SchemaRef, TimeUnit},
 };
 
 use bigdecimal_0_3_0::BigDecimal;
 
+use serde_json::Value;
 use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
@@ -433,6 +434,17 @@ impl InsertBuilder {
                             row_values.push(valid_array.value(row).into());
                         }
                     }
+                    DataType::Struct(fields) => {
+                        let array = column.as_any().downcast_ref::<array::StructArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+                            row_values.push(serialize_struct_to_json(fields, valid_array, row).into());
+                        }
+                    }
                     unimplemented_type => {
                         return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
                             data_type: unimplemented_type.clone(),
@@ -580,6 +592,102 @@ fn insert_timestamp_into_row_values(
     }
 }
 
+fn serialize_struct_to_json(fields: &Fields, array: &StructArray, row: usize) -> String {
+    // TODO: invetigate https://arrow.apache.org/rust/arrow_json/reader/struct.Decoder.html
+
+    let mut json_object = serde_json::Map::new();
+
+    for (idx, field) in array.fields().iter().enumerate() {
+        let column = array.column(idx);
+
+        let field_name = field.name();
+        let field_value = match field.data_type() {
+            DataType::Int8 => {
+                let int_array = column.as_any().downcast_ref::<array::Int8Array>().unwrap();
+                if int_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(int_array.value(row))
+                }
+            }
+            DataType::Int16 => {
+                let int_array = column.as_any().downcast_ref::<array::Int16Array>().unwrap();
+                if int_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(int_array.value(row))
+                }
+            }
+            DataType::Int32 => {
+                let int_array = column.as_any().downcast_ref::<array::Int32Array>().unwrap();
+                if int_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(int_array.value(row))
+                }
+            }
+            DataType::Int64 => {
+                let int_array = column.as_any().downcast_ref::<array::Int64Array>().unwrap();
+                if int_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(int_array.value(row))
+                }
+            }
+            DataType::Float32 => {
+                let float_array = column.as_any().downcast_ref::<array::Float32Array>().unwrap();
+                if float_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(float_array.value(row))
+                }
+            },
+            DataType::Float64 => {
+                let float_array = column.as_any().downcast_ref::<array::Float64Array>().unwrap();
+                if float_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(float_array.value(row))
+                }
+            },
+            DataType::Boolean => {
+                let bool_array = column.as_any().downcast_ref::<array::BooleanArray>().unwrap();
+                if bool_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(bool_array.value(row))
+                }
+            },
+            DataType::Utf8 => {
+                let str_array = column.as_any().downcast_ref::<array::StringArray>().unwrap();
+                if str_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(str_array.value(row))
+                }
+            },
+            DataType::Struct(_) => {
+                let struct_array = column.as_any().downcast_ref::<array::StructArray>().unwrap();
+                if struct_array.is_null(row) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(serialize_struct_to_json(fields, struct_array, row))
+                }
+            },
+            _ => unimplemented!(
+                "Struct does not implement data type mapping for {}",
+                field.data_type()
+            ),
+        };
+
+        json_object.insert(field_name.to_string(), field_value);
+
+    }
+
+    Value::Object(json_object).to_string()
+
+}
+
 fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
     match data_type {
         DataType::Int8 => ColumnType::TinyInteger,
@@ -602,6 +710,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
         }
+        DataType::Struct(_) => ColumnType::Json,
         DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
 
         // Add more mappings here as needed

@@ -221,7 +221,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -524,7 +524,9 @@ dependencies = [
  "clickhouse-rs",
  "mysql_async",
  "rusqlite",
- "sea-query",
+ "sea-query 0.30.7",
+ "sea-query-postgres",
+ "serde_json",
  "snafu 0.8.2",
  "time",
  "tokio",
@@ -535,9 +537,10 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
+ "serde_json",
  "snafu 0.8.2",
 ]
 
@@ -1884,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2614,7 +2617,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
 name = "data_components"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3002,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3719,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3735,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3748,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3767,7 +3770,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -5284,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "async-openai",
  "async-stream",
@@ -5657,7 +5660,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5959,7 +5962,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -6837,6 +6840,8 @@ dependencies = [
  "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -7586,7 +7591,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "anyhow",
  "app",
@@ -7984,6 +7989,16 @@ dependencies = [
 
 [[package]]
 name = "sea-query"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "332375aa0c555318544beec038b285c75f2dbeecaecb844383419ccf2663868e"
+dependencies = [
+ "inherent",
+ "serde_json",
+]
+
+[[package]]
+name = "sea-query"
 version = "0.30.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4166a1e072292d46dc91f31617c2a1cdaf55a8be4b5c9f4bf2ba248e3ac4999b"
@@ -7992,6 +8007,7 @@ dependencies = [
  "inherent",
  "rust_decimal",
  "sea-query-derive",
+ "serde_json",
  "time",
 ]
 
@@ -8006,6 +8022,17 @@ dependencies = [
  "quote",
  "syn 2.0.60",
  "thiserror",
+]
+
+[[package]]
+name = "sea-query-postgres"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c2f53dbf4f98a811ccc09948c94e2cead3269cdb8a2aa549dfed11b9576fd8f"
+dependencies = [
+ "bytes",
+ "postgres-types",
+ "sea-query 0.29.1",
 ]
 
 [[package]]
@@ -8045,7 +8072,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -8501,7 +8528,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -8518,7 +8545,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -8536,7 +8563,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -8581,7 +8608,7 @@ dependencies = [
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
@@ -9819,7 +9846,7 @@ checksum = "711b9620af191e0cdc7468a8d14e709c3dcdb115b36f838e601583af800a370a"
 
 [[package]]
 name = "util"
-version = "0.14.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "humantime",
  "tokio",

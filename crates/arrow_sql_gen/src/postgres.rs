@@ -48,6 +48,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{types::Type, Column, Row};
 
+use sea_query::{ColumnDef, ColumnType, Iden, Order, PostgresQueryBuilder, Query, Table};
+use sea_query_postgres::PostgresBinder;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to build record batch: {source}"))]
@@ -230,6 +233,26 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 }
                 Type::VARCHAR => {
                     handle_primitive_type!(builder, Type::VARCHAR, StringBuilder, &str, row, i);
+                }
+                Type::JSONB | Type::JSON => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+
+                    let v: Option<serde_json::Value> = row.try_get(i).context(FailedToGetRowValueSnafu {
+                        pg_type: Type::JSONB,
+                    })?;
+
+                    match v {
+                        Some(v) => builder.append_value(v.to_string()),
+                        None => builder.append_null(),
+                    }
                 }
                 Type::BPCHAR => {
                     let Some(builder) = builder else {
@@ -479,6 +502,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         }
         Type::DATE => Some(DataType::Date32),
         Type::UUID => Some(DataType::FixedSizeBinary(16)),
+        Type::JSON | Type::JSONB => Some(DataType::Utf8),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,
