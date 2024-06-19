@@ -7,6 +7,7 @@ pub mod column_reference;
 pub mod constraints;
 pub mod indexes;
 pub mod on_conflict;
+pub mod secrets;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::mysql::MySQLTableFactory;
 use data_components::Read;
@@ -22,7 +23,6 @@ use datafusion::datasource::TableProvider;
 use db_connection_pool::mysqlpool::MySQLConnectionPool;
 use db_connection_pool::DbConnectionPool;
 use mysql_async::prelude::ToValue;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -48,13 +48,23 @@ impl DataConnectorFactory for MySQL {
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let mut params: SecretMap = params.as_ref().into();
+        if let Some(secret) = secret {
+            secret.insert_to_params(
+                &mut params,
+                "mysql_connection_string_key",
+                "mysql_connection_string",
+            );
+            secret.insert_to_params(&mut params, "mysql_pass_key", "mysql_pass");
+        }
+
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(params, secret)
+                MySQLConnectionPool::new(Arc::new(params.into_map()))
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );

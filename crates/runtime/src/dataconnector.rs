@@ -44,7 +44,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
-use secrets::Secret;
+use crate::secrets::Secret;
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;

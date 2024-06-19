@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
@@ -34,7 +35,6 @@ use datafusion::{
     },
 };
 use futures::Future;
-use secrets::Secret;
 use snafu::prelude::*;
 
 use super::{DataConnector, DataConnectorFactory};

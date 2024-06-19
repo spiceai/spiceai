@@ -70,7 +70,6 @@ prost = { version = "0.12.1", default-features = false, features = [
     "prost-derive",
 ] }
 once_cell = "1.19.0"
-secrets = { path = "../secrets" }
 db_connection_pool = { path = "../db_connection_pool" }
 cache = { path = "../cache" }
 rusqlite = { workspace = true, optional = true }
@@ -94,6 +93,13 @@ metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
 async-openai.workspace = true
 derive_builder = "0.20.0"
+keyring = { version = "2.3.2", optional = true }
+secrecy.workspace = true
+base64 = "0.22.0"
+aws-config = { version = "1.1.10", optional = true}
+aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
+aws-sdk-sts = { version = "1.19.0", optional = true }
+toml = "0.8.8"
 
 [dev-dependencies]
 bollard = "0.16.1"
@@ -142,9 +148,9 @@ clickhouse = [
     "arrow_sql_gen/clickhouse",
     "data_components/clickhouse",
 ]
-keyring-secret-store = ["secrets/keyring-secret-store"]
+keyring-secret-store = ["dep:keyring"]
+aws-secrets-manager = ["dep:aws-config", "dep:aws-sdk-secretsmanager", "dep:aws-sdk-sts" ]
 flightsql = ["data_components/flightsql"]
-aws-secrets-manager = ["secrets/aws-secrets-manager"]
 databricks = ["data_components/databricks"]
 spark = ["data_components/spark_connect"]
 dremio = []

@@ -16,10 +16,10 @@ use runtime::{
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnectorError},
     extension::{Extension, ExtensionFactory, ExtensionManifest, Result},
+    secrets::Secret,
     spice_metrics::get_metrics_table_reference,
     Runtime,
 };
-use secrets::Secret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
