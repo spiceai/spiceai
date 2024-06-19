@@ -24,7 +24,13 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion, model::LLMModelStore, EmbeddingModelStore};
+use crate::{
+    config,
+    datafusion::DataFusion,
+    embeddings::vector_search::{self, compute_primary_keys},
+    model::LLMModelStore,
+    EmbeddingModelStore,
+};
 
 mod routes;
 mod v1;
@@ -54,7 +60,21 @@ pub(crate) async fn start<A>(
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app, df, models, llms, embeddings, config, with_metrics);
+    let vsearch = Arc::new(vector_search::VectorSearch::new(
+        Arc::clone(&df),
+        Arc::clone(&embeddings),
+        compute_primary_keys(Arc::clone(&app)).await,
+    ));
+    let routes = routes::routes(
+        app,
+        df,
+        models,
+        llms,
+        embeddings,
+        config,
+        with_metrics,
+        vsearch,
+    );
 
     let listener = TcpListener::bind(&bind_address)
         .await
