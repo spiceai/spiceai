@@ -1,0 +1,27 @@
+# permissions for end users to edit spicedinstances.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: spice-k8s-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: spicedinstance-editor-role
+rules:
+- apiGroups:
+  - spiceai.spiceai.org
+  resources:
+  - spicedinstances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - spiceai.spiceai.org
+  resources:
+  - spicedinstances/status
+  verbs:
+  - get
