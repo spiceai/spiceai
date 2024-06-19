@@ -22,9 +22,9 @@ use crate::{
     modelsource::{path, Error as ModelSourceError, ModelSource, ModelSourceType},
 };
 use arrow::record_batch::RecordBatch;
-use secrets::Secret;
+use secrecy::SecretString;
 use snafu::prelude::*;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
@@ -53,7 +53,7 @@ pub enum Error {
 impl Model {
     pub async fn load(
         model: spicepod::component::model::Model,
-        secret: Option<Secret>,
+        mut params: HashMap<String, SecretString>,
     ) -> Result<Self> {
         let Ok(source) = model.from.parse::<ModelSourceType>() else {
             return Err(Error::UnknownModelSource {
@@ -63,25 +63,21 @@ impl Model {
             });
         };
 
-        let Some(secret) = secret else {
-            tracing::warn!(
-                "Unable to load model {}: unable to get secret for source {}",
-                model.name,
-                source.to_string()
-            );
-            return UnableToLoadRequiredSecretsSnafu {}.fail();
-        };
-
-        let mut params = std::collections::HashMap::new();
-        params.insert("name".to_string(), model.name.to_string());
-        params.insert("path".to_string(), path(&model.from));
-        params.insert("from".to_string(), path(&model.from));
-        params.insert("files".to_string(), model.files.join(",").to_string());
+        params.insert(
+            "name".to_string(),
+            SecretString::from(model.name.to_string()),
+        );
+        params.insert("path".to_string(), SecretString::from(path(&model.from)));
+        params.insert("from".to_string(), SecretString::from(path(&model.from)));
+        params.insert(
+            "files".to_string(),
+            SecretString::from(model.files.join(",").to_string()),
+        );
 
         let model_source: Option<Box<dyn ModelSource>> = source.into();
         if let Some(model_source) = model_source {
             let path = model_source
-                .pull(secret, Arc::new(Option::from(params)))
+                .pull(Arc::new(params))
                 .await
                 .context(UnableToLoadModelSnafu)?;
 

@@ -56,6 +56,7 @@ use crate::{
         constraints::{self, get_primary_keys_from_constraints},
         indexes::IndexType,
         on_conflict::{self, OnConflict},
+        secrets::to_secret_map,
     },
     Read, ReadWrite,
 };
@@ -263,10 +264,10 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             );
         }
 
-        let params = Arc::new(options);
+        let params = Arc::new(to_secret_map(options));
 
         let pool = Arc::new(
-            PostgresConnectionPool::new(params, None)
+            PostgresConnectionPool::new(params)
                 .await
                 .context(UnableToCreatePostgresConnectionPoolSnafu)
                 .map_err(to_datafusion_error)?,
