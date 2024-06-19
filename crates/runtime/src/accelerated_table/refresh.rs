@@ -441,10 +441,10 @@ impl Refresher {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
                 }
-                Some(TimeFormat::UnixSeconds) => {
+                Some(TimeFormat::UnixSeconds) | None => {
                     value *= 1_000_000_000;
                 }
-                _ => (),
+                Some(TimeFormat::ISO8601) => (),
             }
         };
 
