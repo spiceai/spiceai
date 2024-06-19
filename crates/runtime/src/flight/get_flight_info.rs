@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use arrow_flight::{
     sql::{Any, Command},
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
@@ -28,7 +30,7 @@ pub(crate) async fn handle(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
-        return Ok(get_flight_info_simple(request));
+        return get_flight_info_simple(flight_svc, request).await;
     };
 
     match Command::try_from(message).map_err(to_tonic_err)? {
@@ -60,15 +62,28 @@ pub(crate) async fn handle(
     }
 }
 
-fn get_flight_info_simple(request: Request<FlightDescriptor>) -> Response<FlightInfo> {
+async fn get_flight_info_simple(
+    flight_svc: &Service,
+    request: Request<FlightDescriptor>,
+) -> Result<Response<FlightInfo>, Status> {
     tracing::trace!("get_flight_info_simple: {request:?}");
+
     let fd = request.into_inner();
-    Response::new(FlightInfo {
+    let sql = String::from_utf8(fd.cmd.clone().to_vec()).map_err(to_tonic_err)?;
+    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+        .await
+        .map_err(to_tonic_err)?;
+
+    let info = FlightInfo {
         flight_descriptor: Some(fd.clone()),
         endpoint: vec![FlightEndpoint {
             ticket: Some(Ticket { ticket: fd.cmd }),
             ..Default::default()
         }],
         ..Default::default()
-    })
+    }
+    .try_with_schema(&arrow_schema)
+    .map_err(to_tonic_err)?;
+
+    Ok(Response::new(info))
 }
