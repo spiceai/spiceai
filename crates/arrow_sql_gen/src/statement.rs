@@ -118,7 +118,7 @@ impl CreateTableBuilder {
 
         // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
         // https://www.postgresql.org/docs/current/rowtypes.html
-        let mut type_creation_stmts = Vec::new();
+        //let mut type_creation_stmts = Vec::new();
 
         vec![create_stmt.to_string(query_builder)]
     }

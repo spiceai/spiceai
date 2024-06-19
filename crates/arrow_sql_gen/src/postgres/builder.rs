@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::module_name_repetitions)]
 
 use arrow::datatypes::Fields;
-use sea_query::{Alias, ColumnDef, PostgresQueryBuilder, TableBuilder, Write};
+use sea_query::{Alias, ColumnDef, PostgresQueryBuilder, TableBuilder};
 
 use crate::statement::map_data_type_to_column_type;
 
@@ -35,28 +35,48 @@ impl<'a> TypeBuilder<'a> {
     }
 
     #[must_use]
-    pub fn build(self) -> Vec<String> {
+    pub fn build(self) -> String {
         let pg_builder = PostgresQueryBuilder;
-
-        // To be idempotent, we need to drop the type if it already exists before creating it.
-        let mut drop_sql = String::new();
 
         let mut sql = String::new();
 
-        let _ = write!(sql, "CREATE TYPE {} AS (", self.name);
+        // Postgres doesn't natively support a CREATE TYPE IF NOT EXISTS statement,
+        // so we'll wrap it in a DO block with a conditional check.
+
+        sql.push_str(&format!(
+            "
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_type t
+                WHERE t.typname = '{}'
+            ) THEN
+                ",
+            self.name
+        ));
+
+        sql.push_str(&format!("CREATE TYPE {} AS (", self.name));
 
         let mut first = true;
 
         for column_def in &self.columns {
             if !first {
-                let _ = write!(sql, ", ");
+                sql.push_str(", ");
             }
 
             pg_builder.prepare_column_def(column_def, &mut sql);
             first = false;
         }
 
-        let _ = write!(sql, " )");
+        sql.push_str(" );");
+
+        sql.push_str(
+            "
+            END IF;
+        END $$;
+        ",
+        );
 
         sql
     }
@@ -92,6 +112,20 @@ mod tests {
         let type_builder = TypeBuilder::new("person", schema.fields());
         let sql = type_builder.build();
 
-        assert_eq!(sql, r#"CREATE TYPE person AS ("id" integer, "name" text )"#);
+        assert_eq!(
+            sql,
+            r#"
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_type t
+                WHERE t.typname = 'person'
+            ) THEN
+                CREATE TYPE person AS ("id" integer, "name" text );
+            END IF;
+        END $$;
+        "#
+        );
     }
 }
