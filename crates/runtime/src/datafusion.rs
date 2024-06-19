@@ -592,7 +592,7 @@ impl DataFusion {
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(TableReference::from(dataset_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 
