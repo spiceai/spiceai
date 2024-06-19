@@ -57,7 +57,7 @@ impl Read for ClickhouseTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let table_provider = Arc::new(
-            SqlTable::new("clickhouse", &pool, table_reference, None)
+            SqlTable::new("clickhouse", &pool, table_reference, None, None)
                 .await
                 .context(UnableToConstructSQLTableSnafu)?,
         );

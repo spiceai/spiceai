@@ -6,7 +6,7 @@ use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::sync::Arc;
 
-use crate::{get_stream, to_execution_error, SqlTable, UnableToGetSchemaSnafu};
+use crate::{get_cte, get_stream, to_execution_error, SqlTable, UnableToGetSchemaSnafu};
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
@@ -70,7 +70,8 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
         schema: SchemaRef,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         println!("[SQLExecutor]: Executing query: {}", query);
-        let fut = get_stream(Arc::clone(&self.pool), query.to_string());
+        let sql = format!("{cte} {query}", cte=get_cte(&self.temporary_cte));
+        let fut = get_stream(Arc::clone(&self.pool), sql.to_string());
 
         let stream = futures::stream::once(fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))

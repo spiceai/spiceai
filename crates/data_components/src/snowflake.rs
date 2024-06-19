@@ -41,7 +41,7 @@ impl Read for SnowflakeTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let table_provider = Arc::new(
-            SqlTable::new("snowflake", &pool, table_reference, None)
+            SqlTable::new("snowflake", &pool, table_reference, None, None)
                 .await
                 .context(UnableToConstructSQLTableSnafu)?,
         );

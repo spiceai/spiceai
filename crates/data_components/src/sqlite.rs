@@ -219,6 +219,7 @@ impl TableProviderFactory for SqliteTableFactory {
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
             Some(Engine::SQLite),
+            None,
         ));
 
         let sqlite = Arc::into_inner(sqlite)

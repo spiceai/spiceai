@@ -239,6 +239,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
             Some(Engine::DuckDB),
+            None,
         ));
 
         let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb, on_conflict);
@@ -427,7 +428,15 @@ impl Read for DuckDBTableFactory {
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
 
         let schema = get_schema(conn, &table_reference).await?;
-        let table_provider = Arc::new(SqlTable::new_with_schema("duckdb", &dyn_pool, schema, table_reference, None));
+
+
+        let (tbl_ref, cte) = if is_table_function(&table_reference) {
+            (TableReference::bare("tbl_ref"), Some(HashMap::from_iter(vec![("tbl_ref".to_string(), format!("SELECT * FROM {}", table_reference.to_string()))])))
+        } else {
+            (table_reference.clone(), None)
+        };
+
+        let table_provider = Arc::new(SqlTable::new_with_schema("duckdb", &dyn_pool, schema, tbl_ref, None, cte));
         let table_provider = Arc::new(table_provider.create_federated_table_provider()?);
         Ok(table_provider)
     }

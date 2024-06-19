@@ -23,7 +23,9 @@ use db_connection_pool::DbConnectionPool;
 use expr::Engine;
 use futures::TryStreamExt;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::fmt::Display;
+use std::hash::Hash;
 use std::{any::Any, fmt, sync::Arc};
 
 use datafusion::{
@@ -66,6 +68,7 @@ pub struct SqlTable<T: 'static, P: 'static> {
     table_reference: TableReference,
     engine: Option<Engine>,
     dialect: Option<Arc<dyn Dialect + Send + Sync>>,
+    temporary_cte: Option<HashMap<String, String>>
 }
 
 // Jeadie: What happens if I had a view at the bottom, like in the execution plan for this [`SqlTable`]? Datafusion would not be able to federate anything underneath it (i.e. the view's logical/execution plan ).
@@ -95,6 +98,7 @@ impl<T, P> SqlTable<T, P> {
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
+        temporary_cte: Option<HashMap<String, String>>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let conn = pool
@@ -113,6 +117,7 @@ impl<T, P> SqlTable<T, P> {
             table_reference,
             engine,
             dialect: None,
+            temporary_cte
         })
     }
 
@@ -122,6 +127,7 @@ impl<T, P> SqlTable<T, P> {
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
+        temporary_cte: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
             name,
@@ -130,6 +136,7 @@ impl<T, P> SqlTable<T, P> {
             table_reference: table_reference.into(),
             engine,
             dialect: None,
+            temporary_cte 
         }
     }
 
@@ -156,6 +163,7 @@ impl<T, P> SqlTable<T, P> {
             filters,
             limit,
             self.engine,
+            self.temporary_cte.clone(),
         )?))
     }
 
@@ -220,6 +228,7 @@ struct SqlExec<T, P> {
     limit: Option<usize>,
     properties: PlanProperties,
     engine: Option<Engine>,
+    temporary_cte: Option<HashMap<String, String>>,
 }
 
 pub fn project_schema_safe(
@@ -248,6 +257,7 @@ impl<T, P> SqlExec<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
         engine: Option<Engine>,
+        temporary_cte: Option<HashMap<String, String>>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema_safe(schema, projections)?;
 
@@ -263,6 +273,7 @@ impl<T, P> SqlExec<T, P> {
                 ExecutionMode::Bounded,
             ),
             engine,
+            temporary_cte
         })
     }
 
@@ -299,8 +310,8 @@ impl<T, P> SqlExec<T, P> {
         };
 
         Ok(format!(
-            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference.to_string(),
+            "{cte_expr} SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            table_reference = self.table_reference.to_string(), cte_expr=get_cte(&self.temporary_cte)
         ))
     }
 }
@@ -378,6 +389,17 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) ->
     DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
 
+pub fn get_cte(temporary_cte: &Option<HashMap<String, String>>) -> String {
+    if let Some(temp_cte) = temporary_cte {
+        let inner = temp_cte.iter().map(|(name, sql)| {
+            format!("{} AS ({})", name, sql)
+        }).collect::<Vec<_>>().join(", ");
+        format!("WITH {inner} ")
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, sync::Arc};
@@ -423,7 +445,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None, None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -449,7 +471,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None, None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

@@ -57,7 +57,7 @@ CREATE TABLE test (
         )
         .await
         .expect("row inserted");
-    let table = SqlTable::new("postgres", &pool, "test", None)
+    let table = SqlTable::new("postgres", &pool, "test", None, None)
         .await
         .expect("SqlTable should be created");
     ctx.register_table("test_datafusion", Arc::new(table))
