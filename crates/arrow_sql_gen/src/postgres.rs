@@ -48,6 +48,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{types::Type, Column, Row};
 
+pub mod builder;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to build record batch: {source}"))]

@@ -24,7 +24,7 @@ use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
-    Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
+    Alias, BlobSize, ColumnDef, ColumnType, Expr, GenericBuilder, Index, InsertStatement, IntoIden,
     IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
     SimpleExpr, SqliteQueryBuilder, Table,
 };
@@ -68,22 +68,30 @@ impl CreateTableBuilder {
     }
 
     #[must_use]
-    pub fn build_postgres(self) -> String {
+    pub fn build_postgres(self) -> Vec<String> {
         self.build(PostgresQueryBuilder)
     }
 
     #[must_use]
     pub fn build_sqlite(self) -> String {
-        self.build(SqliteQueryBuilder)
+        let stmts = self.build(SqliteQueryBuilder);
+        let Some(stmt) = stmts.into_iter().next() else {
+            unreachable!("Expected one statement, found none")
+        };
+        stmt
     }
 
     #[must_use]
     pub fn build_mysql(self) -> String {
-        self.build(MysqlQueryBuilder)
+        let stmts = self.build(MysqlQueryBuilder);
+        let Some(stmt) = stmts.into_iter().next() else {
+            unreachable!("Expected one statement, found none")
+        };
+        stmt
     }
 
     #[must_use]
-    pub fn build<T: GenericBuilder>(self, query_builder: T) -> String {
+    pub fn build<T: GenericBuilder>(self, query_builder: T) -> Vec<String> {
         let mut create_stmt = Table::create();
         create_stmt
             .table(Alias::new(self.table_name))
@@ -108,7 +116,11 @@ impl CreateTableBuilder {
             create_stmt.primary_key(&mut index);
         }
 
-        create_stmt.to_string(query_builder)
+        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
+        // https://www.postgresql.org/docs/current/rowtypes.html
+        let mut type_creation_stmts = Vec::new();
+
+        vec![create_stmt.to_string(query_builder)]
     }
 }
 
@@ -433,6 +445,188 @@ impl InsertBuilder {
                             row_values.push(valid_array.value(row).into());
                         }
                     }
+                    DataType::Struct(fields) => {
+                        let array = column.as_any().downcast_ref::<array::StructArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+
+                            let mut param_values: Vec<SimpleExpr> = vec![];
+
+                            for col in valid_array.columns() {
+                                match col.data_type() {
+                                    DataType::Int8 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int8Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Int16 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int16Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Int32 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int32Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Int64 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int64Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt8 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt8Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt16 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt16Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt32 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt32Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt64 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt64Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Float32 => {
+                                        let float_array =
+                                            col.as_any().downcast_ref::<array::Float32Array>();
+
+                                        if let Some(valid_float_array) = float_array {
+                                            param_values.push(valid_float_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Float64 => {
+                                        let float_array =
+                                            col.as_any().downcast_ref::<array::Float64Array>();
+
+                                        if let Some(valid_float_array) = float_array {
+                                            param_values.push(valid_float_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Utf8 => {
+                                        let string_array =
+                                            col.as_any().downcast_ref::<array::StringArray>();
+
+                                        if let Some(valid_string_array) = string_array {
+                                            param_values.push(valid_string_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Null => {
+                                        param_values.push(Keyword::Null.into());
+                                    }
+                                    DataType::Boolean => {
+                                        let bool_array =
+                                            col.as_any().downcast_ref::<array::BooleanArray>();
+
+                                        if let Some(valid_bool_array) = bool_array {
+                                            param_values.push(valid_bool_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Binary => {
+                                        let binary_array =
+                                            col.as_any().downcast_ref::<array::BinaryArray>();
+
+                                        if let Some(valid_binary_array) = binary_array {
+                                            param_values.push(valid_binary_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::FixedSizeBinary(_) => {
+                                        let binary_array = col
+                                            .as_any()
+                                            .downcast_ref::<array::FixedSizeBinaryArray>();
+
+                                        if let Some(valid_binary_array) = binary_array {
+                                            param_values.push(valid_binary_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::LargeBinary => {
+                                        let binary_array =
+                                            col.as_any().downcast_ref::<array::LargeBinaryArray>();
+
+                                        if let Some(valid_binary_array) = binary_array {
+                                            param_values.push(valid_binary_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::LargeUtf8 => {
+                                        let string_array =
+                                            col.as_any().downcast_ref::<array::LargeStringArray>();
+
+                                        if let Some(valid_string_array) = string_array {
+                                            param_values.push(valid_string_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Float16
+                                    | DataType::Timestamp(_, _)
+                                    | DataType::Date32
+                                    | DataType::Date64
+                                    | DataType::Time32(_)
+                                    | DataType::Time64(_)
+                                    | DataType::Duration(_)
+                                    | DataType::Interval(_)
+                                    | DataType::BinaryView
+                                    | DataType::Utf8View
+                                    | DataType::List(_)
+                                    | DataType::ListView(_)
+                                    | DataType::FixedSizeList(_, _)
+                                    | DataType::LargeList(_)
+                                    | DataType::LargeListView(_)
+                                    | DataType::Struct(_)
+                                    | DataType::Union(_, _)
+                                    | DataType::Dictionary(_, _)
+                                    | DataType::Map(_, _)
+                                    | DataType::RunEndEncoded(_, _)
+                                    | DataType::Decimal128(_, _)
+                                    | DataType::Decimal256(_, _) => {
+                                        unimplemented!(
+                                            "Data type mapping not implemented for Struct of {}",
+                                            col.data_type()
+                                        )
+                                    }
+                                }
+                            }
+
+                            let param_format = vec!["?"; fields.len()].join(", ");
+                            row_values.push(Expr::cust_with_exprs(
+                                format!("ROW({param_format})"),
+                                param_values,
+                            ));
+                        }
+                    }
                     unimplemented_type => {
                         return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
                             data_type: unimplemented_type.clone(),
@@ -580,7 +774,7 @@ fn insert_timestamp_into_row_values(
     }
 }
 
-fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
+pub(crate) fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
     match data_type {
         DataType::Int8 => ColumnType::TinyInteger,
         DataType::Int16 => ColumnType::SmallInteger,
@@ -625,7 +819,7 @@ mod tests {
         ]);
         let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users").build_postgres();
 
-        assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
+        assert_eq!(sql[0], "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
     }
 
     #[test]
@@ -684,7 +878,7 @@ mod tests {
             .primary_keys(vec!["id", "id2"])
             .build_postgres();
 
-        assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"id2\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer, PRIMARY KEY (\"id\", \"id2\") )");
+        assert_eq!(sql[0], "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"id2\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer, PRIMARY KEY (\"id\", \"id2\") )");
     }
 
     #[test]

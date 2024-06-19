@@ -38,7 +38,7 @@ serde = { version = "1.0.195", features = ["derive"] }
 serde_yaml = "0.9.30"
 serde_json = "1.0.1"
 snafu = "0.8.0"
-tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
+tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal", "macros"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
