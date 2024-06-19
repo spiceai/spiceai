@@ -18,6 +18,7 @@ pub struct SpiceAI {}
 
 use super::ModelSource;
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
@@ -27,19 +28,13 @@ use std::string::ToString;
 use std::sync::Arc;
 
 use regex::Regex;
-use secrets::Secret;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
-    async fn pull(
-        &self,
-        secret: Secret,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> super::Result<String> {
+    async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("name"))
+            .get("name")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let Some(name) = name else {
@@ -53,9 +48,8 @@ impl ModelSource for SpiceAI {
         let local_path = super::ensure_model_path(name.as_str())?;
 
         let remote_path = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("path"))
+            .get("path")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let Some(remote_path) = remote_path else {
@@ -109,7 +103,13 @@ impl ModelSource for SpiceAI {
         let client = reqwest::Client::new();
         let data: ModelRoot = client
             .get(url)
-            .bearer_auth(secret.get("token").unwrap_or_default())
+            .bearer_auth(
+                params
+                    .get("token")
+                    .map(Secret::expose_secret)
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
             .send()
             .await
             .context(super::UnableToFetchModelSnafu)?

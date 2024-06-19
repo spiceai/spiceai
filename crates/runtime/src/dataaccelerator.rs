@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::secrets::ExposeSecret;
+use crate::secrets::Secret;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::util::{column_reference::ColumnReference, on_conflict::OnConflict};
@@ -24,8 +26,6 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use lazy_static::lazy_static;
-use secrets::ExposeSecret;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;

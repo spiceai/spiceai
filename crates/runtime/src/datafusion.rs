@@ -25,6 +25,7 @@ use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::object_store_registry::default_runtime_env;
+use crate::secrets::Secret;
 use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
@@ -41,7 +42,6 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 use query::{Protocol, QueryBuilder};
-use secrets::Secret;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
