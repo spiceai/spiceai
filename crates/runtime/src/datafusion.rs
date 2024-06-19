@@ -25,6 +25,7 @@ use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::object_store_registry::default_runtime_env;
+use crate::secrets::Secret;
 use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
@@ -41,7 +42,6 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 use query::{Protocol, QueryBuilder};
-use secrets::Secret;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -53,6 +53,7 @@ pub mod filter_converter;
 pub mod initial_load;
 pub mod refresh_sql;
 pub mod schema;
+pub mod udf;
 
 use self::schema::SpiceSchemaProvider;
 
@@ -220,6 +221,8 @@ impl DataFusion {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
+        ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
+        ctx.register_udf(crate::datafusion::udf::Least::new().into());
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
@@ -589,7 +592,7 @@ impl DataFusion {
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(TableReference::from(dataset_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 

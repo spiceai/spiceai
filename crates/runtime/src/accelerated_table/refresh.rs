@@ -441,10 +441,10 @@ impl Refresher {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
                 }
-                Some(TimeFormat::UnixSeconds) => {
+                Some(TimeFormat::UnixSeconds) | None => {
                     value *= 1_000_000_000;
                 }
-                _ => (),
+                Some(TimeFormat::ISO8601) => (),
             }
         };
 
@@ -1012,6 +1012,7 @@ mod tests {
             source_data: Vec<u64>,
             existing_data: Vec<u64>,
             expected_size: usize,
+            time_format: Option<TimeFormat>,
             append_overlap: Option<Duration>,
             message: &str,
         ) {
@@ -1041,7 +1042,7 @@ mod tests {
 
             let refresh = Refresh::new(
                 Some("time".to_string()),
-                Some(TimeFormat::UnixSeconds),
+                time_format,
                 None,
                 None,
                 RefreshMode::Append,
@@ -1100,6 +1101,7 @@ mod tests {
             vec![1, 2, 3],
             vec![],
             3,
+            Some(TimeFormat::UnixSeconds),
             None,
             "should insert all data into empty accelerator",
         )
@@ -1108,6 +1110,7 @@ mod tests {
             vec![1, 2, 3],
             vec![2, 3, 4, 5],
             4,
+            Some(TimeFormat::UnixSeconds),
             None,
             "should not insert any stale data and keep original size",
         )
@@ -1116,6 +1119,7 @@ mod tests {
             vec![],
             vec![1, 2, 3, 4],
             4,
+            Some(TimeFormat::UnixSeconds),
             None,
             "should keep original data of accelerator when no new data is found",
         )
@@ -1124,6 +1128,7 @@ mod tests {
             vec![5, 6],
             vec![1, 2, 3, 4],
             6,
+            Some(TimeFormat::UnixSeconds),
             None,
             "should apply new data onto existing data",
         )
@@ -1134,6 +1139,7 @@ mod tests {
             vec![4, 4],
             vec![1, 2, 3, 4],
             4,
+            Some(TimeFormat::UnixSeconds),
             None,
             "should not apply same timestamp data",
         )
@@ -1143,6 +1149,7 @@ mod tests {
             vec![4, 5, 6, 7, 8, 9, 10],
             vec![1, 2, 3, 9],
             10,
+            Some(TimeFormat::UnixSeconds),
             Some(Duration::from_secs(10)),
             "should apply late arrival and new data onto existing data",
         )
@@ -1152,8 +1159,28 @@ mod tests {
             vec![4, 5, 6, 7, 8, 9, 10],
             vec![1, 2, 3, 9],
             7, // 1, 2, 3, 7, 8, 9, 10
+            Some(TimeFormat::UnixSeconds),
             Some(Duration::from_secs(3)),
             "should apply late arrival within the append overlap period and new data onto existing data",
+        )
+        .await;
+
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            7, // 1, 2, 3, 7, 8, 9, 10
+            None,
+            Some(Duration::from_secs(3)),
+            "should default to time unix seconds",
+        )
+        .await;
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            10, // all the data
+            Some(TimeFormat::UnixMillis),
+            Some(Duration::from_secs(3)),
+            "should fetch all data as 3 seconds is enough to cover all time span in source with millis",
         )
         .await;
     }
