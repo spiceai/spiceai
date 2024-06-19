@@ -18,6 +18,7 @@ use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use async_trait::async_trait;
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
@@ -53,7 +54,7 @@ pub enum Error {
 
 pub struct ODBCPool {
     pool: &'static Environment,
-    params: Arc<HashMap<String, String>>,
+    params: Arc<HashMap<String, SecretString>>,
     connection_string: String,
 }
 
@@ -63,9 +64,10 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub fn new(params: Arc<HashMap<String, String>>) -> Result<Self> {
+    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Result<Self> {
         let connection_string = params
             .get("odbc_connection_string")
+            .map(Secret::expose_secret)
             .map(ToString::to_string)
             .context(MissingConnectionStringSnafu)?;
         Ok(Self {

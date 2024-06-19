@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::mysql::MySQLTableFactory;
 use data_components::Read;
@@ -48,7 +48,7 @@ impl DataConnectorFactory for MySQL {
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params = (*params).clone();
+        let mut params: SecretMap = params.as_ref().into();
         if let Some(secret) = secret {
             secret.insert_to_params(
                 &mut params,
@@ -64,7 +64,7 @@ impl DataConnectorFactory for MySQL {
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(Arc::new(params))
+                MySQLConnectionPool::new(Arc::new(params.into_map()))
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );

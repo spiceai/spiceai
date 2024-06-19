@@ -22,6 +22,7 @@ use data_components::Read;
 
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
+use crate::secrets::SecretMap;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use db_connection_pool::DbConnectionPool;
@@ -50,7 +51,7 @@ impl DataConnectorFactory for Snowflake {
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params = (*params).clone();
+        let mut params: SecretMap = params.as_ref().into();
         if let Some(secret) = secret {
             secret.insert_to_params(&mut params, "username_key", "username");
             secret.insert_to_params(&mut params, "account_key", "account");

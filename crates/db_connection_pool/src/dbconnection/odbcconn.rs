@@ -34,6 +34,7 @@ use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
 use odbc_api::Cursor;
 use odbc_api::CursorImpl;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use snafu::Snafu;
 
@@ -75,7 +76,7 @@ pub enum Error {
 
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,
-    pub params: Arc<HashMap<String, String>>,
+    pub params: Arc<HashMap<String, SecretString>>,
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
@@ -177,7 +178,7 @@ where
 fn build_odbc_reader<C: Cursor>(
     cursor: C,
     schema: &Arc<Schema>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<OdbcReader<C>> {
     let mut builder = OdbcReaderBuilder::new();
     builder.with_schema(Arc::clone(schema));
@@ -185,6 +186,7 @@ fn build_odbc_reader<C: Cursor>(
     let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize)| {
         params
             .get(k)
+            .map(Secret::expose_secret)
             .cloned()
             .and_then(|s| s.parse::<usize>().ok())
             .into_iter()

@@ -54,6 +54,7 @@ regex = "1.10.4"
 bytes = "1.6.0"
 url = "2.5.0"
 itertools.workspace = true
+secrecy.workspace = true
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb"]

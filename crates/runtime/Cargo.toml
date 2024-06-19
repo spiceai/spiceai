@@ -94,7 +94,7 @@ prometheus-parse = "0.2.5"
 async-openai.workspace = true
 derive_builder = "0.20.0"
 keyring = { version = "2.3.2", optional = true }
-secrecy = "0.8.0"
+secrecy.workspace = true
 base64 = "0.22.0"
 aws-config = { version = "1.1.10", optional = true}
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }

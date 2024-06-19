@@ -19,6 +19,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use deltalake::aws::storage::s3_constants::AWS_S3_ALLOW_UNSAFE_RENAME;
 use deltalake::open_table_with_storage_options;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use serde::Deserialize;
 use std::{collections::HashMap, error::Error, sync::Arc};
 
@@ -28,12 +29,12 @@ use crate::deltatable::write::DeltaTableWriter;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
-    pub params: Arc<HashMap<String, String>>,
+    pub params: Arc<HashMap<String, SecretString>>,
 }
 
 impl DatabricksDelta {
     #[must_use]
-    pub fn new(params: Arc<HashMap<String, String>>) -> Self {
+    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Self {
         Self { params }
     }
 }
@@ -62,7 +63,7 @@ impl ReadWrite for DatabricksDelta {
 
 async fn get_delta_table(
     table_reference: TableReference,
-    params: Arc<HashMap<String, String>>,
+    params: Arc<HashMap<String, SecretString>>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn Error + Send + Sync>> {
     // Needed to be able to load the s3:// scheme
     deltalake::aws::register_handlers(None);
@@ -74,7 +75,7 @@ async fn get_delta_table(
         if key == "token" {
             continue;
         }
-        storage_options.insert(key.to_string(), value.to_string());
+        storage_options.insert(key.to_string(), value.expose_secret().to_string());
     }
     storage_options.insert(AWS_S3_ALLOW_UNSAFE_RENAME.to_string(), "true".to_string());
 
@@ -91,16 +92,16 @@ struct DatabricksTablesApiResponse {
 #[allow(clippy::implicit_hasher)]
 pub async fn resolve_table_uri(
     table_reference: TableReference,
-    params: Arc<HashMap<String, String>>,
+    params: Arc<HashMap<String, SecretString>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(endpoint) = params.get("endpoint") else {
+    let Some(endpoint) = params.get("endpoint").map(Secret::expose_secret) else {
         return Err("Endpoint not found in dataset params".into());
     };
 
     let table_name = table_reference.table();
 
     let mut token = "Token not found in auth provider";
-    if let Some(token_secret_val) = params.get("token") {
+    if let Some(token_secret_val) = params.get("token").map(Secret::expose_secret) {
         token = token_secret_val;
     };
 

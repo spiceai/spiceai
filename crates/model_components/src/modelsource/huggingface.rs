@@ -18,6 +18,7 @@ use super::Error;
 use super::ModelSource;
 use async_trait::async_trait;
 use regex::Regex;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -27,8 +28,11 @@ pub struct Huggingface {}
 
 #[async_trait]
 impl ModelSource for Huggingface {
-    async fn pull(&self, params: Arc<HashMap<String, String>>) -> super::Result<String> {
-        let name = params.get("name").map(ToString::to_string);
+    async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
+        let name = params
+            .get("name")
+            .map(Secret::expose_secret)
+            .map(ToString::to_string);
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
@@ -37,7 +41,10 @@ impl ModelSource for Huggingface {
             .build());
         };
 
-        let files_param = params.get("files").map(ToString::to_string);
+        let files_param = params
+            .get("files")
+            .map(Secret::expose_secret)
+            .map(ToString::to_string);
 
         let files = match files_param {
             Some(files) => files.split(',').map(ToString::to_string).collect(),
@@ -47,7 +54,10 @@ impl ModelSource for Huggingface {
         // it is not copying local model into .spice folder
         let local_path = super::ensure_model_path(name.as_str())?;
 
-        let remote_path = params.get("path").map(ToString::to_string);
+        let remote_path = params
+            .get("path")
+            .map(Secret::expose_secret)
+            .map(ToString::to_string);
 
         let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
@@ -115,6 +125,7 @@ impl ModelSource for Huggingface {
                 .bearer_auth(
                     params
                         .get("token")
+                        .map(Secret::expose_secret)
                         .map(ToString::to_string)
                         .unwrap_or_default(),
                 )

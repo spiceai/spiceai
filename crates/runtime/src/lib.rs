@@ -46,8 +46,7 @@ use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
-use secrecy::ExposeSecret;
-use secrets::{spicepod_secret_store_type, Secret};
+use secrets::{spicepod_secret_store_type, Secret, SecretMap};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
@@ -881,14 +880,14 @@ impl Runtime {
             }
         };
 
-        let mut params: HashMap<String, String> = HashMap::new();
+        let mut params: SecretMap = SecretMap::new();
         if let Some(secret) = secret {
             for (k, v) in secret.iter() {
-                params.insert(k.to_string(), v.expose_secret().to_string());
+                params.insert(k.to_string(), v.clone());
             }
         }
 
-        match Model::load(m.clone(), params).await {
+        match Model::load(m.clone(), params.into_map()).await {
             Ok(in_m) => {
                 let mut model_map = self.models.write().await;
                 model_map.insert(m.name.clone(), in_m);

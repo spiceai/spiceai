@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
@@ -53,7 +53,7 @@ where
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params = (*params).clone();
+        let mut params: SecretMap = params.as_ref().into();
         if let Some(secret) = secret {
             secret.insert_to_params(
                 &mut params,
@@ -64,7 +64,8 @@ where
 
         Box::pin(async move {
             let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
-                ODBCPool::new(Arc::new(params)).context(UnableToCreateODBCConnectionPoolSnafu)?,
+                ODBCPool::new(Arc::new(params.into_map()))
+                    .context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
             let odbc_factory = ODBCTableFactory::new(pool);

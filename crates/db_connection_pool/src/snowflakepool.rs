@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use pkcs8::{LineEnding, SecretDocument};
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
 use std::{collections::HashMap, fs, sync::Arc};
@@ -78,22 +79,31 @@ impl SnowflakeConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: &HashMap<String, String>) -> Result<Self> {
+    pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self> {
         let username = params
             .get("username")
+            .map(Secret::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "username" })?;
 
         let account = params
             .get("account")
+            .map(Secret::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "account" })?;
         // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
         let account = account.replace('.', "-");
 
-        let warehouse = params.get("snowflake_warehouse").map(ToString::to_string);
-        let role = params.get("snowflake_role").map(ToString::to_string);
+        let warehouse = params
+            .get("snowflake_warehouse")
+            .map(Secret::expose_secret)
+            .map(ToString::to_string);
+        let role = params
+            .get("snowflake_role")
+            .map(Secret::expose_secret)
+            .map(ToString::to_string);
 
         let auth_type = params
             .get("snowflake_auth_type")
+            .map(Secret::expose_secret)
             .map_or_else(|| "snowflake".to_string(), ToString::to_string)
             .to_lowercase();
 
@@ -153,10 +163,11 @@ fn init_snowflake_api_with_password_auth(
     username: &str,
     warehouse: &Option<String>,
     role: &Option<String>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<SnowflakeApi> {
     let password = params
         .get("password")
+        .map(Secret::expose_secret)
         .context(MissingRequiredSecretSnafu { name: "password" })?;
     let api = SnowflakeApi::with_password_auth(
         account,
@@ -177,14 +188,14 @@ fn init_snowflake_api_with_keypair_auth(
     username: &str,
     warehouse: &Option<String>,
     role: &Option<String>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<SnowflakeApi> {
-    let private_key_path =
-        params
-            .get("snowflake_private_key_path")
-            .context(MissingRequiredSecretSnafu {
-                name: "snowflake_private_key_path",
-            })?;
+    let private_key_path = params
+        .get("snowflake_private_key_path")
+        .map(Secret::expose_secret)
+        .context(MissingRequiredSecretSnafu {
+            name: "snowflake_private_key_path",
+        })?;
 
     let mut private_key_pem: String =
         fs::read_to_string(private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
@@ -195,12 +206,12 @@ fn init_snowflake_api_with_keypair_auth(
         SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
 
     if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
-        let passphrase =
-            params
-                .get("snowflake_private_key_passphrase")
-                .context(MissingRequiredSecretSnafu {
-                    name: "snowflake_private_key_passphrase",
-                })?;
+        let passphrase = params
+            .get("snowflake_private_key_passphrase")
+            .map(Secret::expose_secret)
+            .context(MissingRequiredSecretSnafu {
+                name: "snowflake_private_key_passphrase",
+            })?;
 
         private_key_pem = decode_pkcs8_encrypted_data(&data, passphrase)?;
     }

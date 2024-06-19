@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::clickhouse::ClickhouseTableFactory;
 use data_components::Read;
@@ -46,19 +46,19 @@ impl DataConnectorFactory for Clickhouse {
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params = (*params).clone();
+        let mut secret_params: SecretMap = params.as_ref().into();
 
         if let Some(secret) = secret {
             secret.insert_to_params(
-                &mut params,
+                &mut secret_params,
                 "clickhouse_connection_string_key",
                 "clickhouse_connection_string",
             );
-            secret.insert_to_params(&mut params, "clickhouse_pass_key", "clickhouse_pass");
+            secret.insert_to_params(&mut secret_params, "clickhouse_pass_key", "clickhouse_pass");
         }
 
         Box::pin(async move {
-            match ClickhouseConnectionPool::new(Arc::new(params)).await {
+            match ClickhouseConnectionPool::new(Arc::new(secret_params.into_map())).await {
                 Ok(pool) => {
                     let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Self { clickhouse_factory }) as Arc<dyn DataConnector>)
