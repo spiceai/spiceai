@@ -17,11 +17,11 @@ limitations under the License.
 use async_trait::async_trait;
 
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use data_components::spark_connect::SparkConnect;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;

@@ -17,7 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 
 use super::ModelSource;
-use secrets::Secret;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::Arc;
@@ -25,15 +25,10 @@ use std::sync::Arc;
 pub struct Local {}
 #[async_trait]
 impl ModelSource for Local {
-    async fn pull(
-        &self,
-        _: Secret,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> super::Result<String> {
+    async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("name"))
+            .get("name")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let Some(name) = name else {
@@ -47,9 +42,8 @@ impl ModelSource for Local {
         let _ = super::ensure_model_path(name.as_str())?;
 
         let path = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("from"))
+            .get("from")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let Some(path) = path else {

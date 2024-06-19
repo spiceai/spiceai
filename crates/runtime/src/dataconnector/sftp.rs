@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use secrets::{get_secret_or_param, Secret};
+use crate::secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
