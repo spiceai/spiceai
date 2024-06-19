@@ -22,13 +22,16 @@ pub mod file;
 pub mod keyring;
 pub mod kubernetes;
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+};
 
 use async_trait::async_trait;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
-use crate::file::FileSecretStore;
+use crate::secrets::file::FileSecretStore;
 use spicepod::component::secrets::SpiceSecretStore;
 
 pub use secrecy::ExposeSecret;
@@ -39,9 +42,7 @@ pub enum Error {
     UnableToLoadSecrets { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
-    UnableToInitializeAwsSecretsManager {
-        source: crate::aws_secrets_manager::Error,
-    },
+    UnableToInitializeAwsSecretsManager { source: aws_secrets_manager::Error },
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue {},
 }
@@ -55,8 +56,73 @@ pub trait SecretStore {
 }
 
 #[derive(Debug, Clone)]
+pub struct SecretMap(HashMap<String, SecretString>);
+
+impl SecretMap {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    #[must_use]
+    pub fn into_map(self) -> HashMap<String, SecretString> {
+        self.0
+    }
+}
+
+impl Default for SecretMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for SecretMap {
+    type Target = HashMap<String, SecretString>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SecretMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl FromIterator<(String, SecretString)> for SecretMap {
+    fn from_iter<T: IntoIterator<Item = (String, SecretString)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl FromIterator<(String, String)> for SecretMap {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        Self(
+            iter.into_iter()
+                .map(|(k, v)| (k, SecretString::from(v)))
+                .collect(),
+        )
+    }
+}
+
+impl From<HashMap<String, String>> for SecretMap {
+    fn from(map: HashMap<String, String>) -> Self {
+        map.into_iter().collect()
+    }
+}
+
+impl From<&HashMap<String, String>> for SecretMap {
+    fn from(map: &HashMap<String, String>) -> Self {
+        map.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Secret {
-    data: HashMap<String, SecretString>,
+    data: SecretMap,
 }
 
 impl Secret {
@@ -83,6 +149,22 @@ impl Secret {
 
     pub fn add(&mut self, key: String, value: String) {
         self.data.insert(key, SecretString::from(value));
+    }
+
+    pub fn insert_to_params(
+        &self,
+        params: &mut SecretMap,
+        secret_param_key: &str,
+        param_key: &str,
+    ) {
+        let secret_param_val = match params.get(secret_param_key) {
+            Some(val) => val.expose_secret(),
+            None => param_key,
+        };
+
+        if let Some(secret_val) = self.data.get(secret_param_val) {
+            params.insert(param_key.to_string(), secret_val.clone());
+        }
     }
 }
 

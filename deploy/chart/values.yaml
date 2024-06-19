@@ -1,6 +1,6 @@
 image:
   repository: spiceai/spiceai
-  tag: 0.13.2-alpha
+  tag: 0.14.0-alpha
 replicaCount: 1
 monitoring:
   podMonitor:

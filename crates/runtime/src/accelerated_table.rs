@@ -62,6 +62,11 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Unable to create MemTable from data update: {source}"))]
+    UnableToCreateMemTableFromUpdate {
+        source: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to trigger table refresh: {source}"))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<()>,
@@ -161,6 +166,7 @@ impl Builder {
         self.cache_provider = cache_provider;
         self
     }
+
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;

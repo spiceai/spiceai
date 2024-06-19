@@ -111,6 +111,22 @@ impl DuckDbConnectionPool {
             join_push_down: JoinPushDown::AllowedFor(path.to_string()),
         })
     }
+
+    /// Create a new `DuckDbConnectionPool` from a database URL.
+    ///
+    /// # Errors
+    ///
+    /// * `DuckDBSnafu` - If there is an error creating the connection pool
+    pub fn connect_sync(
+        self: Arc<Self>,
+    ) -> Result<
+        Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
+    > {
+        let pool = Arc::clone(&self.pool);
+        let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
+            pool.get().context(ConnectionPoolSnafu)?;
+        Ok(Box::new(DuckDbConnection::new(conn)))
+    }
 }
 
 #[async_trait]

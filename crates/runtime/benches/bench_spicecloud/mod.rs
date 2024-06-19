@@ -19,8 +19,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         // Error: "query `tpch_q1` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q1", include_str!("tpch_q1.sql")),
-        // Error: "query `tpch_q2` to results: External error: This feature is not implemented: Unsupported Expr conversion: OuterReferenceColumn(Int32, Column { relation: Some(Partial { schema: \"tpch\", table: \"part\" }), name: \"p_partkey\" })"
-        // ("tpch_q2", include_str!("tpch_q2.sql")),
+        ("tpch_q2", include_str!("tpch_q2.sql")),
         // Error: "query `tpch_q3` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q3", include_str!("tpch_q3.sql")),
         // Error: "query `tpch_q4` to results: External error: This feature is not implemented: Unsupported scalar: IntervalMonthDayNano(\"237684487542793012780631851008\")"
@@ -29,12 +28,12 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         // ("tpch_q5", include_str!("tpch_q5.sql")),
         // Error: "query `tpch_q6` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(30, 15)"
         // ("tpch_q6", include_str!("tpch_q6.sql")),
-        // Error: "query `tpch_q7` to results: federation_optimizer_rule\ncaused by\nfederate_sql\ncaused by\nSchema error: No field named shipping.\"supp_tpch.nation\". Valid fields are shipping.supp_nation, shipping.cust_nation, shipping.l_year, shipping.volume."
+        // Error: "query `tpch_q7` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q7", include_str!("tpch_q7.sql")),
-        // Error: "query `tpch_q8` to results: federation_optimizer_rule\ncaused by\nfederate_sql\ncaused by\nSchema error: No field named \"SUM(CASE WHEN all_tpch.nations.tpch.nation = Utf8(\"\"BRAZIL\"\") THEN all_tpch.nations.volume ELSE Int64(0) END)\". Valid fields are all_nations.o_year, \"SUM(CASE WHEN all_nations.tpch.nation = Utf8(\"\"BRAZIL\"\") THEN all_nations.volume ELSE Int64(0) END)\", \"SUM(all_nations.volume)\"."
+        // Error: "query `tpch_q8` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q8", include_str!("tpch_q8.sql")),
-        // Error: "query `tpch_q9` to results: federation_optimizer_rule\ncaused by\nfederate_sql\ncaused by\nSchema error: No field named profit.\"tpch.nation\". Valid fields are profit.nation, profit.o_year, profit.amount."
-        // ("tpch_q9", include_str!("tpch_q9.sql")),
+        // Error: "query `tpch_q9` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
+        //("tpch_q9", include_str!("tpch_q9.sql")),
         // Error: "query `tpch_q10` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q10", include_str!("tpch_q10.sql")),
         // Error: "query `tpch_q11` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(10, 0)"
@@ -49,8 +48,8 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         // ("tpch_q12", include_str!("tpch_q12.sql")),
         // Error: "query `tpch_q13` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.customer' not found ...
         // ("tpch_q13", include_str!("tpch_q13.sql")),
-        // Error: "query `tpch_q14` to results: federation_optimizer_rule\ncaused by\nfederate_sql\ncaused by\nSchema error: No field named \"SUM(CASE WHEN part.p_type LIKE Utf8(\"\"PROMO%\"\")  THEN tpch.lineitem.l_extendedprice * Int64(1) - tpch.lineitem.l_discount ELSE Int64(0) END)\". Valid fields are \"SUM(CASE WHEN tpch.part.p_type LIKE Utf8(\"\"PROMO%\"\")  THEN tpch.lineitem.l_extendedprice * Int64(1) - tpch.lineitem.l_discount ELSE Int64(0) END)\", \"SUM(tpch.lineitem.l_extendedprice * Int64(1) - tpch.lineitem.l_discount)\"."
-        // ("tpch_q14", include_str!("tpch_q14.sql")),
+        // Error: "query `tpch_q14` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
+        //("tpch_q14", include_str!("tpch_q14.sql")),
 
         // tpch_q15 has a view creation which we don't support by design
 
@@ -62,10 +61,9 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         // ("tpch_q18", include_str!("tpch_q18.sql")),
         // Error: "query `tpch_q19` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(20, 0)"
         // ("tpch_q19", include_str!("tpch_q19.sql")),
-        // Error: "query `tpch_q20` to results: External error: This feature is not implemented: Unsupported Expr conversion: OuterReferenceColumn(Int32, Column { relation: Some(Partial { schema: \"tpch\", table: \"partsupp\" }), name: \"ps_partkey\" })"
+        // Error: "query `tpch_q20` to results: External error: This feature is not implemented: Unsupported scalar: IntervalMonthDayNano(\"IntervalMonthDayNano { months: 12, days: 0, nanoseconds: 0 }\")"
         // ("tpch_q20", include_str!("tpch_q20.sql")),
-        // Error: "query `tpch_q21` to results: External error: This feature is not implemented: Unsupported Expr conversion: OuterReferenceColumn(Int32, Column { relation: Some(Bare { table: \"l1\" }), name: \"l_orderkey\" })"
-        // ("tpch_q21", include_str!("tpch_q21.sql")),
+        ("tpch_q21", include_str!("tpch_q21.sql")),
         // Error: "query `tpch_q22` to results: External error: This feature is not implemented: Unsupported DataType: conversion: Decimal128(19, 6)"
         // ("tpch_q22", include_str!("tpch_q22.sql")),
         ("tpch_simple_q1", include_str!("tpch_simple_q1.sql")),

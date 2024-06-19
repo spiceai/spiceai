@@ -25,8 +25,8 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
-    SqliteQueryBuilder, Table,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
+    SimpleExpr, SqliteQueryBuilder, Table,
 };
 
 #[derive(Debug, Snafu)]
@@ -59,8 +59,11 @@ impl CreateTableBuilder {
     }
 
     #[must_use]
-    pub fn primary_keys(mut self, keys: Vec<&str>) -> Self {
-        self.primary_keys = keys.into_iter().map(ToString::to_string).collect();
+    pub fn primary_keys<T>(mut self, keys: Vec<T>) -> Self
+    where
+        T: Into<String>,
+    {
+        self.primary_keys = keys.into_iter().map(Into::into).collect();
         self
     }
 
@@ -453,31 +456,35 @@ impl InsertBuilder {
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid postgres insert statement.
-    pub fn build_postgres(self) -> Result<String> {
-        self.build(PostgresQueryBuilder)
+    pub fn build_postgres(self, on_conflict: Option<OnConflict>) -> Result<String> {
+        self.build(PostgresQueryBuilder, on_conflict)
     }
 
     ///
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid sqlite insert statement.
-    pub fn build_sqlite(self) -> Result<String> {
-        self.build(SqliteQueryBuilder)
+    pub fn build_sqlite(self, on_conflict: Option<OnConflict>) -> Result<String> {
+        self.build(SqliteQueryBuilder, on_conflict)
     }
 
     ///
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid `MySQL` insert statement.
-    pub fn build_mysql(self) -> Result<String> {
-        self.build(MysqlQueryBuilder)
+    pub fn build_mysql(self, on_conflict: Option<OnConflict>) -> Result<String> {
+        self.build(MysqlQueryBuilder, on_conflict)
     }
 
     /// # Errors
     ///
     /// Returns an error if any `RecordBatch` fails to convert into a valid insert statement. Upon
     /// error, no further `RecordBatch` is processed.
-    pub fn build<T: GenericBuilder>(&self, query_builder: T) -> Result<String> {
+    pub fn build<T: GenericBuilder>(
+        &self,
+        query_builder: T,
+        on_conflict: Option<OnConflict>,
+    ) -> Result<String> {
         let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
             .fields()
@@ -493,7 +500,68 @@ impl InsertBuilder {
         for record_batch in &self.record_batches {
             self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
         }
+        if let Some(on_conflict) = on_conflict {
+            insert_stmt.on_conflict(on_conflict);
+        }
         Ok(insert_stmt.to_string(query_builder))
+    }
+}
+
+pub struct IndexBuilder {
+    table_name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+impl IndexBuilder {
+    #[must_use]
+    pub fn new(table_name: &str, columns: Vec<&str>) -> Self {
+        Self {
+            table_name: table_name.to_string(),
+            columns: columns.into_iter().map(ToString::to_string).collect(),
+            unique: false,
+        }
+    }
+
+    #[must_use]
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
+    #[must_use]
+    pub fn index_name(&self) -> String {
+        format!("i_{}_{}", self.table_name, self.columns.join("_"))
+    }
+
+    #[must_use]
+    pub fn build_postgres(self) -> String {
+        self.build(PostgresQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_sqlite(self) -> String {
+        self.build(SqliteQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_mysql(self) -> String {
+        self.build(MysqlQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build<T: GenericBuilder>(self, query_builder: T) -> String {
+        let mut index = Index::create();
+        index.table(Alias::new(&self.table_name));
+        index.name(self.index_name());
+        if self.unique {
+            index.unique();
+        }
+        for column in self.columns {
+            index.col(Alias::new(column).into_iden().into_index_column());
+        }
+        index.if_not_exists();
+        index.to_string(query_builder)
     }
 }
 
@@ -599,7 +667,7 @@ mod tests {
         let record_batches = vec![batch1, batch2];
 
         let sql = InsertBuilder::new("users", record_batches)
-            .build_postgres()
+            .build_postgres(None)
             .expect("Failed to build insert statement");
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
@@ -636,11 +704,31 @@ mod tests {
             .expect("Unable to build record batch");
 
         let sql = InsertBuilder::new("arrays", vec![batch])
-            .build_postgres()
+            .build_postgres(None)
             .expect("Failed to build insert statement");
         assert_eq!(
             sql,
             "INSERT INTO \"arrays\" (\"list\") VALUES (CAST(ARRAY [1,2,3] AS int4[])), (CAST(ARRAY [4,5,6] AS int4[])), (CAST(ARRAY [7,8,9] AS int4[]))"
+        );
+    }
+
+    #[test]
+    fn test_create_index() {
+        let sql = IndexBuilder::new("users", vec!["id", "name"]).build_postgres();
+        assert_eq!(
+            sql,
+            r#"CREATE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
+        );
+    }
+
+    #[test]
+    fn test_create_unique_index() {
+        let sql = IndexBuilder::new("users", vec!["id", "name"])
+            .unique()
+            .build_postgres();
+        assert_eq!(
+            sql,
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
         );
     }
 }

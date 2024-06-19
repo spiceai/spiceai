@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{TableProvider, TableType},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
@@ -31,20 +32,29 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::{
+    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
+    util::{constraints, on_conflict::OnConflict},
+};
 
 use super::{to_datafusion_error, Postgres};
 
 pub struct PostgresTableWriter {
     read_provider: Arc<dyn TableProvider>,
     postgres: Arc<Postgres>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl PostgresTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, postgres: Postgres) -> Arc<Self> {
+    pub fn create(
+        read_provider: Arc<dyn TableProvider>,
+        postgres: Postgres,
+        on_conflict: Option<OnConflict>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             postgres: Arc::new(postgres),
+            on_conflict,
         })
     }
 }
@@ -61,6 +71,10 @@ impl TableProvider for PostgresTableWriter {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(self.postgres.constraints())
     }
 
     async fn scan(
@@ -83,7 +97,11 @@ impl TableProvider for PostgresTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(PostgresDataSink::new(Arc::clone(&self.postgres), overwrite)),
+            Arc::new(PostgresDataSink::new(
+                Arc::clone(&self.postgres),
+                overwrite,
+                self.on_conflict.clone(),
+            )),
             self.schema(),
             None,
         )) as _)
@@ -147,6 +165,7 @@ impl DeletionSink for PostgresDeletionSink {
 struct PostgresDataSink {
     postgres: Arc<Postgres>,
     overwrite: bool,
+    on_conflict: Option<OnConflict>,
 }
 
 #[async_trait]
@@ -193,8 +212,16 @@ impl DataSink for PostgresDataSink {
 
             num_rows += batch_num_rows as u64;
 
+            constraints::validate_batch_with_constraints(
+                &[batch.clone()],
+                self.postgres.constraints(),
+            )
+            .await
+            .context(super::ConstraintViolationSnafu)
+            .map_err(to_datafusion_error)?;
+
             self.postgres
-                .insert_batch(&tx, batch)
+                .insert_batch(&tx, batch, self.on_conflict.clone())
                 .await
                 .map_err(to_datafusion_error)?;
         }
@@ -209,10 +236,11 @@ impl DataSink for PostgresDataSink {
 }
 
 impl PostgresDataSink {
-    fn new(postgres: Arc<Postgres>, overwrite: bool) -> Self {
+    fn new(postgres: Arc<Postgres>, overwrite: bool, on_conflict: Option<OnConflict>) -> Self {
         Self {
             postgres,
             overwrite,
+            on_conflict,
         }
     }
 }

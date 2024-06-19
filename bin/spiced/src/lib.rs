@@ -29,6 +29,7 @@ use futures::future::join_all;
 use futures::Future;
 use runtime::config::Config as RuntimeConfig;
 
+use runtime::datasets_health_monitor::DatasetsHealthMonitor;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
@@ -117,6 +118,18 @@ pub async fn run(args: Args) -> Result<()> {
     // mutable reference
     rt.with_pods_watcher(pods_watcher);
 
+    rt.with_datasets_health_monitor(DatasetsHealthMonitor::new(Arc::clone(&rt.datafusion().ctx)));
+
+    rt.start_datasets_health_monitor();
+
+    let cloned_rt = rt.clone();
+    let server_thread =
+        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
+
+    rt.load_secrets().await;
+
+    rt.start_extensions().await;
+
     if let Err(err) = rt
         .start_metrics(args.metrics)
         .await
@@ -124,12 +137,6 @@ pub async fn run(args: Args) -> Result<()> {
     {
         tracing::warn!("{err}");
     }
-
-    let cloned_rt = rt.clone();
-    let server_thread =
-        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
-
-    rt.load_secrets().await;
 
     #[cfg(feature = "models")]
     rt.load_embeddings().await; // Must be loaded before datasets
@@ -141,7 +148,6 @@ pub async fn run(args: Args) -> Result<()> {
             };
         }),
         Box::pin(rt.init_results_cache()),
-        Box::pin(rt.start_extensions()),
         Box::pin(rt.load_datasets()),
     ];
 

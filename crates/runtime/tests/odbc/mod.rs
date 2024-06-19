@@ -48,15 +48,8 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
         mode: spicepod::component::dataset::acceleration::Mode::Memory,
         engine: Some(engine.to_string()),
         refresh_mode: spicepod::component::dataset::acceleration::RefreshMode::Full,
-        refresh_check_interval: None,
         refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 10")),
-        refresh_data_window: None,
-        params: None,
-        engine_secret: None,
-        retention_period: None,
-        retention_check_interval: None,
-        retention_check_enabled: false,
-        on_zero_results: spicepod::component::dataset::acceleration::ZeroResultsAction::ReturnEmpty,
+        ..Default::default()
     });
     dataset
 }

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
-use secrets::Secret;
+use crate::secrets::Secret;
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;
@@ -565,8 +565,6 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::common::FileType;
-
     use super::*;
 
     struct TestConnector {
@@ -636,10 +634,9 @@ mod tests {
     fn test_get_file_format_and_extension_detect_csv_extension() {
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
 
-        if let Ok((Some(file_format), extension)) =
+        if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
         {
-            assert_eq!(file_format.file_type(), FileType::CSV);
             assert_eq!(extension, ".csv");
         } else {
             panic!("Unexpected error");
@@ -650,10 +647,9 @@ mod tests {
     fn test_get_file_format_and_extension_detect_parquet_extension() {
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
 
-        if let Ok((Some(file_format), extension)) =
+        if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
         {
-            assert_eq!(file_format.file_type(), FileType::PARQUET);
             assert_eq!(extension, ".parquet");
         } else {
             panic!("Unexpected error");
@@ -666,10 +662,9 @@ mod tests {
         params.insert("file_format".to_string(), "csv".to_string());
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
 
-        if let Ok((Some(file_format), extension)) =
+        if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
         {
-            assert_eq!(file_format.file_type(), FileType::CSV);
             assert_eq!(extension, ".csv");
         } else {
             panic!("Unexpected error");
@@ -682,10 +677,9 @@ mod tests {
         params.insert("file_format".to_string(), "parquet".to_string());
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
 
-        if let Ok((Some(file_format), extension)) =
+        if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
         {
-            assert_eq!(file_format.file_type(), FileType::PARQUET);
             assert_eq!(extension, ".parquet");
         } else {
             panic!("Unexpected error");

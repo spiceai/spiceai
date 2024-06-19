@@ -528,7 +528,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (protocol, quantile)(query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\"}>0)",
+          "expr": "sum by (protocol, quantile)(query_duration_seconds{quantile=~\"${percentile}\",pod=~\"${pods}\"}>0)",
           "instant": false,
           "legendFormat": "{{protocol}} (P{{quantile}})",
           "range": true,
@@ -793,7 +793,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (dataset) (increase(datasets_acceleration_refresh_errors{pod=~\"${pods}\"}[$__rate_interval])>0)\n",
+          "expr": "sum by (dataset) ((datasets_acceleration_refresh_errors{pod=~\"${pods}\"}) - (datasets_acceleration_refresh_errors{pod=~\"${pods}\"} offset $__rate_interval)>0)\n",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -811,6 +811,94 @@
         "x": 0,
         "y": 34
       },
+      "id": 32,
+      "panels": [],
+      "title": "Federated Datasets",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "Available"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "id": 33,
+      "options": {
+        "displayMode": "gradient",
+        "minVizHeight": 10,
+        "minVizWidth": 0,
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.1.5",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sgn(datasets_unavailable_time{pod=~\"${pods}\"})*(time()-datasets_unavailable_time{pod=~\"${pods}\"})",
+          "instant": false,
+          "legendFormat": "{{dataset}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Time Since Offline",
+      "type": "bargauge"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
       "id": 22,
       "panels": [],
       "title": "Results Cache",
@@ -825,8 +913,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "fixedColor": "dark-green",
-            "mode": "shades"
+            "fixedColor": "dark-green"
           },
           "custom": {
             "axisCenteredZero": false,
@@ -893,7 +980,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 44
       },
       "id": 20,
       "options": {
@@ -1013,7 +1100,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 44
       },
       "id": 23,
       "options": {
@@ -1120,7 +1207,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 52
       },
       "id": 24,
       "options": {
@@ -1218,7 +1305,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 43
+        "y": 52
       },
       "id": 25,
       "options": {
@@ -1273,7 +1360,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 60
       },
       "id": 2,
       "panels": [],
@@ -1343,7 +1430,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 61
       },
       "id": 7,
       "options": {
@@ -1365,7 +1452,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\"} > 0)",
+          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds{quantile=~\"${percentile}\",pod=~\"${pods}\"} > 0)",
           "instant": false,
           "legendFormat": "{{method}} {{path}} (P{{quantile}})",
           "range": true,
@@ -1437,7 +1524,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 52
+        "y": 61
       },
       "id": 8,
       "options": {
@@ -1475,7 +1562,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 69
       },
       "id": 3,
       "panels": [],
@@ -1545,7 +1632,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 61
+        "y": 70
       },
       "id": 9,
       "options": {
@@ -1567,7 +1654,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_dataset_duration_ms{quantile=~\"${quantile}\", pod=~\"${pods}\"} unless load_dataset == 0",
+          "expr": "load_dataset_duration_ms{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
           "instant": false,
           "legendFormat": "{{dataset}} (P{{quantile}})",
           "range": true,
@@ -1639,7 +1726,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 61
+        "y": 70
       },
       "id": 10,
       "options": {
@@ -1661,7 +1748,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "1000*load_model{quantile=~\"${quantile}\", pod=~\"${pods}\"} unless load_model == 0",
+          "expr": "1000*load_model{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_model == 0",
           "instant": false,
           "legendFormat": "{{model}} (P{{quantile}})",
           "range": true,
@@ -1734,7 +1821,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 61
+        "y": 70
       },
       "id": 11,
       "options": {
@@ -1756,7 +1843,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_secrets{quantile=~\"${quantile}\", pod=~\"${pods}\"} unless load_secrets == 0",
+          "expr": "load_secrets{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_secrets == 0",
           "instant": false,
           "legendFormat": "P{{quantile}}",
           "range": true,
@@ -1772,7 +1859,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 78
       },
       "id": 12,
       "panels": [],
@@ -1843,7 +1930,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 70
+        "y": 79
       },
       "id": 13,
       "options": {
@@ -1865,7 +1952,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_put_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"}",
+          "expr": "flight_do_put_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"}",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,
@@ -1921,8 +2008,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -1937,7 +2023,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 70
+        "y": 79
       },
       "id": 16,
       "options": {
@@ -2016,8 +2102,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -2033,7 +2118,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 78
+        "y": 87
       },
       "id": 15,
       "options": {
@@ -2055,7 +2140,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_get_tables_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms == 0",
+          "expr": "flight_do_get_get_tables_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms == 0",
           "instant": false,
           "legendFormat": "CommandGetTables",
           "range": true,
@@ -2067,7 +2152,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_statement_query_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms == 0",
+          "expr": "flight_do_get_statement_query_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms == 0",
           "hide": false,
           "instant": false,
           "legendFormat": "CommandStatementQuery",
@@ -2124,8 +2209,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -2141,7 +2225,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 78
+        "y": 87
       },
       "id": 17,
       "options": {
@@ -2233,8 +2317,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -2250,7 +2333,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 95
       },
       "id": 14,
       "options": {
@@ -2272,7 +2355,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_get_flight_info_request_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms == 0",
+          "expr": "flight_get_flight_info_request_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms == 0",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,
@@ -2329,8 +2412,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -2346,7 +2428,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 95
       },
       "id": 18,
       "options": {
@@ -2441,7 +2523,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 94
+        "y": 103
       },
       "id": 19,
       "options": {
@@ -2619,50 +2701,45 @@
         "current": {
           "selected": true,
           "text": [
-            "0.95"
+            "95th"
           ],
           "value": [
             "0.95"
           ]
         },
         "hide": 0,
-        "includeAll": true,
-        "label": "Quantile",
+        "includeAll": false,
+        "label": "Percentile",
         "multi": true,
-        "name": "quantile",
+        "name": "percentile",
         "options": [
           {
             "selected": false,
-            "text": "All",
-            "value": "$__all"
-          },
-          {
-            "selected": false,
-            "text": "0.5",
+            "text": "50th",
             "value": "0.5"
           },
           {
             "selected": false,
-            "text": "0.75",
+            "text": "75th",
             "value": "0.75"
           },
           {
-            "selected": false,
-            "text": "0.9",
+            "selected": true,
+            "text": "90th",
             "value": "0.9"
           },
           {
             "selected": true,
-            "text": "0.95",
+            "text": "95th",
             "value": "0.95"
           },
           {
-            "selected": false,
-            "text": "0.99",
+            "selected": true,
+            "text": "99th",
             "value": "0.99"
           }
         ],
-        "query": "0.5, 0.75, 0.9, 0.95, 0.99",
+        "query": "50th : 0.5, 75th : 0.75, 90th : 0.9, 95th : 0.95, 99th : 0.99",
         "queryValue": "",
         "skipUrlSync": false,
         "type": "custom"

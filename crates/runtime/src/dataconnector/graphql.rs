@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::secrets::{get_secret_or_param, Secret};
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_stream::stream;
@@ -31,7 +32,6 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT},
     RequestBuilder, StatusCode,
 };
-use secrets::{get_secret_or_param, Secret};
 use serde_json::{json, Value};
 use snafu::{ResultExt, Snafu};
 use std::{any::Any, collections::HashMap, future::Future, io::Cursor, pin::Pin, sync::Arc};

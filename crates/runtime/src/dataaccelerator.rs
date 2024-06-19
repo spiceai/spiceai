@@ -14,17 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::acceleration::{self, Engine, Mode};
+use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::secrets::ExposeSecret;
+use crate::secrets::Secret;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use data_components::util::{column_reference::ColumnReference, on_conflict::OnConflict};
 use datafusion::{
-    common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
+    common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
 use lazy_static::lazy_static;
-use secrets::ExposeSecret;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -116,8 +117,11 @@ pub struct AcceleratorExternalTableBuilder {
     schema: SchemaRef,
     engine: Engine,
     mode: Mode,
-    params: Option<HashMap<String, String>>,
+    options: Option<HashMap<String, String>>,
     secret: Option<Secret>,
+    indexes: HashMap<ColumnReference, IndexType>,
+    constraints: Option<Constraints>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -128,9 +132,24 @@ impl AcceleratorExternalTableBuilder {
             schema,
             engine,
             mode: Mode::Memory,
-            params: None,
+            options: None,
             secret: None,
+            indexes: HashMap::new(),
+            constraints: None,
+            on_conflict: None,
         }
+    }
+
+    #[must_use]
+    pub fn indexes(mut self, indexes: HashMap<ColumnReference, IndexType>) -> Self {
+        self.indexes = indexes;
+        self
+    }
+
+    #[must_use]
+    pub fn on_conflict(mut self, on_conflict: OnConflict) -> Self {
+        self.on_conflict = Some(on_conflict);
+        self
     }
 
     #[must_use]
@@ -140,14 +159,20 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn params(mut self, params: HashMap<String, String>) -> Self {
-        self.params = Some(params);
+    pub fn options(mut self, options: HashMap<String, String>) -> Self {
+        self.options = Some(options);
         self
     }
 
     #[must_use]
     pub fn secret(mut self, secret: Option<Secret>) -> Self {
         self.secret = secret;
+        self
+    }
+
+    #[must_use]
+    pub fn constraints(mut self, constraints: Constraints) -> Self {
+        self.constraints = Some(constraints);
         self
     }
 
@@ -171,18 +196,32 @@ impl AcceleratorExternalTableBuilder {
     pub fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
 
-        let mut params = self.params.unwrap_or_default();
+        let mut options = self.options.unwrap_or_default();
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
         let mode = self.mode;
-        params.insert("mode".to_string(), mode.to_string());
+        options.insert("mode".to_string(), mode.to_string());
 
         if let Some(secret) = self.secret {
             for (k, v) in secret.iter() {
-                params.insert(k.to_string(), v.expose_secret().to_string());
+                options.insert(k.to_string(), v.expose_secret().to_string());
             }
         }
+
+        if !self.indexes.is_empty() {
+            let indexes_option_str = Acceleration::hashmap_to_option_string(&self.indexes);
+            options.insert("indexes".to_string(), indexes_option_str);
+        }
+
+        if let Some(on_conflict) = self.on_conflict {
+            options.insert("on_conflict".to_string(), on_conflict.to_string());
+        }
+
+        let constraints = match self.constraints {
+            Some(constraints) => constraints,
+            None => Constraints::empty(),
+        };
 
         let external_table = CreateExternalTable {
             schema: df_schema.map_err(|e| {
@@ -194,16 +233,13 @@ impl AcceleratorExternalTableBuilder {
             name: self.table_name.clone(),
             location: String::new(),
             file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
             table_partition_cols: vec![],
             if_not_exists: true,
             definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
-            options: params,
-            constraints: Constraints::empty(),
+            options,
+            constraints,
             column_defaults: HashMap::default(),
         };
 
@@ -227,11 +263,44 @@ pub async fn create_accelerator_table(
                 msg: format!("Unknown engine: {engine}"),
             })?;
 
-    let external_table = AcceleratorExternalTableBuilder::new(table_name, schema, engine)
-        .mode(acceleration_settings.mode)
-        .params(acceleration_settings.params.clone())
-        .secret(acceleration_secret)
-        .build()?;
+    if let Err(e) = acceleration_settings.validate_indexes(&schema) {
+        InvalidConfigurationSnafu {
+            msg: format!("{e}"),
+        }
+        .fail()?;
+    };
+
+    let mut external_table_builder =
+        AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
+            .mode(acceleration_settings.mode)
+            .options(acceleration_settings.params.clone())
+            .indexes(acceleration_settings.indexes.clone())
+            .secret(acceleration_secret);
+
+    if let Some(on_conflict) =
+        acceleration_settings
+            .on_conflict()
+            .map_err(|e| Error::InvalidConfiguration {
+                msg: format!("on_conflict invalid: {e}"),
+            })?
+    {
+        external_table_builder = external_table_builder.on_conflict(on_conflict);
+    };
+
+    match acceleration_settings.table_constraints(Arc::clone(&schema)) {
+        Ok(Some(constraints)) => {
+            external_table_builder = external_table_builder.constraints(constraints);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            InvalidConfigurationSnafu {
+                msg: format!("{e}"),
+            }
+            .fail()?;
+        }
+    }
+
+    let external_table = external_table_builder.build()?;
 
     let table_provider = accelerator
         .create_external_table(&external_table)

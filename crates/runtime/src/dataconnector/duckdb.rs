@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;

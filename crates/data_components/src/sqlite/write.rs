@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
+    common::Constraints,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
@@ -33,20 +34,29 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::Engine;
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::{
+    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
+    util::{constraints, on_conflict::OnConflict},
+};
 
 use super::{to_datafusion_error, Sqlite};
 
 pub struct SqliteTableWriter {
     read_provider: Arc<dyn TableProvider>,
     sqlite: Arc<Sqlite>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl SqliteTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, sqlite: Sqlite) -> Arc<Self> {
+    pub fn create(
+        read_provider: Arc<dyn TableProvider>,
+        sqlite: Sqlite,
+        on_conflict: Option<OnConflict>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             sqlite: Arc::new(sqlite),
+            on_conflict,
         })
     }
 }
@@ -63,6 +73,10 @@ impl TableProvider for SqliteTableWriter {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(self.sqlite.constraints())
     }
 
     async fn scan(
@@ -85,7 +99,11 @@ impl TableProvider for SqliteTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(SqliteDataSink::new(Arc::clone(&self.sqlite), overwrite)),
+            Arc::new(SqliteDataSink::new(
+                Arc::clone(&self.sqlite),
+                overwrite,
+                self.on_conflict.clone(),
+            )),
             self.schema(),
             None,
         )) as _)
@@ -96,6 +114,7 @@ impl TableProvider for SqliteTableWriter {
 struct SqliteDataSink {
     sqlite: Arc<Sqlite>,
     overwrite: bool,
+    on_conflict: Option<OnConflict>,
 }
 
 #[async_trait]
@@ -126,6 +145,11 @@ impl DataSink for SqliteDataSink {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
+        constraints::validate_batch_with_constraints(&data_batches, self.sqlite.constraints())
+            .await
+            .context(super::ConstraintViolationSnafu)
+            .map_err(to_datafusion_error)?;
+
         for data_batch in &data_batches {
             num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
                 DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
@@ -134,6 +158,7 @@ impl DataSink for SqliteDataSink {
 
         let overwrite = self.overwrite;
         let sqlite = Arc::clone(&self.sqlite);
+        let on_conflict = self.on_conflict.clone();
         sqlite_conn
             .conn
             .call(move |conn| {
@@ -145,7 +170,7 @@ impl DataSink for SqliteDataSink {
 
                 for batch in data_batches {
                     if batch.num_rows() > 0 {
-                        sqlite.insert_batch(&transaction, batch)?;
+                        sqlite.insert_batch(&transaction, batch, on_conflict.as_ref())?;
                     }
                 }
 
@@ -162,8 +187,12 @@ impl DataSink for SqliteDataSink {
 }
 
 impl SqliteDataSink {
-    fn new(sqlite: Arc<Sqlite>, overwrite: bool) -> Self {
-        Self { sqlite, overwrite }
+    fn new(sqlite: Arc<Sqlite>, overwrite: bool, on_conflict: Option<OnConflict>) -> Self {
+        Self {
+            sqlite,
+            overwrite,
+            on_conflict,
+        }
     }
 }
 
@@ -241,7 +270,7 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use datafusion::{
-        common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
+        common::{Constraints, TableReference, ToDFSchema},
         datasource::provider::TableProviderFactory,
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
@@ -264,12 +293,9 @@ mod tests {
             name: TableReference::bare("test_table"),
             location: String::new(),
             file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
             table_partition_cols: vec![],
             if_not_exists: true,
             definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
             options: HashMap::new(),

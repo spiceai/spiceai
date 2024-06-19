@@ -67,7 +67,7 @@ spec:
               port: 3000
           readinessProbe:
             httpGet:
-              path: /health
+              path: /v1/ready
               port: 3000
           startupProbe:
             httpGet:

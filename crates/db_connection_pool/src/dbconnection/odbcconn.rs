@@ -24,7 +24,6 @@ use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
-use arrow_odbc::Quirks;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
@@ -35,6 +34,7 @@ use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
 use odbc_api::Cursor;
 use odbc_api::CursorImpl;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use snafu::Snafu;
 
@@ -76,7 +76,7 @@ pub enum Error {
 
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,
-    pub params: Arc<HashMap<String, String>>,
+    pub params: Arc<HashMap<String, SecretString>>,
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
@@ -178,7 +178,7 @@ where
 fn build_odbc_reader<C: Cursor>(
     cursor: C,
     schema: &Arc<Schema>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<OdbcReader<C>> {
     let mut builder = OdbcReaderBuilder::new();
     builder.with_schema(Arc::clone(schema));
@@ -186,6 +186,7 @@ fn build_odbc_reader<C: Cursor>(
     let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize)| {
         params
             .get(k)
+            .map(Secret::expose_secret)
             .cloned()
             .and_then(|s| s.parse::<usize>().ok())
             .into_iter()
@@ -204,16 +205,6 @@ fn build_odbc_reader<C: Cursor>(
     bind_as_usize("max_num_rows_per_batch", &mut |s| {
         builder.with_max_num_rows_per_batch(s);
     });
-
-    params
-        .get("enable_db2_length_quirk")
-        .and_then(|q| q.parse::<bool>().ok())
-        .into_iter()
-        .for_each(|b| {
-            builder.with_shims(Quirks {
-                indicators_returned_from_bulk_fetch_are_memory_garbage: b,
-            });
-        });
 
     Ok(builder.build(cursor).context(ArrowODBCSnafu)?)
 }
@@ -255,7 +246,7 @@ mod tests {
         use odbc_api::Cursor;
 
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(Arc::new(HashMap::new()), &None).expect("Must create ODBC pool");
+        let pool = ODBCPool::new(Arc::new(HashMap::new())).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(

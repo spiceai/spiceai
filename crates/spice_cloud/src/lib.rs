@@ -16,10 +16,10 @@ use runtime::{
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnectorError},
     extension::{Extension, ExtensionFactory, ExtensionManifest, Result},
+    secrets::Secret,
     spice_metrics::get_metrics_table_reference,
     Runtime,
 };
-use secrets::Secret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -128,6 +128,7 @@ impl SpiceExtension {
             None,
             RefreshMode::Full,
             Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
+            None,
         );
 
         let metrics_table_reference = get_metrics_table_reference();
