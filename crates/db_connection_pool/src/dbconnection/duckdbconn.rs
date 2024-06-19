@@ -39,6 +39,14 @@ pub struct DuckDbConnection {
     pub conn: r2d2::PooledConnection<DuckdbConnectionManager>,
 }
 
+impl DuckDbConnection {
+    pub fn get_underlying_conn_mut(
+        &mut self,
+    ) -> &mut r2d2::PooledConnection<DuckdbConnectionManager> {
+        &mut self.conn
+    }
+}
+
 impl<'a> DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'a dyn ToSql>
     for DuckDbConnection
 {

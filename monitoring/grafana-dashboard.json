@@ -528,7 +528,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (protocol, quantile)(query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\"}>0)",
+          "expr": "sum by (protocol, quantile)(query_duration_seconds{quantile=~\"${percentile}\",pod=~\"${pods}\"}>0)",
           "instant": false,
           "legendFormat": "{{protocol}} (P{{quantile}})",
           "range": true,
@@ -913,8 +913,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "fixedColor": "dark-green",
-            "mode": "shades"
+            "fixedColor": "dark-green"
           },
           "custom": {
             "axisCenteredZero": false,
@@ -1453,7 +1452,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\"} > 0)",
+          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds{quantile=~\"${percentile}\",pod=~\"${pods}\"} > 0)",
           "instant": false,
           "legendFormat": "{{method}} {{path}} (P{{quantile}})",
           "range": true,
@@ -1655,7 +1654,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_dataset_duration_ms{quantile=~\"${quantile}\", pod=~\"${pods}\"} unless load_dataset == 0",
+          "expr": "load_dataset_duration_ms{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
           "instant": false,
           "legendFormat": "{{dataset}} (P{{quantile}})",
           "range": true,
@@ -1749,7 +1748,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "1000*load_model{quantile=~\"${quantile}\", pod=~\"${pods}\"} unless load_model == 0",
+          "expr": "1000*load_model{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_model == 0",
           "instant": false,
           "legendFormat": "{{model}} (P{{quantile}})",
           "range": true,
@@ -1844,7 +1843,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_secrets{quantile=~\"${quantile}\", pod=~\"${pods}\"} unless load_secrets == 0",
+          "expr": "load_secrets{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_secrets == 0",
           "instant": false,
           "legendFormat": "P{{quantile}}",
           "range": true,
@@ -1914,7 +1913,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -1952,7 +1952,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_put_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"}",
+          "expr": "flight_do_put_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"}",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,
@@ -2140,7 +2140,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_get_tables_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms == 0",
+          "expr": "flight_do_get_get_tables_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms == 0",
           "instant": false,
           "legendFormat": "CommandGetTables",
           "range": true,
@@ -2152,7 +2152,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_statement_query_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms == 0",
+          "expr": "flight_do_get_statement_query_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms == 0",
           "hide": false,
           "instant": false,
           "legendFormat": "CommandStatementQuery",
@@ -2355,7 +2355,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_get_flight_info_request_duration_ms{quantile=~\"${quantile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms == 0",
+          "expr": "flight_get_flight_info_request_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms == 0",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,
@@ -2701,50 +2701,45 @@
         "current": {
           "selected": true,
           "text": [
-            "0.95"
+            "95th"
           ],
           "value": [
             "0.95"
           ]
         },
         "hide": 0,
-        "includeAll": true,
-        "label": "Quantile",
+        "includeAll": false,
+        "label": "Percentile",
         "multi": true,
-        "name": "quantile",
+        "name": "percentile",
         "options": [
           {
             "selected": false,
-            "text": "All",
-            "value": "$__all"
-          },
-          {
-            "selected": false,
-            "text": "0.5",
+            "text": "50th",
             "value": "0.5"
           },
           {
             "selected": false,
-            "text": "0.75",
+            "text": "75th",
             "value": "0.75"
           },
           {
-            "selected": false,
-            "text": "0.9",
+            "selected": true,
+            "text": "90th",
             "value": "0.9"
           },
           {
             "selected": true,
-            "text": "0.95",
+            "text": "95th",
             "value": "0.95"
           },
           {
-            "selected": false,
-            "text": "0.99",
+            "selected": true,
+            "text": "99th",
             "value": "0.99"
           }
         ],
-        "query": "0.5, 0.75, 0.9, 0.95, 0.99",
+        "query": "50th : 0.5, 75th : 0.75, 90th : 0.9, 95th : 0.95, 99th : 0.99",
         "queryValue": "",
         "skipUrlSync": false,
         "type": "custom"

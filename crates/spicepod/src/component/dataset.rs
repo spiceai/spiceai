@@ -167,7 +167,7 @@ pub mod acceleration {
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "lowercase")]
     pub enum IndexType {
         #[default]
@@ -180,6 +180,23 @@ pub mod acceleration {
             match self {
                 IndexType::Enabled => write!(f, "enabled"),
                 IndexType::Unique => write!(f, "unique"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum OnConflictBehavior {
+        #[default]
+        Drop,
+        Upsert,
+    }
+
+    impl Display for OnConflictBehavior {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OnConflictBehavior::Drop => write!(f, "drop"),
+                OnConflictBehavior::Upsert => write!(f, "upsert"),
             }
         }
     }
@@ -208,6 +225,9 @@ pub mod acceleration {
         pub refresh_data_window: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_append_overlap: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +247,12 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub indexes: HashMap<String, IndexType>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub primary_key: Option<String>,
+
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub on_conflict: HashMap<String, OnConflictBehavior>,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -248,6 +274,7 @@ pub mod acceleration {
                 refresh_check_interval: None,
                 refresh_sql: None,
                 refresh_data_window: None,
+                refresh_append_overlap: None,
                 params: None,
                 engine_secret: None,
                 retention_period: None,
@@ -255,6 +282,8 @@ pub mod acceleration {
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
                 indexes: HashMap::default(),
+                primary_key: None,
+                on_conflict: HashMap::default(),
             }
         }
     }

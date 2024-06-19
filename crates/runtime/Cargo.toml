@@ -58,7 +58,7 @@ reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
 arrow-json = "52.0.0"
 async-trait.workspace = true
-itertools = "0.12"
+itertools.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 url = "2.5.0"
 arrow_sql_gen = { path = "../arrow_sql_gen" }
@@ -92,7 +92,7 @@ datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
-async-openai = "0.21.0"
+async-openai.workspace = true
 derive_builder = "0.20.0"
 
 [dev-dependencies]

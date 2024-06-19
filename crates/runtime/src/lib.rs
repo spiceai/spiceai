@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 #![allow(clippy::missing_errors_doc)]
 
 use std::borrow::Borrow;
@@ -54,6 +53,7 @@ use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing_util::dataset_registered_trace;
 pub use util::shutdown_signal;
 use uuid::Uuid;
 
@@ -80,6 +80,7 @@ pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
+mod tracing_util;
 
 pub mod datasets_health_monitor;
 
@@ -196,6 +197,11 @@ pub enum Error {
 
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
+
+    #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
+    InvalidSpicepodDataset {
+        source: crate::component::dataset::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -393,9 +399,10 @@ impl Runtime {
             let connector = match self.load_dataset_connector(ds).await {
                 Ok(connector) => connector,
                 Err(err) => {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                    let ds_name = &ds.name;
+                    status::update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -453,9 +460,10 @@ impl Runtime {
         {
             Ok(data_connector) => data_connector,
             Err(err) => {
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                let ds_name = &ds.name;
+                status::update_dataset(ds_name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -503,7 +511,10 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Registered dataset {}", &ds.name);
+                tracing::info!(
+                    "{}",
+                    dataset_registered_trace(&ds, self.df.cache_provider().is_some())
+                );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
                         tracing::warn!(
@@ -574,33 +585,36 @@ impl Runtime {
 
     pub async fn update_dataset(&self, ds: &Dataset) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        if let Ok(connector) = self.load_dataset_connector(ds).await {
-            tracing::info!("Updating accelerated dataset {}...", &ds.name);
+        match self.load_dataset_connector(ds).await {
+            Ok(connector) => {
+                // File accelerated datasets don't support hot reload.
+                if ds.is_accelerated() {
+                    tracing::info!("Updating accelerated dataset {}...", &ds.name);
+                    if let Ok(()) = &self
+                        .reload_accelerated_dataset(ds, Arc::clone(&connector))
+                        .await
+                    {
+                        status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+                        return;
+                    }
+                    tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
+                }
 
-            // File accelerated datasets don't support hot reload.
-            if ds.is_accelerated() {
-                if let Ok(()) = &self
-                    .reload_accelerated_dataset(ds, Arc::clone(&connector))
+                self.remove_dataset(ds).await;
+
+                if let Ok(()) = self
+                    .register_loaded_dataset(ds, Arc::clone(&connector), None)
                     .await
                 {
                     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-                    return;
+                } else {
+                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 }
-                tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
-
-            self.remove_dataset(ds).await;
-
-            if let Ok(()) = self
-                .register_loaded_dataset(ds, Arc::clone(&connector), None)
-                .await
-            {
-                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-            } else {
+            Err(e) => {
+                tracing::error!("Unable to update dataset {}: {e}", ds.name);
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
             }
-        } else {
-            status::update_dataset(&ds.name, status::ComponentStatus::Error);
         }
     }
 
@@ -986,13 +1000,11 @@ impl Runtime {
 
                 // check for new and updated datasets
                 let valid_datasets = Self::get_valid_datasets(&new_app, true);
+                let existing_datasets = Self::get_valid_datasets(current_app, false);
+
                 for ds in &valid_datasets {
-                    if let Some(current_ds) = current_app
-                        .datasets
-                        .iter()
-                        .find(|d| TableReference::parse_str(&d.name) == ds.name)
-                    {
-                        if TableReference::parse_str(&current_ds.name) != ds.name {
+                    if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
+                        if ds != current_ds {
                             self.update_dataset(ds).await;
                         }
                     } else {

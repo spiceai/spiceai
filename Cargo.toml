@@ -24,7 +24,7 @@ default-members = ["bin/spiced"]
 resolver = "2"
 
 [workspace.package]
-version = "0.14.0-alpha"
+version = "0.14.1-alpha"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
@@ -46,6 +46,7 @@ datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "be2c2c1
 arrow = "52.0.0"
 arrow-flight = "52.0.0"
 duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "506c2ddb81e86ef13b75f7fa8817abefb04a123d" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 tonic = "0.11.0"
 futures = "0.3.30"
 r2d2 = "0.8.10"
@@ -72,6 +73,7 @@ arrow-odbc = { version = "11.1.0" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 ssh2 = { version = "0.9.4" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "4ea973e9feebfdb776bcfb6daeef91e897b0375f" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "4ea973e9feebfdb776bcfb6daeef91e897b0375f" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "e85aa9652326c9d1649f6535620990e12efa37a2" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "e85aa9652326c9d1649f6535620990e12efa37a2" }
 object_store = { version = "0.10.1" }
+itertools = "0.12"

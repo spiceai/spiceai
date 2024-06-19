@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
 use crate::util::constraints;
+use crate::util::on_conflict::OnConflict;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::Constraints;
@@ -43,13 +44,19 @@ use super::to_datafusion_error;
 pub struct DuckDBTableWriter {
     read_provider: Arc<dyn TableProvider>,
     duckdb: Arc<DuckDB>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl DuckDBTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, duckdb: DuckDB) -> Arc<Self> {
+    pub fn create(
+        read_provider: Arc<dyn TableProvider>,
+        duckdb: DuckDB,
+        on_conflict: Option<OnConflict>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             duckdb: Arc::new(duckdb),
+            on_conflict,
         })
     }
 }
@@ -92,7 +99,11 @@ impl TableProvider for DuckDBTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(DuckDBDataSink::new(Arc::clone(&self.duckdb), overwrite)),
+            Arc::new(DuckDBDataSink::new(
+                Arc::clone(&self.duckdb),
+                overwrite,
+                self.on_conflict.clone(),
+            )),
             self.schema(),
             None,
         )) as _)
@@ -100,9 +111,10 @@ impl TableProvider for DuckDBTableWriter {
 }
 
 #[derive(Clone)]
-struct DuckDBDataSink {
+pub(crate) struct DuckDBDataSink {
     duckdb: Arc<DuckDB>,
     overwrite: bool,
+    on_conflict: Option<OnConflict>,
 }
 
 #[async_trait]
@@ -142,10 +154,13 @@ impl DataSink for DuckDBDataSink {
             .context(super::UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        let num_rows = self.try_write_all(&tx, &data_batches)?;
+        let num_rows = match **self.duckdb.constraints() {
+            [] => self.try_write_all_no_constraints(&tx, &data_batches)?,
+            _ => self.try_write_all_with_constraints(&tx, &data_batches)?,
+        };
 
         tx.commit()
-            .context(super::UnableToCommitDuckDBTransactionSnafu)
+            .context(super::UnableToCommitTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
         Ok(num_rows)
@@ -153,11 +168,78 @@ impl DataSink for DuckDBDataSink {
 }
 
 impl DuckDBDataSink {
-    fn new(duckdb: Arc<DuckDB>, overwrite: bool) -> Self {
-        Self { duckdb, overwrite }
+    pub(crate) fn new(
+        duckdb: Arc<DuckDB>,
+        overwrite: bool,
+        on_conflict: Option<OnConflict>,
+    ) -> Self {
+        Self {
+            duckdb,
+            overwrite,
+            on_conflict,
+        }
     }
 
-    fn try_write_all(
+    /// If there are constraints on the `DuckDB` table, we need to create an empty copy of the target table, write to that table copy and then depending on
+    /// if the mode is overwrite or not, insert into the target table or drop the target table and rename the current table.
+    ///
+    /// See: <https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking>
+    fn try_write_all_with_constraints(
+        &self,
+        tx: &Transaction<'_>,
+        data_batches: &Vec<RecordBatch>,
+    ) -> datafusion::common::Result<u64> {
+        // We want to clone the current table into our insert table
+        let Some(ref orig_table_creator) = self.duckdb.table_creator else {
+            return Err(DataFusionError::Execution(
+                "Expected table with constraints to have a table creator".to_string(),
+            ));
+        };
+
+        let mut num_rows = 0;
+
+        for data_batch in data_batches {
+            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
+                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
+            })?;
+        }
+
+        let mut insert_table = orig_table_creator
+            .create_empty_clone(tx)
+            .map_err(to_datafusion_error)?;
+
+        let Some(insert_table_creator) = insert_table.table_creator.take() else {
+            unreachable!()
+        };
+
+        for (i, batch) in data_batches.iter().enumerate() {
+            tracing::debug!(
+                "Inserting batch #{i}/{} into cloned table.",
+                data_batches.len()
+            );
+            insert_table
+                .insert_batch_no_constraints(tx, batch)
+                .map_err(to_datafusion_error)?;
+        }
+
+        if self.overwrite {
+            insert_table_creator
+                .replace_table(tx, orig_table_creator)
+                .map_err(to_datafusion_error)?;
+        } else {
+            insert_table
+                .insert_table_into(tx, &self.duckdb, self.on_conflict.as_ref())
+                .map_err(to_datafusion_error)?;
+            insert_table_creator
+                .delete_table(tx)
+                .map_err(to_datafusion_error)?;
+        }
+
+        Ok(num_rows)
+    }
+
+    /// If there are no constraints on the `DuckDB` table, we can do a simple single transaction write.
+    fn try_write_all_no_constraints(
         &self,
         tx: &Transaction<'_>,
         data_batches: &Vec<RecordBatch>,
@@ -172,9 +254,6 @@ impl DuckDBDataSink {
 
         if self.overwrite {
             tracing::debug!("Deleting all data from table.");
-
-            // There is a known limitation in DuckDB for doing a delete, then an insert in the
-            // same transaction with a uniqueness constraint: https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking
             self.duckdb
                 .delete_all_table_data(tx)
                 .map_err(to_datafusion_error)?;
@@ -183,7 +262,7 @@ impl DuckDBDataSink {
         for (i, batch) in data_batches.iter().enumerate() {
             tracing::debug!("Inserting batch #{i}/{} into table.", data_batches.len());
             self.duckdb
-                .insert_batch(tx, batch)
+                .insert_batch_no_constraints(tx, batch)
                 .map_err(to_datafusion_error)?;
         }
 
@@ -247,7 +326,10 @@ impl DeletionSink for DuckDBDeletionSink {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
+    use crate::{
+        delete::get_deletion_provider,
+        duckdb::{creator::tests::init_tracing, DuckDBTableProviderFactory},
+    };
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -266,6 +348,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
+        let _guard = init_tracing(None);
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
             arrow::datatypes::Field::new(

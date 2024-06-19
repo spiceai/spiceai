@@ -53,6 +53,7 @@ pub mod filter_converter;
 pub mod initial_load;
 pub mod refresh_sql;
 pub mod schema;
+pub mod udf;
 
 use self::schema::SpiceSchemaProvider;
 
@@ -220,6 +221,8 @@ impl DataFusion {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
+        ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
+        ctx.register_udf(crate::datafusion::udf::Least::new().into());
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
@@ -540,6 +543,7 @@ impl DataFusion {
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode,
                 dataset.refresh_data_window(),
+                acceleration_settings.refresh_append_overlap,
             ),
         );
         accelerated_table_builder.retention(Retention::new(

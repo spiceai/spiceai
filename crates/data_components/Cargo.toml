@@ -39,7 +39,7 @@ bb8-postgres = { workspace = true, optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 tokio-postgres = { workspace = true, features = ["with-chrono-0_4"], optional = true }
 mysql_async = { workspace = true, optional = true }
-arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
+arrow_sql_gen = { path = "../arrow_sql_gen" }
 rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 spark-connect-rs =  { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "d937df525d7c237c717b42e6146494c524dbf267", features = ["tls"], optional = true}
@@ -54,6 +54,7 @@ object_store = { workspace = true }
 regex = "1.10.4"
 bytes = "1.6.0"
 url = "2.5.0"
+itertools.workspace = true
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2", "arrow_sql_gen",  "db_connection_pool/duckdb"]
@@ -66,3 +67,6 @@ spark_connect = ["dep:spark-connect-rs"]
 databricks = ["dep:deltalake", "spark_connect"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc"]
 snowflake = ["dep:snowflake-api"]
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
