@@ -34,6 +34,8 @@ chrono-tz = "0.8.6"
 mysql_async = { workspace = true, optional = true }
 clickhouse-rs = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+byteorder = "1.5.0"
+fallible-iterator = "0.3.0"
 
 [features]
 sqlite = ["dep:rusqlite"]
