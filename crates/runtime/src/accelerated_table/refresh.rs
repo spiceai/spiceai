@@ -497,13 +497,10 @@ impl Refresher {
         };
 
         let update_data = update.clone();
-        let update_data = update_data.data.first();
-
-        let Some(update_data) = update_data else {
+        let Some(update_data) = update_data.data.first() else {
             return Ok(update);
         };
 
-        let update_struct_array = StructArray::from(update_data.clone());
         let existing_records = self
             .accelerator_df(self.refresh_df_context())
             .await
@@ -517,6 +514,7 @@ impl Refresher {
         let mut predicates = vec![];
         let mut comparators = vec![];
 
+        let update_struct_array = StructArray::from(update_data.clone());
         for existing in existing_records {
             let existing_array = StructArray::from(existing.clone());
             comparators.push((
