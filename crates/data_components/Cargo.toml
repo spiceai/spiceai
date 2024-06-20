@@ -23,7 +23,6 @@ tokio.workspace = true
 tracing.workspace = true
 flight_client = { path = "../flight_client" }
 sql_provider_datafusion = { path = "../sql_provider_datafusion" }
-secrets = { path = "../secrets" }
 deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "5d7cb57499ef3c35b944cf51fdd5f267e641f6d1", features = [
     "datafusion-ext",
     "s3",
@@ -55,6 +54,7 @@ regex = "1.10.4"
 bytes = "1.6.0"
 url = "2.5.0"
 itertools.workspace = true
+secrecy.workspace = true
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2",  "db_connection_pool/duckdb"]

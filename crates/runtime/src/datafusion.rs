@@ -25,6 +25,7 @@ use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::object_store_registry::default_runtime_env;
+use crate::secrets::Secret;
 use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
@@ -41,7 +42,6 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 use query::{Protocol, QueryBuilder};
-use secrets::Secret;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -211,6 +211,7 @@ impl DataFusion {
                 "datafusion.execution.listing_table_ignore_subdirectory",
                 false,
             );
+
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
@@ -592,7 +593,7 @@ impl DataFusion {
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(TableReference::from(dataset_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 

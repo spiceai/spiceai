@@ -68,7 +68,12 @@ impl ArrayDistance {
     pub fn new() -> Self {
         let valid_types = [true, false]
             .iter()
-            .cartesian_product([DataType::Float16, DataType::Float32, DataType::Float64])
+            .cartesian_product([
+                #[cfg(feature = "f16_and_f128")]
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64,
+            ])
             .flat_map(|(nullable, type_)| {
                 vec![
                     DataType::new_fixed_size_list(
@@ -82,17 +87,31 @@ impl ArrayDistance {
             })
             .collect_vec();
 
+        // Force one of the two inputs to be a fixed length vector.
+        let valid_signatures = valid_types
+            .clone()
+            .iter()
+            .cartesian_product(valid_types)
+            .filter(|(a, b)| {
+                matches!(a, DataType::FixedSizeList(_, _))
+                    || matches!(b, DataType::FixedSizeList(_, _))
+            })
+            .map(|(a, b)| TypeSignature::Exact(vec![a.clone(), b.clone()]))
+            .collect_vec();
+
         Self {
-            signature: Signature::new(
-                TypeSignature::Uniform(2, valid_types),
-                Volatility::Immutable,
-            ),
+            signature: Signature::one_of(valid_signatures, Volatility::Immutable),
         }
     }
 
     /// Returns the less precise Float16/32/64 of the two input types.
     fn least_precise_float_type(t1: &DataType, t2: &DataType) -> DataFusionResult<DataType> {
-        let float_types = [DataType::Float16, DataType::Float32, DataType::Float64];
+        let float_types = [
+            #[cfg(feature = "f16_and_f128")]
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+        ];
         let i1 = float_types
             .iter()
             .position(|t| t == t1)

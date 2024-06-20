@@ -13,10 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(unused_attributes)] // This is for the `f16_and_f128` feature.
-#![feature(f16_and_f128)]
-pub mod array_distance;
-pub mod connector;
-pub mod execution_plan;
-pub mod table;
-pub mod vector_search;
+
+use secrecy::SecretString;
+use std::collections::HashMap;
+
+#[must_use]
+pub fn to_secret_map<S: ::std::hash::BuildHasher + ::std::default::Default>(
+    map: HashMap<String, String, S>,
+) -> HashMap<String, SecretString, S> {
+    map.into_iter()
+        .map(|(k, v)| (k, SecretString::new(v)))
+        .collect()
+}

@@ -18,7 +18,7 @@ use super::Error;
 use super::ModelSource;
 use async_trait::async_trait;
 use regex::Regex;
-use secrets::Secret;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -28,15 +28,10 @@ pub struct Huggingface {}
 
 #[async_trait]
 impl ModelSource for Huggingface {
-    async fn pull(
-        &self,
-        secret: Secret,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> super::Result<String> {
+    async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("name"))
+            .get("name")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let Some(name) = name else {
@@ -47,9 +42,8 @@ impl ModelSource for Huggingface {
         };
 
         let files_param = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("files"))
+            .get("files")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let files = match files_param {
@@ -61,9 +55,8 @@ impl ModelSource for Huggingface {
         let local_path = super::ensure_model_path(name.as_str())?;
 
         let remote_path = params
-            .as_ref()
-            .as_ref()
-            .and_then(|p| p.get("path"))
+            .get("path")
+            .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let Some(remote_path) = remote_path else {
@@ -129,7 +122,13 @@ impl ModelSource for Huggingface {
             let client = reqwest::Client::new();
             let response = client
                 .get(download_url)
-                .bearer_auth(secret.get("token").unwrap_or_default())
+                .bearer_auth(
+                    params
+                        .get("token")
+                        .map(Secret::expose_secret)
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
                 .send()
                 .await
                 .context(super::UnableToFetchModelSnafu {})?;

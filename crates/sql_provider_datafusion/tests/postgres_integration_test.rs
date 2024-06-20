@@ -10,6 +10,7 @@ use db_connection_pool::{
     DbConnectionPool,
 };
 use pgtemp::PgTempDB;
+use secrecy::SecretString;
 use sql_provider_datafusion::SqlTable;
 
 // Run this test requires local installation of postgres
@@ -19,16 +20,34 @@ use sql_provider_datafusion::SqlTable;
 async fn test_postgres_types() {
     let db = PgTempDB::async_new().await;
     let ctx = SessionContext::new();
-    let params = Arc::new(HashMap::from([
-        ("pg_host".to_string(), "localhost".into()),
-        ("pg_port".to_string(), format!("{}", db.db_port())),
-        ("pg_user".to_string(), db.db_user().into()),
-        ("pg_pass".to_string(), db.db_pass().into()),
-        ("pg_db".to_string(), db.db_name().into()),
-        ("pg_sslmode".to_string(), "disable".into()),
-    ]));
+    let params = HashMap::from([
+        (
+            "pg_host".to_string(),
+            SecretString::from("localhost".to_string()),
+        ),
+        (
+            "pg_port".to_string(),
+            SecretString::from(format!("{}", db.db_port())),
+        ),
+        (
+            "pg_user".to_string(),
+            SecretString::from(db.db_user().to_string()),
+        ),
+        (
+            "pg_pass".to_string(),
+            SecretString::from(db.db_pass().to_string()),
+        ),
+        (
+            "pg_db".to_string(),
+            SecretString::from(db.db_name().to_string()),
+        ),
+        (
+            "pg_sslmode".to_string(),
+            SecretString::from("disable".to_string()),
+        ),
+    ]);
     let pool: Arc<dyn DbConnectionPool<_, _> + Send + Sync> = Arc::new(
-        PostgresConnectionPool::new(params, None)
+        PostgresConnectionPool::new(Arc::new(params))
             .await
             .expect("Postgres connection pool should be created"),
     );
