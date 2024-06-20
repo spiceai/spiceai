@@ -550,7 +550,7 @@ impl Refresher {
         };
 
         tracing::debug!(
-            "Filters: {:?} used for refresh {}",
+            "Filters: {:?} used to refresh {}",
             filters,
             self.dataset_name
         );
