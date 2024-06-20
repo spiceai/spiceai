@@ -464,7 +464,7 @@ impl Refresher {
         column: &str,
     ) -> Result<DataFrame, DataFusionError> {
         let expr = cast(
-            col(column),
+            col(format!(r#""{column}""#)),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
         )
         .alias("a");

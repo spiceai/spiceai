@@ -470,12 +470,14 @@ impl Postgres {
     ) -> Result<()> {
         let create_table_statement =
             CreateTableBuilder::new(schema, &self.table_name).primary_keys(primary_keys);
-        let sql = create_table_statement.build_postgres();
+        let create_stmts = create_table_statement.build_postgres();
 
-        transaction
-            .execute(&sql, &[])
-            .await
-            .context(UnableToCreatePostgresTableSnafu)?;
+        for create_stmt in create_stmts {
+            transaction
+                .execute(&create_stmt, &[])
+                .await
+                .context(UnableToCreatePostgresTableSnafu)?;
+        }
 
         Ok(())
     }
