@@ -27,10 +27,10 @@ pub struct TypeBuilder {
 
 impl TypeBuilder {
     #[must_use]
-    pub fn new(name: String, fields: &Fields) -> Self {
+    pub fn new(name: String, table_name: &str, fields: &Fields) -> Self {
         Self {
             name,
-            columns: fields_to_simple_column_defs(fields),
+            columns: fields_to_simple_column_defs(table_name, fields),
         }
     }
 
@@ -83,11 +83,15 @@ impl TypeBuilder {
 }
 
 /// Convert a `Fields` struct into a vector of `ColumnDef` without any constraints or other column specs.
-fn fields_to_simple_column_defs(fields: &Fields) -> Vec<ColumnDef> {
+fn fields_to_simple_column_defs(table_name: &str, fields: &Fields) -> Vec<ColumnDef> {
     let mut column_defs = Vec::new();
     for field in fields {
-        let column_type =
-            map_data_type_to_column_type(field.data_type(), field.name(), Engine::Postgres);
+        let column_type = map_data_type_to_column_type(
+            field.data_type(),
+            table_name,
+            field.name(),
+            Engine::Postgres,
+        );
         let column_def = ColumnDef::new_with_type(Alias::new(field.name()), column_type);
 
         column_defs.push(column_def);
@@ -110,7 +114,7 @@ mod tests {
         ];
         let schema = Schema::new(fields);
 
-        let type_builder = TypeBuilder::new("person".to_string(), schema.fields());
+        let type_builder = TypeBuilder::new("person".to_string(), "users", schema.fields());
         let sql = type_builder.build();
 
         assert_eq!(

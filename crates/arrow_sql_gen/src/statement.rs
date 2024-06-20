@@ -27,8 +27,8 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, BlobSize, ColumnDef, ColumnType, Expr, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query, SeaRc,
-    SimpleExpr, SqliteQueryBuilder, Table,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
+    QueryBuilder, SeaRc, SimpleExpr, SqliteQueryBuilder, Table,
 };
 
 use crate::postgres::builder::TypeBuilder;
@@ -81,6 +81,7 @@ impl CreateTableBuilder {
     #[must_use]
     pub fn build_postgres(self) -> Vec<String> {
         let schema = Arc::clone(&self.schema);
+        let table_name = self.table_name.clone();
         let main_table_creation = self.build(PostgresQueryBuilder, Engine::Postgres);
 
         // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
@@ -91,7 +92,8 @@ impl CreateTableBuilder {
                 continue;
             };
             let type_builder = TypeBuilder::new(
-                get_postgres_composite_type_name(field.name()),
+                get_postgres_composite_type_name(&table_name, field.name()),
+                &table_name,
                 struct_inner_fields,
             );
             creation_stmts.push(type_builder.build());
@@ -115,11 +117,16 @@ impl CreateTableBuilder {
     fn build<T: GenericBuilder>(self, query_builder: T, engine: Engine) -> String {
         let mut create_stmt = Table::create();
         create_stmt
-            .table(Alias::new(self.table_name))
+            .table(Alias::new(self.table_name.clone()))
             .if_not_exists();
 
         for field in self.schema.fields() {
-            let column_type = map_data_type_to_column_type(field.data_type(), field.name(), engine);
+            let column_type = map_data_type_to_column_type(
+                field.data_type(),
+                &self.table_name,
+                field.name(),
+                engine,
+            );
             let mut column_def = ColumnDef::new_with_type(Alias::new(field.name()), column_type);
             if !field.is_nullable() {
                 column_def.not_null();
@@ -189,10 +196,11 @@ impl InsertBuilder {
     ///
     /// Returns an error if a column's data type is not supported, or its conversion failed.
     #[allow(clippy::too_many_lines)]
-    pub fn construct_insert_stmt(
+    pub fn construct_insert_stmt<T: QueryBuilder>(
         &self,
         insert_stmt: &mut InsertStatement,
         record_batch: &RecordBatch,
+        query_builder: &T,
     ) -> Result<()> {
         for row in 0..record_batch.num_rows() {
             let mut row_values: Vec<SimpleExpr> = vec![];
@@ -462,7 +470,7 @@ impl InsertBuilder {
                             row_values.push(valid_array.value(row).into());
                         }
                     }
-                    DataType::Struct(fields) => {
+                    DataType::Struct(_) => {
                         let array = column.as_any().downcast_ref::<array::StructArray>();
 
                         if let Some(valid_array) = array {
@@ -637,11 +645,15 @@ impl InsertBuilder {
                                 }
                             }
 
-                            let param_format = vec!["?"; fields.len()].join(", ");
-                            row_values.push(Expr::cust_with_exprs(
-                                format!("ROW({param_format})"),
-                                param_values,
-                            ));
+                            let mut params_vec = Vec::new();
+                            for param_value in &param_values {
+                                let mut params_str = String::new();
+                                query_builder.prepare_simple_expr(param_value, &mut params_str);
+                                params_vec.push(params_str);
+                            }
+
+                            let params = params_vec.join(", ");
+                            row_values.push(Expr::cust(format!("ROW({params})")));
                         }
                     }
                     unimplemented_type => {
@@ -709,7 +721,7 @@ impl InsertBuilder {
             .to_owned();
 
         for record_batch in &self.record_batches {
-            self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
+            self.construct_insert_stmt(&mut insert_stmt, record_batch, &query_builder)?;
         }
         if let Some(on_conflict) = on_conflict {
             insert_stmt.on_conflict(on_conflict);
@@ -793,6 +805,7 @@ fn insert_timestamp_into_row_values(
 
 pub(crate) fn map_data_type_to_column_type(
     data_type: &DataType,
+    table_name: &str,
     field_name: &str,
     engine: Engine,
 ) -> ColumnType {
@@ -815,20 +828,23 @@ pub(crate) fn map_data_type_to_column_type(
         DataType::Date32 | DataType::Date64 => ColumnType::Date,
         DataType::Time64(_unit) | DataType::Time32(_unit) => ColumnType::Time,
         DataType::List(list_type) => ColumnType::Array(
-            map_data_type_to_column_type(list_type.data_type(), field_name, engine).into(),
+            map_data_type_to_column_type(list_type.data_type(), table_name, field_name, engine)
+                .into(),
         ),
         DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
-        DataType::Struct(_) if matches!(engine, Engine::Postgres) => ColumnType::Custom(
-            SeaRc::new(Alias::new(get_postgres_composite_type_name(field_name))),
-        ),
+        DataType::Struct(_) if matches!(engine, Engine::Postgres) => {
+            ColumnType::Custom(SeaRc::new(Alias::new(get_postgres_composite_type_name(
+                table_name, field_name,
+            ))))
+        }
         // Add more mappings here as needed
         _ => unimplemented!("Data type mapping not implemented for {:?}", data_type),
     }
 }
 
 #[must_use]
-fn get_postgres_composite_type_name(field_name: &str) -> String {
-    format!("struct_{field_name}")
+fn get_postgres_composite_type_name(table_name: &str, field_name: &str) -> String {
+    format!("struct_{table_name}_{field_name}")
 }
 
 #[cfg(test)]
