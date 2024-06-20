@@ -139,7 +139,7 @@ impl Refresher {
                     let (start_time, data_update) = match result {
                         Ok((start_time, data_update)) => (start_time, data_update),
                         Err(e) => {
-                            tracing::debug!("Error getting update for dataset {dataset_name}: {e}");
+                            tracing::error!("Error getting update for dataset {dataset_name}: {e}");
                             self.mark_dataset_status(status::ComponentStatus::Error);
                             continue;
                         }
@@ -548,6 +548,12 @@ impl Refresher {
                 );
             }
         };
+
+        tracing::debug!(
+            "Filters: {:?} used to refresh {}",
+            filters,
+            self.dataset_name
+        );
 
         match self.get_data_update(filters).await {
             Ok(data) => Ok(data),
