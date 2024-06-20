@@ -17,7 +17,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use std::{path::Path, pin::Pin};
 
 use async_openai::{
@@ -49,6 +49,11 @@ pub enum LlmRuntime {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Failed to run LLM health check: {source}"))]
+    HealthCheckError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to run the LLM chat model: {source}"))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -131,6 +136,13 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 #[async_trait]
 pub trait Chat: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
+
+    /// A basic health check to ensure the model can process future [`Self::run`] requests.
+    /// Default implementation is a basic call to [`Self::run`].
+    async fn health(&mut self) -> Result<()> {
+        self.run("health".to_string()).await.boxed().context(HealthCheckSnafu)?;
+        Ok(())
+    }
 
     async fn stream<'a>(
         &mut self,
