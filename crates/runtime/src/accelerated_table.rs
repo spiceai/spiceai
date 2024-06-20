@@ -220,7 +220,9 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
 
-        let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+        let refresh_handle = refresher
+            .start(acceleration_refresh_mode, ready_sender)
+            .await;
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];

@@ -145,20 +145,25 @@ impl Refresher {
         })
     }
 
-    pub(crate) fn start(
+    pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
-        let (task_sender, mut task_callback) = self.refresh_task_runner.start();
+        let time_column = self.refresh.read().await.time_column.clone();
 
         let mut refresh_receiver = match acceleration_refresh_mode {
-            AccelerationRefreshMode::Append(Some(receiver))
-            | AccelerationRefreshMode::Full(receiver) => receiver,
-            AccelerationRefreshMode::Append(None) => {
-                return self.start_streamed_append(ready_sender);
+            AccelerationRefreshMode::Append(receiver) => {
+                if let (Some(receiver), Some(_)) = (receiver, time_column) {
+                    receiver
+                } else {
+                    return self.start_streamed_append(ready_sender);
+                }
             }
+            AccelerationRefreshMode::Full(receiver) => receiver,
         };
+
+        let (task_sender, mut task_callback) = self.refresh_task_runner.start();
 
         let mut ready_sender = Some(ready_sender);
         let dataset_name = self.dataset_name.clone();
@@ -293,7 +298,9 @@ mod tests {
         let (trigger, receiver) = mpsc::channel::<()>(1);
         let (ready_sender, is_ready) = oneshot::channel::<()>();
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-        let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+        let refresh_handle = refresher
+            .start(acceleration_refresh_mode, ready_sender)
+            .await;
 
         trigger
             .send(())
@@ -469,7 +476,9 @@ mod tests {
             let (trigger, receiver) = mpsc::channel::<()>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode, ready_sender)
+                .await;
 
             trigger
                 .send(())
@@ -617,7 +626,9 @@ mod tests {
             let (trigger, receiver) = mpsc::channel::<()>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode, ready_sender)
+                .await;
 
             trigger
                 .send(())
@@ -819,7 +830,9 @@ mod tests {
             let (trigger, receiver) = mpsc::channel::<()>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode, ready_sender)
+                .await;
             trigger
                 .send(())
                 .await
