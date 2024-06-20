@@ -259,10 +259,9 @@ impl Chat for MistralLlama {
         &mut self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
-        let r = self.to_request(prompt, true);
         self.pipeline
             .get_sender()
-            .send(r)
+            .send(self.to_request(prompt, true))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
@@ -293,13 +292,6 @@ impl Chat for MistralLlama {
                         })
                     },
                     MistralRsponse::CompletionDone(cr) => {
-                        println!(
-                            "total: {}, avg_tok_per_sec: {}, avg_prompt_tok_per_sec: {}, avg_compl_tok_per_sec: {}",
-                            cr.usage.total_time_sec,
-                            cr.usage.avg_tok_per_sec,
-                            cr.usage.avg_prompt_tok_per_sec,
-                            cr.usage.avg_compl_tok_per_sec
-                        );
                         yield Ok(Some(cr.choices[0].text.clone()));
                         break;
                     },
@@ -321,16 +313,7 @@ impl Chat for MistralLlama {
             .context(FailedToRunModelSnafu)?;
         match self.rx.write().await.recv().await {
             Some(response) => match response {
-                MistralRsponse::CompletionDone(cr) => {
-                    println!(
-                        "total: {}, avg_tok_per_sec: {}, avg_prompt_tok_per_sec: {}, avg_compl_tok_per_sec: {}",
-                        cr.usage.total_time_sec,
-                        cr.usage.avg_tok_per_sec,
-                        cr.usage.avg_prompt_tok_per_sec,
-                        cr.usage.avg_compl_tok_per_sec
-                    );
-                    Ok(Some(cr.choices[0].text.clone()))
-                }
+                MistralRsponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
                 MistralRsponse::CompletionModelError(err_msg, _cr) => {
                     Err(ChatError::FailedToRunModel {
                         source: err_msg.into(),

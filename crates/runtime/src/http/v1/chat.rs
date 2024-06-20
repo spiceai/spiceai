@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use core::time;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use async_openai::types::CreateChatCompletionRequest;
+use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
 use async_stream::stream;
 use axum::{
     http::StatusCode,
@@ -41,25 +41,7 @@ pub(crate) async fn post(
         Some(model) => {
             if req.stream.unwrap_or_default() {
                 match model.write().await.chat_stream(req).await {
-                    Ok(mut strm) => Sse::new(Box::pin(stream! {
-                        while let Some(msg) = strm.next().await {
-                            match msg {
-                                Ok(resp) => {
-                                    let y = Event::default();
-                                    match y.json_data(resp).map_err(axum::Error::new) {
-                                        Ok(a) => yield Ok(a),
-                                        Err(e) => yield Err(e),
-                                    }
-                                },
-                                Err(e) => {
-                                    yield Err(axum::Error::new(e.to_string()));
-                                    break;
-                                }
-                            }
-                        };
-                    }))
-                    .keep_alive(KeepAlive::new().interval(time::Duration::from_secs(30)))
-                    .into_response(),
+                    Ok(strm) => create_sse_response(strm, time::Duration::from_secs(30)),
                     Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 }
             } else {
@@ -71,4 +53,30 @@ pub(crate) async fn post(
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].
+fn create_sse_response(
+    mut strm: ChatCompletionResponseStream,
+    keep_alive_interval: Duration,
+) -> Response {
+    Sse::new(Box::pin(stream! {
+        while let Some(msg) = strm.next().await {
+            match msg {
+                Ok(resp) => {
+                    let y = Event::default();
+                    match y.json_data(resp).map_err(axum::Error::new) {
+                        Ok(a) => yield Ok(a),
+                        Err(e) => yield Err(e),
+                    }
+                },
+                Err(e) => {
+                    yield Err(axum::Error::new(e.to_string()));
+                    break;
+                }
+            }
+        };
+    }))
+    .keep_alive(KeepAlive::new().interval(keep_alive_interval))
+    .into_response()
 }
