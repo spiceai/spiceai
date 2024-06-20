@@ -18,37 +18,26 @@ use std::convert;
 use std::sync::Arc;
 
 use crate::arrow::map_data_type_to_array_builder_optional;
-use arrow::array::ArrayBuilder;
-use arrow::array::ArrayRef;
-use arrow::array::BooleanBuilder;
-use arrow::array::Date32Builder;
-use arrow::array::Decimal128Builder;
-use arrow::array::FixedSizeBinaryBuilder;
-use arrow::array::Float32Builder;
-use arrow::array::Float64Builder;
-use arrow::array::Int16Builder;
-use arrow::array::Int32Builder;
-use arrow::array::Int64Builder;
-use arrow::array::ListBuilder;
-use arrow::array::RecordBatch;
-use arrow::array::RecordBatchOptions;
-use arrow::array::StringBuilder;
-use arrow::array::TimestampMillisecondBuilder;
-use arrow::datatypes::DataType;
-use arrow::datatypes::Date32Type;
-use arrow::datatypes::Field;
-use arrow::datatypes::Schema;
-use arrow::datatypes::TimeUnit;
+use arrow::array::{
+    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, Int8Builder, LargeBinaryBuilder, LargeStringBuilder, ListBuilder, RecordBatch,
+    RecordBatchOptions, StringBuilder, StructBuilder, TimestampMillisecondBuilder, UInt32Builder,
+};
+use arrow::datatypes::{DataType, Date32Type, Field, Schema, TimeUnit};
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::num_bigint::Sign;
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
+use composite::CompositeType;
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
+use tokio_postgres::types::Kind;
 use tokio_postgres::{types::Type, Column, Row};
 
 pub mod builder;
+pub mod composite;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,6 +67,12 @@ pub enum Error {
     FailedToGetRowValue {
         pg_type: Type,
         source: tokio_postgres::Error,
+    },
+
+    #[snafu(display("Failed to get a composite row value for {pg_type}: {source}"))]
+    FailedToGetCompositeRowValue {
+        pg_type: Type,
+        source: composite::Error,
     },
 
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
@@ -142,6 +137,48 @@ macro_rules! handle_primitive_array_type {
             None => builder.append_null(),
         }
     }};
+}
+
+macro_rules! handle_composite_type {
+    ($BuilderType:ty, $ValueType:ty, $pg_type:expr, $composite_type:expr, $builder:expr, $idx:expr, $field_name:expr) => {{
+        let Some(field_builder) = $builder.field_builder::<$BuilderType>($idx) else {
+            return FailedToDowncastBuilderSnafu {
+                postgres_type: format!("{}", $pg_type),
+            }
+            .fail();
+        };
+        let v: Option<$ValueType> =
+            $composite_type
+                .try_get($field_name)
+                .context(FailedToGetCompositeRowValueSnafu {
+                    pg_type: $pg_type.clone(),
+                })?;
+        match v {
+            Some(v) => field_builder.append_value(v),
+            None => field_builder.append_null(),
+        }
+    }};
+}
+
+macro_rules! handle_composite_types {
+    ($field_type:expr, $pg_type:expr, $composite_type:expr, $builder:expr, $idx:expr, $field_name:expr, $($DataType:ident => ($BuilderType:ty, $ValueType:ty)),*) => {
+        match $field_type {
+            $(
+                DataType::$DataType => {
+                    handle_composite_type!(
+                        $BuilderType,
+                        $ValueType,
+                        $pg_type,
+                        $composite_type,
+                        $builder,
+                        $idx,
+                        $field_name
+                    );
+                }
+            )*
+            _ => unimplemented!("Unsupported field type {:?}", $field_type),
+        }
+    }
 }
 
 /// Converts Postgres Columns to Arrow Data Types
@@ -446,7 +483,69 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     ListBuilder<BooleanBuilder>,
                     bool
                 ),
-                _ => unimplemented!("Unsupported type {:?} for column index {i}", postgres_type,),
+                _ => match *postgres_type.kind() {
+                    Kind::Composite(_) => {
+                        let Some(builder) = builder else {
+                            return NoBuilderForIndexSnafu { index: i }.fail();
+                        };
+                        let Some(builder) = builder.as_any_mut().downcast_mut::<StructBuilder>()
+                        else {
+                            return FailedToDowncastBuilderSnafu {
+                                postgres_type: format!("{postgres_type}"),
+                            }
+                            .fail();
+                        };
+
+                        let v = row.try_get::<usize, Option<CompositeType>>(i).context(
+                            FailedToGetRowValueSnafu {
+                                pg_type: postgres_type.clone(),
+                            },
+                        )?;
+
+                        let Some(composite_type) = v else {
+                            builder.append_null();
+                            continue;
+                        };
+
+                        builder.append(true);
+
+                        let fields = composite_type.fields();
+                        for (idx, field) in fields.iter().enumerate() {
+                            let field_name = field.name();
+                            let Some(field_type) = map_column_type_to_data_type(field.type_())
+                            else {
+                                return FailedToDowncastBuilderSnafu {
+                                    postgres_type: format!("{}", field.type_()),
+                                }
+                                .fail();
+                            };
+
+                            handle_composite_types!(
+                                field_type,
+                                field.type_(),
+                                composite_type,
+                                builder,
+                                idx,
+                                field_name,
+                                Boolean => (BooleanBuilder, bool),
+                                Int8 => (Int8Builder, i8),
+                                Int16 => (Int16Builder, i16),
+                                Int32 => (Int32Builder, i32),
+                                Int64 => (Int64Builder, i64),
+                                UInt32 => (UInt32Builder, u32),
+                                Float32 => (Float32Builder, f32),
+                                Float64 => (Float64Builder, f64),
+                                Binary => (BinaryBuilder, Vec<u8>),
+                                LargeBinary => (LargeBinaryBuilder, Vec<u8>),
+                                Utf8 => (StringBuilder, String),
+                                LargeUtf8 => (LargeStringBuilder, String)
+                            );
+                        }
+                    }
+                    _ => {
+                        unimplemented!("Unsupported type {:?} for column index {i}", postgres_type,)
+                    }
+                },
             }
         }
     }
@@ -516,7 +615,26 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
             DataType::Boolean,
             true,
         )))),
-        _ => unimplemented!("Unsupported column type {:?}", column_type),
+        _ => match *column_type.kind() {
+            Kind::Composite(ref fields) => {
+                let mut arrow_fields = Vec::new();
+                for field in fields {
+                    let field_name = field.name();
+                    let field_type = map_column_type_to_data_type(field.type_());
+                    match field_type {
+                        Some(field_type) => {
+                            arrow_fields.push(Field::new(field_name, field_type, false));
+                        }
+                        None => unimplemented!(
+                            "Unsupported column type in nested struct {:?}",
+                            field_type
+                        ),
+                    }
+                }
+                Some(DataType::Struct(arrow_fields.into()))
+            }
+            _ => unimplemented!("Unsupported column type {:?}", column_type),
+        },
     }
 }
 
