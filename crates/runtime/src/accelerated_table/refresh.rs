@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,11 +14,11 @@ use crate::{
     status,
     timing::TimeMeasurement,
 };
-use arrow::array::TimestampNanosecondArray;
+use arrow::array::{make_comparator, StructArray, TimestampNanosecondArray};
+use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::datatypes::DataType;
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::arrow::write::MemTable;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
@@ -495,32 +496,57 @@ impl Refresher {
             return Ok(update);
         };
 
-        let ctx = SessionContext::new();
-        let mem_table = MemTable::try_new(self.accelerator.schema(), vec![update.clone().data])
-            .context(super::UnableToCreateMemTableFromUpdateSnafu)?;
-        let update_df = ctx
-            .read_table(Arc::new(mem_table))
-            .context(super::UnableToScanTableProviderSnafu)?;
+        let update_data = update.clone();
+        let Some(update_data) = update_data.data.first() else {
+            return Ok(update);
+        };
 
-        let existing_df = self
+        let existing_records = self
             .accelerator_df(self.refresh_df_context())
             .await
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        let data = update_df
-            .except(existing_df)
             .context(super::UnableToScanTableProviderSnafu)?
             .collect()
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        Ok(DataUpdate {
-            schema: update.schema,
-            data,
-            update_type: update.update_type,
-        })
+        let mut predicates = vec![];
+        let mut comparators = vec![];
+
+        let update_struct_array = StructArray::from(update_data.clone());
+        for existing in existing_records {
+            let existing_array = StructArray::from(existing.clone());
+            comparators.push((
+                existing.num_rows(),
+                make_comparator(
+                    &update_struct_array,
+                    &existing_array,
+                    SortOptions::default(),
+                )
+                .context(super::FailedToFilterUpdatesSnafu)?,
+            ));
+        }
+
+        for i in 0..update_data.num_rows() {
+            let mut not_matched = true;
+            for (size, comparator) in &comparators {
+                if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
+                    not_matched = false;
+                    break;
+                }
+            }
+
+            predicates.push(not_matched);
+        }
+
+        filter_record_batch(update_data, &predicates.into())
+            .map(|data| DataUpdate {
+                schema: update.schema,
+                data: vec![data],
+                update_type: update.update_type,
+            })
+            .context(super::FailedToFilterUpdatesSnafu)
     }
 
     pub async fn get_full_or_incremental_append_update(
@@ -686,7 +712,7 @@ mod tests {
 
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, UInt64Array},
-        datatypes::{DataType, Schema},
+        datatypes::{DataType, Fields, Schema},
     };
     use data_components::arrow::write::MemTable;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -1041,6 +1067,211 @@ mod tests {
 
             let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
                 .expect("data should be created");
+
+            let accelerator = Arc::new(
+                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                time_format,
+                None,
+                None,
+                RefreshMode::Append,
+                None,
+                append_overlap,
+            );
+
+            let refresher = Refresher::new(
+                TableReference::bare("test"),
+                federated,
+                Arc::new(RwLock::new(refresh)),
+                Arc::clone(&accelerator),
+            );
+
+            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (ready_sender, is_ready) = oneshot::channel::<()>();
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
+            let refresh_handle = tokio::spawn(async move {
+                refresher
+                    .start(acceleration_refresh_mode, ready_sender)
+                    .await;
+            });
+            trigger
+                .send(())
+                .await
+                .expect("trigger sent correctly to refresh");
+
+            timeout(Duration::from_secs(2), async move {
+                is_ready.await.expect("data is received");
+            })
+            .await
+            .expect("finish before the timeout");
+
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan = accelerator
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            assert_eq!(
+                expected_size,
+                result.into_iter().map(|f| f.num_rows()).sum::<usize>(),
+                "{message}"
+            );
+
+            drop(refresh_handle);
+        }
+
+        test(
+            vec![1, 2, 3],
+            vec![],
+            3,
+            Some(TimeFormat::UnixSeconds),
+            None,
+            "should insert all data into empty accelerator",
+        )
+        .await;
+        test(
+            vec![1, 2, 3],
+            vec![2, 3, 4, 5],
+            4,
+            Some(TimeFormat::UnixSeconds),
+            None,
+            "should not insert any stale data and keep original size",
+        )
+        .await;
+        test(
+            vec![],
+            vec![1, 2, 3, 4],
+            4,
+            Some(TimeFormat::UnixSeconds),
+            None,
+            "should keep original data of accelerator when no new data is found",
+        )
+        .await;
+        test(
+            vec![5, 6],
+            vec![1, 2, 3, 4],
+            6,
+            Some(TimeFormat::UnixSeconds),
+            None,
+            "should apply new data onto existing data",
+        )
+        .await;
+
+        // Known limitation, doesn't dedup
+        test(
+            vec![4, 4],
+            vec![1, 2, 3, 4],
+            4,
+            Some(TimeFormat::UnixSeconds),
+            None,
+            "should not apply same timestamp data",
+        )
+        .await;
+
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            10,
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(10)),
+            "should apply late arrival and new data onto existing data",
+        )
+        .await;
+
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            7, // 1, 2, 3, 7, 8, 9, 10
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(3)),
+            "should apply late arrival within the append overlap period and new data onto existing data",
+        )
+        .await;
+
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            7, // 1, 2, 3, 7, 8, 9, 10
+            None,
+            Some(Duration::from_secs(3)),
+            "should default to time unix seconds",
+        )
+        .await;
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            10, // all the data
+            Some(TimeFormat::UnixMillis),
+            Some(Duration::from_secs(3)),
+            "should fetch all data as 3 seconds is enough to cover all time span in source with millis",
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn test_refresh_append_batch_for_timestamp_with_more_complicated_structs() {
+        async fn test(
+            source_data: Vec<u64>,
+            existing_data: Vec<u64>,
+            expected_size: usize,
+            time_format: Option<TimeFormat>,
+            append_overlap: Option<Duration>,
+            message: &str,
+        ) {
+            let original_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "time",
+                DataType::UInt64,
+                false,
+            )]));
+            let arr = UInt64Array::from(source_data);
+            let batch =
+                RecordBatch::try_new(Arc::clone(&original_schema), vec![Arc::new(arr.clone())])
+                    .expect("data should be created");
+
+            let struct_array = StructArray::from(batch);
+            let schema = Arc::new(Schema::new(vec![
+                arrow::datatypes::Field::new("time", DataType::UInt64, false),
+                arrow::datatypes::Field::new(
+                    "struct",
+                    DataType::Struct(Fields::from(vec![arrow::datatypes::Field::new(
+                        "time",
+                        DataType::UInt64,
+                        false,
+                    )])),
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arr), Arc::new(struct_array)],
+            )
+            .expect("data should be created");
+
+            let federated = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            );
+
+            let arr = UInt64Array::from(existing_data);
+            let batch =
+                RecordBatch::try_new(Arc::clone(&original_schema), vec![Arc::new(arr.clone())])
+                    .expect("data should be created");
+            let struct_array = StructArray::from(batch);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arr), Arc::new(struct_array)],
+            )
+            .expect("data should be created");
 
             let accelerator = Arc::new(
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
