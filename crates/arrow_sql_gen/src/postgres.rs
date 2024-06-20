@@ -625,7 +625,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
                     let field_type = map_column_type_to_data_type(field.type_());
                     match field_type {
                         Some(field_type) => {
-                            arrow_fields.push(Field::new(field_name, field_type, false));
+                            arrow_fields.push(Field::new(field_name, field_type, true));
                         }
                         None => unimplemented!(
                             "Unsupported column type in nested struct {:?}",
