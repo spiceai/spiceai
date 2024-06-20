@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -15,7 +17,7 @@ limitations under the License.
 */
 use arrow::{
     array::{array, Array, RecordBatch},
-    datatypes::{DataType, SchemaRef, TimeUnit},
+    datatypes::{DataType, Field, SchemaRef, TimeUnit},
 };
 
 use bigdecimal_0_3_0::BigDecimal;
@@ -24,9 +26,9 @@ use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
-    Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
+    Alias, BlobSize, ColumnDef, ColumnType, Expr, GenericBuilder, Index, InsertStatement, IntoIden,
     IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
-    SimpleExpr, SqliteQueryBuilder, Table,
+    QueryBuilder, SimpleExpr, SqliteQueryBuilder, Table,
 };
 
 #[derive(Debug, Snafu)]
@@ -68,29 +70,64 @@ impl CreateTableBuilder {
     }
 
     #[must_use]
-    pub fn build_postgres(self) -> String {
-        self.build(PostgresQueryBuilder)
+    #[cfg(feature = "postgres")]
+    pub fn build_postgres(self) -> Vec<String> {
+        use crate::postgres::{
+            builder::TypeBuilder, get_postgres_composite_type_name,
+            map_data_type_to_column_type_postgres,
+        };
+        let schema = Arc::clone(&self.schema);
+        let table_name = self.table_name.clone();
+        let main_table_creation =
+            self.build(PostgresQueryBuilder, &|f: &Arc<Field>| -> ColumnType {
+                map_data_type_to_column_type_postgres(f.data_type(), &table_name, f.name())
+            });
+
+        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
+        // https://www.postgresql.org/docs/current/rowtypes.html
+        let mut creation_stmts = Vec::new();
+        for field in schema.fields() {
+            let DataType::Struct(struct_inner_fields) = field.data_type() else {
+                continue;
+            };
+            let type_builder = TypeBuilder::new(
+                get_postgres_composite_type_name(&table_name, field.name()),
+                struct_inner_fields,
+            );
+            creation_stmts.push(type_builder.build());
+        }
+
+        creation_stmts.push(main_table_creation);
+        creation_stmts
     }
 
     #[must_use]
     pub fn build_sqlite(self) -> String {
-        self.build(SqliteQueryBuilder)
+        self.build(SqliteQueryBuilder, &|f: &Arc<Field>| -> ColumnType {
+            map_data_type_to_column_type(f.data_type())
+        })
     }
 
     #[must_use]
     pub fn build_mysql(self) -> String {
-        self.build(MysqlQueryBuilder)
+        self.build(MysqlQueryBuilder, &|f: &Arc<Field>| -> ColumnType {
+            map_data_type_to_column_type(f.data_type())
+        })
     }
 
     #[must_use]
-    pub fn build<T: GenericBuilder>(self, query_builder: T) -> String {
+    fn build<T: GenericBuilder>(
+        self,
+        query_builder: T,
+        map_data_type_to_column_type_fn: &dyn Fn(&Arc<Field>) -> ColumnType,
+    ) -> String {
         let mut create_stmt = Table::create();
         create_stmt
-            .table(Alias::new(self.table_name))
+            .table(Alias::new(self.table_name.clone()))
             .if_not_exists();
 
         for field in self.schema.fields() {
-            let column_type = map_data_type_to_column_type(field.data_type());
+            let column_type = map_data_type_to_column_type_fn(field);
             let mut column_def = ColumnDef::new_with_type(Alias::new(field.name()), column_type);
             if !field.is_nullable() {
                 column_def.not_null();
@@ -160,10 +197,11 @@ impl InsertBuilder {
     ///
     /// Returns an error if a column's data type is not supported, or its conversion failed.
     #[allow(clippy::too_many_lines)]
-    pub fn construct_insert_stmt(
+    pub fn construct_insert_stmt<T: QueryBuilder>(
         &self,
         insert_stmt: &mut InsertStatement,
         record_batch: &RecordBatch,
+        query_builder: &T,
     ) -> Result<()> {
         for row in 0..record_batch.num_rows() {
             let mut row_values: Vec<SimpleExpr> = vec![];
@@ -433,6 +471,192 @@ impl InsertBuilder {
                             row_values.push(valid_array.value(row).into());
                         }
                     }
+                    DataType::Struct(_) => {
+                        let array = column.as_any().downcast_ref::<array::StructArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+
+                            let mut param_values: Vec<SimpleExpr> = vec![];
+
+                            for col in valid_array.columns() {
+                                match col.data_type() {
+                                    DataType::Int8 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int8Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Int16 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int16Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Int32 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int32Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Int64 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::Int64Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt8 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt8Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt16 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt16Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt32 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt32Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::UInt64 => {
+                                        let int_array =
+                                            col.as_any().downcast_ref::<array::UInt64Array>();
+
+                                        if let Some(valid_int_array) = int_array {
+                                            param_values.push(valid_int_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Float32 => {
+                                        let float_array =
+                                            col.as_any().downcast_ref::<array::Float32Array>();
+
+                                        if let Some(valid_float_array) = float_array {
+                                            param_values.push(valid_float_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Float64 => {
+                                        let float_array =
+                                            col.as_any().downcast_ref::<array::Float64Array>();
+
+                                        if let Some(valid_float_array) = float_array {
+                                            param_values.push(valid_float_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Utf8 => {
+                                        let string_array =
+                                            col.as_any().downcast_ref::<array::StringArray>();
+
+                                        if let Some(valid_string_array) = string_array {
+                                            param_values.push(valid_string_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Null => {
+                                        param_values.push(Keyword::Null.into());
+                                    }
+                                    DataType::Boolean => {
+                                        let bool_array =
+                                            col.as_any().downcast_ref::<array::BooleanArray>();
+
+                                        if let Some(valid_bool_array) = bool_array {
+                                            param_values.push(valid_bool_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Binary => {
+                                        let binary_array =
+                                            col.as_any().downcast_ref::<array::BinaryArray>();
+
+                                        if let Some(valid_binary_array) = binary_array {
+                                            param_values.push(valid_binary_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::FixedSizeBinary(_) => {
+                                        let binary_array = col
+                                            .as_any()
+                                            .downcast_ref::<array::FixedSizeBinaryArray>();
+
+                                        if let Some(valid_binary_array) = binary_array {
+                                            param_values.push(valid_binary_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::LargeBinary => {
+                                        let binary_array =
+                                            col.as_any().downcast_ref::<array::LargeBinaryArray>();
+
+                                        if let Some(valid_binary_array) = binary_array {
+                                            param_values.push(valid_binary_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::LargeUtf8 => {
+                                        let string_array =
+                                            col.as_any().downcast_ref::<array::LargeStringArray>();
+
+                                        if let Some(valid_string_array) = string_array {
+                                            param_values.push(valid_string_array.value(row).into());
+                                        }
+                                    }
+                                    DataType::Float16
+                                    | DataType::Timestamp(_, _)
+                                    | DataType::Date32
+                                    | DataType::Date64
+                                    | DataType::Time32(_)
+                                    | DataType::Time64(_)
+                                    | DataType::Duration(_)
+                                    | DataType::Interval(_)
+                                    | DataType::BinaryView
+                                    | DataType::Utf8View
+                                    | DataType::List(_)
+                                    | DataType::ListView(_)
+                                    | DataType::FixedSizeList(_, _)
+                                    | DataType::LargeList(_)
+                                    | DataType::LargeListView(_)
+                                    | DataType::Struct(_)
+                                    | DataType::Union(_, _)
+                                    | DataType::Dictionary(_, _)
+                                    | DataType::Map(_, _)
+                                    | DataType::RunEndEncoded(_, _)
+                                    | DataType::Decimal128(_, _)
+                                    | DataType::Decimal256(_, _) => {
+                                        unimplemented!(
+                                            "Data type mapping not implemented for Struct of {}",
+                                            col.data_type()
+                                        )
+                                    }
+                                }
+                            }
+
+                            let mut params_vec = Vec::new();
+                            for param_value in &param_values {
+                                let mut params_str = String::new();
+                                query_builder.prepare_simple_expr(param_value, &mut params_str);
+                                params_vec.push(params_str);
+                            }
+
+                            let params = params_vec.join(", ");
+                            row_values.push(Expr::cust(format!("ROW({params})")));
+                        }
+                    }
                     unimplemented_type => {
                         return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
                             data_type: unimplemented_type.clone(),
@@ -498,7 +722,7 @@ impl InsertBuilder {
             .to_owned();
 
         for record_batch in &self.record_batches {
-            self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
+            self.construct_insert_stmt(&mut insert_stmt, record_batch, &query_builder)?;
         }
         if let Some(on_conflict) = on_conflict {
             insert_stmt.on_conflict(on_conflict);
@@ -580,7 +804,7 @@ fn insert_timestamp_into_row_values(
     }
 }
 
-fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
+pub(crate) fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
     match data_type {
         DataType::Int8 => ColumnType::TinyInteger,
         DataType::Int16 => ColumnType::SmallInteger,
@@ -603,7 +827,6 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
         }
         DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
-
         // Add more mappings here as needed
         _ => unimplemented!("Data type mapping not implemented for {:?}", data_type),
     }
@@ -625,7 +848,7 @@ mod tests {
         ]);
         let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users").build_postgres();
 
-        assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
+        assert_eq!(sql[0], "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
     }
 
     #[test]
@@ -684,7 +907,7 @@ mod tests {
             .primary_keys(vec!["id", "id2"])
             .build_postgres();
 
-        assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"id2\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer, PRIMARY KEY (\"id\", \"id2\") )");
+        assert_eq!(sql[0], "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"id2\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer, PRIMARY KEY (\"id\", \"id2\") )");
     }
 
     #[test]
