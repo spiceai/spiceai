@@ -49,6 +49,10 @@ E.g. `explain select 1`
 
 **Have you tried this on the latest `trunk` branch?**
 
+**If possible, run `spiced` with DEBUG log level**
+
+By setting the environment variable `SPICED_LOG=debug`
+
 **Screenshots**
 If applicable, add screenshots to help explain your problem.
 
