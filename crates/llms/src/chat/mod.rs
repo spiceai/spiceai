@@ -140,7 +140,10 @@ pub trait Chat: Sync + Send {
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&mut self) -> Result<()> {
-        self.run("health".to_string()).await.boxed().context(HealthCheckSnafu)?;
+        self.run("health".to_string())
+            .await
+            .boxed()
+            .context(HealthCheckSnafu)?;
         Ok(())
     }
 

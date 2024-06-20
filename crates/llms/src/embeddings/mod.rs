@@ -21,7 +21,6 @@ use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-
     #[snafu(display("Failed to run Embedding health check: {source}"))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -48,7 +47,9 @@ pub trait Embed: Sync + Send {
     /// Default implementation is a basic call to [`embed()`].
     async fn health(&mut self) -> Result<()> {
         self.embed(EmbeddingInput::String("health".to_string()))
-            .await.boxed().context(HealthCheckSnafu)?;
+            .await
+            .boxed()
+            .context(HealthCheckSnafu)?;
         Ok(())
     }
 
