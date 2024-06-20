@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::embeddings::vector_search;
 use crate::model::LLMModelStore;
 use crate::EmbeddingModelStore;
 use crate::{config, datafusion::DataFusion};
@@ -45,6 +46,7 @@ pub(crate) fn routes(
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
+    vector_search: Arc<vector_search::VectorSearch>,
 ) -> Router {
     let mut router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
@@ -74,6 +76,7 @@ pub(crate) fn routes(
             .route("/v1/assist", post(v1::assist::post))
             .layer(Extension(llms))
             .layer(Extension(models))
+            .layer(Extension(vector_search))
             .layer(Extension(embeddings));
     }
 
