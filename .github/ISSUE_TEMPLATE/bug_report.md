@@ -51,7 +51,7 @@ E.g. `explain select 1`
 
 **If possible, run `spiced` with DEBUG log level**
 
-By setting the environment variable `SPICED_LOG=spiced,runtime,data_components`
+By setting the environment variable `SPICED_LOG="spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,sql_provider_datafusion=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG"`
 
 **Screenshots**
 If applicable, add screenshots to help explain your problem.
