@@ -18,6 +18,7 @@ use std::convert;
 use std::sync::Arc;
 
 use crate::arrow::map_data_type_to_array_builder_optional;
+use crate::statement::map_data_type_to_column_type;
 use arrow::array::{
     ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
     FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
@@ -30,6 +31,7 @@ use bigdecimal::num_bigint::Sign;
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
 use composite::CompositeType;
+use sea_query::{Alias, ColumnType, SeaRc};
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
@@ -636,6 +638,24 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
             _ => unimplemented!("Unsupported column type {:?}", column_type),
         },
     }
+}
+
+pub(crate) fn map_data_type_to_column_type_postgres(
+    data_type: &DataType,
+    table_name: &str,
+    field_name: &str,
+) -> ColumnType {
+    match data_type {
+        DataType::Struct(_) => ColumnType::Custom(SeaRc::new(Alias::new(
+            get_postgres_composite_type_name(table_name, field_name),
+        ))),
+        _ => map_data_type_to_column_type(data_type),
+    }
+}
+
+#[must_use]
+pub(crate) fn get_postgres_composite_type_name(table_name: &str, field_name: &str) -> String {
+    format!("struct_{table_name}_{field_name}")
 }
 
 struct BigDecimalFromSql {
