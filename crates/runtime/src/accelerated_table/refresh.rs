@@ -138,9 +138,14 @@ impl Refresher {
             Arc::clone(&self.accelerator),
         ));
 
+        let cache_provider = self.cache_provider.clone();
+
         tokio::spawn(async move {
-            if let Err(err) = refresh_task.start_streamed_append(Some(ready_sender)).await {
-                tracing::error!("Failed to start append refresh: {err}");
+            if let Err(err) = refresh_task
+                .start_streamed_append(cache_provider, Some(ready_sender))
+                .await
+            {
+                tracing::error!("Append refresh failed with error: {err}");
             }
         })
     }
@@ -175,7 +180,7 @@ impl Refresher {
             loop {
                 select! {
                     _ = refresh_receiver.recv() => {
-                        tracing::debug!("Received outside triggered for refresh");
+                        tracing::debug!("Received outside trigger to start refresh");
 
                         if let Err(err) = task_sender.send(()).await {
                             tracing::error!("Failed to execute refresh: {err}");

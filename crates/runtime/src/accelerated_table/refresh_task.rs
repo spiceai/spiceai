@@ -20,6 +20,7 @@ use arrow::{
     datatypes::DataType,
 };
 use async_stream::stream;
+use cache::QueryResultsCacheProvider;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 
@@ -78,8 +79,11 @@ impl RefreshTask {
 
     pub async fn start_streamed_append(
         &self,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
     ) -> super::Result<()> {
+        self.mark_dataset_status(status::ComponentStatus::Refreshing);
+
         let mut stream = Box::pin(self.get_append_stream());
 
         let dataset_name = self.dataset_name.clone();
@@ -89,12 +93,26 @@ impl RefreshTask {
         while let Some(update) = stream.next().await {
             match update {
                 Ok((start_time, data_update)) => {
-                    if let Err(err) = self.write_data_update(start_time, data_update).await {
-                        tracing::error!("Error adding data for dataset {dataset_name}: {err}");
-                    } else {
-                        // TODO : move cache invalidation to self.write_data_update or pass a callback
+                    // write_data_update updates dataset status and logs errors so we don't do this here
+                    if self
+                        .write_data_update(start_time, data_update)
+                        .await
+                        .is_ok()
+                    {
                         if let Some(ready_sender) = ready_sender.take() {
                             ready_sender.send(()).ok();
+                        }
+
+                        if let Some(cache_provider) = &cache_provider {
+                            if let Err(e) = cache_provider
+                                .invalidate_for_table(&dataset_name.to_string())
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name.to_string()
+                                );
+                            }
                         }
                     }
                 }
