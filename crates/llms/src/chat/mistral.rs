@@ -16,7 +16,9 @@ limitations under the License.
 #![allow(clippy::needless_pass_by_value)]
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use async_stream::stream;
 use async_trait::async_trait;
+use futures::Stream;
 use mistralrs::{
     Constraint, Device, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig,
     GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder,
@@ -25,13 +27,16 @@ use mistralrs::{
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
-use std::{path::Path, str::FromStr, sync::Arc};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use std::{path::Path, pin::Pin, str::FromStr, sync::Arc};
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    RwLock,
+};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     tx: Sender<MistralRsponse>,
-    rx: Receiver<MistralRsponse>,
+    rx: Arc<RwLock<Receiver<MistralRsponse>>>,
 }
 
 impl MistralLlama {
@@ -225,11 +230,11 @@ impl MistralLlama {
             )
             .build(),
             tx,
-            rx,
+            rx: Arc::new(RwLock::new(rx)),
         })
     }
 
-    fn to_request(&self, prompt: String) -> MistralRsquest {
+    fn to_request(&self, prompt: String, is_streaming: bool) -> MistralRsquest {
         MistralRsquest::Normal(NormalRequest {
             messages: RequestMessage::Completion {
                 text: prompt,
@@ -239,7 +244,7 @@ impl MistralLlama {
             sampling_params: SamplingParams::default(),
             response: self.tx.clone(),
             return_logprobs: false,
-            is_streaming: false,
+            is_streaming,
             id: 0,
             constraint: Constraint::None,
             suffix: None,
@@ -250,15 +255,71 @@ impl MistralLlama {
 
 #[async_trait]
 impl Chat for MistralLlama {
-    async fn run(&mut self, prompt: String) -> Result<Option<String>> {
-        let r = self.to_request(prompt);
+    async fn stream<'a>(
+        &mut self,
+        prompt: String,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
+        let r = self.to_request(prompt, true);
         self.pipeline
             .get_sender()
             .send(r)
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-        match self.rx.recv().await {
+
+        let stream_rx = Arc::clone(&self.rx);
+        Ok(Pin::from(Box::new(stream! {
+            while let Some(resp) = stream_rx.write().await.recv().await {
+                match resp {
+                    MistralRsponse::Chunk(chunk) => {
+                        if let Some(choice) = chunk.choices.first() {
+                            yield Ok(Some(choice.delta.content.clone()));
+                            if choice.finish_reason.is_some() {
+                                break;
+                            }
+                        } else {
+                            yield Ok(None);
+                            break;
+                        }
+                    },
+                    MistralRsponse::ModelError(err_msg, _) | MistralRsponse::CompletionModelError(err_msg, _) => {
+                        yield Err(ChatError::FailedToRunModel {
+                            source: err_msg.into(),
+                        })
+                    },
+                    MistralRsponse::InternalError(err_msg) | MistralRsponse::ValidationError(err_msg) => {
+                        yield Err(ChatError::FailedToRunModel {
+                            source: err_msg,
+                        })
+                    },
+                    MistralRsponse::CompletionDone(cr) => {
+                        println!(
+                            "total: {}, avg_tok_per_sec: {}, avg_prompt_tok_per_sec: {}, avg_compl_tok_per_sec: {}",
+                            cr.usage.total_time_sec,
+                            cr.usage.avg_tok_per_sec,
+                            cr.usage.avg_prompt_tok_per_sec,
+                            cr.usage.avg_compl_tok_per_sec
+                        );
+                        yield Ok(Some(cr.choices[0].text.clone()));
+                        break;
+                    },
+                    MistralRsponse::Done(_) => {
+                        unreachable!()
+                    },
+                }
+            }
+        })))
+    }
+
+    async fn run(&mut self, prompt: String) -> Result<Option<String>> {
+        let r = self.to_request(prompt, false);
+        self.pipeline
+            .get_sender()
+            .send(r)
+            .await
+            .boxed()
+            .context(FailedToRunModelSnafu)?;
+        match self.rx.write().await.recv().await {
             Some(response) => match response {
                 MistralRsponse::CompletionDone(cr) => {
                     println!(
