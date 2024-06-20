@@ -18,16 +18,16 @@ limitations under the License.
 use arrow::datatypes::Fields;
 use sea_query::{Alias, ColumnDef, PostgresQueryBuilder, TableBuilder};
 
-use crate::statement::map_data_type_to_column_type;
+use crate::statement::{map_data_type_to_column_type, Engine};
 
-pub struct TypeBuilder<'a> {
-    name: &'a str,
+pub struct TypeBuilder {
+    name: String,
     columns: Vec<ColumnDef>,
 }
 
-impl<'a> TypeBuilder<'a> {
+impl TypeBuilder {
     #[must_use]
-    pub fn new(name: &'a str, fields: &Fields) -> Self {
+    pub fn new(name: String, fields: &Fields) -> Self {
         Self {
             name,
             columns: fields_to_simple_column_defs(fields),
@@ -86,7 +86,8 @@ impl<'a> TypeBuilder<'a> {
 fn fields_to_simple_column_defs(fields: &Fields) -> Vec<ColumnDef> {
     let mut column_defs = Vec::new();
     for field in fields {
-        let column_type = map_data_type_to_column_type(field.data_type());
+        let column_type =
+            map_data_type_to_column_type(field.data_type(), field.name(), Engine::Postgres);
         let column_def = ColumnDef::new_with_type(Alias::new(field.name()), column_type);
 
         column_defs.push(column_def);
@@ -109,7 +110,7 @@ mod tests {
         ];
         let schema = Schema::new(fields);
 
-        let type_builder = TypeBuilder::new("person", schema.fields());
+        let type_builder = TypeBuilder::new("person".to_string(), schema.fields());
         let sql = type_builder.build();
 
         assert_eq!(

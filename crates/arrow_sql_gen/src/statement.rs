@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -25,9 +27,11 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, BlobSize, ColumnDef, ColumnType, Expr, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query, SeaRc,
     SimpleExpr, SqliteQueryBuilder, Table,
 };
+
+use crate::postgres::builder::TypeBuilder;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -46,6 +50,13 @@ pub struct CreateTableBuilder {
     schema: SchemaRef,
     table_name: String,
     primary_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Engine {
+    Postgres,
+    Sqlite,
+    Mysql,
 }
 
 impl CreateTableBuilder {
@@ -69,36 +80,46 @@ impl CreateTableBuilder {
 
     #[must_use]
     pub fn build_postgres(self) -> Vec<String> {
-        self.build(PostgresQueryBuilder)
+        let schema = Arc::clone(&self.schema);
+        let main_table_creation = self.build(PostgresQueryBuilder, Engine::Postgres);
+
+        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
+        // https://www.postgresql.org/docs/current/rowtypes.html
+        let mut creation_stmts = Vec::new();
+        for field in schema.fields() {
+            let DataType::Struct(struct_inner_fields) = field.data_type() else {
+                continue;
+            };
+            let type_builder = TypeBuilder::new(
+                get_postgres_composite_type_name(field.name()),
+                struct_inner_fields,
+            );
+            creation_stmts.push(type_builder.build());
+        }
+
+        creation_stmts.push(main_table_creation);
+        creation_stmts
     }
 
     #[must_use]
     pub fn build_sqlite(self) -> String {
-        let stmts = self.build(SqliteQueryBuilder);
-        let Some(stmt) = stmts.into_iter().next() else {
-            unreachable!("Expected one statement, found none")
-        };
-        stmt
+        self.build(SqliteQueryBuilder, Engine::Sqlite)
     }
 
     #[must_use]
     pub fn build_mysql(self) -> String {
-        let stmts = self.build(MysqlQueryBuilder);
-        let Some(stmt) = stmts.into_iter().next() else {
-            unreachable!("Expected one statement, found none")
-        };
-        stmt
+        self.build(MysqlQueryBuilder, Engine::Mysql)
     }
 
     #[must_use]
-    pub fn build<T: GenericBuilder>(self, query_builder: T) -> Vec<String> {
+    fn build<T: GenericBuilder>(self, query_builder: T, engine: Engine) -> String {
         let mut create_stmt = Table::create();
         create_stmt
             .table(Alias::new(self.table_name))
             .if_not_exists();
 
         for field in self.schema.fields() {
-            let column_type = map_data_type_to_column_type(field.data_type());
+            let column_type = map_data_type_to_column_type(field.data_type(), field.name(), engine);
             let mut column_def = ColumnDef::new_with_type(Alias::new(field.name()), column_type);
             if !field.is_nullable() {
                 column_def.not_null();
@@ -116,11 +137,7 @@ impl CreateTableBuilder {
             create_stmt.primary_key(&mut index);
         }
 
-        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
-        // https://www.postgresql.org/docs/current/rowtypes.html
-        //let mut type_creation_stmts = Vec::new();
-
-        vec![create_stmt.to_string(query_builder)]
+        create_stmt.to_string(query_builder)
     }
 }
 
@@ -774,7 +791,11 @@ fn insert_timestamp_into_row_values(
     }
 }
 
-pub(crate) fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
+pub(crate) fn map_data_type_to_column_type(
+    data_type: &DataType,
+    field_name: &str,
+    engine: Engine,
+) -> ColumnType {
     match data_type {
         DataType::Int8 => ColumnType::TinyInteger,
         DataType::Int16 => ColumnType::SmallInteger,
@@ -793,14 +814,21 @@ pub(crate) fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::Timestamp(_unit, _time_zone) => ColumnType::Timestamp,
         DataType::Date32 | DataType::Date64 => ColumnType::Date,
         DataType::Time64(_unit) | DataType::Time32(_unit) => ColumnType::Time,
-        DataType::List(list_type) => {
-            ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
-        }
+        DataType::List(list_type) => ColumnType::Array(
+            map_data_type_to_column_type(list_type.data_type(), field_name, engine).into(),
+        ),
         DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
-
+        DataType::Struct(_) if matches!(engine, Engine::Postgres) => ColumnType::Custom(
+            SeaRc::new(Alias::new(get_postgres_composite_type_name(field_name))),
+        ),
         // Add more mappings here as needed
         _ => unimplemented!("Data type mapping not implemented for {:?}", data_type),
     }
+}
+
+#[must_use]
+fn get_postgres_composite_type_name(field_name: &str) -> String {
+    format!("struct_{field_name}")
 }
 
 #[cfg(test)]
