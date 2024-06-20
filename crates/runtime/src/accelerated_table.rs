@@ -22,6 +22,7 @@ use crate::component::dataset::TimeFormat;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
 use data_components::delete::get_deletion_provider;
@@ -84,6 +85,9 @@ pub enum Error {
 
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
+
+    #[snafu(display("Failed to filter update data: {source}"))]
+    FailedToFilterUpdates { source: ArrowError },
 
     #[snafu(display("Failed to write data into accelerated table: {source}"))]
     FailedToWriteData {

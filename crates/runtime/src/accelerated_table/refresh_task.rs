@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::TimestampNanosecondArray, datatypes::DataType};
+use arrow::compute::{filter_record_batch, SortOptions};
+use arrow::{
+    array::{make_comparator, StructArray, TimestampNanosecondArray},
+    datatypes::DataType,
+};
 use async_stream::stream;
-use data_components::arrow::write::MemTable;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 
@@ -35,7 +38,7 @@ use crate::{
 use super::refresh::get_timestamp;
 
 use crate::component::dataset::TimeFormat;
-use std::{sync::Arc, time::SystemTime};
+use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{oneshot, RwLock};
 
 use datafusion::{
@@ -429,7 +432,7 @@ impl RefreshTask {
         column: &str,
     ) -> Result<DataFrame, DataFusionError> {
         let expr = cast(
-            col(column),
+            col(format!(r#""{column}""#)),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
         )
         .alias("a");
@@ -454,38 +457,62 @@ impl RefreshTask {
         let Some(value) = self.timestamp_nanos_for_append_query().await? else {
             return Ok(update);
         };
-
         let refresh = self.refresh.read().await;
         let Some(filter_converter) = self.get_filter_converter(&refresh) else {
             return Ok(update);
         };
 
-        let ctx = SessionContext::new();
-        let mem_table = MemTable::try_new(self.accelerator.schema(), vec![update.clone().data])
-            .context(super::UnableToCreateMemTableFromUpdateSnafu)?;
-        let update_df = ctx
-            .read_table(Arc::new(mem_table))
-            .context(super::UnableToScanTableProviderSnafu)?;
+        let update_data = update.clone();
+        let Some(update_data) = update_data.data.first() else {
+            return Ok(update);
+        };
 
-        let existing_df = self
+        let existing_records = self
             .accelerator_df(self.refresh_df_context())
             .await
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        let data = update_df
-            .except(existing_df)
             .context(super::UnableToScanTableProviderSnafu)?
             .collect()
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        Ok(DataUpdate {
-            schema: update.schema,
-            data,
-            update_type: update.update_type,
-        })
+        let mut predicates = vec![];
+        let mut comparators = vec![];
+
+        let update_struct_array = StructArray::from(update_data.clone());
+        for existing in existing_records {
+            let existing_array = StructArray::from(existing.clone());
+            comparators.push((
+                existing.num_rows(),
+                make_comparator(
+                    &update_struct_array,
+                    &existing_array,
+                    SortOptions::default(),
+                )
+                .context(super::FailedToFilterUpdatesSnafu)?,
+            ));
+        }
+
+        for i in 0..update_data.num_rows() {
+            let mut not_matched = true;
+            for (size, comparator) in &comparators {
+                if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
+                    not_matched = false;
+                    break;
+                }
+            }
+
+            predicates.push(not_matched);
+        }
+
+        filter_record_batch(update_data, &predicates.into())
+            .map(|data| DataUpdate {
+                schema: update.schema,
+                data: vec![data],
+                update_type: update.update_type,
+            })
+            .context(super::FailedToFilterUpdatesSnafu)
     }
 
     async fn refresh_append_overlap_nanos(&self) -> u128 {
