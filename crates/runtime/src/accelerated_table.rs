@@ -52,7 +52,7 @@ use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
 pub mod refresh;
-mod refresh_task;
+pub mod refresh_task;
 mod refresh_task_runner;
 
 #[derive(Debug, Snafu)]
@@ -270,6 +270,11 @@ impl AcceleratedTable {
     #[must_use]
     pub fn refresher(&self) -> Arc<refresh::Refresher> {
         Arc::clone(&self.refresher)
+    }
+
+    #[must_use]
+    pub fn refresh_params(&self) -> Arc<RwLock<refresh::Refresh>> {
+        Arc::clone(&self.refresh_params)
     }
 
     pub async fn trigger_refresh(&self) -> Result<()> {
