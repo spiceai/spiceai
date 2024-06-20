@@ -51,7 +51,7 @@ E.g. `explain select 1`
 
 **If possible, run `spiced` with DEBUG log level**
 
-By setting the environment variable `SPICED_LOG=debug`
+By setting the environment variable `SPICED_LOG=spiced,runtime,data_components`
 
 **Screenshots**
 If applicable, add screenshots to help explain your problem.
