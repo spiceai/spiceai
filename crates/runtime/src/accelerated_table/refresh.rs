@@ -1,37 +1,36 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::sync::Arc;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::accelerated_table::refresh_task::RefreshTask;
+use crate::accelerated_table::refresh_task_runner::RefreshTaskResult;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
-use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::datafusion::{schema, SPICE_RUNTIME_SCHEMA};
-use crate::execution_plan::schema_cast::EnsureSchema;
-use crate::object_store_registry::default_runtime_env;
-use crate::{
-    dataconnector::get_data,
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
-    status,
-    timing::TimeMeasurement,
-};
-use arrow::array::TimestampNanosecondArray;
-use arrow::datatypes::DataType;
-use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::arrow::write::MemTable;
 use datafusion::common::TableReference;
-use datafusion::error::DataFusionError;
-use datafusion::execution::config::SessionConfig;
-use datafusion::logical_expr::{cast, col, Expr, Operator};
-use datafusion::physical_plan::{collect, ExecutionPlanProperties};
-use datafusion::prelude::DataFrame;
-use datafusion::{datasource::TableProvider, execution::context::SessionContext};
-use futures::Stream;
-use futures::{stream::BoxStream, StreamExt};
-use snafu::prelude::*;
+use datafusion::datasource::TableProvider;
+use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tokio_stream::wrappers::ReceiverStream;
+
+use super::refresh_task_runner::RefreshTaskRunner;
 
 #[derive(Clone, Debug)]
 pub struct Refresh {
@@ -93,6 +92,7 @@ pub struct Refresher {
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    refresh_task_runner: RefreshTaskRunner,
 }
 
 impl Refresher {
@@ -102,12 +102,20 @@ impl Refresher {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
+        let refresh_task_runner = RefreshTaskRunner::new(
+            dataset_name.clone(),
+            Arc::clone(&federated),
+            Arc::clone(&refresh),
+            Arc::clone(&accelerator),
+        );
+
         Self {
             dataset_name,
             federated,
             refresh,
             accelerator,
             cache_provider: None,
+            refresh_task_runner,
         }
     }
 
@@ -119,552 +127,105 @@ impl Refresher {
         self
     }
 
-    pub(crate) async fn start(
-        &self,
-        acceleration_refresh_mode: AccelerationRefreshMode,
+    fn start_streamed_append(
+        &mut self,
         ready_sender: oneshot::Sender<()>,
-    ) {
-        let dataset_name = self.dataset_name.clone();
-        let mut stream = self.stream_updates(acceleration_refresh_mode).await;
+    ) -> tokio::task::JoinHandle<()> {
+        let refresh_task = Arc::new(RefreshTask::new(
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            Arc::clone(&self.refresh),
+            Arc::clone(&self.accelerator),
+        ));
 
-        let ctx = SessionContext::new();
-
-        let mut ready_sender = Some(ready_sender);
-
-        loop {
-            let future_result = stream.next().await;
-
-            match future_result {
-                Some(result) => {
-                    let (start_time, data_update) = match result {
-                        Ok((start_time, data_update)) => (start_time, data_update),
-                        Err(e) => {
-                            tracing::debug!("Error getting update for dataset {dataset_name}: {e}");
-                            self.mark_dataset_status(status::ComponentStatus::Error);
-                            continue;
-                        }
-                    };
-
-                    if data_update.data.is_empty()
-                        || data_update
-                            .data
-                            .first()
-                            .map_or(false, |x| x.columns().is_empty())
-                    {
-                        if let Some(start_time) = start_time {
-                            self.trace_dataset_loaded(start_time, 0, None);
-                        }
-                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready)
-                            .await;
-                        continue;
-                    };
-
-                    let overwrite = data_update.update_type == UpdateType::Overwrite;
-                    match self
-                        .accelerator
-                        .insert_into(
-                            &ctx.state(),
-                            Arc::new(DataUpdateExecutionPlan::new(data_update.clone())),
-                            overwrite,
-                        )
-                        .await
-                    {
-                        Ok(plan) => {
-                            if let Err(e) = collect(plan, ctx.task_ctx()).await {
-                                tracing::error!("Error adding data for {dataset_name}: {e}");
-                                self.mark_dataset_status(status::ComponentStatus::Error);
-                            } else {
-                                if let Some(start_time) = start_time {
-                                    let num_rows = data_update
-                                        .clone()
-                                        .data
-                                        .into_iter()
-                                        .map(|x| x.num_rows())
-                                        .sum::<usize>();
-
-                                    let memory_size = data_update
-                                        .data
-                                        .into_iter()
-                                        .map(|x| x.get_array_memory_size())
-                                        .sum::<usize>();
-
-                                    self.trace_dataset_loaded(
-                                        start_time,
-                                        num_rows,
-                                        Some(memory_size),
-                                    );
-
-                                    if let Some(cache_provider) = &self.cache_provider {
-                                        if let Err(e) = cache_provider
-                                            .invalidate_for_table(&dataset_name.to_string())
-                                            .await
-                                        {
-                                            tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
-                                        }
-                                    }
-                                }
-
-                                self.notify_refresh_done(
-                                    &mut ready_sender,
-                                    status::ComponentStatus::Ready,
-                                )
-                                .await;
-                            };
-                        }
-                        Err(e) => {
-                            self.mark_dataset_status(status::ComponentStatus::Error);
-                            tracing::error!("Error adding data for {dataset_name}: {e}");
-                        }
-                    }
-                }
-                None => break,
-            };
-        }
-    }
-
-    fn trace_dataset_loaded(
-        &self,
-        start_time: SystemTime,
-        num_rows: usize,
-        memory_size: Option<usize>,
-    ) {
-        if let Ok(elapse) = util::humantime_elapsed(start_time) {
-            let dataset_name = &self.dataset_name;
-            let num_rows = util::pretty_print_number(num_rows);
-            let memory_size = match memory_size {
-                Some(memory_size) => format!(" ({})", util::human_readable_bytes(memory_size)),
-                None => String::new(),
-            };
-
-            if self.dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-                tracing::debug!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}.",
-                );
-            } else {
-                tracing::info!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}."
-                );
+        tokio::spawn(async move {
+            if let Err(err) = refresh_task.start_streamed_append(Some(ready_sender)).await {
+                tracing::error!("Failed to start append refresh: {err}");
             }
-        }
-    }
-
-    async fn stream_updates(
-        &self,
-        acceleration_refresh_mode: AccelerationRefreshMode,
-    ) -> BoxStream<'_, super::Result<(Option<SystemTime>, DataUpdate)>> {
-        let time_column = self.refresh.read().await.time_column.clone();
-
-        match acceleration_refresh_mode {
-            AccelerationRefreshMode::Append(receiver) => {
-                if let (Some(receiver), Some(_)) = (receiver, time_column) {
-                    Box::pin(self.get_incremental_append_update_stream(receiver))
-                } else {
-                    Box::pin(self.get_append_stream())
-                }
-            }
-            AccelerationRefreshMode::Full(receiver) => {
-                Box::pin(self.get_full_update_stream(receiver))
-            }
-        }
-    }
-
-    fn get_append_stream(
-        &self,
-    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> {
-        let ctx = self.refresh_df_context();
-        let federated = Arc::clone(&self.federated);
-        let dataset_name = self.dataset_name.clone();
-
-        stream! {
-            let plan = federated
-                .scan(&ctx.state(), None, &[], None)
-                .await
-                .context(super::UnableToScanTableProviderSnafu {})?;
-
-            if plan.output_partitioning().partition_count() > 1 {
-                tracing::error!(
-                    "Append mode is not supported for datasets with multiple partitions: {dataset_name}"
-                );
-                return;
-            }
-
-            let schema = federated.schema();
-
-            let mut stream = plan
-                .execute(0, ctx.task_ctx())
-                .context(super::UnableToScanTableProviderSnafu {})?;
-            loop {
-                match stream.next().await {
-                    Some(Ok(batch)) => {
-                        yield Ok((None, DataUpdate {
-                            schema: Arc::clone(&schema),
-                            data: vec![batch],
-                            update_type: UpdateType::Append,
-                        }));
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!("Error reading data for dataset {dataset_name}: {e}");
-                        yield Err(super::Error::UnableToScanTableProvider { source: e });
-                    }
-                    None => {
-                        tracing::warn!("Append stream ended for dataset {dataset_name}");
-                        break;
-                    },
-                }
-            }
-        }
-    }
-
-    fn get_full_update_stream(
-        &self,
-        receiver: Receiver<()>,
-    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> + '_ {
-        let dataset_name = self.dataset_name.clone();
-
-        let mut refresh_stream = ReceiverStream::new(receiver);
-        stream! {
-            while refresh_stream.next().await.is_some() {
-                let timer = TimeMeasurement::new(
-                    "load_dataset_duration_ms",
-                    vec![("dataset", dataset_name.to_string())],
-                );
-                let start = SystemTime::now();
-                match self.get_full_or_incremental_append_update(None).await {
-                    Ok(data) => yield Ok((Some(start), data)),
-                    Err(e) => yield Err(e),
-                };
-                drop(timer);
-            }
-        }
-    }
-
-    fn get_incremental_append_update_stream(
-        &self,
-        receiver: Receiver<()>,
-    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> + '_ {
-        let dataset_name = self.dataset_name.clone();
-
-        let mut refresh_stream = ReceiverStream::new(receiver);
-
-        stream! {
-            while refresh_stream.next().await.is_some() {
-                let timer = TimeMeasurement::new(
-                    "append_dataset_duration_ms",
-                    vec![("dataset", dataset_name.to_string())],
-                );
-                match self.timestamp_nanos_for_append_query().await {
-                    Ok(timestamp) => {
-                        let start = SystemTime::now();
-                        match self.get_full_or_incremental_append_update(timestamp).await {
-                            Ok(data) => match self.except_existing_records_from(data).await {
-                                Ok(data) => yield Ok((Some(start), data)),
-                                Err(e) => yield Err(e),
-                            },
-                            Err(e) => yield Err(e),
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("No latest timestamp is found: {e}");
-                    }
-                }
-                drop(timer);
-            }
-        }
-    }
-
-    async fn refresh_append_overlap_nanos(&self) -> u128 {
-        self.refresh
-            .read()
-            .await
-            .append_overlap
-            .map(|f| f.as_nanos())
-            .unwrap_or_default()
-    }
-
-    #[allow(clippy::cast_sign_loss)]
-    async fn timestamp_nanos_for_append_query(&self) -> super::Result<Option<u128>> {
-        let ctx = self.refresh_df_context();
-        let refresh = self.refresh.read().await;
-
-        let column =
-            refresh
-                .time_column
-                .clone()
-                .context(super::FailedToFindLatestTimestampSnafu {
-                    reason: "Failed to get latest timestamp due to time column not specified",
-                })?;
-
-        let df = self
-            .max_timestamp_df(ctx, &column)
-            .await
-            .context(super::UnableToScanTableProviderSnafu)?;
-        let result = &df
-            .collect()
-            .await
-            .context(super::FailedToQueryLatestTimestampSnafu)?;
-
-        let Some(result) = result.first() else {
-            return Ok(None);
-        };
-
-        let array = result.column(0)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get latest timestamp during incremental appending process due to time column is unable to cast to timestamp",
-            })?;
-
-        if array.is_empty() {
-            return Ok(None);
-        }
-
-        let mut value = array.value(0) as u128;
-
-        let schema = &self.accelerator.schema();
-        let Ok(accelerated_field) = schema.field_with_name(&column) else {
-            return Err(super::Error::FailedToFindLatestTimestamp {
-                reason: "Failed to get latest timestamp due to time column not specified"
-                    .to_string(),
-            });
-        };
-
-        if let arrow::datatypes::DataType::Int8
-        | arrow::datatypes::DataType::Int16
-        | arrow::datatypes::DataType::Int32
-        | arrow::datatypes::DataType::Int64
-        | arrow::datatypes::DataType::UInt8
-        | arrow::datatypes::DataType::UInt16
-        | arrow::datatypes::DataType::UInt32
-        | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
-        {
-            match refresh.time_format {
-                Some(TimeFormat::UnixMillis) => {
-                    value *= 1_000_000;
-                }
-                Some(TimeFormat::UnixSeconds) | None => {
-                    value *= 1_000_000_000;
-                }
-                Some(TimeFormat::ISO8601) => (),
-            }
-        };
-
-        let refresh_append_value = self.refresh_append_overlap_nanos().await;
-
-        if refresh_append_value > value {
-            Ok(Some(0))
-        } else {
-            Ok(Some(value - refresh_append_value))
-        }
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    async fn max_timestamp_df(
-        &self,
-        ctx: SessionContext,
-        column: &str,
-    ) -> Result<DataFrame, DataFusionError> {
-        let expr = cast(
-            col(column),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        )
-        .alias("a");
-
-        self.accelerator_df(ctx)
-            .await?
-            .select(vec![expr])?
-            .sort(vec![col("a").sort(false, false)])?
-            .limit(0, Some(1))
-    }
-
-    async fn accelerator_df(&self, ctx: SessionContext) -> Result<DataFrame, DataFusionError> {
-        if let Some(sql) = &self.refresh.read().await.sql {
-            ctx.sql(sql.as_str()).await
-        } else {
-            ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    async fn except_existing_records_from(&self, update: DataUpdate) -> super::Result<DataUpdate> {
-        let Some(value) = self.timestamp_nanos_for_append_query().await? else {
-            return Ok(update);
-        };
-
-        let refresh = self.refresh.read().await;
-        let Some(filter_converter) = self.get_filter_converter(&refresh) else {
-            return Ok(update);
-        };
-
-        let ctx = SessionContext::new();
-        let mem_table = MemTable::try_new(self.accelerator.schema(), vec![update.clone().data])
-            .context(super::UnableToCreateMemTableFromUpdateSnafu)?;
-        let update_df = ctx
-            .read_table(Arc::new(mem_table))
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        let existing_df = self
-            .accelerator_df(self.refresh_df_context())
-            .await
-            .context(super::UnableToScanTableProviderSnafu)?
-            .filter(filter_converter.convert(value, Operator::Gt))
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        let data = update_df
-            .except(existing_df)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .collect()
-            .await
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        Ok(DataUpdate {
-            schema: update.schema,
-            data,
-            update_type: update.update_type,
         })
     }
 
-    pub async fn get_full_or_incremental_append_update(
-        &self,
-        overwrite_timestamp_in_nano: Option<u128>,
-    ) -> super::Result<DataUpdate> {
+    pub(crate) fn start(
+        &mut self,
+        acceleration_refresh_mode: AccelerationRefreshMode,
+        ready_sender: oneshot::Sender<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let (task_sender, mut task_callback) = self.refresh_task_runner.start();
+
+        let mut refresh_receiver = match acceleration_refresh_mode {
+            AccelerationRefreshMode::Append(Some(receiver))
+            | AccelerationRefreshMode::Full(receiver) => receiver,
+            AccelerationRefreshMode::Append(None) => {
+                return self.start_streamed_append(ready_sender);
+            }
+        };
+
+        let mut ready_sender = Some(ready_sender);
         let dataset_name = self.dataset_name.clone();
-        let refresh = self.refresh.read().await;
-        let filter_converter = self.get_filter_converter(&refresh);
+        let refresh = Arc::clone(&self.refresh);
 
-        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-            tracing::debug!("Loading data for dataset {dataset_name}");
-        } else {
-            tracing::info!("Loading data for dataset {dataset_name}");
-        }
-        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
-        let refresh = refresh.clone();
-        let mut filters = vec![];
-        if let Some(converter) = filter_converter.as_ref() {
-            if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::Gt));
-            } else if let Some(period) = refresh.period {
-                filters.push(
-                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
-                );
+        let cache_provider = self.cache_provider.clone();
+
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = refresh_receiver.recv() => {
+                        tracing::debug!("Received outside triggered for refresh");
+
+                        if let Err(err) = task_sender.send(()).await {
+                            tracing::error!("Failed to execute refresh: {err}");
+                        }
+                    },
+                    Some(res) = task_callback.recv() => {
+                        tracing::debug!("Received refresh task completion callback: {res}");
+
+                        match res {
+                            RefreshTaskResult::Success => {
+                                notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
+
+                                if let Some(cache_provider) = &cache_provider {
+                                    if let Err(e) = cache_provider
+                                        .invalidate_for_table(&dataset_name.to_string())
+                                        .await
+                                    {
+                                        tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                    }
+                                }
+                            },
+                            RefreshTaskResult::Error => {
+                            }
+                        }
+                    }
+                }
             }
-        };
-
-        match self.get_data_update(filters).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
-                Err(e)
-            }
-        }
+        })
     }
+}
 
-    async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
-        let refresh = self.refresh.read().await;
-        let update_type = match refresh.mode {
-            RefreshMode::Full => UpdateType::Overwrite,
-            RefreshMode::Append => UpdateType::Append,
-        };
-        let mut ctx = self.refresh_df_context();
-        let federated = Arc::clone(&self.federated);
-        let dataset_name = self.dataset_name.clone();
-        match get_data(
-            &mut ctx,
-            dataset_name.clone(),
-            Arc::clone(&federated),
-            refresh.sql.clone(),
-            filters,
-        )
-        .await
-        .map(|data| DataUpdate {
-            schema: data.0,
-            data: data.1,
-            update_type,
-        }) {
-            Ok(data) => Ok(data),
-            Err(e) => Err(super::Error::UnableToGetDataFromConnector { source: e }),
-        }
-    }
+async fn notify_refresh_done(
+    dataset_name: &TableReference,
+    refresh: &Arc<RwLock<Refresh>>,
+    ready_sender: &mut Option<oneshot::Sender<()>>,
+) {
+    if let Some(sender) = ready_sender.take() {
+        sender.send(()).ok();
+    };
 
-    fn refresh_df_context(&self) -> SessionContext {
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
 
-        let ctx_state = ctx.state();
-        let default_catalog = &ctx_state.config_options().catalog.default_catalog;
-        match schema::ensure_schema_exists(&ctx, default_catalog, &self.dataset_name) {
-            Ok(()) => (),
-            Err(_) => {
-                unreachable!("The default catalog should always exist");
-            }
-        };
+    let mut labels = vec![("dataset", dataset_name.to_string())];
+    if let Some(sql) = &refresh.read().await.sql {
+        labels.push(("sql", sql.to_string()));
+    };
 
-        if let Err(e) = ctx.register_table(self.dataset_name.clone(), Arc::clone(&self.federated)) {
-            tracing::error!("Unable to register federated table: {e}");
-        }
+    metrics::gauge!("datasets_acceleration_last_refresh_time", &labels).set(now.as_secs_f64());
+}
 
-        let mut acc_dataset_name = String::with_capacity(
-            self.dataset_name.table().len() + self.dataset_name.schema().map_or(0, str::len),
-        );
-
-        if let Some(schema) = self.dataset_name.schema() {
-            acc_dataset_name.push_str(schema);
-        }
-
-        acc_dataset_name.push_str("accelerated_");
-        acc_dataset_name.push_str(self.dataset_name.table());
-
-        if let Err(e) = ctx.register_table(
-            TableReference::parse_str(&acc_dataset_name),
-            Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
-        ) {
-            tracing::error!("Unable to register accelerator table: {e}");
-        }
-        ctx
-    }
-
-    fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
-        let schema = self.federated.schema();
-        let column = refresh.time_column.as_deref().unwrap_or_default();
-        let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
-
-        TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
-    }
-
-    async fn notify_refresh_done(
-        &self,
-        ready_sender: &mut Option<oneshot::Sender<()>>,
-        status: status::ComponentStatus,
-    ) {
-        if let Some(sender) = ready_sender.take() {
-            sender.send(()).ok();
-        };
-
-        self.mark_dataset_status(status);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-
-        let mut labels = vec![("dataset", self.dataset_name.to_string())];
-        if let Some(sql) = &self.refresh.read().await.sql {
-            labels.push(("sql", sql.to_string()));
-        };
-
-        metrics::gauge!("datasets_acceleration_last_refresh_time", &labels).set(now.as_secs_f64());
-    }
-
-    fn mark_dataset_status(&self, status: status::ComponentStatus) {
-        status::update_dataset(&self.dataset_name, status);
-
-        if status == status::ComponentStatus::Error {
-            let labels = [("dataset", self.dataset_name.to_string())];
-            metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
-        }
+impl Drop for Refresher {
+    fn drop(&mut self) {
+        self.refresh_task_runner.stop();
     }
 }
 
@@ -683,8 +244,11 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use data_components::arrow::write::MemTable;
+    use datafusion::{physical_plan::collect, prelude::SessionContext};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use tokio::{sync::mpsc, time::timeout};
+
+    use crate::status;
 
     use super::*;
 
@@ -719,7 +283,7 @@ mod tests {
 
         let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
 
-        let refresher = Refresher::new(
+        let mut refresher = Refresher::new(
             TableReference::bare("test"),
             federated,
             Arc::new(RwLock::new(refresh)),
@@ -729,11 +293,7 @@ mod tests {
         let (trigger, receiver) = mpsc::channel::<()>(1);
         let (ready_sender, is_ready) = oneshot::channel::<()>();
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-        let refresh_handle = tokio::spawn(async move {
-            refresher
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
-        });
+        let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
 
         trigger
             .send(())
@@ -899,7 +459,7 @@ mod tests {
                 None,
             );
 
-            let refresher = Refresher::new(
+            let mut refresher = Refresher::new(
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
@@ -909,11 +469,8 @@ mod tests {
             let (trigger, receiver) = mpsc::channel::<()>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = tokio::spawn(async move {
-                refresher
-                    .start(acceleration_refresh_mode, ready_sender)
-                    .await;
-            });
+            let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+
             trigger
                 .send(())
                 .await
@@ -1050,7 +607,7 @@ mod tests {
                 append_overlap,
             );
 
-            let refresher = Refresher::new(
+            let mut refresher = Refresher::new(
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
@@ -1060,11 +617,8 @@ mod tests {
             let (trigger, receiver) = mpsc::channel::<()>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = tokio::spawn(async move {
-                refresher
-                    .start(acceleration_refresh_mode, ready_sender)
-                    .await;
-            });
+            let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+
             trigger
                 .send(())
                 .await

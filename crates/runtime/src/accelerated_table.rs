@@ -51,6 +51,8 @@ use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
 pub mod refresh;
+mod refresh_task;
+mod refresh_task_runner;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -82,6 +84,11 @@ pub enum Error {
 
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
+
+    #[snafu(display("Failed to write data into accelerated table: {source}"))]
+    FailedToWriteData {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -208,14 +215,9 @@ impl Builder {
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
-        let refresher = Arc::new(refresher);
 
-        let refresher_tokio = Arc::clone(&refresher);
-        let refresh_handle = tokio::spawn(async move {
-            refresher_tokio
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
-        });
+        let refresh_handle = refresher.start(acceleration_refresh_mode, ready_sender);
+        let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
         handlers.push(refresh_handle);
