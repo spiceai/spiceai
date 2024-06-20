@@ -33,7 +33,12 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
-    sql::{sqlparser::{ast::TableFactor, dialect::DuckDbDialect, parser::Parser, tokenizer::Tokenizer}, TableReference},
+    sql::{
+        sqlparser::{
+            ast::TableFactor, dialect::DuckDbDialect, parser::Parser, tokenizer::Tokenizer,
+        },
+        TableReference,
+    },
 };
 use db_connection_pool::{
     dbconnection::{duckdbconn::DuckDbConnection, get_schema, DbConnection},
@@ -41,6 +46,7 @@ use db_connection_pool::{
     DbConnectionPool, Mode,
 };
 use duckdb::{AccessMode, DuckdbConnectionManager, ToSql, Transaction};
+use itertools::Itertools;
 use snafu::prelude::*;
 use sql_provider_datafusion::{expr::Engine, SqlTable};
 use std::{cmp, collections::HashMap, sync::Arc, time::SystemTime};
@@ -429,14 +435,32 @@ impl Read for DuckDBTableFactory {
 
         let schema = get_schema(conn, &table_reference).await?;
 
-
         let (tbl_ref, cte) = if is_table_function(&table_reference) {
-            (TableReference::bare("tbl_ref"), Some(HashMap::from_iter(vec![("tbl_ref".to_string(), format!("SELECT * FROM {}", table_reference.to_string()))])))
+            let tbl_ref_view = vec![
+                table_reference.catalog(),
+                table_reference.schema(),
+                Some(&format!("{}_view", table_reference.table())),
+            ]
+            .iter()
+            .flatten()
+            .collect_vec()
+            .iter()
+            .join(".");
+            let new_tbl = TableReference::from(&tbl_ref_view);
+            (
+                new_tbl.clone(),
+                Some(HashMap::from_iter(vec![(
+                    tbl_ref_view,
+                    format!("SELECT * FROM {}", table_reference.to_string()),
+                )])),
+            )
         } else {
             (table_reference.clone(), None)
         };
 
-        let table_provider = Arc::new(SqlTable::new_with_schema("duckdb", &dyn_pool, schema, tbl_ref, None, cte));
+        let table_provider = Arc::new(SqlTable::new_with_schema(
+            "duckdb", &dyn_pool, schema, tbl_ref, None, cte,
+        ));
         let table_provider = Arc::new(table_provider.create_federated_table_provider()?);
         Ok(table_provider)
     }

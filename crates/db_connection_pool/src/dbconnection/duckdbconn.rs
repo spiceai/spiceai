@@ -76,7 +76,10 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
     fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, super::Error> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
+            .prepare(&format!(
+                "SELECT * FROM {} LIMIT 0",
+                table_reference.to_quoted_string()
+            ))
             .boxed()
             .context(super::UnableToGetSchemaSnafu)?;
 

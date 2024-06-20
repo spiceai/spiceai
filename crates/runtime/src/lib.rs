@@ -420,7 +420,6 @@ impl Runtime {
         }
     }
 
-    // This is the view here. 
     pub fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
         let existing_tables = all_datasets
             .iter()
