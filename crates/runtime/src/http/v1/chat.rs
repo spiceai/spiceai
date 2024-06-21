@@ -42,12 +42,18 @@ pub(crate) async fn post(
             if req.stream.unwrap_or_default() {
                 match model.write().await.chat_stream(req).await {
                     Ok(strm) => create_sse_response(strm, time::Duration::from_secs(30)),
-                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    Err(e) => {
+                        tracing::debug!("Error from v1/chat: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
                 }
             } else {
                 match model.write().await.chat_request(req).await {
                     Ok(response) => Json(response).into_response(),
-                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    Err(e) => {
+                        tracing::debug!("Error from v1/chat: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
                 }
             }
         }

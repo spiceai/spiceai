@@ -22,21 +22,16 @@ use futures::Stream;
 use mistralrs::{
     Constraint, Device, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig,
     GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder,
-    NormalRequest, Request as MistralRsquest, RequestMessage, Response as MistralRsponse,
+    NormalRequest, Request as MistralRequest, RequestMessage, Response as MistralResponse,
     SamplingParams, SchedulerMethod, TokenSource,
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
 use std::{path::Path, pin::Pin, str::FromStr, sync::Arc};
-use tokio::sync::{
-    mpsc::{channel, Receiver, Sender},
-    RwLock,
-};
+use tokio::sync::mpsc::{channel, Sender};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
-    tx: Sender<MistralRsponse>,
-    rx: Arc<RwLock<Receiver<MistralRsponse>>>,
 }
 
 impl MistralLlama {
@@ -220,7 +215,6 @@ impl MistralLlama {
     }
 
     fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Result<Self> {
-        let (tx, rx) = channel(10_000);
         Ok(Self {
             pipeline: MistralRsBuilder::new(
                 p,
@@ -229,20 +223,23 @@ impl MistralLlama {
                 })?),
             )
             .build(),
-            tx,
-            rx: Arc::new(RwLock::new(rx)),
         })
     }
 
-    fn to_request(&self, prompt: String, is_streaming: bool) -> MistralRsquest {
-        MistralRsquest::Normal(NormalRequest {
+    fn to_request(
+        &self,
+        prompt: String,
+        is_streaming: bool,
+        tx: Sender<MistralResponse>,
+    ) -> MistralRequest {
+        MistralRequest::Normal(NormalRequest {
             messages: RequestMessage::Completion {
                 text: prompt,
                 echo_prompt: false,
                 best_of: 1,
             },
             sampling_params: SamplingParams::default(),
-            response: self.tx.clone(),
+            response: tx,
             return_logprobs: false,
             is_streaming,
             id: 0,
@@ -255,22 +252,29 @@ impl MistralLlama {
 
 #[async_trait]
 impl Chat for MistralLlama {
+    async fn health(&mut self) -> Result<()> {
+        // If [`MistralLlama`] is instantiated successfully, it is healthy.
+        Ok(())
+    }
+
     async fn stream<'a>(
         &mut self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
+        let (snd, mut rcv) = channel::<MistralResponse>(1000);
+        tracing::debug!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(self.to_request(prompt, true))
+            .send(self.to_request(prompt, true, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-
-        let stream_rx = Arc::clone(&self.rx);
+        tracing::debug!("Request sent!");
         Ok(Pin::from(Box::new(stream! {
-            while let Some(resp) = stream_rx.write().await.recv().await {
+            while let Some(resp) = rcv.recv().await {
+                tracing::debug!("Received response from pipeline");
                 match resp {
-                    MistralRsponse::Chunk(chunk) => {
+                    MistralResponse::Chunk(chunk) => {
                         if let Some(choice) = chunk.choices.first() {
                             yield Ok(Some(choice.delta.content.clone()));
                             if choice.finish_reason.is_some() {
@@ -281,21 +285,21 @@ impl Chat for MistralLlama {
                             break;
                         }
                     },
-                    MistralRsponse::ModelError(err_msg, _) | MistralRsponse::CompletionModelError(err_msg, _) => {
+                    MistralResponse::ModelError(err_msg, _) | MistralResponse::CompletionModelError(err_msg, _) => {
                         yield Err(ChatError::FailedToRunModel {
                             source: err_msg.into(),
                         })
                     },
-                    MistralRsponse::InternalError(err_msg) | MistralRsponse::ValidationError(err_msg) => {
+                    MistralResponse::InternalError(err_msg) | MistralResponse::ValidationError(err_msg) => {
                         yield Err(ChatError::FailedToRunModel {
                             source: err_msg,
                         })
                     },
-                    MistralRsponse::CompletionDone(cr) => {
+                    MistralResponse::CompletionDone(cr) => {
                         yield Ok(Some(cr.choices[0].text.clone()));
                         break;
                     },
-                    MistralRsponse::Done(_) => {
+                    MistralResponse::Done(_) => {
                         unreachable!()
                     },
                 }
@@ -304,17 +308,19 @@ impl Chat for MistralLlama {
     }
 
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
-        let r = self.to_request(prompt, false);
+        let (snd, mut rcv) = channel::<MistralResponse>(10_000);
+        tracing::debug!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(r)
+            .send(self.to_request(prompt, false, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-        match self.rx.write().await.recv().await {
+        tracing::debug!("Request sent!");
+        match rcv.recv().await {
             Some(response) => match response {
-                MistralRsponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
-                MistralRsponse::CompletionModelError(err_msg, _cr) => {
+                MistralResponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
+                MistralResponse::CompletionModelError(err_msg, _cr) => {
                     Err(ChatError::FailedToRunModel {
                         source: err_msg.into(),
                     })
