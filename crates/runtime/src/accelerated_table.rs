@@ -26,7 +26,7 @@ use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
 use data_components::delete::get_deletion_provider;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
@@ -43,7 +43,6 @@ use tokio::time::interval;
 
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::dataconnector;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
@@ -58,7 +57,7 @@ mod refresh_task_runner;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
-    UnableToGetDataFromConnector { source: dataconnector::Error },
+    UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {

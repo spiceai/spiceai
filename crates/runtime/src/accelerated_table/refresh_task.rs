@@ -416,10 +416,14 @@ impl RefreshTask {
                     let labels = [("dataset", dataset_name.to_string())];
                     metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
 
-                    Err(RetryError::Transient {
-                        err: e,
-                        retry_after: None,
-                    })
+                    if should_retry_df_error(&e) {
+                        Err(RetryError::Transient {
+                            err: e,
+                            retry_after: None,
+                        })
+                    } else {
+                        Err(RetryError::Permanent(e))
+                    }
                 }
             }
         })
@@ -673,5 +677,15 @@ impl RefreshTask {
             metrics::gauge!("datasets_acceleration_last_refresh_time", &labels)
                 .set(now.as_secs_f64());
         }
+    }
+}
+
+fn should_retry_df_error(error: &DataFusionError) -> bool {
+    match error {
+        DataFusionError::Context(_, err) => should_retry_df_error(err.as_ref()),
+        DataFusionError::SQL(..) | DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
+            false
+        }
+        _ => true,
     }
 }
