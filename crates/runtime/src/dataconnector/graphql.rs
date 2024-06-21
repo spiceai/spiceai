@@ -225,7 +225,7 @@ impl GraphQLClient {
         handle_http_error(status, &response)?;
         handle_graphql_query_error(&response, &query)?;
 
-        let exctracted_data = response
+        let extracted_data = response
             .pointer(self.pointer.as_str())
             .unwrap_or(&Value::Null)
             .to_owned();
@@ -238,7 +238,7 @@ impl GraphQLClient {
                 .and_then(|x| x.get_next_cursor_from_response(&response))
         };
 
-        let unwrapped = match exctracted_data {
+        let unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
             obj @ Value::Object(_) => Ok(vec![obj]),
             Value::Null => Err(Error::InvalidObjectAccess {
