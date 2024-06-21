@@ -14,15 +14,18 @@ use crate::{
     status,
     timing::TimeMeasurement,
 };
-use arrow::array::{make_comparator, StructArray, TimestampNanosecondArray};
+use arrow::array::{
+    make_comparator, Int64Array, RecordBatch, StringArray, StructArray, TimestampNanosecondArray,
+};
 use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
+use data_components::delete::get_deletion_provider;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
-use datafusion::logical_expr::{cast, col, Expr, Operator};
+use datafusion::logical_expr::{cast, col, lit, Expr, Operator};
 use datafusion::physical_plan::{collect, ExecutionPlanProperties};
 use datafusion::prelude::DataFrame;
 use datafusion::{datasource::TableProvider, execution::context::SessionContext};
@@ -126,6 +129,7 @@ impl Refresher {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn start(
         &self,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -167,7 +171,83 @@ impl Refresher {
                     };
 
                     if data_update.update_type == UpdateType::Changes {
-                        todo!("Apply changes")
+                        let Some(deletion_provider) =
+                            get_deletion_provider(Arc::clone(&self.accelerator))
+                        else {
+                            panic!("Failed to get deletion provider");
+                        };
+
+                        for data_batch in &data_update.data {
+                            let Some(op_col) =
+                                data_batch.column(0).as_any().downcast_ref::<StringArray>()
+                            else {
+                                panic!("Failed to get op column");
+                            };
+                            let Some(data_col) =
+                                data_batch.column(3).as_any().downcast_ref::<StructArray>()
+                            else {
+                                panic!("Failed to get data column");
+                            };
+                            for row in 0..data_batch.num_rows() {
+                                let op = op_col.value(row);
+                                match op {
+                                    "d" => {
+                                        let inner_data: RecordBatch = data_col.slice(row, 1).into();
+                                        let Some(id_col) = inner_data.column_by_name("id") else {
+                                            panic!("Failed to get id column");
+                                        };
+                                        let Some(id_col) =
+                                            id_col.as_any().downcast_ref::<Int64Array>()
+                                        else {
+                                            panic!("Failed to get id column as Int64Array");
+                                        };
+                                        let delete_where_expr = col("id").eq(lit(id_col.value(0)));
+
+                                        let ctx = SessionContext::new();
+                                        let session_state = ctx.state();
+
+                                        let Ok(delete_plan) = deletion_provider
+                                            .delete_from(&session_state, &[delete_where_expr])
+                                            .await
+                                        else {
+                                            panic!("Failed to create delete plan");
+                                        };
+
+                                        if let Err(e) = collect(delete_plan, ctx.task_ctx()).await {
+                                            panic!("Failed to delete data: {e}");
+                                        };
+                                    }
+                                    "c" | "u" | "r" => {
+                                        let inner_data: RecordBatch = data_col.slice(row, 1).into();
+                                        let ctx = SessionContext::new();
+                                        let session_state = ctx.state();
+
+                                        let Ok(insert_plan) = self
+                                            .accelerator
+                                            .insert_into(
+                                                &session_state,
+                                                Arc::new(DataUpdateExecutionPlan::new(
+                                                    DataUpdate {
+                                                        schema: inner_data.schema(),
+                                                        data: vec![inner_data],
+                                                        update_type: UpdateType::Append,
+                                                    },
+                                                )),
+                                                false,
+                                            )
+                                            .await
+                                        else {
+                                            panic!("Failed to create insert plan");
+                                        };
+
+                                        if let Err(e) = collect(insert_plan, ctx.task_ctx()).await {
+                                            panic!("Failed to insert data: {e}");
+                                        };
+                                    }
+                                    _ => panic!("Unknown operation"),
+                                }
+                            }
+                        }
                     }
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
