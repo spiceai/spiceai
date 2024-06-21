@@ -15,7 +15,7 @@ use crate::{
     timing::TimeMeasurement,
 };
 use arrow::array::{
-    make_comparator, Int64Array, RecordBatch, StringArray, StructArray, TimestampNanosecondArray,
+    make_comparator, Int32Array, RecordBatch, StringArray, StructArray, TimestampNanosecondArray,
 };
 use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::datatypes::{DataType, SchemaRef};
@@ -185,7 +185,7 @@ impl Refresher {
                                 panic!("Failed to get op column");
                             };
                             let Some(data_col) =
-                                data_batch.column(3).as_any().downcast_ref::<StructArray>()
+                                data_batch.column(2).as_any().downcast_ref::<StructArray>()
                             else {
                                 panic!("Failed to get data column");
                             };
@@ -198,9 +198,9 @@ impl Refresher {
                                             panic!("Failed to get id column");
                                         };
                                         let Some(id_col) =
-                                            id_col.as_any().downcast_ref::<Int64Array>()
+                                            id_col.as_any().downcast_ref::<Int32Array>()
                                         else {
-                                            panic!("Failed to get id column as Int64Array");
+                                            panic!("Failed to get id column as Int32Array, {inner_data:?}");
                                         };
                                         let delete_where_expr = col("id").eq(lit(id_col.value(0)));
 
@@ -253,6 +253,7 @@ impl Refresher {
                                 }
                             }
                         }
+                        continue;
                     }
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
