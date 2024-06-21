@@ -328,7 +328,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
         let line = graphql_error["locations"][0]["line"].as_u64();
         let column = graphql_error["locations"][0]["column"].as_u64();
 
-        let location: Option<(usize, usize)> = match (line, column) {
+        let location = match (line, column) {
             (Some(line), Some(column)) => Some((
                 usize::try_from(line).unwrap_or_default(),
                 usize::try_from(column).unwrap_or_default(),
