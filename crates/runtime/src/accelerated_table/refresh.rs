@@ -127,7 +127,7 @@ impl Refresher {
         self
     }
 
-    fn start_streamed_append(
+    fn start_streaming_append(
         &mut self,
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
