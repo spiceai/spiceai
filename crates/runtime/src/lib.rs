@@ -41,6 +41,7 @@ use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
+use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
@@ -49,6 +50,8 @@ pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret, SecretMap};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
+use spicepod::component::embeddings::Embeddings;
+use spicepod::component::llms::Llm;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -110,6 +113,16 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     UnableToInitializeDataConnector {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToInitializeLlm {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToInitializeEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -788,12 +801,24 @@ impl Runtime {
         Ok(())
     }
 
+    /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
+    pub async fn load_llm(&self, in_llm: &Llm) -> Result<Box<dyn Chat>> {
+        let mut l = try_to_chat_model(in_llm)
+            .boxed()
+            .context(UnableToInitializeLlmSnafu)?;
+        l.health()
+            .await
+            .boxed()
+            .context(UnableToInitializeLlmSnafu)?;
+        Ok(l)
+    }
+
     pub async fn load_llms(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for in_llm in &app.llms {
                 status::update_llm(&in_llm.name, status::ComponentStatus::Initializing);
-                match try_to_chat_model(in_llm) {
+                match self.load_llm(in_llm).await {
                     Ok(l) => {
                         let mut llm_map = self.llms.write().await;
                         llm_map.insert(in_llm.name.clone(), l.into());
@@ -815,12 +840,24 @@ impl Runtime {
         }
     }
 
+    /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
+    pub async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
+        let mut l = try_to_embedding(in_embed)
+            .boxed()
+            .context(UnableToInitializeEmbeddingModelSnafu)?;
+        l.health()
+            .await
+            .boxed()
+            .context(UnableToInitializeEmbeddingModelSnafu)?;
+        Ok(l)
+    }
+
     pub async fn load_embeddings(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for in_embed in &app.embeddings {
                 status::update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
-                match try_to_embedding(in_embed) {
+                match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
                         embeds_map.insert(in_embed.name.clone(), e.into());

@@ -90,7 +90,7 @@ impl TimestampFilterConvert {
     #[allow(clippy::cast_possible_wrap)]
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn convert(&self, timestamp_in_nanos: u128, op: Operator) -> Expr {
-        let time_column: &str = self.time_column.as_ref();
+        let time_column: &str = &format!(r#""{}""#, &self.time_column);
         match &self.time_format {
             ExprTimeFormat::ISO8601 => binary_expr(
                 cast(

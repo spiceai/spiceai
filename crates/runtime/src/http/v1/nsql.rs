@@ -82,7 +82,7 @@ pub(crate) async fn post(
         match df.get_arrow_schema(t).await {
             Ok(schm) => {
                 let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
-                table_create_stms.push(c.build_postgres());
+                table_create_stms.push(c.build_sqlite());
             }
             Err(e) => {
                 tracing::error!("Error getting table={t} schema: {e}");
