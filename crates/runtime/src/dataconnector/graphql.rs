@@ -225,7 +225,7 @@ impl GraphQLClient {
         handle_http_error(status, &response)?;
         handle_graphql_query_error(&response, &query)?;
 
-        let exctracted_data = response
+        let extracted_data = response
             .pointer(self.pointer.as_str())
             .unwrap_or(&Value::Null)
             .to_owned();
@@ -238,7 +238,7 @@ impl GraphQLClient {
                 .and_then(|x| x.get_next_cursor_from_response(&response))
         };
 
-        let unwrapped = match exctracted_data {
+        let unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
             obj @ Value::Object(_) => Ok(vec![obj]),
             Value::Null => Err(Error::InvalidObjectAccess {
@@ -323,27 +323,41 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
 
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     let graphql_error = &response["errors"][0];
+
     if !graphql_error.is_null() {
-        let line = usize::try_from(graphql_error["locations"][0]["line"].as_u64().unwrap_or(0))
-            .unwrap_or_default();
-        let column = usize::try_from(
-            graphql_error["locations"][0]["column"]
-                .as_u64()
-                .unwrap_or(0),
-        )
-        .unwrap_or_default();
-        return Err(Error::InvalidGraphQLQuery {
-            message: graphql_error["message"]
-                .as_str()
-                .unwrap_or_default()
-                .split(" at [")
-                .next()
-                .unwrap_or_default()
-                .to_string(),
-            line,
-            column,
-            query: format_query_with_context(query, line, column),
-        });
+        let line = graphql_error["locations"][0]["line"].as_u64();
+        let column = graphql_error["locations"][0]["column"].as_u64();
+
+        let location = match (line, column) {
+            (Some(line), Some(column)) => Some((
+                usize::try_from(line).unwrap_or_default(),
+                usize::try_from(column).unwrap_or_default(),
+            )),
+            _ => None,
+        };
+
+        let message = graphql_error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .split(" at [")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+
+        return match location {
+            Some((line, column)) => Err(Error::InvalidGraphQLQuery {
+                message,
+                line,
+                column,
+                query: format_query_with_context(query, line, column),
+            }),
+            _ => Err(Error::InvalidGraphQLQuery {
+                message,
+                line: 0,
+                column: 0,
+                query: query.to_string(),
+            }),
+        };
     }
     Ok(())
 }
