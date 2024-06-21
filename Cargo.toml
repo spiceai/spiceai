@@ -45,7 +45,7 @@ metrics = "0.22.0"
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "be2c2c1f74823956e609a23ca38657cd76c2fcfe" }
 arrow = "52.0.0"
 arrow-flight = "52.0.0"
-duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "40e4a8e8c7e6e079b06da24d06a14c491c3c2f61" }
+duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 tonic = "0.11.0"
 futures = "0.3.30"
