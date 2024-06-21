@@ -51,6 +51,7 @@ use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
+pub mod changes;
 pub mod refresh;
 
 #[derive(Debug, Snafu)]
@@ -86,6 +87,9 @@ pub enum Error {
 
     #[snafu(display("Failed to filter update data: {source}"))]
     FailedToFilterUpdates { source: ArrowError },
+
+    #[snafu(display("Changes: {message}"))]
+    Changes { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -201,6 +205,7 @@ impl Builder {
                 .await;
                 refresh::AccelerationRefreshMode::Full(receiver)
             }
+            RefreshMode::Changes => refresh::AccelerationRefreshMode::Changes,
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());

@@ -16,7 +16,7 @@ use crate::{
 };
 use arrow::array::{make_comparator, StructArray, TimestampNanosecondArray};
 use arrow::compute::{filter_record_batch, SortOptions};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
 use datafusion::common::TableReference;
@@ -86,6 +86,7 @@ impl Default for Refresh {
 pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append(Option<Receiver<()>>),
+    Changes,
 }
 
 pub struct Refresher {
@@ -110,6 +111,11 @@ impl Refresher {
             accelerator,
             cache_provider: None,
         }
+    }
+
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.accelerator.schema()
     }
 
     pub fn cache_provider(
@@ -159,6 +165,10 @@ impl Refresher {
                             .await;
                         continue;
                     };
+
+                    if data_update.update_type == UpdateType::Changes {
+                        todo!("Apply changes")
+                    }
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
                     match self
@@ -266,6 +276,7 @@ impl Refresher {
             AccelerationRefreshMode::Full(receiver) => {
                 Box::pin(self.get_full_update_stream(receiver))
             }
+            AccelerationRefreshMode::Changes => Box::pin(self.get_changes_stream()),
         }
     }
 
@@ -595,6 +606,7 @@ impl Refresher {
         let update_type = match refresh.mode {
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
+            RefreshMode::Changes => unreachable!("Should not trigger this code path for changes"),
         };
         let mut ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);

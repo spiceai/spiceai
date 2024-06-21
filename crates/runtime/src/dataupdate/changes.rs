@@ -42,7 +42,7 @@ impl Display for Op {
 }
 
 pub struct ChangeEvent {
-    table_schema: SchemaRef,
+    pub table_schema: SchemaRef,
     pub op: Op,
     pub ts_ms: i64,
     pub source: Source,

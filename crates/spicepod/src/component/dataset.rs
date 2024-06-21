@@ -128,6 +128,7 @@ pub mod acceleration {
         #[default]
         Full,
         Append,
+        Changes,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
