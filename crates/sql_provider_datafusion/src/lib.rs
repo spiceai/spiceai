@@ -57,13 +57,13 @@ pub enum Error {
     UnableToGenerateSQL { source: expr::Error },
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqlTable<T: 'static, P: 'static> {
     name: &'static str,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
-    table_reference: TableReference,
+    pub table_reference: TableReference,
     engine: Option<Engine>,
     dialect: Option<Arc<dyn Dialect + Send + Sync>>,
 }
@@ -142,6 +142,16 @@ impl<T, P> SqlTable<T, P> {
     fn unique_id(&self) -> usize {
         std::ptr::from_ref(self) as usize
     }
+
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[must_use]
+    pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
+        Arc::clone(&self.pool)
+    }
 }
 
 #[async_trait]
@@ -191,7 +201,7 @@ impl<T, P> Display for SqlTable<T, P> {
 }
 
 #[derive(Clone)]
-struct SqlExec<T, P> {
+pub struct SqlExec<T, P> {
     projected_schema: SchemaRef,
     table_reference: TableReference,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
@@ -219,7 +229,7 @@ pub fn project_schema_safe(
 }
 
 impl<T, P> SqlExec<T, P> {
-    fn new(
+    pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &TableReference,
@@ -244,8 +254,12 @@ impl<T, P> SqlExec<T, P> {
             engine,
         })
     }
+    #[must_use]
+    pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
+        Arc::clone(&self.pool)
+    }
 
-    fn sql(&self) -> Result<String> {
+    pub fn sql(&self) -> Result<String> {
         let columns = self
             .projected_schema
             .fields()
@@ -279,7 +293,7 @@ impl<T, P> SqlExec<T, P> {
 
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference.to_quoted_string(),
+            table_reference = self.table_reference
         ))
     }
 }
@@ -342,7 +356,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
     }
 }
 
-async fn get_stream<T: 'static, P: 'static>(
+pub async fn get_stream<T: 'static, P: 'static>(
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     sql: String,
 ) -> DataFusionResult<SendableRecordBatchStream> {
@@ -352,7 +366,9 @@ async fn get_stream<T: 'static, P: 'static>(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
+pub fn to_execution_error(
+    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
 

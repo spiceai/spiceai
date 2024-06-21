@@ -20,6 +20,9 @@ use arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::sql::sqlparser::ast::TableFactor;
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::{dialect::DuckDbDialect, tokenizer::Tokenizer};
 use datafusion::sql::TableReference;
 use duckdb::DuckdbConnectionManager;
 use duckdb::ToSql;
@@ -74,12 +77,14 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
     }
 
     fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, super::Error> {
+        let table_str = if is_table_function(table_reference) {
+            table_reference.to_string()
+        } else {
+            table_reference.to_quoted_string()
+        };
         let mut stmt = self
             .conn
-            .prepare(&format!(
-                "SELECT * FROM {} LIMIT 0",
-                table_reference.to_quoted_string()
-            ))
+            .prepare(&format!("SELECT * FROM {table_str} LIMIT 0"))
             .boxed()
             .context(super::UnableToGetSchemaSnafu)?;
 
@@ -103,5 +108,65 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
     fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
         let rows_modified = self.conn.execute(sql, params).context(DuckDBSnafu)?;
         Ok(rows_modified as u64)
+    }
+}
+
+#[must_use]
+pub fn flatten_table_function_name(table_reference: &TableReference) -> String {
+    let result = table_reference
+        .table()
+        .replace([')', '('], "_")
+        .replace(['\'', ','], "")
+        .replace(['.', ' '], "_");
+
+    format!("{result}__view")
+}
+
+#[must_use]
+pub fn is_table_function(table_reference: &TableReference) -> bool {
+    let table_name = match table_reference {
+        TableReference::Full { .. } | TableReference::Partial { .. } => return false,
+        TableReference::Bare { table } => table,
+    };
+
+    let dialect = DuckDbDialect {};
+    let mut tokenizer = Tokenizer::new(&dialect, table_name);
+    let Ok(tokens) = tokenizer.tokenize() else {
+        return false;
+    };
+    let Ok(tf) = Parser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_table_factor()
+    else {
+        return false;
+    };
+
+    let TableFactor::Table { args, .. } = tf else {
+        return false;
+    };
+
+    args.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_table_function() {
+        let tests = vec![
+            ("table_name", false),
+            ("table_name()", true),
+            ("table_name(arg1, arg2)", true),
+            ("read_parquet", false),
+            ("read_parquet()", true),
+            ("read_parquet('my_parquet_file.parquet')", true),
+            ("read_csv_auto('my_csv_file.csv')", true),
+        ];
+
+        for (table_name, expected) in tests {
+            let table_reference = TableReference::bare(table_name.to_string());
+            assert_eq!(is_table_function(&table_reference), expected);
+        }
     }
 }
