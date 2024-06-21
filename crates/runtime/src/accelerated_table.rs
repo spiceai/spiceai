@@ -185,18 +185,18 @@ impl Builder {
                 if self.refresh.time_column.is_none() {
                     (refresh::AccelerationRefreshMode::Append(None), None)
                 } else {
-                    let (trigger, receiver) = mpsc::channel::<()>(1);
+                    let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
                     (
-                        refresh::AccelerationRefreshMode::Append(Some(receiver)),
-                        Some(trigger),
+                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
+                        Some(start_refresh),
                     )
                 }
             }
             RefreshMode::Full => {
-                let (trigger, receiver) = mpsc::channel::<()>(1);
+                let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
                 (
-                    refresh::AccelerationRefreshMode::Full(receiver),
-                    Some(trigger),
+                    refresh::AccelerationRefreshMode::Full(on_start_refresh),
+                    Some(start_refresh),
                 )
             }
         };
