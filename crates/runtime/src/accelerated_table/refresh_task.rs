@@ -20,6 +20,7 @@ use arrow::{
     datatypes::DataType,
 };
 use async_stream::stream;
+use cache::QueryResultsCacheProvider;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 
@@ -38,6 +39,7 @@ use crate::{
 use super::refresh::get_timestamp;
 
 use crate::component::dataset::TimeFormat;
+use std::time::UNIX_EPOCH;
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{oneshot, RwLock};
 
@@ -78,8 +80,12 @@ impl RefreshTask {
 
     pub async fn start_streamed_append(
         &self,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
     ) -> super::Result<()> {
+        self.mark_dataset_status(status::ComponentStatus::Refreshing)
+            .await;
+
         let mut stream = Box::pin(self.get_append_stream());
 
         let dataset_name = self.dataset_name.clone();
@@ -89,18 +95,33 @@ impl RefreshTask {
         while let Some(update) = stream.next().await {
             match update {
                 Ok((start_time, data_update)) => {
-                    if let Err(err) = self.write_data_update(start_time, data_update).await {
-                        tracing::error!("Error adding data for dataset {dataset_name}: {err}");
-                    } else {
-                        // TODO : move cache invalidation to self.write_data_update or pass a callback
+                    // write_data_update updates dataset status and logs errors so we don't do this here
+                    if self
+                        .write_data_update(start_time, data_update)
+                        .await
+                        .is_ok()
+                    {
                         if let Some(ready_sender) = ready_sender.take() {
                             ready_sender.send(()).ok();
+                        }
+
+                        if let Some(cache_provider) = &cache_provider {
+                            if let Err(e) = cache_provider
+                                .invalidate_for_table(&dataset_name.to_string())
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name.to_string()
+                                );
+                            }
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!("Error getting update for dataset {dataset_name}: {e}");
-                    self.mark_dataset_status(status::ComponentStatus::Error);
+                    self.mark_dataset_status(status::ComponentStatus::Error)
+                        .await;
                 }
             }
         }
@@ -125,7 +146,8 @@ impl RefreshTask {
                 self.trace_dataset_loaded(start_time, 0, None);
             }
 
-            self.mark_dataset_status(status::ComponentStatus::Ready);
+            self.mark_dataset_status(status::ComponentStatus::Ready)
+                .await;
 
             return Ok(());
         };
@@ -145,7 +167,8 @@ impl RefreshTask {
             Ok(plan) => {
                 if let Err(e) = collect(plan, ctx.task_ctx()).await {
                     tracing::error!("Error adding data for {dataset_name}: {e}");
-                    self.mark_dataset_status(status::ComponentStatus::Error);
+                    self.mark_dataset_status(status::ComponentStatus::Error)
+                        .await;
                     return Err(Error::FailedToWriteData { source: e });
                 }
                 if let Some(start_time) = start_time {
@@ -165,12 +188,14 @@ impl RefreshTask {
                     self.trace_dataset_loaded(start_time, num_rows, Some(memory_size));
                 }
 
-                self.mark_dataset_status(status::ComponentStatus::Ready);
+                self.mark_dataset_status(status::ComponentStatus::Ready)
+                    .await;
 
                 Ok(())
             }
             Err(e) => {
-                self.mark_dataset_status(status::ComponentStatus::Error);
+                self.mark_dataset_status(status::ComponentStatus::Error)
+                    .await;
                 tracing::error!("Error adding data for {dataset_name}: {e}");
                 Err(Error::FailedToWriteData { source: e })
             }
@@ -178,7 +203,8 @@ impl RefreshTask {
     }
 
     pub async fn run(&self) -> super::Result<()> {
-        self.mark_dataset_status(status::ComponentStatus::Refreshing);
+        self.mark_dataset_status(status::ComponentStatus::Refreshing)
+            .await;
 
         let dataset_name = self.dataset_name.clone();
 
@@ -201,7 +227,8 @@ impl RefreshTask {
             Ok((start_time, data_update)) => (start_time, data_update),
             Err(e) => {
                 tracing::warn!("Error getting update for dataset {dataset_name}: {e}");
-                self.mark_dataset_status(status::ComponentStatus::Error);
+                self.mark_dataset_status(status::ComponentStatus::Error)
+                    .await;
                 return Err(e);
             }
         };
@@ -600,12 +627,26 @@ impl RefreshTask {
         }
     }
 
-    fn mark_dataset_status(&self, status: status::ComponentStatus) {
+    async fn mark_dataset_status(&self, status: status::ComponentStatus) {
         status::update_dataset(&self.dataset_name, status);
 
         if status == status::ComponentStatus::Error {
             let labels = [("dataset", self.dataset_name.to_string())];
             metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+        }
+
+        if status == status::ComponentStatus::Ready {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+
+            let mut labels = vec![("dataset", self.dataset_name.to_string())];
+            if let Some(sql) = &self.refresh.read().await.sql {
+                labels.push(("sql", sql.to_string()));
+            };
+
+            metrics::gauge!("datasets_acceleration_last_refresh_time", &labels)
+                .set(now.as_secs_f64());
         }
     }
 }
