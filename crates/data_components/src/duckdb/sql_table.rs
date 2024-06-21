@@ -51,7 +51,6 @@ pub struct DuckDBTable<T: 'static, P: 'static> {
 }
 
 impl<T, P> DuckDBTable<T, P> {
-    
     pub fn new_with_schema(
         name: &'static str,
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,

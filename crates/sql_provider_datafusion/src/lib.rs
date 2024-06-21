@@ -143,11 +143,13 @@ impl<T, P> SqlTable<T, P> {
         std::ptr::from_ref(self) as usize
     }
 
-    #[must_use] pub fn name(&self) -> &'static str {
+    #[must_use]
+    pub fn name(&self) -> &'static str {
         self.name
     }
 
-    #[must_use] pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
+    #[must_use]
+    pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
         Arc::clone(&self.pool)
     }
 }
@@ -252,7 +254,8 @@ impl<T, P> SqlExec<T, P> {
             engine,
         })
     }
-    #[must_use] pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
+    #[must_use]
+    pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
         Arc::clone(&self.pool)
     }
 

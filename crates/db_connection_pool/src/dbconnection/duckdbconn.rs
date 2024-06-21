@@ -111,17 +111,19 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
     }
 }
 
-#[must_use] pub fn flatten_table_function_name(table_reference: &TableReference) -> String {
+#[must_use]
+pub fn flatten_table_function_name(table_reference: &TableReference) -> String {
     let result = table_reference
         .table()
-        .replace('(', "_")
-        .replace([')', '(', '\'', ','], "")
+        .replace([')', '('], "_")
+        .replace(['\'', ','], "")
         .replace(['.', ' '], "_");
 
-    format!("{result}_view")
+    format!("{result}__view")
 }
 
-#[must_use] pub fn is_table_function(table_reference: &TableReference) -> bool {
+#[must_use]
+pub fn is_table_function(table_reference: &TableReference) -> bool {
     let table_name = match table_reference {
         TableReference::Full { .. } | TableReference::Partial { .. } => return false,
         TableReference::Bare { table } => table,

@@ -434,19 +434,11 @@ impl Read for DuckDBTableFactory {
 
         let schema = get_schema(conn, &table_reference).await?;
         let (tbl_ref, cte) = if is_table_function(&table_reference) {
-            let tbl_ref_view = [table_reference.catalog(),
-                table_reference.schema(),
-                Some(&flatten_table_function_name(&table_reference))]
-            .iter()
-            .flatten()
-            .collect_vec()
-            .iter()
-            .join(".");
-            let new_tbl = TableReference::from(&tbl_ref_view);
+            let tbl_ref_view = create_table_function_view_name(&table_reference);
             (
-                new_tbl.clone(),
+                tbl_ref_view.clone(),
                 Some(HashMap::from_iter(vec![(
-                    tbl_ref_view,
+                    tbl_ref_view.to_string(),
                     format!("SELECT * FROM {table_reference}"),
                 )])),
             )
@@ -481,4 +473,30 @@ impl ReadWrite for DuckDBTableFactory {
 
         Ok(DuckDBTableWriter::create(read_provider, duckdb, None))
     }
+}
+
+/// For a [`TableReference`] that is a table function, create a name for a view on the original [`TableReference`]
+/// ### Example
+///
+/// ```rust
+/// use data_components::duckdb::create_table_function_view_name;
+/// use datafusion::datasource::TableReference;
+///
+/// let table_reference = TableReference::from("catalog.schema.read_parquet('cleaned_sales_data.parquet')");
+/// let view_name = create_table_function_view_name(&table_reference);
+/// assert_eq!(view_name.to_string(), "catalog.schema.read_parquet_cleaned_sales_dataparquet__view");
+/// ```  read_parquetcleaned_sales_dataparquet_view
+///
+fn create_table_function_view_name(table_reference: &TableReference) -> TableReference {
+    let tbl_ref_view = [
+        table_reference.catalog(),
+        table_reference.schema(),
+        Some(&flatten_table_function_name(table_reference)),
+    ]
+    .iter()
+    .flatten()
+    .collect_vec()
+    .iter()
+    .join(".");
+    TableReference::from(&tbl_ref_view)
 }
