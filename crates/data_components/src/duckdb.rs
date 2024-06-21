@@ -439,7 +439,7 @@ impl Read for DuckDBTableFactory {
                 tbl_ref_view.clone(),
                 Some(HashMap::from_iter(vec![(
                     tbl_ref_view.to_string(),
-                    format!("SELECT * FROM {table_reference}"),
+                    table_reference.table().to_string(),
                 )])),
             )
         } else {

@@ -47,7 +47,9 @@ use sql_provider_datafusion::{
 
 pub struct DuckDBTable<T: 'static, P: 'static> {
     base_table: SqlTable<T, P>,
-    temporary_cte: Option<HashMap<String, String>>,
+
+    /// A mapping of table/view names to `DuckDB` functions that can instantiate a table (e.g. "`read_parquet`('`my_file.parquet`')").
+    table_functions: Option<HashMap<String, String>>,
 }
 
 impl<T, P> DuckDBTable<T, P> {
@@ -57,13 +59,13 @@ impl<T, P> DuckDBTable<T, P> {
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
-        temporary_cte: Option<HashMap<String, String>>,
+        table_functions: Option<HashMap<String, String>>,
     ) -> Self {
         let base_table = SqlTable::new_with_schema(name, pool, schema, table_reference, engine);
 
         Self {
             base_table,
-            temporary_cte,
+            table_functions,
         }
     }
 
@@ -81,7 +83,7 @@ impl<T, P> DuckDBTable<T, P> {
             self.base_table.clone_pool(),
             filters,
             limit,
-            self.temporary_cte.clone(),
+            self.table_functions.clone(),
         )?))
     }
 
@@ -150,7 +152,7 @@ impl<T, P> Display for DuckDBTable<T, P> {
 #[derive(Clone)]
 struct DuckSqlExec<T, P> {
     base_exec: SqlExec<T, P>,
-    temporary_cte: Option<HashMap<String, String>>,
+    table_functions: Option<HashMap<String, String>>,
 }
 
 impl<T, P> DuckSqlExec<T, P> {
@@ -161,7 +163,7 @@ impl<T, P> DuckSqlExec<T, P> {
         pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         filters: &[Expr],
         limit: Option<usize>,
-        temporary_cte: Option<HashMap<String, String>>,
+        table_functions: Option<HashMap<String, String>>,
     ) -> DataFusionResult<Self> {
         let base_exec = SqlExec::new(
             projections,
@@ -175,7 +177,7 @@ impl<T, P> DuckSqlExec<T, P> {
 
         Ok(Self {
             base_exec,
-            temporary_cte,
+            table_functions,
         })
     }
 
@@ -183,7 +185,7 @@ impl<T, P> DuckSqlExec<T, P> {
         let sql = self.base_exec.sql()?;
         Ok(format!(
             "{cte_expr} {sql}",
-            cte_expr = get_cte(&self.temporary_cte)
+            cte_expr = get_cte(&self.table_functions)
         ))
     }
 }
@@ -191,20 +193,20 @@ impl<T, P> DuckSqlExec<T, P> {
 impl<T, P> std::fmt::Debug for DuckSqlExec<T, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "SqlExec sql={sql}")
+        write!(f, "DuckSqlExec sql={sql}")
     }
 }
 
 impl<T, P> DisplayAs for DuckSqlExec<T, P> {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "SqlExec sql={sql}")
+        write!(f, "DuckSqlExec sql={sql}")
     }
 }
 
 impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
     fn name(&self) -> &'static str {
-        "SqlExec"
+        "DuckSqlExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -236,7 +238,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
-        tracing::debug!("SqlExec sql: {sql}");
+        tracing::debug!("DuckSqlExec sql: {sql}");
 
         let fut = get_stream(self.base_exec.clone_pool(), sql);
 
@@ -267,7 +269,7 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let fut = get_stream(
             self.base_table.clone_pool(),
-            format!("{cte} {query}", cte = get_cte(&self.temporary_cte)),
+            format!("{cte} {query}", cte = get_cte(&self.table_functions)),
         );
 
         let stream = futures::stream::once(fut).try_flatten();
@@ -295,11 +297,12 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
     }
 }
 
-pub fn get_cte(temporary_cte: &Option<HashMap<String, String>>) -> String {
-    if let Some(temp_cte) = temporary_cte {
-        let inner = temp_cte
+/// Create CTE expressions for all the table functions.
+pub fn get_cte(table_functions: &Option<HashMap<String, String>>) -> String {
+    if let Some(table_fn) = table_functions {
+        let inner = table_fn
             .iter()
-            .map(|(name, sql)| format!("{name} AS ({sql})"))
+            .map(|(name, r#fn)| format!("{name} AS (SELECT * FROM {fn})"))
             .collect::<Vec<_>>()
             .join(", ");
         format!("WITH {inner} ")
