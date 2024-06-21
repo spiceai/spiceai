@@ -39,7 +39,6 @@ use datafusion::{
 };
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
-use tokio::time::interval;
 
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -179,34 +178,26 @@ impl Builder {
     }
 
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
-        let mut refresh_trigger = None;
-        let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
-        let acceleration_refresh_mode: refresh::AccelerationRefreshMode = match self.refresh.mode {
+        let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
-                    refresh::AccelerationRefreshMode::Append(None)
+                    (refresh::AccelerationRefreshMode::Append(None), None)
                 } else {
                     let (trigger, receiver) = mpsc::channel::<()>(1);
-                    refresh_trigger = Some(trigger.clone());
-                    scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
-                        self.refresh.check_interval,
-                        trigger,
+                    (
+                        refresh::AccelerationRefreshMode::Append(Some(receiver)),
+                        Some(trigger),
                     )
-                    .await;
-                    refresh::AccelerationRefreshMode::Append(Some(receiver))
                 }
             }
             RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
-                refresh_trigger = Some(trigger.clone());
-                scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
-                    self.refresh.check_interval,
-                    trigger,
+                (
+                    refresh::AccelerationRefreshMode::Full(receiver),
+                    Some(trigger),
                 )
-                .await;
-                refresh::AccelerationRefreshMode::Full(receiver)
             }
         };
 
@@ -227,10 +218,6 @@ impl Builder {
 
         let mut handlers = vec![];
         handlers.push(refresh_handle);
-
-        if let Some(scheduled_refreshes_handle) = scheduled_refreshes_handle {
-            handlers.push(scheduled_refreshes_handle);
-        }
 
         if let Some(retention) = self.retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
@@ -311,31 +298,6 @@ impl AcceleratedTable {
         let mut refresh = self.refresh_params.write().await;
         refresh.sql = refresh_sql;
         Ok(())
-    }
-
-    async fn schedule_regular_refreshes(
-        refresh_check_interval: Option<Duration>,
-        refresh_trigger: mpsc::Sender<()>,
-    ) -> Option<JoinHandle<()>> {
-        if let Some(refresh_check_interval) = refresh_check_interval {
-            let mut interval_timer = interval(refresh_check_interval);
-            let trigger = refresh_trigger.clone();
-            let handle = tokio::spawn(async move {
-                loop {
-                    interval_timer.tick().await;
-                    // If sending fails, it means the receiver is dropped, and we should stop the task.
-                    if trigger.send(()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            return Some(handle);
-        } else if let Err(err) = refresh_trigger.send(()).await {
-            tracing::error!("Failed to trigger refresh: {err}");
-        }
-
-        None
     }
 
     #[allow(clippy::cast_possible_wrap)]
