@@ -18,8 +18,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::sql::unparser::dialect::Dialect;
-use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
-use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+use datafusion_federation_sql::SQLExecutor;
 use db_connection_pool::dbconnection::{get_schema, Error as DbError};
 use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
@@ -46,7 +45,7 @@ use sql_provider_datafusion::{
 };
 
 pub struct DuckDBTable<T: 'static, P: 'static> {
-    base_table: SqlTable<T, P>,
+    pub(crate) base_table: SqlTable<T, P>,
 
     /// A mapping of table/view names to `DuckDB` functions that can instantiate a table (e.g. "`read_parquet`('`my_file.parquet`')").
     table_functions: Option<HashMap<String, String>>,
@@ -85,29 +84,6 @@ impl<T, P> DuckDBTable<T, P> {
             limit,
             self.table_functions.clone(),
         )?))
-    }
-
-    fn create_federated_table_source(
-        self: Arc<Self>,
-    ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
-        let table_name = self.base_table.table_reference.to_quoted_string();
-        let schema = Arc::clone(&Arc::clone(&self).base_table.schema());
-        let fed_provider = Arc::new(SQLFederationProvider::new(self));
-        Ok(Arc::new(SQLTableSource::new_with_schema(
-            fed_provider,
-            table_name,
-            schema,
-        )?))
-    }
-
-    pub fn create_federated_table_provider(
-        self: Arc<Self>,
-    ) -> DataFusionResult<FederatedTableProviderAdaptor> {
-        let table_source = Self::create_federated_table_source(Arc::clone(&self))?;
-        Ok(FederatedTableProviderAdaptor::new_with_provider(
-            table_source,
-            self,
-        ))
     }
 }
 

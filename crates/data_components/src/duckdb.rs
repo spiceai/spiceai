@@ -52,6 +52,7 @@ use std::{cmp, collections::HashMap, sync::Arc};
 use self::{creator::TableCreator, sql_table::DuckDBTable, write::DuckDBTableWriter};
 
 mod creator;
+mod federation;
 mod sql_table;
 pub mod write;
 
