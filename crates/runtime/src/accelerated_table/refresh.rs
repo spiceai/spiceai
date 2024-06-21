@@ -171,6 +171,7 @@ impl Refresher {
                     };
 
                     if data_update.update_type == UpdateType::Changes {
+                        tracing::info!("Processing changes for {dataset_name}");
                         let Some(deletion_provider) =
                             get_deletion_provider(Arc::clone(&self.accelerator))
                         else {
@@ -203,6 +204,8 @@ impl Refresher {
                                         };
                                         let delete_where_expr = col("id").eq(lit(id_col.value(0)));
 
+                                        tracing::info!("Deleting data for {dataset_name} where {delete_where_expr}");
+
                                         let ctx = SessionContext::new();
                                         let session_state = ctx.state();
 
@@ -221,6 +224,8 @@ impl Refresher {
                                         let inner_data: RecordBatch = data_col.slice(row, 1).into();
                                         let ctx = SessionContext::new();
                                         let session_state = ctx.state();
+
+                                        tracing::info!("Inserting data row for {dataset_name}");
 
                                         let Ok(insert_plan) = self
                                             .accelerator
