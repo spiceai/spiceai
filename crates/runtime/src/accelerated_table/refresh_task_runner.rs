@@ -100,7 +100,7 @@ impl RefreshTaskRunner {
                                     _ = callback_sender.send(RefreshTaskResult::Success).await;
                                 },
                                 Err(err) => {
-                                    tracing::debug!("Refresh task for dataset {dataset_name} failed with error: {}", err);
+                                    tracing::debug!("Refresh task for dataset {dataset_name} failed with error: {err}");
                                     _ = callback_sender.send(RefreshTaskResult::Error).await;
                                 }
                             }
