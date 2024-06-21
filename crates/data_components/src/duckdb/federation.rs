@@ -22,11 +22,17 @@ use futures::TryStreamExt;
 use snafu::ResultExt;
 use sql_provider_datafusion::{get_stream, to_execution_error};
 
-use tonic::async_trait;
 use std::sync::Arc;
+use tonic::async_trait;
 
 use super::sql_table::{get_cte, DuckDBTable};
-use datafusion::{datasource::TableProvider, error::{DataFusionError, Result as DataFusionResult}, execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference};
+use datafusion::{
+    datasource::TableProvider,
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
+    sql::TableReference,
+};
 
 impl<T, P> DuckDBTable<T, P> {
     fn create_federated_table_source(
