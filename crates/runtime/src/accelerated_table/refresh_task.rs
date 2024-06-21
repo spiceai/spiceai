@@ -129,6 +129,77 @@ impl RefreshTask {
         Ok(())
     }
 
+    pub async fn run(&self) -> super::Result<()> {
+        self.mark_dataset_status(status::ComponentStatus::Refreshing)
+            .await;
+
+        let dataset_name = self.dataset_name.clone();
+
+        let refresh = self.refresh.read().await;
+
+        let timer = TimeMeasurement::new(
+            match refresh.mode {
+                RefreshMode::Full => "load_dataset_duration_ms",
+                RefreshMode::Append => "append_dataset_duration_ms",
+            },
+            vec![("dataset", dataset_name.to_string())],
+        );
+
+        let get_data_update_result = match refresh.mode {
+            RefreshMode::Full => self.get_full_update().await,
+            RefreshMode::Append => self.get_incremental_append_update().await,
+        };
+
+        let (start_time, data_update) = match get_data_update_result {
+            Ok((start_time, data_update)) => (start_time, data_update),
+            Err(e) => {
+                tracing::warn!("Error getting update for dataset {dataset_name}: {e}");
+                self.mark_dataset_status(status::ComponentStatus::Error)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        drop(timer);
+
+        self.write_data_update(start_time, data_update).await
+    }
+
+    pub async fn get_full_or_incremental_append_update(
+        &self,
+        overwrite_timestamp_in_nano: Option<u128>,
+    ) -> super::Result<DataUpdate> {
+        let dataset_name = self.dataset_name.clone();
+        let refresh = self.refresh.read().await;
+        let filter_converter = self.get_filter_converter(&refresh);
+
+        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+            tracing::debug!("Loading data for dataset {dataset_name}");
+        } else {
+            tracing::info!("Loading data for dataset {dataset_name}");
+        }
+        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
+        let refresh = refresh.clone();
+        let mut filters = vec![];
+        if let Some(converter) = filter_converter.as_ref() {
+            if let Some(timestamp) = overwrite_timestamp_in_nano {
+                filters.push(converter.convert(timestamp, Operator::Gt));
+            } else if let Some(period) = refresh.period {
+                filters.push(
+                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
+                );
+            }
+        };
+
+        match self.get_data_update(filters).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
+                Err(e)
+            }
+        }
+    }
+
     async fn write_data_update(
         &self,
         start_time: Option<SystemTime>,
@@ -202,42 +273,6 @@ impl RefreshTask {
         }
     }
 
-    pub async fn run(&self) -> super::Result<()> {
-        self.mark_dataset_status(status::ComponentStatus::Refreshing)
-            .await;
-
-        let dataset_name = self.dataset_name.clone();
-
-        let refresh = self.refresh.read().await;
-
-        let timer = TimeMeasurement::new(
-            match refresh.mode {
-                RefreshMode::Full => "load_dataset_duration_ms",
-                RefreshMode::Append => "append_dataset_duration_ms",
-            },
-            vec![("dataset", dataset_name.to_string())],
-        );
-
-        let get_data_update_result = match refresh.mode {
-            RefreshMode::Full => self.get_full_update().await,
-            RefreshMode::Append => self.get_incremental_append_update().await,
-        };
-
-        let (start_time, data_update) = match get_data_update_result {
-            Ok((start_time, data_update)) => (start_time, data_update),
-            Err(e) => {
-                tracing::warn!("Error getting update for dataset {dataset_name}: {e}");
-                self.mark_dataset_status(status::ComponentStatus::Error)
-                    .await;
-                return Err(e);
-            }
-        };
-
-        drop(timer);
-
-        self.write_data_update(start_time, data_update).await
-    }
-
     async fn get_full_update(&self) -> super::Result<(Option<SystemTime>, DataUpdate)> {
         let start = SystemTime::now();
         match self.get_full_or_incremental_append_update(None).await {
@@ -262,41 +297,6 @@ impl RefreshTask {
             }
             Err(e) => {
                 tracing::error!("No latest timestamp is found: {e}");
-                Err(e)
-            }
-        }
-    }
-
-    pub async fn get_full_or_incremental_append_update(
-        &self,
-        overwrite_timestamp_in_nano: Option<u128>,
-    ) -> super::Result<DataUpdate> {
-        let dataset_name = self.dataset_name.clone();
-        let refresh = self.refresh.read().await;
-        let filter_converter = self.get_filter_converter(&refresh);
-
-        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-            tracing::debug!("Loading data for dataset {dataset_name}");
-        } else {
-            tracing::info!("Loading data for dataset {dataset_name}");
-        }
-        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
-        let refresh = refresh.clone();
-        let mut filters = vec![];
-        if let Some(converter) = filter_converter.as_ref() {
-            if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::Gt));
-            } else if let Some(period) = refresh.period {
-                filters.push(
-                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
-                );
-            }
-        };
-
-        match self.get_data_update(filters).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
                 Err(e)
             }
         }

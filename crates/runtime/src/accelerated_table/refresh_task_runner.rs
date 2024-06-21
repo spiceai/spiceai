@@ -22,37 +22,19 @@ use tokio::{
     task::JoinHandle,
 };
 
-use std::{
-    fmt::{Display, Formatter},
-    sync::Arc,
-};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use datafusion::{datasource::TableProvider, sql::TableReference};
 
 use super::refresh::Refresh;
 
-#[derive(Debug)]
-pub enum RefreshTaskResult {
-    Success,
-    Error,
-}
-
-impl Display for RefreshTaskResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RefreshTaskResult::Success => write!(f, "Success"),
-            RefreshTaskResult::Error => write!(f, "Error"),
-        }
-    }
-}
-
 pub struct RefreshTaskRunner {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
-    task_thread: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl RefreshTaskRunner {
@@ -68,17 +50,17 @@ impl RefreshTaskRunner {
             federated,
             refresh,
             accelerator,
-            task_thread: None,
+            task: None,
         }
     }
 
-    pub fn start(&mut self) -> (Sender<()>, Receiver<RefreshTaskResult>) {
-        let (task_sender, mut task_receiver) = mpsc::channel::<()>(1);
+    pub fn start(&mut self) -> (Sender<()>, Receiver<super::Result<()>>) {
+        let (start_refresh, mut on_start_refresh) = mpsc::channel::<()>(1);
 
-        let (callback_sender, callback_receiver) = mpsc::channel::<RefreshTaskResult>(1);
+        let (notify_refresh_complete, on_refresh_complete) = mpsc::channel::<super::Result<()>>(1);
 
         let dataset_name = self.dataset_name.clone();
-        let callback_sender = Arc::new(callback_sender);
+        let notify_refresh_complete = Arc::new(notify_refresh_complete);
 
         let refresh_task = Arc::new(RefreshTask::new(
             dataset_name.clone(),
@@ -87,7 +69,7 @@ impl RefreshTaskRunner {
             Arc::clone(&self.accelerator),
         ));
 
-        self.task_thread = Some(tokio::spawn(async move {
+        self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<BoxFuture<super::Result<()>>> = None;
 
             loop {
@@ -97,21 +79,25 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(()) => {
                                     tracing::debug!("Refresh task successfully completed for dataset {dataset_name}");
-                                    _ = callback_sender.send(RefreshTaskResult::Success).await;
+                                    if let Err(err) = notify_refresh_complete.send(Ok(())).await {
+                                        tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
+                                    }
                                 },
                                 Err(err) => {
                                     tracing::debug!("Refresh task for dataset {dataset_name} failed with error: {err}");
-                                    _ = callback_sender.send(RefreshTaskResult::Error).await;
+                                    if let Err(err) = notify_refresh_complete.send(Err(err)).await {
+                                        tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
+                                    }
                                 }
                             }
                         },
-                        _ = task_receiver.recv() => {
+                        _ = on_start_refresh.recv() => {
                             task_completion = Some(Box::pin(refresh_task.run()));
                         }
                     }
                 } else {
                     select! {
-                        _ = task_receiver.recv() => {
+                        _ = on_start_refresh.recv() => {
                             task_completion = Some(Box::pin(refresh_task.run()));
                         }
                     }
@@ -119,13 +105,19 @@ impl RefreshTaskRunner {
             }
         }));
 
-        (task_sender, callback_receiver)
+        (start_refresh, on_refresh_complete)
     }
 
-    pub fn stop(&mut self) {
-        if let Some(task_thread) = &self.task_thread {
-            task_thread.abort();
-            self.task_thread = None;
+    pub fn abort(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+            self.task = None;
         }
+    }
+}
+
+impl Drop for RefreshTaskRunner {
+    fn drop(&mut self) {
+        self.abort();
     }
 }

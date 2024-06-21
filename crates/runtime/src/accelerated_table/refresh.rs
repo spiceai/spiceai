@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::accelerated_table::refresh_task::RefreshTask;
-use crate::accelerated_table::refresh_task_runner::RefreshTaskResult;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use cache::QueryResultsCacheProvider;
@@ -127,6 +126,63 @@ impl Refresher {
         self
     }
 
+    pub(crate) async fn start(
+        &mut self,
+        acceleration_refresh_mode: AccelerationRefreshMode,
+        ready_sender: oneshot::Sender<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let time_column = self.refresh.read().await.time_column.clone();
+
+        let mut on_start_refresh_external = match acceleration_refresh_mode {
+            AccelerationRefreshMode::Append(receiver) => {
+                if let (Some(receiver), Some(_)) = (receiver, time_column) {
+                    receiver
+                } else {
+                    return self.start_streaming_append(ready_sender);
+                }
+            }
+            AccelerationRefreshMode::Full(receiver) => receiver,
+        };
+
+        let (start_refresh, mut on_refresh_complete) = self.refresh_task_runner.start();
+
+        let mut ready_sender = Some(ready_sender);
+        let dataset_name = self.dataset_name.clone();
+        let refresh = Arc::clone(&self.refresh);
+
+        let cache_provider = self.cache_provider.clone();
+
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = on_start_refresh_external.recv() => {
+                        tracing::debug!("Received external trigger to start refresh");
+
+                        if let Err(err) = start_refresh.send(()).await {
+                            tracing::error!("Failed to execute refresh: {err}");
+                        }
+                    },
+                    Some(res) = on_refresh_complete.recv() => {
+                        tracing::debug!("Received refresh task completion callback: {res:?}");
+
+                        if let Ok(()) = res {
+                                notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
+
+                                if let Some(cache_provider) = &cache_provider {
+                                    if let Err(e) = cache_provider
+                                        .invalidate_for_table(&dataset_name.to_string())
+                                        .await
+                                    {
+                                        tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                    }
+                                }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     fn start_streaming_append(
         &mut self,
         ready_sender: oneshot::Sender<()>,
@@ -142,74 +198,25 @@ impl Refresher {
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streamed_append(cache_provider, Some(ready_sender))
+                .start_streaming_append(cache_provider, Some(ready_sender))
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
             }
         })
     }
+}
 
-    pub(crate) async fn start(
-        &mut self,
-        acceleration_refresh_mode: AccelerationRefreshMode,
-        ready_sender: oneshot::Sender<()>,
-    ) -> tokio::task::JoinHandle<()> {
-        let time_column = self.refresh.read().await.time_column.clone();
-
-        let mut refresh_receiver = match acceleration_refresh_mode {
-            AccelerationRefreshMode::Append(receiver) => {
-                if let (Some(receiver), Some(_)) = (receiver, time_column) {
-                    receiver
-                } else {
-                    return self.start_streamed_append(ready_sender);
-                }
-            }
-            AccelerationRefreshMode::Full(receiver) => receiver,
-        };
-
-        let (task_sender, mut task_callback) = self.refresh_task_runner.start();
-
-        let mut ready_sender = Some(ready_sender);
-        let dataset_name = self.dataset_name.clone();
-        let refresh = Arc::clone(&self.refresh);
-
-        let cache_provider = self.cache_provider.clone();
-
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    _ = refresh_receiver.recv() => {
-                        tracing::debug!("Received outside trigger to start refresh");
-
-                        if let Err(err) = task_sender.send(()).await {
-                            tracing::error!("Failed to execute refresh: {err}");
-                        }
-                    },
-                    Some(res) = task_callback.recv() => {
-                        tracing::debug!("Received refresh task completion callback: {res}");
-
-                        match res {
-                            RefreshTaskResult::Success => {
-                                notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
-
-                                if let Some(cache_provider) = &cache_provider {
-                                    if let Err(e) = cache_provider
-                                        .invalidate_for_table(&dataset_name.to_string())
-                                        .await
-                                    {
-                                        tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
-                                    }
-                                }
-                            },
-                            RefreshTaskResult::Error => {
-                            }
-                        }
-                    }
-                }
-            }
-        })
+impl Drop for Refresher {
+    fn drop(&mut self) {
+        self.refresh_task_runner.abort();
     }
+}
+
+pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 async fn notify_refresh_done(
@@ -231,18 +238,6 @@ async fn notify_refresh_done(
     };
 
     metrics::gauge!("datasets_acceleration_last_refresh_time", &labels).set(now.as_secs_f64());
-}
-
-impl Drop for Refresher {
-    fn drop(&mut self) {
-        self.refresh_task_runner.stop();
-    }
-}
-
-pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 #[cfg(test)]
