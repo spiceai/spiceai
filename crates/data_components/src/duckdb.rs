@@ -36,18 +36,24 @@ use datafusion::{
     sql::TableReference,
 };
 use db_connection_pool::{
-    dbconnection::{duckdbconn::DuckDbConnection, DbConnection},
+    dbconnection::{
+        duckdbconn::{flatten_table_function_name, is_table_function, DuckDbConnection},
+        get_schema, DbConnection,
+    },
     duckdbpool::DuckDbConnectionPool,
     DbConnectionPool, Mode,
 };
 use duckdb::{AccessMode, DuckdbConnectionManager, ToSql, Transaction};
+use itertools::Itertools;
 use snafu::prelude::*;
-use sql_provider_datafusion::{expr::Engine, SqlTable};
+use sql_provider_datafusion::expr::Engine;
 use std::{cmp, collections::HashMap, sync::Arc};
 
-use self::{creator::TableCreator, write::DuckDBTableWriter};
+use self::{creator::TableCreator, sql_table::DuckDBTable, write::DuckDBTableWriter};
 
 mod creator;
+mod federation;
+mod sql_table;
 pub mod write;
 
 #[derive(Debug, Snafu)]
@@ -233,12 +239,13 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
 
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
 
-        let read_provider = Arc::new(SqlTable::new_with_schema(
+        let read_provider = Arc::new(DuckDBTable::new_with_schema(
             "duckdb",
             &dyn_pool,
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
             Some(Engine::DuckDB),
+            None,
         ));
 
         let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb, on_conflict);
@@ -423,19 +430,27 @@ impl Read for DuckDBTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
+        let conn = Arc::clone(&pool).connect().await?;
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
-        let table_provider = SqlTable::new("duckdb", &dyn_pool, table_reference, None)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        let table_provider = Arc::new(table_provider);
+        let schema = get_schema(conn, &table_reference).await?;
+        let (tbl_ref, cte) = if is_table_function(&table_reference) {
+            let tbl_ref_view = create_table_function_view_name(&table_reference);
+            (
+                tbl_ref_view.clone(),
+                Some(HashMap::from_iter(vec![(
+                    tbl_ref_view.to_string(),
+                    table_reference.table().to_string(),
+                )])),
+            )
+        } else {
+            (table_reference.clone(), None)
+        };
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
-
+        let table_provider = Arc::new(DuckDBTable::new_with_schema(
+            "duckdb", &dyn_pool, schema, tbl_ref, None, cte,
+        ));
+        let table_provider = Arc::new(table_provider.create_federated_table_provider()?);
         Ok(table_provider)
     }
 }
@@ -459,4 +474,28 @@ impl ReadWrite for DuckDBTableFactory {
 
         Ok(DuckDBTableWriter::create(read_provider, duckdb, None))
     }
+}
+
+/// For a [`TableReference`] that is a table function, create a name for a view on the original [`TableReference`]
+/// ### Example
+///
+/// ```rust
+/// use data_components::duckdb::create_table_function_view_name;
+/// use datafusion::datasource::TableReference;
+///
+/// let table_reference = TableReference::from("catalog.schema.read_parquet('cleaned_sales_data.parquet')");
+/// let view_name = create_table_function_view_name(&table_reference);
+/// assert_eq!(view_name.to_string(), "catalog.schema.read_parquet_cleaned_sales_dataparquet__view");
+/// ```  read_parquetcleaned_sales_dataparquet_view
+///
+fn create_table_function_view_name(table_reference: &TableReference) -> TableReference {
+    let tbl_ref_view = [
+        table_reference.catalog(),
+        table_reference.schema(),
+        Some(&flatten_table_function_name(table_reference)),
+    ]
+    .iter()
+    .flatten()
+    .join(".");
+    TableReference::from(&tbl_ref_view)
 }
