@@ -64,7 +64,7 @@ impl Read for MySQLTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let table_provider = Arc::new(
-            SqlTable::new("mysql", &pool, table_reference, None, None)
+            SqlTable::new("mysql", &pool, table_reference, None)
                 .await
                 .context(UnableToConstructSQLTableSnafu)?
                 .with_dialect(Arc::new(MySqlDialect {})),

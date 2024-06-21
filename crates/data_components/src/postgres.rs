@@ -171,7 +171,7 @@ impl Read for PostgresTableFactory {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
         let table_provider = Arc::new(
-            SqlTable::new("postgres", &dyn_pool, table_reference, None, None)
+            SqlTable::new("postgres", &dyn_pool, table_reference, None)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
         );
@@ -322,7 +322,6 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
             Some(Engine::Postgres),
-            None,
         ));
 
         let delete_adapter = DeletionTableProviderAdapter::new(PostgresTableWriter::create(

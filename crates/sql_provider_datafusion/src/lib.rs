@@ -23,9 +23,7 @@ use db_connection_pool::DbConnectionPool;
 use expr::Engine;
 use futures::TryStreamExt;
 use snafu::prelude::*;
-use std::collections::HashMap;
 use std::fmt::Display;
-use std::hash::Hash;
 use std::{any::Any, fmt, sync::Arc};
 
 use datafusion::{
@@ -59,16 +57,15 @@ pub enum Error {
     UnableToGenerateSQL { source: expr::Error },
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqlTable<T: 'static, P: 'static> {
     name: &'static str,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
-    table_reference: TableReference,
+    pub table_reference: TableReference,
     engine: Option<Engine>,
     dialect: Option<Arc<dyn Dialect + Send + Sync>>,
-    temporary_cte: Option<HashMap<String, String>>,
 }
 
 impl<T, P> SqlTable<T, P> {
@@ -77,7 +74,6 @@ impl<T, P> SqlTable<T, P> {
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
-        temporary_cte: Option<HashMap<String, String>>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let conn = pool
@@ -96,7 +92,6 @@ impl<T, P> SqlTable<T, P> {
             table_reference,
             engine,
             dialect: None,
-            temporary_cte,
         })
     }
 
@@ -106,7 +101,6 @@ impl<T, P> SqlTable<T, P> {
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
-        temporary_cte: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
             name,
@@ -115,7 +109,6 @@ impl<T, P> SqlTable<T, P> {
             table_reference: table_reference.into(),
             engine,
             dialect: None,
-            temporary_cte,
         }
     }
 
@@ -142,13 +135,20 @@ impl<T, P> SqlTable<T, P> {
             filters,
             limit,
             self.engine,
-            self.temporary_cte.clone(),
         )?))
     }
 
     // Return the current memory location of the object as a unique identifier
     fn unique_id(&self) -> usize {
         std::ptr::from_ref(self) as usize
+    }
+
+    #[must_use] pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[must_use] pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
+        Arc::clone(&self.pool)
     }
 }
 
@@ -199,7 +199,7 @@ impl<T, P> Display for SqlTable<T, P> {
 }
 
 #[derive(Clone)]
-struct SqlExec<T, P> {
+pub struct SqlExec<T, P> {
     projected_schema: SchemaRef,
     table_reference: TableReference,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
@@ -207,7 +207,6 @@ struct SqlExec<T, P> {
     limit: Option<usize>,
     properties: PlanProperties,
     engine: Option<Engine>,
-    temporary_cte: Option<HashMap<String, String>>,
 }
 
 pub fn project_schema_safe(
@@ -228,7 +227,7 @@ pub fn project_schema_safe(
 }
 
 impl<T, P> SqlExec<T, P> {
-    fn new(
+    pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &TableReference,
@@ -236,7 +235,6 @@ impl<T, P> SqlExec<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
         engine: Option<Engine>,
-        temporary_cte: Option<HashMap<String, String>>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema_safe(schema, projections)?;
 
@@ -252,11 +250,13 @@ impl<T, P> SqlExec<T, P> {
                 ExecutionMode::Bounded,
             ),
             engine,
-            temporary_cte,
         })
     }
+    #[must_use] pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
+        Arc::clone(&self.pool)
+    }
 
-    fn sql(&self) -> Result<String> {
+    pub fn sql(&self) -> Result<String> {
         let columns = self
             .projected_schema
             .fields()
@@ -289,9 +289,8 @@ impl<T, P> SqlExec<T, P> {
         };
 
         Ok(format!(
-            "{cte_expr} SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference.to_string(),
-            cte_expr = get_cte(&self.temporary_cte)
+            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            table_reference = self.table_reference
         ))
     }
 }
@@ -354,7 +353,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
     }
 }
 
-async fn get_stream<T: 'static, P: 'static>(
+pub async fn get_stream<T: 'static, P: 'static>(
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     sql: String,
 ) -> DataFusionResult<SendableRecordBatchStream> {
@@ -364,21 +363,10 @@ async fn get_stream<T: 'static, P: 'static>(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
+pub fn to_execution_error(
+    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
-}
-
-pub fn get_cte(temporary_cte: &Option<HashMap<String, String>>) -> String {
-    if let Some(temp_cte) = temporary_cte {
-        let inner = temp_cte
-            .iter()
-            .map(|(name, sql)| format!("{} AS ({})", name, sql))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("WITH {inner} ")
-    } else {
-        String::new()
-    }
 }
 
 #[cfg(test)]
@@ -426,7 +414,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None, None).await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -452,7 +440,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None, None).await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;
