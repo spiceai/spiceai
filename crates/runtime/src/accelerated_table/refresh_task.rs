@@ -78,7 +78,7 @@ impl RefreshTask {
         }
     }
 
-    pub async fn start_streamed_append(
+    pub async fn start_streaming_append(
         &self,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
