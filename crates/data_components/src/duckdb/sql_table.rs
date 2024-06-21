@@ -17,12 +17,8 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use datafusion::sql::unparser::dialect::Dialect;
-use datafusion_federation_sql::SQLExecutor;
-use db_connection_pool::dbconnection::{get_schema, Error as DbError};
 use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use snafu::prelude::*;
 use sql_provider_datafusion::expr::Engine;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -31,7 +27,7 @@ use std::{any::Any, fmt, sync::Arc};
 use datafusion::{
     arrow::datatypes::SchemaRef,
     datasource::TableProvider,
-    error::{DataFusionError, Result as DataFusionResult},
+    error::Result as DataFusionResult,
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
@@ -48,7 +44,7 @@ pub struct DuckDBTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
 
     /// A mapping of table/view names to `DuckDB` functions that can instantiate a table (e.g. "`read_parquet`('`my_file.parquet`')").
-    table_functions: Option<HashMap<String, String>>,
+    pub(crate) table_functions: Option<HashMap<String, String>>,
 }
 
 impl<T, P> DuckDBTable<T, P> {
@@ -224,57 +220,8 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
     }
 }
 
-#[async_trait]
-impl<T, P> SQLExecutor for DuckDBTable<T, P> {
-    fn name(&self) -> &str {
-        self.base_table.name()
-    }
-
-    fn compute_context(&self) -> Option<String> {
-        self.base_table.compute_context()
-    }
-
-    fn dialect(&self) -> Arc<dyn Dialect> {
-        self.base_table.dialect()
-    }
-
-    fn execute(
-        &self,
-        query: &str,
-        schema: SchemaRef,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let fut = get_stream(
-            self.base_table.clone_pool(),
-            format!("{cte} {query}", cte = get_cte(&self.table_functions)),
-        );
-
-        let stream = futures::stream::once(fut).try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-
-    async fn table_names(&self) -> DataFusionResult<Vec<String>> {
-        Err(DataFusionError::NotImplemented(
-            "table inference not implemented".to_string(),
-        ))
-    }
-
-    async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        let conn = self
-            .base_table
-            .clone_pool()
-            .connect()
-            .await
-            .map_err(to_execution_error)?;
-        get_schema(conn, &TableReference::from(table_name))
-            .await
-            .boxed()
-            .map_err(|e| DbError::UnableToGetSchema { source: e })
-            .map_err(to_execution_error)
-    }
-}
-
 /// Create CTE expressions for all the table functions.
-pub fn get_cte(table_functions: &Option<HashMap<String, String>>) -> String {
+pub(crate) fn get_cte(table_functions: &Option<HashMap<String, String>>) -> String {
     if let Some(table_fn) = table_functions {
         let inner = table_fn
             .iter()
