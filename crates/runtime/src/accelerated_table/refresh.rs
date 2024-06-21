@@ -158,7 +158,7 @@ impl Refresher {
 
         tokio::spawn(async move {
             // first refresh is on start, thus duration is 0
-            let mut next_scheduled_refresh_timer = Some(Box::pin(sleep(Duration::from_secs(0))));
+            let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
 
             loop {
                 let scheduled_refresh_fut: BoxFuture<()> = match next_scheduled_refresh_timer.take()
@@ -198,7 +198,7 @@ impl Refresher {
                         }
 
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(Box::pin(sleep(refresh_check_interval)));
+                            next_scheduled_refresh_timer = Some(sleep(refresh_check_interval));
                         }
                     }
                 }
