@@ -39,6 +39,8 @@ fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset 
 #[cfg(feature = "spiceai-dataset-test")]
 #[allow(clippy::too_many_lines)]
 async fn refresh_sql_pushdown() -> Result<(), String> {
+    use runtime::accelerated_table::refresh_task::RefreshTask;
+
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("refresh_sql_pushdown")
         .with_secret_store(SpiceSecretStore::File)
@@ -66,14 +68,19 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
         .downcast_ref::<AcceleratedTable>()
         .ok_or("traces table is not an AcceleratedTable")?;
 
-    let refresher = traces_accelerated_table.refresher();
+    let refresh_task = Arc::new(RefreshTask::new(
+        "traces".into(),
+        Arc::clone(&traces_accelerated_table.get_federated_table()),
+        traces_accelerated_table.refresh_params(),
+        traces_table,
+    ));
 
     // If the refresh SQL filters aren't being pushed down, this will timeout
     let data_update = tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        res = refresher.get_full_or_incremental_append_update(None) => {
+        res = refresh_task.get_full_or_incremental_append_update(None) => {
             res.map_err(|e| e.to_string())?
         }
     };
