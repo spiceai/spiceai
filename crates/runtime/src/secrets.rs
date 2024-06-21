@@ -162,7 +162,7 @@ impl Secret {
             None => param_key,
         };
 
-        if let Some(secret_val) = self.data.get(secret_param_val) {
+        if let Some(secret_val) = self.data.get(secret_param_val.to_lowercase().as_str()) {
             params.insert(param_key.to_string(), secret_val.clone());
         }
     }

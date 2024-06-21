@@ -17,10 +17,15 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Failed to run Embedding health check: {source}"))]
+    HealthCheckError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to prepare input for embedding: {source}"))]
     FailedToPrepareInput {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -31,11 +36,22 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait Embed: Sync + Send {
     async fn embed(&mut self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+
+    /// A basic health check to ensure the model can process future [`Self::embed`] requests.
+    /// Default implementation is a basic call to [`embed()`].
+    async fn health(&mut self) -> Result<()> {
+        self.embed(EmbeddingInput::String("health".to_string()))
+            .await
+            .boxed()
+            .context(HealthCheckSnafu)?;
+        Ok(())
+    }
 
     /// Returns the size of the embedding vector returned by the model.
     fn size(&self) -> i32;

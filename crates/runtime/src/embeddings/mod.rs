@@ -19,3 +19,4 @@ pub mod array_distance;
 pub mod connector;
 pub mod execution_plan;
 pub mod table;
+pub mod vector_search;

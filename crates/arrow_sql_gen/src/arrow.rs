@@ -18,7 +18,7 @@ use arrow::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder,
         Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
         Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder, LargeStringBuilder,
-        ListBuilder, NullBuilder, StringBuilder, Time64NanosecondBuilder,
+        ListBuilder, NullBuilder, StringBuilder, StructBuilder, Time64NanosecondBuilder,
         TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
         TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     },
@@ -89,6 +89,13 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             _ => unimplemented!("Unsupported list value data type {:?}", data_type),
         },
         DataType::Null => Box::new(NullBuilder::new()),
+        DataType::Struct(fields) => {
+            let mut field_builders = Vec::with_capacity(fields.len());
+            for field in fields {
+                field_builders.push(map_data_type_to_array_builder(field.data_type()));
+            }
+            Box::new(StructBuilder::new(fields.clone(), field_builders))
+        }
         _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }

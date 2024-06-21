@@ -38,14 +38,14 @@ serde = { version = "1.0.195", features = ["derive"] }
 serde_yaml = "0.9.30"
 serde_json = "1.0.1"
 snafu = "0.8.0"
-tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
+tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal", "macros"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "be2c2c1f74823956e609a23ca38657cd76c2fcfe" }
 arrow = "52.0.0"
 arrow-flight = "52.0.0"
-duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "506c2ddb81e86ef13b75f7fa8817abefb04a123d" }
+duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 tonic = "0.11.0"
 futures = "0.3.30"
