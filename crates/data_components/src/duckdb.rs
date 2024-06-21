@@ -495,8 +495,6 @@ fn create_table_function_view_name(table_reference: &TableReference) -> TableRef
     ]
     .iter()
     .flatten()
-    .collect_vec()
-    .iter()
     .join(".");
     TableReference::from(&tbl_ref_view)
 }
