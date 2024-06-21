@@ -27,10 +27,13 @@ use datafusion::physical_plan::{
 };
 use futures::stream;
 
-#[derive(Debug, Clone, PartialEq)]
+pub mod changes;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpdateType {
     Append,
     Overwrite,
+    Changes,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +43,7 @@ pub struct DataUpdate {
     /// The type of update to perform.
     /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
     /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
+    /// If `UpdateType::Changes`, the `data` represents `ChangeEvent`s captured from a Change Data Capture tool like Debezium.
     pub update_type: UpdateType,
 }
 
