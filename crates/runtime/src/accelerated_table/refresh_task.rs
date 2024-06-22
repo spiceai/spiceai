@@ -155,7 +155,7 @@ impl RefreshTask {
         let (start_time, data_update) = match get_data_update_result {
             Ok((start_time, data_update)) => (start_time, data_update),
             Err(e) => {
-                tracing::error!("Failed to load data for dataset{dataset_name}: {e}");
+                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
                 self.mark_dataset_status(status::ComponentStatus::Error)
                     .await;
                 return Err(e);
@@ -372,22 +372,33 @@ impl RefreshTask {
     }
 
     async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
-        let refresh = self.refresh.read().await;
+        let refresh = Arc::clone(&self.refresh);
 
         let ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
-        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(0)).build();
 
         retry(retry_strategy, || async {
             let mut ctx_clone = ctx.clone();
+
+            let (sql, update_type) = {
+                let refresh = refresh.read().await;
+                (
+                    refresh.sql.clone(),
+                    match refresh.mode {
+                        RefreshMode::Full => UpdateType::Overwrite,
+                        RefreshMode::Append => UpdateType::Append,
+                    },
+                )
+            };
 
             let get_data_result = get_data(
                 &mut ctx_clone,
                 dataset_name.clone(),
                 Arc::clone(&federated),
-                refresh.sql.clone(),
+                sql,
                 filters.clone(),
             )
             .await;
@@ -396,10 +407,7 @@ impl RefreshTask {
                 Ok(data) => Ok(DataUpdate {
                     schema: data.0,
                     data: data.1,
-                    update_type: match refresh.mode {
-                        RefreshMode::Full => UpdateType::Overwrite,
-                        RefreshMode::Append => UpdateType::Append,
-                    },
+                    update_type,
                 }),
                 Err(e) => {
                     tracing::warn!(

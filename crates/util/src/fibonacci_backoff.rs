@@ -150,7 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_within_range() {
+    fn test_backoff_interval_within_range() {
         let tests = vec![
             (1000, 900, 1100),
             (13000, 11700, 14300),
@@ -196,7 +196,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unlimited_max_retries() {
+    fn test_zero_max_retries() {
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(0)).build();
+
+        assert!(backoff.next_backoff().is_none());
+    }
+
+    #[test]
+    fn test_undefined_max_retries() {
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         for _ in 0..100 {
