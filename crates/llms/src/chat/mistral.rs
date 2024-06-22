@@ -225,29 +225,28 @@ impl MistralLlama {
             .build(),
         })
     }
+}
 
-    fn to_request(
-        &self,
-        prompt: String,
-        is_streaming: bool,
-        tx: Sender<MistralResponse>,
-    ) -> MistralRequest {
-        MistralRequest::Normal(NormalRequest {
-            messages: RequestMessage::Completion {
-                text: prompt,
-                echo_prompt: false,
-                best_of: 1,
-            },
-            sampling_params: SamplingParams::default(),
-            response: tx,
-            return_logprobs: false,
-            is_streaming,
-            id: 0,
-            constraint: Constraint::None,
-            suffix: None,
-            adapters: None,
-        })
-    }
+fn to_mistralrs_request(
+    prompt: String,
+    is_streaming: bool,
+    tx: Sender<MistralResponse>,
+) -> MistralRequest {
+    MistralRequest::Normal(NormalRequest {
+        messages: RequestMessage::Completion {
+            text: prompt,
+            echo_prompt: false,
+            best_of: 1,
+        },
+        sampling_params: SamplingParams::default(),
+        response: tx,
+        return_logprobs: false,
+        is_streaming,
+        id: 0,
+        constraint: Constraint::None,
+        suffix: None,
+        adapters: None,
+    })
 }
 
 #[async_trait]
@@ -265,7 +264,7 @@ impl Chat for MistralLlama {
         tracing::debug!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(self.to_request(prompt, true, snd))
+            .send(to_mistralrs_request(prompt, true, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
@@ -312,7 +311,7 @@ impl Chat for MistralLlama {
         tracing::debug!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(self.to_request(prompt, false, snd))
+            .send(to_mistralrs_request(prompt, false, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
