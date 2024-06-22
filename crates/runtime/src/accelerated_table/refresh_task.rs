@@ -155,7 +155,7 @@ impl RefreshTask {
         let (start_time, data_update) = match get_data_update_result {
             Ok((start_time, data_update)) => (start_time, data_update),
             Err(e) => {
-                tracing::warn!("Error getting update for dataset {dataset_name}: {e}");
+                tracing::error!("Failed to load data for dataset{dataset_name}: {e}");
                 self.mark_dataset_status(status::ComponentStatus::Error)
                     .await;
                 return Err(e);
@@ -193,13 +193,7 @@ impl RefreshTask {
             }
         };
 
-        match self.get_data_update(filters).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
-                Err(e)
-            }
-        }
+        self.get_data_update(filters).await
     }
 
     async fn write_data_update(
