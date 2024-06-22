@@ -161,14 +161,14 @@ impl Refresher {
             let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
 
             loop {
-                let scheduled_refresh_fut: BoxFuture<()> = match next_scheduled_refresh_timer.take()
-                {
-                    Some(timer) => Box::pin(timer),
-                    None => Box::pin(std::future::pending()),
-                };
+                let scheduled_refresh_future: BoxFuture<()> =
+                    match next_scheduled_refresh_timer.take() {
+                        Some(timer) => Box::pin(timer),
+                        None => Box::pin(std::future::pending()),
+                    };
 
                 select! {
-                    () = scheduled_refresh_fut => {
+                    () = scheduled_refresh_future => {
                         tracing::debug!("Starting scheduled refresh");
                         if let Err(err) = start_refresh.send(()).await {
                             tracing::error!("Failed to execute refresh: {err}");
