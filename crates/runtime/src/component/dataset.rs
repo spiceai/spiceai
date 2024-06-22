@@ -331,6 +331,22 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn refresh_retry_enabled(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_retry_enabled;
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_retry_max_attempts;
+        }
+        None
+    }
+
+    #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
     }

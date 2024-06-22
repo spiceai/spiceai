@@ -533,19 +533,25 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
+        let refresh = Refresh::new(
+            dataset.time_column.clone(),
+            dataset.time_format,
+            dataset.refresh_check_interval(),
+            refresh_sql.clone(),
+            acceleration_settings.refresh_mode,
+            dataset.refresh_data_window(),
+            acceleration_settings.refresh_append_overlap,
+        )
+        .with_retry(
+            dataset.refresh_retry_enabled(),
+            dataset.refresh_retry_max_attempts(),
+        );
+
         let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.clone(),
             source_table_provider,
             accelerated_table_provider,
-            Refresh::new(
-                dataset.time_column.clone(),
-                dataset.time_format,
-                dataset.refresh_check_interval(),
-                refresh_sql.clone(),
-                acceleration_settings.refresh_mode,
-                dataset.refresh_data_window(),
-                acceleration_settings.refresh_append_overlap,
-            ),
+            refresh,
         );
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
