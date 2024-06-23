@@ -24,10 +24,12 @@ use crate::component::dataset::TimeFormat;
 use cache::QueryResultsCacheProvider;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 use super::refresh_task_runner::RefreshTaskRunner;
 
@@ -152,9 +154,26 @@ impl Refresher {
 
         let cache_provider = self.cache_provider.clone();
 
+        let refresh_check_interval = self.refresh.read().await.check_interval;
+
         tokio::spawn(async move {
+            // first refresh is on start, thus duration is 0
+            let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
+
             loop {
+                let scheduled_refresh_future: BoxFuture<()> =
+                    match next_scheduled_refresh_timer.take() {
+                        Some(timer) => Box::pin(timer),
+                        None => Box::pin(std::future::pending()),
+                    };
+
                 select! {
+                    () = scheduled_refresh_future => {
+                        tracing::debug!("Starting scheduled refresh");
+                        if let Err(err) = start_refresh.send(()).await {
+                            tracing::error!("Failed to execute refresh: {err}");
+                        }
+                    },
                     _ = on_start_refresh_external.recv() => {
                         tracing::debug!("Received external trigger to start refresh");
 
@@ -166,16 +185,20 @@ impl Refresher {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
                         if let Ok(()) = res {
-                                notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
+                            notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
 
-                                if let Some(cache_provider) = &cache_provider {
-                                    if let Err(e) = cache_provider
-                                        .invalidate_for_table(&dataset_name.to_string())
-                                        .await
-                                    {
-                                        tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
-                                    }
+                            if let Some(cache_provider) = &cache_provider {
+                                if let Err(e) = cache_provider
+                                    .invalidate_for_table(&dataset_name.to_string())
+                                    .await
+                                {
+                                    tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }
+                            }
+                        }
+
+                        if let Some(refresh_check_interval) = refresh_check_interval {
+                            next_scheduled_refresh_timer = Some(sleep(refresh_check_interval));
                         }
                     }
                 }
