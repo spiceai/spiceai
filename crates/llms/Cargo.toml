@@ -21,22 +21,25 @@ async-trait.workspace = true
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
+tokenizers = {version= "0.19.1"}
 
 ## `candle` feature packages
 candle-core = {version= "0.5.0", optional = true}
 candle-examples = {version= "0.5.0", optional = true}
 candle-transformers = {version= "0.5.0", optional = true}
-tokenizers = {version= "0.19.1", optional = true}
 
 ## `mistralrs` feature packages
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "2f3469c52cea2167d4c5ed32623b879001ab4a4d", optional=true }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "2f3469c52cea2167d4c5ed32623b879001ab4a4d", optional=true, package="mistralrs-core" }
 candle-core-rs = { package="candle-core", git = "https://github.com/spiceai/candle.git", rev = "38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54", optional=true }
+tei_core = { package="text-embeddings-backend-core", path = "../../../text-embeddings-inference/backends/core" } # git="https://github.com/huggingface/text-embeddings-inference.git"}
+tei_backend = { package="text-embeddings-backend", path = "../../../text-embeddings-inference/backends" } # git="https://github.com/huggingface/text-embeddings-inference.git"}
+tei_candle = { package="text-embeddings-backend-candle", path = "../../../text-embeddings-inference/backends/candle" } # git="https://github.com/huggingface/text-embeddings-inference.git"}
 tokio = { workspace = true, optional=true }
 rand = "0.8.5"
 
 [features]
-default = []
-candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers", "dep:tokenizers"]
+default = ["candle"]
+candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers"]
 mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core", "dep:tokio"]
 metal = [] # "mistralrs-core/metal"

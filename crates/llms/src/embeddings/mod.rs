@@ -19,6 +19,9 @@ use async_openai::{
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
 
+#[cfg(feature = "candle")]
+pub mod candle;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to run Embedding health check: {source}"))]
@@ -33,6 +36,11 @@ pub enum Error {
 
     #[snafu(display("Failed to create embedding: {source}"))]
     FailedToCreateEmbedding {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to instantiate embedding model: {source}"))]
+    FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
