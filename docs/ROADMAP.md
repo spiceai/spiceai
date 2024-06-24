@@ -66,7 +66,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `mysql`       | Alpha  |
 | `flightsql`   | Alpha  |
 | `graphql`     | Alpha  |
-| `motherduck`  | Alpha  |
 
 ## v1.1 (Oct 2024)
 
