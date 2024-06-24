@@ -83,4 +83,4 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   - RocksDB data accelerator
   - DynamoDB data connector
 - CLI publish Spicepods to [spicerack.org](https://spicerack.org)
-- MotherDuck data connector (alpha)
+- MotherDuck data connector
