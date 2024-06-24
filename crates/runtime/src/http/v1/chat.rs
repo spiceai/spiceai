@@ -14,14 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use core::time;
+use std::{sync::Arc, time::Duration};
 
-use async_openai::types::CreateChatCompletionRequest;
+use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+use async_stream::stream;
 use axum::{
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Extension, Json,
 };
+use futures::StreamExt;
 use tokio::sync::RwLock;
 
 use crate::model::LLMModelStore;
@@ -32,10 +38,51 @@ pub(crate) async fn post(
 ) -> Response {
     let model_id = req.model.clone();
     match llms.read().await.get(&model_id) {
-        Some(model) => match model.write().await.chat_request(req).await {
-            Ok(response) => Json(response).into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
+        Some(model) => {
+            if req.stream.unwrap_or_default() {
+                match model.write().await.chat_stream(req).await {
+                    Ok(strm) => create_sse_response(strm, time::Duration::from_secs(30)),
+                    Err(e) => {
+                        tracing::debug!("Error from v1/chat: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            } else {
+                match model.write().await.chat_request(req).await {
+                    Ok(response) => Json(response).into_response(),
+                    Err(e) => {
+                        tracing::debug!("Error from v1/chat: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            }
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].
+fn create_sse_response(
+    mut strm: ChatCompletionResponseStream,
+    keep_alive_interval: Duration,
+) -> Response {
+    Sse::new(Box::pin(stream! {
+        while let Some(msg) = strm.next().await {
+            match msg {
+                Ok(resp) => {
+                    let y = Event::default();
+                    match y.json_data(resp).map_err(axum::Error::new) {
+                        Ok(a) => yield Ok(a),
+                        Err(e) => yield Err(e),
+                    }
+                },
+                Err(e) => {
+                    yield Err(axum::Error::new(e.to_string()));
+                    break;
+                }
+            }
+        };
+    }))
+    .keep_alive(KeepAlive::new().interval(keep_alive_interval))
+    .into_response()
 }
