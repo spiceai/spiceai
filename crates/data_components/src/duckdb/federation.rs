@@ -22,8 +22,8 @@ use futures::TryStreamExt;
 use snafu::ResultExt;
 use sql_provider_datafusion::{get_stream, to_execution_error};
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use super::sql_table::{get_cte, DuckDBTable};
 use datafusion::{
