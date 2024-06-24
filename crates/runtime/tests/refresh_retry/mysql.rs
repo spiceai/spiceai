@@ -117,8 +117,8 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         ..Default::default()
     });
 
-    let mut ds_default = make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT);
-    ds_default.acceleration = Some(Acceleration {
+    let mut ds_default_retries = make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT);
+    ds_default_retries.acceleration = Some(Acceleration {
         enabled: true,
         refresh_sql: Some("SELECT * from lineitem_retries limit 1".to_string()),
         ..Default::default()
@@ -126,7 +126,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
 
     let app = AppBuilder::new("mysql_refresh_retry")
         .with_dataset(ds_no_retries)
-        .with_dataset(ds_default)
+        .with_dataset(ds_default_retries)
         .build();
 
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
