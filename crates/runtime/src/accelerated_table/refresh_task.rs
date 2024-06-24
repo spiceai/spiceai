@@ -23,6 +23,8 @@ use async_stream::stream;
 use cache::QueryResultsCacheProvider;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{retry, RetryError};
 
 use crate::{
     accelerated_table::Error,
@@ -153,7 +155,7 @@ impl RefreshTask {
         let (start_time, data_update) = match get_data_update_result {
             Ok((start_time, data_update)) => (start_time, data_update),
             Err(e) => {
-                tracing::warn!("Error getting update for dataset {dataset_name}: {e}");
+                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
                 self.mark_dataset_status(status::ComponentStatus::Error)
                     .await;
                 return Err(e);
@@ -191,13 +193,7 @@ impl RefreshTask {
             }
         };
 
-        match self.get_data_update(filters).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
-                Err(e)
-            }
-        }
+        self.get_data_update(filters).await
     }
 
     async fn write_data_update(
@@ -376,30 +372,65 @@ impl RefreshTask {
     }
 
     async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
-        let refresh = self.refresh.read().await;
-        let update_type = match refresh.mode {
-            RefreshMode::Full => UpdateType::Overwrite,
-            RefreshMode::Append => UpdateType::Append,
-        };
-        let mut ctx = self.refresh_df_context();
+        let refresh = Arc::clone(&self.refresh);
+
+        let ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
-        match get_data(
-            &mut ctx,
-            dataset_name.clone(),
-            Arc::clone(&federated),
-            refresh.sql.clone(),
-            filters,
-        )
+
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(0)).build();
+
+        retry(retry_strategy, || async {
+            let mut ctx_clone = ctx.clone();
+
+            let (sql, update_type) = {
+                let refresh = refresh.read().await;
+                (
+                    refresh.sql.clone(),
+                    match refresh.mode {
+                        RefreshMode::Full => UpdateType::Overwrite,
+                        RefreshMode::Append => UpdateType::Append,
+                    },
+                )
+            };
+
+            let get_data_result = get_data(
+                &mut ctx_clone,
+                dataset_name.clone(),
+                Arc::clone(&federated),
+                sql,
+                filters.clone(),
+            )
+            .await;
+
+            match get_data_result {
+                Ok(data) => Ok(DataUpdate {
+                    schema: data.0,
+                    data: data.1,
+                    update_type,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get refresh data for dataset {}: {}",
+                        dataset_name,
+                        e
+                    );
+                    let labels = [("dataset", dataset_name.to_string())];
+                    metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+
+                    if should_retry_df_error(&e) {
+                        Err(RetryError::Transient {
+                            err: e,
+                            retry_after: None,
+                        })
+                    } else {
+                        Err(RetryError::Permanent(e))
+                    }
+                }
+            }
+        })
         .await
-        .map(|data| DataUpdate {
-            schema: data.0,
-            data: data.1,
-            update_type,
-        }) {
-            Ok(data) => Ok(data),
-            Err(e) => Err(super::Error::UnableToGetDataFromConnector { source: e }),
-        }
+        .context(super::UnableToGetDataFromConnectorSnafu)
     }
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
@@ -648,5 +679,15 @@ impl RefreshTask {
             metrics::gauge!("datasets_acceleration_last_refresh_time", &labels)
                 .set(now.as_secs_f64());
         }
+    }
+}
+
+fn should_retry_df_error(error: &DataFusionError) -> bool {
+    match error {
+        DataFusionError::Context(_, err) => should_retry_df_error(err.as_ref()),
+        DataFusionError::SQL(..) | DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
+            false
+        }
+        _ => true,
     }
 }
