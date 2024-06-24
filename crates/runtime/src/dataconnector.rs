@@ -28,6 +28,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{DefaultTableSource, TableProvider};
+use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
@@ -306,28 +307,23 @@ pub async fn get_data(
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,
-) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
+) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>), DataFusionError> {
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
-            let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
-                .context(UnableToConstructLogicalPlanBuilderSnafu {})?
-                .build()
-                .context(UnableToBuildLogicalPlanSnafu {})?;
+            let logical_plan =
+                LogicalPlanBuilder::scan(table_name.clone(), table_source, None)?.build()?;
 
             DataFrame::new(ctx.state(), logical_plan)
         }
-        Some(sql) => ctx
-            .sql(&sql)
-            .await
-            .context(UnableToCreateDataFrameSnafu {})?,
+        Some(sql) => ctx.sql(&sql).await?,
     };
 
     for filter in filters {
-        df = df.filter(filter).context(UnableToFilterDataFrameSnafu {})?;
+        df = df.filter(filter)?;
     }
 
-    let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
+    let batches = df.collect().await?;
 
     Ok((table_provider.schema(), batches))
 }
