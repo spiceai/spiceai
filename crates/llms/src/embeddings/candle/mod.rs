@@ -12,11 +12,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::{Embed, FailedToInstantiateEmbeddingModelSnafu, Result};
+use super::{Embed, FailedToInstantiateEmbeddingModelSnafu, FailedToPrepareInputSnafu, Result};
 
 use async_openai::types::EmbeddingInput;
 use snafu::ResultExt;
-use tei_core::{ModelType, Pool};
+use tei_core::{Backend, Batch, ModelType, Pool, tokenization::ValidEncoding};
 use tokenizers::Tokenizer;
 use tei_candle::CandleBackend;
 use candle_core::DType;
@@ -46,17 +46,23 @@ impl CandleEmbedding {
           })
      }
 
-     pub async fn tokenise(&self) -> Result<()> {
-          self.tok
-            .tokenize(inputs.into(), add_special_tokens)
-            .await
-            .map_err(|err| {
-                metrics::increment_counter!("te_request_failure", "err" => "tokenization");
-                tracing::error!("{err}");
-                err
-            })
+     pub fn tokenise(&self, s: String, add_special_tokens: bool) -> Result<ValidEncoding> {
+        let encoding = self.tok
+            .encode::<String>(s, add_special_tokens).context(FailedToPrepareInputSnafu)?;
+
+        let seq_len = encoding.len();
+        Ok(ValidEncoding {
+            input_ids: encoding.get_ids().to_vec(),
+            token_type_ids: encoding.get_type_ids().to_vec(),
+            position_ids: (position_offset as u32..(seq_len + position_offset) as u32)
+                .collect::<Vec<_>>(),
+        })
      }
      
+}
+
+pub fn e(b: Backend) -> Result<()> {
+    b.embed(Batch::)
 }
 
 /// For a given HuggingFace repo, download the needed files to create a `CandleEmbedding`.
@@ -96,7 +102,7 @@ pub fn download_hf_artifacts(
 
 impl Embed for CandleEmbedding {
      async fn embed(&mut self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
-
+        e(self.backend)?;
           
      }
  
