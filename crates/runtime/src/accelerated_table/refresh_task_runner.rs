@@ -55,6 +55,8 @@ impl RefreshTaskRunner {
     }
 
     pub fn start(&mut self) -> (Sender<()>, Receiver<super::Result<()>>) {
+        assert!(self.task.is_none());
+
         let (start_refresh, mut on_start_refresh) = mpsc::channel::<()>(1);
 
         let (notify_refresh_complete, on_refresh_complete) = mpsc::channel::<super::Result<()>>(1);

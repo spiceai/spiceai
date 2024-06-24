@@ -21,6 +21,10 @@ use std::{
 
 use tokio::signal;
 
+pub mod fibonacci_backoff;
+pub use backoff::future::retry;
+pub use backoff::Error as RetryError;
+
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_possible_truncation)]
