@@ -109,125 +109,125 @@ impl ChangeEvent {
                         };
                         int_builder.append_value(change.ts_ms);
                     }
-                    // "source" => {
-                    //     let struct_data_type = schema.field(idx).data_type();
-                    //     let DataType::Struct(source_fields) = struct_data_type else {
-                    //         unreachable!("Source is a struct")
-                    //     };
-                    //     let Some(source_struct_builder) =
-                    //         struct_builder.field_builder::<StructBuilder>(idx)
-                    //     else {
-                    //         todo!("Handle missing field builder");
-                    //     };
-                    //     source_struct_builder.append(true);
+                    "source" => {
+                        let struct_data_type = schema.field(idx).data_type();
+                        let DataType::Struct(source_fields) = struct_data_type else {
+                            unreachable!("Source is a struct")
+                        };
+                        let Some(source_struct_builder) =
+                            struct_builder.field_builder::<StructBuilder>(idx)
+                        else {
+                            todo!("Handle missing field builder");
+                        };
+                        source_struct_builder.append(true);
 
-                    //     for source_field in source_fields {
-                    //         match source_field.name().as_str() {
-                    //             "version" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 if let Some(version) = &change.source.version {
-                    //                     str_builder.append_value(version);
-                    //                 } else {
-                    //                     str_builder.append_null();
-                    //                 }
-                    //             }
-                    //             "connector" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 if let Some(connector) = &change.source.connector {
-                    //                     str_builder.append_value(connector);
-                    //                 } else {
-                    //                     str_builder.append_null();
-                    //                 }
-                    //             }
-                    //             "name" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 if let Some(name) = &change.source.name {
-                    //                     str_builder.append_value(name);
-                    //                 } else {
-                    //                     str_builder.append_null();
-                    //                 }
-                    //             }
-                    //             "ts_ms" => {
-                    //                 let Some(int_builder) =
-                    //                     source_struct_builder.field_builder::<Int64Builder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder ts_ms in source for {idx}");
-                    //                 };
-                    //                 int_builder.append_value(change.source.ts_ms);
-                    //             }
-                    //             "snapshot" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 if let Some(snapshot) = &change.source.snapshot {
-                    //                     str_builder.append_value(snapshot);
-                    //                 } else {
-                    //                     str_builder.append_null();
-                    //                 }
-                    //             }
-                    //             "db" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 str_builder.append_value(change.source.db.clone());
-                    //             }
-                    //             "schema" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 str_builder.append_value(change.source.schema.clone());
-                    //             }
-                    //             "table" => {
-                    //                 let Some(str_builder) =
-                    //                     source_struct_builder.field_builder::<StringBuilder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 str_builder.append_value(change.source.table.clone());
-                    //             }
-                    //             "tx_id" => {
-                    //                 let Some(int_builder) =
-                    //                     source_struct_builder.field_builder::<Int64Builder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 int_builder.append_value(change.source.tx_id);
-                    //             }
-                    //             "lsn" => {
-                    //                 let Some(int_builder) =
-                    //                     source_struct_builder.field_builder::<Int64Builder>(idx)
-                    //                 else {
-                    //                     todo!("Handle missing field builder in source");
-                    //                 };
-                    //                 int_builder.append_value(change.source.lsn);
-                    //             }
-                    //             _ => {
-                    //                 unimplemented!(
-                    //                     "Field {} not supported yet",
-                    //                     source_field.name().as_str()
-                    //                 );
-                    //             }
-                    //         }
-                    //     }
-                    // }
+                        for source_field in source_fields {
+                            match source_field.name().as_str() {
+                                "version" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    if let Some(version) = &change.source.version {
+                                        str_builder.append_value(version);
+                                    } else {
+                                        str_builder.append_null();
+                                    }
+                                }
+                                "connector" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    if let Some(connector) = &change.source.connector {
+                                        str_builder.append_value(connector);
+                                    } else {
+                                        str_builder.append_null();
+                                    }
+                                }
+                                "name" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    if let Some(name) = &change.source.name {
+                                        str_builder.append_value(name);
+                                    } else {
+                                        str_builder.append_null();
+                                    }
+                                }
+                                "ts_ms" => {
+                                    let Some(int_builder) =
+                                        source_struct_builder.field_builder::<Int64Builder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder ts_ms in source for {idx}");
+                                    };
+                                    int_builder.append_value(change.source.ts_ms);
+                                }
+                                "snapshot" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    if let Some(snapshot) = &change.source.snapshot {
+                                        str_builder.append_value(snapshot);
+                                    } else {
+                                        str_builder.append_null();
+                                    }
+                                }
+                                "db" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    str_builder.append_value(change.source.db.clone());
+                                }
+                                "schema" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    str_builder.append_value(change.source.schema.clone());
+                                }
+                                "table" => {
+                                    let Some(str_builder) =
+                                        source_struct_builder.field_builder::<StringBuilder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    str_builder.append_value(change.source.table.clone());
+                                }
+                                "tx_id" => {
+                                    let Some(int_builder) =
+                                        source_struct_builder.field_builder::<Int64Builder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    int_builder.append_value(change.source.tx_id);
+                                }
+                                "lsn" => {
+                                    let Some(int_builder) =
+                                        source_struct_builder.field_builder::<Int64Builder>(idx)
+                                    else {
+                                        todo!("Handle missing field builder in source");
+                                    };
+                                    int_builder.append_value(change.source.lsn);
+                                }
+                                _ => {
+                                    unimplemented!(
+                                        "Field {} not supported yet",
+                                        source_field.name().as_str()
+                                    );
+                                }
+                            }
+                        }
+                    }
                     "data" => {
                         let struct_data_type = schema.field(idx).data_type();
                         let DataType::Struct(data_fields) = struct_data_type else {
@@ -305,25 +305,25 @@ fn changes_schema(table_schema: &Schema) -> Schema {
     Schema::new(vec![
         Field::new("op", DataType::Utf8, false),
         Field::new("ts_ms", DataType::Int64, false),
-        // Field::new(
-        //     "source",
-        //     DataType::Struct(
-        //         vec![
-        //             Field::new("version", DataType::Utf8, true),
-        //             Field::new("connector", DataType::Utf8, true),
-        //             Field::new("name", DataType::Utf8, true),
-        //             Field::new("ts_ms", DataType::Int64, false),
-        //             Field::new("snapshot", DataType::Utf8, true),
-        //             Field::new("db", DataType::Utf8, false),
-        //             Field::new("schema", DataType::Utf8, false),
-        //             Field::new("table", DataType::Utf8, false),
-        //             Field::new("tx_id", DataType::Int64, false),
-        //             Field::new("lsn", DataType::Int64, false),
-        //         ]
-        //         .into(),
-        //     ),
-        //     false,
-        // ),
+        Field::new(
+            "source",
+            DataType::Struct(
+                vec![
+                    Field::new("version", DataType::Utf8, true),
+                    Field::new("connector", DataType::Utf8, true),
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("ts_ms", DataType::Int64, false),
+                    Field::new("snapshot", DataType::Utf8, true),
+                    Field::new("db", DataType::Utf8, false),
+                    Field::new("schema", DataType::Utf8, false),
+                    Field::new("table", DataType::Utf8, false),
+                    Field::new("tx_id", DataType::Int64, false),
+                    Field::new("lsn", DataType::Int64, false),
+                ]
+                .into(),
+            ),
+            false,
+        ),
         Field::new(
             "data",
             DataType::Struct(table_schema.fields().clone()),
