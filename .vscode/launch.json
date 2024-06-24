@@ -36,6 +36,15 @@
       "name": "[Rust] Attack to spiced",
       "program": "~/.spice/bin/spiced",
       "pid": "${input:pid}"
+    },
+    {
+      "name": "[Rust] Debug runtime benchmark",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--package", "runtime", "--bench", "bench"],
+        "problemMatcher": "$rustc"
+      }
     }
   ],
   "inputs": [
