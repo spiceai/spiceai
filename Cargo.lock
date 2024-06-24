@@ -6838,18 +6838,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgtemp"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc39977b03503cfcf74ce2f8938d7b8340d1f8ef31a3f2a289b1c1abff8ace2c"
-dependencies = [
- "libc",
- "tempfile",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "phf"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8851,7 +8839,6 @@ dependencies = [
  "db_connection_pool",
  "duckdb",
  "futures",
- "pgtemp",
  "r2d2",
  "secrecy",
  "snafu 0.8.3",
