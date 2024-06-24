@@ -23,7 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 flight_client = { path = "../flight_client" }
 sql_provider_datafusion = { path = "../sql_provider_datafusion" }
-deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "5d7cb57499ef3c35b944cf51fdd5f267e641f6d1", features = [
+deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "4794f7bcfe31db28f434b9ed64e390d40b64bbc3", features = [
     "datafusion-ext",
     "s3",
     "azure",

@@ -26,7 +26,7 @@ use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
 use data_components::delete::get_deletion_provider;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
@@ -39,11 +39,9 @@ use datafusion::{
 };
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
-use tokio::time::interval;
 
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::dataconnector;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
@@ -53,11 +51,13 @@ use crate::execution_plan::TableScanParams;
 
 pub mod changes;
 pub mod refresh;
+pub mod refresh_task;
+mod refresh_task_runner;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
-    UnableToGetDataFromConnector { source: dataconnector::Error },
+    UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
@@ -90,6 +90,11 @@ pub enum Error {
 
     #[snafu(display("Changes: {message}"))]
     Changes { message: String },
+
+    #[snafu(display("Failed to write data into accelerated table: {source}"))]
+    FailedToWriteData {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -176,36 +181,28 @@ impl Builder {
     }
 
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
-        let mut refresh_trigger = None;
-        let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
-        let acceleration_refresh_mode: refresh::AccelerationRefreshMode = match self.refresh.mode {
+        let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
-                    refresh::AccelerationRefreshMode::Append(None)
+                    (refresh::AccelerationRefreshMode::Append(None), None)
                 } else {
-                    let (trigger, receiver) = mpsc::channel::<()>(1);
-                    refresh_trigger = Some(trigger.clone());
-                    scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
-                        self.refresh.check_interval,
-                        trigger,
+                    let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                    (
+                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
+                        Some(start_refresh),
                     )
-                    .await;
-                    refresh::AccelerationRefreshMode::Append(Some(receiver))
                 }
             }
             RefreshMode::Full => {
-                let (trigger, receiver) = mpsc::channel::<()>(1);
-                refresh_trigger = Some(trigger.clone());
-                scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
-                    self.refresh.check_interval,
-                    trigger,
+                let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                (
+                    refresh::AccelerationRefreshMode::Full(on_start_refresh),
+                    Some(start_refresh),
                 )
-                .await;
-                refresh::AccelerationRefreshMode::Full(receiver)
             }
-            RefreshMode::Changes => refresh::AccelerationRefreshMode::Changes,
+            RefreshMode::Changes => (refresh::AccelerationRefreshMode::Changes, None),
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
@@ -217,21 +214,14 @@ impl Builder {
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
-        let refresher = Arc::new(refresher);
 
-        let refresher_tokio = Arc::clone(&refresher);
-        let refresh_handle = tokio::spawn(async move {
-            refresher_tokio
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
-        });
+        let refresh_handle = refresher
+            .start(acceleration_refresh_mode, ready_sender)
+            .await;
+        let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
         handlers.push(refresh_handle);
-
-        if let Some(scheduled_refreshes_handle) = scheduled_refreshes_handle {
-            handlers.push(scheduled_refreshes_handle);
-        }
 
         if let Some(retention) = self.retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
@@ -273,6 +263,11 @@ impl AcceleratedTable {
         Arc::clone(&self.refresher)
     }
 
+    #[must_use]
+    pub fn refresh_params(&self) -> Arc<RwLock<refresh::Refresh>> {
+        Arc::clone(&self.refresh_params)
+    }
+
     pub async fn trigger_refresh(&self) -> Result<()> {
         match &self.refresh_trigger {
             Some(refresh_trigger) => {
@@ -307,31 +302,6 @@ impl AcceleratedTable {
         let mut refresh = self.refresh_params.write().await;
         refresh.sql = refresh_sql;
         Ok(())
-    }
-
-    async fn schedule_regular_refreshes(
-        refresh_check_interval: Option<Duration>,
-        refresh_trigger: mpsc::Sender<()>,
-    ) -> Option<JoinHandle<()>> {
-        if let Some(refresh_check_interval) = refresh_check_interval {
-            let mut interval_timer = interval(refresh_check_interval);
-            let trigger = refresh_trigger.clone();
-            let handle = tokio::spawn(async move {
-                loop {
-                    interval_timer.tick().await;
-                    // If sending fails, it means the receiver is dropped, and we should stop the task.
-                    if trigger.send(()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            return Some(handle);
-        } else if let Err(err) = refresh_trigger.send(()).await {
-            tracing::error!("Failed to trigger refresh: {err}");
-        }
-
-        None
     }
 
     #[allow(clippy::cast_possible_wrap)]

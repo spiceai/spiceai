@@ -119,6 +119,55 @@ spice init test-app
 spice run
 ```
 
+#### Linux (Ubuntu)
+
+```bash
+# Install system dependencies
+sudo apt update
+sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler
+
+# Install Go
+export GO_VERSION="1.22.4"
+rm -rf /tmp/spice
+mkdir -p /tmp/spice
+cd /tmp/spice
+wget https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz
+tar xcvf go$GO_VERSION.linux-amd64.tar.gz
+mv ./go /usr/local/go
+echo 'export PATH=$PATH:/usr/local/go/bin' >> $HOME/.profile
+source $HOME/.PROFILE
+cd $HOME
+rm -rf /tmp/spice
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y # install unattended
+source $HOME/.cargo/env
+
+# Clone SpiceAI OSS Repo
+git clone https://github.com/spiceai/spiceai.git
+cd spiceai
+
+# Build and install OSS project in release mode
+make install
+
+# Build and install OSS project in dev mode
+make install-dev
+
+# Also you can specify specific features
+SPICED_CUSTOM_FEATURES="postgres sqlite" make install
+
+# Run the following to temporarily add spice to your PATH.
+# Add it to the end of your .bashrc or .zshrc to permanently add spice to your PATH.
+export PATH="$PATH:$HOME/.spice/bin"
+
+# Initialize and run a test app to ensure everything is working
+cd ../
+mkdir test-app
+cd test-app
+spice init test-app
+spice run
+```
+
 #### VSCode Configuration
 
 To configure VSCode to automatically apply the rustfmt style on save and to use the same Clippy rules we enforce in our CI as the default, add the following in your User Settings JSON file:

@@ -9,11 +9,11 @@ use rdkafka::{
 
 use crate::dataupdate::{changes::ChangeEvent as DataUpdateChangeEvent, DataUpdate, UpdateType};
 
-use super::refresh::Refresher;
+use super::refresh_task::RefreshTask;
 
 mod change_event;
 
-impl Refresher {
+impl RefreshTask {
     #[allow(clippy::missing_panics_doc)]
     pub fn get_changes_stream(
         &self,
