@@ -42,6 +42,8 @@ pub struct Refresh {
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
+    pub(crate) refresh_retry_enabled: bool,
+    pub(crate) refresh_retry_max_attempts: Option<usize>,
 }
 
 impl Refresh {
@@ -64,7 +66,14 @@ impl Refresh {
             mode,
             period,
             append_overlap,
+            ..Default::default()
         }
+    }
+    #[must_use]
+    pub fn with_retry(mut self, enabled: bool, max_attempts: Option<usize>) -> Self {
+        self.refresh_retry_enabled = enabled;
+        self.refresh_retry_max_attempts = max_attempts;
+        self
     }
 }
 
@@ -78,6 +87,8 @@ impl Default for Refresh {
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
+            refresh_retry_enabled: false,
+            refresh_retry_max_attempts: None,
         }
     }
 }
