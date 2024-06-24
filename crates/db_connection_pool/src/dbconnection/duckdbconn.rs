@@ -116,7 +116,7 @@ pub fn flatten_table_function_name(table_reference: &TableReference) -> String {
     let result = table_reference
         .table()
         .replace([')', '('], "_")
-        .replace(['\'', ','], "")
+        .replace(['\'', ',', '=', '"'], "")
         .replace(['.', ' '], "_");
 
     format!("{result}__view")
