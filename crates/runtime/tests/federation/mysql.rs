@@ -27,10 +27,11 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql";
+const MYSQL_PORT: u16 = 13306;
 
 #[instrument]
 async fn init_mysql_db() -> Result<(), anyhow::Error> {
-    let pool = get_mysql_conn()?;
+    let pool = get_mysql_conn(MYSQL_PORT)?;
     let mut conn = pool.get_conn().await?;
 
     tracing::debug!("DROP TABLE IF EXISTS lineitem");
@@ -59,7 +60,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER)
+    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
         .await
         .map_err(|e| {
             tracing::error!("start_mysql_docker_container: {e}");
@@ -71,7 +72,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         e.to_string()
     })?;
     let app = AppBuilder::new("mysql_federation_push_down")
-        .with_dataset(make_mysql_dataset("lineitem", "line"))
+        .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT))
         .build();
 
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;

@@ -22,11 +22,11 @@ use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
-pub fn make_mysql_dataset(path: &str, name: &str) -> Dataset {
+pub fn make_mysql_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
     let params = HashMap::from([
         ("mysql_host".to_string(), "localhost".to_string()),
-        ("mysql_tcp_port".to_string(), "13306".to_string()),
+        ("mysql_tcp_port".to_string(), port.to_string()),
         ("mysql_user".to_string(), "root".to_string()),
         ("mysql_pass".to_string(), "integration-test-pw".to_string()),
         ("mysql_db".to_string(), "mysqldb".to_string()),
@@ -41,10 +41,11 @@ const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
 #[instrument]
 pub async fn start_mysql_docker_container(
     container_name: &'static str,
+    port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image("mysql:latest")
-        .add_port_binding(3306, 13306)
+        .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")
         .healthcheck(HealthConfig {
@@ -67,8 +68,8 @@ pub async fn start_mysql_docker_container(
 }
 
 #[instrument]
-pub fn get_mysql_conn() -> Result<mysql_async::Pool, anyhow::Error> {
-    let url = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:13306/mysqldb",);
+pub fn get_mysql_conn(port: u16) -> Result<mysql_async::Pool, anyhow::Error> {
+    let url = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:{port}/mysqldb",);
     let opts_builder =
         mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(url.as_str())?);
     let opts = mysql_async::Opts::from(opts_builder);

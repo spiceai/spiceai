@@ -378,7 +378,23 @@ impl RefreshTask {
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
-        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(0)).build();
+        let (refresh_retry_enabled, refresh_retry_max_attempts) = {
+            let refresh = refresh.read().await;
+            (
+                refresh.refresh_retry_enabled,
+                refresh.refresh_retry_max_attempts,
+            )
+        };
+
+        let max_retries = if refresh_retry_enabled {
+            refresh_retry_max_attempts
+        } else {
+            Some(0)
+        };
+
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(max_retries)
+            .build();
 
         retry(retry_strategy, || async {
             let mut ctx_clone = ctx.clone();

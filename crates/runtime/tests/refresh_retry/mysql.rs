@@ -16,22 +16,31 @@ limitations under the License.
 //! Runs federation integration tests for `MySQL`.
 //!
 //! Expects a Docker daemon to be running.
-use crate::utils::mysql::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
-use std::sync::Arc;
+use crate::{
+    docker::RunningContainer,
+    utils::mysql::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
+};
+use std::{sync::Arc, time::Duration};
 
 use crate::init_tracing;
 
 use app::AppBuilder;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use mysql_async::{prelude::Queryable, Params, Row};
-use runtime::Runtime;
+use runtime::{
+    accelerated_table::{refresh_task::RefreshTask, AcceleratedTable},
+    Runtime,
+};
+use spicepod::component::dataset::acceleration::Acceleration;
+use tokio::time;
 use tracing::instrument;
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-frefresh-retry-mysql";
+const MYSQL_PORT: u16 = 13307;
 
 #[instrument]
 async fn init_mysql_db() -> Result<(), anyhow::Error> {
-    let pool = get_mysql_conn()?;
+    let pool = get_mysql_conn(MYSQL_PORT)?;
     let mut conn = pool.get_conn().await?;
 
     tracing::debug!("DROP TABLE IF EXISTS lineitem");
@@ -56,14 +65,10 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[cfg(feature = "mysql")]
-#[tokio::test]
-async fn mysql_refresh_no_retries_by_default() -> Result<(), String> {
-    use runtime::accelerated_table::{refresh_task::RefreshTask, AcceleratedTable};
-    use spicepod::component::dataset::acceleration::Acceleration;
-
+#[instrument]
+async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER)
+    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
         .await
         .map_err(|e| {
             tracing::error!("start_mysql_docker_container: {e}");
@@ -75,20 +80,57 @@ async fn mysql_refresh_no_retries_by_default() -> Result<(), String> {
         e.to_string()
     })?;
 
-    let mut ds = make_mysql_dataset("lineitem", "lineitem");
-    ds.acceleration = Some(Acceleration {
+    Ok(running_container)
+}
+
+async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTask, String> {
+    let table = rt
+        .datafusion()
+        .ctx
+        .table_provider(table_name)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let accelerated_table = table
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .ok_or("table is not an AcceleratedTable")?;
+
+    Ok(RefreshTask::new(
+        table_name.into(),
+        Arc::clone(&accelerated_table.get_federated_table()),
+        accelerated_table.refresh_params(),
+        table,
+    ))
+}
+
+#[tokio::test]
+async fn mysql_refresh_retries() -> Result<(), String> {
+    let running_container = prepare_test_environment().await?;
+    let running_container = Arc::new(running_container);
+
+    let mut ds_no_retries = make_mysql_dataset("lineitem", "lineitem_no_retries", MYSQL_PORT);
+    ds_no_retries.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some("SELECT * from lineitem limit 1".to_string()),
+        refresh_retry_enabled: false,
+        refresh_sql: Some("SELECT * from lineitem_no_retries limit 1".to_string()),
         ..Default::default()
     });
 
-    let app = AppBuilder::new("mysql_refresh_no_retry")
-        .with_dataset(ds)
+    let mut ds_default = make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT);
+    ds_default.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some("SELECT * from lineitem_retries limit 1".to_string()),
+        ..Default::default()
+    });
+
+    let app = AppBuilder::new("mysql_refresh_retry")
+        .with_dataset(ds_no_retries)
+        .with_dataset(ds_default)
         .build();
 
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
-    // Set a timeout for the test
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
@@ -96,37 +138,51 @@ async fn mysql_refresh_no_retries_by_default() -> Result<(), String> {
         () = rt.load_datasets() => {}
     }
 
-    let lineitem_table = rt
-        .datafusion()
-        .ctx
-        .table_provider("lineitem")
-        .await
-        .map_err(|e| e.to_string())?;
+    let refresh_task_no_retries = create_refresh_task(&rt, "lineitem_no_retries").await?;
 
-    let lineitem_accelerated_table = lineitem_table
-        .as_any()
-        .downcast_ref::<AcceleratedTable>()
-        .ok_or("lineitem table is not an AcceleratedTable")?;
-
-    let refresh_task = Arc::new(RefreshTask::new(
-        "lineitem".into(),
-        Arc::clone(&lineitem_accelerated_table.get_federated_table()),
-        lineitem_accelerated_table.refresh_params(),
-        lineitem_table,
-    ));
-
+    tracing::debug!("Simulating connectivity issue...");
     running_container.stop().await.map_err(|e| {
         tracing::error!("running_container.stop: {e}");
         e.to_string()
     })?;
 
-    // Refresh should fail w/o retries
+    // Refresh should fail fast w/o retries
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
             return Err("Timed out waiting for dataset refresh result".to_string());
         },
-        res = refresh_task.get_full_or_incremental_append_update(None) => {
+        res = refresh_task_no_retries.get_full_or_incremental_append_update(None) => {
+            tracing::debug!("Refresh task completed. Is error={}", res.is_err());
             assert!(res.is_err(), "Expected refresh error but got {res:?}");
+        }
+    };
+
+    let refresh_task_retries = create_refresh_task(&rt, "lineitem_retries").await?;
+
+    let running_container_reference_copy = Arc::clone(&running_container);
+
+    tokio::spawn(async move {
+        // restore connectivity after 3 seconds
+        time::sleep(Duration::from_secs(3)).await;
+        tracing::debug!("Restoring connectivity...");
+        assert!(running_container_reference_copy
+            .start()
+            .await
+            .map_err(|e| {
+                tracing::error!("running_container.start: {e}");
+                e.to_string()
+            })
+            .is_ok());
+    });
+
+    // Refresh should do retries and succeed
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+            return Err("Timed out waiting for dataset refresh result".to_string());
+        },
+        res = refresh_task_retries.get_full_or_incremental_append_update(None) => {
+            tracing::debug!("Refresh task completed. Is error={}", res.is_err());
+            assert!(res.is_ok(), "Expected refresh succeed after retrying but got {res:?}");
         }
     };
 
