@@ -11,12 +11,7 @@
       "program": "${workspaceFolder}/target/debug/spiced",
       "args": [],
       "cwd": "${workspaceFolder}",
-      "cargo": {
-                "args": [
-                    "build",
-                ],
-            },
-      // "preLaunchTask": "rust: cargo build"
+      "preLaunchTask": "rust: cargo build"
     },
     {
       "type": "lldb",
