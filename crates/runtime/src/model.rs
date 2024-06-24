@@ -19,6 +19,7 @@ use llms::chat::{Chat, Error as LlmError};
 use llms::embeddings::Embed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
+use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
 use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
@@ -52,8 +53,9 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
     }
 }
 
-pub fn try_to_embedding(
+pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::embeddings::Embeddings,
+    params: &HashMap<String, SecretString, S>,
 ) -> Result<Box<dyn Embed>, LlmError> {
     let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
         source: format!(
@@ -65,7 +67,7 @@ pub fn try_to_embedding(
 
     let model_id = component.get_model_id();
 
-    match construct_embedding_params(&prefix, &(component.params).clone().unwrap_or_default()) {
+    match construct_embedding_params(&prefix, params) {
         EmbeddingParams::OpenAiParams {
             api_base,
             api_key,
@@ -86,8 +88,9 @@ pub fn try_to_embedding(
 }
 
 /// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
-pub fn try_to_chat_model(
+pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::llms::Llm,
+    params: &HashMap<String, SecretString, S>,
 ) -> Result<Box<dyn Chat>, LlmError> {
     let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
         source: format!(
@@ -99,11 +102,7 @@ pub fn try_to_chat_model(
 
     let model_id = component.get_model_id();
 
-    match construct_llm_params(
-        &prefix,
-        &model_id,
-        &(component.params).clone().unwrap_or_default(),
-    ) {
+    match construct_llm_params(&prefix, &model_id, params) {
         Ok(LlmParams::OpenAiParams {
             api_base,
             api_key,
@@ -159,14 +158,14 @@ pub fn try_to_chat_model(
 
 /// Construct the parameters needed to create an LLM based on its source (i.e. prefix).
 /// If a `model_id` is provided (in the `from: `), it is provided.
-fn construct_llm_params(
+fn construct_llm_params<S: ::std::hash::BuildHasher>(
     from: &LlmPrefix,
     model_id: &Option<String>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString, S>,
 ) -> Result<LlmParams, LlmError> {
     match from {
         LlmPrefix::HuggingFace => {
-            let model_type = params.get("model_type").cloned();
+            let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
             let arch = match model_type {
                 Some(arch) => {
                     let a = Architecture::try_from(arch.as_str()).map_err(|_| {
@@ -182,22 +181,38 @@ fn construct_llm_params(
 
             Ok(LlmParams::HuggingfaceParams {
                 model_type: arch,
-                weights_path: model_id.clone().or(params.get("weights_path").cloned()),
-                tokenizer_path: params.get("tokenizer_path").cloned(),
-                tokenizer_config_path: params.get("tokenizer_config_path").cloned(),
+                weights_path: model_id.clone().or(params
+                    .get("weights_path")
+                    .map(Secret::expose_secret)
+                    .cloned()),
+                tokenizer_path: params
+                    .get("tokenizer_path")
+                    .map(Secret::expose_secret)
+                    .cloned(),
+                tokenizer_config_path: params
+                    .get("tokenizer_config_path")
+                    .map(Secret::expose_secret)
+                    .cloned(),
             })
         }
         LlmPrefix::File => {
             let weights_path = model_id
                 .clone()
-                .or(params.get("weights_path").cloned())
+                .or(params
+                    .get("weights_path")
+                    .map(Secret::expose_secret)
+                    .cloned())
                 .ok_or(LlmError::FailedToLoadModel {
                     source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
-            let tokenizer_path = params.get("tokenizer_path").cloned();
+            let tokenizer_path = params
+                .get("tokenizer_path")
+                .map(Secret::expose_secret)
+                .cloned();
             let tokenizer_config_path = params
                 .get("tokenizer_config_path")
+                .map(Secret::expose_secret)
                 .ok_or(LlmError::FailedToLoadTokenizer {
                     source: "No 'tokenizer_config_path' parameter provided".into(),
                 })?
@@ -212,26 +227,44 @@ fn construct_llm_params(
         LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {}),
 
         LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
-            api_base: params.get("endpoint").cloned(),
-            api_key: params.get("openai_api_key").cloned(),
-            org_id: params.get("openai_org_id").cloned(),
-            project_id: params.get("openai_project_id").cloned(),
+            api_base: params.get("endpoint").map(Secret::expose_secret).cloned(),
+            api_key: params
+                .get("openai_api_key")
+                .map(Secret::expose_secret)
+                .cloned(),
+            org_id: params
+                .get("openai_org_id")
+                .map(Secret::expose_secret)
+                .cloned(),
+            project_id: params
+                .get("openai_project_id")
+                .map(Secret::expose_secret)
+                .cloned(),
         }),
     }
 }
 
 /// Construct the parameters needed to create an [`Embeddings`] based on its source (i.e. prefix).
 /// If a `model_id` is provided (in the `from: `), it is provided.
-fn construct_embedding_params(
+fn construct_embedding_params<S: ::std::hash::BuildHasher>(
     from: &EmbeddingPrefix,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString, S>,
 ) -> EmbeddingParams {
     match from {
         EmbeddingPrefix::OpenAi => EmbeddingParams::OpenAiParams {
-            api_base: params.get("endpoint").cloned(),
-            api_key: params.get("openai_api_key").cloned(),
-            org_id: params.get("openai_org_id").cloned(),
-            project_id: params.get("openai_project_id").cloned(),
+            api_base: params.get("endpoint").map(Secret::expose_secret).cloned(),
+            api_key: params
+                .get("openai_api_key")
+                .map(Secret::expose_secret)
+                .cloned(),
+            org_id: params
+                .get("openai_org_id")
+                .map(Secret::expose_secret)
+                .cloned(),
+            project_id: params
+                .get("openai_project_id")
+                .map(Secret::expose_secret)
+                .cloned(),
         },
     }
 }

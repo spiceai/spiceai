@@ -379,7 +379,10 @@ pub trait ListingTableConnector: DataConnector {
         let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
             .context(InvalidConfigurationSnafu {
             dataconnector: format!("{self}"),
-            message: format!("Invalid extension ({extension}) for source ({store_url})"),
+            message: format!(
+                "Invalid extension ({extension}) for source ({})",
+                dataset.name
+            ),
         })?;
         Ok(table as Arc<dyn TableProvider>)
     }
@@ -527,7 +530,10 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 )
                 .context(InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("Invalid extension ({extension}) for source ({url})"),
+                    message: format!(
+                        "Invalid extension ({extension}) for source ({})",
+                        dataset.name
+                    ),
                 })?)
             }
             Some(file_format) => {

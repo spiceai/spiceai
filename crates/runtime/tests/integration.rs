@@ -30,6 +30,7 @@ mod docker;
 // Run all tests in the `federation` module
 mod federation;
 mod graphql;
+mod postgres;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;

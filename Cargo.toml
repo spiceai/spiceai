@@ -42,7 +42,7 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal", "macros"]
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "be2c2c1f74823956e609a23ca38657cd76c2fcfe" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "a155dee3293a5536ca5c5514f3e87884aa32e5ae" }
 arrow = "52.0.0"
 arrow-flight = "52.0.0"
 duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
@@ -73,8 +73,8 @@ arrow-odbc = { version = "11.1.0" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 ssh2 = { version = "0.9.4" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "e85aa9652326c9d1649f6535620990e12efa37a2" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "e85aa9652326c9d1649f6535620990e12efa37a2" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "15d4bd95d0fe09aa963492044944b33ef66b540d" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "15d4bd95d0fe09aa963492044944b33ef66b540d" }
 object_store = { version = "0.10.1" }
 itertools = "0.12"
 secrecy = "0.8.0"
