@@ -56,13 +56,6 @@ fn get_pg_params() -> HashMap<String, SecretString> {
     params
 }
 
-// pub(super) fn make_postgres_dataset(path: &str, name: &str) -> Dataset {
-//     let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
-//     let params = get_pg_params();
-//     dataset.params = Some(DatasetParams::from_string_map(params.into()));
-//     dataset
-// }
-
 #[instrument]
 pub(super) async fn start_postgres_docker_container(
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
