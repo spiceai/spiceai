@@ -196,6 +196,17 @@ impl PostgresConnectionPool {
             join_push_down,
         })
     }
+
+    /// Returns a direct connection to the underlying database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub async fn connect_direct(&self) -> super::Result<PostgresConnection> {
+        let pool = Arc::clone(&self.pool);
+        let conn = pool.get_owned().await.context(ConnectionPoolRunSnafu)?;
+        Ok(PostgresConnection::new(conn))
+    }
 }
 
 fn parse_connection_string(pg_connection_string: &str) -> (String, String, Option<String>) {
