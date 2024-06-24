@@ -138,6 +138,11 @@ pub enum Error {
         data_connector: String,
     },
 
+    #[snafu(display("Unable to get secret for LLM: {source}"))]
+    UnableToGetSecretForLLM {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
@@ -801,9 +806,33 @@ impl Runtime {
         Ok(())
     }
 
+    async fn get_params_with_secrets(&self, params: &HashMap<String, String>) -> Result<SecretMap> {
+        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
+        let secrets_provider = shared_secrets_provider.read().await;
+
+        let mut params_with_secrets: SecretMap = params.clone().into();
+
+        if let (Some(secret_name), Some(secret_key)) =
+            (params.get("secret_name"), params.get("secret_key"))
+        {
+            if let Some(secret) = secrets_provider
+                .get_secret(secret_name)
+                .await
+                .context(UnableToGetSecretForLLMSnafu)?
+            {
+                secret.insert_to_params(&mut params_with_secrets, secret_key, secret_key);
+            }
+        }
+
+        Ok(params_with_secrets)
+    }
+
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
     pub async fn load_llm(&self, in_llm: &Llm) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(in_llm)
+        let params = in_llm.params.clone().unwrap_or_default();
+        let params_with_secrets = self.get_params_with_secrets(&params).await?;
+
+        let mut l = try_to_chat_model(in_llm, &params_with_secrets.into_map())
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
         l.health()
@@ -842,7 +871,10 @@ impl Runtime {
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     pub async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
-        let mut l = try_to_embedding(in_embed)
+        let params = in_embed.params.clone().unwrap_or_default();
+        let params_with_secrets = self.get_params_with_secrets(&params).await?;
+
+        let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()
