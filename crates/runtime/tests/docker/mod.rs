@@ -20,6 +20,10 @@ impl<'a> RunningContainer<'a> {
     pub async fn remove(&self) -> Result<(), anyhow::Error> {
         remove(&self.docker, self.name).await
     }
+
+    pub async fn stop(&self) -> Result<(), anyhow::Error> {
+        stop(&self.docker, self.name).await
+    }
 }
 
 pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
@@ -32,6 +36,10 @@ pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
             }),
         )
         .await?)
+}
+
+pub async fn stop(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
+    Ok(docker.stop_container(name, None).await?)
 }
 
 pub struct ContainerRunnerBuilder<'a> {
