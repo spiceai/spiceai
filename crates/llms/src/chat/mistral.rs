@@ -261,17 +261,17 @@ impl Chat for MistralLlama {
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         let (snd, mut rcv) = channel::<MistralResponse>(1000);
-        tracing::debug!("Sending request to pipeline");
+        tracing::trace!("Sending request to pipeline");
         self.pipeline
             .get_sender()
             .send(to_mistralrs_request(prompt, true, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-        tracing::debug!("Request sent!");
+        tracing::trace!("Request sent!");
         Ok(Pin::from(Box::new(stream! {
             while let Some(resp) = rcv.recv().await {
-                tracing::debug!("Received response from pipeline");
+                tracing::trace!("Received response from pipeline");
                 match resp {
                     MistralResponse::Chunk(chunk) => {
                         if let Some(choice) = chunk.choices.first() {
@@ -299,6 +299,7 @@ impl Chat for MistralLlama {
                         break;
                     },
                     MistralResponse::Done(_) => {
+                        // Only reachable if message is [`RequestMessage::Chat`]. This function is using [`RequestMessage::Completion`].
                         unreachable!()
                     },
                 }
@@ -308,14 +309,14 @@ impl Chat for MistralLlama {
 
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
         let (snd, mut rcv) = channel::<MistralResponse>(10_000);
-        tracing::debug!("Sending request to pipeline");
+        tracing::trace!("Sending request to pipeline");
         self.pipeline
             .get_sender()
             .send(to_mistralrs_request(prompt, false, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-        tracing::debug!("Request sent!");
+        tracing::trace!("Request sent!");
         match rcv.recv().await {
             Some(response) => match response {
                 MistralResponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
