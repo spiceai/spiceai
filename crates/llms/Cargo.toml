@@ -18,6 +18,8 @@ serde_json.workspace = true
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+tokio.workspace = true
+
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
@@ -36,11 +38,10 @@ candle-core-rs = { package="candle-core", git = "https://github.com/spiceai/cand
 tei_core = { package="text-embeddings-core", git="https://github.com/spiceai/text-embeddings-inference.git", rev="dde326b330ecb609201110d4725928a6e977f0dd" }
 tei_backend_core = { package="text-embeddings-backend-core",  git="https://github.com/spiceai/text-embeddings-inference.git", rev="dde326b330ecb609201110d4725928a6e977f0dd" }
 tei_candle = { package="text-embeddings-backend-candle",  git="https://github.com/spiceai/text-embeddings-inference.git", rev="dde326b330ecb609201110d4725928a6e977f0dd" }
-tokio = { workspace = true, optional=true }
 rand = "0.8.5"
 
 [features]
 default = ["candle"]
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers"]
-mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core", "dep:tokio"]
+mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core" ]
 metal = [] # "mistralrs-core/metal"

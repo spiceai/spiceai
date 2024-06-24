@@ -43,6 +43,8 @@ pub struct ModelConfig {
 }
 
 impl CandleEmbedding {
+
+    /// Attemmpt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder. 
     pub fn try_new(model_root: &Path, dtype: DType) -> Result<Self> {
         Ok(Self {
             backend: Arc::new(Mutex::new(CandleBackend::new(
@@ -56,6 +58,12 @@ impl CandleEmbedding {
                 .context(FailedToInstantiateEmbeddingModelSnafu)?,
             model_cfg: Self::model_config(model_root)?,
         })
+    }
+
+    /// Loads a `CandleEmbedding` model from HuggingFace. 
+    pub fn from_hf(model_id: String, revision: Option<String>, dtype: DType) -> Result<Self> {
+        let model_root = download_hf_artifacts(&model_id, revision.as_deref())?;
+        Self::try_new(&model_root, dtype)
     }
 
     fn convert_dtype(dtype: DType) -> String {
@@ -130,8 +138,8 @@ impl Embed for CandleEmbedding {
 
 /// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
 pub fn download_hf_artifacts(
-    model_id: &'static str,
-    revision: Option<&'static str>,
+    model_id: &str,
+    revision: Option<&str>,
 ) -> Result<PathBuf> {
     let builder = ApiBuilder::new().with_progress(false);
 
@@ -155,4 +163,38 @@ pub fn download_hf_artifacts(
         p
     };
     Ok(model.parent().ok_or("".into()).context(FailedToInstantiateEmbeddingModelSnafu)?.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::DType;
+    use tokio;
+
+    #[tokio::test]
+    async fn test_candle_embedding_from_hf() {
+        let model_id = "BAAI/bge-large-en-v1.5".to_string();
+        let revision = None;
+        let dtype = DType::F32;
+        let mut emb = CandleEmbedding::from_hf(model_id, revision, dtype).unwrap();
+
+        let input = EmbeddingInput::String("Hello, world!".to_string());
+        let emb_vec = emb.embed(input).await.unwrap();
+        assert_eq!(emb_vec.len(), 1);
+        assert_eq!(emb_vec[0], vec![0.1_f32]);
+        assert_eq!(emb_vec[0].len(), emb.size() as usize);
+    }
+
+    #[tokio::test]
+    async fn test_candle_embedding_from_hf_with_revision() {
+        let model_id = "BAAI/bge-large-en-v1.5".to_string();
+        let revision = Some("refs/pr/5".to_string());
+        let dtype = DType::F32;
+        let mut emb = CandleEmbedding::from_hf(model_id, revision, dtype).unwrap();
+
+        let input = EmbeddingInput::String("Hello, world!".to_string());
+        let emb_vec = emb.embed(input).await.unwrap();
+        assert_eq!(emb_vec.len(), 1);
+        assert_eq!(emb_vec[0].len(), emb.size() as usize);
+    }
 }
