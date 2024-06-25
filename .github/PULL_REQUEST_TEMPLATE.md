@@ -2,13 +2,13 @@
 
 <!-- mark what type of change this pull request is -->
 
-- [] ♻️ Refactor
-- [] ✨ Feature
-- [] 🐛 Bug Fix
-- [] 👷 Optimization
-- [] 📝 Documentation Update
-- [] 🔖 Release
-- [] 🚩 Other
+- [ ] ♻️ Refactor
+- [ ] ✨ Feature
+- [ ] 🐛 Bug Fix
+- [ ] 👷 Optimization
+- [ ] 📝 Documentation Update
+- [ ] 🔖 Release
+- [ ] 🚩 Other
 
 ## 🗣 Description
 
