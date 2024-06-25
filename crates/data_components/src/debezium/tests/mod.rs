@@ -34,15 +34,10 @@ fn parse_arrow_schema() {
     let change_event: ChangeEvent =
         serde_json::from_str(change_event_json).expect("to deserialize change event");
 
-    let after_schema = change_event
-        .schema
-        .fields
-        .into_iter()
-        .find(|field| field.field.as_ref().is_some_and(|field| field == "after"))
-        .expect("to find after field");
-
-    let fields = after_schema.fields.expect("fields");
-    let arrow_schema = convert_fields_to_arrow_schema(&fields).expect("to convert to arrow schema");
+    let fields = change_event
+        .get_schema_fields()
+        .expect("to get schema fields");
+    let arrow_schema = convert_fields_to_arrow_schema(fields).expect("to convert to arrow schema");
 
     assert_eq!(arrow_schema.fields.len(), 24);
     assert_eq!(arrow_schema.field(0).name(), "id");
@@ -206,15 +201,10 @@ fn parse_values() {
     let change_event: ChangeEvent =
         serde_json::from_str(change_event_json).expect("to deserialize change event");
 
-    let after_schema = change_event
-        .schema
-        .fields
-        .into_iter()
-        .find(|field| field.field.as_ref().is_some_and(|field| field == "after"))
-        .expect("to find after field");
-
-    let fields = after_schema.fields.expect("fields");
-    let arrow_schema = convert_fields_to_arrow_schema(&fields).expect("to convert to arrow schema");
+    let fields = change_event
+        .get_schema_fields()
+        .expect("to get schema fields");
+    let arrow_schema = convert_fields_to_arrow_schema(fields).expect("to convert to arrow schema");
 
     let record_batch = to_record_batch(vec![change_event.payload.after], &arrow_schema)
         .expect("to convert to record batch");

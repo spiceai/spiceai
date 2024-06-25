@@ -162,6 +162,7 @@ snowflake = [
     "data_components/snowflake",
 ]
 models = ["model_components/full", "llms/mistralrs", "llms/candle"]
+debezium = ["data_components/debezium"]
 
 [[bench]]
 name = "bench"
