@@ -16,13 +16,14 @@ limitations under the License.
 #![allow(clippy::module_name_repetitions)]
 use arrow::record_batch::RecordBatch;
 use llms::chat::{Chat, Error as LlmError};
-use llms::embeddings::Embed;
+use llms::embeddings::{candle::CandleEmbedding, Embed, Error as EmbedError};
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
 use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
+use std::path::Path;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -56,34 +57,55 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
 pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString, S>,
-) -> Result<Box<dyn Embed>, LlmError> {
-    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
-        source: format!(
-            "Unknown model source for spicepod component from: {}",
-            component.from.clone()
-        )
-        .into(),
-    })?;
+) -> Result<Box<dyn Embed>, EmbedError> {
+    let prefix = component
+        .get_prefix()
+        .ok_or(EmbedError::UnknownModelSource {
+            source: format!(
+                "Unknown model source for spicepod component from: {}",
+                component.from.clone()
+            )
+            .into(),
+        })?;
 
     let model_id = component.get_model_id();
 
-    match construct_embedding_params(&prefix, params) {
-        EmbeddingParams::OpenAiParams {
+    match construct_embedding_params(&prefix, &model_id, params) {
+        Ok(EmbeddingParams::OpenAiParams {
             api_base,
             api_key,
             org_id,
             project_id,
-        } => Ok(Box::new(llms::openai::Openai::new(
+        }) => Ok(Box::new(llms::openai::Openai::new(
             model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
             api_base,
             api_key,
             org_id,
             project_id,
         ))),
-        EmbeddingParams::None => Err(LlmError::UnsupportedTaskForModel {
+        Ok(EmbeddingParams::HuggingfaceParams {}) => {
+            if let Some(id) = model_id {
+                Ok(Box::new(CandleEmbedding::from_hf(&id, None)?))
+            } else {
+                Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: format!("Failed to load model from: {}", component.from).into(),
+                })
+            }
+        }
+        Ok(EmbeddingParams::LocalModelParams {
+            weights_path,
+            config_path,
+            tokenizer_path,
+        }) => Ok(Box::new(CandleEmbedding::from_local(
+            Path::new(&weights_path),
+            Path::new(&config_path),
+            Path::new(&tokenizer_path),
+        )?)),
+        Ok(EmbeddingParams::None) => Err(EmbedError::UnsupportedTaskForModel {
             from: component.from.clone(),
             task: "embedding".into(),
         }),
+        Err(e) => Err(e),
     }
 }
 
@@ -248,10 +270,11 @@ fn construct_llm_params<S: ::std::hash::BuildHasher>(
 /// If a `model_id` is provided (in the `from: `), it is provided.
 fn construct_embedding_params<S: ::std::hash::BuildHasher>(
     from: &EmbeddingPrefix,
+    model_id: &Option<String>,
     params: &HashMap<String, SecretString, S>,
-) -> EmbeddingParams {
+) -> Result<EmbeddingParams, EmbedError> {
     match from {
-        EmbeddingPrefix::OpenAi => EmbeddingParams::OpenAiParams {
+        EmbeddingPrefix::OpenAi => Ok(EmbeddingParams::OpenAiParams {
             api_base: params.get("endpoint").map(Secret::expose_secret).cloned(),
             api_key: params
                 .get("openai_api_key")
@@ -265,6 +288,39 @@ fn construct_embedding_params<S: ::std::hash::BuildHasher>(
                 .get("openai_project_id")
                 .map(Secret::expose_secret)
                 .cloned(),
-        },
+        }),
+        EmbeddingPrefix::File => {
+            let weights_path = model_id
+                .clone()
+                .or(params
+                    .get("weights_path")
+                    .map(ExposeSecret::expose_secret)
+                    .cloned())
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'weights_path' parameter provided".into(),
+                })?
+                .clone();
+            let config_path = params
+                .get("config_path")
+                .map(Secret::expose_secret)
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'config_path' parameter provided".into(),
+                })?
+                .clone();
+
+            let tokenizer_path = params
+                .get("tokenizer_path")
+                .map(Secret::expose_secret)
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'tokenizer_path' parameter provided".into(),
+                })?
+                .clone();
+            Ok(EmbeddingParams::LocalModelParams {
+                weights_path,
+                config_path,
+                tokenizer_path,
+            })
+        }
+        EmbeddingPrefix::HuggingFace => Ok(EmbeddingParams::HuggingfaceParams {}),
     }
 }
