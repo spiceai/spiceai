@@ -16,7 +16,7 @@ limitations under the License.
 //! Runs federation integration tests for `MySQL`.
 //!
 //! Expects a Docker daemon to be running.
-use crate::utils::mysql::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
+use crate::mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
 use std::sync::Arc;
 
 use super::*;

@@ -18,7 +18,7 @@ limitations under the License.
 //! Expects a Docker daemon to be running.
 use crate::{
     docker::RunningContainer,
-    utils::mysql::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
+    mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
 };
 use std::{sync::Arc, time::Duration};
 
@@ -162,8 +162,8 @@ async fn mysql_refresh_retries() -> Result<(), String> {
     let running_container_reference_copy = Arc::clone(&running_container);
 
     tokio::spawn(async move {
-        // restore connectivity after 3 seconds
-        time::sleep(Duration::from_secs(3)).await;
+        // restore connectivity after few seconds
+        time::sleep(Duration::from_secs(2)).await;
         tracing::debug!("Restoring connectivity...");
         assert!(running_container_reference_copy
             .start()
