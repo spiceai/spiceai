@@ -17,33 +17,43 @@ limitations under the License.
 package spec
 
 import (
+	"reflect"
+
 	"gopkg.in/yaml.v3"
 )
 
 type SpicepodSpec struct {
-	Version      string               `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
-	Kind         string               `json:"kind,omitempty" csv:"kind" yaml:"kind,omitempty"`
-	Name         string               `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	Params       map[string]string    `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
-	Metadata     map[string]string    `json:"metadata,omitempty" csv:"metadata" yaml:"metadata,omitempty"`
-	Datasets     []DatasetOrReference `json:"datasets,omitempty" csv:"datasets" yaml:"datasets,omitempty"`
-	Functions    []*Reference         `json:"functions,omitempty" csv:"functions" yaml:"functions,omitempty"`
-	Models       []*Reference         `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
-	Dependencies []string             `json:"dependencies,omitempty" csv:"dependencies" yaml:"dependencies,omitempty"`
-	Secrets      Secrets              `json:"secrets,omitempty" csv:"secrets" yaml:"secrets,omitempty"`
+	Version      string            `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
+	Kind         string            `json:"kind,omitempty" csv:"kind" yaml:"kind,omitempty"`
+	Name         string            `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Params       map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty" csv:"metadata" yaml:"metadata,omitempty"`
+	Datasets     []Component       `json:"datasets,omitempty" csv:"datasets" yaml:"datasets,omitempty"`
+	Functions    []*Reference      `json:"functions,omitempty" csv:"functions" yaml:"functions,omitempty"`
+	Models       []*Reference      `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
+	Dependencies []string          `json:"dependencies,omitempty" csv:"dependencies" yaml:"dependencies,omitempty"`
+	Secrets      Secrets           `json:"secrets,omitempty" csv:"secrets" yaml:"secrets,omitempty"`
 }
 
-type DatasetOrReference struct {
+type Component struct {
 	Dataset   DatasetSpec
 	Reference Reference
 }
 
-func (r Reference) ToDatasetOrReference() DatasetOrReference {
-	return DatasetOrReference{Reference: r}
+func (c Component) IsReference() bool {
+	return c.Reference != (Reference{})
 }
 
-func (d DatasetSpec) ToDatasetOrReference() DatasetOrReference {
-	return DatasetOrReference{Dataset: d}
+func (c Component) IsDataset() bool {
+	return !reflect.DeepEqual(c.Dataset, DatasetSpec{})
+}
+
+func (r Reference) ToComponent() Component {
+	return Component{Reference: r}
+}
+
+func (d DatasetSpec) ToComponent() Component {
+	return Component{Dataset: d}
 }
 
 // Helper function to find a node by key in a mapping node
@@ -56,7 +66,7 @@ func findNodeByKey(node *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-func (dr *DatasetOrReference) UnmarshalYAML(node *yaml.Node) error {
+func (c *Component) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode { // confirm the dataset entry is an key-pair object
 		return nil
 	}
@@ -67,22 +77,27 @@ func (dr *DatasetOrReference) UnmarshalYAML(node *yaml.Node) error {
 		if err := node.Decode(&ref); err != nil {
 			return err
 		}
-		dr.Reference = ref
+		c.Reference = ref
 	} else {
 		var dataset DatasetSpec
 		if err := node.Decode(&dataset); err != nil {
 			return err
 		}
-		dr.Dataset = dataset
+		c.Dataset = dataset
 	}
 	return nil
 }
 
-func (dr DatasetOrReference) MarshalYAML() (interface{}, error) {
-	if dr.Reference != (Reference{}) {
-		return dr.Reference, nil
+func (c Component) MarshalYAML() (interface{}, error) {
+	if c.IsReference() {
+		return c.Reference, nil
 	}
-	return dr.Dataset, nil
+
+	if c.IsDataset() {
+		return c.Dataset, nil
+	}
+
+	return nil, nil // should we error here?
 }
 
 type Reference struct {

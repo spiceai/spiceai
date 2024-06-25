@@ -209,7 +209,7 @@ spice dataset configure
 		if !datasetReferenced {
 			spicePod.Datasets = append(spicePod.Datasets, spec.Reference{
 				Ref: dirPath,
-			}.ToDatasetOrReference())
+			}.ToComponent())
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
 				cmd.Println(err)

@@ -116,7 +116,7 @@ datasets:
 		Version: "v1beta1",
 		Kind:    "Spicepod",
 		Name:    "spice_app",
-		Datasets: []DatasetOrReference{
+		Datasets: []Component{
 			{
 				Dataset: DatasetSpec{
 					From: "datasets/uniswap_v2_eth_usdc",
@@ -147,7 +147,7 @@ datasets:
 		Version: "v1beta1",
 		Kind:    "Spicepod",
 		Name:    "spice_app",
-		Datasets: []DatasetOrReference{
+		Datasets: []Component{
 			{
 				Reference: Reference{
 					Ref: "eth_recent_blocks",
@@ -179,7 +179,7 @@ datasets:
 		Version: "v1beta1",
 		Kind:    "Spicepod",
 		Name:    "spice_app",
-		Datasets: []DatasetOrReference{
+		Datasets: []Component{
 			{
 				Reference: Reference{
 					Ref: "eth_recent_blocks",
