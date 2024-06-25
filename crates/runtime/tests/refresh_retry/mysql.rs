@@ -35,7 +35,7 @@ use spicepod::component::dataset::acceleration::Acceleration;
 use tokio::time;
 use tracing::instrument;
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-frefresh-retry-mysql";
+const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-refresh-retry-mysql";
 const MYSQL_PORT: u16 = 13307;
 
 #[instrument]
