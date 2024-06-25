@@ -78,6 +78,9 @@ pub fn try_to_embedding(
             org_id,
             project_id,
         ))),
+        EmbeddingParams::HuggingfaceParams {  } => {
+            
+        }
         EmbeddingParams::None => Err(LlmError::UnsupportedTaskForModel {
             from: component.from.clone(),
             task: "embedding".into(),
@@ -233,5 +236,22 @@ fn construct_embedding_params(
             org_id: params.get("openai_org_id").cloned(),
             project_id: params.get("openai_project_id").cloned(),
         },
+        EmbeddingPrefix::File => {
+            let weights_path = model_id
+                .clone()
+                .or(params.get("weights_path").cloned())
+                .ok_or(LlmError::FailedToLoadModel {
+                    source: "No 'weights_path' parameter provided".into(),
+                })?
+                .clone();
+            let config_path = params
+                .get("config_path")
+                .ok_or(LlmError::FailedToLoadTokenizer {
+                    source: "No 'config_path' parameter provided".into(),
+                })?
+                .clone();
+            EmbeddingParams::LocalModelParams { weights_path , config_path }
+        },
+        EmbeddingPrefix::HuggingFace => EmbeddingParams::HuggingfaceParams {  },
     }
 }

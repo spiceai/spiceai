@@ -63,6 +63,8 @@ impl Embeddings {
 
 pub enum EmbeddingPrefix {
     OpenAi,
+    HuggingFace,
+    File,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
@@ -93,6 +95,12 @@ pub enum EmbeddingParams {
         api_key: Option<String>,
         org_id: Option<String>,
         project_id: Option<String>,
+    },
+    HuggingfaceParams { },
+
+    LocalModelParams {
+        weights_path: String,
+        config_path: String,
     },
     None,
 }
