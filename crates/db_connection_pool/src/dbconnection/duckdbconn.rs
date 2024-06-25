@@ -114,7 +114,10 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
 #[must_use]
 pub fn flatten_table_function_name(table_reference: &TableReference) -> String {
     let table_name = table_reference.table();
-    let filtered_name: String = table_name.chars().filter(|c| c.is_alphanumeric() || *c == '(').collect();
+    let filtered_name: String = table_name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '(')
+        .collect();
     let result = filtered_name.replace('(', "_");
 
     format!("{result}__view")
