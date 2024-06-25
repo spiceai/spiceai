@@ -25,7 +25,7 @@ use std::{
 };
 
 #[cfg(target_os = "windows")]
-use std::os::windows::fs::symlink;
+use std::os::windows::fs::symlink_file as symlink;
 
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::fs::symlink;
