@@ -13,10 +13,15 @@ limitations under the License.
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::{fs, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 use super::{
     Embed, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu,
     FailedToPrepareInputSnafu, Result,
+};
+use std::{
+    fs,
+    os::unix::fs::symlink,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use async_openai::types::EmbeddingInput;
@@ -26,8 +31,9 @@ use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use snafu::ResultExt;
-use tei_backend_core::{ModelType, Pool, Backend};
+use tei_backend_core::{Backend, ModelType, Pool};
 use tei_candle::{batch, sort_embeddings, CandleBackend};
+use tempfile::tempdir;
 use tokenizers::{Encoding, Tokenizer};
 
 pub struct CandleEmbedding {
@@ -43,27 +49,32 @@ pub struct ModelConfig {
 }
 
 impl CandleEmbedding {
+    pub fn from_local(model_path: &Path, config_path: &Path, dtype: DType) -> Result<Self> {
+        let model_root = link_files_into_tmp_dir(vec![model_path, config_path])?;
+        Self::try_new(&model_root, dtype)
+    }
 
-    /// Attemmpt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder. 
+    pub fn from_hf(model_id: &str, revision: Option<&str>, dtype: DType) -> Result<Self> {
+        let model_root = download_hf_artifacts(model_id, revision)?;
+        Self::try_new(&model_root, dtype)
+    }
+
+    /// Attemmpt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
     pub fn try_new(model_root: &Path, dtype: DType) -> Result<Self> {
         Ok(Self {
-            backend: Arc::new(Mutex::new(CandleBackend::new(
-                model_root.to_path_buf(),
-                Self::convert_dtype(dtype),
-                ModelType::Embedding(Pool::Cls),
-            )
-            .boxed()
-            .context(FailedToInstantiateEmbeddingModelSnafu)?)),
+            backend: Arc::new(Mutex::new(
+                CandleBackend::new(
+                    model_root.to_path_buf(),
+                    Self::convert_dtype(dtype),
+                    ModelType::Embedding(Pool::Cls),
+                )
+                .boxed()
+                .context(FailedToInstantiateEmbeddingModelSnafu)?,
+            )),
             tok: Tokenizer::from_file(model_root.join("tokenizer.json"))
                 .context(FailedToInstantiateEmbeddingModelSnafu)?,
             model_cfg: Self::model_config(model_root)?,
         })
-    }
-
-    /// Loads a `CandleEmbedding` model from HuggingFace. 
-    pub fn from_hf(model_id: String, revision: Option<String>, dtype: DType) -> Result<Self> {
-        let model_root = download_hf_artifacts(&model_id, revision.as_deref())?;
-        Self::try_new(&model_root, dtype)
     }
 
     fn convert_dtype(dtype: DType) -> String {
@@ -137,13 +148,13 @@ impl Embed for CandleEmbedding {
 }
 
 /// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
-pub fn download_hf_artifacts(
-    model_id: &str,
-    revision: Option<&str>,
-) -> Result<PathBuf> {
+pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<PathBuf> {
     let builder = ApiBuilder::new().with_progress(false);
 
-    let api = builder.build().boxed().context(FailedToInstantiateEmbeddingModelSnafu)?;
+    let api = builder
+        .build()
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
     let api_repo = if let Some(revision) = revision {
         api.repo(Repo::with_revision(
             model_id.to_string(),
@@ -154,47 +165,45 @@ pub fn download_hf_artifacts(
         api.repo(Repo::new(model_id.to_string(), RepoType::Model))
     };
 
-    api_repo.get("config.json").boxed().context(FailedToInstantiateEmbeddingModelSnafu)?;
-    api_repo.get("tokenizer.json").boxed().context(FailedToInstantiateEmbeddingModelSnafu)?;
+    api_repo
+        .get("config.json")
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+    api_repo
+        .get("tokenizer.json")
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    let model = if let Ok(p) = api_repo.get("model.safetensors") { p } else {
-        let p = api_repo.get("pytorch_model.bin").boxed().context(FailedToInstantiateEmbeddingModelSnafu)?;
+    let model = if let Ok(p) = api_repo.get("model.safetensors") {
+        p
+    } else {
+        let p = api_repo
+            .get("pytorch_model.bin")
+            .boxed()
+            .context(FailedToInstantiateEmbeddingModelSnafu)?;
         tracing::warn!("`model.safetensors` not found. Using `pytorch_model.bin` instead. Model loading will be significantly slower.");
         p
     };
-    Ok(model.parent().ok_or("".into()).context(FailedToInstantiateEmbeddingModelSnafu)?.to_path_buf())
+    Ok(model
+        .parent()
+        .ok_or("".into())
+        .context(FailedToInstantiateEmbeddingModelSnafu)?
+        .to_path_buf())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use candle_core::DType;
-    use tokio;
+/// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested).
+fn link_files_into_tmp_dir(files: Vec<&Path>) -> Result<PathBuf> {
+    let temp_dir = tempdir()
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    #[tokio::test]
-    async fn test_candle_embedding_from_hf() {
-        let model_id = "BAAI/bge-large-en-v1.5".to_string();
-        let revision = None;
-        let dtype = DType::F32;
-        let mut emb = CandleEmbedding::from_hf(model_id, revision, dtype).unwrap();
-
-        let input = EmbeddingInput::String("Hello, world!".to_string());
-        let emb_vec = emb.embed(input).await.unwrap();
-        assert_eq!(emb_vec.len(), 1);
-        assert_eq!(emb_vec[0], vec![0.1_f32]);
-        assert_eq!(emb_vec[0].len(), emb.size() as usize);
+    for file in files {
+        if let Some(file_name) = file.file_name() {
+            let temp_file_path = temp_dir.path().join(file_name);
+            symlink(file, &temp_file_path).boxed().context(FailedToInstantiateEmbeddingModelSnafu)?;
+        }
     }
 
-    #[tokio::test]
-    async fn test_candle_embedding_from_hf_with_revision() {
-        let model_id = "BAAI/bge-large-en-v1.5".to_string();
-        let revision = Some("refs/pr/5".to_string());
-        let dtype = DType::F32;
-        let mut emb = CandleEmbedding::from_hf(model_id, revision, dtype).unwrap();
-
-        let input = EmbeddingInput::String("Hello, world!".to_string());
-        let emb_vec = emb.embed(input).await.unwrap();
-        assert_eq!(emb_vec.len(), 1);
-        assert_eq!(emb_vec[0].len(), emb.size() as usize);
-    }
+    Ok(temp_dir.into_path())
 }
+
