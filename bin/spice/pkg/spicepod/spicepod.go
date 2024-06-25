@@ -22,7 +22,7 @@ import (
 	"path"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 func CreateManifest(name string, spicepodDir string) (string, error) {

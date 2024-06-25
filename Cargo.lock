@@ -1853,7 +1853,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
- "metrics",
+ "metrics 0.22.3",
  "moka",
  "snafu 0.8.3",
  "spicepod",
@@ -5361,12 +5361,17 @@ dependencies = [
  "candle-transformers 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "dirs",
  "futures",
+ "hf-hub",
  "mistralrs",
  "mistralrs-core",
  "rand",
  "serde",
  "serde_json",
  "snafu 0.8.3",
+ "tempfile",
+ "text-embeddings-backend-candle",
+ "text-embeddings-backend-core",
+ "text-embeddings-core",
  "tokenizers",
  "tokio",
  "tracing",
@@ -5562,6 +5567,17 @@ dependencies = [
 
 [[package]]
 name = "metrics"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fde3af1a009ed76a778cb84fdef9e7dbbdf5775ae3e4cc1f434a6a307f6f76c5"
+dependencies = [
+ "ahash 0.8.11",
+ "metrics-macros",
+ "portable-atomic",
+]
+
+[[package]]
+name = "metrics"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2be3cbd384d4e955b231c895ce10685e3d8260c5ccffae898c96c723b0772835"
@@ -5581,12 +5597,23 @@ dependencies = [
  "hyper-tls 0.5.0",
  "indexmap 2.2.6",
  "ipnet",
- "metrics",
+ "metrics 0.22.3",
  "metrics-util",
  "quanta",
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "metrics-macros"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b4faf00617defe497754acde3024865bc143d44a86799b24e191ecff91354f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.66",
 ]
 
 [[package]]
@@ -5600,7 +5627,7 @@ dependencies = [
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "indexmap 2.2.6",
- "metrics",
+ "metrics 0.22.3",
  "num_cpus",
  "ordered-float 4.2.0",
  "quanta",
@@ -5992,6 +6019,12 @@ dependencies = [
  "cfg-if",
  "libc",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -7881,7 +7914,7 @@ dependencies = [
  "keyring",
  "lazy_static",
  "llms",
- "metrics",
+ "metrics 0.22.3",
  "metrics-exporter-prometheus",
  "metrics-util",
  "model_components",
@@ -9142,6 +9175,59 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "text-embeddings-backend"
+version = "1.2.3"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
+dependencies = [
+ "text-embeddings-backend-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "text-embeddings-backend-candle"
+version = "1.2.3"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
+dependencies = [
+ "anyhow",
+ "candle-core 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-nn 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-transformers 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "memmap2",
+ "nohash-hasher",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "text-embeddings-backend-core",
+ "thiserror",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
+name = "text-embeddings-backend-core"
+version = "1.2.3"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
+dependencies = [
+ "nohash-hasher",
+ "thiserror",
+]
+
+[[package]]
+name = "text-embeddings-core"
+version = "1.2.3"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
+dependencies = [
+ "hf-hub",
+ "metrics 0.21.1",
+ "text-embeddings-backend",
+ "thiserror",
+ "tokenizers",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

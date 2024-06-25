@@ -28,7 +28,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 var datasetCmd = &cobra.Command{
@@ -200,16 +200,16 @@ spice dataset configure
 
 		var datasetReferenced bool
 		for _, dataset := range spicePod.Datasets {
-			if dataset.Ref == dirPath {
+			if dataset.Reference.Ref == dirPath {
 				datasetReferenced = true
 				break
 			}
 		}
 
 		if !datasetReferenced {
-			spicePod.Datasets = append(spicePod.Datasets, &spec.Reference{
+			spicePod.Datasets = append(spicePod.Datasets, spec.Reference{
 				Ref: dirPath,
-			})
+			}.ToComponent())
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
 				cmd.Println(err)

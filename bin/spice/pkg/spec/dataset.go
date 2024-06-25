@@ -38,6 +38,10 @@ type DatasetSpec struct {
 	Acceleration *AccelerationSpec `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
 }
 
+func (d DatasetSpec) ToComponent() Component {
+	return Component{Dataset: d}
+}
+
 type AccelerationSpec struct {
 	Enabled              bool              `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
 	Mode                 string            `json:"mode,omitempty" csv:"mode" yaml:"mode,omitempty"`

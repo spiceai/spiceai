@@ -29,7 +29,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spicepod"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 var addCmd = &cobra.Command{
