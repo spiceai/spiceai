@@ -43,6 +43,14 @@ pub enum Error {
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unsupported source of model: {source}"))]
+    UnknownModelSource {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("No model from {from} currently supports {task}"))]
+    UnsupportedTaskForModel { from: String, task: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

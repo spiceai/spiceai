@@ -26,7 +26,7 @@ use std::{
 
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
-use candle_core::DType;
+use candle_core::{DType};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
@@ -49,14 +49,14 @@ pub struct ModelConfig {
 }
 
 impl CandleEmbedding {
-    pub fn from_local(model_path: &Path, config_path: &Path, dtype: DType) -> Result<Self> {
+    pub fn from_local(model_path: &Path, config_path: &Path) -> Result<Self> {
         let model_root = link_files_into_tmp_dir(vec![model_path, config_path])?;
-        Self::try_new(&model_root, dtype)
+        Self::try_new(&model_root, DType::F32)
     }
 
-    pub fn from_hf(model_id: &str, revision: Option<&str>, dtype: DType) -> Result<Self> {
+    pub fn from_hf(model_id: &str, revision: Option<&str>) -> Result<Self> {
         let model_root = download_hf_artifacts(model_id, revision)?;
-        Self::try_new(&model_root, dtype)
+        Self::try_new(&model_root, DType::F32)
     }
 
     /// Attemmpt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
@@ -200,10 +200,11 @@ fn link_files_into_tmp_dir(files: Vec<&Path>) -> Result<PathBuf> {
     for file in files {
         if let Some(file_name) = file.file_name() {
             let temp_file_path = temp_dir.path().join(file_name);
-            symlink(file, &temp_file_path).boxed().context(FailedToInstantiateEmbeddingModelSnafu)?;
+            symlink(file, &temp_file_path)
+                .boxed()
+                .context(FailedToInstantiateEmbeddingModelSnafu)?;
         }
     }
 
     Ok(temp_dir.into_path())
 }
-

@@ -83,6 +83,8 @@ impl Display for EmbeddingPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EmbeddingPrefix::OpenAi => write!(f, "openai"),
+            EmbeddingPrefix::HuggingFace => write!(f, "huggingface:huggingface.co"),
+            EmbeddingPrefix::File => write!(f, "file:"),
         }
     }
 }
@@ -96,7 +98,7 @@ pub enum EmbeddingParams {
         org_id: Option<String>,
         project_id: Option<String>,
     },
-    HuggingfaceParams { },
+    HuggingfaceParams {},
 
     LocalModelParams {
         weights_path: String,

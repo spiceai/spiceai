@@ -161,7 +161,7 @@ snowflake = [
     "db_connection_pool/snowflake",
     "data_components/snowflake",
 ]
-models = ["model_components/full", "llms/mistralrs"]
+models = ["model_components/full", "llms/mistralrs", "llms/candle"]
 
 [[bench]]
 name = "bench"
