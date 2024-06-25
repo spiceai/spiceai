@@ -48,3 +48,6 @@ venv
 /test/tpch/tpch_queries.sql
 
 .vscode/settings.json
+
+# Nix
+/result
