@@ -20,75 +20,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Helper function to find a node by key in a mapping node
-func findNodeByKey(node *yaml.Node, key string) *yaml.Node {
-	for i := 0; i < len(node.Content)-1; i += 2 {
-		if node.Content[i].Value == key {
-			return node.Content[i+1]
-		}
-	}
-	return nil
-}
-
-func (s *SpicepodSpec) UnmarshalYAML(value *yaml.Node) error {
-	// Initialize a new struct to hold temporary values
-	temp := struct {
-		Version      string            `yaml:"version,omitempty"`
-		Kind         string            `yaml:"kind,omitempty"`
-		Name         string            `yaml:"name,omitempty"`
-		Params       map[string]string `yaml:"params,omitempty"`
-		Metadata     map[string]string `yaml:"metadata,omitempty"`
-		Functions    []*Reference      `yaml:"functions,omitempty"`
-		Models       []*Reference      `yaml:"models,omitempty"`
-		Dependencies []string          `yaml:"dependencies,omitempty"`
-		Secrets      Secrets           `yaml:"secrets,omitempty"`
-	}{}
-
-	// Unmarshal all fields except Datasets
-	if err := value.Decode(&temp); err != nil {
-		return err
-	}
-
-	// Set the values of the inner temp to the struct
-	// This way we can retain the default unmarshal behaviour for values we don't care to change
-	s.Version = temp.Version
-	s.Kind = temp.Kind
-	s.Name = temp.Name
-	s.Params = temp.Params
-	s.Metadata = temp.Metadata
-	s.Functions = temp.Functions
-	s.Models = temp.Models
-	s.Dependencies = temp.Dependencies
-	s.Secrets = temp.Secrets
-
-	// Find and process datasets into their respective type (Reference or DatasetSpec)
-	datasetsNode := findNodeByKey(value, "datasets")                   // this relies on the parent YAML being the correct key-pair structure
-	if datasetsNode != nil && datasetsNode.Kind == yaml.SequenceNode { // we expect Datasets to be a list
-		for _, node := range datasetsNode.Content {
-			if node.Kind != yaml.MappingNode { // confirm the dataset entry is an key-pair object
-				continue
-			}
-
-			// Determine if it's a Reference or Dataset based on presence of 'ref' key
-			if refNode := findNodeByKey(node, "ref"); refNode != nil {
-				var ref Reference
-				if err := node.Decode(&ref); err != nil {
-					return err
-				}
-				s.Datasets = append(s.Datasets, &ref) // we can append either Reference or DatasetSpec because they both implement DatasetOrReference
-			} else {
-				var dataset DatasetSpec
-				if err := node.Decode(&dataset); err != nil {
-					return err
-				}
-				s.Datasets = append(s.Datasets, &dataset) // we can append either Reference or DatasetSpec because they both implement DatasetOrReference
-			}
-		}
-	}
-
-	return nil
-}
-
 type SpicepodSpec struct {
 	Version      string               `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
 	Kind         string               `json:"kind,omitempty" csv:"kind" yaml:"kind,omitempty"`
@@ -102,32 +33,61 @@ type SpicepodSpec struct {
 	Secrets      Secrets              `json:"secrets,omitempty" csv:"secrets" yaml:"secrets,omitempty"`
 }
 
-type DatasetOrReference interface {
-	IsReference() bool
-	IsDataset() bool
-	Dataset() DatasetSpec
-	Reference() Reference
+type DatasetOrReference struct {
+	Dataset   DatasetSpec
+	Reference Reference
+}
+
+func (r Reference) ToDatasetOrReference() DatasetOrReference {
+	return DatasetOrReference{Reference: r}
+}
+
+func (d DatasetSpec) ToDatasetOrReference() DatasetOrReference {
+	return DatasetOrReference{Dataset: d}
+}
+
+// Helper function to find a node by key in a mapping node
+func findNodeByKey(node *yaml.Node, key string) *yaml.Node {
+	for i := 0; i < len(node.Content)-1; i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func (dr *DatasetOrReference) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode { // confirm the dataset entry is an key-pair object
+		return nil
+	}
+
+	// Determine if it's a Reference or Dataset based on presence of 'ref' key
+	if refNode := findNodeByKey(node, "ref"); refNode != nil {
+		var ref Reference
+		if err := node.Decode(&ref); err != nil {
+			return err
+		}
+		dr.Reference = ref // we can append either Reference or DatasetSpec because they both implement DatasetOrReference
+	} else {
+		var dataset DatasetSpec
+		if err := node.Decode(&dataset); err != nil {
+			return err
+		}
+		dr.Dataset = dataset // we can append either Reference or DatasetSpec because they both implement DatasetOrReference
+	}
+	return nil
+}
+
+func (dr DatasetOrReference) MarshalYAML() (interface{}, error) {
+	if dr.Reference != (Reference{}) {
+		return dr.Reference, nil
+	}
+	return dr.Dataset, nil
 }
 
 type Reference struct {
 	Ref       string `json:"ref,omitempty" csv:"ref" yaml:"ref,omitempty"`
 	DependsOn string `json:"depends_on,omitempty" csv:"depends_on" yaml:"dependsOn,omitempty"`
-}
-
-func (Reference) IsReference() bool {
-	return true
-}
-
-func (Reference) IsDataset() bool {
-	return false
-}
-
-func (Reference) Dataset() DatasetSpec {
-	panic("Value is a Reference, not a DatasetSpec!")
-}
-
-func (r Reference) Reference() Reference {
-	return r
 }
 
 type Secrets struct {

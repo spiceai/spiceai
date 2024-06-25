@@ -200,16 +200,16 @@ spice dataset configure
 
 		var datasetReferenced bool
 		for _, dataset := range spicePod.Datasets {
-			if dataset.IsReference() && dataset.Reference().Ref == dirPath {
+			if dataset.Reference != (spec.Reference{}) && dataset.Reference.Ref == dirPath {
 				datasetReferenced = true
 				break
 			}
 		}
 
 		if !datasetReferenced {
-			spicePod.Datasets = append(spicePod.Datasets, &spec.Reference{
+			spicePod.Datasets = append(spicePod.Datasets, spec.Reference{
 				Ref: dirPath,
-			})
+			}.ToDatasetOrReference())
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
 				cmd.Println(err)
