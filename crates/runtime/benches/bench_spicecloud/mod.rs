@@ -54,7 +54,6 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
 
         // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.supplier' not found
         // ("tpch_q16", include_str!("tpch_q16.sql")),
-
         ("tpch_q17", include_str!("tpch_q17.sql")),
         ("tpch_q18", include_str!("tpch_q18.sql")),
         ("tpch_q19", include_str!("tpch_q19.sql")),
