@@ -11,8 +11,8 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
 - CDC replication refresh mode
-- MotherDuck data connector (alpha)
-- Generic Object-Store connector (alpha)
+- Refresh SQL reliability improvements
+- C# SDK (.Net Core 7.0+)
 
 ## [v0.16-beta (July 2024)](https://github.com/spiceai/spiceai/milestone/31)
 
@@ -66,7 +66,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `mysql`       | Alpha  |
 | `flightsql`   | Alpha  |
 | `graphql`     | Alpha  |
-| `motherduck`  | Alpha  |
 
 ## v1.1 (Oct 2024)
 
@@ -83,3 +82,4 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   - RocksDB data accelerator
   - DynamoDB data connector
 - CLI publish Spicepods to [spicerack.org](https://spicerack.org)
+- MotherDuck data connector
