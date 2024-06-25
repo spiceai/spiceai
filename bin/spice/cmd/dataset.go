@@ -200,7 +200,7 @@ spice dataset configure
 
 		var datasetReferenced bool
 		for _, dataset := range spicePod.Datasets {
-			if dataset.Reference != (spec.Reference{}) && dataset.Reference.Ref == dirPath {
+			if dataset.Reference.Ref == dirPath {
 				datasetReferenced = true
 				break
 			}
