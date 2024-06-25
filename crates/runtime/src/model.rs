@@ -85,8 +85,7 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
         ))),
         Ok(EmbeddingParams::HuggingfaceParams {}) => {
             if let Some(id) = model_id {
-                let model = CandleEmbedding::from_hf(&id, None)?;
-                Ok(Box::new(model))
+                Ok(Box::new(CandleEmbedding::from_hf(&id, None)?))
             } else {
                 Err(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: format!("Failed to load model from: {}", component.from).into(),
@@ -98,12 +97,11 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
             config_path,
             tokenizer_path,
         }) => {
-            let model = CandleEmbedding::from_local(
+            Ok(Box::new(CandleEmbedding::from_local(
                 Path::new(&weights_path),
                 Path::new(&config_path),
                 Path::new(&tokenizer_path),
-            )?;
-            Ok(Box::new(model))
+            )?))
         }
         Ok(EmbeddingParams::None) => Err(EmbedError::UnsupportedTaskForModel {
             from: component.from.clone(),
