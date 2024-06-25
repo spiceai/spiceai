@@ -18,6 +18,7 @@ use super::{
     FailedToPrepareInputSnafu, Result,
 };
 use std::{
+    collections::HashMap,
     fs,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
@@ -54,12 +55,20 @@ impl CandleEmbedding {
         config_path: &Path,
         tokenizer_path: &Path,
     ) -> Result<Self> {
-        let model_root = link_files_into_tmp_dir(vec![model_path, config_path, tokenizer_path])?;
+        // `text-embeddings-inference` expects the model artifacts to to be in a single folder with specific filenames.
+        let files: HashMap<String, &Path> = vec![
+            ("model.safetensors".to_string(), model_path),
+            ("config.json".to_string(), config_path),
+            ("tokenizer.json".to_string(), tokenizer_path),
+        ]
+        .into_iter()
+        .collect();
+
+        let model_root = link_files_into_tmp_dir(files)?;
         Self::try_new(&model_root, DType::F32)
     }
 
     pub fn from_hf(model_id: &str, revision: Option<&str>) -> Result<Self> {
-        println!("Downloading model: {model_id} revision: {revision:?}");
         let model_root = download_hf_artifacts(model_id, revision)?;
         Self::try_new(&model_root, DType::F32)
     }
@@ -94,11 +103,11 @@ impl CandleEmbedding {
     }
 
     fn model_config(model_root: &Path) -> Result<ModelConfig> {
-        let config_path = model_root.join("config.json");
-        let config = fs::read_to_string(config_path)
+        let config_str = fs::read_to_string(model_root.join("config.json"))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
-        let config: ModelConfig = serde_json::from_str(&config)
+
+        let config: ModelConfig = serde_json::from_str(&config_str)
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
         Ok(config)
@@ -154,34 +163,32 @@ impl Embed for CandleEmbedding {
 
 /// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
 pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<PathBuf> {
-    let builder = ApiBuilder::new().with_progress(false);
-
-    let api = builder
+    let api = ApiBuilder::new()
+        .with_progress(false)
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
-    let api_repo = if let Some(revision) = revision {
-        api.repo(Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            revision.to_string(),
-        ))
+
+    let repo = if let Some(revision) = revision {
+        Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string())
     } else {
-        api.repo(Repo::new(model_id.to_string(), RepoType::Model))
+        Repo::new(model_id.to_string(), RepoType::Model)
     };
-    println!("Downloading 'config.json'");
+    let api_repo = api.repo(repo.clone());
+
+    tracing::trace!("Downloading 'config.json' for {}", repo.url());
     api_repo
         .get("config.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    println!("Downloading 'tokenizer.json'");
+    tracing::trace!("Downloading 'tokenizer.json' for {}", repo.url());
     api_repo
         .get("tokenizer.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    println!("Downloading 'model.safetensors'");
+    tracing::trace!("Downloading 'model.safetensors' for {}", repo.url());
     let model = if let Ok(p) = api_repo.get("model.safetensors") {
         p
     } else {
@@ -202,18 +209,15 @@ pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<P
 /// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested).
 ///
 /// TODO: make this a Hashmap to predefine linked file names.
-fn link_files_into_tmp_dir(files: Vec<&Path>) -> Result<PathBuf> {
+fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    for file in files {
-        if let Some(file_name) = file.file_name() {
-            let temp_file_path = temp_dir.path().join(file_name);
-            symlink(file, &temp_file_path)
-                .boxed()
-                .context(FailedToInstantiateEmbeddingModelSnafu)?;
-        }
+    for (name, file) in files {
+        symlink(file, &temp_dir.path().join(name))
+            .boxed()
+            .context(FailedToInstantiateEmbeddingModelSnafu)?;
     }
 
     Ok(temp_dir.into_path())
