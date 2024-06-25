@@ -21,9 +21,9 @@ use crate::arrow::map_data_type_to_array_builder_optional;
 use crate::statement::map_data_type_to_column_type;
 use arrow::array::{
     ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
-    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-    Int64Builder, Int8Builder, LargeBinaryBuilder, LargeStringBuilder, ListBuilder, RecordBatch,
-    RecordBatchOptions, StringBuilder, StructBuilder, TimestampMillisecondBuilder, UInt32Builder,
+    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder,
+    LargeBinaryBuilder, LargeStringBuilder, ListBuilder, RecordBatch, RecordBatchOptions,
+    StringBuilder, StructBuilder, TimestampMillisecondBuilder, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Date32Type, Field, Schema, TimeUnit};
 use bigdecimal::num_bigint::BigInt;
@@ -61,9 +61,6 @@ pub enum Error {
     FailedToConvertU128toI64 {
         source: <u128 as convert::TryInto<i64>>::Error,
     },
-
-    #[snafu(display("Error building fixed size binary field: {source}"))]
-    FailedToBuildFixedSizeBinary { source: arrow::error::ArrowError },
 
     #[snafu(display("Failed to get a row value for {pg_type}: {source}"))]
     FailedToGetRowValue {
@@ -407,10 +404,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<FixedSizeBinaryBuilder>()
-                    else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
@@ -423,9 +417,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     )?;
 
                     match v {
-                        Some(v) => builder
-                            .append_value(v)
-                            .context(FailedToBuildFixedSizeBinarySnafu)?,
+                        Some(v) => builder.append_value(v.to_string()),
                         None => builder.append_null(),
                     }
                 }
@@ -572,7 +564,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         Type::INT8 => Some(DataType::Int64),
         Type::FLOAT4 => Some(DataType::Float32),
         Type::FLOAT8 => Some(DataType::Float64),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR => Some(DataType::Utf8),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::UUID => Some(DataType::Utf8),
         Type::BOOL => Some(DataType::Boolean),
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC => None,
@@ -581,7 +573,6 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
             Some(DataType::Timestamp(TimeUnit::Millisecond, None))
         }
         Type::DATE => Some(DataType::Date32),
-        Type::UUID => Some(DataType::FixedSizeBinary(16)),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,

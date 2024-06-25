@@ -176,6 +176,7 @@ pub trait Chat: Sync + Send {
                 code: None,
             })
         })?;
+
         let strm_id: String = thread_rng()
             .sample_iter(&Alphanumeric)
             .take(10)

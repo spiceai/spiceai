@@ -42,7 +42,7 @@ rand = "0.8.5"
 tempfile = "3.10.1"
 
 [features]
-default = ["candle"]
+default = ["candle", "mistralrs"]
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers"]
 mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core" ]
 metal = [] # "mistralrs-core/metal"

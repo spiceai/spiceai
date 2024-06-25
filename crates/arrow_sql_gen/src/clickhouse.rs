@@ -18,10 +18,10 @@ use std::{str::FromStr, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder,
-        FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-        Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder,
-        TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch,
+        RecordBatchOptions, StringBuilder, TimestampSecondBuilder, UInt16Builder, UInt32Builder,
+        UInt64Builder, UInt8Builder,
     },
     datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
@@ -166,10 +166,7 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<FixedSizeBinaryBuilder>()
-                    else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             clickhouse_type: SqlType::Uuid,
                         }
@@ -190,11 +187,7 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
                     };
 
                     match v {
-                        Some(v) => builder.append_value(v.as_bytes()).context(
-                            FailedToAppendRowValueSnafu {
-                                clickhouse_type: SqlType::Uuid,
-                            },
-                        )?,
+                        Some(v) => builder.append_value(v.to_string()),
                         None => builder.append_null(),
                     }
                 }
@@ -517,7 +510,6 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
 
 fn map_column_to_data_type(column_type: &SqlType) -> DataType {
     match column_type {
-        SqlType::Uuid => DataType::FixedSizeBinary(16),
         SqlType::Bool => DataType::Boolean,
         SqlType::Int8 => DataType::Int8,
         SqlType::Int16 => DataType::Int16,
@@ -529,7 +521,7 @@ fn map_column_to_data_type(column_type: &SqlType) -> DataType {
         SqlType::UInt64 => DataType::UInt64,
         SqlType::Float32 => DataType::Float32,
         SqlType::Float64 => DataType::Float64,
-        SqlType::String | SqlType::FixedString(_) => DataType::Utf8,
+        SqlType::String | SqlType::FixedString(_) | SqlType::Uuid => DataType::Utf8,
         SqlType::Date => DataType::Date32,
         SqlType::DateTime(_) => DataType::Timestamp(TimeUnit::Second, None),
         SqlType::Decimal(size, align) => {
@@ -545,8 +537,6 @@ fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
 }
 
 mod tests {
-
-    #[cfg(feature = "clickhouse")]
     #[test]
     fn test_block_to_arrow() {
         use super::block_to_arrow;
@@ -608,7 +598,7 @@ mod tests {
             arrow::datatypes::DataType::Float32,
             arrow::datatypes::DataType::Float64,
             arrow::datatypes::DataType::Utf8,
-            arrow::datatypes::DataType::FixedSizeBinary(16),
+            arrow::datatypes::DataType::Utf8,
             arrow::datatypes::DataType::Int32,
             arrow::datatypes::DataType::Date32,
             arrow::datatypes::DataType::Boolean,
