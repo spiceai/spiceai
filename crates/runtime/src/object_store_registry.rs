@@ -23,7 +23,7 @@ use datafusion::{
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
 };
-use object_store::{aws::AmazonS3Builder, ClientOptions, ObjectStore};
+use object_store::{aws::AmazonS3Builder, http::HttpBuilder, ClientOptions, ObjectStore};
 use url::{form_urlencoded::parse, Url};
 
 #[cfg(feature = "ftp")]
@@ -42,8 +42,23 @@ impl SpiceObjectStoreRegistry {
         SpiceObjectStoreRegistry::default()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         {
+            if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
+                let base_url = if url.scheme() == "https" {
+                    format!("https://{}/", url.authority())
+                } else {
+                    format!("http://{}/", url.authority())
+                };
+
+                return Ok(Arc::new(
+                    HttpBuilder::new()
+                        .with_url(base_url)
+                        .with_client_options(ClientOptions::new().with_allow_http(true))
+                        .build()?,
+                ));
+            }
             if url.as_str().starts_with("s3://") {
                 if let Some(bucket_name) = url.host_str() {
                     let mut s3_builder = AmazonS3Builder::from_env()

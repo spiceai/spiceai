@@ -59,7 +59,7 @@ notify = "6.1.1"
 arrow-json = "52.0.0"
 async-trait.workspace = true
 itertools.workspace = true
-object_store = { workspace = true, features = ["aws"] }
+object_store = { workspace = true, features = ["aws", "http"] }
 url = "2.5.0"
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
