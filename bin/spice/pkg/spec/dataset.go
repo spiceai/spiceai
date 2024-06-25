@@ -38,6 +38,22 @@ type DatasetSpec struct {
 	Acceleration *AccelerationSpec `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
 }
 
+func (DatasetSpec) IsReference() bool {
+	return false
+}
+
+func (DatasetSpec) IsDataset() bool {
+	return true
+}
+
+func (d DatasetSpec) Dataset() DatasetSpec {
+	return d
+}
+
+func (DatasetSpec) Reference() Reference {
+	panic("Value is a DatasetSpec, not a Reference!")
+}
+
 type AccelerationSpec struct {
 	Enabled              bool              `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
 	Mode                 string            `json:"mode,omitempty" csv:"mode" yaml:"mode,omitempty"`

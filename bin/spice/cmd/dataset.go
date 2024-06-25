@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v3"
@@ -201,30 +200,16 @@ spice dataset configure
 
 		var datasetReferenced bool
 		for _, dataset := range spicePod.Datasets {
-			var dataset_reference spec.Reference
-			err := mapstructure.Decode(dataset, &dataset_reference)
-			if err != nil {
-				panic(err)
-			}
-
-			if dataset_reference.Ref == dirPath {
+			if dataset.IsReference() && dataset.Reference().Ref == dirPath {
 				datasetReferenced = true
 				break
 			}
 		}
 
 		if !datasetReferenced {
-			dataset_reference := &spec.Reference{
+			spicePod.Datasets = append(spicePod.Datasets, &spec.Reference{
 				Ref: dirPath,
-			}
-
-			var result map[string]interface{}
-			err := mapstructure.Decode(dataset_reference, &result)
-			if err != nil {
-				panic(err)
-			}
-
-			spicePod.Datasets = append(spicePod.Datasets, result)
+			})
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
 				cmd.Println(err)
