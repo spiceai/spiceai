@@ -206,7 +206,23 @@ pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<P
         .to_path_buf())
 }
 
-/// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested).
+/// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested). The files are linked with to names defined in the hashmap, as keys.
+///
+/// Example:
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// use std::path::Path;
+///
+/// let files: HashMap<String, &Path> = vec![
+///    ("model.safetensors".to_string(), Path::new("path/to/model.safetensors")),
+///   ("config.json".to_string(), Path::new("path/to/irrelevant_filename.json")),
+/// ].into_iter().collect();
+///
+/// let temp_dir = link_files_into_tmp_dir(files).unwrap();
+///
+/// ```
+///
 fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()
