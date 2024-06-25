@@ -26,7 +26,7 @@ use std::{
 
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
-use candle_core::{DType};
+use candle_core::DType;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
@@ -49,12 +49,17 @@ pub struct ModelConfig {
 }
 
 impl CandleEmbedding {
-    pub fn from_local(model_path: &Path, config_path: &Path) -> Result<Self> {
-        let model_root = link_files_into_tmp_dir(vec![model_path, config_path])?;
+    pub fn from_local(
+        model_path: &Path,
+        config_path: &Path,
+        tokenizer_path: &Path,
+    ) -> Result<Self> {
+        let model_root = link_files_into_tmp_dir(vec![model_path, config_path, tokenizer_path])?;
         Self::try_new(&model_root, DType::F32)
     }
 
     pub fn from_hf(model_id: &str, revision: Option<&str>) -> Result<Self> {
+        println!("Downloading model: {model_id} revision: {revision:?}");
         let model_root = download_hf_artifacts(model_id, revision)?;
         Self::try_new(&model_root, DType::F32)
     }
@@ -164,16 +169,19 @@ pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<P
     } else {
         api.repo(Repo::new(model_id.to_string(), RepoType::Model))
     };
-
+    println!("Downloading 'config.json'");
     api_repo
         .get("config.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
+
+    println!("Downloading 'tokenizer.json'");
     api_repo
         .get("tokenizer.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
+    println!("Downloading 'model.safetensors'");
     let model = if let Ok(p) = api_repo.get("model.safetensors") {
         p
     } else {
@@ -192,6 +200,8 @@ pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<P
 }
 
 /// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested).
+///
+/// TODO: make this a Hashmap to predefine linked file names.
 fn link_files_into_tmp_dir(files: Vec<&Path>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()

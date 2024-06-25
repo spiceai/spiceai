@@ -98,9 +98,13 @@ pub fn try_to_embedding(
         Ok(EmbeddingParams::LocalModelParams {
             weights_path,
             config_path,
+            tokenizer_path,
         }) => {
-            let model =
-                CandleEmbedding::from_local(Path::new(&weights_path), Path::new(&config_path))?;
+            let model = CandleEmbedding::from_local(
+                Path::new(&weights_path),
+                Path::new(&config_path),
+                Path::new(&tokenizer_path),
+            )?;
             Ok(Box::new(model))
         }
         Ok(EmbeddingParams::None) => Err(EmbedError::UnsupportedTaskForModel {
@@ -274,9 +278,17 @@ fn construct_embedding_params(
                     source: "No 'config_path' parameter provided".into(),
                 })?
                 .clone();
+
+            let tokenizer_path = params
+                .get("tokenizer_path")
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'tokenizer_path' parameter provided".into(),
+                })?
+                .clone();
             Ok(EmbeddingParams::LocalModelParams {
                 weights_path,
                 config_path,
+                tokenizer_path,
             })
         }
         EmbeddingPrefix::HuggingFace => Ok(EmbeddingParams::HuggingfaceParams {}),

@@ -71,7 +71,11 @@ impl TryFrom<&str> for EmbeddingPrefix {
     type Error = &'static str;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.starts_with("openai") {
+        if value.starts_with("huggingface:huggingface.co") {
+            Ok(EmbeddingPrefix::HuggingFace)
+        } else if value.starts_with("file:") {
+            Ok(EmbeddingPrefix::File)
+        } else if value.starts_with("openai") {
             Ok(EmbeddingPrefix::OpenAi)
         } else {
             Err("Unknown prefix")
@@ -103,6 +107,7 @@ pub enum EmbeddingParams {
     LocalModelParams {
         weights_path: String,
         config_path: String,
+        tokenizer_path: String,
     },
     None,
 }
