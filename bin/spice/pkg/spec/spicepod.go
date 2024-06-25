@@ -67,13 +67,13 @@ func (dr *DatasetOrReference) UnmarshalYAML(node *yaml.Node) error {
 		if err := node.Decode(&ref); err != nil {
 			return err
 		}
-		dr.Reference = ref // we can append either Reference or DatasetSpec because they both implement DatasetOrReference
+		dr.Reference = ref
 	} else {
 		var dataset DatasetSpec
 		if err := node.Decode(&dataset); err != nil {
 			return err
 		}
-		dr.Dataset = dataset // we can append either Reference or DatasetSpec because they both implement DatasetOrReference
+		dr.Dataset = dataset
 	}
 	return nil
 }
