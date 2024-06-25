@@ -207,8 +207,6 @@ pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<P
 }
 
 /// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested).
-///
-/// TODO: make this a Hashmap to predefine linked file names.
 fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()
