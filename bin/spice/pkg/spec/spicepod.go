@@ -22,7 +22,7 @@ type SpicepodSpec struct {
 	Name         string            `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
 	Params       map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty" csv:"metadata" yaml:"metadata,omitempty"`
-	Datasets     []*Reference      `json:"datasets,omitempty" csv:"datasets" yaml:"datasets,omitempty"`
+	Datasets     []Component       `json:"datasets,omitempty" csv:"datasets" yaml:"datasets,omitempty"`
 	Functions    []*Reference      `json:"functions,omitempty" csv:"functions" yaml:"functions,omitempty"`
 	Models       []*Reference      `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
 	Dependencies []string          `json:"dependencies,omitempty" csv:"dependencies" yaml:"dependencies,omitempty"`
@@ -32,6 +32,10 @@ type SpicepodSpec struct {
 type Reference struct {
 	Ref       string `json:"ref,omitempty" csv:"ref" yaml:"ref,omitempty"`
 	DependsOn string `json:"depends_on,omitempty" csv:"depends_on" yaml:"dependsOn,omitempty"`
+}
+
+func (r Reference) ToComponent() Component {
+	return Component{Reference: r}
 }
 
 type Secrets struct {
