@@ -42,60 +42,68 @@ impl SpiceObjectStoreRegistry {
         SpiceObjectStoreRegistry::default()
     }
 
+    fn prepare_s3_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        if let Some(bucket_name) = url.host_str() {
+            let mut s3_builder = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket_name)
+                .with_allow_http(true);
+            let mut client_options = ClientOptions::default();
+
+            let params: HashMap<String, String> =
+                parse(url.fragment().unwrap_or_default().as_bytes())
+                    .into_owned()
+                    .collect();
+
+            if let Some(region) = params.get("region") {
+                s3_builder = s3_builder.with_region(region);
+            }
+            if let Some(endpoint) = params.get("endpoint") {
+                s3_builder = s3_builder.with_endpoint(endpoint);
+            }
+            if let Some(timeout) = params.get("timeout") {
+                client_options = client_options.with_timeout(
+                    fundu::parse_duration(timeout).map_err(|_| {
+                        DataFusionError::Configuration(format!(
+                            "Unable to parse timeout: {timeout}",
+                        ))
+                    })?,
+                );
+            }
+            if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
+                s3_builder = s3_builder.with_access_key_id(key);
+                s3_builder = s3_builder.with_secret_access_key(secret);
+            } else {
+                s3_builder = s3_builder.with_skip_signature(true);
+            };
+            s3_builder = s3_builder.with_client_options(client_options);
+
+            return Ok(Arc::new(s3_builder.build()?));
+        }
+    }
+
+    fn prepare_https_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let base_url = if url.scheme() == "https" {
+            format!("https://{}/", url.authority())
+        } else {
+            format!("http://{}/", url.authority())
+        };
+
+        Ok(Arc::new(
+            HttpBuilder::new()
+                .with_url(base_url)
+                .with_client_options(ClientOptions::new().with_allow_http(true))
+                .build()?,
+        ))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         {
             if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
-                let base_url = if url.scheme() == "https" {
-                    format!("https://{}/", url.authority())
-                } else {
-                    format!("http://{}/", url.authority())
-                };
-
-                return Ok(Arc::new(
-                    HttpBuilder::new()
-                        .with_url(base_url)
-                        .with_client_options(ClientOptions::new().with_allow_http(true))
-                        .build()?,
-                ));
+                return Self::prepare_https_object_store(url);
             }
             if url.as_str().starts_with("s3://") {
-                if let Some(bucket_name) = url.host_str() {
-                    let mut s3_builder = AmazonS3Builder::from_env()
-                        .with_bucket_name(bucket_name)
-                        .with_allow_http(true);
-                    let mut client_options = ClientOptions::default();
-
-                    let params: HashMap<String, String> =
-                        parse(url.fragment().unwrap_or_default().as_bytes())
-                            .into_owned()
-                            .collect();
-
-                    if let Some(region) = params.get("region") {
-                        s3_builder = s3_builder.with_region(region);
-                    }
-                    if let Some(endpoint) = params.get("endpoint") {
-                        s3_builder = s3_builder.with_endpoint(endpoint);
-                    }
-                    if let Some(timeout) = params.get("timeout") {
-                        client_options = client_options.with_timeout(
-                            fundu::parse_duration(timeout).map_err(|_| {
-                                DataFusionError::Configuration(format!(
-                                    "Unable to parse timeout: {timeout}",
-                                ))
-                            })?,
-                        );
-                    }
-                    if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
-                        s3_builder = s3_builder.with_access_key_id(key);
-                        s3_builder = s3_builder.with_secret_access_key(secret);
-                    } else {
-                        s3_builder = s3_builder.with_skip_signature(true);
-                    };
-                    s3_builder = s3_builder.with_client_options(client_options);
-
-                    return Ok(Arc::new(s3_builder.build()?));
-                }
+                return Self::prepare_s3_object_store(url);
             }
             #[cfg(feature = "ftp")]
             if url.as_str().starts_with("ftp://") {

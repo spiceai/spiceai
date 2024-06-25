@@ -34,7 +34,7 @@ pub struct Https {
 
 impl std::fmt::Display for Https {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Https")
+        write!(f, "https")
     }
 }
 
@@ -53,15 +53,15 @@ impl ListingTableConnector for Https {
     }
 
     fn get_params(&self) -> &HashMap<String, String> {
-        &self.params
+        &self.params    
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
         Url::parse(&dataset.from)
             .boxed()
-            .context(InvalidConfigurationSnafu {
-                dataconnector: "Https".to_string(),
-                message: "Invalid URL".to_string(),
-            })
+            .map_err( |e| InvalidConfigurationSnafu {
+                dataconnector: "https".to_string(),
+                message: format!("Invalid URL: {}", e.to_string()),
+            })?
     }
 }
