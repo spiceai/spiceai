@@ -63,13 +63,19 @@ impl Embeddings {
 
 pub enum EmbeddingPrefix {
     OpenAi,
+    HuggingFace,
+    File,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
     type Error = &'static str;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.starts_with("openai") {
+        if value.starts_with("huggingface:huggingface.co") {
+            Ok(EmbeddingPrefix::HuggingFace)
+        } else if value.starts_with("file:") {
+            Ok(EmbeddingPrefix::File)
+        } else if value.starts_with("openai") {
             Ok(EmbeddingPrefix::OpenAi)
         } else {
             Err("Unknown prefix")
@@ -81,6 +87,8 @@ impl Display for EmbeddingPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EmbeddingPrefix::OpenAi => write!(f, "openai"),
+            EmbeddingPrefix::HuggingFace => write!(f, "huggingface:huggingface.co"),
+            EmbeddingPrefix::File => write!(f, "file:"),
         }
     }
 }
@@ -93,6 +101,13 @@ pub enum EmbeddingParams {
         api_key: Option<String>,
         org_id: Option<String>,
         project_id: Option<String>,
+    },
+    HuggingfaceParams {},
+
+    LocalModelParams {
+        weights_path: String,
+        config_path: String,
+        tokenizer_path: String,
     },
     None,
 }
