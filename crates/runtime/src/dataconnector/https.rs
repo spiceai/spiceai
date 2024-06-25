@@ -24,7 +24,7 @@ use std::{collections::HashMap, future::Future};
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,
     ListingTableConnector,
 };
 
@@ -53,15 +53,18 @@ impl ListingTableConnector for Https {
     }
 
     fn get_params(&self) -> &HashMap<String, String> {
-        &self.params    
+        &self.params
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        Url::parse(&dataset.from)
-            .boxed()
-            .map_err( |e| InvalidConfigurationSnafu {
+        let u = Url::parse(&dataset.from).boxed().map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),
-                message: format!("Invalid URL: {}", e.to_string()),
-            })?
+                message: format!("Invalid URL: {e}"),
+                source: e,
+            }
+        })?;
+
+        Ok(u)
     }
 }

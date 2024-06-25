@@ -43,42 +43,42 @@ impl SpiceObjectStoreRegistry {
     }
 
     fn prepare_s3_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-        if let Some(bucket_name) = url.host_str() {
-            let mut s3_builder = AmazonS3Builder::from_env()
-                .with_bucket_name(bucket_name)
-                .with_allow_http(true);
-            let mut client_options = ClientOptions::default();
+        let Some(bucket_name) = url.host_str() else {
+            return Err(DataFusionError::Configuration(
+                "No bucket name provided".to_string(),
+            ));
+        };
 
-            let params: HashMap<String, String> =
-                parse(url.fragment().unwrap_or_default().as_bytes())
-                    .into_owned()
-                    .collect();
+        let mut s3_builder = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket_name)
+            .with_allow_http(true);
+        let mut client_options = ClientOptions::default();
 
-            if let Some(region) = params.get("region") {
-                s3_builder = s3_builder.with_region(region);
-            }
-            if let Some(endpoint) = params.get("endpoint") {
-                s3_builder = s3_builder.with_endpoint(endpoint);
-            }
-            if let Some(timeout) = params.get("timeout") {
-                client_options = client_options.with_timeout(
-                    fundu::parse_duration(timeout).map_err(|_| {
-                        DataFusionError::Configuration(format!(
-                            "Unable to parse timeout: {timeout}",
-                        ))
-                    })?,
-                );
-            }
-            if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
-                s3_builder = s3_builder.with_access_key_id(key);
-                s3_builder = s3_builder.with_secret_access_key(secret);
-            } else {
-                s3_builder = s3_builder.with_skip_signature(true);
-            };
-            s3_builder = s3_builder.with_client_options(client_options);
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
 
-            return Ok(Arc::new(s3_builder.build()?));
+        if let Some(region) = params.get("region") {
+            s3_builder = s3_builder.with_region(region);
         }
+        if let Some(endpoint) = params.get("endpoint") {
+            s3_builder = s3_builder.with_endpoint(endpoint);
+        }
+        if let Some(timeout) = params.get("timeout") {
+            client_options =
+                client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
+                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
+                })?);
+        }
+        if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
+            s3_builder = s3_builder.with_access_key_id(key);
+            s3_builder = s3_builder.with_secret_access_key(secret);
+        } else {
+            s3_builder = s3_builder.with_skip_signature(true);
+        };
+        s3_builder = s3_builder.with_client_options(client_options);
+
+        Ok(Arc::new(s3_builder.build()?))
     }
 
     fn prepare_https_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
@@ -96,73 +96,74 @@ impl SpiceObjectStoreRegistry {
         ))
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn prepare_ftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for FTP".to_string(),
+            ));
+        };
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let port = params
+            .get("port")
+            .map_or("21".to_string(), ToOwned::to_owned);
+        let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No user provided for FTP".to_string())
+        })?;
+        let password = params
+            .get("password")
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                DataFusionError::Configuration("No password provided for FTP".to_string())
+            })?;
+
+        let ftp_object_store = FTPObjectStore::new(user, password, host.to_string(), port);
+        Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>)
+    }
+
+    fn prepare_sftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for SFTP".to_string(),
+            ));
+        };
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let port = params
+            .get("port")
+            .map_or("22".to_string(), ToOwned::to_owned);
+        let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No user provided for SFTP".to_string())
+        })?;
+        let password = params
+            .get("password")
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                DataFusionError::Configuration("No password provided for SFTP".to_string())
+            })?;
+
+        let sftp_object_store = SFTPObjectStore::new(user, password, host.to_string(), port);
+        Ok(Arc::new(sftp_object_store) as Arc<dyn ObjectStore>)
+    }
+
     fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-        {
-            if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
-                return Self::prepare_https_object_store(url);
-            }
-            if url.as_str().starts_with("s3://") {
-                return Self::prepare_s3_object_store(url);
-            }
-            #[cfg(feature = "ftp")]
-            if url.as_str().starts_with("ftp://") {
-                if let Some(host) = url.host() {
-                    let params: HashMap<String, String> =
-                        parse(url.fragment().unwrap_or_default().as_bytes())
-                            .into_owned()
-                            .collect();
-
-                    let port = params
-                        .get("port")
-                        .map_or("21".to_string(), ToOwned::to_owned);
-                    let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
-                        DataFusionError::Configuration("No user provided for FTP".to_string())
-                    })?;
-                    let password =
-                        params
-                            .get("password")
-                            .map(ToOwned::to_owned)
-                            .ok_or_else(|| {
-                                DataFusionError::Configuration(
-                                    "No password provided for FTP".to_string(),
-                                )
-                            })?;
-
-                    let ftp_object_store =
-                        FTPObjectStore::new(user, password, host.to_string(), port);
-                    return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);
-                }
-            }
-            #[cfg(feature = "ftp")]
-            if url.as_str().starts_with("sftp://") {
-                if let Some(host) = url.host() {
-                    let params: HashMap<String, String> =
-                        parse(url.fragment().unwrap_or_default().as_bytes())
-                            .into_owned()
-                            .collect();
-
-                    let port = params
-                        .get("port")
-                        .map_or("22".to_string(), ToOwned::to_owned);
-                    let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
-                        DataFusionError::Configuration("No user provided for SFTP".to_string())
-                    })?;
-                    let password =
-                        params
-                            .get("password")
-                            .map(ToOwned::to_owned)
-                            .ok_or_else(|| {
-                                DataFusionError::Configuration(
-                                    "No password provided for SFTP".to_string(),
-                                )
-                            })?;
-
-                    let sftp_object_store =
-                        SFTPObjectStore::new(user, password, host.to_string(), port);
-                    return Ok(Arc::new(sftp_object_store) as Arc<dyn ObjectStore>);
-                }
-            }
+        if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
+            return Self::prepare_https_object_store(url);
+        }
+        if url.as_str().starts_with("s3://") {
+            return Self::prepare_s3_object_store(url);
+        }
+        #[cfg(feature = "ftp")]
+        if url.as_str().starts_with("ftp://") {
+            return Self::prepare_ftp_object_store(url);
+        }
+        #[cfg(feature = "ftp")]
+        if url.as_str().starts_with("sftp://") {
+            return Self::prepare_sftp_object_store(url);
         }
 
         Err(DataFusionError::Execution(format!(
