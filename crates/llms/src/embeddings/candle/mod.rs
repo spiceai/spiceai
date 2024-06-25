@@ -20,10 +20,15 @@ use super::{
 use std::{
     collections::HashMap,
     fs,
-    os::unix::fs::symlink,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::symlink;
+
+#[cfg(not(target_os = "windows"))]
+use std::os::unix::fs::symlink;
 
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
@@ -73,7 +78,7 @@ impl CandleEmbedding {
         Self::try_new(&model_root, DType::F32)
     }
 
-    /// Attemmpt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
+    /// Attempt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
     pub fn try_new(model_root: &Path, dtype: DType) -> Result<Self> {
         Ok(Self {
             backend: Arc::new(Mutex::new(
