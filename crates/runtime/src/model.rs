@@ -56,6 +56,7 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
 
 pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::embeddings::Embeddings,
+    params: &HashMap<String, SecretString, S>,
 ) -> Result<Box<dyn Embed>, EmbedError> {
     let prefix = component
         .get_prefix()
@@ -69,11 +70,7 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
 
     let model_id = component.get_model_id();
 
-    match construct_embedding_params(
-        &prefix,
-        &model_id,
-        &(component.params).clone().unwrap_or_default(),
-    ) {
+    match construct_embedding_params(&prefix, &model_id, params) {
         Ok(EmbeddingParams::OpenAiParams {
             api_base,
             api_key,
@@ -278,7 +275,7 @@ fn construct_llm_params<S: ::std::hash::BuildHasher>(
 fn construct_embedding_params<S: ::std::hash::BuildHasher>(
     from: &EmbeddingPrefix,
     model_id: &Option<String>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, SecretString, S>,
 ) -> Result<EmbeddingParams, EmbedError> {
     match from {
         EmbeddingPrefix::OpenAi => Ok(EmbeddingParams::OpenAiParams {
@@ -299,13 +296,17 @@ fn construct_embedding_params<S: ::std::hash::BuildHasher>(
         EmbeddingPrefix::File => {
             let weights_path = model_id
                 .clone()
-                .or(params.get("weights_path").cloned())
+                .or(params
+                    .get("weights_path")
+                    .map(ExposeSecret::expose_secret)
+                    .cloned())
                 .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
             let config_path = params
                 .get("config_path")
+                .map(Secret::expose_secret)
                 .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: "No 'config_path' parameter provided".into(),
                 })?
@@ -313,6 +314,7 @@ fn construct_embedding_params<S: ::std::hash::BuildHasher>(
 
             let tokenizer_path = params
                 .get("tokenizer_path")
+                .map(Secret::expose_secret)
                 .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: "No 'tokenizer_path' parameter provided".into(),
                 })?
