@@ -16,6 +16,12 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow::array::{
+    Array, ArrayAccessor, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray,
+};
+
 use crate::debezium::{arrow::convert_fields_to_arrow_schema, change_event::ChangeEvent};
 
 use super::arrow::to_record_batch;
@@ -193,6 +199,7 @@ fn parse_arrow_schema() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn parse_values() {
     let change_event_json = include_str!("./all_types.json");
 
@@ -214,4 +221,117 @@ fn parse_values() {
 
     assert_eq!(record_batch.num_columns(), 24);
     assert_eq!(record_batch.num_rows(), 1);
+
+    let mut i: usize = 0;
+    assert_eq!(val::<i32, Int32Array>(&record_batch, &mut i), 1);
+    assert_eq!(val::<i16, Int16Array>(&record_batch, &mut i), 1);
+    assert_eq!(val::<i32, Int32Array>(&record_batch, &mut i), 2);
+    assert_eq!(val::<i64, Int64Array>(&record_batch, &mut i), 3);
+    assert_eq!(val::<f32, Float32Array>(&record_batch, &mut i), 4f32);
+    assert_eq!(val::<f64, Float64Array>(&record_batch, &mut i), 5f64);
+    assert_eq!(val::<&str, StringArray>(&record_batch, &mut i), "test");
+    assert_eq!(val::<&str, StringArray>(&record_batch, &mut i), "test");
+    assert_eq!(val::<&str, StringArray>(&record_batch, &mut i), "test");
+    assert!(val::<bool, BooleanArray>(&record_batch, &mut i));
+    assert_eq!(
+        val::<i128, Decimal128Array>(&record_batch, &mut i),
+        6_000_000_000_i128
+    );
+    assert_eq!(
+        val::<i64, TimestampMicrosecondArray>(&record_batch, &mut i),
+        1_719_400_371_219_026
+    );
+    assert_eq!(
+        val::<i64, TimestampMicrosecondArray>(&record_batch, &mut i),
+        1_719_367_971_219_026
+    );
+    assert_eq!(
+        val::<i64, Time64MicrosecondArray>(&record_batch, &mut i),
+        40_371_219_026
+    );
+    assert_eq!(
+        val::<i64, Time64MicrosecondArray>(&record_batch, &mut i),
+        7_971_219_026
+    );
+    assert_eq!(val::<i32, Date32Array>(&record_batch, &mut i), 19900);
+    assert_eq!(
+        val::<&str, StringArray>(&record_batch, &mut i),
+        "86f701e6-f8f8-4dc4-8cbd-ed84280b5b84"
+    );
+    assert_eq!(val_list::<i16, Int16Array>(&record_batch, i, 0), 1);
+    assert_eq!(val_list::<i16, Int16Array>(&record_batch, i, 1), 2);
+    i += 1;
+    assert_eq!(val_list::<i32, Int32Array>(&record_batch, i, 0), 3);
+    assert_eq!(val_list::<i32, Int32Array>(&record_batch, i, 1), 4);
+    i += 1;
+    assert_eq!(val_list::<i64, Int64Array>(&record_batch, i, 0), 5);
+    assert_eq!(val_list::<i64, Int64Array>(&record_batch, i, 1), 6);
+    i += 1;
+    assert_eq!(val_list::<f32, Float32Array>(&record_batch, i, 0), 7f32);
+    assert_eq!(val_list::<f32, Float32Array>(&record_batch, i, 1), 8f32);
+    i += 1;
+    assert_eq!(val_list::<f64, Float64Array>(&record_batch, i, 0), 9f64);
+    assert_eq!(val_list::<f64, Float64Array>(&record_batch, i, 1), 10f64);
+    i += 1;
+    assert_eq!(val_list_str(&record_batch, i, 0), "test1");
+    assert_eq!(val_list_str(&record_batch, i, 1), "test2");
+    i += 1;
+    assert!(val_list::<bool, BooleanArray>(&record_batch, i, 0));
+    assert!(!val_list::<bool, BooleanArray>(&record_batch, i, 1));
+}
+
+fn val<'a, 'b, T, A: 'static>(rb: &'a RecordBatch, col: &mut usize) -> T
+where
+    &'b A: ArrayAccessor<Item = T> + Array,
+    'a: 'b,
+{
+    let array_ref = rb
+        .column(*col)
+        .as_any()
+        .downcast_ref::<A>()
+        .expect("to downcast");
+
+    *col += 1;
+
+    array_ref.value(0)
+}
+
+fn val_list<'a, 'b, T, A: 'static>(rb: &'a RecordBatch, col: usize, list_row: usize) -> T
+where
+    for<'c> &'c A: ArrayAccessor<Item = T> + Array,
+    T: 'a,
+{
+    let list_array = rb
+        .column(col)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("to downcast");
+
+    let list_values = list_array.value(0);
+    let list = list_values
+        .as_any()
+        .downcast_ref::<A>()
+        .expect("to downcast");
+
+    assert!(!list.is_empty());
+    list.value(list_row)
+}
+
+fn val_list_str<'a>(rb: &'a RecordBatch, col: usize, list_row: usize) -> &'a str {
+    let list_array = rb
+        .column(col)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("to downcast");
+
+    let list_values = list_array.value(0);
+    let list = list_values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("to downcast");
+
+    assert!(!list.is_empty());
+    let value = list.value(list_row);
+    // Safety: We know the value is valid for the lifetime of the record batch
+    unsafe { std::mem::transmute::<&str, &'a str>(value) }
 }

@@ -21,16 +21,16 @@ use arrow::{
     array::{
         ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
         Int16Builder, Int32Builder, Int64Builder, ListBuilder, PrimitiveBuilder, RecordBatch,
-        StringBuilder, StructArray, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        StringBuilder, StructArray, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder,
     },
     datatypes::{
         ArrowPrimitiveType, DataType, Date32Type, Field, Int16Type, Int32Type, Int64Type, Schema,
-        Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType,
-        TimestampMillisecondType,
+        Time64MicrosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     },
 };
 use base64::prelude::*;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -235,10 +235,24 @@ fn append_field_value_to_builder(
             .fail()?,
         },
         DataType::Time64(TimeUnit::Microsecond) => {
-            append_i64_to_builder::<i64, Time64MicrosecondType>(field_value, builder)?;
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            append_i64_to_builder::<i64, Time64NanosecondType>(field_value, builder)?;
+            if field_value.is_string() {
+                let time_builder = downcast_builder::<Time64MicrosecondBuilder>(builder)?;
+                let time_micros = field_value
+                    .as_str()
+                    .map(|ts| {
+                        // ts is in the format "02:12:51.219026Z"
+                        let parsed_time: NaiveTime = NaiveTime::parse_from_str(ts, "%H:%M:%S%.fZ")
+                            .context(UnableToParseTimestampSnafu)?;
+                        let microseconds: i64 = i64::from(parsed_time.num_seconds_from_midnight())
+                            * 1_000_000
+                            + i64::from(parsed_time.nanosecond() / 1_000);
+                        Ok(microseconds)
+                    })
+                    .transpose()?;
+                time_builder.append_option(time_micros);
+            } else {
+                append_i64_to_builder::<i64, Time64MicrosecondType>(field_value, builder)?;
+            }
         }
         DataType::Date32 => {
             append_i64_to_builder::<i32, Date32Type>(field_value, builder)?;
@@ -309,10 +323,6 @@ fn append_field_value_to_builder(
                         },
                     )?;
                 }
-                DataType::Timestamp(_, _) => todo!(),
-                DataType::Date32 => todo!(),
-                DataType::Time32(_) => todo!(),
-                DataType::Decimal128(_, _) => todo!(),
                 _ => {
                     ListDataTypeNotSupportedSnafu {
                         data_type: field.data_type().clone(),
@@ -343,13 +353,13 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
         return Ok(());
     };
 
-    list_str_builder.append(true);
-
     let str_builder = downcast_builder::<T>(list_str_builder.values())?;
 
     for field_value in field_array {
         append(str_builder, field_value);
     }
+
+    list_str_builder.append(true);
 
     Ok(())
 }
@@ -385,9 +395,9 @@ fn convert_string_to_decimal(field_value: &str) -> Result<i128> {
         .decode(field_value)
         .context(UnableToDecodeBase64Snafu)?;
 
-    // Pad the bytes to 16 bytes
+    // Pad the bytes to 16 bytes, inserting 0s at the beginning
     while decimal_bytes.len() < 16 {
-        decimal_bytes.push(0);
+        decimal_bytes.insert(0, 0);
     }
 
     let decimal_slice: [u8; 16] = match decimal_bytes.try_into() {
