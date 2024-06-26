@@ -95,7 +95,7 @@ async-openai.workspace = true
 derive_builder = "0.20.0"
 keyring = { version = "2.3.2", optional = true }
 secrecy.workspace = true
-base64 = "0.22.0"
+base64.workspace = true
 aws-config = { version = "1.1.10", optional = true}
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
 aws-sdk-sts = { version = "1.19.0", optional = true }

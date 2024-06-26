@@ -2568,14 +2568,17 @@ name = "data_components"
 version = "0.15.0-alpha"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "arrow-flight",
  "arrow-odbc",
  "arrow_sql_gen",
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "bb8",
  "bb8-postgres",
  "bytes",
+ "chrono",
  "clickhouse-rs",
  "datafusion",
  "datafusion-federation",

@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f23af338e80e495b77fb38ced23f0ef88a94662c" }
 arrow = "52.0.0"
+arrow-buffer = "52.0.0"
 arrow-flight = "52.0.0"
 duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
@@ -78,3 +79,5 @@ datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-feder
 object_store = { version = "0.10.1" }
 itertools = "0.12"
 secrecy = "0.8.0"
+base64 = "0.22.1"
+chrono = "0.4.38"

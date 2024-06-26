@@ -12,6 +12,7 @@ exclude.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 datafusion.workspace = true
@@ -56,6 +57,8 @@ bytes = "1.6.0"
 url = "2.5.0"
 itertools.workspace = true
 secrecy.workspace = true
+base64.workspace = true
+chrono.workspace = true
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb"]
