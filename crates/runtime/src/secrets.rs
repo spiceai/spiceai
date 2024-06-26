@@ -279,10 +279,9 @@ impl SecretsProvider {
     }
 }
 
-
-/// Retrieves an associated value from either the secret store or in the component's params. For 
-/// secrets, the associated key into secrets, is the value associated to the `param` 
-/// key: `secret_param_key`. Fallback to a hardcoded value in `params` (accessed via `param_key`) 
+/// Retrieves an associated value from either the secret store or in the component's params. For
+/// secrets, the associated key into secrets, is the value associated to the `param`
+/// key: `secret_param_key`. Fallback to a hardcoded value in `params` (accessed via `param_key`)
 /// if:
 ///   1. There is no provided secret
 ///   2. There is no entry with key `secret_param_key` in params
@@ -320,7 +319,6 @@ mod tests {
 
     use crate::secrets::{get_secret_or_param, Secret};
 
-    
     #[test]
     fn test_value_from_secret() {
         let mut params = HashMap::new();
@@ -330,9 +328,12 @@ mod tests {
         let secret = Secret::new(
             vec![("val".to_string(), "secret_value".to_string())]
                 .into_iter()
-                .collect()
+                .collect(),
         );
-        assert_eq!(Some("secret_value".to_string()), get_secret_or_param(&params, &Some(secret), "secret_param", "anything"));
+        assert_eq!(
+            Some("secret_value".to_string()),
+            get_secret_or_param(&params, &Some(secret), "secret_param", "anything")
+        );
     }
 
     #[test]
@@ -344,8 +345,11 @@ mod tests {
         let secret = Secret::new(
             vec![("val".to_string(), "secret_value".to_string())]
                 .into_iter()
-                .collect()
+                .collect(),
         );
-        assert_eq!(Some("value_from_params".to_string()), get_secret_or_param(&params, &Some(secret), "secret_param", "anything"));
+        assert_eq!(
+            Some("value_from_params".to_string()),
+            get_secret_or_param(&params, &Some(secret), "secret_param", "anything")
+        );
     }
 }

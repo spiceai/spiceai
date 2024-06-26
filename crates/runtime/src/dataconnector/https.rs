@@ -80,7 +80,12 @@ impl ListingTableConnector for Https {
             let _ = u.set_port(Some(n));
         };
 
-        if let Some(p) = get_secret_or_param(&self.params, &self.secret, "http_password_key", "http_password") {
+        if let Some(p) = get_secret_or_param(
+            &self.params,
+            &self.secret,
+            "http_password_key",
+            "http_password",
+        ) {
             if u.set_password(Some(&p)).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
