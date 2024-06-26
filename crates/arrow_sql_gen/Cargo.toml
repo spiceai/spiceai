@@ -28,7 +28,7 @@ time = "0.3.34"
 bigdecimal = "0.4.3"
 tokio.workspace = true
 rusqlite = { workspace = true, optional = true }
-chrono = "0.4.35"
+chrono.workspace = true
 chrono-tz = "0.8.6"
 
 mysql_async = { workspace = true, optional = true }
