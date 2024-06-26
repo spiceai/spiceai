@@ -29,6 +29,7 @@ deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "488e36c8d7
     "azure",
 ], optional = true }
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 reqwest = { version = "0.11.24", features = ["json"] }
 db_connection_pool = { path = "../db_connection_pool" }
 duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow", "appender-arrow"], optional = true }
@@ -67,6 +68,7 @@ spark_connect = ["dep:spark-connect-rs"]
 databricks = ["dep:deltalake", "spark_connect"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc"]
 snowflake = ["dep:snowflake-api"]
+debezium = ["dep:serde_json"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
