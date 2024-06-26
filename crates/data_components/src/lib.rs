@@ -28,6 +28,8 @@ pub mod databricks_spark;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "debezium")]
+pub mod debezium;
 #[cfg(feature = "databricks")]
 pub mod deltatable;
 #[cfg(feature = "duckdb")]

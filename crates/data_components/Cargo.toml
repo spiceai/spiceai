@@ -69,6 +69,7 @@ uuid.workspace = true
 [features]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
 databricks = ["dep:deltalake", "spark_connect"]
+debezium = ["dep:serde_json"]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb"]
 flightsql = ["dep:tonic", "dep:r2d2"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
