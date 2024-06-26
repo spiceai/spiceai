@@ -35,6 +35,7 @@ clickhouse-rs = { workspace = true, optional = true }
 tokio-postgres = { workspace = true , optional = true}
 async-stream = { workspace = true, optional = true }
 snowflake-api = { workspace = true, optional = true }
+sysinfo = { workspace = true, optional = true }
 pkcs8 = { version = "0.10.2",  features = ["encryption", "pem", "3des"], optional = true }
 url = "2.5.0"
 secrecy.workspace = true
@@ -54,6 +55,7 @@ postgres = [
     "arrow_sql_gen/postgres",
     "dep:tokio-postgres",
     "dep:async-stream",
+    "dep:sysinfo",
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]

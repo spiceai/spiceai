@@ -78,3 +78,4 @@ datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-feder
 object_store = { version = "0.10.1" }
 itertools = "0.12"
 secrecy = "0.8.0"
+sysinfo = "0.30.12"

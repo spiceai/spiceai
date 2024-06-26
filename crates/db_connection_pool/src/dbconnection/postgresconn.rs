@@ -18,7 +18,6 @@ use std::any::Any;
 use std::error::Error;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::postgres::columns_to_schema;
@@ -34,6 +33,7 @@ use futures::stream;
 use futures::StreamExt;
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
+use sysinfo::System;
 
 use super::AsyncDbConnection;
 use super::DbConnection;
@@ -151,30 +151,28 @@ impl<'a>
             .await
             .context(QuerySnafu)?;
 
-        // chunk the stream into groups of 4k rows
-        //
-        // TODO: make chunk count configurable?
-        // we could use sysinfo to dynamically change row count based on system memory: https://crates.io/crates/sysinfo
-        let mut stream = streamable.chunks(4000).boxed().map(|rows| {
-            let rows = rows
-                .into_iter()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context(QuerySnafu)?;
-            let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-            Ok::<_, PostgresError>(rec)
-        });
+        // chunk the stream into groups of rows based on available system memory
+        let chunk_size = determine_chunk_size();
+        let mut stream = streamable
+            .chunks(chunk_size.try_into()?)
+            .boxed()
+            .map(|rows| {
+                let rows = rows
+                    .into_iter()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context(QuerySnafu)?;
+                let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+                Ok::<_, PostgresError>(rec)
+            });
 
-        let first_chunk = stream.next().await;
-        if first_chunk.is_none() {
+        let Some(first_chunk) = stream.next().await else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
                 stream::empty(),
             )));
-        }
+        };
 
-        let first_chunk =
-            first_chunk.unwrap_or(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))?; // more lax clippy rules might be nice here so we could just .unwrap()
-
+        let first_chunk = first_chunk?;
         let schema = first_chunk.schema(); // like clickhouse, pull out the schema from the first chunk to use in the DataFusion Stream Adapter
 
         let output_stream = stream! {
@@ -200,4 +198,21 @@ impl<'a>
     async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
         Ok(self.conn.execute(sql, params).await?)
     }
+}
+
+const KILOBYTE: u64 = 1_024;
+const MEGABYTE: u64 = 1_024 * KILOBYTE;
+const REFERENCE_CHUNKS_PER_GB: u64 = 15_000;
+const REFERENCE_CHUNKS_PER_MB: u64 = REFERENCE_CHUNKS_PER_GB / 1_024;
+
+fn determine_chunk_size() -> u64 {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let mem = sys.free_memory() / MEGABYTE; // free memory in MB
+                                            // free includes cached memory available for flushing
+                                            // this is the safest calculation method for available system memory
+                                            // use MB as the unit of reference, as we might be running on low memory systems
+
+    REFERENCE_CHUNKS_PER_MB * mem
 }
