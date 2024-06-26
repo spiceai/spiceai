@@ -2568,6 +2568,7 @@ name = "data_components"
 version = "0.15.0-alpha"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "arrow-flight",
  "arrow-odbc",
  "arrow_sql_gen",

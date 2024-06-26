@@ -12,6 +12,7 @@ exclude.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 datafusion.workspace = true

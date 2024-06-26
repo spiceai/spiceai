@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::arrow::struct_builder::StructBuilder;
+
 use super::change_event::Field as ChangeEventField;
 use arrow::{
     array::{
         ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
         Int16Builder, Int32Builder, Int64Builder, ListBuilder, PrimitiveBuilder, RecordBatch,
-        StringBuilder, StructArray, StructBuilder, TimestampMicrosecondBuilder,
-        TimestampMillisecondBuilder,
+        StringBuilder, StructArray, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
     },
     datatypes::{
         ArrowPrimitiveType, DataType, Date32Type, Field, Int16Type, Int32Type, Int64Type, Schema,
@@ -123,7 +124,7 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), values.len());
 
     for value in values {
-        append_value_to_struct_builder(value, schema, &mut struct_builder)?;
+        append_value_to_struct_builder(value, &mut struct_builder)?;
     }
 
     Ok(struct_builder.finish())
@@ -131,12 +132,11 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
 
 pub fn append_value_to_struct_builder(
     value: serde_json::Value,
-    schema: &Schema,
     builder: &mut StructBuilder,
 ) -> Result<()> {
     builder.append(true);
 
-    for (idx, field) in schema.fields().iter().enumerate() {
+    for (idx, field) in builder.fields().iter().enumerate() {
         let Some(field_value) = value.get(field.name()) else {
             return MissingFieldInValueSnafu {
                 field_name: field.name().to_string(),
@@ -145,7 +145,7 @@ pub fn append_value_to_struct_builder(
             .fail();
         };
 
-        let field_builder = get_builder::<Box<dyn ArrayBuilder>>(idx, builder, schema)?;
+        let field_builder = builder.field_builder_array(idx);
 
         append_field_value_to_builder(field_value, field, field_builder)?;
     }
@@ -158,7 +158,7 @@ pub fn append_value_to_struct_builder(
 fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,
-    builder: &mut Box<dyn ArrayBuilder>,
+    builder: &mut dyn ArrayBuilder,
 ) -> Result<()> {
     match field.data_type() {
         DataType::Utf8 => {
@@ -291,8 +291,24 @@ fn append_field_value_to_builder(
                         },
                     )?;
                 }
-                DataType::Float32 => todo!(),
-                DataType::Float64 => todo!(),
+                DataType::Float32 => {
+                    append_array_value_to_list_builder::<Float32Builder>(
+                        field_array,
+                        builder,
+                        |float_builder, field_value| {
+                            float_builder.append_option(field_value.as_f64().map(|f| f as f32));
+                        },
+                    )?;
+                }
+                DataType::Float64 => {
+                    append_array_value_to_list_builder::<Float64Builder>(
+                        field_array,
+                        builder,
+                        |float_builder, field_value| {
+                            float_builder.append_option(field_value.as_f64());
+                        },
+                    )?;
+                }
                 DataType::Timestamp(_, _) => todo!(),
                 DataType::Date32 => todo!(),
                 DataType::Time32(_) => todo!(),
@@ -318,10 +334,10 @@ fn append_field_value_to_builder(
 
 fn append_array_value_to_list_builder<T: ArrayBuilder>(
     field_array: Option<&Vec<serde_json::Value>>,
-    builder: &mut Box<dyn ArrayBuilder>,
+    builder: &mut dyn ArrayBuilder,
     append: impl Fn(&mut T, &serde_json::Value),
 ) -> Result<()> {
-    let list_str_builder = downcast_builder::<ListBuilder<T>>(builder)?;
+    let list_str_builder = downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(builder)?;
     let Some(field_array) = field_array else {
         list_str_builder.append_null();
         return Ok(());
@@ -329,7 +345,7 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
 
     list_str_builder.append(true);
 
-    let str_builder = list_str_builder.values();
+    let str_builder = downcast_builder::<T>(list_str_builder.values())?;
 
     for field_value in field_array {
         append(str_builder, field_value);
@@ -340,7 +356,7 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
 
 fn append_i64_to_builder<CastTo, T: ArrowPrimitiveType<Native = CastTo>>(
     field_value: &serde_json::Value,
-    builder: &mut Box<dyn ArrayBuilder>,
+    builder: &mut dyn ArrayBuilder,
 ) -> Result<()>
 where
     CastTo: TryFrom<i64> + Copy,
@@ -356,26 +372,11 @@ where
     Ok(())
 }
 
-fn downcast_builder<T: ArrayBuilder>(builder: &mut Box<dyn ArrayBuilder>) -> Result<&mut T> {
+fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T> {
     let builder = builder
         .as_any_mut()
         .downcast_mut::<T>()
         .context(DowncastBuilderSnafu)?;
-    Ok(builder)
-}
-
-fn get_builder<'a, T: ArrayBuilder>(
-    field_idx: usize,
-    builder: &'a mut StructBuilder,
-    schema: &'_ Schema,
-) -> Result<&'a mut T> {
-    let Some(builder) = builder.field_builder::<T>(field_idx) else {
-        return MissingStructBuilderSnafu {
-            data_struct_field_idx: field_idx,
-            schema: schema.clone(),
-        }
-        .fail();
-    };
     Ok(builder)
 }
 

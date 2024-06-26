@@ -28,6 +28,7 @@ use crate::delete::DeletionTableProviderAdapter;
 
 use self::write::MemTable;
 
+pub mod struct_builder;
 pub mod write;
 
 #[allow(clippy::module_name_repetitions)]
