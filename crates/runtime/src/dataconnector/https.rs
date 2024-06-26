@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use crate::secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -30,6 +30,7 @@ use super::{
 
 pub struct Https {
     params: Arc<HashMap<String, String>>,
+    secret: Option<Secret>,
 }
 
 impl std::fmt::Display for Https {
@@ -40,10 +41,10 @@ impl std::fmt::Display for Https {
 
 impl DataConnectorFactory for Https {
     fn create(
-        _secret: Option<Secret>,
+        secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(Self { secret, params }) as Arc<dyn DataConnector>) })
     }
 }
 
@@ -57,7 +58,7 @@ impl ListingTableConnector for Https {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let u = Url::parse(&dataset.from).boxed().map_err(|e| {
+        let mut u = Url::parse(&dataset.from).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),
                 message: format!("Invalid URL: {e}"),
@@ -65,6 +66,39 @@ impl ListingTableConnector for Https {
             }
         })?;
 
+        if let Some(p) = self.params.get("port") {
+            let n = match p.parse::<u16>() {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "https".to_string(),
+                        message: format!("Invalid port parameter: {e}"),
+                        source: Box::new(e),
+                    });
+                }
+            };
+            let _ = u.set_port(Some(n));
+        };
+
+        if let Some(p) = get_secret_or_param(&self.params, &self.secret, "http_password_key", "http_password") {
+            if u.set_password(Some(&p)).is_err() {
+                return Err(
+                    DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                        dataconnector: "https".to_string(),
+                    },
+                );
+            };
+        }
+
+        if let Some(p) = self.params.get("username") {
+            if u.set_username(p).is_err() {
+                return Err(
+                    DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                        dataconnector: "https".to_string(),
+                    },
+                );
+            };
+        }
         Ok(u)
     }
 }

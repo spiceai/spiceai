@@ -96,6 +96,7 @@ impl SpiceObjectStoreRegistry {
         ))
     }
 
+    #[cfg(feature = "ftp")]
     fn prepare_ftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(host) = url.host() else {
             return Err(DataFusionError::Configuration(
@@ -119,10 +120,10 @@ impl SpiceObjectStoreRegistry {
                 DataFusionError::Configuration("No password provided for FTP".to_string())
             })?;
 
-        let ftp_object_store = FTPObjectStore::new(user, password, host.to_string(), port);
-        Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>)
+        Ok(Arc::new(FTPObjectStore::new(user, password, host.to_string(), port)) as Arc<dyn ObjectStore>)
     }
 
+    #[cfg(feature = "ftp")]
     fn prepare_sftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(host) = url.host() else {
             return Err(DataFusionError::Configuration(
@@ -146,8 +147,7 @@ impl SpiceObjectStoreRegistry {
                 DataFusionError::Configuration("No password provided for SFTP".to_string())
             })?;
 
-        let sftp_object_store = SFTPObjectStore::new(user, password, host.to_string(), port);
-        Ok(Arc::new(sftp_object_store) as Arc<dyn ObjectStore>)
+        Ok(Arc::new(SFTPObjectStore::new(user, password, host.to_string(), port)) as Arc<dyn ObjectStore>)
     }
 
     fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
@@ -161,6 +161,7 @@ impl SpiceObjectStoreRegistry {
         if url.as_str().starts_with("ftp://") {
             return Self::prepare_ftp_object_store(url);
         }
+
         #[cfg(feature = "ftp")]
         if url.as_str().starts_with("sftp://") {
             return Self::prepare_sftp_object_store(url);
