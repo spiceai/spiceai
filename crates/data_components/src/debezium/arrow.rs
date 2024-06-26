@@ -18,12 +18,14 @@ use super::change_event::Field as ChangeEventField;
 use arrow::{
     array::{
         ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
-        PrimitiveBuilder, RecordBatch, StringBuilder, StructArray, StructBuilder,
-        TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        Int16Builder, Int32Builder, Int64Builder, ListBuilder, PrimitiveBuilder, RecordBatch,
+        StringBuilder, StructArray, StructBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder,
     },
     datatypes::{
-        ArrowPrimitiveType, DataType, Field, Int16Type, Int32Type, Int64Type, Schema, TimeUnit,
-        TimestampMicrosecondType, TimestampMillisecondType,
+        ArrowPrimitiveType, DataType, Date32Type, Field, Int16Type, Int32Type, Int64Type, Schema,
+        Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType,
+        TimestampMillisecondType,
     },
 };
 use base64::prelude::*;
@@ -68,6 +70,9 @@ pub enum Error {
         schema: Schema,
     },
 
+    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    DowncastBuilder,
+
     #[snafu(display("Unable to decode base64 string: {source}"))]
     UnableToDecodeBase64 { source: base64::DecodeError },
 
@@ -88,6 +93,9 @@ pub enum Error {
 
     #[snafu(display("Data type {data_type} not supported yet"))]
     DataTypeNotSupported { data_type: DataType },
+
+    #[snafu(display("List field {data_type} not supported yet"))]
+    ListDataTypeNotSupported { data_type: DataType },
 
     #[snafu(display("Debezium field type {field_type} not supported yet"))]
     DebeziumFieldNotSupported { field_type: String },
@@ -115,15 +123,13 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), values.len());
 
     for value in values {
-        append_value_to_builder(value, schema, &mut struct_builder)?;
+        append_value_to_struct_builder(value, schema, &mut struct_builder)?;
     }
 
     Ok(struct_builder.finish())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::too_many_lines)]
-pub fn append_value_to_builder(
+pub fn append_value_to_struct_builder(
     value: serde_json::Value,
     schema: &Schema,
     builder: &mut StructBuilder,
@@ -139,99 +145,194 @@ pub fn append_value_to_builder(
             .fail();
         };
 
-        match field.data_type() {
-            DataType::Utf8 => {
-                let str_builder = get_builder::<StringBuilder>(idx, builder, schema)?;
-                str_builder.append_option(field_value.as_str());
+        let field_builder = get_builder::<Box<dyn ArrayBuilder>>(idx, builder, schema)?;
+
+        append_field_value_to_builder(field_value, field, field_builder)?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_lines)]
+fn append_field_value_to_builder(
+    field_value: &serde_json::Value,
+    field: &Arc<Field>,
+    builder: &mut Box<dyn ArrayBuilder>,
+) -> Result<()> {
+    match field.data_type() {
+        DataType::Utf8 => {
+            let str_builder = downcast_builder::<StringBuilder>(builder)?;
+            str_builder.append_option(field_value.as_str());
+        }
+        DataType::Int16 => {
+            append_i64_to_builder::<i16, Int16Type>(field_value, builder)?;
+        }
+        DataType::Int32 => {
+            append_i64_to_builder::<i32, Int32Type>(field_value, builder)?;
+        }
+        DataType::Int64 => {
+            append_i64_to_builder::<i64, Int64Type>(field_value, builder)?;
+        }
+        DataType::Float32 => {
+            let float_builder = downcast_builder::<Float32Builder>(builder)?;
+            float_builder.append_option(field_value.as_f64().map(|f| f as f32));
+        }
+        DataType::Float64 => {
+            let float_builder = downcast_builder::<Float64Builder>(builder)?;
+            float_builder.append_option(field_value.as_f64());
+        }
+        DataType::Boolean => {
+            let bool_builder = downcast_builder::<BooleanBuilder>(builder)?;
+            bool_builder.append_option(field_value.as_bool());
+        }
+        DataType::Decimal128(_, _) => {
+            let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
+            decimal_builder.append_option(
+                field_value
+                    .as_str()
+                    .map(convert_string_to_decimal)
+                    .transpose()?,
+            );
+        }
+        DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
+            (TimeUnit::Microsecond, None) => {
+                append_i64_to_builder::<i64, TimestampMicrosecondType>(field_value, builder)?;
             }
-            DataType::Int16 => {
-                append_i64_to_builder::<i16, Int16Type>(field_value, idx, builder, schema)?;
+            (TimeUnit::Millisecond, None) => {
+                append_i64_to_builder::<i64, TimestampMillisecondType>(field_value, builder)?;
             }
-            DataType::Int32 => {
-                append_i64_to_builder::<i32, Int32Type>(field_value, idx, builder, schema)?;
+            (TimeUnit::Microsecond, Some(_)) => {
+                let tz_builder = downcast_builder::<TimestampMicrosecondBuilder>(builder)?;
+                let time_micros = field_value
+                    .as_str()
+                    .map(|ts| {
+                        // ts is in the format "2024-06-26T02:12:51.219026Z"
+                        let parsed_timestamp: DateTime<Utc> =
+                            ts.parse().context(UnableToParseTimestampSnafu)?;
+                        Ok(parsed_timestamp.timestamp_micros())
+                    })
+                    .transpose()?;
+                tz_builder.append_option(time_micros);
             }
-            DataType::Int64 => {
-                append_i64_to_builder::<i64, Int64Type>(field_value, idx, builder, schema)?;
+            (TimeUnit::Millisecond, Some(_)) => {
+                let tz_builder = downcast_builder::<TimestampMillisecondBuilder>(builder)?;
+                let time_millis = field_value
+                    .as_str()
+                    .map(|ts| {
+                        // ts is in the format "2024-06-26T02:12:51.219026Z"
+                        let parsed_timestamp: DateTime<Utc> =
+                            ts.parse().context(UnableToParseTimestampSnafu)?;
+                        Ok(parsed_timestamp.timestamp_millis())
+                    })
+                    .transpose()?;
+                tz_builder.append_option(time_millis);
             }
-            DataType::Float32 => {
-                let float_builder = get_builder::<Float32Builder>(idx, builder, schema)?;
-                float_builder.append_option(field_value.as_f64().map(|f| f as f32));
+            _ => TimestampNotSupportedSnafu {
+                unit: unit.clone(),
+                time_zone: time_zone.as_ref().map(|tz| tz.as_ref().to_string()),
             }
-            DataType::Float64 => {
-                let float_builder = get_builder::<Float64Builder>(idx, builder, schema)?;
-                float_builder.append_option(field_value.as_f64());
-            }
-            DataType::Boolean => {
-                let bool_builder = get_builder::<BooleanBuilder>(idx, builder, schema)?;
-                bool_builder.append_option(field_value.as_bool());
-            }
-            DataType::Decimal128(_, _) => {
-                let decimal_builder = get_builder::<Decimal128Builder>(idx, builder, schema)?;
-                decimal_builder.append_option(
-                    field_value
-                        .as_str()
-                        .map(convert_string_to_decimal)
-                        .transpose()?,
-                );
-            }
-            DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
-                (TimeUnit::Microsecond, None) => {
-                    append_i64_to_builder::<i64, TimestampMicrosecondType>(
-                        field_value,
-                        idx,
+            .fail()?,
+        },
+        DataType::Time64(TimeUnit::Microsecond) => {
+            append_i64_to_builder::<i64, Time64MicrosecondType>(field_value, builder)?;
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            append_i64_to_builder::<i64, Time64NanosecondType>(field_value, builder)?;
+        }
+        DataType::Date32 => {
+            append_i64_to_builder::<i32, Date32Type>(field_value, builder)?;
+        }
+        DataType::List(field) => {
+            let field_array: Option<&Vec<serde_json::Value>> = field_value.as_array();
+            match field.data_type() {
+                DataType::Utf8 => {
+                    append_array_value_to_list_builder::<StringBuilder>(
+                        field_array,
                         builder,
-                        schema,
+                        |str_builder, field_value| {
+                            str_builder.append_option(field_value.as_str());
+                        },
                     )?;
                 }
-                (TimeUnit::Millisecond, None) => {
-                    append_i64_to_builder::<i64, TimestampMillisecondType>(
-                        field_value,
-                        idx,
+                DataType::Boolean => {
+                    append_array_value_to_list_builder::<BooleanBuilder>(
+                        field_array,
                         builder,
-                        schema,
+                        |bool_builder, field_value| {
+                            bool_builder.append_option(field_value.as_bool());
+                        },
                     )?;
                 }
-                (TimeUnit::Microsecond, Some(_)) => {
-                    let tz_builder =
-                        get_builder::<TimestampMicrosecondBuilder>(idx, builder, schema)?;
-                    let time_micros = field_value
-                        .as_str()
-                        .map(|ts| {
-                            // ts is in the format "2024-06-26T02:12:51.219026Z"
-                            let parsed_timestamp: DateTime<Utc> =
-                                ts.parse().context(UnableToParseTimestampSnafu)?;
-                            Ok(parsed_timestamp.timestamp_micros())
-                        })
-                        .transpose()?;
-                    tz_builder.append_option(time_micros);
+                DataType::Int16 => {
+                    append_array_value_to_list_builder::<Int16Builder>(
+                        field_array,
+                        builder,
+                        |ts_builder, field_value| {
+                            ts_builder.append_option(field_value.as_i64().map(|i| i as i16));
+                        },
+                    )?;
                 }
-                (TimeUnit::Millisecond, Some(_)) => {
-                    let tz_builder =
-                        get_builder::<TimestampMillisecondBuilder>(idx, builder, schema)?;
-                    let time_millis = field_value
-                        .as_str()
-                        .map(|ts| {
-                            // ts is in the format "2024-06-26T02:12:51.219026Z"
-                            let parsed_timestamp: DateTime<Utc> =
-                                ts.parse().context(UnableToParseTimestampSnafu)?;
-                            Ok(parsed_timestamp.timestamp_millis())
-                        })
-                        .transpose()?;
-                    tz_builder.append_option(time_millis);
+                DataType::Int32 => {
+                    append_array_value_to_list_builder::<Int32Builder>(
+                        field_array,
+                        builder,
+                        |ts_builder, field_value| {
+                            ts_builder.append_option(field_value.as_i64().map(|i| i as i32));
+                        },
+                    )?;
                 }
-                _ => TimestampNotSupportedSnafu {
-                    unit: unit.clone(),
-                    time_zone: time_zone.as_ref().map(|tz| tz.as_ref().to_string()),
+                DataType::Int64 => {
+                    append_array_value_to_list_builder::<Int64Builder>(
+                        field_array,
+                        builder,
+                        |ts_builder, field_value| {
+                            ts_builder.append_option(field_value.as_i64());
+                        },
+                    )?;
                 }
-                .fail()?,
-            },
-            _ => {
-                DataTypeNotSupportedSnafu {
-                    data_type: field.data_type().clone(),
+                DataType::Float32 => todo!(),
+                DataType::Float64 => todo!(),
+                DataType::Timestamp(_, _) => todo!(),
+                DataType::Date32 => todo!(),
+                DataType::Time32(_) => todo!(),
+                DataType::Decimal128(_, _) => todo!(),
+                _ => {
+                    ListDataTypeNotSupportedSnafu {
+                        data_type: field.data_type().clone(),
+                    }
+                    .fail()?;
                 }
-                .fail()?;
             }
         }
+        _ => {
+            DataTypeNotSupportedSnafu {
+                data_type: field.data_type().clone(),
+            }
+            .fail()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn append_array_value_to_list_builder<T: ArrayBuilder>(
+    field_array: Option<&Vec<serde_json::Value>>,
+    builder: &mut Box<dyn ArrayBuilder>,
+    append: impl Fn(&mut T, &serde_json::Value),
+) -> Result<()> {
+    let list_str_builder = downcast_builder::<ListBuilder<T>>(builder)?;
+    let Some(field_array) = field_array else {
+        list_str_builder.append_null();
+        return Ok(());
+    };
+
+    list_str_builder.append(true);
+
+    let str_builder = list_str_builder.values();
+
+    for field_value in field_array {
+        append(str_builder, field_value);
     }
 
     Ok(())
@@ -239,14 +340,12 @@ pub fn append_value_to_builder(
 
 fn append_i64_to_builder<CastTo, T: ArrowPrimitiveType<Native = CastTo>>(
     field_value: &serde_json::Value,
-    field_idx: usize,
-    builder: &mut StructBuilder,
-    schema: &Schema,
+    builder: &mut Box<dyn ArrayBuilder>,
 ) -> Result<()>
 where
     CastTo: TryFrom<i64> + Copy,
 {
-    let ts_builder = get_builder::<PrimitiveBuilder<T>>(field_idx, builder, schema)?;
+    let ts_builder = downcast_builder::<PrimitiveBuilder<T>>(builder)?;
     ts_builder.append_option(
         field_value
             .as_i64()
@@ -255,6 +354,14 @@ where
             .map_err(|_| Error::UnableToConvertToI64)?,
     );
     Ok(())
+}
+
+fn downcast_builder<T: ArrayBuilder>(builder: &mut Box<dyn ArrayBuilder>) -> Result<&mut T> {
+    let builder = builder
+        .as_any_mut()
+        .downcast_mut::<T>()
+        .context(DowncastBuilderSnafu)?;
+    Ok(builder)
 }
 
 fn get_builder<'a, T: ArrayBuilder>(
