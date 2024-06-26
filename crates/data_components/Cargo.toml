@@ -12,14 +12,17 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-buffer.workspace = true
 arrow-flight.workspace = true
 arrow-odbc = { workspace = true, optional = true }
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 async-stream.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
 bytes = "1.6.0"
+chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
