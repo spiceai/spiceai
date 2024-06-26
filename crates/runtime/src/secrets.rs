@@ -314,7 +314,12 @@ pub fn get_secret_or_param(
     None
 }
 
+#[allow(unused_imports)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::secrets::{get_secret_or_param, Secret};
+
     
     #[test]
     fn test_value_from_secret() {

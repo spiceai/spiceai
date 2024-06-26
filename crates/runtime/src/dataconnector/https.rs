@@ -44,7 +44,7 @@ impl DataConnectorFactory for Https {
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { secret, params }) as Arc<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(Self { params, secret }) as Arc<dyn DataConnector>) })
     }
 }
 
