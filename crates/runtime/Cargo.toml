@@ -23,7 +23,7 @@ aws-config = { version = "1.1.10", optional = true }
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
 aws-sdk-sts = { version = "1.19.0", optional = true }
 axum = { version = "0.7.4", features = ["macros"] }
-base64 = "0.22.0"
+base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
 bytes = { version = "1", default-features = false }
