@@ -211,7 +211,7 @@ fn determine_chunk_size() -> u64 {
 
     let mem = sys.free_memory() / MEGABYTE; // free memory in MB
                                             // free includes cached memory available for flushing
-                                            // this is the safest calculation method for available system memory
+                                            // this is a safe calculation method for available system memory
                                             // use MB as the unit of reference, as we might be running on low memory systems
 
     REFERENCE_CHUNKS_PER_MB * mem
