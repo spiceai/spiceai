@@ -53,6 +53,7 @@ postgres = [
     "dep:tokio",
     "arrow_sql_gen/postgres",
     "dep:tokio-postgres",
+    "dep:async-stream",
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
