@@ -152,14 +152,16 @@ impl<'a>
             .context(QuerySnafu)?;
 
         // chunk the stream into groups of 4k rows
+        //
         // TODO: make chunk count configurable?
+        // we could use sysinfo to dynamically change row count based on system memory: https://crates.io/crates/sysinfo
         let mut stream = streamable.chunks(4000).boxed().map(|rows| {
             let rows = rows
                 .into_iter()
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context(QuerySnafu)?;
             let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-            Ok::<arrow::array::RecordBatch, PostgresError>(rec)
+            Ok::<_, PostgresError>(rec)
         });
 
         let first_chunk = stream.next().await;
@@ -172,6 +174,7 @@ impl<'a>
 
         let first_chunk =
             first_chunk.unwrap_or(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))?; // more lax clippy rules might be nice here so we could just .unwrap()
+
         let schema = first_chunk.schema(); // like clickhouse, pull out the schema from the first chunk to use in the DataFusion Stream Adapter
 
         let output_stream = stream! {
@@ -192,12 +195,6 @@ impl<'a>
             schema,
             output_stream,
         )))
-
-        // let rows = self.conn.query(sql, params).await.context(QuerySnafu)?;
-        // let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-        // let schema = rec.schema();
-        // let recs = vec![rec];
-        // Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 
     async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
