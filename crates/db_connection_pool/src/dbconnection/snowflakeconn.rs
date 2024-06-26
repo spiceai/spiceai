@@ -58,6 +58,9 @@ pub enum Error {
     #[snafu(display("Failed to cast snowflake timestamp to arrow timestamp: {reason}"))]
     UnableToCastSnowflakeTimestamp { reason: String },
 
+    #[snafu(display("Failed to cast snowflake fixed-point number to decimal: {source}"))]
+    UnableToCastSnowflakeNumericToDecimal { source: arrow::error::ArrowError },
+
     #[snafu(display("Failed to create record batch: {source}"))]
     FailedToCreateRecordBatch { source: arrow::error::ArrowError },
 }
@@ -181,7 +184,8 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
 
     for (idx, field) in record_batch.schema().fields().iter().enumerate() {
         let column = record_batch.column(idx);
-        if let Some(sf_logical_type) = field.metadata().get("logicalType") {
+        let field_metadata = field.metadata();
+        if let Some(sf_logical_type) = field_metadata.get("logicalType") {
             if sf_logical_type.to_lowercase().as_str() == "timestamp_ntz" {
                 fields.push(Arc::new(Field::new(
                     field.name(),
@@ -190,6 +194,34 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
                 )));
                 columns.push(cast_sf_timestamp_ntz_to_arrow_timestamp(column)?);
                 continue;
+            }
+
+            let is_decimal_type = matches!(
+                field.data_type(),
+                DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+            );
+
+            if !is_decimal_type && sf_logical_type.to_lowercase().as_str() == "fixed" {
+                if let (Some(precision_str), Some(scale_str)) =
+                    (field_metadata.get("precision"), field_metadata.get("scale"))
+                {
+                    if let (Ok(precision), Ok(scale)) =
+                        (precision_str.parse::<u8>(), scale_str.parse::<i8>())
+                    {
+                        if scale != 0 {
+                            fields.push(Arc::new(Field::new(
+                                field.name(),
+                                DataType::Decimal128(precision, scale),
+                                field.is_nullable(),
+                            )));
+
+                            columns.push(cast_sf_fixed_point_number_to_decimal(
+                                column, precision, scale,
+                            )?);
+                            continue;
+                        }
+                    }
+                }
             }
         }
         fields.push(Arc::clone(field));
@@ -240,6 +272,18 @@ fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRe
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn cast_sf_fixed_point_number_to_decimal(
+    column: &ArrayRef,
+    precision: u8,
+    scale: i8,
+) -> Result<ArrayRef, Error> {
+    let decimal_type = DataType::Decimal128(precision, scale);
+    let decimal_array = arrow::compute::cast(&column, &decimal_type)
+        .context(UnableToCastSnowflakeNumericToDecimalSnafu)?;
+
+    Ok(decimal_array)
 }
 
 #[cfg(test)]
