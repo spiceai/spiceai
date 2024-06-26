@@ -183,6 +183,7 @@ impl<'a>
                         yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
                     }
                     Err(e) => {
+                        println!("Yielding an error");
                         yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
                     }
                 }
@@ -200,19 +201,18 @@ impl<'a>
     }
 }
 
-const KILOBYTE: u64 = 1_024;
-const MEGABYTE: u64 = 1_024 * KILOBYTE;
-const REFERENCE_CHUNKS_PER_GB: u64 = 15_000;
-const REFERENCE_CHUNKS_PER_MB: u64 = REFERENCE_CHUNKS_PER_GB / 1_024;
+const BYTES_PER_KILOBYTE: u64 = 1_024;
+const BYTES_PER_MEGABYTE: u64 = 1_024 * BYTES_PER_KILOBYTE;
+const ROWS_PER_MB: u64 = 1; // 1024 rows per GB
 
 fn determine_chunk_size() -> u64 {
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    let mem = sys.free_memory() / MEGABYTE; // free memory in MB
-                                            // free includes cached memory available for flushing
-                                            // this is a safe calculation method for available system memory
-                                            // use MB as the unit of reference, as we might be running on low memory systems
+    let mem = sys.available_memory() / BYTES_PER_MEGABYTE; // available memory in MB
+                                                           // available includes cached memory available for flushing
+                                                           // this is a safe calculation method for available system memory
+                                                           // use MB as the unit of reference, as we might be running on low memory systems
 
-    REFERENCE_CHUNKS_PER_MB * mem
+    ROWS_PER_MB * mem
 }
