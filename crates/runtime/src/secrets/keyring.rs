@@ -39,7 +39,6 @@ pub enum Error {
     InvalidJsonFormat {},
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct KeyringSecretStore {}
 
 impl Default for KeyringSecretStore {

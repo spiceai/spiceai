@@ -42,16 +42,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::module_name_repetitions)]
 pub type AuthConfigs = HashMap<String, AuthConfig>;
 
-#[allow(clippy::module_name_repetitions)]
 #[derive(Default, Deserialize, Clone)]
 pub struct AuthConfig {
     pub params: HashMap<String, String>,
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct FileSecretStore {
     secrets: HashMap<String, Secret>,
 }

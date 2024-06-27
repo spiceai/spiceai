@@ -179,7 +179,7 @@ To configure VSCode to automatically apply the rustfmt style on save and to use 
   },
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.check.features": "all",
-  "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr"]
+  "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"]
 ```
 
 By default, `rust-analyzer` will attempt to rebuild all dependencies when a change is made to a `cargo.toml` file. To prevent this and only rebuild what has changed, add the following in your User Settings JSON file, setting the value to your architecture:

@@ -27,7 +27,6 @@ use std::fmt;
 use std::sync::Arc;
 
 /// `SliceExec` slices an `ExecutionPlan` and returns output from a single partition.
-#[allow(clippy::module_name_repetitions)]
 pub struct SliceExec {
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
