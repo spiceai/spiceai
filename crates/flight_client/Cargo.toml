@@ -1,12 +1,12 @@
 [package]
-name = "flight_client"
-version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "flight_client"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,8 +16,8 @@ arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 base64 = "0.21.7"
 bytes = "1.5.0"
 futures.workspace = true
-snafu.workspace = true
 rustls-native-certs = "0.6.3"
 rustls-pemfile = "1.0.3"
+snafu.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
 tracing.workspace = true

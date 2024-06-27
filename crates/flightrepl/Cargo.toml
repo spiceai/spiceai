@@ -1,24 +1,26 @@
 [package]
-name = "flightrepl"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 description = "Spice OSS Flight Query Repl"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "flightrepl"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
-arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-clap.workspace = true
-tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
-futures.workspace = true
-tracing.workspace = true
-datafusion.workspace = true
-rustyline = "13.0.0"
-prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
 ansi_term = "0.12.1"
-reqwest = { version = "0.11.24", features = ["json"] }
-serde_json.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json = "52.0.0"
+clap.workspace = true
+datafusion.workspace = true
+futures.workspace = true
 llms = { path = "../llms" }
+prost = { version = "0.12.1", default-features = false, features = [
+  "prost-derive",
+] }
+reqwest = { version = "0.11.24", features = ["json"] }
+rustyline = "13.0.0"
+serde_json.workspace = true
+tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+tracing.workspace = true
