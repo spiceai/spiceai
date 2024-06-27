@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::secrets::{get_secret_or_param, Secret};
-use arrow::array::AsArray;
-use arrow::datatypes::Fields;
+use arrow::array::{Array, AsArray, ListArray};
+use arrow::datatypes::{Field, Fields};
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_trait::async_trait;
@@ -210,86 +210,93 @@ impl GraphQLClient {
     }
 }
 
-fn unnest_record_batch_one_level(record: &RecordBatch) -> Result<RecordBatch> {
+fn unnest_record_batch_one_level(record: &RecordBatch) -> Vec<RecordBatch> {
     let schema = record.schema();
     let fields = schema.fields();
     let mut new_fields = vec![];
-    let mut new_columns = vec![];
+    let mut new_records = vec![];
+    let mut base_values = vec![];
+    let mut new_columns: HashMap<Field, Vec<Arc<dyn Array>>> = HashMap::new();
 
+    // unnesting isn't just a simple matter of moving the data from one column to another
+    // unnesting is actually like a union of the data in the unnested column with the rest of the columns
+    // e.g. {continent: "Europe", countries: [{name: "France", capital: "Paris"}]} -> {continent: "Europe", name: "France", capital: "Paris"}
+
+    // base values of the record
+    // these get unioned with everything else
     for i in 0..fields.len() {
         let Some(field) = fields.get(i) else {
             continue;
         };
 
-        match field.data_type() {
-            arrow::datatypes::DataType::Struct(fields) => {
+        if let arrow::datatypes::DataType::List(_) = field.data_type() {
+            continue;
+        }
+
+        new_fields.push(Arc::clone(field));
+        base_values.push(Arc::clone(record.column(i)));
+    }
+
+    for i in 0..fields.len() {
+        let mut new_column = vec![];
+        let Some(field) = fields.get(i) else {
+            continue;
+        };
+
+        if let arrow::datatypes::DataType::List(field) = field.data_type() {
+            if let arrow::datatypes::DataType::Struct(fields) = field.data_type() {
+                new_fields.extend(fields.iter().map(|f| Arc::clone(f)));
+
+                let Some(list_array) = record.column(i).as_any().downcast_ref::<ListArray>() else {
+                    continue;
+                };
+
                 for j in 0..fields.len() {
-                    let Some(new_field) = fields.get(j) else {
+                    let Some(field) = fields.get(j) else {
                         continue;
                     };
 
-                    new_fields.push(Arc::clone(new_field));
-                    new_columns.push(Arc::clone(record.column(i).as_struct().column(j)));
-                }
-            }
-            arrow::datatypes::DataType::List(field) => {
-                if let arrow::datatypes::DataType::Struct(fields) = field.data_type() {
-                    for j in 0..fields.len() {
-                        let Some(new_field) = fields.get(j) else {
-                            continue;
-                        };
+                    println!("{:#?}", list_array.value(0));
 
-                        new_fields.push(Arc::clone(new_field));
-                        new_columns.push(Arc::clone(record.column(i).as_struct().column(j)));
-                    }
-                } else {
-                    new_fields.push(Arc::clone(field));
-                    new_columns.push(Arc::clone(record.column(i)));
+                    /*
+
+                    StructArray <- this is .value(0)?
+                    [
+                    -- child 0: "capital" (Utf8)
+                    StringArray <-- how do I get here from .value(0).<...>? this is the column value I need to unnest
+                    [
+                        "",
+                        ...
+                    ]
+
+                    -- child 1: "name" (Utf8)
+                    StringArray
+                    [
+                        "",
+                        ...
+                    ]
+                    ]
+
+                    */
                 }
-            }
-            _ => {
+            } else {
                 new_fields.push(Arc::clone(field));
-                new_columns.push(Arc::clone(record.column(i)));
+
+                let Some(list_array) = record.column(i).as_any().downcast_ref::<ListArray>() else {
+                    continue;
+                };
+
+                for j in 0..list_array.len() {
+                    new_column.push(list_array.value(j));
+                }
             }
         }
     }
 
-    RecordBatch::try_new(schema, new_columns).context(ArrowInternalSnafu)
+    // RecordBatch::try_new(schema, new_columns).context(ArrowInternalSnafu)
+
+    new_records
 }
-
-// fn unnest_record_batches(batch: Vec<RecordBatch>, depth: usize) -> Result<Vec<RecordBatch>> {
-//     if depth == 0 {
-//         return Ok(batch);
-//     }
-
-//     let mut res = vec![];
-//     for record in batch {
-//         let schema = record.schema();
-//         let fields = schema.fields();
-//         for i in 0..fields.len() {
-//             let field = fields[i].clone();
-//             match field.data_type() {
-//                 arrow::datatypes::DataType::Struct(fields) => {
-//                     let mut new_fields = vec![];
-//                     for j in 0..fields.len() {
-//                         let new_field = fields[j].clone();
-//                         new_fields.push(new_field);
-//                     }
-//                     let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
-//                     let new_record =
-//                         RecordBatch::try_new(new_schema, vec![]).context(ArrowInternal)?;
-//                     res.push(new_record);
-//                 }
-//                 arrow::datatypes::DataType::List(field) => {}
-//                 _ => {
-//                     res.push(record.clone());
-//                 }
-//             }
-//         }
-//     }
-
-//     Ok(res)
-// }
 
 impl GraphQLClient {
     async fn execute(
@@ -356,6 +363,8 @@ impl GraphQLClient {
                 .context(ArrowInternalSnafu)?
                 .collect::<Result<Vec<_>, _>>()
                 .context(ArrowInternalSnafu)?;
+
+            println!("{:#?}", unnest_record_batch_one_level(&batch[0]));
             res.extend(batch);
         }
 
