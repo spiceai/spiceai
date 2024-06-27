@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::{Int32Array, Int64Array, ListArray, RecordBatch, StringArray};
 use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::{
     array::{make_comparator, StructArray, TimestampNanosecondArray},
@@ -21,6 +22,10 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
+use data_components::cdc::{self, ChangeEnvelope};
+use data_components::delete::get_deletion_provider;
+use datafusion::logical_expr::lit;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -81,6 +86,65 @@ impl RefreshTask {
             refresh,
             accelerator,
         }
+    }
+
+    pub async fn start_changes_stream(
+        &self,
+        mut changes_stream: BoxStream<
+            'static,
+            std::result::Result<ChangeEnvelope, cdc::StreamError>,
+        >,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        ready_sender: Option<oneshot::Sender<()>>,
+    ) -> super::Result<()> {
+        self.mark_dataset_status(status::ComponentStatus::Refreshing)
+            .await;
+
+        let dataset_name = self.dataset_name.clone();
+
+        let mut ready_sender = ready_sender;
+
+        while let Some(update) = changes_stream.next().await {
+            match update {
+                Ok(change_envelope) => {
+                    let data_update = DataUpdate {
+                        schema: change_envelope.rb.schema(),
+                        data: vec![change_envelope.rb.clone()],
+                        update_type: UpdateType::Changes,
+                    };
+
+                    // write_data_update updates dataset status and logs errors so we don't do this here
+                    if self.write_data_update(None, data_update).await.is_ok() {
+                        if let Some(ready_sender) = ready_sender.take() {
+                            ready_sender.send(()).ok();
+                        }
+
+                        if let Err(e) = change_envelope.commit() {
+                            tracing::debug!("Failed to commit CDC change envelope: {e}");
+                        }
+
+                        if let Some(cache_provider) = &cache_provider {
+                            if let Err(e) = cache_provider
+                                .invalidate_for_table(&dataset_name.to_string())
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name.to_string()
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Changes error for {dataset_name}: {e}");
+                    self.mark_dataset_status(status::ComponentStatus::Error)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn start_streaming_append(
@@ -201,6 +265,7 @@ impl RefreshTask {
         self.get_data_update(filters).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn write_data_update(
         &self,
         start_time: Option<SystemTime>,
@@ -225,6 +290,133 @@ impl RefreshTask {
         };
 
         let ctx = SessionContext::new();
+
+        if data_update.update_type == UpdateType::Changes {
+            tracing::info!("Processing changes for {dataset_name}");
+            let Some(deletion_provider) = get_deletion_provider(Arc::clone(&self.accelerator))
+            else {
+                panic!("Failed to get deletion provider");
+            };
+
+            for data_batch in &data_update.data {
+                let Some(op_col) = data_batch.column(0).as_any().downcast_ref::<StringArray>()
+                else {
+                    panic!("Failed to get op column");
+                };
+                let Some(primary_keys_col) =
+                    data_batch.column(1).as_any().downcast_ref::<ListArray>()
+                else {
+                    panic!("Failed to get primary keys column");
+                };
+                let Some(data_col) = data_batch.column(2).as_any().downcast_ref::<StructArray>()
+                else {
+                    panic!("Failed to get data column");
+                };
+                for row in 0..data_batch.num_rows() {
+                    let op = op_col.value(row);
+                    match op {
+                        "d" => {
+                            let inner_data: RecordBatch = data_col.slice(row, 1).into();
+                            let primary_keys_col_dyn_arr = primary_keys_col.value(row);
+                            let Some(primary_key) = primary_keys_col_dyn_arr
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                            else {
+                                panic!("Failed to get primary key column");
+                            };
+                            let primary_key = primary_key.value(0);
+                            let inner_data_schema = inner_data.schema();
+                            let Some((primary_key_idx, field)) =
+                                inner_data_schema.column_with_name(primary_key)
+                            else {
+                                panic!("Failed to get primary key column");
+                            };
+                            let key_col = inner_data.column(primary_key_idx);
+                            let delete_where_expr = match field.data_type() {
+                                DataType::Int32 => {
+                                    let Some(key_col) =
+                                        key_col.as_any().downcast_ref::<Int32Array>()
+                                    else {
+                                        panic!(
+                                            "Failed to get id column as Int32Array, {inner_data:?}"
+                                        );
+                                    };
+                                    col(primary_key).eq(lit(key_col.value(0)))
+                                }
+                                DataType::Int64 => {
+                                    let Some(key_col) =
+                                        key_col.as_any().downcast_ref::<Int64Array>()
+                                    else {
+                                        panic!(
+                                            "Failed to get id column as Int64Array, {inner_data:?}"
+                                        );
+                                    };
+                                    col(primary_key).eq(lit(key_col.value(0)))
+                                }
+                                DataType::Utf8 => {
+                                    let Some(key_col) =
+                                        key_col.as_any().downcast_ref::<StringArray>()
+                                    else {
+                                        panic!(
+                                            "Failed to get id column as Int64Array, {inner_data:?}"
+                                        );
+                                    };
+                                    col(primary_key).eq(lit(key_col.value(0)))
+                                }
+                                _ => panic!("Unsupported primary key type {}", field.data_type()),
+                            };
+                            tracing::info!(
+                                "Deleting data for {dataset_name} where {delete_where_expr}"
+                            );
+
+                            let ctx = SessionContext::new();
+                            let session_state = ctx.state();
+
+                            let Ok(delete_plan) = deletion_provider
+                                .delete_from(&session_state, &[delete_where_expr])
+                                .await
+                            else {
+                                panic!("Failed to create delete plan");
+                            };
+
+                            if let Err(e) = collect(delete_plan, ctx.task_ctx()).await {
+                                panic!("Failed to delete data: {e}");
+                            };
+                        }
+                        "c" | "u" | "r" => {
+                            let inner_data: RecordBatch = data_col.slice(row, 1).into();
+                            let ctx = SessionContext::new();
+                            let session_state = ctx.state();
+
+                            tracing::info!("Inserting data row for {dataset_name}");
+
+                            let Ok(insert_plan) = self
+                                .accelerator
+                                .insert_into(
+                                    &session_state,
+                                    Arc::new(DataUpdateExecutionPlan::new(DataUpdate {
+                                        schema: inner_data.schema(),
+                                        data: vec![inner_data],
+                                        update_type: UpdateType::Append,
+                                    })),
+                                    false,
+                                )
+                                .await
+                            else {
+                                panic!("Failed to create insert plan");
+                            };
+
+                            if let Err(e) = collect(insert_plan, ctx.task_ctx()).await {
+                                panic!("Failed to insert data: {e}");
+                            };
+                        }
+                        _ => panic!("Unknown operation"),
+                    }
+                }
+            }
+
+            return Ok(());
+        }
 
         let overwrite = data_update.update_type == UpdateType::Overwrite;
         match self

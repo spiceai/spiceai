@@ -35,6 +35,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
+use futures::stream::BoxStream;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
