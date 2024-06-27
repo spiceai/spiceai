@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-#![allow(clippy::module_name_repetitions)]
 
 use component::view::View;
 use serde::{Deserialize, Serialize};

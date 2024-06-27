@@ -89,7 +89,6 @@ fn get_random_value_from_interval(
     nanos_to_duration(nanos)
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct FibonacciBackoffBuilder {
     randomization_factor: f64,
     max_retries: Option<usize>,

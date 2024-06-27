@@ -24,7 +24,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// This function will return an error if the fields of the expected schema don't
 /// match the fields of the actual schema.
-#[allow(clippy::module_name_repetitions)]
 pub fn verify_schema(
     expected: &arrow::datatypes::Fields,
     actual: &arrow::datatypes::Fields,

@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(clippy::module_name_repetitions)]
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::sea_query::{self, Alias};
 use itertools::Itertools;

@@ -51,7 +51,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::module_name_repetitions)]
 #[derive(Copy, Clone)]
 pub struct AwsSecretsManager {}
 

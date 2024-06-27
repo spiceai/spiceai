@@ -193,7 +193,6 @@ pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStor
     }
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct SecretsProvider {
     pub store: SecretStoreType,
 
