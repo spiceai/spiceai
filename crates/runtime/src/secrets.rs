@@ -313,6 +313,7 @@ pub fn get_secret_or_param(
     None
 }
 
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
