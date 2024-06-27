@@ -154,12 +154,15 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
-        .await
-        .map_err(|e| {
-            tracing::error!("start_mysql_docker_container: {e}");
-            e.to_string()
-        })?;
+    let running_container = start_mysql_docker_container(
+        "runtime-integration-test-federation-inner-join-mysql",
+        MYSQL_PORT,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("start_mysql_docker_container: {e}");
+        e.to_string()
+    })?;
     tracing::debug!("Container started");
     init_mysql_db().await.map_err(|e| {
         tracing::error!("init_mysql_db: {e}");
