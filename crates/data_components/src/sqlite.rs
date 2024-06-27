@@ -96,7 +96,6 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::module_name_repetitions)]
 pub struct SqliteTableFactory {
     db_path_param: String,
 }

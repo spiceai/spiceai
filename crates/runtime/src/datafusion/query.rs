@@ -33,9 +33,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 pub mod builder;
-#[allow(clippy::module_name_repetitions)]
 pub mod query_history;
-#[allow(clippy::module_name_repetitions)]
 pub use builder::QueryBuilder;
 
 pub mod error_code;

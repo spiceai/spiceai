@@ -42,7 +42,6 @@ pub enum Error {
     MissingStatement,
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub fn validate_refresh_sql(expected_table: TableReference, refresh_sql: &str) -> Result<()> {
     let mut statements = DFParser::parse_sql_with_dialect(refresh_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;

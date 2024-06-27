@@ -22,7 +22,6 @@ use uuid::Uuid;
 use crate::{spark_connect::SparkConnect, Read, ReadWrite};
 
 #[derive(Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub struct DatabricksSparkConnect {
     spark_connect: SparkConnect,
 }

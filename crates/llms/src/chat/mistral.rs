@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-#![allow(clippy::module_name_repetitions)]
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
