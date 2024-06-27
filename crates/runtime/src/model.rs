@@ -20,8 +20,10 @@ use llms::embeddings::{candle::CandleEmbedding, Embed, Error as EmbedError};
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use secrecy::{ExposeSecret, Secret, SecretString};
-use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
-use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
+use spicepod::component::{
+    embeddings::{EmbeddingParams, EmbeddingPrefix},
+    model::ModelSource,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::result::Result;
@@ -109,163 +111,6 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     }
 }
 
-/// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
-pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
-    component: &spicepod::component::llms::Llm,
-    params: &HashMap<String, SecretString, S>,
-) -> Result<Box<dyn Chat>, LlmError> {
-    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
-        source: format!(
-            "Unknown model source for spicepod component from: {}",
-            component.from.clone()
-        )
-        .into(),
-    })?;
-
-    let model_id = component.get_model_id();
-
-    match construct_llm_params(&prefix, &model_id, params) {
-        Ok(LlmParams::OpenAiParams {
-            api_base,
-            api_key,
-            org_id,
-            project_id,
-        }) => Ok(Box::new(llms::openai::Openai::new(
-            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
-            api_base,
-            api_key,
-            org_id,
-            project_id,
-        ))),
-        Ok(LlmParams::LocalModelParams {
-            weights_path,
-            tokenizer_path,
-            tokenizer_config_path,
-        }) => llms::chat::create_local_model(
-            &weights_path,
-            tokenizer_path.as_deref(),
-            tokenizer_config_path.as_ref(),
-        ),
-        Ok(LlmParams::HuggingfaceParams {
-            model_type,
-            weights_path,
-            tokenizer_path,
-            tokenizer_config_path,
-        }) => {
-            match component.get_model_id() {
-                Some(id) => {
-                    llms::chat::create_hf_model(
-                        &id,
-                        model_type.map(|x| x.to_string()),
-                        &weights_path,
-                        &tokenizer_path,
-                        &tokenizer_config_path, // TODO handle inline chat templates
-                    )
-                }
-                None => Err(LlmError::FailedToLoadModel {
-                    source: format!("Failed to load model from: {}", component.from).into(),
-                }),
-            }
-        }
-        Err(e) => Err(e),
-        _ => Err(LlmError::UnknownModelSource {
-            source: format!(
-                "Unknown model source for spicepod component from: {}",
-                component.from.clone()
-            )
-            .into(),
-        }),
-    }
-}
-
-/// Construct the parameters needed to create an LLM based on its source (i.e. prefix).
-/// If a `model_id` is provided (in the `from: `), it is provided.
-fn construct_llm_params<S: ::std::hash::BuildHasher>(
-    from: &LlmPrefix,
-    model_id: &Option<String>,
-    params: &HashMap<String, SecretString, S>,
-) -> Result<LlmParams, LlmError> {
-    match from {
-        LlmPrefix::HuggingFace => {
-            let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
-            let arch = match model_type {
-                Some(arch) => {
-                    let a = Architecture::try_from(arch.as_str()).map_err(|_| {
-                        LlmError::UnknownModelSource {
-                            source: format!("Unknown model architecture {arch} for spicepod llm")
-                                .into(),
-                        }
-                    })?;
-                    Some(a)
-                }
-                None => None,
-            };
-
-            Ok(LlmParams::HuggingfaceParams {
-                model_type: arch,
-                weights_path: model_id.clone().or(params
-                    .get("weights_path")
-                    .map(Secret::expose_secret)
-                    .cloned()),
-                tokenizer_path: params
-                    .get("tokenizer_path")
-                    .map(Secret::expose_secret)
-                    .cloned(),
-                tokenizer_config_path: params
-                    .get("tokenizer_config_path")
-                    .map(Secret::expose_secret)
-                    .cloned(),
-            })
-        }
-        LlmPrefix::File => {
-            let weights_path = model_id
-                .clone()
-                .or(params
-                    .get("weights_path")
-                    .map(Secret::expose_secret)
-                    .cloned())
-                .ok_or(LlmError::FailedToLoadModel {
-                    source: "No 'weights_path' parameter provided".into(),
-                })?
-                .clone();
-            let tokenizer_path = params
-                .get("tokenizer_path")
-                .map(Secret::expose_secret)
-                .cloned();
-            let tokenizer_config_path = params
-                .get("tokenizer_config_path")
-                .map(Secret::expose_secret)
-                .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'tokenizer_config_path' parameter provided".into(),
-                })?
-                .clone();
-            Ok(LlmParams::LocalModelParams {
-                weights_path,
-                tokenizer_path,
-                tokenizer_config_path,
-            })
-        }
-
-        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {}),
-
-        LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
-            api_base: params.get("endpoint").map(Secret::expose_secret).cloned(),
-            api_key: params
-                .get("openai_api_key")
-                .map(Secret::expose_secret)
-                .cloned(),
-            org_id: params
-                .get("openai_org_id")
-                .map(Secret::expose_secret)
-                .cloned(),
-            project_id: params
-                .get("openai_project_id")
-                .map(Secret::expose_secret)
-                .cloned(),
-        }),
-    }
-}
-
 /// Construct the parameters needed to create an [`Embeddings`] based on its source (i.e. prefix).
 /// If a `model_id` is provided (in the `from: `), it is provided.
 fn construct_embedding_params<S: ::std::hash::BuildHasher>(
@@ -322,5 +167,111 @@ fn construct_embedding_params<S: ::std::hash::BuildHasher>(
             })
         }
         EmbeddingPrefix::HuggingFace => Ok(EmbeddingParams::HuggingfaceParams {}),
+    }
+}
+
+/// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
+pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
+    component: &spicepod::component::model::Model,
+    params: &HashMap<String, SecretString, S>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let model_id = component.get_model_id();
+    let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
+
+    match prefix {
+        ModelSource::HuggingFace => {
+            let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
+            let weights_path = model_id.clone().or(params
+                .get("weights_path")
+                .map(Secret::expose_secret)
+                .cloned());
+
+            let tokenizer_path = params
+                .get("tokenizer_path")
+                .map(Secret::expose_secret)
+                .cloned();
+
+            let tokenizer_config_path = params
+                .get("tokenizer_config_path")
+                .map(Secret::expose_secret)
+                .cloned();
+
+            match model_id {
+                Some(id) => {
+                    llms::chat::create_hf_model(
+                        &id,
+                        model_type.map(|x| x.to_string()),
+                        &weights_path,
+                        &tokenizer_path,
+                        &tokenizer_config_path, // TODO handle inline chat templates
+                    )
+                }
+                None => Err(LlmError::FailedToLoadModel {
+                    source: "No model id for Huggingface model".to_string().into(),
+                }),
+            }
+        }
+        ModelSource::File => {
+            let weights_path = model_id
+                .clone()
+                .or(params
+                    .get("weights_path")
+                    .map(Secret::expose_secret)
+                    .cloned())
+                .ok_or(LlmError::FailedToLoadModel {
+                    source: "No 'weights_path' parameter provided".into(),
+                })?
+                .clone();
+            let tokenizer_path = params
+                .get("tokenizer_path")
+                .map(Secret::expose_secret)
+                .cloned();
+            let tokenizer_config_path = params
+                .get("tokenizer_config_path")
+                .map(Secret::expose_secret)
+                .ok_or(LlmError::FailedToLoadTokenizer {
+                    source: "No 'tokenizer_config_path' parameter provided".into(),
+                })?
+                .clone();
+
+            llms::chat::create_local_model(
+                &weights_path,
+                tokenizer_path.as_deref(),
+                tokenizer_config_path.as_ref(),
+            )
+        }
+        ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
+            from: "spiceai".into(),
+            task: "llm".into(),
+        }),
+        ModelSource::OpenAi => {
+            let api_base = params.get("endpoint").map(Secret::expose_secret).cloned();
+            let api_key = params
+                .get("openai_api_key")
+                .map(Secret::expose_secret)
+                .cloned();
+            let org_id = params
+                .get("openai_org_id")
+                .map(Secret::expose_secret)
+                .cloned();
+            let project_id = params
+                .get("openai_project_id")
+                .map(Secret::expose_secret)
+                .cloned();
+
+            Ok(Box::new(llms::openai::Openai::new(
+                model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+                api_base,
+                api_key,
+                org_id,
+                project_id,
+            )))
+        }
     }
 }

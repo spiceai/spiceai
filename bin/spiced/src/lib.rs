@@ -95,7 +95,9 @@ pub async fn run(args: Args) -> Result<()> {
     let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
-        Ok(app) => Some(app),
+        Ok(app) => {
+            Some(app)
+        }
         Err(e) => {
             tracing::warn!("{}", e);
             None
@@ -152,10 +154,7 @@ pub async fn run(args: Args) -> Result<()> {
     ];
 
     if cfg!(feature = "models") {
-        let mut v: Vec<Pin<Box<dyn Future<Output = ()>>>> =
-            vec![Box::pin(rt.load_models()), Box::pin(rt.load_llms())];
-
-        futures.append(&mut v);
+        futures.push(Box::pin(rt.load_models()));
     }
 
     tokio::select! {

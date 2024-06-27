@@ -24,7 +24,6 @@ use spicepod::{
         dataset::Dataset,
         embeddings::Embeddings,
         extension::Extension,
-        llms::Llm,
         model::Model,
         runtime::{ResultsCache, Runtime},
         secrets::{Secrets, SpiceSecretStore},
@@ -49,8 +48,6 @@ pub struct App {
 
     pub embeddings: Vec<Embeddings>,
 
-    pub llms: Vec<Llm>,
-
     pub spicepods: Vec<Spicepod>,
 
     pub runtime: Runtime,
@@ -74,7 +71,6 @@ pub struct AppBuilder {
     datasets: Vec<Dataset>,
     views: Vec<View>,
     models: Vec<Model>,
-    llms: Vec<Llm>,
     embeddings: Vec<Embeddings>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
@@ -89,7 +85,6 @@ impl AppBuilder {
             datasets: vec![],
             views: vec![],
             models: vec![],
-            llms: vec![],
             embeddings: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
@@ -103,7 +98,6 @@ impl AppBuilder {
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
-        self.llms.extend(spicepod.llms.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
         self.spicepods.push(spicepod);
         self
@@ -140,12 +134,6 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_llm(mut self, llm: Llm) -> AppBuilder {
-        self.llms.push(llm);
-        self
-    }
-
-    #[must_use]
     pub fn with_embedding(mut self, embedding: Embeddings) -> AppBuilder {
         self.embeddings.push(embedding);
         self
@@ -166,7 +154,6 @@ impl AppBuilder {
             datasets: self.datasets,
             views: self.views,
             models: self.models,
-            llms: self.llms,
             embeddings: self.embeddings,
             spicepods: self.spicepods,
             runtime: self.runtime,
@@ -183,7 +170,6 @@ impl AppBuilder {
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
-        let mut llms: Vec<Llm> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
 
         for dataset in &spicepod_root.datasets {
@@ -196,10 +182,6 @@ impl AppBuilder {
 
         for model in &spicepod_root.models {
             models.push(model.clone());
-        }
-
-        for llm in &spicepod_root.llms {
-            llms.push(llm.clone());
         }
 
         for embedding in &spicepod_root.embeddings {
@@ -224,9 +206,6 @@ impl AppBuilder {
             for model in &dependent_spicepod.models {
                 models.push(model.clone());
             }
-            for llm in &dependent_spicepod.llms {
-                llms.push(llm.clone());
-            }
             for embedding in &dependent_spicepod.embeddings {
                 embeddings.push(embedding.clone());
             }
@@ -243,7 +222,6 @@ impl AppBuilder {
             views,
             models,
             embeddings,
-            llms,
             spicepods,
             runtime,
         })

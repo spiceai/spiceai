@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::{collections::HashMap, fmt::Display, path::Path};
+
 use super::WithDependsOn;
 use serde::{Deserialize, Serialize};
 
@@ -24,11 +26,17 @@ pub struct Model {
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "files", default)]
-    pub files: Vec<String>,
+    pub files: Vec<ModelFile>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, String>,
+
+    #[serde(rename = "datasets", default, skip_serializing_if = "Vec::is_empty")]
+    pub datasets: Vec<String>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "datasets", default)]
-    pub datasets: Vec<String>,
+    #[serde(rename = "dependsOn", default)]
+    pub depends_on: Vec<String>,
 }
 
 impl WithDependsOn<Model> for Model {
@@ -36,8 +44,245 @@ impl WithDependsOn<Model> for Model {
         Model {
             from: self.from.clone(),
             name: self.name.clone(),
-            files: depends_on.to_vec(),
-            datasets: depends_on.to_vec(),
+            files: self.files.clone(),
+            params: self.params.clone(),
+            datasets: self.datasets.clone(),
+            depends_on: depends_on.to_vec(),
         }
     }
+}
+
+/// Describe where the [`Model`] is sourced from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ModelSource {
+    OpenAi,
+    HuggingFace,
+    SpiceAI,
+    File,
+}
+
+/// Implement the [`TryFrom<&str>`] trait for [`ModelSource`]. Should be the inverse of [`ModelSource`]'s [`Display`].
+impl TryFrom<&str> for ModelSource {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.starts_with("huggingface:huggingface.co") {
+            Ok(ModelSource::HuggingFace)
+        } else if value.starts_with("file:") {
+            Ok(ModelSource::File)
+        } else if value.starts_with("openai") {
+            Ok(ModelSource::OpenAi)
+        } else if value.starts_with("spiceai") {
+            Ok(ModelSource::SpiceAI)
+        } else {
+            Err("Unknown prefix")
+        }
+    }
+}
+
+/// Implement the [`Display`] trait for [`ModelSource`]. Should be the inverse of [`TryFrom<&str>`].
+impl Display for ModelSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelSource::OpenAi => write!(f, "openai"),
+            ModelSource::HuggingFace => write!(f, "huggingface:huggingface.co"),
+            ModelSource::File => write!(f, "file:"),
+            ModelSource::SpiceAI => write!(f, "spiceai"),
+        }
+    }
+}
+
+pub enum ModelType {
+    Llm,
+    Ml,
+}
+impl Display for ModelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelType::Llm => write!(f, "Llm"),
+            ModelType::Ml => write!(f, "Ml"),
+        }
+    }
+}
+
+impl Model {
+    #[must_use]
+    pub fn get_source(&self) -> Option<ModelSource> {
+        ModelSource::try_from(self.from.as_str()).ok()
+    }
+
+    /// Get the model id from the `from` field. The model id is the part of the `from` field after the source.
+    ///
+    /// # Example
+    /// - `spice.ai/taxi_tech_co/taxi_drives/models/drive_stats:latest`
+    ///     - Prefix: `spice.ai`
+    ///     - Source: `taxi_tech_co/taxi_drives/models/drive_stats:latest`
+    /// - `huggingface:huggingface.co/transformers/gpt-2:latest`
+    ///    - Prefix: `huggingface:huggingface.co`
+    ///    - Source: `transformers/gpt-2:latest`
+    /// - `file://absolute/path/to/my/model.onnx`
+    ///     - Prefix: `file:`
+    ///     - Source: `/absolute/path/to/my/model.onnx`
+    /// - `openai`
+    ///    - Prefix: `openai`
+    ///    - Source: None
+    #[must_use]
+    pub fn get_model_id(&self) -> Option<String> {
+        match self.get_source() {
+            Some(p) => self
+                .from
+                .strip_prefix(&format!("{p}/"))
+                .map(ToString::to_string),
+            None => None,
+        }
+    }
+
+    /// Attempts to determine the model's type based on its `from` field and, `files` and `params`.
+    /// TODO: Actually this is going to be hard for either spice or HF for ML models
+    ///
+    /// ### Current support/checks
+    ///
+    /// | ModelType | OpenAI  |      Hugging Face       | Spice   | Local          |
+    /// | --------- | ------- | ----------------------- | ------- | -------------- |
+    /// | Llm       | Default | `params.model_type` set | N/A     | File Specified |
+    /// | Ml        |  N/A    | ONNX file specified     | Default | File specified |
+    pub fn model_type(&self) -> Option<ModelType> {
+        let Ok(source) = ModelSource::try_from(self.from.as_str()) else {
+            tracing::error!("Unknown model source from model: {}", self.from);
+            return None;
+        };
+
+        // OpenAI and SpiceAi only support Llm and Ml respectively.
+        if source == ModelSource::OpenAi {
+            return Some(ModelType::Llm);
+        };
+        if source == ModelSource::SpiceAI {
+            return Some(ModelType::Ml);
+        };
+
+        // TODO: Need to scan filenames from HF for [`ModelSource::HuggingFace`]. Below is a hack
+        // to determine if it's an LLM from HF.
+        if source == ModelSource::HuggingFace && self.params.get("model_type").is_some() {
+            return Some(ModelType::Llm);
+        }
+
+        let mut files = self.files.clone();
+
+        // For [`ModelSource::File`], The model id is a weights file.
+        if source == ModelSource::File {
+            if let Some(id) = self.get_model_id() {
+                files.push(ModelFile {
+                    path: id,
+                    name: "from_id".to_string(),
+                    r#type: Some(ModelFileType::Weights),
+                });
+            }
+        }
+
+        let is_llm = files
+            .iter()
+            .find(|f| {
+                match f.file_type() {
+                    // Only true since embeddings aren't [`Model`]s.
+                    Some(ModelFileType::Tokenizer | ModelFileType::Config |
+ModelFileType::TokenizerConfig) => true,
+                    _ => is_llm_file(Path::new(&f.path)),
+                }
+            })
+            .is_some();
+        if is_llm {
+            return Some(ModelType::Llm);
+        }
+
+        if files
+            .iter()
+            .any(|f| is_ml_file(Path::new(&f.path)))
+        {
+            return Some(ModelType::Ml);
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelFile {
+    pub path: String,
+    pub name: String,
+    pub r#type: Option<ModelFileType>,
+}
+
+impl ModelFile {
+    /// Returns the [`ModelFileType`] if explicitly set, otherwise attempts to determine the file
+    /// type for the [`ModelFile`] based on the file path.
+    #[must_use] pub fn file_type(&self) -> Option<ModelFileType> {
+        match self.r#type {
+            Some(t) => Some(t),
+            None => determine_type_from_path(&self.path),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ModelFileType {
+    Weights,
+    Config,
+    Tokenizer,
+    TokenizerConfig,
+}
+
+/// Attempts to determine the file type for the [`ModelFile`] based on the file path. If
+/// [`determine_type_from_path`] is None, the file may be one of [`ModelFileType`], but the type
+/// could not be determined.
+pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
+    let path = Path::new(p);
+
+    if is_ml_file(path) || is_llm_file(path) {
+        return Some(ModelFileType::Weights);
+    }
+
+    let filename = path.file_name().map(|f| f.to_string_lossy().to_string())?;
+
+    if filename == "config.json" {
+        return Some(ModelFileType::Config);
+    }
+
+    if filename == "tokenizer.json" {
+        return Some(ModelFileType::Tokenizer);
+    }
+
+    if filename == "tokenizer_config.json" {
+        return Some(ModelFileType::TokenizerConfig);
+    }
+
+    None
+}
+
+/// Returns true if the file is an ML model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
+pub(crate) fn is_ml_file(p: &Path) -> bool {
+    let extension = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    extension == "onnx"
+}
+
+/// Returns true if the file is an LLM model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
+pub(crate) fn is_llm_file(p: &Path) -> bool {
+    let Some(filename) = p.file_name().map(|f| f.to_string_lossy().to_string()) else {
+        return false;
+    };
+    let extension = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    println!("is_llm_file: {filename}, {extension}");
+
+    // `extension == "safetensors" || filename == "pytorch_model.bin"` also true for embeddings.
+    extension == "gguf"
+        || extension == "ggml"
+        || extension == "safetensors"
+        || filename == "pytorch_model.bin"
 }
