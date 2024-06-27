@@ -154,7 +154,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let mysql_port = 13307;
+    let mysql_port = 13308;
 
     let running_container = start_mysql_docker_container(
         "runtime-integration-test-federation-inner-join-mysql",
