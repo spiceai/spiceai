@@ -68,6 +68,7 @@ pub(super) async fn start_postgres_docker_container(
         .image("postgres:latest")
         .add_port_binding(
             5432,
+            #[allow(clippy::expect_used)]
             port.try_into().expect("Port number should fit into u16"),
         )
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
