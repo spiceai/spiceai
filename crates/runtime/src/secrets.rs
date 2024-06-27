@@ -300,7 +300,7 @@ pub fn get_secret_or_param(
     };
 
     if let Some(secrets) = secret {
-        if let Some(secret_val) = secrets.get(secret_param_val) {
+        if let Some(secret_val) = secrets.get(secret_param_val.to_lowercase().as_str()) {
             return Some(secret_val.to_string());
         };
     };
