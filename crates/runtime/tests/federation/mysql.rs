@@ -154,9 +154,11 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let mysql_port = 13307;
+
     let running_container = start_mysql_docker_container(
         "runtime-integration-test-federation-inner-join-mysql",
-        MYSQL_PORT,
+        mysql_port,
     )
     .await
     .map_err(|e| {
@@ -169,8 +171,8 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         e.to_string()
     })?;
     let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")
-        .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
-        .with_dataset(make_mysql_dataset("lineitem", "acc_line", MYSQL_PORT, true))
+        .with_dataset(make_mysql_dataset("lineitem", "line", mysql_port, false))
+        .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
         .build();
 
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
