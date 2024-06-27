@@ -50,6 +50,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct KafkaConsumer {
+    group_id: String,
     consumer: StreamConsumer,
 }
 
@@ -63,6 +64,11 @@ impl KafkaConsumer {
 
     pub fn create_with_generated_group_id(dataset: &str, brokers: String) -> Result<Self> {
         Self::create(Self::generate_group_id(dataset), brokers)
+    }
+
+    #[must_use]
+    pub fn group_id(&self) -> &str {
+        &self.group_id
     }
 
     pub fn subscribe(&self, topic: &str) -> Result<()> {
@@ -101,7 +107,7 @@ impl KafkaConsumer {
         tracing::debug!("rd_kafka_version: {}", version);
 
         let consumer: StreamConsumer = ClientConfig::new()
-            .set("group.id", group_id)
+            .set("group.id", group_id.clone())
             .set("bootstrap.servers", brokers)
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
@@ -116,7 +122,7 @@ impl KafkaConsumer {
             .create()
             .context(UnableToCreateConsumerSnafu)?;
 
-        Ok(Self { consumer })
+        Ok(Self { group_id, consumer })
     }
 
     fn generate_group_id(dataset: &str) -> String {
