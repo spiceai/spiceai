@@ -49,7 +49,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Debezium {
-    consumer_group_id_map: Mutex<HashMap<String, String>>,
+    _consumer_group_id_map: Mutex<HashMap<String, String>>,
     kafka_brokers: String,
 }
 
@@ -76,7 +76,7 @@ impl Debezium {
 
         Ok(Self {
             kafka_brokers: kakfa_brokers.to_string(),
-            consumer_group_id_map: Mutex::new(HashMap::new()),
+            _consumer_group_id_map: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -139,40 +139,36 @@ impl DataConnector for Debezium {
 
         // `read_provider` is called twice, once to test connectivity and once to actually register the table.
         // To prevent creating an unused consumer group, we store the group_id in a map.
-        let mut existing_group_id_map = self.consumer_group_id_map.lock().await;
-        let group_id = existing_group_id_map.get(&dataset_name);
+        // let mut existing_group_id_map = self.consumer_group_id_map.lock().await;
+        // let group_id = existing_group_id_map.get(&dataset_name);
 
-        let consumer = if let Some(group_id) = group_id {
-            KafkaConsumer::create_with_existing_group_id(group_id, self.kafka_brokers.clone())
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                })?
-        } else {
-            let kafka_consumer = KafkaConsumer::create_with_generated_group_id(
-                &dataset_name,
-                self.kafka_brokers.clone(),
-            )
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-            })?;
+        let kafka_consumer = KafkaConsumer::create_with_generated_group_id(
+            &dataset_name,
+            self.kafka_brokers.clone(),
+        )
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+        })?;
 
-            let group_id = kafka_consumer.group_id().to_string();
-            existing_group_id_map.insert(dataset_name, group_id);
+        //     let group_id = kafka_consumer.group_id().to_string();
+        //     existing_group_id_map.insert(dataset_name, group_id);
 
-            kafka_consumer
-        };
-        drop(existing_group_id_map);
+        //     kafka_consumer
+        // };
+        // drop(existing_group_id_map);
 
-        consumer
+        kafka_consumer
             .subscribe(&topic)
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
             })?;
 
-        let msg = match consumer.next_json::<ChangeEventKey, ChangeEvent>().await {
+        let msg = match kafka_consumer
+            .next_json::<ChangeEventKey, ChangeEvent>()
+            .await
+        {
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
@@ -202,7 +198,11 @@ impl DataConnector for Debezium {
                 dataconnector: "debezium",
             })?;
 
-        let debezium_kafka = Arc::new(DebeziumKafka::new(Arc::new(schema), primary_keys, consumer));
+        let debezium_kafka = Arc::new(DebeziumKafka::new(
+            Arc::new(schema),
+            primary_keys,
+            kafka_consumer,
+        ));
 
         Ok(debezium_kafka)
     }

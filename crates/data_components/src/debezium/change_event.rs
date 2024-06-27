@@ -133,7 +133,6 @@ pub struct Schema {
     pub fields: Vec<Field>,
     pub optional: bool,
     pub name: String,
-    pub version: i64,
 }
 
 #[derive(Serialize, Deserialize)]
