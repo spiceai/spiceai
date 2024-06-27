@@ -387,8 +387,9 @@ mod tests {
     fn test_cast_sf_fixed_point_number_to_decimal_i32() {
         let scale = 4i8;
         let data = vec![
-            (0.123 * 10f64.powi(scale.into())) as i32,
-            (-345.1234 * 10f64.powi(scale.into())) as i32,
+            Some((0.123 * 10f64.powi(scale.into())) as i32),
+            Some((-345.1234 * 10f64.powi(scale.into())) as i32),
+            None,
         ];
         let int32_array = Int32Array::from(data);
         let decimal_array =
@@ -409,6 +410,7 @@ mod tests {
             "-345.1234",
             display::array_value_to_string(&decimal_array, 1).expect("Should format decimal")
         );
+        assert!(decimal_array.is_null(2), "The third entry should be null.");
     }
 
     #[test]
