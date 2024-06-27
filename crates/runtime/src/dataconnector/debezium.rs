@@ -164,12 +164,7 @@ impl DataConnector for Debezium {
         };
         drop(existing_group_id_map);
 
-        tracing::info!(
-            "Subscribing to topic: {topic} with group_id: {}",
-            consumer.group_id()
-        );
-
-        kafka_consumer
+        consumer
             .subscribe(&topic)
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
