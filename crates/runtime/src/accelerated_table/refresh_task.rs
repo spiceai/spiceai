@@ -289,7 +289,6 @@ impl RefreshTask {
         let ctx = SessionContext::new();
 
         if data_update.update_type == UpdateType::Changes {
-            tracing::info!("Processing changes for {dataset_name}");
             let Some(deletion_provider) = get_deletion_provider(Arc::clone(&self.accelerator))
             else {
                 panic!("Failed to get deletion provider");
