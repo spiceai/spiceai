@@ -22,7 +22,6 @@ use arrow::{
 };
 use data_components::postgres::DynPostgresConnectionPool;
 use datafusion::execution::context::SessionContext;
-use serial_test::serial;
 use sql_provider_datafusion::SqlTable;
 
 use crate::init_tracing;
@@ -30,13 +29,13 @@ use crate::init_tracing;
 mod common;
 
 #[tokio::test]
-#[serial]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = common::start_postgres_docker_container().await?;
+    let port = common::get_random_port();
+    let running_container = common::start_postgres_docker_container(port).await?;
 
     let ctx = SessionContext::new();
-    let pool = common::get_postgres_connection_pool().await?;
+    let pool = common::get_postgres_connection_pool(port).await?;
     let db_conn = pool
         .connect_direct()
         .await
@@ -110,13 +109,13 @@ CREATE TABLE test (
 }
 
 #[tokio::test]
-#[serial]
 async fn test_postgres_chunking_performance() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = common::start_postgres_docker_container().await?;
+    let port = common::get_random_port();
+    let running_container = common::start_postgres_docker_container(port).await?;
 
     let ctx = SessionContext::new();
-    let pool = common::get_postgres_connection_pool().await?;
+    let pool = common::get_postgres_connection_pool(port).await?;
     let db_conn = pool
         .connect_direct()
         .await

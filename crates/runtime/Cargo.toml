@@ -108,7 +108,7 @@ anyhow = "1.0.86"
 tracing-subscriber.workspace = true
 async-graphql = "7.0.5"
 async-graphql-axum = "7.0.5"
-serial_test = "3.1.1"
+rand = "0.8.5"
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
