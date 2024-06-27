@@ -20,7 +20,6 @@ use datafusion::sql::TableReference;
 use metrics::gauge;
 use serde::{Deserialize, Serialize};
 
-#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
 pub enum ComponentStatus {
     Initializing = 1,

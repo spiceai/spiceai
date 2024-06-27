@@ -28,7 +28,6 @@ use std::fmt;
 use std::sync::Arc;
 
 /// `TeeExec` duplicates the output of an execution plan into N partitions.
-#[allow(clippy::module_name_repetitions)]
 pub struct TeeExec {
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,

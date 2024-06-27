@@ -24,7 +24,6 @@ use crate::datafusion::DataFusion;
 
 use super::{Protocol, Query};
 
-#[allow(clippy::module_name_repetitions)]
 pub struct QueryBuilder {
     df: Arc<DataFusion>,
     sql: String,

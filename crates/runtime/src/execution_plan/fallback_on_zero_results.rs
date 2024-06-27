@@ -39,7 +39,6 @@ use super::TableScanParams;
 /// If the input `ExecutionPlan` returns 0 rows, the fallback `TableProvider.scan()` is executed.
 ///
 /// The input and fallback `ExecutionPlan` must have the same schema, execution modes and equivalence properties.
-#[allow(clippy::module_name_repetitions)]
 pub struct FallbackOnZeroResultsScanExec {
     table_name: TableReference,
     /// The input execution plan.

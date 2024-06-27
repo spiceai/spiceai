@@ -30,7 +30,6 @@ use self::write::MemTable;
 
 pub mod write;
 
-#[allow(clippy::module_name_repetitions)]
 pub struct ArrowFactory {}
 
 impl ArrowFactory {

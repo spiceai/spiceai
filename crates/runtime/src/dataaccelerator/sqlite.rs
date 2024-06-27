@@ -36,7 +36,6 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::module_name_repetitions)]
 pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableFactory,
 }

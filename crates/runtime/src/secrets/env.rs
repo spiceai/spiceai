@@ -22,7 +22,6 @@ use super::{Secret, SecretStore};
 
 const ENV_SECRET_PREFIX: &str = "SPICE_SECRET_";
 
-#[allow(clippy::module_name_repetitions)]
 pub struct EnvSecretStore {
     secrets: HashMap<String, Secret>,
 }
