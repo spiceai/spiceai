@@ -31,10 +31,11 @@ mod common;
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = common::start_postgres_docker_container().await?;
+    let port = common::get_random_port();
+    let running_container = common::start_postgres_docker_container(port).await?;
 
     let ctx = SessionContext::new();
-    let pool = common::get_postgres_connection_pool().await?;
+    let pool = common::get_postgres_connection_pool(port).await?;
     let db_conn = pool
         .connect_direct()
         .await
@@ -100,6 +101,75 @@ CREATE TABLE test (
             .downcast_ref::<TimestampMillisecondArray>()
             .expect("array can be cast")
             .value(0)
+    );
+
+    running_container.remove().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_postgres_chunking_performance() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let port = common::get_random_port();
+    let running_container = common::start_postgres_docker_container(port).await?;
+
+    let ctx = SessionContext::new();
+    let pool = common::get_postgres_connection_pool(port).await?;
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("connection can be established");
+    db_conn
+        .conn
+        .execute(
+            "
+CREATE TABLE test (
+    id INTEGER PRIMARY KEY,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);",
+            &[],
+        )
+        .await
+        .expect("table is created");
+
+    let mut values: Vec<String> = Vec::new();
+    for i in 0..250_000 {
+        values.push(format!("('{i}')"));
+    }
+
+    let values = values.join(",");
+    db_conn
+        .conn
+        .execute(&format!("INSERT INTO test (id) VALUES {values};"), &[])
+        .await
+        .expect("inserted data");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "test", None)
+        .await
+        .expect("table can be created");
+    ctx.register_table("test_datafusion", Arc::new(table))
+        .expect("Table should be registered");
+    let sql = "SELECT id, created_at FROM test_datafusion";
+    let start = std::time::Instant::now();
+    let df = ctx
+        .sql(sql)
+        .await
+        .expect("DataFrame can be created from query");
+    let record_batch = df.collect().await.expect("RecordBatch can be collected");
+    let end = std::time::Instant::now();
+    let duration = end - start;
+    let duration_ms = duration.as_millis();
+    let num_rows = record_batch
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(num_rows, 250_000);
+
+    assert!(
+        duration_ms < 700,
+        "Duration {duration_ms}ms was higher than 700ms",
     );
 
     running_container.remove().await?;
