@@ -171,10 +171,7 @@ impl DataConnector for Debezium {
                 dataconnector: "debezium",
             })?;
 
-        let msg = match kafka_consumer
-            .next_json::<ChangeEventKey, ChangeEvent>()
-            .await
-        {
+        let msg = match consumer.next_json::<ChangeEventKey, ChangeEvent>().await {
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
@@ -204,11 +201,7 @@ impl DataConnector for Debezium {
                 dataconnector: "debezium",
             })?;
 
-        let debezium_kafka = Arc::new(DebeziumKafka::new(
-            Arc::new(schema),
-            primary_keys,
-            kafka_consumer,
-        ));
+        let debezium_kafka = Arc::new(DebeziumKafka::new(Arc::new(schema), primary_keys, consumer));
 
         Ok(debezium_kafka)
     }
