@@ -77,27 +77,37 @@ impl KafkaConsumer {
     }
 
     /// Receive a JSON message from the Kafka topic.
-    pub async fn next_json<T: DeserializeOwned>(&self) -> Result<Option<KafkaMessage<T>>> {
-        let mut stream = Box::pin(self.stream_json::<T>());
+    pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
+        &self,
+    ) -> Result<Option<KafkaMessage<K, V>>> {
+        let mut stream = Box::pin(self.stream_json::<K, V>());
         stream.next().await.transpose()
     }
 
     /// Stream JSON messages from the Kafka topic.
-    pub fn stream_json<T: DeserializeOwned>(&self) -> impl Stream<Item = Result<KafkaMessage<T>>> {
+    pub fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
+        &self,
+    ) -> impl Stream<Item = Result<KafkaMessage<K, V>>> {
         self.consumer.stream().filter_map(move |msg| async move {
             let msg = match msg {
                 Ok(msg) => msg,
                 Err(e) => return Some(Err(Error::UnableToReceiveMessage { source: e })),
             };
 
+            let key_bytes = msg.key()?;
             let payload = msg.payload()?;
+
+            let key = match serde_json::from_slice(key_bytes) {
+                Ok(key) => key,
+                Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
+            };
 
             let value = match serde_json::from_slice(payload) {
                 Ok(value) => value,
                 Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
             };
 
-            Some(Ok(KafkaMessage::new(&self.consumer, msg, value)))
+            Some(Ok(KafkaMessage::new(&self.consumer, msg, key, value)))
         })
     }
 
@@ -129,22 +139,28 @@ impl KafkaConsumer {
     }
 }
 
-pub struct KafkaMessage<'a, T> {
+pub struct KafkaMessage<'a, K, V> {
     consumer: &'a StreamConsumer,
     msg: BorrowedMessage<'a>,
-    pub value: T,
+    key: K,
+    value: V,
 }
 
-impl<'a, T> KafkaMessage<'a, T> {
-    fn new(consumer: &'a StreamConsumer, msg: BorrowedMessage<'a>, value: T) -> Self {
+impl<'a, K, V> KafkaMessage<'a, K, V> {
+    fn new(consumer: &'a StreamConsumer, msg: BorrowedMessage<'a>, key: K, value: V) -> Self {
         Self {
             consumer,
             msg,
+            key,
             value,
         }
     }
 
-    pub fn value(&self) -> &T {
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    pub fn value(&self) -> &V {
         &self.value
     }
 

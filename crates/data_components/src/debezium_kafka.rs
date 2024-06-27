@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::{
     debezium::{
-        arrow::changes::{self, changes_schema},
-        change_event::ChangeEvent,
+        arrow::changes,
+        change_event::{ChangeEvent, ChangeEventKey},
     },
     kafka::KafkaConsumer,
 };
@@ -31,8 +31,8 @@ use datafusion::{
     logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        empty::EmptyExec, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
+        ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
     },
     sql::sqlparser::ast::{Ident, TableConstraint},
 };
@@ -88,7 +88,7 @@ impl TableProvider for DebeziumKafka {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(changes_schema(&self.schema))
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -106,11 +106,7 @@ impl TableProvider for DebeziumKafka {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DebeziumKafkaExec::new(
-            self.schema(),
-            self.primary_keys.clone(),
-            self.consumer,
-        )))
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
     }
 }
 
@@ -199,7 +195,7 @@ impl ExecutionPlan for DebeziumKafkaExec {
         let schema = Arc::clone(&self.schema());
         let primary_keys = self.primary_keys.clone();
         let stream = consumer
-            .stream_json::<ChangeEvent>()
+            .stream_json::<ChangeEventKey, ChangeEvent>()
             .filter_map(move |msg| {
                 let schema = Arc::clone(&schema);
                 let pk = primary_keys.clone();

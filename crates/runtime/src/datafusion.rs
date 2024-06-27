@@ -513,19 +513,7 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
-        let mut source_schema = source_table_provider.schema();
-
-        // TODO: Not sure about this.
-        if let Some(acceleration) = dataset.acceleration {
-            if source.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes {
-                let data = source_schema
-                    .field_with_name("data")
-                    .context(ChangeSchemaWithoutDataFieldSnafu)?;
-                if let DataType::Struct(data_fields) = data.data_type() {
-                    source_schema = Arc::new(Schema::new(data_fields.clone()));
-                }
-            }
-        }
+        let source_schema = source_table_provider.schema();
 
         let acceleration_settings =
             dataset

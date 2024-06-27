@@ -19,7 +19,7 @@ use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::debezium;
-use data_components::debezium::change_event::ChangeEvent;
+use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
@@ -170,7 +170,7 @@ impl DataConnector for Debezium {
                 dataconnector: "debezium",
             })?;
 
-        let msg = match consumer.next_json::<ChangeEvent>().await {
+        let msg = match consumer.next_json::<ChangeEventKey, ChangeEvent>().await {
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
@@ -185,6 +185,8 @@ impl DataConnector for Debezium {
             }
         };
 
+        let primary_keys = msg.key().get_primary_key();
+
         let Some(schema_fields) = msg.value().get_schema_fields() else {
             return Err(super::DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "debezium".to_string(),
@@ -198,7 +200,7 @@ impl DataConnector for Debezium {
                 dataconnector: "debezium",
             })?;
 
-        let debezium_kafka = Arc::new(DebeziumKafka::new(Arc::new(schema), consumer));
+        let debezium_kafka = Arc::new(DebeziumKafka::new(Arc::new(schema), primary_keys, consumer));
 
         Ok(debezium_kafka)
     }
