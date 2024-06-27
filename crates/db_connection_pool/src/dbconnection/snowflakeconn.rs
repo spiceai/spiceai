@@ -18,9 +18,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray, TimestampMillisecondBuilder,
+    Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
+    StructArray, TimestampMillisecondBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
+    SchemaRef, TimeUnit,
+};
+use arrow::error::ArrowError;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -275,15 +280,55 @@ fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRe
 }
 
 fn cast_sf_fixed_point_number_to_decimal(
-    column: &ArrayRef,
+    array: &ArrayRef,
     precision: u8,
     scale: i8,
 ) -> Result<ArrayRef, Error> {
-    let decimal_type = DataType::Decimal128(precision, scale);
-    let decimal_array = arrow::compute::cast(&column, &decimal_type)
-        .context(UnableToCastSnowflakeNumericToDecimalSnafu)?;
+    let data_type = array.data_type();
+    let decimal_array = match array.data_type() {
+        DataType::Int8 => {
+            cast_integer_to_decimal(array.as_primitive::<Int8Type>(), precision, scale)
+        }
+        DataType::Int16 => {
+            cast_integer_to_decimal(array.as_primitive::<Int16Type>(), precision, scale)
+        }
+        DataType::Int32 => {
+            cast_integer_to_decimal(array.as_primitive::<Int32Type>(), precision, scale)
+        }
+        DataType::Int64 => {
+            cast_integer_to_decimal(array.as_primitive::<Int64Type>(), precision, scale)
+        }
+        _ => Err(ArrowError::CastError(format!(
+            "Casting from {data_type:?} is not supported"
+        ))),
+    }
+    .context(UnableToCastSnowflakeNumericToDecimalSnafu)?;
 
     Ok(decimal_array)
+}
+
+fn cast_integer_to_decimal<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>,
+    precision: u8,
+    scale: i8,
+) -> Result<ArrayRef, ArrowError>
+where
+    T::Native: Into<i128>,
+{
+    let mut decimal_builder = Decimal128Array::builder(array.len());
+    for value in array {
+        match value {
+            Some(value) => {
+                decimal_builder.append_value(value.into());
+            }
+            None => decimal_builder.append_null(),
+        }
+    }
+
+    let decimal_array = decimal_builder.finish();
+    Ok(Arc::new(
+        decimal_array.with_precision_and_scale(precision, scale)?,
+    ))
 }
 
 #[cfg(test)]
@@ -294,6 +339,7 @@ mod tests {
         TimestampMillisecondArray,
     };
     use arrow::datatypes::{DataType, Field};
+    use arrow::util::display;
     use std::sync::Arc;
 
     #[test]
@@ -334,6 +380,65 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_cast_sf_fixed_point_number_to_decimal_i32() {
+        let scale = 4i8;
+        let data = vec![
+            (0.123 * 10f64.powi(scale.into())) as i32,
+            (-345.1234 * 10f64.powi(scale.into())) as i32,
+        ];
+        let int32_array = Int32Array::from(data);
+        let decimal_array =
+            cast_integer_to_decimal(&int32_array, 10, scale).expect("Should cast to decimal");
+        let decimal_array = decimal_array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Should downcast to Decimal128Array");
+
+        assert_eq!(decimal_array.value(0), 1_230_i128);
+        assert_eq!(decimal_array.value(1), -3_451_234_i128);
+
+        assert_eq!(
+            "0.1230",
+            display::array_value_to_string(&decimal_array, 0).expect("Should format decimal")
+        );
+        assert_eq!(
+            "-345.1234",
+            display::array_value_to_string(&decimal_array, 1).expect("Should format decimal")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_cast_sf_fixed_point_number_to_decimal_i64() {
+        let scale = 9i8;
+        let data = vec![
+            (0.000_000_001 * 10f64.powi(scale.into())) as i64,
+            (999_999.999_999_999 * 10f64.powi(scale.into())) as i64,
+        ];
+
+        let int_array = Int64Array::from(data);
+        let decimal_array =
+            cast_integer_to_decimal(&int_array, 34, scale).expect("Should cast to decimal");
+        let decimal_array = decimal_array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Should downcast to Decimal128Array");
+
+        assert_eq!(decimal_array.value(0), 1i128); // 0.000000001 scaled by 10^9
+        assert_eq!(decimal_array.value(1), 999_999_999_999_999_i128);
+
+        assert_eq!(
+            "0.000000001",
+            display::array_value_to_string(&decimal_array, 0).expect("Should format decimal")
+        );
+        assert_eq!(
+            "999999.999999999",
+            display::array_value_to_string(&decimal_array, 1).expect("Should format decimal")
+        );
     }
 
     fn create_timestamp_ntz_array(
