@@ -435,12 +435,9 @@ impl RefreshTask {
                     metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
 
                     if should_retry_df_error(&e) {
-                        Err(RetryError::Transient {
-                            err: e,
-                            retry_after: None,
-                        })
+                        Err(RetryError::transient(e))
                     } else {
-                        Err(RetryError::Permanent(e))
+                        Err(RetryError::permanent(e))
                     }
                 }
             }

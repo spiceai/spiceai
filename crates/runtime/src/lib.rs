@@ -55,9 +55,10 @@ use spicepod::component::llms::Llm;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use tracing_util::dataset_registered_trace;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 pub use util::shutdown_signal;
+use util::{retry, RetryError};
 use uuid::Uuid;
 
 use crate::extension::{Extension, ExtensionFactory};
@@ -414,7 +415,9 @@ impl Runtime {
     pub async fn load_dataset(&self, ds: &Dataset) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        loop {
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
+
+        let _ = retry(retry_strategy, || async {
             let connector = match self.load_dataset_connector(ds).await {
                 Ok(connector) => connector,
                 Err(err) => {
@@ -422,20 +425,19 @@ impl Runtime {
                     status::update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
+                    return Err(RetryError::transient(err));
                 }
             };
 
-            if let Ok(()) = self.register_loaded_dataset(ds, connector, None).await {
-            } else {
-                sleep(Duration::from_secs(1)).await;
-                continue;
-            }
+            if let Err(err) = self.register_loaded_dataset(ds, connector, None).await {
+                return Err(RetryError::transient(err));
+            };
 
             status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-            break;
-        }
+
+            Ok(())
+        })
+        .await;
     }
 
     pub fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
