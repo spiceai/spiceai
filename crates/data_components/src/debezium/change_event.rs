@@ -89,12 +89,12 @@ pub enum Op {
 impl Display for Op {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            Op::Create => write!(f, "create"),
-            Op::Update => write!(f, "update"),
-            Op::Delete => write!(f, "delete"),
-            Op::Read => write!(f, "read"),
-            Op::Truncate => write!(f, "truncate"),
-            Op::Message => write!(f, "message"),
+            Op::Create => write!(f, "c"),
+            Op::Update => write!(f, "u"),
+            Op::Delete => write!(f, "d"),
+            Op::Read => write!(f, "r"),
+            Op::Truncate => write!(f, "t"),
+            Op::Message => write!(f, "m"),
         }
     }
 }

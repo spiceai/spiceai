@@ -407,7 +407,9 @@ impl RefreshTask {
                                 panic!("Failed to insert data: {e}");
                             };
                         }
-                        _ => panic!("Unknown operation"),
+                        _ => {
+                            tracing::error!("Unknown operation {op} for {dataset_name}");
+                        }
                     }
                 }
             }

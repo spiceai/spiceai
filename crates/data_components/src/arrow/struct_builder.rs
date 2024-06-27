@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc};
 
 use arrow::{
     array::{make_builder, ArrayBuilder, ArrayRef, StructArray},
-    datatypes::{Fields, SchemaBuilder},
+    datatypes::{DataType, Fields, SchemaBuilder},
 };
 use arrow_buffer::NullBufferBuilder;
 
@@ -100,8 +100,15 @@ impl StructBuilder {
     /// Creates a new `StructBuilder` from [`Fields`] and `capacity`
     pub fn from_fields(fields: impl Into<Fields>, capacity: usize) -> Self {
         let fields = fields.into();
-        let mut builders = Vec::with_capacity(fields.len());
+        let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::with_capacity(fields.len());
         for field in &fields {
+            if let DataType::Struct(fields) = field.data_type() {
+                builders.push(Box::new(StructBuilder::from_fields(
+                    fields.clone(),
+                    capacity,
+                )));
+                continue;
+            }
             builders.push(make_builder(field.data_type(), capacity));
         }
         Self::new(fields, builders)
