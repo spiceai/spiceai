@@ -18,6 +18,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use data_components::cdc::{self, ChangeEnvelope};
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
 use datafusion::dataframe::DataFrame;
@@ -34,6 +35,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
+use futures::stream::BoxStream;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -305,10 +307,10 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
-    async fn stream_provider(
+    fn changes_stream(
         &self,
-        _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+        _table_provider: Arc<dyn TableProvider>,
+    ) -> Option<BoxStream<'_, Result<ChangeEnvelope, cdc::StreamError>>> {
         None
     }
 

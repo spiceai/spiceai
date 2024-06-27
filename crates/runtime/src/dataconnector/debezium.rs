@@ -18,11 +18,13 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use async_trait::async_trait;
+use data_components::cdc::{self, ChangeEnvelope};
 use data_components::debezium;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
+use futures::stream::BoxStream;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -203,5 +205,15 @@ impl DataConnector for Debezium {
         let debezium_kafka = Arc::new(DebeziumKafka::new(Arc::new(schema), primary_keys, consumer));
 
         Ok(debezium_kafka)
+    }
+
+    fn changes_stream(
+        &self,
+        table_provider: Arc<dyn TableProvider>,
+    ) -> Option<BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>> {
+        let table_provider = Arc::clone(&table_provider);
+        let debezium_kafka = table_provider.as_any().downcast_ref::<DebeziumKafka>()?;
+
+        Some(debezium_kafka.stream_changes())
     }
 }

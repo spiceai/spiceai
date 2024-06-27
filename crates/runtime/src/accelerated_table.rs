@@ -25,6 +25,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
+use data_components::cdc::{self, ChangeEnvelope};
 use data_components::delete::get_deletion_provider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionState;
@@ -37,6 +38,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
+use futures::stream::BoxStream;
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
 
@@ -138,6 +140,8 @@ pub struct Builder {
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    changes_stream:
+        Option<BoxStream<'static, std::result::Result<ChangeEnvelope, cdc::StreamError>>>,
 }
 
 impl Builder {
@@ -155,6 +159,7 @@ impl Builder {
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
             cache_provider: None,
+            changes_stream: None,
         }
     }
 
@@ -176,6 +181,25 @@ impl Builder {
         self
     }
 
+    /// Set the changes stream for the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode isn't `RefreshMode::Changes`.
+    pub fn changes_stream(
+        &mut self,
+        changes_stream: BoxStream<'static, std::result::Result<ChangeEnvelope, cdc::StreamError>>,
+    ) -> &mut Self {
+        assert!(self.refresh.mode == RefreshMode::Changes);
+        self.changes_stream = Some(changes_stream);
+        self
+    }
+
+    /// Build the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode is `RefreshMode::Changes` and no changes stream is provided.
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
@@ -199,7 +223,13 @@ impl Builder {
                 )
             }
             RefreshMode::Changes => {
-                todo!()
+                let Some(changes_stream) = self.changes_stream else {
+                    panic!("Changes stream is required for `RefreshMode::Changes`");
+                };
+                (
+                    refresh::AccelerationRefreshMode::Changes(changes_stream),
+                    None,
+                )
             }
         };
 

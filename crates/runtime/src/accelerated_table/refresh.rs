@@ -22,9 +22,11 @@ use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use cache::QueryResultsCacheProvider;
+use data_components::cdc::{self, ChangeEnvelope};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
@@ -96,6 +98,7 @@ impl Default for Refresh {
 pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append(Option<Receiver<()>>),
+    Changes(BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>),
 }
 
 pub struct Refresher {
@@ -155,6 +158,9 @@ impl Refresher {
                 }
             }
             AccelerationRefreshMode::Full(receiver) => receiver,
+            AccelerationRefreshMode::Changes(stream) => {
+                return self.start_changes_stream(stream, ready_sender);
+            }
         };
 
         let (start_refresh, mut on_refresh_complete) = self.refresh_task_runner.start();
@@ -236,6 +242,30 @@ impl Refresher {
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
+            }
+        })
+    }
+
+    fn start_changes_stream(
+        &mut self,
+        changes_stream: BoxStream<'static, std::result::Result<ChangeEnvelope, cdc::StreamError>>,
+        ready_sender: oneshot::Sender<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let refresh_task = Arc::new(RefreshTask::new(
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            Arc::clone(&self.refresh),
+            Arc::clone(&self.accelerator),
+        ));
+
+        let cache_provider = self.cache_provider.clone();
+
+        tokio::spawn(async move {
+            if let Err(err) = refresh_task
+                .start_changes_stream(changes_stream, cache_provider, Some(ready_sender))
+                .await
+            {
+                tracing::error!("Changes stream failed with error: {err}");
             }
         })
     }

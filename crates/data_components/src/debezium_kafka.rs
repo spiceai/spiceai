@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::{
+    cdc::{self, ChangeEnvelope},
     debezium::{
         arrow::changes,
         change_event::{ChangeEvent, ChangeEventKey},
@@ -36,7 +37,7 @@ use datafusion::{
     },
     sql::sqlparser::ast::{Ident, TableConstraint},
 };
-use futures::StreamExt;
+use futures::{stream::BoxStream, StreamExt};
 use std::{any::Any, fmt, sync::Arc};
 
 pub struct DebeziumKafka {
@@ -78,6 +79,31 @@ impl DebeziumKafka {
     #[must_use]
     pub fn get_primary_keys(&self) -> &Vec<String> {
         &self.primary_keys
+    }
+
+    #[must_use]
+    pub fn stream_changes(&self) -> BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>> {
+        let schema = Arc::clone(&self.schema);
+        let primary_keys = self.primary_keys.clone();
+        let stream = self
+            .consumer
+            .stream_json::<ChangeEventKey, ChangeEvent>()
+            .map(move |msg| {
+                let schema = Arc::clone(&schema);
+                let pk = primary_keys.clone();
+                let Ok(msg) = msg else {
+                    return Err(cdc::StreamError::Kafka(
+                        "Unable to read message".to_string(),
+                    ));
+                };
+
+                let val = msg.value();
+                changes::to_record_batch(&schema, &pk, val)
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+            });
+
+        Box::pin(stream)
     }
 }
 
