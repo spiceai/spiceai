@@ -16,6 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::secrets::{get_secret_or_param, Secret};
+use arrow::array::AsArray;
+use arrow::datatypes::Fields;
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_trait::async_trait;
@@ -34,7 +36,7 @@ use reqwest::{
     RequestBuilder, StatusCode,
 };
 use serde_json::{json, Value};
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 use std::{any::Any, collections::HashMap, future::Future, io::Cursor, pin::Pin, sync::Arc};
 use url::Url;
 
@@ -77,6 +79,11 @@ Please verify the syntax of your GraphQL query."#
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct UnnestParameters {
+    depth: usize,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct PaginationParameters {
@@ -176,6 +183,7 @@ struct GraphQLClient {
     endpoint: Url,
     query: String,
     pointer: String,
+    unnest_parameters: UnnestParameters,
     pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
 }
@@ -186,6 +194,7 @@ impl GraphQLClient {
         endpoint: Url,
         query: String,
         pointer: String,
+        unnest_parameters: UnnestParameters,
         pagination_parameters: Option<PaginationParameters>,
         auth: Option<Auth>,
     ) -> Self {
@@ -194,11 +203,93 @@ impl GraphQLClient {
             endpoint,
             query,
             pointer,
+            unnest_parameters,
             pagination_parameters,
             auth,
         }
     }
 }
+
+fn unnest_record_batch_one_level(record: &RecordBatch) -> Result<RecordBatch> {
+    let schema = record.schema();
+    let fields = schema.fields();
+    let mut new_fields = vec![];
+    let mut new_columns = vec![];
+
+    for i in 0..fields.len() {
+        let Some(field) = fields.get(i) else {
+            continue;
+        };
+
+        match field.data_type() {
+            arrow::datatypes::DataType::Struct(fields) => {
+                for j in 0..fields.len() {
+                    let Some(new_field) = fields.get(j) else {
+                        continue;
+                    };
+
+                    new_fields.push(Arc::clone(new_field));
+                    new_columns.push(Arc::clone(record.column(i).as_struct().column(j)));
+                }
+            }
+            arrow::datatypes::DataType::List(field) => {
+                if let arrow::datatypes::DataType::Struct(fields) = field.data_type() {
+                    for j in 0..fields.len() {
+                        let Some(new_field) = fields.get(j) else {
+                            continue;
+                        };
+
+                        new_fields.push(Arc::clone(new_field));
+                        new_columns.push(Arc::clone(record.column(i).as_struct().column(j)));
+                    }
+                } else {
+                    new_fields.push(Arc::clone(field));
+                    new_columns.push(Arc::clone(record.column(i)));
+                }
+            }
+            _ => {
+                new_fields.push(Arc::clone(field));
+                new_columns.push(Arc::clone(record.column(i)));
+            }
+        }
+    }
+
+    RecordBatch::try_new(schema, new_columns).context(ArrowInternalSnafu)
+}
+
+// fn unnest_record_batches(batch: Vec<RecordBatch>, depth: usize) -> Result<Vec<RecordBatch>> {
+//     if depth == 0 {
+//         return Ok(batch);
+//     }
+
+//     let mut res = vec![];
+//     for record in batch {
+//         let schema = record.schema();
+//         let fields = schema.fields();
+//         for i in 0..fields.len() {
+//             let field = fields[i].clone();
+//             match field.data_type() {
+//                 arrow::datatypes::DataType::Struct(fields) => {
+//                     let mut new_fields = vec![];
+//                     for j in 0..fields.len() {
+//                         let new_field = fields[j].clone();
+//                         new_fields.push(new_field);
+//                     }
+//                     let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
+//                     let new_record =
+//                         RecordBatch::try_new(new_schema, vec![]).context(ArrowInternal)?;
+//                     res.push(new_record);
+//                 }
+//                 arrow::datatypes::DataType::List(field) => {}
+//                 _ => {
+//                     res.push(record.clone());
+//                 }
+//             }
+//         }
+//     }
+
+//     Ok(res)
+// }
 
 impl GraphQLClient {
     async fn execute(
@@ -253,6 +344,8 @@ impl GraphQLClient {
             infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
                 .context(ArrowInternalSnafu)?,
         ));
+
+        println!("{:#?}", schema.fields);
 
         let mut res = vec![];
         for v in unwrapped {
@@ -493,6 +586,25 @@ impl GraphQL {
 
         client_builder = client_builder.default_headers(headers);
 
+        let unnest_depth = self
+            .params
+            .get("unnest_depth")
+            .unwrap_or(&"0".to_string())
+            .parse::<usize>();
+
+        let unnest_depth = match unnest_depth {
+            Ok(depth) => Ok(depth),
+            Err(e) => Err(super::DataConnectorError::InvalidConfiguration {
+                dataconnector: "GraphQL".to_string(),
+                message: "`unnest_depth` is not an integer".to_string(),
+                source: e.into(),
+            }),
+        }?;
+
+        let unnest_parameters = UnnestParameters {
+            depth: unnest_depth,
+        };
+
         Ok(GraphQLClient::new(
             client_builder.build().map_err(|e| {
                 super::DataConnectorError::InvalidConfiguration {
@@ -504,6 +616,7 @@ impl GraphQL {
             endpoint,
             query,
             pointer,
+            unnest_parameters,
             pagination_parameters,
             auth,
         ))
