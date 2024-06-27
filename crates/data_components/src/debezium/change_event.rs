@@ -21,7 +21,29 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// A representation of a Debezium Change Event.
+/// A representation of a Debezium Change Event Key.
+#[derive(Serialize, Deserialize)]
+pub struct ChangeEventKey {
+    pub schema: Schema,
+    pub payload: serde_json::Value,
+}
+
+impl ChangeEventKey {
+    pub fn from_bytes(bytz: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytz)
+    }
+
+    #[must_use]
+    pub fn get_primary_key(&self) -> Vec<String> {
+        self.schema
+            .fields
+            .iter()
+            .filter_map(|field| field.field.clone())
+            .collect()
+    }
+}
+
+/// A representation of a Debezium Change Event Value.
 #[derive(Serialize, Deserialize)]
 pub struct ChangeEvent {
     pub schema: Schema,

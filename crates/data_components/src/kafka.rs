@@ -149,10 +149,6 @@ impl<'a, T> KafkaMessage<'a, T> {
         &self.value
     }
 
-    pub fn take_value(self) -> T {
-        self.value
-    }
-
     pub fn mark_processed(&self) -> Result<()> {
         self.consumer
             .store_offset_from_message(&self.msg)

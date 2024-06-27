@@ -29,6 +29,7 @@ use crate::secrets::Secret;
 use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use cache::QueryResultsCacheProvider;
 use datafusion::catalog::schema::SchemaProvider;
@@ -170,6 +171,9 @@ pub enum Error {
 
     #[snafu(display("Unable to get the lock of data writers"))]
     UnableToLockDataWriters {},
+
+    #[snafu(display("The schema returned by the data connector for refresh_mode: changes does not contain a data field"))]
+    ChangeSchemaWithoutDataField { source: ArrowError },
 }
 
 pub enum Table {
@@ -509,7 +513,20 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
-        let source_schema = source_table_provider.schema();
+        let mut source_schema = source_table_provider.schema();
+
+        // TODO: Not sure about this.
+        if let Some(acceleration) = dataset.acceleration {
+            if source.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes {
+                let data = source_schema
+                    .field_with_name("data")
+                    .context(ChangeSchemaWithoutDataFieldSnafu)?;
+                if let DataType::Struct(data_fields) = data.data_type() {
+                    source_schema = Arc::new(Schema::new(data_fields.clone()));
+                }
+            }
+        }
+
         let acceleration_settings =
             dataset
                 .acceleration
