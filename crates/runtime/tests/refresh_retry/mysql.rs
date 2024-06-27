@@ -151,7 +151,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
             return Err("Timed out waiting for dataset refresh result".to_string());
         },
-        res = refresh_task_no_retries.get_full_or_incremental_append_update(None) => {
+        res = refresh_task_no_retries.run() => {
             tracing::debug!("Refresh task completed. Is error={}", res.is_err());
             assert!(res.is_err(), "Expected refresh error but got {res:?}");
         }
@@ -180,7 +180,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
             return Err("Timed out waiting for dataset refresh result".to_string());
         },
-        res = refresh_task_retries.get_full_or_incremental_append_update(None) => {
+        res = refresh_task_retries.run() => {
             tracing::debug!("Refresh task completed. Is error={}", res.is_err());
             assert!(res.is_ok(), "Expected refresh succeed after retrying but got {res:?}");
         }
