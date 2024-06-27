@@ -1,22 +1,18 @@
 [package]
-name = "flightsubscriber"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 description = "Spice OSS Flight Subscriber"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "flightsubscriber"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 arrow-flight.workspace = true
 clap.workspace = true
-tokio.workspace = true
-tonic = { workspace = true, features = [
-  "transport",
-  "tls",
-  "tls-roots",
-] }
 futures.workspace = true
+tokio.workspace = true
+tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
