@@ -1,12 +1,12 @@
 [package]
-name = "arrow_tools"
-version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "arrow_tools"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 arrow.workspace = true

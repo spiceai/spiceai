@@ -1,16 +1,16 @@
 [package]
-name = "util"
-version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "util"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
+backoff = "0.4.0"
 humantime = "2.1.0"
+rand = "0.8.5"
 tokio = { workspace = true }
 tracing = { workspace = true }
-backoff= "0.4.0"
-rand = "0.8.5"

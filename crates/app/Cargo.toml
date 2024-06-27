@@ -1,12 +1,12 @@
 [package]
-name = "app"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 description = "All loaded components from the root Spicepod and its dependencies"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "app"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 snafu.workspace = true
