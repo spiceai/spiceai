@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::module_name_repetitions)]
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},

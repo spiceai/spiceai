@@ -67,7 +67,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
 /// Configure an accelerator to store data - the localhost connector itself does nothing.
-#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
 pub struct LocalhostConnector {
     schema: SchemaRef,

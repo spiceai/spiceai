@@ -1,5 +1,5 @@
 // Copy the below to `settings.json` and tweak the `features` array to enable optional features in VSCode.
 {
   "rust-analyzer.cargo.features": [],
-  "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr"],
+  "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"],
 }

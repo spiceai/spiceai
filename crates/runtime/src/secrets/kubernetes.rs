@@ -157,7 +157,6 @@ impl KubernetesClient {
     }
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct KubernetesSecretStore {
     kubernetes_client: KubernetesClient,
 }

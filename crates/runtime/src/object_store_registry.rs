@@ -30,7 +30,7 @@ use url::{form_urlencoded::parse, Url};
 use crate::objectstore::ftp::FTPObjectStore;
 #[cfg(feature = "ftp")]
 use crate::objectstore::sftp::SFTPObjectStore;
-#[allow(clippy::module_name_repetitions)]
+
 #[derive(Debug, Default)]
 pub struct SpiceObjectStoreRegistry {
     inner: DefaultObjectStoreRegistry,

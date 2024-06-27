@@ -26,7 +26,6 @@ use std::{any::Any, sync::Arc};
 
 use super::DataAccelerator;
 
-#[allow(clippy::module_name_repetitions)]
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
 }

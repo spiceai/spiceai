@@ -55,7 +55,8 @@ lint-rust:
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions
 
 lint-go:
 	go vet ./...
