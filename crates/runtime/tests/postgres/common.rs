@@ -64,13 +64,15 @@ pub(super) async fn start_postgres_docker_container(
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{PG_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
+    let port = if let Ok(port) = port.try_into() {
+        port
+    } else {
+        15432
+    };
+
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image("postgres:latest")
-        .add_port_binding(
-            5432,
-            #[allow(clippy::expect_used)]
-            port.try_into().expect("Port number should fit into u16"),
-        )
+        .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
             test: Some(vec![
