@@ -30,8 +30,8 @@ const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql"
 const MYSQL_PORT: u16 = 13306;
 
 #[instrument]
-async fn init_mysql_db() -> Result<(), anyhow::Error> {
-    let pool = get_mysql_conn(MYSQL_PORT)?;
+async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
     let mut conn = pool.get_conn().await?;
 
     tracing::debug!("DROP TABLE IF EXISTS lineitem");
@@ -67,7 +67,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
             e.to_string()
         })?;
     tracing::debug!("Container started");
-    init_mysql_db().await.map_err(|e| {
+    init_mysql_db(MYSQL_PORT).await.map_err(|e| {
         tracing::error!("init_mysql_db: {e}");
         e.to_string()
     })?;
@@ -166,7 +166,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         e.to_string()
     })?;
     tracing::debug!("Container started");
-    init_mysql_db().await.map_err(|e| {
+    init_mysql_db(mysql_port).await.map_err(|e| {
         tracing::error!("init_mysql_db: {e}");
         e.to_string()
     })?;
