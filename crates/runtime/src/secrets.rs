@@ -138,7 +138,7 @@ impl Secret {
 
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        let secret_value = self.data.get(key)?;
+        let secret_value = self.data.get(key.to_lowercase().as_str())?;
         let exposed_secret = secret_value.expose_secret();
         Some(exposed_secret)
     }
@@ -300,7 +300,7 @@ pub fn get_secret_or_param(
     };
 
     if let Some(secrets) = secret {
-        if let Some(secret_val) = secrets.get(secret_param_val.to_lowercase().as_str()) {
+        if let Some(secret_val) = secrets.get(secret_param_val) {
             return Some(secret_val.to_string());
         };
     };
