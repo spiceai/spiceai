@@ -24,7 +24,6 @@ use crate::reader;
 pub mod dataset;
 pub mod embeddings;
 pub mod extension;
-pub mod llms;
 pub mod model;
 pub mod params;
 pub mod runtime;
