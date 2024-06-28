@@ -25,6 +25,8 @@ use rdkafka::{
 use serde::de::DeserializeOwned;
 use snafu::prelude::*;
 
+use crate::cdc::{self, CommitChange, CommitError};
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Kafka consumer: {source}"))]
@@ -168,5 +170,14 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
         self.consumer
             .store_offset_from_message(&self.msg)
             .context(UnableToCommitMessageSnafu)
+    }
+}
+
+impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
+    fn commit(&self) -> Result<(), CommitError> {
+        self.mark_processed()
+            .boxed()
+            .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
+        Ok(())
     }
 }

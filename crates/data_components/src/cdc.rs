@@ -23,8 +23,6 @@ use arrow::{
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
-use crate::kafka::KafkaMessage;
-
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
 #[derive(Debug, Snafu)]
@@ -79,15 +77,6 @@ impl ChangeEnvelope {
 
     pub fn commit(self) -> Result<(), CommitError> {
         self.change_committer.commit()
-    }
-}
-
-impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
-    fn commit(&self) -> Result<(), CommitError> {
-        self.mark_processed()
-            .boxed()
-            .context(UnableToCommitChangeSnafu)?;
-        Ok(())
     }
 }
 
