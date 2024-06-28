@@ -1,0 +1,17 @@
+# Spice v0.15-alpha (July 1, 2024)
+
+The v0.15-alpha release ... Configurable retry logic for data refresh ensures data is updated even when the source is temporarily unavailable.
+
+- **Data Refresh Retries:** By default, accelerated datasets attempt to retry data refreshes on transient errors. This behavior can be configured using refresh_retry_enabled and refresh_retry_max_attempts.
+
+Example Spicepod configuration showing how to limit refresh retries to a maximum of 10 attempts
+
+```yaml
+datasets:
+  - from: eth.blocks
+    name: blocks
+    acceleration:
+      refresh_retry_enabled: true
+      refresh_retry_max_attempts: 10
+      refresh_check_interval: 30s
+```
