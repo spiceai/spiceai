@@ -49,6 +49,19 @@ impl Embeddings {
         EmbeddingPrefix::try_from(self.from.as_str()).ok()
     }
 
+    /// Get the model id from the `from` field. The model id is the part of the `from` field after the prefix.
+    ///
+    /// # Example
+    /// - `spice.ai/taxi_tech_co/taxi_drives/models/drive_stats:latest`
+    ///     - Prefix: `spice.ai`
+    ///     - Model Id: `taxi_tech_co/taxi_drives/models/drive_stats:latest`
+    /// - `huggingface:huggingface.co/transformers/gpt-2:latest`
+    ///    - Prefix: `huggingface:huggingface.co`
+    ///    - Model Id: `transformers/gpt-2:latest`
+    ///
+    /// - `file://absolute/path/to/my/model.onnx`
+    ///     - Prefix: `file:`
+    ///     - Model Id: `/absolute/path/to/my/model.onnx`
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_prefix() {

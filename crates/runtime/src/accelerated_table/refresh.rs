@@ -793,6 +793,7 @@ mod tests {
             expected_size: usize,
             time_format: Option<TimeFormat>,
             append_overlap: Option<Duration>,
+            duplicated_incoming_data: bool,
             message: &str,
         ) {
             let original_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
@@ -824,9 +825,13 @@ mod tests {
             )
             .expect("data should be created");
 
+            let mut data = vec![vec![batch.clone()]];
+            if duplicated_incoming_data {
+                data = vec![vec![batch.clone()], vec![batch]];
+            }
+
             let federated = Arc::new(
-                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-                    .expect("mem table should be created"),
+                MemTable::try_new(Arc::clone(&schema), data).expect("mem table should be created"),
             );
 
             let arr = UInt64Array::from(existing_data);
@@ -905,6 +910,7 @@ mod tests {
             3,
             Some(TimeFormat::UnixSeconds),
             None,
+            false,
             "should insert all data into empty accelerator",
         )
         .await;
@@ -914,6 +920,7 @@ mod tests {
             4,
             Some(TimeFormat::UnixSeconds),
             None,
+            false,
             "should not insert any stale data and keep original size",
         )
         .await;
@@ -923,6 +930,7 @@ mod tests {
             4,
             Some(TimeFormat::UnixSeconds),
             None,
+            false,
             "should keep original data of accelerator when no new data is found",
         )
         .await;
@@ -932,6 +940,7 @@ mod tests {
             6,
             Some(TimeFormat::UnixSeconds),
             None,
+            false,
             "should apply new data onto existing data",
         )
         .await;
@@ -943,6 +952,7 @@ mod tests {
             4,
             Some(TimeFormat::UnixSeconds),
             None,
+            false,
             "should not apply same timestamp data",
         )
         .await;
@@ -953,6 +963,7 @@ mod tests {
             10,
             Some(TimeFormat::UnixSeconds),
             Some(Duration::from_secs(10)),
+            false,
             "should apply late arrival and new data onto existing data",
         )
         .await;
@@ -963,6 +974,7 @@ mod tests {
             7, // 1, 2, 3, 7, 8, 9, 10
             Some(TimeFormat::UnixSeconds),
             Some(Duration::from_secs(3)),
+            false,
             "should apply late arrival within the append overlap period and new data onto existing data",
         )
         .await;
@@ -973,6 +985,7 @@ mod tests {
             7, // 1, 2, 3, 7, 8, 9, 10
             None,
             Some(Duration::from_secs(3)),
+            false,
             "should default to time unix seconds",
         )
         .await;
@@ -982,7 +995,18 @@ mod tests {
             10, // all the data
             Some(TimeFormat::UnixMillis),
             Some(Duration::from_secs(3)),
+            false,
             "should fetch all data as 3 seconds is enough to cover all time span in source with millis",
+        )
+        .await;
+        test(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 9],
+            16, // all the data
+            Some(TimeFormat::UnixMillis),
+            Some(Duration::from_secs(3)),
+            true,
+            "should fetch all data from all fetched record batches as 3 seconds is enough to cover all time span in source with millis",
         )
         .await;
     }
