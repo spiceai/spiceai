@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::needless_pass_by_value)]
-#![allow(clippy::module_name_repetitions)]
 use std::path::Path;
 
 use async_trait::async_trait;

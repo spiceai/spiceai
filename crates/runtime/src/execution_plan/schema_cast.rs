@@ -33,7 +33,6 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 
-#[allow(clippy::module_name_repetitions)]
 pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,

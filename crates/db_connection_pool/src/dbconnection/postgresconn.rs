@@ -16,15 +16,21 @@ limitations under the License.
 
 use std::any::Any;
 use std::error::Error;
+use std::sync::Arc;
 
+use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::postgres::columns_to_schema;
 use arrow_sql_gen::postgres::rows_to_arrow;
+use async_stream::stream;
 use bb8_postgres::tokio_postgres::types::ToSql;
 use bb8_postgres::PostgresConnectionManager;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+use futures::stream;
+use futures::StreamExt;
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
 
@@ -136,11 +142,53 @@ impl<'a>
         sql: &str,
         params: &[&'a (dyn ToSql + Sync)],
     ) -> Result<SendableRecordBatchStream> {
-        let rows = self.conn.query(sql, params).await.context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-        let schema = rec.schema();
-        let recs = vec![rec];
-        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
+        // TODO: We should have a way to detect if params have been passed
+        // if they haven't we should use .copy_out instead, because it should be much faster
+        let streamable = self
+            .conn
+            .query_raw(sql, params.iter().copied()) // use .query_raw to get access to the underlying RowStream
+            .await
+            .context(QuerySnafu)?;
+
+        // chunk the stream into groups of rows
+        let mut stream = streamable.chunks(4_000).boxed().map(|rows| {
+            let rows = rows
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context(QuerySnafu)?;
+            let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+            Ok::<_, PostgresError>(rec)
+        });
+
+        let Some(first_chunk) = stream.next().await else {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                stream::empty(),
+            )));
+        };
+
+        let first_chunk = first_chunk?;
+        let schema = first_chunk.schema(); // like clickhouse, pull out the schema from the first chunk to use in the DataFusion Stream Adapter
+
+        let output_stream = stream! {
+           yield Ok(first_chunk);
+           while let Some(batch) = stream.next().await {
+                match batch {
+                    Ok(batch) => {
+                        yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
+                    }
+                    Err(e) => {
+                        println!("Yielding an error");
+                        yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
+                    }
+                }
+           }
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            output_stream,
+        )))
     }
 
     async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {

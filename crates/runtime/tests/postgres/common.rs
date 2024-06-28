@@ -20,6 +20,7 @@ use bollard::secret::HealthConfig;
 use db_connection_pool::postgrespool::PostgresConnectionPool;
 use secrecy::SecretString;
 // use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use rand::Rng;
 use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
@@ -27,16 +28,13 @@ use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 const PG_PASSWORD: &str = "runtime-integration-test-pw";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
 
-fn get_pg_params() -> HashMap<String, SecretString> {
+fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     let mut params = HashMap::new();
     params.insert(
         "pg_host".to_string(),
         SecretString::from("localhost".to_string()),
     );
-    params.insert(
-        "pg_port".to_string(),
-        SecretString::from("15432".to_string()),
-    );
+    params.insert("pg_port".to_string(), SecretString::from(port.to_string()));
     params.insert(
         "pg_user".to_string(),
         SecretString::from("postgres".to_string()),
@@ -56,12 +54,25 @@ fn get_pg_params() -> HashMap<String, SecretString> {
     params
 }
 
+pub(super) fn get_random_port() -> usize {
+    rand::thread_rng().gen_range(15432..65535)
+}
+
 #[instrument]
 pub(super) async fn start_postgres_docker_container(
+    port: usize,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let running_container = ContainerRunnerBuilder::new(PG_DOCKER_CONTAINER)
+    let container_name = format!("{PG_DOCKER_CONTAINER}-{port}");
+    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
+    let port = if let Ok(port) = port.try_into() {
+        port
+    } else {
+        15432
+    };
+
+    let running_container = ContainerRunnerBuilder::new(container_name)
         .image("postgres:latest")
-        .add_port_binding(5432, 15432)
+        .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
             test: Some(vec![
@@ -83,9 +94,10 @@ pub(super) async fn start_postgres_docker_container(
 }
 
 #[instrument]
-pub(super) async fn get_postgres_connection_pool() -> Result<PostgresConnectionPool, anyhow::Error>
-{
-    let pool = PostgresConnectionPool::new(Arc::new(get_pg_params())).await?;
+pub(super) async fn get_postgres_connection_pool(
+    port: usize,
+) -> Result<PostgresConnectionPool, anyhow::Error> {
+    let pool = PostgresConnectionPool::new(Arc::new(get_pg_params(port))).await?;
 
     Ok(pool)
 }

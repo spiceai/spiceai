@@ -2733,7 +2733,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=776930f0af7cc185fbb8e8ee47f01a83f412d527#776930f0af7cc185fbb8e8ee47f01a83f412d527"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=c3f696adceaad7f579af7f163cb933e08d7f8ba1#c3f696adceaad7f579af7f163cb933e08d7f8ba1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2744,7 +2744,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=776930f0af7cc185fbb8e8ee47f01a83f412d527#776930f0af7cc185fbb8e8ee47f01a83f412d527"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=c3f696adceaad7f579af7f163cb933e08d7f8ba1#c3f696adceaad7f579af7f163cb933e08d7f8ba1"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -7931,6 +7931,7 @@ dependencies = [
  "prometheus-parse",
  "prost 0.12.6",
  "r2d2",
+ "rand",
  "regex",
  "reqwest 0.11.27",
  "rusqlite",

@@ -138,7 +138,7 @@ impl Secret {
 
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        let secret_value = self.data.get(key)?;
+        let secret_value = self.data.get(key.to_lowercase().as_str())?;
         let exposed_secret = secret_value.expose_secret();
         Some(exposed_secret)
     }
@@ -193,7 +193,6 @@ pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStor
     }
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct SecretsProvider {
     pub store: SecretStoreType,
 
@@ -279,6 +278,14 @@ impl SecretsProvider {
     }
 }
 
+/// Retrieves an associated value from either the secret store or in the component's params. For
+/// secrets, the associated key into secrets, is the value associated to the `param`
+/// key: `secret_param_key`. Fallback to a hardcoded value in `params` (accessed via `param_key`)
+/// if:
+///   1. There is no provided secret
+///   2. There is no entry with key `secret_param_key` in params
+///   3. For a param entry `(secret_param_key, val)`, there is no secret with key `val`.
+///
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn get_secret_or_param(
@@ -303,4 +310,45 @@ pub fn get_secret_or_param(
     };
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::secrets::{get_secret_or_param, Secret};
+
+    #[test]
+    fn test_value_from_secret() {
+        let mut params = HashMap::new();
+        params.insert("secret_param".to_string(), "val".to_string());
+        params.insert("anything".to_string(), "no_the_val".to_string());
+
+        let secret = Secret::new(
+            vec![("val".to_string(), "secret_value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            Some("secret_value".to_string()),
+            get_secret_or_param(&params, &Some(secret), "secret_param", "anything")
+        );
+    }
+
+    #[test]
+    fn test_value_from_fallback_to_secrets() {
+        let mut params = HashMap::new();
+        params.insert("secret_param".to_string(), "val_no_secret".to_string());
+        params.insert("anything".to_string(), "value_from_params".to_string());
+
+        let secret = Secret::new(
+            vec![("val".to_string(), "secret_value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            Some("value_from_params".to_string()),
+            get_secret_or_param(&params, &Some(secret), "secret_param", "anything")
+        );
+    }
 }

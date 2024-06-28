@@ -1,80 +1,84 @@
 [workspace]
-members = [
-    "bin/spiced/",
-    "crates/data_components",
-    "crates/flight_client",
-    "crates/spicepod",
-    "crates/app",
-    "crates/arrow_sql_gen",
-    "crates/arrow_tools",
-    "crates/sql_provider_datafusion",
-    "crates/flightrepl",
-    "crates/llms",
-    "crates/model_components",
-    "crates/ns_lookup",
-    "crates/util",
-    "crates/spice_cloud",
-    "tools/flightpublisher/",
-    "tools/flightsubscriber/",
-]
 default-members = ["bin/spiced"]
+members = [
+  "bin/spiced/",
+  "crates/data_components",
+  "crates/flight_client",
+  "crates/spicepod",
+  "crates/app",
+  "crates/arrow_sql_gen",
+  "crates/arrow_tools",
+  "crates/sql_provider_datafusion",
+  "crates/flightrepl",
+  "crates/llms",
+  "crates/model_components",
+  "crates/ns_lookup",
+  "crates/util",
+  "crates/spice_cloud",
+  "tools/flightpublisher/",
+  "tools/flightsubscriber/",
+]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
 resolver = "2"
 
 [workspace.package]
-version = "0.15.0-alpha"
 edition = "2021"
-rust-version = "1.78"
-license = "Apache-2.0"
-homepage = "https://spice.ai"
-repository = "https://github.com/spiceai/spiceai"
 exclude = [".github/"]
+homepage = "https://spice.ai"
+license = "Apache-2.0"
+repository = "https://github.com/spiceai/spiceai"
+rust-version = "1.78"
+version = "0.15.0-alpha"
 
 [workspace.dependencies]
-clap = { version = "4.4.14", features = ["derive"] }
-serde = { version = "1.0.195", features = ["derive"] }
-serde_yaml = "0.9.30"
-serde_json = "1.0.1"
-snafu = "0.8.0"
-tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal", "macros"] }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-metrics = "0.22.0"
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f23af338e80e495b77fb38ced23f0ef88a94662c" }
 arrow = "52.0.0"
 arrow-flight = "52.0.0"
-duckdb = { git="https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
+arrow-odbc = { version = "11.1.0" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
-tonic = "0.11.0"
-futures = "0.3.30"
-r2d2 = "0.8.10"
 async-stream = "0.3.5"
 async-trait = "0.1.77"
 bb8 = "0.8"
 bb8-postgres = "0.8"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
-tokio-rusqlite = "0.5.1"
-mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
-tokio-postgres = { version = "0.7.10", features = [
-    "with-chrono-0_4",
-    "with-uuid-1",
-] }
+clap = { version = "4.4.14", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
-    "tokio_io",
-    "tls",
+  "tokio_io",
+  "tls",
 ] }
-uuid = "1.6.1"
-pem = "3.0.4"
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f23af338e80e495b77fb38ced23f0ef88a94662c" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "c3f696adceaad7f579af7f163cb933e08d7f8ba1" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "c3f696adceaad7f579af7f163cb933e08d7f8ba1" }
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
 fundu = "2.0.0"
-odbc-api = { version = "7.0.0" }
-arrow-odbc = { version = "11.1.0" }
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
-suppaftp = { version = "5.3.1", features = ["async"] }
-ssh2 = { version = "0.9.4" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "776930f0af7cc185fbb8e8ee47f01a83f412d527" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "776930f0af7cc185fbb8e8ee47f01a83f412d527" }
-object_store = { version = "0.10.1" }
+futures = "0.3.30"
 itertools = "0.12"
+metrics = "0.22.0"
+mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
+object_store = { version = "0.10.1" }
+odbc-api = { version = "7.0.0" }
+pem = "3.0.4"
+r2d2 = "0.8.10"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
 secrecy = "0.8.0"
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.1"
+serde_yaml = "0.9.30"
+snafu = "0.8.0"
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
+ssh2 = { version = "0.9.4" }
+suppaftp = { version = "5.3.1", features = ["async"] }
+tokio = { version = "1.35.1", features = [
+  "rt-multi-thread",
+  "signal",
+  "macros",
+] }
+tokio-postgres = { version = "0.7.10", features = [
+  "with-chrono-0_4",
+  "with-uuid-1",
+] }
+tokio-rusqlite = "0.5.1"
+tonic = "0.11.0"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+uuid = "1.6.1"
