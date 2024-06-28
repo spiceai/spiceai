@@ -216,7 +216,7 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> V
         let mut depth_counter = 0;
 
         loop {
-            if depth_counter > unnest_parameters.depth && unnest_parameters.depth > 0 {
+            if depth_counter > unnest_parameters.depth {
                 break; // break if we've hit the unnest depth limit
             }
 
@@ -305,7 +305,7 @@ impl GraphQLClient {
                 .and_then(|x| x.get_next_cursor_from_response(&response))
         };
 
-        let unwrapped = match extracted_data {
+        let mut unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
             obj @ Value::Object(_) => Ok(vec![obj]),
             Value::Null => Err(Error::InvalidObjectAccess {
@@ -316,7 +316,9 @@ impl GraphQLClient {
             }),
         }?;
 
-        let unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped);
+        if self.unnest_parameters.depth > 0 {
+            unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped);
+        }
 
         let schema = schema.unwrap_or(Arc::new(
             infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
