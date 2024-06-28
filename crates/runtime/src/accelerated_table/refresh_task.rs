@@ -22,7 +22,7 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -42,7 +42,6 @@ use crate::{
 };
 
 use super::refresh::get_timestamp;
-use super::{FailedToCollectDataSnafu, UnableToCreateStreamSnafu};
 
 use crate::component::dataset::TimeFormat;
 use std::time::UNIX_EPOCH;
@@ -558,31 +557,24 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        // TODO temporary sync conversion. This will be updated so it is a stream next
-        let data_update = update
-            .collect_data()
-            .await
-            .context(FailedToCollectDataSnafu)?;
+        let schema = Arc::clone(&update.schema);
+        let update_type = update.update_type.clone();
 
-        let mut filtered_record_batches = Vec::new();
+        let mut update = update;
 
-        for batch in &data_update.data {
-            let processed_batch = filter_records(batch, &existing_records)?;
-            filtered_record_batches.push(processed_batch);
-        }
+        let filtereed_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
+            stream! {
+                while let Some(batch) = update.data.next().await {
+                    let batch = filter_records(&batch?, &existing_records);
+                    yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+                }
+            }
+        }));
 
-        let record_batch_stream = MemoryStream::try_new(
-            filtered_record_batches,
-            Arc::clone(&data_update.schema),
-            None,
-        )
-        .context(UnableToCreateStreamSnafu)?;
-
-        // construct stream back after filtering
         Ok(StreamingDataUpdate::new(
-            data_update.schema,
-            Box::pin(record_batch_stream),
-            data_update.update_type,
+            schema,
+            filtereed_data,
+            update_type,
         ))
     }
 
