@@ -656,16 +656,12 @@ impl Runtime {
         let acceleration_secret =
             Runtime::get_acceleration_secret(ds, Arc::clone(&self.secrets_provider)).await?;
 
-        let existing_table = self.df.ctx.table_provider(ds.name.clone()).await.ok();
-        let read_table = match existing_table {
-            Some(provider) => provider,
-            None => connector.read_provider(ds).await.map_err(|_| {
-                UnableToLoadDatasetConnectorSnafu {
-                    dataset: ds.name.clone(),
-                }
-                .build()
-            })?,
-        };
+        let read_table = connector.read_provider(ds).await.map_err(|_| {
+            UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .build()
+        })?;
 
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
