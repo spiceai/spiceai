@@ -93,6 +93,27 @@ pub enum Error {
     FailedToWriteData {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("The accelerated table does not support delete operations"))]
+    AcceleratedTableDoesntSupportDelete {},
+
+    #[snafu(display("Expected schema to have field '{field_name}' schema={schema}"))]
+    ExpectedSchemaToHaveField {
+        field_name: String,
+        schema: SchemaRef,
+    },
+
+    #[snafu(display("Expected field in schema '{field_name}' to have type '{expected_data_type}' schema={schema}"))]
+    ArrayDataTypeMismatch {
+        field_name: String,
+        expected_data_type: String,
+        schema: SchemaRef,
+    },
+
+    #[snafu(display(
+        "The type of the primary key '{data_type}' is not yet supported for change deletion."
+    ))]
+    PrimaryKeyTypeNotYetSupported { data_type: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -13,10 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::sync::Arc;
 
 use crate::{
     arrow::struct_builder::StructBuilder,
+    cdc::{changes_schema, ChangeBatch},
     debezium::{
         arrow::downcast_builder,
         change_event::{ChangeEvent, Op},
@@ -24,16 +24,16 @@ use crate::{
 };
 use arrow::{
     array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::SchemaRef,
 };
 use snafu::prelude::*;
 
-/// Converts a `ChangeEvent` into an Arrow `RecordBatch`
+/// Converts a `ChangeEvent` into a `ChangeBatch`
 pub fn to_record_batch(
     table_schema: &SchemaRef,
     primary_key: &[String],
     change: &ChangeEvent,
-) -> super::Result<RecordBatch> {
+) -> super::Result<ChangeBatch> {
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), 1);
@@ -79,22 +79,13 @@ pub fn to_record_batch(
     }
 
     let struct_array = struct_builder.finish();
-    Ok(struct_array.into())
-}
+    let record_batch: RecordBatch = struct_array.into();
 
-#[must_use]
-pub fn changes_schema(table_schema: &Schema) -> Schema {
-    Schema::new(vec![
-        Field::new("op", DataType::Utf8, false),
-        Field::new(
-            "primary_key",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
-            true,
-        ),
-        Field::new(
-            "data",
-            DataType::Struct(table_schema.fields().clone()),
-            true,
-        ),
-    ])
+    let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
+        unreachable!(
+            "We constructed the record batch with the correct schema, so this shouldn't fail"
+        );
+    };
+
+    Ok(change_batch)
 }
