@@ -14,27 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::RecordBatch;
 use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::{
-    array::{make_comparator, StructArray, TimestampNanosecondArray},
+    array::{make_comparator, RecordBatch, StructArray, TimestampNanosecondArray},
     datatypes::DataType,
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
-use crate::dataupdate::StreamingDataUpdate;
 use crate::{
     accelerated_table::Error,
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema, SPICE_RUNTIME_SCHEMA},
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
+    dataupdate::{DataUpdate, DataUpdateExecutionPlan, StreamingDataUpdate, UpdateType},
     execution_plan::schema_cast::EnsureSchema,
     object_store_registry::default_runtime_env,
     status,
@@ -53,7 +50,7 @@ use datafusion::{
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{cast, col, Expr, Operator},
-    physical_plan::ExecutionPlanProperties,
+    physical_plan::{stream::RecordBatchStreamAdapter, ExecutionPlanProperties},
     prelude::SessionConfig,
     sql::TableReference,
 };
@@ -535,7 +532,7 @@ impl RefreshTask {
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records_from(
         &self,
-        update: StreamingDataUpdate,
+        mut update: StreamingDataUpdate,
     ) -> super::Result<StreamingDataUpdate> {
         let Some(value) = self.timestamp_nanos_for_append_query().await? else {
             return Ok(update);
@@ -558,9 +555,7 @@ impl RefreshTask {
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
-        let mut update = update;
-
-        let filtereed_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
+        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
                     let batch = filter_records(&batch?, &existing_records);
@@ -569,11 +564,7 @@ impl RefreshTask {
             }
         }));
 
-        Ok(StreamingDataUpdate::new(
-            schema,
-            filtereed_data,
-            update_type,
-        ))
+        Ok(StreamingDataUpdate::new(schema, filtered_data, update_type))
     }
 
     async fn refresh_append_overlap_nanos(&self) -> u128 {

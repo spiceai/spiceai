@@ -91,16 +91,6 @@ pub enum Error {
     FailedToWriteData {
         source: datafusion::error::DataFusionError,
     },
-
-    #[snafu(display("Failed to collect query result data: {source}"))]
-    FailedToCollectData {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to create memory stream from records batches: {source}"))]
-    UnableToCreateStream {
-        source: datafusion::error::DataFusionError,
-    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
