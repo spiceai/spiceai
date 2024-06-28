@@ -538,7 +538,7 @@ impl DataFusion {
             dataset.time_format,
             dataset.refresh_check_interval(),
             refresh_sql.clone(),
-            acceleration_settings.refresh_mode,
+            source.resolve_refresh_mode(acceleration_settings.refresh_mode),
             dataset.refresh_data_window(),
             acceleration_settings.refresh_append_overlap,
         )

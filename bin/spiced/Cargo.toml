@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
 databricks = ["runtime/databricks"]
+debezium = ["runtime/debezium"]
 default = [
   "duckdb",
   "postgres",
@@ -39,6 +40,7 @@ default = [
   "snowflake",
   "ftp",
   "spice-cloud",
+  "debezium",
 ]
 dev = ["runtime/dev"]
 dremio = ["runtime/dremio"]
@@ -55,3 +57,4 @@ snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 spice-cloud = []
 sqlite = ["runtime/sqlite"]
+

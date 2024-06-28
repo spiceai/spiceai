@@ -123,6 +123,7 @@ clickhouse = [
   "data_components/clickhouse",
 ]
 databricks = ["data_components/databricks"]
+debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
 dremio = []
