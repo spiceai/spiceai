@@ -19,7 +19,7 @@ use llms::embeddings::{candle::CandleEmbedding, Embed, Error as EmbedError};
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use secrecy::{ExposeSecret, Secret, SecretString};
-use spicepod::component::model::{ModelFile, ModelFileType};
+use spicepod::component::model::ModelFileType;
 use spicepod::component::{
     embeddings::{EmbeddingParams, EmbeddingPrefix},
     model::ModelSource,
@@ -188,12 +188,12 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         ModelSource::HuggingFace => {
             let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
 
+            let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
+            let tokenizer_config_path =
+                component.find_any_file_path(ModelFileType::TokenizerConfig);
             let weights_path = model_id
                 .clone()
-                .or(find_file_path(&component.files, ModelFileType::Weights));
-            let tokenizer_path = find_file_path(&component.files, ModelFileType::Tokenizer);
-            let tokenizer_config_path =
-                find_file_path(&component.files, ModelFileType::TokenizerConfig);
+                .or(component.find_any_file_path(ModelFileType::Weights));
 
             match model_id {
                 Some(id) => {
@@ -213,18 +213,17 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         ModelSource::File => {
             let weights_path = model_id
                 .clone()
-                .or(find_file_path(&component.files, ModelFileType::Weights))
+                .or(component.find_any_file_path(ModelFileType::Weights))
                 .ok_or(LlmError::FailedToLoadModel {
                     source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
-            let tokenizer_path = find_file_path(&component.files, ModelFileType::Tokenizer);
-            let tokenizer_config_path =
-                find_file_path(&component.files, ModelFileType::TokenizerConfig).ok_or(
-                    LlmError::FailedToLoadTokenizer {
-                        source: "No 'tokenizer_config_path' parameter provided".into(),
-                    },
-                )?;
+            let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
+            let tokenizer_config_path = component
+                .find_any_file_path(ModelFileType::TokenizerConfig)
+                .ok_or(LlmError::FailedToLoadTokenizer {
+                    source: "No 'tokenizer_config_path' parameter provided".into(),
+                })?;
 
             llms::chat::create_local_model(
                 &weights_path,
@@ -260,11 +259,4 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
             )))
         }
     }
-}
-
-fn find_file_path(files: &[ModelFile], file_type: ModelFileType) -> Option<String> {
-    files
-        .iter()
-        .find(|f| f.r#type == Some(file_type))
-        .map(|f| f.path.clone())
 }

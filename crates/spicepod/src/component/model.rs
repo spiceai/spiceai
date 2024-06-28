@@ -108,6 +108,20 @@ impl Display for ModelType {
 
 impl Model {
     #[must_use]
+    pub fn get_all_file_paths(&self) -> Vec<String> {
+        self.files.iter().map(|f| f.path.clone()).collect()
+    }
+
+    /// Finds at most one model file with the given [`ModelFileType`].
+    #[must_use]
+    pub fn find_any_file_path(&self, file_type: ModelFileType) -> Option<String> {
+        self.files
+            .iter()
+            .find(|f| f.r#type == Some(file_type))
+            .map(|f| f.path.clone())
+    }
+
+    #[must_use]
     pub fn get_source(&self) -> Option<ModelSource> {
         ModelSource::try_from(self.from.as_str()).ok()
     }
@@ -139,7 +153,6 @@ impl Model {
     }
 
     /// Attempts to determine the model's type based on its `from` field and, `files` and `params`.
-    /// TODO: Actually this is going to be hard for either spice or HF for ML models
     ///
     /// ### Current support/checks
     ///
@@ -180,19 +193,17 @@ impl Model {
             }
         }
 
-        let is_llm = files
-            .iter()
-            .any(|f| {
-                match f.file_type() {
-                    // Only true since embeddings aren't [`Model`]s.
-                    Some(
-                        ModelFileType::Tokenizer
-                        | ModelFileType::Config
-                        | ModelFileType::TokenizerConfig,
-                    ) => true,
-                    _ => is_llm_file(Path::new(&f.path)),
-                }
-            });
+        let is_llm = files.iter().any(|f| {
+            match f.file_type() {
+                // Only true since embeddings aren't [`Model`]s.
+                Some(
+                    ModelFileType::Tokenizer
+                    | ModelFileType::Config
+                    | ModelFileType::TokenizerConfig,
+                ) => true,
+                _ => is_llm_file(Path::new(&f.path)),
+            }
+        });
         if is_llm {
             return Some(ModelType::Llm);
         }
@@ -220,7 +231,9 @@ impl ModelFile {
         match self.r#type {
             Some(t) => Some(t),
             None => {
-                if let Some(t) = self.r#type { Some(t) } else {
+                if let Some(t) = self.r#type {
+                    Some(t)
+                } else {
                     let typ = determine_type_from_path(&self.path);
                     tracing::trace!("Determined model file type for {}: {:?}", self.path, typ);
                     typ
@@ -231,6 +244,7 @@ impl ModelFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ModelFileType {
     Weights,
     Config,

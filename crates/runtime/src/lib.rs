@@ -894,6 +894,7 @@ impl Runtime {
         }
     }
 
+    /// Combine the parameters for a model component with relevant secrets from the secrets provider.
     pub async fn construct_model_params(
         &self,
         params: HashMap<String, String>,
