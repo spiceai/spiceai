@@ -107,9 +107,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn convert_fields_to_arrow_schema(fields: &[ChangeEventField]) -> Result<Schema> {
+pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<Schema> {
     let arrow_fields = fields
-        .iter()
+        .into_iter()
         .map(convert_to_arrow_field)
         .collect::<Result<Vec<Field>>>()?;
 

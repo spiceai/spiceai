@@ -32,6 +32,20 @@ impl ChangeEvent {
     pub fn from_bytes(bytz: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytz)
     }
+
+    #[must_use]
+    pub fn get_schema_fields(&self) -> Option<Vec<&Field>> {
+        self.schema
+            .fields
+            .iter()
+            .find(|field| field.field.as_ref().is_some_and(|field| field == "after"))
+            .and_then(|field| {
+                field
+                    .fields
+                    .as_ref()
+                    .map(|fields| fields.as_slice().iter().collect())
+            })
+    }
 }
 
 #[derive(Serialize, Deserialize)]

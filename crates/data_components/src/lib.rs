@@ -21,15 +21,16 @@ use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 
 pub mod arrow;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod databricks_delta;
 #[cfg(feature = "databricks")]
 pub mod databricks_spark;
-
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
 #[cfg(feature = "debezium")]
 pub mod debezium;
+#[cfg(feature = "debezium")]
+pub mod debezium_kafka;
 #[cfg(feature = "databricks")]
 pub mod deltatable;
 #[cfg(feature = "duckdb")]
@@ -37,19 +38,20 @@ pub mod duckdb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "debezium")]
+pub mod kafka;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
 #[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-
-#[cfg(feature = "snowflake")]
-pub mod snowflake;
 
 pub mod delete;
 pub mod object;

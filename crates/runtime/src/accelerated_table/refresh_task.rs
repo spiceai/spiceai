@@ -143,6 +143,7 @@ impl RefreshTask {
             match refresh.mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
+                RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
             vec![("dataset", dataset_name.to_string())],
         );
@@ -150,6 +151,7 @@ impl RefreshTask {
         let get_data_update_result = match refresh.mode {
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
+            RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
         let (start_time, data_update) = match get_data_update_result {
@@ -406,6 +408,7 @@ impl RefreshTask {
                     match refresh.mode {
                         RefreshMode::Full => UpdateType::Overwrite,
                         RefreshMode::Append => UpdateType::Append,
+                        RefreshMode::Changes => unreachable!("changes are handled upstream"),
                     },
                 )
             };

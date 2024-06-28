@@ -198,6 +198,9 @@ impl Builder {
                     Some(start_refresh),
                 )
             }
+            RefreshMode::Changes => {
+                todo!()
+            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
