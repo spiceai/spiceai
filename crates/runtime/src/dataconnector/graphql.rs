@@ -16,8 +16,6 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::secrets::{get_secret_or_param, Secret};
-use arrow::array::{Array, AsArray, ListArray};
-use arrow::datatypes::{Field, Fields};
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_trait::async_trait;
@@ -36,7 +34,7 @@ use reqwest::{
     RequestBuilder, StatusCode,
 };
 use serde_json::{json, Value};
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{ResultExt, Snafu};
 use std::{any::Any, collections::HashMap, future::Future, io::Cursor, pin::Pin, sync::Arc};
 use url::Url;
 
@@ -210,92 +208,63 @@ impl GraphQLClient {
     }
 }
 
-fn unnest_record_batch_one_level(record: &RecordBatch) -> Vec<RecordBatch> {
-    let schema = record.schema();
-    let fields = schema.fields();
-    let mut new_fields = vec![];
-    let mut new_records = vec![];
-    let mut base_values = vec![];
-    let mut new_columns: HashMap<Field, Vec<Arc<dyn Array>>> = HashMap::new();
+fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Value {
+    if let Value::Object(obj) = object {
+        let mut new_object = obj.clone();
 
-    // unnesting isn't just a simple matter of moving the data from one column to another
-    // unnesting is actually like a union of the data in the unnested column with the rest of the columns
-    // e.g. {continent: "Europe", countries: [{name: "France", capital: "Paris"}]} -> {continent: "Europe", name: "France", capital: "Paris"}
+        // setup some loop controls
+        let mut depth_counter = 0;
 
-    // base values of the record
-    // these get unioned with everything else
-    for i in 0..fields.len() {
-        let Some(field) = fields.get(i) else {
-            continue;
-        };
-
-        if let arrow::datatypes::DataType::List(_) = field.data_type() {
-            continue;
-        }
-
-        new_fields.push(Arc::clone(field));
-        base_values.push(Arc::clone(record.column(i)));
-    }
-
-    for i in 0..fields.len() {
-        let mut new_column = vec![];
-        let Some(field) = fields.get(i) else {
-            continue;
-        };
-
-        if let arrow::datatypes::DataType::List(field) = field.data_type() {
-            if let arrow::datatypes::DataType::Struct(fields) = field.data_type() {
-                new_fields.extend(fields.iter().map(|f| Arc::clone(f)));
-
-                let Some(list_array) = record.column(i).as_any().downcast_ref::<ListArray>() else {
-                    continue;
-                };
-
-                for j in 0..fields.len() {
-                    let Some(field) = fields.get(j) else {
-                        continue;
-                    };
-
-                    println!("{:#?}", list_array.value(0));
-
-                    /*
-
-                    StructArray <- this is .value(0)?
-                    [
-                    -- child 0: "capital" (Utf8)
-                    StringArray <-- how do I get here from .value(0).<...>? this is the column value I need to unnest
-                    [
-                        "",
-                        ...
-                    ]
-
-                    -- child 1: "name" (Utf8)
-                    StringArray
-                    [
-                        "",
-                        ...
-                    ]
-                    ]
-
-                    */
-                }
-            } else {
-                new_fields.push(Arc::clone(field));
-
-                let Some(list_array) = record.column(i).as_any().downcast_ref::<ListArray>() else {
-                    continue;
-                };
-
-                for j in 0..list_array.len() {
-                    new_column.push(list_array.value(j));
-                }
+        loop {
+            if depth_counter > unnest_parameters.depth && unnest_parameters.depth > 0 {
+                break; // break if we've hit the unnest depth limit
             }
+
+            // store additions and deletions
+            let mut additions = vec![];
+
+            new_object.retain(|_, value| {
+                match value {
+                    Value::Object(ref mut inner_obj) => {
+                        inner_obj.retain(|inner_key, inner_value| {
+                            additions.push((inner_key.clone(), inner_value.clone())); // add the inner key to the additions list
+                            false
+                        });
+
+                        // don't retain the inner object, because we're about to bump it up to the root object
+                        false
+                    }
+                    _ => true, // we don't need to do anything for non-object inner types
+                }
+            });
+
+            if additions.is_empty() {
+                break; // break if there's nothing else to do
+            }
+
+            // add the staged additions back to the root object
+            for (key, value) in additions {
+                new_object.insert(key, value);
+            }
+
+            // increment the depth counter
+            depth_counter += 1;
         }
+
+        Value::Object(new_object)
+    } else {
+        // unnesting something else?
+        // TODO: could add support for unnesting nested arrays like [[1, 2], [3, 4]]
+        // would need to change return type to Vec<Value> and vec reduce in unnest_json_objects
+        panic!("Unsupported unnest type"); // TODO: make this panic not a panic
     }
+}
 
-    // RecordBatch::try_new(schema, new_columns).context(ArrowInternalSnafu)
-
-    new_records
+fn unnest_json_objects(unnest_parameters: &UnnestParameters, objects: &[Value]) -> Vec<Value> {
+    objects
+        .iter()
+        .map(|obj| unnest_json_object(unnest_parameters, obj))
+        .collect()
 }
 
 impl GraphQLClient {
@@ -347,12 +316,12 @@ impl GraphQLClient {
             }),
         }?;
 
+        let unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped);
+
         let schema = schema.unwrap_or(Arc::new(
             infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
                 .context(ArrowInternalSnafu)?,
         ));
-
-        println!("{:#?}", schema.fields);
 
         let mut res = vec![];
         for v in unwrapped {
@@ -364,7 +333,6 @@ impl GraphQLClient {
                 .collect::<Result<Vec<_>, _>>()
                 .context(ArrowInternalSnafu)?;
 
-            println!("{:#?}", unnest_record_batch_one_level(&batch[0]));
             res.extend(batch);
         }
 
