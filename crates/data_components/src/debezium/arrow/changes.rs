@@ -47,7 +47,7 @@ pub fn to_record_batch(
                 let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
                 str_builder.append_value(change.payload.op.to_string());
             }
-            "primary_key" => {
+            "primary_keys" => {
                 let list_builder =
                     downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)?;
                 if primary_key.is_empty() {
@@ -74,7 +74,7 @@ pub fn to_record_batch(
 
                 super::append_value_to_struct_builder(change_data, data_struct_builder)?;
             }
-            _ => unreachable!("Unexpected field in changes schema"),
+            _ => unreachable!("Unexpected field in changes schema {}", field.name()),
         }
     }
 
