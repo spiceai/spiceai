@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{Int32Array, Int64Array, ListArray, RecordBatch, StringArray};
+use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::{
     array::{make_comparator, StructArray, TimestampNanosecondArray},
@@ -22,7 +22,7 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{ChangeBatch, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::lit;
 use futures::{Stream, StreamExt};
@@ -103,42 +103,47 @@ impl RefreshTask {
         while let Some(update) = changes_stream.next().await {
             match update {
                 Ok(change_envelope) => {
-                    let data_update = DataUpdate {
-                        schema: change_envelope.rb.schema(),
-                        data: vec![change_envelope.rb.clone()],
-                        update_type: UpdateType::Changes,
-                    };
-
-                    // write_data_update updates dataset status and logs errors so we don't do this here
-                    if self.write_data_update(None, data_update).await.is_ok() {
-                        if let Some(ready_sender) = ready_sender.take() {
-                            ready_sender.send(()).ok();
-                        }
-
-                        if let Err(e) = change_envelope.commit() {
-                            tracing::debug!("Failed to commit CDC change envelope: {e}");
-                        }
-
-                        if let Some(cache_provider) = &cache_provider {
-                            if let Err(e) = cache_provider
-                                .invalidate_for_table(&dataset_name.to_string())
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name.to_string()
-                                );
+                    match self
+                        .write_change(change_envelope.change_batch.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            if let Some(ready_sender) = ready_sender.take() {
+                                ready_sender.send(()).ok();
                             }
+
+                            if let Err(e) = change_envelope.commit() {
+                                tracing::debug!("Failed to commit CDC change envelope: {e}");
+                            }
+
+                            if let Some(cache_provider) = &cache_provider {
+                                if let Err(e) = cache_provider
+                                    .invalidate_for_table(&dataset_name.to_string())
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Failed to invalidate cached results for dataset {}: {e}",
+                                        &dataset_name.to_string()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.mark_dataset_status(status::ComponentStatus::Error)
+                                .await;
+                            tracing::error!("Error writing change for {dataset_name}: {e}");
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Changes error for {dataset_name}: {e}");
+                    tracing::error!("Changes stream error for {dataset_name}: {e}");
                     self.mark_dataset_status(status::ComponentStatus::Error)
                         .await;
                 }
             }
         }
+
+        tracing::warn!("Changes stream ended for dataset {dataset_name}");
 
         Ok(())
     }
@@ -261,7 +266,133 @@ impl RefreshTask {
         self.get_data_update(filters).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    async fn write_change(&self, change_batch: ChangeBatch) -> super::Result<()> {
+        let dataset_name = self.dataset_name.clone();
+        let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
+            .context(super::AcceleratedTableDoesntSupportDeleteSnafu)?;
+
+        for row in 0..change_batch.record.num_rows() {
+            let op = change_batch.op(row);
+            match op {
+                "d" => {
+                    let inner_data: RecordBatch = change_batch.data(row);
+                    let primary_keys = change_batch.primary_keys(row);
+                    let delete_where_exprs =
+                        Self::get_delete_where_expr(&inner_data, primary_keys)?;
+
+                    tracing::info!(
+                        "Deleting data for {dataset_name} where {}",
+                        delete_where_exprs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" AND ")
+                    );
+
+                    let ctx = SessionContext::new();
+                    let session_state = ctx.state();
+
+                    let delete_plan = deletion_provider
+                        .delete_from(&session_state, &delete_where_exprs)
+                        .await
+                        .context(super::FailedToWriteDataSnafu)?;
+
+                    collect(delete_plan, ctx.task_ctx())
+                        .await
+                        .context(super::FailedToWriteDataSnafu)?;
+                }
+                "c" | "u" | "r" => {
+                    let inner_data: RecordBatch = change_batch.data(row);
+                    let ctx = SessionContext::new();
+                    let session_state = ctx.state();
+
+                    tracing::info!("Inserting data row for {dataset_name}");
+
+                    let insert_plan = self
+                        .accelerator
+                        .insert_into(
+                            &session_state,
+                            Arc::new(DataUpdateExecutionPlan::new(DataUpdate {
+                                schema: inner_data.schema(),
+                                data: vec![inner_data],
+                                update_type: UpdateType::Append,
+                            })),
+                            false,
+                        )
+                        .await
+                        .context(super::FailedToWriteDataSnafu)?;
+
+                    collect(insert_plan, ctx.task_ctx())
+                        .await
+                        .context(super::FailedToWriteDataSnafu)?;
+                }
+                _ => {
+                    tracing::error!("Unknown operation {op} for {dataset_name}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_delete_where_expr(
+        data: &RecordBatch,
+        primary_keys: Vec<String>,
+    ) -> super::Result<Vec<Expr>> {
+        let mut delete_where_exprs: Vec<Expr> = vec![];
+        let data_schema = data.schema();
+        for primary_key in primary_keys {
+            let Some((primary_key_idx, field)) = data_schema.column_with_name(&primary_key) else {
+                return super::ExpectedSchemaToHaveFieldSnafu {
+                    field_name: primary_key.clone(),
+                    schema: Arc::clone(&data_schema),
+                }
+                .fail();
+            };
+            let key_col = data.column(primary_key_idx);
+            let delete_where_expr = match field.data_type() {
+                DataType::Int32 => {
+                    let key_col = key_col.as_any().downcast_ref::<Int32Array>().context(
+                        super::ArrayDataTypeMismatchSnafu {
+                            field_name: primary_key.clone(),
+                            expected_data_type: "Int32".to_string(),
+                            schema: Arc::clone(&data_schema),
+                        },
+                    )?;
+                    col(primary_key).eq(lit(key_col.value(0)))
+                }
+                DataType::Int64 => {
+                    let key_col = key_col.as_any().downcast_ref::<Int64Array>().context(
+                        super::ArrayDataTypeMismatchSnafu {
+                            field_name: primary_key.clone(),
+                            expected_data_type: "Int64".to_string(),
+                            schema: Arc::clone(&data_schema),
+                        },
+                    )?;
+                    col(primary_key).eq(lit(key_col.value(0)))
+                }
+                DataType::Utf8 => {
+                    let key_col = key_col.as_any().downcast_ref::<StringArray>().context(
+                        super::ArrayDataTypeMismatchSnafu {
+                            field_name: primary_key.clone(),
+                            expected_data_type: "String".to_string(),
+                            schema: Arc::clone(&data_schema),
+                        },
+                    )?;
+                    col(primary_key).eq(lit(key_col.value(0)))
+                }
+                _ => {
+                    return super::PrimaryKeyTypeNotYetSupportedSnafu {
+                        data_type: field.data_type().to_string(),
+                    }
+                    .fail()
+                }
+            };
+            delete_where_exprs.push(delete_where_expr);
+        }
+        Ok(delete_where_exprs)
+    }
+
     async fn write_data_update(
         &self,
         start_time: Option<SystemTime>,
@@ -286,134 +417,6 @@ impl RefreshTask {
         };
 
         let ctx = SessionContext::new();
-
-        if data_update.update_type == UpdateType::Changes {
-            let Some(deletion_provider) = get_deletion_provider(Arc::clone(&self.accelerator))
-            else {
-                panic!("Failed to get deletion provider");
-            };
-
-            for data_batch in &data_update.data {
-                let Some(op_col) = data_batch.column(0).as_any().downcast_ref::<StringArray>()
-                else {
-                    panic!("Failed to get op column");
-                };
-                let Some(primary_keys_col) =
-                    data_batch.column(1).as_any().downcast_ref::<ListArray>()
-                else {
-                    panic!("Failed to get primary keys column");
-                };
-                let Some(data_col) = data_batch.column(2).as_any().downcast_ref::<StructArray>()
-                else {
-                    panic!("Failed to get data column");
-                };
-                for row in 0..data_batch.num_rows() {
-                    let op = op_col.value(row);
-                    match op {
-                        "d" => {
-                            let inner_data: RecordBatch = data_col.slice(row, 1).into();
-                            let primary_keys_col_dyn_arr = primary_keys_col.value(row);
-                            let Some(primary_key) = primary_keys_col_dyn_arr
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                            else {
-                                panic!("Failed to get primary key column");
-                            };
-                            let primary_key = primary_key.value(0);
-                            let inner_data_schema = inner_data.schema();
-                            let Some((primary_key_idx, field)) =
-                                inner_data_schema.column_with_name(primary_key)
-                            else {
-                                panic!("Failed to get primary key column");
-                            };
-                            let key_col = inner_data.column(primary_key_idx);
-                            let delete_where_expr = match field.data_type() {
-                                DataType::Int32 => {
-                                    let Some(key_col) =
-                                        key_col.as_any().downcast_ref::<Int32Array>()
-                                    else {
-                                        panic!(
-                                            "Failed to get id column as Int32Array, {inner_data:?}"
-                                        );
-                                    };
-                                    col(primary_key).eq(lit(key_col.value(0)))
-                                }
-                                DataType::Int64 => {
-                                    let Some(key_col) =
-                                        key_col.as_any().downcast_ref::<Int64Array>()
-                                    else {
-                                        panic!(
-                                            "Failed to get id column as Int64Array, {inner_data:?}"
-                                        );
-                                    };
-                                    col(primary_key).eq(lit(key_col.value(0)))
-                                }
-                                DataType::Utf8 => {
-                                    let Some(key_col) =
-                                        key_col.as_any().downcast_ref::<StringArray>()
-                                    else {
-                                        panic!(
-                                            "Failed to get id column as Int64Array, {inner_data:?}"
-                                        );
-                                    };
-                                    col(primary_key).eq(lit(key_col.value(0)))
-                                }
-                                _ => panic!("Unsupported primary key type {}", field.data_type()),
-                            };
-                            tracing::info!(
-                                "Deleting data for {dataset_name} where {delete_where_expr}"
-                            );
-
-                            let ctx = SessionContext::new();
-                            let session_state = ctx.state();
-
-                            let Ok(delete_plan) = deletion_provider
-                                .delete_from(&session_state, &[delete_where_expr])
-                                .await
-                            else {
-                                panic!("Failed to create delete plan");
-                            };
-
-                            if let Err(e) = collect(delete_plan, ctx.task_ctx()).await {
-                                panic!("Failed to delete data: {e}");
-                            };
-                        }
-                        "c" | "u" | "r" => {
-                            let inner_data: RecordBatch = data_col.slice(row, 1).into();
-                            let ctx = SessionContext::new();
-                            let session_state = ctx.state();
-
-                            tracing::info!("Inserting data row for {dataset_name}");
-
-                            let Ok(insert_plan) = self
-                                .accelerator
-                                .insert_into(
-                                    &session_state,
-                                    Arc::new(DataUpdateExecutionPlan::new(DataUpdate {
-                                        schema: inner_data.schema(),
-                                        data: vec![inner_data],
-                                        update_type: UpdateType::Append,
-                                    })),
-                                    false,
-                                )
-                                .await
-                            else {
-                                panic!("Failed to create insert plan");
-                            };
-
-                            if let Err(e) = collect(insert_plan, ctx.task_ctx()).await {
-                                panic!("Failed to insert data: {e}");
-                            };
-                        }
-                        _ => {
-                            tracing::error!("Unknown operation {op} for {dataset_name}");
-                        }
-                    }
-                }
-            }
-
-            return Ok(());
-        }
 
         let overwrite = data_update.update_type == UpdateType::Overwrite;
         match self

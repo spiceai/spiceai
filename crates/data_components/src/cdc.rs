@@ -249,3 +249,137 @@ impl ChangeBatch {
         Ok(())
     }
 }
+
+/// The Arrow schema that represents a `ChangeEvent`
+#[must_use]
+pub fn changes_schema(table_schema: &Schema) -> Schema {
+    Schema::new(vec![
+        Field::new("op", DataType::Utf8, false),
+        Field::new(
+            "primary_keys",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            true,
+        ),
+        Field::new(
+            "data",
+            DataType::Struct(table_schema.fields().clone()),
+            true,
+        ),
+    ])
+}
+
+#[derive(Clone)]
+pub struct ChangeBatch {
+    pub record: RecordBatch,
+    op_idx: usize,
+    primary_keys_idx: usize,
+    data_idx: usize,
+}
+
+impl ChangeBatch {
+    pub fn try_new(record: RecordBatch) -> Result<Self, ChangeBatchError> {
+        let schema = record.schema();
+        Self::validate_schema(Arc::clone(&schema))?;
+
+        let Some((op_idx, _)) = schema.column_with_name("op") else {
+            unreachable!("The schema is validated to have an 'op' field")
+        };
+        let Some((primary_keys_idx, _)) = schema.column_with_name("primary_keys") else {
+            unreachable!("The schema is validated to have a 'primary_keys' field")
+        };
+        let Some((data_idx, _)) = schema.column_with_name("data") else {
+            unreachable!("The schema is validated to have a 'data' field")
+        };
+
+        Ok(Self {
+            record,
+            op_idx,
+            primary_keys_idx,
+            data_idx,
+        })
+    }
+
+    #[must_use]
+    pub fn op(&self, row: usize) -> &str {
+        let Some(op_col) = self
+            .record
+            .column(self.op_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+        else {
+            unreachable!("The schema is validated to have an 'op' field which is a StringArray");
+        };
+        op_col.value(row)
+    }
+
+    #[must_use]
+    pub fn primary_keys(&self, row: usize) -> Vec<String> {
+        let Some(primary_keys_col) = self
+            .record
+            .column(self.primary_keys_idx)
+            .as_any()
+            .downcast_ref::<ListArray>()
+        else {
+            unreachable!(
+                "The schema is validated to have a 'primary_keys' field which is a ListArray"
+            );
+        };
+        let primary_keys_values = primary_keys_col.value(row);
+        let Some(primary_keys_values) = primary_keys_values.as_any().downcast_ref::<StringArray>()
+        else {
+            unreachable!("The schema is validated to have a 'primary_keys' field which is a ListArray of StringArray");
+        };
+        let num_keys = primary_keys_values.len();
+        let mut primary_keys: Vec<String> = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            primary_keys.push(primary_keys_values.value(i).to_string());
+        }
+
+        primary_keys
+    }
+
+    #[must_use]
+    pub fn data(&self, row: usize) -> RecordBatch {
+        let Some(data_col) = self
+            .record
+            .column(self.data_idx)
+            .as_any()
+            .downcast_ref::<StructArray>()
+        else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        data_col.slice(row, 1).into()
+    }
+
+    fn validate_schema(schema: SchemaRef) -> Result<(), ChangeBatchError> {
+        let Some(data_col) = schema.fields().iter().find(|field| field.name() == "data") else {
+            return SchemaMismatchSnafu {
+                detail: "Missing 'data' field",
+                schema,
+            }
+            .fail();
+        };
+
+        let data_schema = match data_col.data_type() {
+            DataType::Struct(fields) => Schema::new(fields.clone()),
+            _ => {
+                return SchemaMismatchSnafu {
+                    detail: "Unexpected data type for 'data' field, expected Struct",
+                    schema,
+                }
+                .fail();
+            }
+        };
+
+        let expected_schema = changes_schema(&data_schema);
+        if *schema != expected_schema {
+            return SchemaMismatchSnafu {
+                detail: "Schema didn't match expected change batch format",
+                schema,
+            }
+            .fail();
+        }
+
+        Ok(())
+    }
+}
