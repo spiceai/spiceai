@@ -793,7 +793,7 @@ mod tests {
             expected_size: usize,
             time_format: Option<TimeFormat>,
             append_overlap: Option<Duration>,
-            duplicated_existing_data: bool,
+            duplicated_incoming_data: bool,
             message: &str,
         ) {
             let original_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
@@ -826,7 +826,7 @@ mod tests {
             .expect("data should be created");
 
             let mut data = vec![vec![batch.clone()]];
-            if duplicated_existing_data {
+            if duplicated_incoming_data {
                 data = vec![vec![batch.clone()], vec![batch]];
             }
 
