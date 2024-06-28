@@ -135,24 +135,57 @@ impl RefreshTask {
     }
 
     pub async fn run(&self) -> super::Result<()> {
+        let (refresh_retry_enabled, refresh_retry_max_attempts) = {
+            let refresh = self.refresh.read().await;
+            (
+                refresh.refresh_retry_enabled,
+                refresh.refresh_retry_max_attempts,
+            )
+        };
+
+        let max_retries = if refresh_retry_enabled {
+            refresh_retry_max_attempts
+        } else {
+            Some(0)
+        };
+
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(max_retries)
+            .build();
+
+        let dataset_name = self.dataset_name.clone();
+
+        retry(retry_strategy, || async {
+            self.run_once().await.map_err(|err| {
+                let labels = [("dataset", dataset_name.to_string())];
+                metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+                err
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
+            e
+        })
+    }
+
+    async fn run_once(&self) -> Result<(), RetryError<super::Error>> {
         self.mark_dataset_status(status::ComponentStatus::Refreshing)
             .await;
 
         let dataset_name = self.dataset_name.clone();
 
-        let refresh = self.refresh.read().await;
+        let mode = self.refresh.read().await.mode.clone();
 
         let timer = TimeMeasurement::new(
-            match refresh.mode {
+            match mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
             },
             vec![("dataset", dataset_name.to_string())],
         );
 
-        // TODO: retry logic must be moved on task level as it can now fail in multiple places, specifically when we collect data
-
-        let get_data_update_result = match refresh.mode {
+        let get_data_update_result = match mode {
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
         };
@@ -160,26 +193,28 @@ impl RefreshTask {
         let (start_time, streaming_data_update) = match get_data_update_result {
             Ok((start_time, data_update)) => (start_time, data_update),
             Err(e) => {
-                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
+                tracing::warn!("Failed to load data for dataset {dataset_name}: {e}");
                 self.mark_dataset_status(status::ComponentStatus::Error)
                     .await;
-                return Err(e);
+                return Err(RetryError::transient(e));
             }
         };
 
         let data_update = match streaming_data_update.collect_data().await {
             Ok(data_update) => data_update,
             Err(e) => {
-                tracing::error!("Failed to convert streaming data update to data update: {e}");
+                tracing::warn!("Failed to load data for dataset {dataset_name}: {e}");
                 self.mark_dataset_status(status::ComponentStatus::Error)
                     .await;
-                return Err(super::Error::FailedToCollectData { source: e });
+                return Err(from_df_error(e));
             }
         };
 
         drop(timer);
 
-        self.write_data_update(start_time, data_update).await
+        self.write_data_update(start_time, data_update)
+            .await
+            .map_err(RetryError::permanent)
     }
 
     pub async fn get_full_or_incremental_append_update(
@@ -389,72 +424,35 @@ impl RefreshTask {
     async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<StreamingDataUpdate> {
         let refresh = Arc::clone(&self.refresh);
 
-        let ctx = self.refresh_df_context();
+        let mut ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
-        let (refresh_retry_enabled, refresh_retry_max_attempts) = {
+        let (sql, update_type) = {
             let refresh = refresh.read().await;
             (
-                refresh.refresh_retry_enabled,
-                refresh.refresh_retry_max_attempts,
+                refresh.sql.clone(),
+                match refresh.mode {
+                    RefreshMode::Full => UpdateType::Overwrite,
+                    RefreshMode::Append => UpdateType::Append,
+                },
             )
         };
 
-        let max_retries = if refresh_retry_enabled {
-            refresh_retry_max_attempts
-        } else {
-            Some(0)
-        };
-
-        let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(max_retries)
-            .build();
-
-        retry(retry_strategy, || async {
-            let mut ctx_clone = ctx.clone();
-
-            let (sql, update_type) = {
-                let refresh = refresh.read().await;
-                (
-                    refresh.sql.clone(),
-                    match refresh.mode {
-                        RefreshMode::Full => UpdateType::Overwrite,
-                        RefreshMode::Append => UpdateType::Append,
-                    },
-                )
-            };
-
-            let get_data_result = get_data(
-                &mut ctx_clone,
-                dataset_name.clone(),
-                Arc::clone(&federated),
-                sql,
-                filters.clone(),
-            )
-            .await;
-
-            match get_data_result {
-                Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to get refresh data for dataset {}: {}",
-                        dataset_name,
-                        e
-                    );
-                    let labels = [("dataset", dataset_name.to_string())];
-                    metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
-
-                    if should_retry_df_error(&e) {
-                        Err(RetryError::transient(e))
-                    } else {
-                        Err(RetryError::permanent(e))
-                    }
-                }
-            }
-        })
+        let get_data_result = get_data(
+            &mut ctx,
+            dataset_name.clone(),
+            Arc::clone(&federated),
+            sql,
+            filters.clone(),
+        )
         .await
-        .context(super::UnableToGetDataFromConnectorSnafu)
+        .context(super::UnableToGetDataFromConnectorSnafu);
+
+        match get_data_result {
+            Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
+            Err(e) => Err(e),
+        }
     }
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
@@ -730,5 +728,13 @@ fn should_retry_df_error(error: &DataFusionError) -> bool {
             false
         }
         _ => true,
+    }
+}
+
+fn from_df_error(error: DataFusionError) -> RetryError<super::Error> {
+    if should_retry_df_error(&error) {
+        RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error })
+    } else {
+        RetryError::permanent(super::Error::UnableToGetDataFromConnector { source: error })
     }
 }
