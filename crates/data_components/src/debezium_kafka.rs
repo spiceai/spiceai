@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::{
-    cdc::{self, ChangeEnvelope},
+    cdc::{self, ChangeEnvelope, ChangesStream},
     debezium::{
         arrow::changes,
         change_event::{ChangeEvent, ChangeEventKey},
@@ -27,18 +27,14 @@ use async_trait::async_trait;
 use datafusion::{
     common::{Constraints, DFSchema},
     datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    error::Result as DataFusionResult,
+    execution::context::SessionState,
     logical_expr::Expr,
-    physical_expr::EquivalenceProperties,
-    physical_plan::{
-        empty::EmptyExec, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
-        ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-    },
+    physical_plan::{empty::EmptyExec, ExecutionPlan},
     sql::sqlparser::ast::{Ident, TableConstraint},
 };
-use futures::{stream::BoxStream, StreamExt};
-use std::{any::Any, fmt, sync::Arc};
+use futures::StreamExt;
+use std::{any::Any, sync::Arc};
 
 pub struct DebeziumKafka {
     schema: SchemaRef,
@@ -82,7 +78,7 @@ impl DebeziumKafka {
     }
 
     #[must_use]
-    pub fn stream_changes(&self) -> BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>> {
+    pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();
         let stream = self
@@ -133,117 +129,5 @@ impl TableProvider for DebeziumKafka {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
-    }
-}
-
-#[derive(Clone)]
-pub struct DebeziumKafkaExec {
-    schema: SchemaRef,
-    primary_keys: Vec<String>,
-    consumer: &'static KafkaConsumer,
-    properties: PlanProperties,
-}
-
-impl DebeziumKafkaExec {
-    #[must_use]
-    pub fn new(
-        schema: SchemaRef,
-        primary_keys: Vec<String>,
-        consumer: &'static KafkaConsumer,
-    ) -> Self {
-        Self {
-            schema: Arc::clone(&schema),
-            primary_keys,
-            consumer,
-            properties: PlanProperties::new(
-                EquivalenceProperties::new(schema),
-                Partitioning::UnknownPartitioning(0),
-                ExecutionMode::Unbounded,
-            ),
-        }
-    }
-}
-
-impl std::fmt::Debug for DebeziumKafkaExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "DebeziumKafkaExec primary_keys={}",
-            self.primary_keys.join(",")
-        )
-    }
-}
-
-impl DisplayAs for DebeziumKafkaExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "DebeziumKafkaExec primary_keys={}",
-            self.primary_keys.join(",")
-        )
-    }
-}
-
-impl ExecutionPlan for DebeziumKafkaExec {
-    fn name(&self) -> &'static str {
-        "DebeziumKafkaExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let consumer: &'static KafkaConsumer = self.consumer;
-        let schema = Arc::clone(&self.schema());
-        let primary_keys = self.primary_keys.clone();
-        let stream = consumer
-            .stream_json::<ChangeEventKey, ChangeEvent>()
-            .filter_map(move |msg| {
-                let schema = Arc::clone(&schema);
-                let pk = primary_keys.clone();
-                async move {
-                    let Ok(msg) = msg else { return None };
-
-                    let val = msg.value();
-                    let rb = changes::to_record_batch(&schema, &pk, val)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()));
-
-                    if let Err(e) = msg.mark_processed() {
-                        return Some(Err(DataFusionError::Execution(format!(
-                            "Unable to mark Kafka message as being processed: {e}",
-                        ))));
-                    };
-
-                    Some(rb)
-                }
-            });
-
-        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), stream);
-
-        Ok(Box::pin(stream_adapter))
     }
 }

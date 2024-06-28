@@ -22,11 +22,10 @@ use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use cache::QueryResultsCacheProvider;
-use data_components::cdc::{self, ChangeEnvelope};
+use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
@@ -98,7 +97,7 @@ impl Default for Refresh {
 pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append(Option<Receiver<()>>),
-    Changes(BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>),
+    Changes(ChangesStream),
 }
 
 pub struct Refresher {
@@ -248,7 +247,7 @@ impl Refresher {
 
     fn start_changes_stream(
         &mut self,
-        changes_stream: BoxStream<'static, std::result::Result<ChangeEnvelope, cdc::StreamError>>,
+        changes_stream: ChangesStream,
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(RefreshTask::new(

@@ -15,9 +15,12 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
+use futures::stream::BoxStream;
 use snafu::prelude::*;
 
 use crate::kafka::KafkaMessage;
+
+pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
 #[derive(Debug, Snafu)]
 pub enum CommitError {

@@ -18,19 +18,17 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use async_trait::async_trait;
-use data_components::cdc::{self, ChangeEnvelope};
+use data_components::cdc::ChangesStream;
 use data_components::debezium;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
-use futures::stream::BoxStream;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use tokio::sync::Mutex;
 
 use super::{DataConnector, DataConnectorFactory};
 
@@ -49,7 +47,6 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Debezium {
-    _consumer_group_id_map: Mutex<HashMap<String, String>>,
     kafka_brokers: String,
 }
 
@@ -76,7 +73,6 @@ impl Debezium {
 
         Ok(Self {
             kafka_brokers: kakfa_brokers.to_string(),
-            _consumer_group_id_map: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -137,11 +133,6 @@ impl DataConnector for Debezium {
 
         let dataset_name = dataset.name.to_string();
 
-        // `read_provider` is called twice, once to test connectivity and once to actually register the table.
-        // To prevent creating an unused consumer group, we store the group_id in a map.
-        // let mut existing_group_id_map = self.consumer_group_id_map.lock().await;
-        // let group_id = existing_group_id_map.get(&dataset_name);
-
         let kafka_consumer = KafkaConsumer::create_with_generated_group_id(
             &dataset_name,
             self.kafka_brokers.clone(),
@@ -150,13 +141,6 @@ impl DataConnector for Debezium {
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
         })?;
-
-        //     let group_id = kafka_consumer.group_id().to_string();
-        //     existing_group_id_map.insert(dataset_name, group_id);
-
-        //     kafka_consumer
-        // };
-        // drop(existing_group_id_map);
 
         kafka_consumer
             .subscribe(&topic)
@@ -207,11 +191,7 @@ impl DataConnector for Debezium {
         Ok(debezium_kafka)
     }
 
-    fn changes_stream(
-        &self,
-        table_provider: Arc<dyn TableProvider>,
-    ) -> Option<BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>> {
-        let table_provider = Arc::clone(&table_provider);
+    fn changes_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         let debezium_kafka = table_provider.as_any().downcast_ref::<DebeziumKafka>()?;
 
         Some(debezium_kafka.stream_changes())
