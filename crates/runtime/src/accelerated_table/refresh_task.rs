@@ -22,10 +22,9 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::cdc::{self, ChangeEnvelope};
+use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::lit;
-use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -90,10 +89,7 @@ impl RefreshTask {
 
     pub async fn start_changes_stream(
         &self,
-        mut changes_stream: BoxStream<
-            'static,
-            std::result::Result<ChangeEnvelope, cdc::StreamError>,
-        >,
+        mut changes_stream: ChangesStream,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
     ) -> super::Result<()> {

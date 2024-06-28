@@ -26,7 +26,6 @@ use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
