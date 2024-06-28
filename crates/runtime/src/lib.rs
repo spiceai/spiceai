@@ -938,12 +938,9 @@ impl Runtime {
             }
         };
 
-        println!(
-            "Model type for {} is {:#?}",
-            m.name,
-            m.model_type().map(|s| s.to_string()).unwrap_or_default()
-        );
-        let result: Result<(), String> = match m.model_type() {
+        let model_type = m.model_type();
+        tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
+        let result: Result<(), String> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok(l) => {
                     let mut llm_map = self.llms.write().await;

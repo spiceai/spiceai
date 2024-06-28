@@ -95,9 +95,7 @@ pub async fn run(args: Args) -> Result<()> {
     let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
-        Ok(app) => {
-            Some(app)
-        }
+        Ok(app) => Some(app),
         Err(e) => {
             tracing::warn!("{}", e);
             None

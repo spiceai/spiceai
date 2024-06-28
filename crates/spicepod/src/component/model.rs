@@ -92,6 +92,7 @@ impl Display for ModelSource {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ModelType {
     Llm,
     Ml,
@@ -162,7 +163,7 @@ impl Model {
 
         // TODO: Need to scan filenames from HF for [`ModelSource::HuggingFace`]. Below is a hack
         // to determine if it's an LLM from HF.
-        if source == ModelSource::HuggingFace && self.params.get("model_type").is_some() {
+        if source == ModelSource::HuggingFace && self.params.contains_key("model_type") {
             return Some(ModelType::Llm);
         }
 
@@ -181,23 +182,22 @@ impl Model {
 
         let is_llm = files
             .iter()
-            .find(|f| {
+            .any(|f| {
                 match f.file_type() {
                     // Only true since embeddings aren't [`Model`]s.
-                    Some(ModelFileType::Tokenizer | ModelFileType::Config |
-ModelFileType::TokenizerConfig) => true,
+                    Some(
+                        ModelFileType::Tokenizer
+                        | ModelFileType::Config
+                        | ModelFileType::TokenizerConfig,
+                    ) => true,
                     _ => is_llm_file(Path::new(&f.path)),
                 }
-            })
-            .is_some();
+            });
         if is_llm {
             return Some(ModelType::Llm);
         }
 
-        if files
-            .iter()
-            .any(|f| is_ml_file(Path::new(&f.path)))
-        {
+        if files.iter().any(|f| is_ml_file(Path::new(&f.path))) {
             return Some(ModelType::Ml);
         }
 
@@ -215,10 +215,17 @@ pub struct ModelFile {
 impl ModelFile {
     /// Returns the [`ModelFileType`] if explicitly set, otherwise attempts to determine the file
     /// type for the [`ModelFile`] based on the file path.
-    #[must_use] pub fn file_type(&self) -> Option<ModelFileType> {
+    #[must_use]
+    pub fn file_type(&self) -> Option<ModelFileType> {
         match self.r#type {
             Some(t) => Some(t),
-            None => determine_type_from_path(&self.path),
+            None => {
+                if let Some(t) = self.r#type { Some(t) } else {
+                    let typ = determine_type_from_path(&self.path);
+                    tracing::trace!("Determined model file type for {}: {:?}", self.path, typ);
+                    typ
+                }
+            }
         }
     }
 }
@@ -277,8 +284,6 @@ pub(crate) fn is_llm_file(p: &Path) -> bool {
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
-
-    println!("is_llm_file: {filename}, {extension}");
 
     // `extension == "safetensors" || filename == "pytorch_model.bin"` also true for embeddings.
     extension == "gguf"

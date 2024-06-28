@@ -288,7 +288,6 @@ pub fn create_hf_model(
         });
     };
 
-    println!("Arch!!: {model_type:#?}");
     #[cfg(feature = "mistralrs")]
     {
         mistral::MistralLlama::from_hf(
