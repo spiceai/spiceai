@@ -300,10 +300,14 @@ impl RefreshTask {
                 }
                 "c" | "u" | "r" => {
                     let inner_data: RecordBatch = change_batch.data(row);
+                    let primary_keys = change_batch.primary_keys(row);
                     let ctx = SessionContext::new();
                     let session_state = ctx.state();
 
-                    tracing::info!("Inserting data row for {dataset_name}");
+                    tracing::info!(
+                        "Inserting data row for {dataset_name} with {}",
+                        Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
+                    );
 
                     let insert_plan = self
                         .accelerator
@@ -330,6 +334,71 @@ impl RefreshTask {
         }
 
         Ok(())
+    }
+
+    fn get_primary_key_log_fmt(
+        data: &RecordBatch,
+        primary_keys: &[String],
+    ) -> super::Result<String> {
+        let data_schema = data.schema();
+        primary_keys
+            .iter()
+            .map(|key| {
+                let Some((primary_key_idx, field)) = data_schema.column_with_name(key) else {
+                    return super::ExpectedSchemaToHaveFieldSnafu {
+                        field_name: key.clone(),
+                        schema: Arc::clone(&data_schema),
+                    }
+                    .fail();
+                };
+                let key_col = data.column(primary_key_idx);
+                match field.data_type() {
+                    DataType::Int32 => {
+                        let key_col = key_col.as_any().downcast_ref::<Int32Array>().context(
+                            super::ArrayDataTypeMismatchSnafu {
+                                field_name: key.clone(),
+                                expected_data_type: "Int32".to_string(),
+                                schema: Arc::clone(&data_schema),
+                            },
+                        )?;
+                        Ok(format!("{key}={value}", value = key_col.value(0)))
+                    }
+                    DataType::Int64 => {
+                        let key_col = key_col.as_any().downcast_ref::<Int64Array>().context(
+                            super::ArrayDataTypeMismatchSnafu {
+                                field_name: key.clone(),
+                                expected_data_type: "Int64".to_string(),
+                                schema: Arc::clone(&data_schema),
+                            },
+                        )?;
+                        Ok(format!(
+                            "{key}={value}",
+                            key = key,
+                            value = key_col.value(0)
+                        ))
+                    }
+                    DataType::Utf8 => {
+                        let key_col = key_col.as_any().downcast_ref::<StringArray>().context(
+                            super::ArrayDataTypeMismatchSnafu {
+                                field_name: key.clone(),
+                                expected_data_type: "String".to_string(),
+                                schema: Arc::clone(&data_schema),
+                            },
+                        )?;
+                        Ok(format!(
+                            "{key}={value}",
+                            key = key,
+                            value = key_col.value(0)
+                        ))
+                    }
+                    _ => super::PrimaryKeyTypeNotYetSupportedSnafu {
+                        data_type: field.data_type().to_string(),
+                    }
+                    .fail(),
+                }
+            })
+            .collect::<super::Result<Vec<String>>>()
+            .map(|keys| keys.join(", "))
     }
 
     fn get_delete_where_expr(
