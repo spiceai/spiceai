@@ -89,6 +89,7 @@ pub trait AcceleratedMetadataProvider {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
+#[allow(unreachable_patterns)]
 async fn get_metadata_provider(
     dataset: &Dataset,
     create_if_file_not_exists: bool,
@@ -119,5 +120,6 @@ async fn get_metadata_provider(
         )),
         Engine::PostgreSQL => todo!(),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
+        _ => Err("Unsupported acceleration engine for metadata".into()),
     }
 }
