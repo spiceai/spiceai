@@ -89,7 +89,6 @@ pub trait AcceleratedMetadataProvider {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
-#[allow(unreachable_patterns)]
 async fn get_metadata_provider(
     dataset: &Dataset,
     create_if_file_not_exists: bool,
@@ -110,6 +109,8 @@ async fn get_metadata_provider(
             )
             .await?,
         )),
+        #[cfg(not(feature = "duckdb"))]
+        Engine::DuckDB => Err("Spice wasn't build with DuckDB support enabled".into()),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Ok(Box::new(
             crate::dataaccelerator::metadata::sqlite::AcceleratedMetadataSqlite::try_new(
@@ -118,8 +119,9 @@ async fn get_metadata_provider(
             )
             .await?,
         )),
+        #[cfg(not(feature = "sqlite"))]
+        Engine::DuckDB => Err("Spice wasn't build with Sqlite support enabled".into()),
         Engine::PostgreSQL => todo!(),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
-        _ => Err("Unsupported acceleration engine for metadata".into()),
     }
 }
