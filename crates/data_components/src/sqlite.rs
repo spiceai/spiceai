@@ -107,6 +107,14 @@ impl SqliteTableFactory {
             db_path_param: "sqlite_file".to_string(),
         }
     }
+
+    #[must_use]
+    pub fn sqlite_file_path(&self, name: &str, options: &HashMap<String, String>) -> String {
+        options
+            .get(&self.db_path_param)
+            .cloned()
+            .unwrap_or_else(|| format!("{name}_sqlite.db"))
+    }
 }
 
 impl Default for SqliteTableFactory {
@@ -161,11 +169,7 @@ impl TableProviderFactory for SqliteTableFactory {
             );
         }
 
-        let db_path = cmd
-            .options
-            .get(self.db_path_param.as_str())
-            .cloned()
-            .unwrap_or(format!("{name}_sqlite.db"));
+        let db_path = self.sqlite_file_path(&name, &cmd.options);
 
         let pool: Arc<SqliteConnectionPool> = Arc::new(
             SqliteConnectionPool::new(&db_path, mode)

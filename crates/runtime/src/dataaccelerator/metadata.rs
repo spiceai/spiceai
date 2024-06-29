@@ -16,29 +16,30 @@ limitations under the License.
 
 //! Store and retrieve Spice metadata in durable accelerator tables
 //!
-//! The metadata table will be a new table `__spice_metadata` with two columns:
+//! The metadata table will be a new table `spice_sys_metadata` with two columns:
 //! - `dataset` (PRIMARY KEY, TEXT): The dataset the metadata entry corresponds to
 //! - `metadata` (TEXT): The metadata entry in JSON format
 
 use std::{path::Path, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
 use data_components::duckdb::DuckDB;
 use duckdb::AccessMode;
 use serde::de::DeserializeOwned;
+use tokio_rusqlite::Connection;
 
 use crate::component::dataset::{acceleration::Engine, Dataset};
 use crate::dataaccelerator::DuckDBAccelerator;
-use db_connection_pool::{dbconnection::SyncDbConnection, duckdbpool::DuckDbConnectionPool};
+use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 use super::get_accelerator_engine;
+use super::sqlite::SqliteAccelerator;
 
 const METADATA_TABLE_NAME: &str = "spice_sys_metadata";
 const METADATA_DATASET_COLUMN: &str = "dataset";
 const METADATA_METADATA_COLUMN: &str = "metadata";
 
 pub struct AcceleratedMetadata {
-    metadata_provider: Box<dyn AcceleratedMetadataProvider>,
+    metadata_provider: Box<dyn AcceleratedMetadataProvider + Send + Sync>,
     dataset_name: String,
 }
 
@@ -64,44 +65,42 @@ impl AcceleratedMetadata {
     }
 
     #[must_use]
-    pub fn get_metadata<T: DeserializeOwned>(&self) -> Option<T> {
+    pub async fn get_metadata<T: DeserializeOwned>(&self) -> Option<T> {
         self.metadata_provider
             .get_metadata(&self.dataset_name)
+            .await
             .map(|metadata| serde_json::from_str(&metadata))?
             .ok()
     }
 
-    pub fn set_metadata<T: serde::Serialize>(
+    pub async fn set_metadata<T: serde::Serialize>(
         &self,
         metadata: &T,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let metadata = serde_json::to_string(metadata).map_err(|e| e.to_string())?;
         self.metadata_provider
             .set_metadata(&self.dataset_name, &metadata)
-    }
-
-    pub fn get_schema(&self) -> Result<SchemaRef, Box<dyn std::error::Error + Send + Sync>> {
-        self.metadata_provider.get_schema(&self.dataset_name)
+            .await
     }
 }
 
+#[async_trait::async_trait]
 pub trait AcceleratedMetadataProvider {
-    fn get_metadata(&self, dataset: &str) -> Option<String>;
-    fn set_metadata(
+    async fn get_metadata(&self, dataset: &str) -> Option<String>;
+    async fn set_metadata(
         &self,
         dataset: &str,
         metadata: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    fn get_schema(
-        &self,
-        dataset: &str,
-    ) -> Result<SchemaRef, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 async fn get_metadata_provider(
     dataset: &Dataset,
     create_if_file_not_exists: bool,
-) -> Result<Box<dyn AcceleratedMetadataProvider>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    Box<dyn AcceleratedMetadataProvider + Send + Sync>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let acceleration = dataset
         .acceleration
         .as_ref()
@@ -110,7 +109,9 @@ async fn get_metadata_provider(
         Engine::DuckDB => Ok(Box::new(
             AcceleratedMetadataDuckDB::try_new(dataset, create_if_file_not_exists).await?,
         )),
-        Engine::Sqlite => todo!(),
+        Engine::Sqlite => Ok(Box::new(
+            AcceleratedMetadataSqlite::try_new(dataset, create_if_file_not_exists).await?,
+        )),
         Engine::PostgreSQL => todo!(),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
     }
@@ -149,8 +150,9 @@ impl AcceleratedMetadataDuckDB {
     }
 }
 
+#[async_trait::async_trait]
 impl AcceleratedMetadataProvider for AcceleratedMetadataDuckDB {
-    fn get_metadata(&self, dataset: &str) -> Option<String> {
+    async fn get_metadata(&self, dataset: &str) -> Option<String> {
         let mut db_conn = Arc::clone(&self.pool).connect_sync().ok()?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
             .ok()?
@@ -170,7 +172,7 @@ impl AcceleratedMetadataProvider for AcceleratedMetadataDuckDB {
         metadata
     }
 
-    fn set_metadata(
+    async fn set_metadata(
         &self,
         dataset: &str,
         metadata: &str,
@@ -203,26 +205,87 @@ impl AcceleratedMetadataProvider for AcceleratedMetadataDuckDB {
 
         Ok(())
     }
+}
 
-    fn get_schema(
-        &self,
-        dataset: &str,
-    ) -> Result<SchemaRef, Box<dyn std::error::Error + Send + Sync>> {
-        let mut db_conn = Arc::clone(&self.pool)
-            .connect_sync()
-            .map_err(|e| e.to_string())?;
-        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(|e| e.to_string())?;
+pub struct AcceleratedMetadataSqlite {
+    conn: Connection,
+}
 
-        let query = format!(r#"SELECT * FROM "{dataset}" LIMIT 0"#);
+impl AcceleratedMetadataSqlite {
+    async fn try_new(
+        dataset: &Dataset,
+        create_if_file_not_exists: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let accelerator = get_accelerator_engine(Engine::Sqlite)
+            .await
+            .ok_or("Sqlite accelerator engine not available")?;
+        let sqlite_accelerator = accelerator
+            .as_any()
+            .downcast_ref::<SqliteAccelerator>()
+            .ok_or("Accelerator is not a SqliteAccelerator")?;
 
-        let stream = duckdb_conn
-            .query_arrow(&query, &[])
-            .map_err(|e| e.to_string())?;
+        let sqlite_file = sqlite_accelerator
+            .sqlite_file_path(dataset)
+            .ok_or("Acceleration mode is not file-based.")?;
+        if !create_if_file_not_exists && !Path::new(&sqlite_file).exists() {
+            return Err("Sqlite file does not exist.".into());
+        }
 
-        Ok(stream.schema())
+        let conn = Connection::open(sqlite_file).await.map_err(Box::new)?;
+
+        Ok(Self { conn })
     }
 }
 
-pub struct AcceleratedMetadataSqlite {}
+#[async_trait::async_trait]
+impl AcceleratedMetadataProvider for AcceleratedMetadataSqlite {
+    async fn get_metadata(&self, dataset: &str) -> Option<String> {
+        let dataset = dataset.to_string();
+        self.conn.call(move |conn| {
+            let query = format!(
+                "SELECT {METADATA_METADATA_COLUMN} FROM {METADATA_TABLE_NAME} WHERE {METADATA_DATASET_COLUMN} = ?",
+            );
+            let mut stmt = conn.prepare(&query)?;
+
+            let mut rows = stmt.query([dataset])?;
+
+            let metadata: Option<String> = if let Some(row) = rows.next()? {
+                Some(row.get(0)?)
+            } else {
+                None
+            };
+
+            Ok(metadata)
+        }).await.ok().flatten()
+    }
+
+    async fn set_metadata(
+        &self,
+        dataset: &str,
+        metadata: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dataset = dataset.to_string();
+        let metadata = metadata.to_string();
+
+        self.conn.call(move |conn| {
+            let create_if_not_exists = format!(
+                "CREATE TABLE IF NOT EXISTS {METADATA_TABLE_NAME} (
+                    {METADATA_DATASET_COLUMN} TEXT PRIMARY KEY,
+                    {METADATA_METADATA_COLUMN} TEXT
+                );",
+            );
+
+            conn.execute(&create_if_not_exists, [])?;
+
+            let query = format!(
+                "INSERT INTO {METADATA_TABLE_NAME} ({METADATA_DATASET_COLUMN}, {METADATA_METADATA_COLUMN}) VALUES (?1, ?2) ON CONFLICT ({METADATA_DATASET_COLUMN}) DO UPDATE SET {METADATA_METADATA_COLUMN} = ?2",
+            );
+
+            conn.execute(&query, [dataset, metadata])?;
+
+            Ok(())
+        }).await.map_err(Into::into)
+    }
+}
 
 pub struct AcceleratedMetadataPostgres {}

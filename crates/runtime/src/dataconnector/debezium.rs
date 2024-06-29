@@ -21,8 +21,8 @@ use crate::secrets::Secret;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
-use data_components::debezium;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
+use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
@@ -144,7 +144,7 @@ impl DataConnector for Debezium {
 
         let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
-            Some((metadata, schema)) => {
+            Some(metadata) => {
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
                     &metadata.consumer_group_id,
                     self.kafka_brokers.clone(),
@@ -162,13 +162,21 @@ impl DataConnector for Debezium {
                     }
                 );
 
+                let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                    metadata.schema_fields.iter().collect(),
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                })?;
+
                 kafka_consumer.subscribe(&topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                     },
                 )?;
 
-                (kafka_consumer, metadata, schema)
+                (kafka_consumer, metadata, Arc::new(schema))
             }
             None => infer_metadata_from_kafka(dataset, &topic, self.kafka_brokers.clone()).await?,
         };
@@ -189,20 +197,18 @@ impl DataConnector for Debezium {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DebeziumKafkaMetadata {
     consumer_group_id: String,
     topic: String,
     primary_keys: Vec<String>,
+    schema_fields: Vec<change_event::Field>,
 }
 
-async fn get_metadata_from_accelerator(
-    dataset: &Dataset,
-) -> Option<(DebeziumKafkaMetadata, SchemaRef)> {
+async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
     let accelerated_metadata = AcceleratedMetadata::new(dataset).await?;
-    let metadata = accelerated_metadata.get_metadata()?;
-    let schema = accelerated_metadata.get_schema().ok()?;
-    Some((metadata, schema))
+    let metadata = accelerated_metadata.get_metadata().await?;
+    Some(metadata)
 }
 
 async fn set_metadata_to_accelerator(
@@ -210,7 +216,7 @@ async fn set_metadata_to_accelerator(
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let accelerated_metadata = AcceleratedMetadata::new_create_if_not_exists(dataset).await?;
-    accelerated_metadata.set_metadata(metadata)
+    accelerated_metadata.set_metadata(metadata).await
 }
 
 async fn infer_metadata_from_kafka(
@@ -260,7 +266,7 @@ async fn infer_metadata_from_kafka(
         });
     };
 
-    let schema = debezium::arrow::convert_fields_to_arrow_schema(schema_fields)
+    let schema = debezium::arrow::convert_fields_to_arrow_schema(schema_fields.clone())
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
@@ -270,6 +276,7 @@ async fn infer_metadata_from_kafka(
         consumer_group_id: kafka_consumer.group_id().to_string(),
         topic: topic.to_string(),
         primary_keys,
+        schema_fields: schema_fields.into_iter().cloned().collect(),
     };
 
     if dataset.is_file_accelerated() {
