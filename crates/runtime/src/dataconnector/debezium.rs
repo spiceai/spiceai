@@ -287,5 +287,13 @@ async fn infer_metadata_from_kafka(
             })?;
     }
 
+    // Restart the stream from the beginning
+    kafka_consumer
+        .restart_topic(topic)
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+        })?;
+
     Ok((kafka_consumer, metadata, Arc::new(schema)))
 }

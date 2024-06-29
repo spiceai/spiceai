@@ -20,7 +20,7 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     message::BorrowedMessage,
     util::get_rdkafka_version,
-    ClientConfig, Message,
+    ClientConfig, Message, Offset,
 };
 use serde::de::DeserializeOwned;
 use snafu::prelude::*;
@@ -46,6 +46,15 @@ pub enum Error {
 
     #[snafu(display("Unable to mark Kafka message as being processed: {source}"))]
     UnableToCommitMessage { source: rdkafka::error::KafkaError },
+
+    #[snafu(display("Unable to restart Kafka offsets {message}: {source}"))]
+    UnableToRestartTopic {
+        source: rdkafka::error::KafkaError,
+        message: String,
+    },
+
+    #[snafu(display("The metadata for topic {topic} was not found."))]
+    MetadataTopicNotFound { topic: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -111,6 +120,58 @@ impl KafkaConsumer {
 
             Some(Ok(KafkaMessage::new(&self.consumer, msg, key, value)))
         })
+    }
+
+    pub fn restart_topic(&self, topic: &str) -> Result<()> {
+        let mut assignment = self
+            .consumer
+            .assignment()
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to get assignment".to_string(),
+            })?;
+
+        // Retrieve metadata for the topic to get the list of partitions
+        let metadata = self
+            .consumer
+            .fetch_metadata(Some(topic), std::time::Duration::from_secs(1))
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to fetch metadata".to_string(),
+            })?;
+
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .context(MetadataTopicNotFoundSnafu {
+                topic: topic.to_string(),
+            })?;
+
+        // Assign each partition to start from the beginning
+        for partition_metadata in topic_metadata.partitions() {
+            tracing::debug!(
+                "Resetting partition {} for topic {topic}",
+                partition_metadata.id()
+            );
+            assignment
+                .set_partition_offset(topic, partition_metadata.id(), Offset::Offset(0))
+                .context(UnableToRestartTopicSnafu {
+                    message: "Failed to set partition in list".to_string(),
+                })?;
+            assignment = self
+                .consumer
+                .seek_partitions(assignment, std::time::Duration::from_secs(1))
+                .context(UnableToRestartTopicSnafu {
+                    message: "Failed to seek partitions".to_string(),
+                })?;
+        }
+
+        self.consumer
+            .store_offsets(&assignment)
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to commit".to_string(),
+            })?;
+
+        Ok(())
     }
 
     fn create(group_id: String, brokers: String) -> Result<Self> {
