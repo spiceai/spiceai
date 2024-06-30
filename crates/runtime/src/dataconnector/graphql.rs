@@ -208,7 +208,8 @@ impl GraphQLClient {
     }
 }
 
-fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Value {
+fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Result<Vec<Value>> {
+    let mut new_objects = Vec::new();
     if let Value::Object(obj) = object {
         let mut new_object = obj.clone();
 
@@ -216,7 +217,7 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> V
         let mut depth_counter = 0;
 
         loop {
-            if depth_counter > unnest_parameters.depth {
+            if depth_counter >= unnest_parameters.depth {
                 break; // break if we've hit the unnest depth limit
             }
 
@@ -251,20 +252,30 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> V
             depth_counter += 1;
         }
 
-        Value::Object(new_object)
+        new_objects.push(Value::Object(new_object));
+    } else if let Value::Array(arr) = object {
+        new_objects.extend(arr.clone());
     } else {
-        // unnesting something else?
-        // TODO: could add support for unnesting nested arrays like [[1, 2], [3, 4]]
-        // would need to change return type to Vec<Value> and vec reduce in unnest_json_objects
-        panic!("Unsupported unnest type"); // TODO: make this panic not a panic
+        return Err(Error::InvalidObjectAccess {
+            // unnesting any other type is invalid
+            message: format!("Unsupported unnest type: {object}").to_string(),
+        });
     }
+
+    Ok(new_objects)
 }
 
-fn unnest_json_objects(unnest_parameters: &UnnestParameters, objects: &[Value]) -> Vec<Value> {
-    objects
+fn unnest_json_objects(
+    unnest_parameters: &UnnestParameters,
+    objects: &[Value],
+) -> Result<Vec<Value>> {
+    Ok(objects
         .iter()
         .map(|obj| unnest_json_object(unnest_parameters, obj))
-        .collect()
+        .collect::<Result<Vec<Vec<_>>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 impl GraphQLClient {
@@ -317,7 +328,7 @@ impl GraphQLClient {
         }?;
 
         if self.unnest_parameters.depth > 0 {
-            unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped);
+            unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped)?;
         }
 
         let schema = schema.unwrap_or(Arc::new(
@@ -628,6 +639,7 @@ impl DataConnector for GraphQL {
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
+    use serde_json::Value;
 
     use super::handle_http_error;
     use super::PaginationParameters;
@@ -862,5 +874,100 @@ mod tests {
                 assert!(e.to_string().contains(message));
             }
         }
+    }
+
+    #[test]
+    fn test_json_object_unnesting() {
+        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Invalid json");
+        let result = super::unnest_json_object(&unnest_parameters, &object)
+            .expect("Unnesting object failed");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("Failed to get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "b".to_string(),
+                Value::Number(1.into())
+            )]))
+        );
+
+        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let object =
+            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Invalid json");
+        let result = super::unnest_json_object(&unnest_parameters, &object)
+            .expect("Unnesting object failed");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("Failed to get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "d".to_string(),
+                Value::String("1".to_string())
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_json_object_unnesting_respects_unnest_depth() {
+        let unnest_parameters = super::UnnestParameters { depth: 0 };
+        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Invalid json");
+        let result = super::unnest_json_object(&unnest_parameters, &object)
+            .expect("Unnesting object failed");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("Failed to get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "a".to_string(),
+                Value::Object(serde_json::Map::from_iter(vec![(
+                    "b".to_string(),
+                    Value::Number(1.into())
+                )]))
+            )]))
+        );
+
+        let unnest_parameters = super::UnnestParameters { depth: 1 };
+        let object =
+            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Invalid json");
+        let result = super::unnest_json_object(&unnest_parameters, &object)
+            .expect("Unnesting object failed");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("Failed to get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "b".to_string(),
+                Value::Object(serde_json::Map::from_iter(vec![(
+                    "c".to_string(),
+                    Value::Object(serde_json::Map::from_iter(vec![(
+                        "d".to_string(),
+                        Value::String("1".to_string())
+                    )]))
+                )]))
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_json_array_unnesting() {
+        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let object = serde_json::from_str("[1, 2, 3]").expect("Invalid json");
+        let result = super::unnest_json_object(&unnest_parameters, &object)
+            .expect("Unnesting object failed");
+        assert_eq!(result.len(), 3);
+
+        let obj = result.first().expect("Failed to get first unnested object");
+        assert_eq!(obj, &Value::Number(1.into()));
+
+        let obj = result.get(1).expect("Failed to get second unnested object");
+        assert_eq!(obj, &Value::Number(2.into()));
+
+        let obj = result.get(2).expect("Failed to get third unnested object");
+        assert_eq!(obj, &Value::Number(3.into()));
     }
 }
