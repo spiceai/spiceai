@@ -30,6 +30,8 @@ pub const METADATA_METADATA_COLUMN: &str = "metadata";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "postgres")]
+mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -110,7 +112,7 @@ async fn get_metadata_provider(
             .await?,
         )),
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB => Err("Spice wasn't build with DuckDB support enabled".into()),
+        Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Ok(Box::new(
             crate::dataaccelerator::metadata::sqlite::AcceleratedMetadataSqlite::try_new(
@@ -120,8 +122,16 @@ async fn get_metadata_provider(
             .await?,
         )),
         #[cfg(not(feature = "sqlite"))]
-        Engine::Sqlite => Err("Spice wasn't build with Sqlite support enabled".into()),
-        Engine::PostgreSQL => todo!(),
+        Engine::Sqlite => Err("Spice wasn't built with Sqlite support enabled".into()),
+        #[cfg(feature = "postgres")]
+        Engine::PostgreSQL => Ok(Box::new(
+            crate::dataaccelerator::metadata::postgres::AcceleratedMetadataPostgres::try_new(
+                dataset,
+            )
+            .await?,
+        )),
+        #[cfg(not(feature = "postgres"))]
+        Engine::PostgreSQL => Err("Spice wasn't built with PostgreSQL support enabled".into()),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
     }
 }
