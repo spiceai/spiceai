@@ -120,7 +120,7 @@ async fn get_metadata_provider(
             .await?,
         )),
         #[cfg(not(feature = "sqlite"))]
-        Engine::DuckDB => Err("Spice wasn't build with Sqlite support enabled".into()),
+        Engine::Sqlite => Err("Spice wasn't build with Sqlite support enabled".into()),
         Engine::PostgreSQL => todo!(),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
     }
