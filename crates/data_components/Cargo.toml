@@ -51,7 +51,7 @@ r2d2 = { workspace = true, optional = true }
 rdkafka = { version = "0.36.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-rdkafka = { version = "0.25", features = ["cmake-build"] }
+rdkafka = { version = "0.36.2", features = ["cmake-build"] }
 
 regex = "1.10.4"
 reqwest = { version = "0.11.24", features = ["json"] }
