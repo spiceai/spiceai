@@ -153,7 +153,7 @@ impl KafkaConsumer {
                 partition_metadata.id()
             );
             assignment
-                .set_partition_offset(topic, partition_metadata.id(), Offset::Offset(0))
+                .set_partition_offset(topic, partition_metadata.id(), Offset::Beginning)
                 .context(UnableToRestartTopicSnafu {
                     message: "Failed to set partition in list".to_string(),
                 })?;
