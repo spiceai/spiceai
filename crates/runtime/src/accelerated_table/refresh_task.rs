@@ -221,53 +221,40 @@ impl RefreshTask {
         let overwrite = data_update.update_type == UpdateType::Overwrite;
 
         let refresh_stat: Arc<RwLock<Option<RefreshStat>>> = Arc::new(RwLock::new(None));
-        let refresh_stat_ref_copy = Arc::clone(&refresh_stat);
-
         let is_data_receiving_err: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
-        let is_data_receiving_err_ref_copy = Arc::clone(&is_data_receiving_err);
-
-        let dataset_name_copy = dataset_name.to_string();
-
         let schema = Arc::clone(&data_update.schema);
 
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
-                (data_update.data, 0, 0),
-                move |(mut data_update_stream, mut num_rows, mut memory_size)| {
-                    let dataset_name = dataset_name_copy.clone();
-                    let is_data_receiving_err_ref_copy =
-                        Arc::clone(&is_data_receiving_err_ref_copy);
-                    let refresh_stat_ref_copy = Arc::clone(&refresh_stat_ref_copy);
-
-                    async move {
-                        if let Some(batch) = data_update_stream.next().await {
-                            match batch {
-                                Ok(batch) => {
-                                    tracing::trace!(
-                                        "[refresh] Received {} rows for dataset: {}",
-                                        batch.num_rows(),
-                                        dataset_name
-                                    );
-                                    num_rows += batch.num_rows();
-                                    memory_size += batch.get_array_memory_size();
-                                    Some((Ok(batch), (data_update_stream, num_rows, memory_size)))
-                                }
-                                Err(err) => {
-                                    let mut is_data_receiving_err =
-                                        is_data_receiving_err_ref_copy.write().await;
-                                    *is_data_receiving_err = true;
-                                    Some((Err(err), (data_update_stream, num_rows, memory_size)))
-                                }
+                (
+                    data_update.data,
+                    RefreshStat::default(),
+                    dataset_name.to_string(),
+                    Arc::clone(&refresh_stat),
+                    Arc::clone(&is_data_receiving_err),
+                ),
+                move |(mut stream, mut stat, ds_name, stat_lock, is_err_lock)| async move {
+                    if let Some(batch) = stream.next().await {
+                        match batch {
+                            Ok(batch) => {
+                                tracing::trace!(
+                                    "[refresh] Received {} rows for dataset: {}",
+                                    batch.num_rows(),
+                                    ds_name
+                                );
+                                stat.num_rows += batch.num_rows();
+                                stat.memory_size += batch.get_array_memory_size();
+                                Some((Ok(batch), (stream, stat, ds_name, stat_lock, is_err_lock)))
                             }
-                        } else {
-                            let mut refresh_stat = refresh_stat_ref_copy.write().await;
-                            *refresh_stat = Some(RefreshStat {
-                                num_rows,
-                                memory_size,
-                            });
-                            None
+                            Err(err) => {
+                                *is_err_lock.write().await = true;
+                                Some((Err(err), (stream, stat, ds_name, stat_lock, is_err_lock)))
+                            }
                         }
+                    } else {
+                        *stat_lock.write().await = Some(stat);
+                        None
                     }
                 },
             ),
