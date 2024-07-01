@@ -31,7 +31,6 @@ use futures::stream;
 pub enum UpdateType {
     Append,
     Overwrite,
-    Changes,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +40,6 @@ pub struct DataUpdate {
     /// The type of update to perform.
     /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
     /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
-    /// If `UpdateType::Changes`, the runtime will apply the changes to the existing data.
     pub update_type: UpdateType,
 }
 
