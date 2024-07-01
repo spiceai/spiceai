@@ -70,6 +70,7 @@ pub enum RetrievalLimit {
     Threshold(f64),
 }
 pub type ModelKey = String;
+
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
     pub retrieved_public_keys: HashMap<TableReference, Vec<RecordBatch>>,
