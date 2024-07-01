@@ -382,7 +382,7 @@ impl Chat for MistralLlama {
         }
     }
 
-    #[allow(deprecated)]
+    #[allow(deprecated, clippy::cast_possible_truncation)]
     async fn chat_request(
         &mut self,
         req: CreateChatCompletionRequest,
