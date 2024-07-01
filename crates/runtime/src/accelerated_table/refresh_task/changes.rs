@@ -32,6 +32,19 @@ use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+macro_rules! extract_primary_key {
+    ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
+        let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
+            crate::accelerated_table::ArrayDataTypeMismatchSnafu {
+                field_name: $key.to_string(),
+                expected_data_type: $data_type_str.to_string(),
+                schema: Arc::clone(&$data_schema),
+            },
+        )?;
+        Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+    }};
+}
+
 impl RefreshTask {
     pub async fn start_changes_stream(
         &self,
@@ -209,34 +222,13 @@ impl RefreshTask {
         let key_col = data.column(primary_key_idx);
         match field.data_type() {
             DataType::Int32 => {
-                let key_col = key_col.as_any().downcast_ref::<Int32Array>().context(
-                    crate::accelerated_table::ArrayDataTypeMismatchSnafu {
-                        field_name: key.to_string(),
-                        expected_data_type: "Int32".to_string(),
-                        schema: Arc::clone(&data_schema),
-                    },
-                )?;
-                Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+                extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32")
             }
             DataType::Int64 => {
-                let key_col = key_col.as_any().downcast_ref::<Int64Array>().context(
-                    crate::accelerated_table::ArrayDataTypeMismatchSnafu {
-                        field_name: key.to_string(),
-                        expected_data_type: "Int64".to_string(),
-                        schema: Arc::clone(&data_schema),
-                    },
-                )?;
-                Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+                extract_primary_key!(key_col, key, data_schema, Int64Array, "Int64")
             }
             DataType::Utf8 => {
-                let key_col = key_col.as_any().downcast_ref::<StringArray>().context(
-                    crate::accelerated_table::ArrayDataTypeMismatchSnafu {
-                        field_name: key.to_string(),
-                        expected_data_type: "String".to_string(),
-                        schema: Arc::clone(&data_schema),
-                    },
-                )?;
-                Ok((key_col.value(0).to_string(), lit(key_col.value(0))))
+                extract_primary_key!(key_col, key, data_schema, StringArray, "String")
             }
             _ => crate::accelerated_table::PrimaryKeyTypeNotYetSupportedSnafu {
                 data_type: field.data_type().to_string(),
