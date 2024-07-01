@@ -29,7 +29,7 @@ use arrow::{
 use snafu::prelude::*;
 
 /// Converts a `ChangeEvent` into a `ChangeBatch`
-pub fn to_record_batch(
+pub fn to_change_batch(
     table_schema: &SchemaRef,
     primary_key: &[String],
     change: &ChangeEvent,
