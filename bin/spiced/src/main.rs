@@ -21,6 +21,12 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
     let args = spiced::Args::parse();
 
