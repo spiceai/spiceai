@@ -32,6 +32,20 @@ use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+/// Extracts the primary key value from the data, as a tuple of (String, Expr).
+///
+/// # Example
+///
+/// ```ignore
+/// let data: RecordBatch = get_record_batch();
+/// let key = "id";
+/// let key_col = data.column(0);
+/// let result = extract_primary_key!(key_col, key, data_schema, Int32Array, "Int32");
+/// if let Ok((str_value, expr_value)) = result {
+///    println!("Primary key value as String: {}", str_value);
+///    println!("Primary key value as DataFusion expression: {}", expr_value);
+/// }
+/// ```
 macro_rules! extract_primary_key {
     ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
