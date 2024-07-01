@@ -270,6 +270,7 @@ pub async fn create_synced_internal_accelerated_table(
     let accelerated_table_provider = create_accelerator_table(
         table_reference.clone(),
         source_table_provider.schema(),
+        None,
         &acceleration,
         None,
     )

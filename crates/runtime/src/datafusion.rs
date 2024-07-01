@@ -541,6 +541,7 @@ impl DataFusion {
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
             source_schema,
+            source_table_provider.constraints(),
             &acceleration_settings,
             acceleration_secret,
         )
