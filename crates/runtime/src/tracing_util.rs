@@ -14,19 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::{
-    acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
-    Dataset,
+use crate::{
+    component::dataset::{
+        acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
+        Dataset,
+    },
+    dataconnector::DataConnector,
 };
+use std::sync::Arc;
 
 // Format: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (duckdb), results cache enabled.
-pub fn dataset_registered_trace(ds: &Dataset, results_cache_enabled: bool) -> String {
+pub fn dataset_registered_trace(
+    data_connector: &Arc<dyn DataConnector>,
+    ds: &Dataset,
+    results_cache_enabled: bool,
+) -> String {
     let mut info = format!("Dataset {} registered ({})", &ds.name, &ds.from);
     if let Some(acceleration) = &ds.acceleration {
         if acceleration.enabled {
             info.push_str(&format!(
                 ", acceleration ({})",
-                dataset_acceleration_info(acceleration)
+                dataset_acceleration_info(data_connector, acceleration)
             ));
         }
     }
@@ -40,15 +48,24 @@ pub fn dataset_registered_trace(ds: &Dataset, results_cache_enabled: bool) -> St
 }
 
 // Format: sqlite:file, 30s refresh, 1hr retention, fallback on source on empty result
-fn dataset_acceleration_info(acceleration: &Acceleration) -> String {
+fn dataset_acceleration_info(
+    data_connector: &Arc<dyn DataConnector>,
+    acceleration: &Acceleration,
+) -> String {
     let mut info: String = acceleration.engine.to_string();
 
     if acceleration.mode == Mode::File {
         info.push_str(":file");
     }
 
-    if acceleration.refresh_mode == RefreshMode::Append {
-        info.push_str(", append");
+    match data_connector.resolve_refresh_mode(acceleration.refresh_mode) {
+        RefreshMode::Full => {}
+        RefreshMode::Append => {
+            info.push_str(", append");
+        }
+        RefreshMode::Changes => {
+            info.push_str(", changes");
+        }
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
@@ -69,13 +86,34 @@ fn dataset_acceleration_info(acceleration: &Acceleration) -> String {
 mod tests {
     use super::*;
     use crate::component::dataset::acceleration::Engine;
+    use crate::dataconnector::DataConnectorResult;
+    use async_trait::async_trait;
+    use datafusion::datasource::TableProvider;
+    use std::any::Any;
+
+    struct TestDataConnector {}
+
+    #[async_trait]
+    impl DataConnector for TestDataConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_dataset_registered_trace_no_acceleration() {
         let ds = Dataset::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
             .expect("to create dataset");
 
-        let info = dataset_registered_trace(&ds, false);
+        let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
+        let info = dataset_registered_trace(&test_data_connector, &ds, false);
         assert_eq!(
             info,
             "Dataset taxi_trips registered (s3://taxi_trips/2024/)."
@@ -93,7 +131,8 @@ mod tests {
             .expect("to create dataset");
         ds.acceleration = Some(acceleration);
 
-        let info = dataset_registered_trace(&ds, true);
+        let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
+        let info = dataset_registered_trace(&test_data_connector, &ds, true);
         assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled.");
     }
 
@@ -103,7 +142,7 @@ mod tests {
             enabled: true,
             engine: Engine::DuckDB,
             mode: Mode::File,
-            refresh_mode: RefreshMode::Append,
+            refresh_mode: Some(RefreshMode::Append),
             refresh_check_interval: Some("30s".to_string()),
             retention_check_interval: Some("1hr".to_string()),
             retention_check_enabled: true,
@@ -115,7 +154,8 @@ mod tests {
             .expect("to create dataset");
         ds.acceleration = Some(acceleration);
 
-        let info = dataset_registered_trace(&ds, false);
+        let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
+        let info = dataset_registered_trace(&test_data_connector, &ds, false);
         assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result).");
     }
 }

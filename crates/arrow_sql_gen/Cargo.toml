@@ -1,44 +1,47 @@
 [package]
-name = "arrow_sql_gen"
-version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "arrow_sql_gen"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tracing.workspace = true
 arrow.workspace = true
+bigdecimal = "0.4.3"
+bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0" }
+chrono.workspace = true
+chrono-tz = "0.8.6"
+rusqlite = { workspace = true, optional = true }
 sea-query = { version = "0.30.7", features = [
-    "backend-sqlite",
-    "backend-postgres",
-    "postgres-array",
-    "with-rust_decimal",
-    "with-bigdecimal",
-    "with-time",
+  "backend-sqlite",
+  "backend-postgres",
+  "postgres-array",
+  "with-rust_decimal",
+  "with-bigdecimal",
+  "with-time",
 ] }
 snafu.workspace = true
-tokio-postgres = { workspace = true, features = ["with-chrono-0_4", "with-uuid-1"], optional = true }
-bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0" }
 time = "0.3.34"
-bigdecimal = "0.4.3"
 tokio.workspace = true
-rusqlite = { workspace = true, optional = true }
-chrono = "0.4.35"
-chrono-tz = "0.8.6"
+tokio-postgres = { workspace = true, features = [
+  "with-chrono-0_4",
+  "with-uuid-1",
+], optional = true }
+tracing.workspace = true
 
-mysql_async = { workspace = true, optional = true }
-clickhouse-rs = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
 byteorder = "1.5.0"
+clickhouse-rs = { workspace = true, optional = true }
 fallible-iterator = "0.3.0"
+mysql_async = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [features]
-sqlite = ["dep:rusqlite"]
-postgres = ["dep:tokio-postgres", "dep:uuid"]
-mysql = ["dep:mysql_async"]
 clickhouse = ["dep:clickhouse-rs", "dep:uuid"]
+mysql = ["dep:mysql_async"]
+postgres = ["dep:tokio-postgres", "dep:uuid"]
+sqlite = ["dep:rusqlite"]

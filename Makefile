@@ -62,6 +62,9 @@ lint-go:
 	go vet ./...
 	golangci-lint run
 
+.PHONY: fmt-toml
+fmt-toml:
+	taplo fmt
 
 .PHONY: run
 run:

@@ -152,10 +152,7 @@ pub async fn run(args: Args) -> Result<()> {
     ];
 
     if cfg!(feature = "models") {
-        let mut v: Vec<Pin<Box<dyn Future<Output = ()>>>> =
-            vec![Box::pin(rt.load_models()), Box::pin(rt.load_llms())];
-
-        futures.append(&mut v);
+        futures.push(Box::pin(rt.load_models()));
     }
 
     tokio::select! {

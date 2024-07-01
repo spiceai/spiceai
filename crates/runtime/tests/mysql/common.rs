@@ -17,12 +17,15 @@ limitations under the License.
 use std::collections::HashMap;
 
 use bollard::secret::HealthConfig;
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use spicepod::component::{
+    dataset::{acceleration::Acceleration, Dataset},
+    params::Params as DatasetParams,
+};
 use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
-pub fn make_mysql_dataset(path: &str, name: &str, port: u16) -> Dataset {
+pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
     let params = HashMap::from([
         ("mysql_host".to_string(), "localhost".to_string()),
@@ -33,6 +36,9 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16) -> Dataset {
         ("mysql_sslmode".to_string(), "disabled".to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
+    if accelerated {
+        dataset.acceleration = Some(Acceleration::default());
+    }
     dataset
 }
 

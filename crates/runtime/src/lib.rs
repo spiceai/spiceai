@@ -23,6 +23,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
@@ -32,9 +33,11 @@ use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
+use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
+use dataconnector::AnyErrorResult;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -45,14 +48,13 @@ use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
-use model_components::{model::Model, modelsource::source as model_source};
+use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret, SecretMap};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
-use spicepod::component::llms::Llm;
-use spicepod::component::model::Model as SpicepodModel;
+use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tracing_util::dataset_registered_trace;
@@ -508,32 +510,41 @@ impl Runtime {
             Arc::clone(&self.secrets_provider);
 
         // test dataset connectivity by attempting to get a read provider
-        if let Err(err) = data_connector.read_provider(&ds).await {
-            status::update_dataset(&ds.name, status::ComponentStatus::Error);
-            metrics::counter!("datasets_load_error").increment(1);
-            warn_spaced!(spaced_tracer, "{}{err}", "");
-            return UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
+        let read_provider = match data_connector.read_provider(&ds).await {
+            Ok(provider) => provider,
+            Err(err) => {
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                metrics::counter!("datasets_load_error").increment(1);
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .fail();
             }
-            .fail();
-        }
+        };
 
-        let data_connector = Arc::clone(&data_connector);
         match Runtime::register_dataset(
             &ds,
-            data_connector,
-            Arc::clone(&df),
-            &source,
-            Arc::clone(&shared_secrets_provider),
-            accelerated_table,
-            Arc::clone(&self.embeds),
+            RegisterDatasetContext {
+                data_connector: Arc::clone(&data_connector),
+                federated_read_table: read_provider,
+                df: Arc::clone(&df),
+                source,
+                secrets_provider: Arc::clone(&shared_secrets_provider),
+                accelerated_table,
+                embedding: Arc::clone(&self.embeds),
+            },
         )
         .await
         {
             Ok(()) => {
                 tracing::info!(
                     "{}",
-                    dataset_registered_trace(&ds, self.df.cache_provider().is_some())
+                    dataset_registered_trace(
+                        &data_connector,
+                        &ds,
+                        self.df.cache_provider().is_some()
+                    )
                 );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
@@ -608,7 +619,7 @@ impl Runtime {
         match self.load_dataset_connector(ds).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
-                if ds.is_accelerated() {
+                if Self::accelerated_dataset_supports_hot_reload(ds, &*connector) {
                     tracing::info!("Updating accelerated dataset {}...", &ds.name);
                     if let Ok(()) = &self
                         .reload_accelerated_dataset(ds, Arc::clone(&connector))
@@ -638,6 +649,31 @@ impl Runtime {
         }
     }
 
+    fn accelerated_dataset_supports_hot_reload(
+        ds: &Dataset,
+        connector: &dyn DataConnector,
+    ) -> bool {
+        let Some(acceleration) = &ds.acceleration else {
+            return false;
+        };
+
+        // Datasets that configure changes and are file-accelerated automatically keep track of changes that survive restarts.
+        // Thus we don't need to "hot reload" them to try to keep their data intact.
+        if connector.supports_changes_stream()
+            && ds.is_file_accelerated()
+            && connector.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes
+        {
+            return false;
+        }
+
+        // File accelerated datasets don't support hot reload.
+        if ds.is_file_accelerated() {
+            return false;
+        }
+
+        true
+    }
+
     async fn reload_accelerated_dataset(
         &self,
         ds: &Dataset,
@@ -646,10 +682,17 @@ impl Runtime {
         let acceleration_secret =
             Runtime::get_acceleration_secret(ds, Arc::clone(&self.secrets_provider)).await?;
 
+        let read_table = connector.read_provider(ds).await.map_err(|_| {
+            UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .build()
+        })?;
+
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), acceleration_secret)
+            .create_accelerated_table(ds, Arc::clone(&connector), read_table, acceleration_secret)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -727,13 +770,18 @@ impl Runtime {
 
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
-        data_connector: Arc<dyn DataConnector>,
-        df: Arc<DataFusion>,
-        source: &str,
-        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-        accelerated_table: Option<AcceleratedTable>,
-        embedding: Arc<RwLock<EmbeddingModelStore>>,
+        register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
+        let RegisterDatasetContext {
+            data_connector,
+            federated_read_table,
+            df,
+            source,
+            secrets_provider,
+            accelerated_table,
+            embedding,
+        } = register_dataset_ctx;
+
         let ds = ds.borrow();
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
@@ -758,8 +806,11 @@ impl Runtime {
             return Runtime::register_table(
                 df,
                 ds,
-                datafusion::Table::Federated(connector),
-                source,
+                datafusion::Table::Federated {
+                    data_connector: connector,
+                    federated_read_table,
+                },
+                &source,
             )
             .await;
         }
@@ -785,10 +836,11 @@ impl Runtime {
             ds,
             datafusion::Table::Accelerated {
                 source: connector,
+                federated_read_table,
                 acceleration_secret,
                 accelerated_table,
             },
-            source,
+            &source,
         )
         .await
     }
@@ -830,45 +882,16 @@ impl Runtime {
     }
 
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
-    pub async fn load_llm(&self, in_llm: &Llm) -> Result<Box<dyn Chat>> {
-        let params = in_llm.params.clone().unwrap_or_default();
-        let params_with_secrets = self.get_params_with_secrets(&params).await?;
-
-        let mut l = try_to_chat_model(in_llm, &params_with_secrets.into_map())
+    pub async fn load_llm(&self, m: SpicepodModel, params: SecretMap) -> Result<Box<dyn Chat>> {
+        let mut l = try_to_chat_model(&m, &params.into_map())
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
+
         l.health()
             .await
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
         Ok(l)
-    }
-
-    pub async fn load_llms(&self) {
-        let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            for in_llm in &app.llms {
-                status::update_llm(&in_llm.name, status::ComponentStatus::Initializing);
-                match self.load_llm(in_llm).await {
-                    Ok(l) => {
-                        let mut llm_map = self.llms.write().await;
-                        llm_map.insert(in_llm.name.clone(), l.into());
-                        tracing::info!("Llm [{}] deployed, ready for inferencing", in_llm.name);
-                        metrics::gauge!("llms_count", "llm" => in_llm.name.clone(), "source" => in_llm.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
-                        status::update_llm(&in_llm.name, status::ComponentStatus::Ready);
-                    }
-                    Err(e) => {
-                        metrics::counter!("llms_load_error").increment(1);
-                        status::update_llm(&in_llm.name, status::ComponentStatus::Error);
-                        tracing::warn!(
-                            "Unable to load LLM from spicepod {}, error: {}",
-                            in_llm.name,
-                            e,
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
@@ -923,27 +946,44 @@ impl Runtime {
         }
     }
 
-    // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
-    pub async fn load_model(&self, m: &SpicepodModel) {
-        measure_scope_ms!("load_model", "model" => m.name, "source" => model_source(&m.from));
-        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
-
-        let model = m.clone();
-        let source = model_source(model.from.as_str());
-
+    /// Combine the parameters for a model component with relevant secrets from the secrets provider.
+    pub async fn construct_model_params(
+        &self,
+        params: HashMap<String, String>,
+        source: Option<ModelSource>,
+    ) -> AnyErrorResult<SecretMap> {
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        let secret = match secrets_provider
-            .get_secret(source.to_string().as_str())
-            .await
-        {
+        let secret = match source {
+            Some(m) => secrets_provider.get_secret(m.to_string().as_str()).await?,
+            None => None,
+        };
+
+        let mut params: SecretMap = SecretMap::from(params);
+        if let Some(secret) = secret {
+            for (k, v) in secret.iter() {
+                params.insert(k.to_string(), v.clone());
+            }
+        }
+        Ok(params)
+    }
+
+    // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
+    pub async fn load_model(&self, m: &SpicepodModel) {
+        let source = m.get_source();
+        let source_str = source.clone().map(|s| s.to_string()).unwrap_or_default();
+        let model = m.clone();
+        measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
+        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+
+        let params = match self.construct_model_params(m.params.clone(), source).await {
             Ok(s) => s,
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
                 status::update_model(&model.name, status::ComponentStatus::Error);
                 tracing::warn!(
-                    "Unable to load runnable model from spicepod {}, error: {}",
+                    "Unable to load model '{}' from spicepod, error: {}",
                     m.name,
                     e,
                 );
@@ -951,45 +991,67 @@ impl Runtime {
             }
         };
 
-        let mut params: SecretMap = SecretMap::new();
-        if let Some(secret) = secret {
-            for (k, v) in secret.iter() {
-                params.insert(k.to_string(), v.clone());
-            }
-        }
-
-        match Model::load(m.clone(), params.into_map()).await {
-            Ok(in_m) => {
-                let mut model_map = self.models.write().await;
-                model_map.insert(m.name.clone(), in_m);
+        let model_type = m.model_type();
+        tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
+        let result: Result<(), String> = match model_type {
+            Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
+                Ok(l) => {
+                    let mut llm_map = self.llms.write().await;
+                    llm_map.insert(m.name.clone(), l.into());
+                    Ok(())
+                }
+                Err(e) => Err(format!(
+                    "Unable to load LLM from spicepod {}, error: {}",
+                    m.name, e,
+                )),
+            },
+            Some(ModelType::Ml) => match Model::load(m.clone(), params.into_map()).await {
+                Ok(in_m) => {
+                    let mut model_map = self.models.write().await;
+                    model_map.insert(m.name.clone(), in_m);
+                    Ok(())
+                }
+                Err(e) => Err(format!(
+                    "Unable to load runnable model from spicepod {}, error: {}",
+                    m.name, e,
+                )),
+            },
+            None => Err(format!(
+                "Unable to load model {} from spicepod. Unable to determine model type.",
+                m.name,
+            )),
+        };
+        match result {
+            Ok(()) => {
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).increment(1.0);
+                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => source_str)
+                    .increment(1.0);
                 status::update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
                 status::update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!(
-                    "Unable to load runnable model from spicepod {}, error: {}",
-                    m.name,
-                    e,
-                );
+                tracing::warn!(e);
             }
         }
     }
 
     pub async fn remove_model(&self, m: &SpicepodModel) {
-        let mut model_map = self.models.write().await;
-        if !model_map.contains_key(&m.name) {
-            tracing::warn!(
-                "Unable to unload runnable model {}: model not found",
-                m.name,
-            );
-            return;
-        }
-        model_map.remove(&m.name);
+        match m.model_type() {
+            Some(ModelType::Ml) => {
+                let mut ml_map = self.models.write().await;
+                ml_map.remove(&m.name);
+            }
+            Some(ModelType::Llm) => {
+                let mut llm_map = self.llms.write().await;
+                llm_map.remove(&m.name);
+            }
+            None => return,
+        };
+
         tracing::info!("Model [{}] has been unloaded", m.name);
-        metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).decrement(1.0);
+        metrics::gauge!("models_count", "llm" => m.name.clone(), "source" => m.get_source().map(|s| s.to_string()).unwrap_or_default())
+            .decrement(1.0);
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
@@ -1282,4 +1344,14 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
+}
+
+pub struct RegisterDatasetContext {
+    data_connector: Arc<dyn DataConnector>,
+    federated_read_table: Arc<dyn TableProvider>,
+    df: Arc<DataFusion>,
+    source: String,
+    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    accelerated_table: Option<AcceleratedTable>,
+    embedding: Arc<RwLock<EmbeddingModelStore>>,
 }

@@ -82,12 +82,14 @@ pub fn validate_refresh_sql(expected_table: TableReference, refresh_sql: &str) -
                             version: _,
                             partitions: _,
                         } => {
+                            let table_name_with_schema = name
+                                .0
+                                .iter()
+                                .map(|x| x.value.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
                             ensure!(
-                                name.0.len() == 1,
-                                InvalidSqlStatementSnafu { expected_table }
-                            );
-                            ensure!(
-                                TableReference::parse_str(name.0[0].value.as_str())
+                                TableReference::parse_str(&table_name_with_schema)
                                     == expected_table,
                                 InvalidSqlStatementSnafu { expected_table }
                             );

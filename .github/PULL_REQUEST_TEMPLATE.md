@@ -1,15 +1,3 @@
-## ❓ What type of PR is this?
-
-<!-- mark what type of change this pull request is -->
-
-- [ ] ♻️ Refactor
-- [ ] ✨ Feature
-- [ ] 🐛 Bug Fix
-- [ ] 👷 Optimization
-- [ ] 📝 Documentation Update
-- [ ] 🔖 Release
-- [ ] 🚩 Other
-
 ## 🗣 Description
 
 <!-- include a description about your pull request and changes, and why these changes need to be made -->

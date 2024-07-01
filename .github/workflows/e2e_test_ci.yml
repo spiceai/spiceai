@@ -669,11 +669,12 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT);'
-          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash) VALUES (1, '0x1234');"
-          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash) VALUES (2, '0x5678');"
-          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash) VALUES (3, '0x9abc');"
-          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
+          psql -h localhost -U postgres -d testdb -c 'CREATE SCHEMA eth;'
+          psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth.recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT);'
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth.recent_blocks (block_number, block_hash) VALUES (1, '0x1234');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth.recent_blocks (block_number, block_hash) VALUES (2, '0x5678');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth.recent_blocks (block_number, block_hash) VALUES (3, '0x9abc');"
+          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth.recent_blocks;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -697,15 +698,15 @@ jobs:
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
           echo "datasets:" >> spicepod.yaml
-          echo "  - name: eth_recent_blocks" >> spicepod.yaml
-          echo "    from: postgres:eth_recent_blocks" >> spicepod.yaml
+          echo "  - name: eth.recent_blocks" >> spicepod.yaml
+          echo "    from: postgres:eth.recent_blocks" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
           echo "      engine: $ENGINE" >> spicepod.yaml
           if [[ -n "$MODE" ]]; then
             echo "      mode: $MODE" >> spicepod.yaml
           fi
-          echo "      refresh_sql: SELECT * FROM eth_recent_blocks LIMIT 1" >> spicepod.yaml
+          echo "      refresh_sql: SELECT * FROM eth.recent_blocks LIMIT 1" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
           echo "      pg_port: '5432'" >> spicepod.yaml
@@ -735,7 +736,7 @@ jobs:
       - name: Manually refresh dataset
         working-directory: test_app
         run: |
-          output=$(spice refresh eth_recent_blocks 2>&1)
+          output=$(spice refresh eth.recent_blocks 2>&1)
           echo "$output"
           if [[ $output == *"Dataset refresh triggered"* ]]; then
             # time to refresh dataset
@@ -748,7 +749,7 @@ jobs:
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
         with:
-          name: eth_recent_blocks
+          name: eth.recent_blocks
           expected-rows-count: 1
 
       - name: Stop spice and check logs

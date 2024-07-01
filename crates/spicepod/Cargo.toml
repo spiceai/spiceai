@@ -1,15 +1,15 @@
 [package]
-name = "spicepod"
-version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
 homepage.workspace = true
+license.workspace = true
+name = "spicepod"
 repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-serde_yaml.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 snafu.workspace = true
 tracing.workspace = true

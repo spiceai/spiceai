@@ -71,7 +71,7 @@ impl Model {
         params.insert("from".to_string(), SecretString::from(path(&model.from)));
         params.insert(
             "files".to_string(),
-            SecretString::from(model.files.join(",").to_string()),
+            SecretString::from(model.get_all_file_paths().join(",").to_string()),
         );
 
         let model_source: Option<Box<dyn ModelSource>> = source.into();

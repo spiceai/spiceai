@@ -57,6 +57,9 @@ use datafusion::{
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 
 use super::refresh::Refresh;
+
+mod changes;
+
 pub struct RefreshTask {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
@@ -143,6 +146,7 @@ impl RefreshTask {
             match refresh.mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
+                RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
             vec![("dataset", dataset_name.to_string())],
         );
@@ -150,6 +154,7 @@ impl RefreshTask {
         let get_data_update_result = match refresh.mode {
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
+            RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
         let (start_time, data_update) = match get_data_update_result {
@@ -406,6 +411,7 @@ impl RefreshTask {
                     match refresh.mode {
                         RefreshMode::Full => UpdateType::Overwrite,
                         RefreshMode::Append => UpdateType::Append,
+                        RefreshMode::Changes => unreachable!("changes are handled upstream"),
                     },
                 )
             };
@@ -533,8 +539,7 @@ impl RefreshTask {
             return Ok(update);
         };
 
-        let update_data = update.clone();
-        let Some(update_data) = update_data.data.first() else {
+        if update.clone().data.is_empty() {
             return Ok(update);
         };
 
@@ -548,42 +553,48 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        let mut predicates = vec![];
-        let mut comparators = vec![];
+        let mut result = vec![];
 
-        let update_struct_array = StructArray::from(update_data.clone());
-        for existing in existing_records {
-            let existing_array = StructArray::from(existing.clone());
-            comparators.push((
-                existing.num_rows(),
-                make_comparator(
-                    &update_struct_array,
-                    &existing_array,
-                    SortOptions::default(),
-                )
-                .context(super::FailedToFilterUpdatesSnafu)?,
-            ));
-        }
-
-        for i in 0..update_data.num_rows() {
-            let mut not_matched = true;
-            for (size, comparator) in &comparators {
-                if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
-                    not_matched = false;
-                    break;
-                }
+        for update_data in update.clone().data {
+            let mut predicates = vec![];
+            let mut comparators = vec![];
+            let update_struct_array = StructArray::from(update_data.clone());
+            for existing in &existing_records {
+                let existing_array = StructArray::from(existing.clone());
+                comparators.push((
+                    existing.num_rows(),
+                    make_comparator(
+                        &update_struct_array,
+                        &existing_array,
+                        SortOptions::default(),
+                    )
+                    .context(super::FailedToFilterUpdatesSnafu)?,
+                ));
             }
 
-            predicates.push(not_matched);
+            for i in 0..update_data.num_rows() {
+                let mut not_matched = true;
+                for (size, comparator) in &comparators {
+                    if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
+                        not_matched = false;
+                        break;
+                    }
+                }
+
+                predicates.push(not_matched);
+            }
+
+            let data = filter_record_batch(&update_data, &predicates.into())
+                .context(super::FailedToFilterUpdatesSnafu)?;
+
+            result.push(data);
         }
 
-        filter_record_batch(update_data, &predicates.into())
-            .map(|data| DataUpdate {
-                schema: update.schema,
-                data: vec![data],
-                update_type: update.update_type,
-            })
-            .context(super::FailedToFilterUpdatesSnafu)
+        Ok(DataUpdate {
+            schema: update.schema,
+            data: result,
+            update_type: update.update_type,
+        })
     }
 
     async fn refresh_append_overlap_nanos(&self) -> u128 {

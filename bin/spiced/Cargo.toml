@@ -1,28 +1,32 @@
 [package]
-name = "spiced"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 description = "Spice OSS"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "spiced"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
-snafu.workspace = true
-clap = { workspace = true, features = ["derive"] }
-spicepod = { path = "../../crates/spicepod" }
 app = { path = "../../crates/app" }
-runtime = { path = "../../crates/runtime" }
-spice-cloud = { path = "../../crates/spice_cloud" }
+clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
+futures = { workspace = true }
+metrics-exporter-prometheus = "0.13.0"
+runtime = { path = "../../crates/runtime" }
+snafu.workspace = true
+spice-cloud = { path = "../../crates/spice_cloud" }
+spicepod = { path = "../../crates/spicepod" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-metrics-exporter-prometheus = "0.13.0"
-futures = { workspace = true }
 
 [features]
+aws-secrets-manager = ["runtime/aws-secrets-manager"]
+clickhouse = ["runtime/clickhouse"]
+databricks = ["runtime/databricks"]
+debezium = ["runtime/debezium"]
 default = [
   "duckdb",
   "postgres",
@@ -35,23 +39,22 @@ default = [
   "spark",
   "snowflake",
   "ftp",
-  "spice-cloud"
+  "spice-cloud",
+  "debezium",
 ]
-duckdb = ["runtime/duckdb"]
-postgres = ["runtime/postgres"]
-sqlite = ["runtime/sqlite"]
-mysql = ["runtime/mysql"]
-ftp = ["runtime/ftp"]
-clickhouse = ["runtime/clickhouse"]
-release = []
 dev = ["runtime/dev"]
-keyring-secret-store = ["runtime/keyring-secret-store"]
-flightsql = ["runtime/flightsql"]
-aws-secrets-manager = ["runtime/aws-secrets-manager"]
-databricks = ["runtime/databricks"]
 dremio = ["runtime/dremio"]
-odbc = ["runtime/odbc"]
-spark = ["runtime/spark"]
-snowflake = ["runtime/snowflake"]
+duckdb = ["runtime/duckdb"]
+flightsql = ["runtime/flightsql"]
+ftp = ["runtime/ftp"]
+keyring-secret-store = ["runtime/keyring-secret-store"]
 models = ["runtime/models"]
+mysql = ["runtime/mysql"]
+odbc = ["runtime/odbc"]
+postgres = ["runtime/postgres"]
+release = []
+snowflake = ["runtime/snowflake"]
+spark = ["runtime/spark"]
 spice-cloud = []
+sqlite = ["runtime/sqlite"]
+

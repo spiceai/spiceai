@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
 use component::embeddings::Embeddings;
-use component::llms::Llm;
 use component::model::Model;
 use component::runtime::Runtime;
 use component::secrets::Secrets;
@@ -68,8 +67,6 @@ pub struct Spicepod {
 
     pub dependencies: Vec<String>,
 
-    pub llms: Vec<Llm>,
-
     pub embeddings: Vec<Embeddings>,
 
     pub runtime: Runtime,
@@ -113,10 +110,6 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        let resolved_llms =
-            component::resolve_component_references(fs, &path, &spicepod_definition.llms, "llms")
-                .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
-
         let resolved_embeddings = component::resolve_component_references(
             fs,
             &path,
@@ -131,7 +124,6 @@ impl Spicepod {
             resolved_views,
             resolved_embeddings,
             resolved_models,
-            resolved_llms,
         ))
     }
 
@@ -164,7 +156,6 @@ fn from_definition(
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
     models: Vec<Model>,
-    llms: Vec<Llm>,
 ) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
@@ -174,7 +165,6 @@ fn from_definition(
         datasets,
         views,
         models,
-        llms,
         embeddings,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
