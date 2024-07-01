@@ -21,6 +21,9 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
 fn main() {
     let args = spiced::Args::parse();
 
