@@ -16,10 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display};
 
-use super::{
-    model::{ModelFile, ModelFileType},
-    WithDependsOn,
-};
+use super::WithDependsOn;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,15 +24,8 @@ pub struct Embeddings {
     pub from: String,
     pub name: String,
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
-    pub files: Vec<ModelFile>,
-
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, String>,
-
-    #[serde(rename = "datasets", default, skip_serializing_if = "Vec::is_empty")]
-    pub datasets: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<HashMap<String, String>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
@@ -45,8 +35,10 @@ pub struct Embeddings {
 impl WithDependsOn<Embeddings> for Embeddings {
     fn depends_on(&self, depends_on: &[String]) -> Embeddings {
         Embeddings {
+            from: self.from.clone(),
+            name: self.name.clone(),
+            params: self.params.clone(),
             depends_on: depends_on.to_vec(),
-            ..self.clone()
         }
     }
 }
@@ -55,20 +47,6 @@ impl Embeddings {
     #[must_use]
     pub fn get_prefix(&self) -> Option<EmbeddingPrefix> {
         EmbeddingPrefix::try_from(self.from.as_str()).ok()
-    }
-
-    #[must_use]
-    pub fn get_all_file_paths(&self) -> Vec<String> {
-        self.files.iter().map(|f| f.path.clone()).collect()
-    }
-
-    /// Finds at most one model file with the given [`ModelFileType`].
-    #[must_use]
-    pub fn find_any_file_path(&self, file_type: ModelFileType) -> Option<String> {
-        self.files
-            .iter()
-            .find(|f| f.file_type() == Some(file_type))
-            .map(|f| f.path.clone())
     }
 
     /// Get the model id from the `from` field. The model id is the part of the `from` field after the prefix.
@@ -126,6 +104,25 @@ impl Display for EmbeddingPrefix {
             EmbeddingPrefix::File => write!(f, "file:"),
         }
     }
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone)]
+#[serde(untagged)]
+pub enum EmbeddingParams {
+    OpenAiParams {
+        api_base: Option<String>,
+        api_key: Option<String>,
+        org_id: Option<String>,
+        project_id: Option<String>,
+    },
+    HuggingfaceParams {},
+
+    LocalModelParams {
+        weights_path: String,
+        config_path: String,
+        tokenizer_path: String,
+    },
+    None,
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
