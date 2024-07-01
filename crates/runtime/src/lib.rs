@@ -896,8 +896,7 @@ impl Runtime {
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     pub async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
-        let params = in_embed.params.clone().unwrap_or_default();
-        let params_with_secrets = self.get_params_with_secrets(&params).await?;
+        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
 
         let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
             .boxed()

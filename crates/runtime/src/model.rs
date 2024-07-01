@@ -20,10 +20,7 @@ use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::model::ModelFileType;
-use spicepod::component::{
-    embeddings::{EmbeddingParams, EmbeddingPrefix},
-    model::ModelSource,
-};
+use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelSource};
 use std::collections::HashMap;
 use std::path::Path;
 use std::result::Result;
@@ -72,20 +69,56 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
 
     let model_id = component.get_model_id();
 
-    match construct_embedding_params(&prefix, &model_id, params) {
-        Ok(EmbeddingParams::OpenAiParams {
-            api_base,
-            api_key,
-            org_id,
-            project_id,
-        }) => Ok(Box::new(llms::openai::Openai::new(
-            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
-            api_base,
-            api_key,
-            org_id,
-            project_id,
-        ))),
-        Ok(EmbeddingParams::HuggingfaceParams {}) => {
+    match prefix {
+        EmbeddingPrefix::OpenAi => {
+            // If parameter is from secret store, it will have `openai_` prefix
+            Ok(Box::new(llms::openai::Openai::new(
+                model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+                params.get("endpoint").map(Secret::expose_secret).cloned(),
+                params
+                    .get("api_key")
+                    .or(params.get("openai_api_key"))
+                    .map(Secret::expose_secret)
+                    .cloned(),
+                params
+                    .get("org_id")
+                    .or(params.get("openai_org_id"))
+                    .map(Secret::expose_secret)
+                    .cloned(),
+                params
+                    .get("project_id")
+                    .or(params.get("openai_project_id"))
+                    .map(Secret::expose_secret)
+                    .cloned(),
+            )))
+        }
+        EmbeddingPrefix::File => {
+            let weights_path = model_id
+                .clone()
+                .or(component.find_any_file_path(ModelFileType::Weights))
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'weights_path' parameter provided".into(),
+                })?
+                .clone();
+            let config_path = component
+                .find_any_file_path(ModelFileType::Config)
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'config_path' parameter provided".into(),
+                })?
+                .clone();
+            let tokenizer_path = component
+                .find_any_file_path(ModelFileType::Tokenizer)
+                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: "No 'tokenizer_path' parameter provided".into(),
+                })?
+                .clone();
+            Ok(Box::new(CandleEmbedding::from_local(
+                Path::new(&weights_path),
+                Path::new(&config_path),
+                Path::new(&tokenizer_path),
+            )?))
+        }
+        EmbeddingPrefix::HuggingFace => {
             if let Some(id) = model_id {
                 Ok(Box::new(CandleEmbedding::from_hf(&id, None)?))
             } else {
@@ -94,79 +127,6 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
                 })
             }
         }
-        Ok(EmbeddingParams::LocalModelParams {
-            weights_path,
-            config_path,
-            tokenizer_path,
-        }) => Ok(Box::new(CandleEmbedding::from_local(
-            Path::new(&weights_path),
-            Path::new(&config_path),
-            Path::new(&tokenizer_path),
-        )?)),
-        Ok(EmbeddingParams::None) => Err(EmbedError::UnsupportedTaskForModel {
-            from: component.from.clone(),
-            task: "embedding".into(),
-        }),
-        Err(e) => Err(e),
-    }
-}
-
-/// Construct the parameters needed to create an [`Embeddings`] based on its source (i.e. prefix).
-/// If a `model_id` is provided (in the `from: `), it is provided.
-fn construct_embedding_params<S: ::std::hash::BuildHasher>(
-    from: &EmbeddingPrefix,
-    model_id: &Option<String>,
-    params: &HashMap<String, SecretString, S>,
-) -> Result<EmbeddingParams, EmbedError> {
-    match from {
-        EmbeddingPrefix::OpenAi => Ok(EmbeddingParams::OpenAiParams {
-            api_base: params.get("endpoint").map(Secret::expose_secret).cloned(),
-            api_key: params
-                .get("openai_api_key")
-                .map(Secret::expose_secret)
-                .cloned(),
-            org_id: params
-                .get("openai_org_id")
-                .map(Secret::expose_secret)
-                .cloned(),
-            project_id: params
-                .get("openai_project_id")
-                .map(Secret::expose_secret)
-                .cloned(),
-        }),
-        EmbeddingPrefix::File => {
-            let weights_path = model_id
-                .clone()
-                .or(params
-                    .get("weights_path")
-                    .map(ExposeSecret::expose_secret)
-                    .cloned())
-                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: "No 'weights_path' parameter provided".into(),
-                })?
-                .clone();
-            let config_path = params
-                .get("config_path")
-                .map(Secret::expose_secret)
-                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: "No 'config_path' parameter provided".into(),
-                })?
-                .clone();
-
-            let tokenizer_path = params
-                .get("tokenizer_path")
-                .map(Secret::expose_secret)
-                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: "No 'tokenizer_path' parameter provided".into(),
-                })?
-                .clone();
-            Ok(EmbeddingParams::LocalModelParams {
-                weights_path,
-                config_path,
-                tokenizer_path,
-            })
-        }
-        EmbeddingPrefix::HuggingFace => Ok(EmbeddingParams::HuggingfaceParams {}),
     }
 }
 
