@@ -43,12 +43,12 @@ use self::sqlite::SqliteAccelerator;
 pub mod arrow;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
-// #[cfg(feature = "mysql")]
-// pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+pub mod metadata;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -257,10 +257,9 @@ pub async fn create_accelerator_table(
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
-    let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;
     let accelerator =
-        accelerator_guard
-            .get(&engine)
+        get_accelerator_engine(engine)
+            .await
             .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
             })?;

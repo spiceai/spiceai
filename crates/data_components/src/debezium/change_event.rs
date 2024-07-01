@@ -159,7 +159,7 @@ pub struct Schema {
     pub name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Field {
     #[serde(rename = "type")]
     pub field_type: String,

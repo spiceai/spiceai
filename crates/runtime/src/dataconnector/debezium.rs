@@ -16,14 +16,17 @@ limitations under the License.
 
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
+use crate::dataaccelerator::metadata::AcceleratedMetadata;
 use crate::secrets::Secret;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
-use data_components::debezium;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
+use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -129,62 +132,58 @@ impl DataConnector for Debezium {
             }
         );
 
-        let topic = dataset.path();
-
         let dataset_name = dataset.name.to_string();
 
-        let kafka_consumer = KafkaConsumer::create_with_generated_group_id(
-            &dataset_name,
-            self.kafka_brokers.clone(),
-        )
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "debezium",
-        })?;
+        if !dataset.is_file_accelerated() {
+            tracing::warn!(
+                "Dataset {dataset_name} is not file accelerated. This is not recommended as it requires replaying all changes from the beginning on restarts.",
+            );
+        }
 
-        kafka_consumer
-            .subscribe(&topic)
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-            })?;
+        let topic = dataset.path();
 
-        let msg = match kafka_consumer
-            .next_json::<ChangeEventKey, ChangeEvent>()
-            .await
+        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
-            Ok(Some(msg)) => msg,
-            Ok(None) => {
-                return Err(super::DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "debezium".to_string(),
-                    source: "No message received from Kafka".into(),
-                });
-            }
-            Err(e) => {
-                return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+            Some(metadata) => {
+                let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                    &metadata.consumer_group_id,
+                    self.kafka_brokers.clone(),
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "debezium",
-                });
+                })?;
+
+                ensure!(
+                    topic == metadata.topic,
+                    super::InvalidConfigurationNoSourceSnafu {
+                        dataconnector: "debezium",
+                        message: format!("The topic has changed from {} to {topic} for dataset {dataset_name}. The existing accelerator data may be out of date.", metadata.topic),
+                    }
+                );
+
+                let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                    metadata.schema_fields.iter().collect(),
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                })?;
+
+                kafka_consumer.subscribe(&topic).boxed().context(
+                    super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                    },
+                )?;
+
+                (kafka_consumer, metadata, Arc::new(schema))
             }
+            None => get_metadata_from_kafka(dataset, &topic, self.kafka_brokers.clone()).await?,
         };
-
-        let primary_keys = msg.key().get_primary_key();
-
-        let Some(schema_fields) = msg.value().get_schema_fields() else {
-            return Err(super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "debezium".to_string(),
-                source: "Could not get Arrow schema from Debezium message".into(),
-            });
-        };
-
-        let schema = debezium::arrow::convert_fields_to_arrow_schema(schema_fields)
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-            })?;
 
         let debezium_kafka = Arc::new(DebeziumKafka::new(
-            Arc::new(schema),
-            primary_keys,
+            schema,
+            metadata.primary_keys,
             kafka_consumer,
         ));
 
@@ -196,4 +195,105 @@ impl DataConnector for Debezium {
 
         Some(debezium_kafka.stream_changes())
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DebeziumKafkaMetadata {
+    consumer_group_id: String,
+    topic: String,
+    primary_keys: Vec<String>,
+    schema_fields: Vec<change_event::Field>,
+}
+
+async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
+    let accelerated_metadata = AcceleratedMetadata::new(dataset).await?;
+    let metadata = accelerated_metadata.get_metadata().await?;
+    Some(metadata)
+}
+
+async fn set_metadata_to_accelerator(
+    dataset: &Dataset,
+    metadata: &DebeziumKafkaMetadata,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let accelerated_metadata = AcceleratedMetadata::new_create_if_not_exists(dataset).await?;
+    accelerated_metadata.set_metadata(metadata).await
+}
+
+async fn get_metadata_from_kafka(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_brokers: String,
+) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
+    let dataset_name = dataset.name.to_string();
+    let kafka_consumer =
+        KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_brokers)
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+            })?;
+
+    kafka_consumer
+        .subscribe(topic)
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+        })?;
+
+    let msg = match kafka_consumer
+        .next_json::<ChangeEventKey, ChangeEvent>()
+        .await
+    {
+        Ok(Some(msg)) => msg,
+        Ok(None) => {
+            return Err(super::DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "debezium".to_string(),
+                source: "No message received from Kafka".into(),
+            });
+        }
+        Err(e) => {
+            return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+            });
+        }
+    };
+
+    let primary_keys = msg.key().get_primary_key();
+
+    let Some(schema_fields) = msg.value().get_schema_fields() else {
+        return Err(super::DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "debezium".to_string(),
+            source: "Could not get Arrow schema from Debezium message".into(),
+        });
+    };
+
+    let schema = debezium::arrow::convert_fields_to_arrow_schema(schema_fields.clone())
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+        })?;
+
+    let metadata = DebeziumKafkaMetadata {
+        consumer_group_id: kafka_consumer.group_id().to_string(),
+        topic: topic.to_string(),
+        primary_keys,
+        schema_fields: schema_fields.into_iter().cloned().collect(),
+    };
+
+    if dataset.is_file_accelerated() {
+        set_metadata_to_accelerator(dataset, &metadata)
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+            })?;
+    }
+
+    // Restart the stream from the beginning
+    kafka_consumer
+        .restart_topic(topic)
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+        })?;
+
+    Ok((kafka_consumer, metadata, Arc::new(schema)))
 }

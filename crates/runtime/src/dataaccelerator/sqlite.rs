@@ -24,6 +24,8 @@ use datafusion::{
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::component::dataset::Dataset;
+
 use super::DataAccelerator;
 
 #[derive(Debug, Snafu)]
@@ -46,6 +48,20 @@ impl SqliteAccelerator {
         Self {
             sqlite_factory: SqliteTableFactory::new(),
         }
+    }
+
+    /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
+    #[must_use]
+    pub fn sqlite_file_path(&self, dataset: &Dataset) -> Option<String> {
+        if !dataset.is_file_accelerated() {
+            return None;
+        }
+        let acceleration = dataset.acceleration.as_ref()?;
+
+        Some(
+            self.sqlite_factory
+                .sqlite_file_path(&dataset.name.to_string(), &acceleration.params),
+        )
     }
 }
 

@@ -77,7 +77,6 @@ prost = { version = "0.12.1", default-features = false, features = [
 r2d2 = { workspace = true, optional = true }
 regex = "1.10.3"
 reqwest = { version = "0.11.24", features = ["json"] }
-rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -161,7 +160,6 @@ snowflake = [
 spark = ["data_components/spark_connect"]
 spiceai-dataset-test = []
 sqlite = [
-  "dep:rusqlite",
   "dep:tokio-rusqlite",
   "db_connection_pool/sqlite",
   "sql_provider_datafusion/sqlite",
