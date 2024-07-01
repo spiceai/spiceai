@@ -100,7 +100,7 @@ async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTa
         table_name.into(),
         Arc::clone(&accelerated_table.get_federated_table()),
         accelerated_table.refresh_params(),
-        table,
+        accelerated_table.get_accelerator(),
     ))
 }
 

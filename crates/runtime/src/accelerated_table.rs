@@ -50,6 +50,7 @@ use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
 pub mod refresh;
+mod refresh_execution_plan;
 pub mod refresh_task;
 mod refresh_task_runner;
 
@@ -282,6 +283,11 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.federated)
+    }
+
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
     }
 
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
