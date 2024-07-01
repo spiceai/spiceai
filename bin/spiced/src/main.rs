@@ -20,6 +20,12 @@ use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 fn main() {
     let args = spiced::Args::parse();

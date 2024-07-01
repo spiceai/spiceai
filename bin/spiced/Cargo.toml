@@ -21,6 +21,8 @@ spicepod = { path = "../../crates/spicepod" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+jemallocator = "0.5.4"
 
 [features]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
