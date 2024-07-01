@@ -26,11 +26,12 @@ use mistralrs::{
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
-use std::{path::Path, pin::Pin, str::FromStr, sync::Arc};
+use std::{path::Path, pin::Pin, str::FromStr, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 use tokio::sync::mpsc::{channel, Sender};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
+    counter: AtomicUsize,
 }
 
 impl MistralLlama {
@@ -196,14 +197,14 @@ impl MistralLlama {
             None,
             Some(model_parts[0].to_string()),
         );
-
+        let device = Self::get_device();
         let pipeline = builder
             .build(loader_type)
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
                 TokenSource::CacheToken,
                 None,
-                &Device::Cpu,
+                &device,
                 false,
                 DeviceMapMetadata::dummy(),
                 None,
@@ -222,30 +223,33 @@ impl MistralLlama {
                 })?),
             )
             .build(),
+            counter: AtomicUsize::new(0),
         })
     }
-}
 
-fn to_mistralrs_request(
-    prompt: String,
-    is_streaming: bool,
-    tx: Sender<MistralResponse>,
-) -> MistralRequest {
-    MistralRequest::Normal(NormalRequest {
-        messages: RequestMessage::Completion {
-            text: prompt,
-            echo_prompt: false,
-            best_of: 1,
-        },
-        sampling_params: SamplingParams::default(),
-        response: tx,
-        return_logprobs: false,
-        is_streaming,
-        id: 0,
-        constraint: Constraint::None,
-        suffix: None,
-        adapters: None,
-    })
+    fn to_mistralrs_request(
+        &self,
+        prompt: String,
+        is_streaming: bool,
+        tx: Sender<MistralResponse>,
+    ) -> MistralRequest {
+        MistralRequest::Normal(NormalRequest {            
+            messages: RequestMessage::Completion {
+                text: prompt,
+                echo_prompt: false,
+                best_of: 1,
+            },
+            sampling_params: SamplingParams::default(),
+            response: tx,
+            return_logprobs: false,
+            is_streaming,
+            id: self.counter.fetch_add(1, Ordering::SeqCst),
+            constraint: Constraint::None,
+            suffix: None,
+            adapters: None,
+        })
+    }
+    
 }
 
 #[async_trait]
@@ -263,7 +267,7 @@ impl Chat for MistralLlama {
         tracing::trace!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(to_mistralrs_request(prompt, true, snd))
+            .send(self.to_mistralrs_request(prompt, true, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
@@ -311,7 +315,7 @@ impl Chat for MistralLlama {
         tracing::trace!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(to_mistralrs_request(prompt, false, snd))
+            .send(self.to_mistralrs_request(prompt, false, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
