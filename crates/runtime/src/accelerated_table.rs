@@ -25,7 +25,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
-use data_components::cdc::{self, ChangeEnvelope};
+use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionState;
@@ -38,7 +38,6 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
-use futures::stream::BoxStream;
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
 
@@ -161,8 +160,7 @@ pub struct Builder {
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    changes_stream:
-        Option<BoxStream<'static, std::result::Result<ChangeEnvelope, cdc::StreamError>>>,
+    changes_stream: Option<ChangesStream>,
 }
 
 impl Builder {
@@ -207,10 +205,7 @@ impl Builder {
     /// # Panics
     ///
     /// Panics if the refresh mode isn't `RefreshMode::Changes`.
-    pub fn changes_stream(
-        &mut self,
-        changes_stream: BoxStream<'static, std::result::Result<ChangeEnvelope, cdc::StreamError>>,
-    ) -> &mut Self {
+    pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
         assert!(self.refresh.mode == RefreshMode::Changes);
         self.changes_stream = Some(changes_stream);
         self
