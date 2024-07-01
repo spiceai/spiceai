@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use arrow::{
     array::{Array, ListArray, RecordBatch, StringArray, StructArray},
@@ -106,6 +106,42 @@ pub struct ChangeBatch {
     data_idx: usize,
 }
 
+pub enum ChangeOperation {
+    Create,
+    Update,
+    Delete,
+    Read,
+    Truncate,
+    Unknown(String),
+}
+
+impl From<&str> for ChangeOperation {
+    #[must_use]
+    fn from(op: &str) -> Self {
+        match op {
+            "c" => Self::Create,
+            "u" => Self::Update,
+            "d" => Self::Delete,
+            "r" => Self::Read,
+            "t" => Self::Truncate,
+            _ => Self::Unknown(op.to_string()),
+        }
+    }
+}
+
+impl Display for ChangeOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Create => write!(f, "c"),
+            Self::Update => write!(f, "u"),
+            Self::Delete => write!(f, "d"),
+            Self::Read => write!(f, "r"),
+            Self::Truncate => write!(f, "t"),
+            Self::Unknown(op) => write!(f, "Unknown({op})"),
+        }
+    }
+}
+
 impl ChangeBatch {
     pub fn try_new(record: RecordBatch) -> Result<Self, ChangeBatchError> {
         let schema = record.schema();
@@ -130,7 +166,7 @@ impl ChangeBatch {
     }
 
     #[must_use]
-    pub fn op(&self, row: usize) -> &str {
+    pub fn op(&self, row: usize) -> ChangeOperation {
         let Some(op_col) = self
             .record
             .column(self.op_idx)
@@ -139,7 +175,7 @@ impl ChangeBatch {
         else {
             unreachable!("The schema is validated to have an 'op' field which is a StringArray");
         };
-        op_col.value(row)
+        op_col.value(row).into()
     }
 
     #[must_use]

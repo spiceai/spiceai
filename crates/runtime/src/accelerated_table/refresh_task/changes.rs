@@ -22,7 +22,7 @@ use crate::{
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use cache::QueryResultsCacheProvider;
-use data_components::cdc::{ChangeBatch, ChangesStream};
+use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{col, Expr};
@@ -118,7 +118,7 @@ impl RefreshTask {
         for row in 0..change_batch.record.num_rows() {
             let op = change_batch.op(row);
             match op {
-                "d" => {
+                ChangeOperation::Delete => {
                     let inner_data: RecordBatch = change_batch.data(row);
                     let primary_keys = change_batch.primary_keys(row);
                     let primary_key_log_fmt =
@@ -140,7 +140,7 @@ impl RefreshTask {
                         .await
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
                 }
-                "c" | "u" | "r" => {
+                ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
                     let inner_data: RecordBatch = change_batch.data(row);
                     let primary_keys = change_batch.primary_keys(row);
                     let ctx = SessionContext::new();
@@ -170,7 +170,7 @@ impl RefreshTask {
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
                 }
                 _ => {
-                    tracing::error!("Unknown operation {op} for {dataset_name}");
+                    tracing::error!("Unknown change operation {op} for {dataset_name}");
                 }
             }
         }
