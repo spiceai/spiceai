@@ -1,4 +1,3 @@
-use arrow::array::RecordBatch;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -14,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use arrow::array::RecordBatch;
 use async_stream::stream;
 use axum::{
     extract::Query,
@@ -92,7 +92,7 @@ fn combined_relevant_data_and_input(
 }
 
 #[allow(clippy::from_iter_instead_of_collect)]
-fn create_assist_response_from(
+pub(crate) fn create_primary_key_payload(
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
 ) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
     let from_value_iter = table_primary_keys
@@ -128,7 +128,7 @@ async fn context_aware_stream(
         Ok(model_stream) => model_stream,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let vector_data = match create_assist_response_from(&vector_search_data.retrieved_public_keys) {
+    let vector_data = match create_primary_key_payload(&vector_search_data.retrieved_public_keys) {
         Ok(vector_data) => vector_data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -162,7 +162,7 @@ async fn context_aware_chat(
 ) -> Response {
     match model.write().await.run(model_input).await {
         Ok(Some(text)) => {
-            match create_assist_response_from(&vector_search_data.retrieved_public_keys) {
+            match create_primary_key_payload(&vector_search_data.retrieved_public_keys) {
                 Ok(from) => (StatusCode::OK, Json(AssistResponse { text, from })).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -213,7 +213,6 @@ async fn context_aware_chat(
 /// ```
 ///
 ///
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<VectorSearch>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
