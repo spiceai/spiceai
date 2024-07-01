@@ -28,7 +28,7 @@ pub struct Embeddings {
     pub name: String,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "files", default)]
+    #[serde(default)]
     pub files: Vec<ModelFile>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
