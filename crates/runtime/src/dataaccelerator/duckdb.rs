@@ -25,6 +25,8 @@ use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::component::dataset::Dataset;
+
 use super::DataAccelerator;
 
 #[derive(Debug, Snafu)]
@@ -50,6 +52,20 @@ impl DuckDBAccelerator {
                 .db_path_param("duckdb_file")
                 .access_mode(AccessMode::ReadWrite),
         }
+    }
+
+    /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
+    #[must_use]
+    pub fn duckdb_file_path(&self, dataset: &Dataset) -> Option<String> {
+        if !dataset.is_file_accelerated() {
+            return None;
+        }
+        let acceleration = dataset.acceleration.as_ref()?;
+
+        Some(
+            self.duckdb_factory
+                .duckdb_file_path(&dataset.name.to_string(), &acceleration.params),
+        )
     }
 }
 

@@ -68,6 +68,11 @@ impl SqliteConnectionPool {
             join_push_down,
         })
     }
+
+    #[must_use]
+    pub fn connect_sync(&self) -> Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>> {
+        Box::new(SqliteConnection::new(self.conn.clone()))
+    }
 }
 
 #[async_trait]
