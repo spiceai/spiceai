@@ -173,7 +173,7 @@ pub enum Error {
     #[snafu(display("Unable to get the lock of data writers"))]
     UnableToLockDataWriters {},
 
-    #[snafu(display("The schema returned by the data connector for refresh_mode: changes does not contain a data field"))]
+    #[snafu(display("The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"))]
     ChangeSchemaWithoutDataField { source: ArrowError },
 }
 
