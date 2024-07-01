@@ -879,12 +879,12 @@ mod tests {
     #[test]
     fn test_json_object_unnesting() {
         let unnest_parameters = super::UnnestParameters { depth: 100 };
-        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Invalid json");
-        let result = super::unnest_json_object(&unnest_parameters, &object)
-            .expect("Unnesting object failed");
+        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
-        let obj = result.first().expect("Failed to get first unnested object");
+        let obj = result.first().expect("To get first unnested object");
         assert_eq!(
             obj,
             &Value::Object(serde_json::Map::from_iter(vec![(
@@ -895,12 +895,12 @@ mod tests {
 
         let unnest_parameters = super::UnnestParameters { depth: 100 };
         let object =
-            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Invalid json");
-        let result = super::unnest_json_object(&unnest_parameters, &object)
-            .expect("Unnesting object failed");
+            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
-        let obj = result.first().expect("Failed to get first unnested object");
+        let obj = result.first().expect("To get first unnested object");
         assert_eq!(
             obj,
             &Value::Object(serde_json::Map::from_iter(vec![(
@@ -913,12 +913,12 @@ mod tests {
     #[test]
     fn test_json_object_unnesting_respects_unnest_depth() {
         let unnest_parameters = super::UnnestParameters { depth: 0 };
-        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Invalid json");
-        let result = super::unnest_json_object(&unnest_parameters, &object)
-            .expect("Unnesting object failed");
+        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
-        let obj = result.first().expect("Failed to get first unnested object");
+        let obj = result.first().expect("To get first unnested object");
         assert_eq!(
             obj,
             &Value::Object(serde_json::Map::from_iter(vec![(
@@ -932,12 +932,12 @@ mod tests {
 
         let unnest_parameters = super::UnnestParameters { depth: 1 };
         let object =
-            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Invalid json");
-        let result = super::unnest_json_object(&unnest_parameters, &object)
-            .expect("Unnesting object failed");
+            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
-        let obj = result.first().expect("Failed to get first unnested object");
+        let obj = result.first().expect("To get first unnested object");
         assert_eq!(
             obj,
             &Value::Object(serde_json::Map::from_iter(vec![(
@@ -956,18 +956,18 @@ mod tests {
     #[test]
     fn test_json_array_unnesting() {
         let unnest_parameters = super::UnnestParameters { depth: 100 };
-        let object = serde_json::from_str("[1, 2, 3]").expect("Invalid json");
-        let result = super::unnest_json_object(&unnest_parameters, &object)
-            .expect("Unnesting object failed");
+        let object = serde_json::from_str("[1, 2, 3]").expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest json array");
         assert_eq!(result.len(), 3);
 
-        let obj = result.first().expect("Failed to get first unnested object");
+        let obj = result.first().expect("To get first unnested object");
         assert_eq!(obj, &Value::Number(1.into()));
 
-        let obj = result.get(1).expect("Failed to get second unnested object");
+        let obj = result.get(1).expect("To get second unnested object");
         assert_eq!(obj, &Value::Number(2.into()));
 
-        let obj = result.get(2).expect("Failed to get third unnested object");
+        let obj = result.get(2).expect("To get third unnested object");
         assert_eq!(obj, &Value::Number(3.into()));
     }
 }
