@@ -1,7 +1,8 @@
 # Spice v0.15-alpha (July 1, 2024)
 
-The v0.15-alpha release ... Configurable retry logic for data refresh ensures data is updated even when the source is temporarily unavailable.
+The v0.15-alpha release adds support for Change Data Capture (CDC) into accelerated tables via a new Debezium connector. ... Configurable retry logic for data refresh ensures data is updated even when the source is temporarily unavailable.
 
+- **Change Data Capture (CDC) via Debezium**: Keep locally accelerated datasets synchronized in real-time with a source database with a new Debezium connector.
 - **Data Refresh Retries:** By default, accelerated datasets attempt to retry data refreshes on transient errors. This behavior can be configured using `refresh_retry_enabled` and `refresh_retry_max_attempts`.
 
 Example Spicepod configuration showing how to limit refresh retries to a maximum of 10 attempts
@@ -14,4 +15,25 @@ datasets:
       refresh_retry_enabled: true
       refresh_retry_max_attempts: 10
       refresh_check_interval: 30s
+```
+
+### Change Data Capture (CDC) via Debezium
+
+Get started with Debezium CDC by following along with the [Debezium CDC Sample](https://github.com/spiceai/samples/tree/trunk/cdc-debezium), read more about the [CDC feature](https://docs.spiceai.org/features/cdc) in Spice or view the [docs for the Debezium data connector](https://docs.spiceai.org/data-connectors/debezium).
+
+Example Spicepod with Debezium CDC:
+
+```yaml
+datasets:
+- from: debezium:cdc.public.customer_addresses
+  name: cdc
+  params:
+    debezium_transport: kafka
+    debezium_message_format: json
+    kafka_bootstrap_servers: localhost:19092
+  acceleration:
+    enabled: true
+    engine: duckdb
+    mode: file
+    refresh_mode: changes
 ```
