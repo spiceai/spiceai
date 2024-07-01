@@ -216,7 +216,6 @@ impl RefreshTask {
 
         let dataset_name_copy = dataset_name.clone();
 
-        let ctx = SessionContext::new();
         let schema = Arc::clone(&streaming_data_update.schema);
 
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), {
@@ -247,7 +246,9 @@ impl RefreshTask {
             }
         });
 
-        let insertion_plan_result = self
+        let ctx = SessionContext::new();
+
+        let insertion_plan = match self
             .accelerator
             .insert_into(
                 &ctx.state(),
@@ -256,9 +257,8 @@ impl RefreshTask {
                 ))),
                 overwrite,
             )
-            .await;
-
-        let insertion_plan = match insertion_plan_result {
+            .await
+        {
             Ok(plan) => plan,
             Err(e) => {
                 self.mark_dataset_status(status::ComponentStatus::Error)
@@ -277,7 +277,7 @@ impl RefreshTask {
 
             let is_data_receiving_err = is_data_receiving_err.read().await;
             if *is_data_receiving_err {
-                return Err(from_df_error(e));
+                return Err(retry_from_df_error(e));
             }
             // data acceleration error
             return Err(RetryError::permanent(super::Error::FailedToWriteData {
@@ -529,7 +529,7 @@ impl RefreshTask {
 
         match get_data_result {
             Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
-            Err(e) => Err(from_df_error(e)),
+            Err(e) => Err(retry_from_df_error(e)),
         }
     }
 
@@ -803,7 +803,7 @@ fn should_retry_df_error(error: &DataFusionError) -> bool {
     }
 }
 
-fn from_df_error(error: DataFusionError) -> RetryError<super::Error> {
+fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
     if should_retry_df_error(&error) {
         RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error })
     } else {
