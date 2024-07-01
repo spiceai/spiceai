@@ -64,6 +64,7 @@ struct RefreshStat {
     pub num_rows: usize,
     pub memory_size: usize,
 }
+
 pub struct RefreshTask {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
