@@ -258,7 +258,7 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
     } else {
         return Err(Error::InvalidObjectAccess {
             // unnesting any other type is invalid
-            message: format!("Unsupported unnest type: {object}").to_string(),
+            message: format!("Unsupported unnest type: {object}"),
         });
     }
 
