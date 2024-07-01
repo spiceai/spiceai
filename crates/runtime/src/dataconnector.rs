@@ -306,6 +306,10 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
+    fn supports_changes_stream(&self) -> bool {
+        false
+    }
+
     fn changes_stream(&self, _table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         None
     }
