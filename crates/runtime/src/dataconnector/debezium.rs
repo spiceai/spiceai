@@ -190,6 +190,10 @@ impl DataConnector for Debezium {
         Ok(debezium_kafka)
     }
 
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
     fn changes_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         let debezium_kafka = table_provider.as_any().downcast_ref::<DebeziumKafka>()?;
 

@@ -33,6 +33,7 @@ use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
+use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
@@ -618,7 +619,7 @@ impl Runtime {
         match self.load_dataset_connector(ds).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
-                if ds.is_accelerated() {
+                if Self::accelerated_dataset_supports_hot_reload(ds, &*connector) {
                     tracing::info!("Updating accelerated dataset {}...", &ds.name);
                     if let Ok(()) = &self
                         .reload_accelerated_dataset(ds, Arc::clone(&connector))
@@ -646,6 +647,31 @@ impl Runtime {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
             }
         }
+    }
+
+    fn accelerated_dataset_supports_hot_reload(
+        ds: &Dataset,
+        connector: &dyn DataConnector,
+    ) -> bool {
+        let Some(acceleration) = &ds.acceleration else {
+            return false;
+        };
+
+        // Datasets that configure changes and are file-accelerated automatically keep track of changes that survive restarts.
+        // Thus we don't need to "hot reload" them to try to keep their data intact.
+        if connector.supports_changes_stream()
+            && ds.is_file_accelerated()
+            && connector.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes
+        {
+            return false;
+        }
+
+        // File accelerated datasets don't support hot reload.
+        if ds.is_file_accelerated() {
+            return false;
+        }
+
+        true
     }
 
     async fn reload_accelerated_dataset(
@@ -870,8 +896,7 @@ impl Runtime {
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     pub async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
-        let params = in_embed.params.clone().unwrap_or_default();
-        let params_with_secrets = self.get_params_with_secrets(&params).await?;
+        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
 
         let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
             .boxed()
