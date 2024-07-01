@@ -18,6 +18,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
 use datafusion::dataframe::DataFrame;
@@ -305,10 +306,7 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
-    async fn stream_provider(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    fn changes_stream(&self, _table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         None
     }
 

@@ -53,6 +53,7 @@ pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+pub mod cdc;
 pub mod delete;
 pub mod object;
 pub mod util;
@@ -67,15 +68,6 @@ pub trait Read: Send + Sync {
 
 #[async_trait]
 pub trait ReadWrite: Send + Sync {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
-}
-
-/// Similar to the `Read` trait above, but the `TableProvider.scan()` method returns ExecutionPlans that are unbounded (i.e. streaming).
-#[async_trait]
-pub trait Stream: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: TableReference,

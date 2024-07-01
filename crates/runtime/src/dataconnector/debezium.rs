@@ -18,8 +18,9 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use data_components::debezium;
-use data_components::debezium::change_event::ChangeEvent;
+use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
@@ -130,8 +131,10 @@ impl DataConnector for Debezium {
 
         let topic = dataset.path();
 
-        let consumer = KafkaConsumer::create_with_generated_group_id(
-            &dataset.name.to_string(),
+        let dataset_name = dataset.name.to_string();
+
+        let kafka_consumer = KafkaConsumer::create_with_generated_group_id(
+            &dataset_name,
             self.kafka_brokers.clone(),
         )
         .boxed()
@@ -139,14 +142,17 @@ impl DataConnector for Debezium {
             dataconnector: "debezium",
         })?;
 
-        consumer
+        kafka_consumer
             .subscribe(&topic)
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
             })?;
 
-        let msg = match consumer.next_json::<ChangeEvent>().await {
+        let msg = match kafka_consumer
+            .next_json::<ChangeEventKey, ChangeEvent>()
+            .await
+        {
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
@@ -161,6 +167,8 @@ impl DataConnector for Debezium {
             }
         };
 
+        let primary_keys = msg.key().get_primary_key();
+
         let Some(schema_fields) = msg.value().get_schema_fields() else {
             return Err(super::DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "debezium".to_string(),
@@ -174,8 +182,18 @@ impl DataConnector for Debezium {
                 dataconnector: "debezium",
             })?;
 
-        let debezium_kafka = Arc::new(DebeziumKafka::new(Arc::new(schema), consumer));
+        let debezium_kafka = Arc::new(DebeziumKafka::new(
+            Arc::new(schema),
+            primary_keys,
+            kafka_consumer,
+        ));
 
         Ok(debezium_kafka)
+    }
+
+    fn changes_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
+        let debezium_kafka = table_provider.as_any().downcast_ref::<DebeziumKafka>()?;
+
+        Some(debezium_kafka.stream_changes())
     }
 }

@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(clippy::module_name_repetitions)]
 
 use futures::{Stream, StreamExt};
 use rdkafka::{
@@ -25,6 +24,8 @@ use rdkafka::{
 };
 use serde::de::DeserializeOwned;
 use snafu::prelude::*;
+
+use crate::cdc::{self, CommitChange, CommitError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,6 +51,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct KafkaConsumer {
+    group_id: String,
     consumer: StreamConsumer,
 }
 
@@ -65,6 +67,11 @@ impl KafkaConsumer {
         Self::create(Self::generate_group_id(dataset), brokers)
     }
 
+    #[must_use]
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
     pub fn subscribe(&self, topic: &str) -> Result<()> {
         self.consumer
             .subscribe(&[topic])
@@ -72,27 +79,37 @@ impl KafkaConsumer {
     }
 
     /// Receive a JSON message from the Kafka topic.
-    pub async fn next_json<T: DeserializeOwned>(&self) -> Result<Option<KafkaMessage<T>>> {
-        let mut stream = Box::pin(self.stream_json::<T>());
+    pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
+        &self,
+    ) -> Result<Option<KafkaMessage<K, V>>> {
+        let mut stream = Box::pin(self.stream_json::<K, V>());
         stream.next().await.transpose()
     }
 
     /// Stream JSON messages from the Kafka topic.
-    pub fn stream_json<T: DeserializeOwned>(&self) -> impl Stream<Item = Result<KafkaMessage<T>>> {
+    pub fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
+        &self,
+    ) -> impl Stream<Item = Result<KafkaMessage<K, V>>> {
         self.consumer.stream().filter_map(move |msg| async move {
             let msg = match msg {
                 Ok(msg) => msg,
                 Err(e) => return Some(Err(Error::UnableToReceiveMessage { source: e })),
             };
 
+            let key_bytes = msg.key()?;
             let payload = msg.payload()?;
+
+            let key = match serde_json::from_slice(key_bytes) {
+                Ok(key) => key,
+                Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
+            };
 
             let value = match serde_json::from_slice(payload) {
                 Ok(value) => value,
                 Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
             };
 
-            Some(Ok(KafkaMessage::new(&self.consumer, msg, value)))
+            Some(Ok(KafkaMessage::new(&self.consumer, msg, key, value)))
         })
     }
 
@@ -101,7 +118,7 @@ impl KafkaConsumer {
         tracing::debug!("rd_kafka_version: {}", version);
 
         let consumer: StreamConsumer = ClientConfig::new()
-            .set("group.id", group_id)
+            .set("group.id", group_id.clone())
             .set("bootstrap.servers", brokers)
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
@@ -116,7 +133,7 @@ impl KafkaConsumer {
             .create()
             .context(UnableToCreateConsumerSnafu)?;
 
-        Ok(Self { consumer })
+        Ok(Self { group_id, consumer })
     }
 
     fn generate_group_id(dataset: &str) -> String {
@@ -124,32 +141,43 @@ impl KafkaConsumer {
     }
 }
 
-pub struct KafkaMessage<'a, T> {
+pub struct KafkaMessage<'a, K, V> {
     consumer: &'a StreamConsumer,
     msg: BorrowedMessage<'a>,
-    pub value: T,
+    key: K,
+    value: V,
 }
 
-impl<'a, T> KafkaMessage<'a, T> {
-    fn new(consumer: &'a StreamConsumer, msg: BorrowedMessage<'a>, value: T) -> Self {
+impl<'a, K, V> KafkaMessage<'a, K, V> {
+    fn new(consumer: &'a StreamConsumer, msg: BorrowedMessage<'a>, key: K, value: V) -> Self {
         Self {
             consumer,
             msg,
+            key,
             value,
         }
     }
 
-    pub fn value(&self) -> &T {
-        &self.value
+    pub fn key(&self) -> &K {
+        &self.key
     }
 
-    pub fn take_value(self) -> T {
-        self.value
+    pub fn value(&self) -> &V {
+        &self.value
     }
 
     pub fn mark_processed(&self) -> Result<()> {
         self.consumer
             .store_offset_from_message(&self.msg)
             .context(UnableToCommitMessageSnafu)
+    }
+}
+
+impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
+    fn commit(&self) -> Result<(), CommitError> {
+        self.mark_processed()
+            .boxed()
+            .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
+        Ok(())
     }
 }

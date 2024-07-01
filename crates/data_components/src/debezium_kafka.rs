@@ -14,31 +14,92 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
-
-use crate::kafka::KafkaConsumer;
+use crate::{
+    cdc::{self, ChangeEnvelope, ChangesStream},
+    debezium::{
+        arrow::changes,
+        change_event::{ChangeEvent, ChangeEventKey},
+    },
+    kafka::KafkaConsumer,
+};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    common::{Constraints, DFSchema},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::{empty::EmptyExec, ExecutionPlan},
+    sql::sqlparser::ast::{Ident, TableConstraint},
 };
+use futures::StreamExt;
+use std::{any::Any, sync::Arc};
 
 pub struct DebeziumKafka {
     schema: SchemaRef,
-    _consumer: KafkaConsumer,
+    primary_keys: Vec<String>,
+    constraints: Option<Constraints>,
+    consumer: &'static KafkaConsumer,
 }
 
 impl DebeziumKafka {
     #[must_use]
-    pub fn new(schema: SchemaRef, consumer: KafkaConsumer) -> Self {
+    pub fn new(schema: SchemaRef, primary_keys: Vec<String>, consumer: KafkaConsumer) -> Self {
+        let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
+            unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
+        };
+        let constraints = Constraints::new_from_table_constraints(
+            &[TableConstraint::PrimaryKey {
+                name: None,
+                index_name: None,
+                index_type: None,
+                columns: primary_keys
+                    .iter()
+                    .map(|col| Ident::new(col.clone()))
+                    .collect(),
+                index_options: vec![],
+                characteristics: None,
+            }],
+            &Arc::new(df_schema),
+        )
+        .ok();
         Self {
             schema,
-            _consumer: consumer,
+            primary_keys,
+            constraints,
+            consumer: Box::leak(Box::new(consumer)),
         }
+    }
+
+    #[must_use]
+    pub fn get_primary_keys(&self) -> &Vec<String> {
+        &self.primary_keys
+    }
+
+    #[must_use]
+    pub fn stream_changes(&self) -> ChangesStream {
+        let schema = Arc::clone(&self.schema);
+        let primary_keys = self.primary_keys.clone();
+        let stream = self
+            .consumer
+            .stream_json::<ChangeEventKey, ChangeEvent>()
+            .map(move |msg| {
+                let schema = Arc::clone(&schema);
+                let pk = primary_keys.clone();
+                let Ok(msg) = msg else {
+                    return Err(cdc::StreamError::Kafka(
+                        "Unable to read message".to_string(),
+                    ));
+                };
+
+                let val = msg.value();
+                changes::to_change_batch(&schema, &pk, val)
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+            });
+
+        Box::pin(stream)
     }
 }
 
@@ -56,6 +117,10 @@ impl TableProvider for DebeziumKafka {
         TableType::Base
     }
 
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints.as_ref()
+    }
+
     async fn scan(
         &self,
         _state: &SessionState,
@@ -63,6 +128,6 @@ impl TableProvider for DebeziumKafka {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(self.schema())))
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
     }
 }

@@ -54,6 +54,7 @@ reqwest = { version = "0.11.24", features = ["json"] }
 rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "d937df525d7c237c717b42e6146494c524dbf267", features = [

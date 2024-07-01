@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -29,6 +30,7 @@ use crate::secrets::Secret;
 use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use cache::QueryResultsCacheProvider;
 use datafusion::catalog::schema::SchemaProvider;
@@ -170,6 +172,9 @@ pub enum Error {
 
     #[snafu(display("Unable to get the lock of data writers"))]
     UnableToLockDataWriters {},
+
+    #[snafu(display("The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"))]
+    ChangeSchemaWithoutDataField { source: ArrowError },
 }
 
 pub enum Table {
@@ -510,6 +515,7 @@ impl DataFusion {
         };
 
         let source_schema = source_table_provider.schema();
+
         let acceleration_settings =
             dataset
                 .acceleration
@@ -533,12 +539,13 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
+        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
         let refresh = Refresh::new(
             dataset.time_column.clone(),
             dataset.time_format,
             dataset.refresh_check_interval(),
             refresh_sql.clone(),
-            source.resolve_refresh_mode(acceleration_settings.refresh_mode),
+            refresh_mode,
             dataset.refresh_data_window(),
             acceleration_settings.refresh_append_overlap,
         )
@@ -549,7 +556,7 @@ impl DataFusion {
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.clone(),
-            source_table_provider,
+            Arc::clone(&source_table_provider),
             accelerated_table_provider,
             refresh,
         );
@@ -564,6 +571,14 @@ impl DataFusion {
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
+
+        if refresh_mode == RefreshMode::Changes {
+            let source = Box::leak(Box::new(source));
+            let changes_stream = source.changes_stream(source_table_provider);
+            if let Some(changes_stream) = changes_stream {
+                accelerated_table_builder.changes_stream(changes_stream);
+            }
+        }
 
         Ok(accelerated_table_builder.build().await)
     }

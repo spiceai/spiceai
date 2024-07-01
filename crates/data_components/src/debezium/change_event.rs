@@ -21,7 +21,53 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// A representation of a Debezium Change Event.
+/// A representation of a Debezium Change Event Key.
+#[derive(Serialize, Deserialize)]
+pub struct ChangeEventKey {
+    pub schema: Schema,
+    pub payload: serde_json::Value,
+}
+
+impl ChangeEventKey {
+    pub fn from_bytes(bytz: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytz)
+    }
+
+    /// Gets the primary key fields from the schema.
+    ///
+    /// # Example
+    ///
+    /// ```json
+    /// {
+    ///     "schema": {
+    ///         "type": "struct",
+    ///         "fields": [
+    ///             {
+    ///                 "type": "int32",
+    ///                 "optional": false,
+    ///                 "default": 0,
+    ///                 "field": "id"
+    ///             }
+    ///         ],
+    ///         "optional": false,
+    ///         "name": "acceleration.public.customer_addresses2.Key"
+    ///     },
+    ///     "payload": {
+    ///         "id": 4
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn get_primary_key(&self) -> Vec<String> {
+        self.schema
+            .fields
+            .iter()
+            .filter_map(|field| field.field.clone())
+            .collect()
+    }
+}
+
+/// A representation of a Debezium Change Event Value.
 #[derive(Serialize, Deserialize)]
 pub struct ChangeEvent {
     pub schema: Schema,
@@ -67,12 +113,12 @@ pub enum Op {
 impl Display for Op {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            Op::Create => write!(f, "create"),
-            Op::Update => write!(f, "update"),
-            Op::Delete => write!(f, "delete"),
-            Op::Read => write!(f, "read"),
-            Op::Truncate => write!(f, "truncate"),
-            Op::Message => write!(f, "message"),
+            Op::Create => write!(f, "c"),
+            Op::Update => write!(f, "u"),
+            Op::Delete => write!(f, "d"),
+            Op::Read => write!(f, "r"),
+            Op::Truncate => write!(f, "t"),
+            Op::Message => write!(f, "m"),
         }
     }
 }
@@ -111,7 +157,6 @@ pub struct Schema {
     pub fields: Vec<Field>,
     pub optional: bool,
     pub name: String,
-    pub version: i64,
 }
 
 #[derive(Serialize, Deserialize)]

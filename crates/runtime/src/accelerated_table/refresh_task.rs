@@ -57,6 +57,9 @@ use datafusion::{
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 
 use super::refresh::Refresh;
+
+mod changes;
+
 pub struct RefreshTask {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,

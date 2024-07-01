@@ -34,6 +34,8 @@ use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use snafu::prelude::*;
 use std::sync::Arc;
 
+pub mod changes;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Missing the parameters map for org.apache.kafka.connect.data.Decimal"))]
@@ -103,6 +105,9 @@ pub enum Error {
 
     #[snafu(display("Unable to parse timestamp: {source}"))]
     UnableToParseTimestamp { source: chrono::ParseError },
+
+    #[snafu(display("A deletion change was received without a 'before' field."))]
+    DeleteOpWithoutBeforeField,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -347,19 +352,19 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
     builder: &mut dyn ArrayBuilder,
     append: impl Fn(&mut T, &serde_json::Value),
 ) -> Result<()> {
-    let list_str_builder = downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(builder)?;
+    let list_builder = downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(builder)?;
     let Some(field_array) = field_array else {
-        list_str_builder.append_null();
+        list_builder.append_null();
         return Ok(());
     };
 
-    let str_builder = downcast_builder::<T>(list_str_builder.values())?;
+    let val_builder = downcast_builder::<T>(list_builder.values())?;
 
     for field_value in field_array {
-        append(str_builder, field_value);
+        append(val_builder, field_value);
     }
 
-    list_str_builder.append(true);
+    list_builder.append(true);
 
     Ok(())
 }
@@ -382,7 +387,7 @@ where
     Ok(())
 }
 
-fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T> {
+pub(crate) fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T> {
     let builder = builder
         .as_any_mut()
         .downcast_mut::<T>()
