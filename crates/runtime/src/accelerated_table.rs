@@ -50,7 +50,6 @@ use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
 pub mod refresh;
-mod refresh_execution_plan;
 pub mod refresh_task;
 mod refresh_task_runner;
 

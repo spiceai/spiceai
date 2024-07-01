@@ -21,11 +21,12 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use futures::{Stream, StreamExt};
+use futures::{stream, Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use crate::{
     accelerated_table::Error,
     component::dataset::acceleration::RefreshMode,
@@ -39,7 +40,6 @@ use crate::{
 };
 
 use super::refresh::get_timestamp;
-use super::refresh_execution_plan::RefreshExecutionPlan;
 
 use crate::component::dataset::TimeFormat;
 use std::time::UNIX_EPOCH;
@@ -181,7 +181,7 @@ impl RefreshTask {
 
         let mode = self.refresh.read().await.mode.clone();
 
-        let timer = TimeMeasurement::new(
+        let _ = TimeMeasurement::new(
             match mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
@@ -196,7 +196,7 @@ impl RefreshTask {
             RefreshMode::Append => self.get_incremental_append_update().await,
         };
 
-        let mut streaming_data_update = match get_data_update_result {
+        let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
                 tracing::warn!("Failed to load data for dataset {dataset_name}: {e}");
@@ -206,7 +206,18 @@ impl RefreshTask {
             }
         };
 
-        let overwrite = streaming_data_update.update_type == UpdateType::Overwrite;
+        self.write_streaming_data_update(start_time, streaming_data_update)
+            .await
+    }
+
+    async fn write_streaming_data_update(
+        &self,
+        start_time: SystemTime,
+        data_update: StreamingDataUpdate,
+    ) -> Result<(), RetryError<super::Error>> {
+        let dataset_name = self.dataset_name.clone();
+
+        let overwrite = data_update.update_type == UpdateType::Overwrite;
 
         let refresh_stat: Arc<RwLock<Option<RefreshStat>>> = Arc::new(RwLock::new(None));
         let refresh_stat_ref_copy = Arc::clone(&refresh_stat);
@@ -214,37 +225,52 @@ impl RefreshTask {
         let is_data_receiving_err: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
         let is_data_receiving_err_ref_copy = Arc::clone(&is_data_receiving_err);
 
-        let dataset_name_copy = dataset_name.clone();
+        let dataset_name_copy = dataset_name.to_string();
 
-        let schema = Arc::clone(&streaming_data_update.schema);
+        let schema = Arc::clone(&data_update.schema);
 
-        let observed_record_batch_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), {
-            stream! {
-                let mut num_rows = 0;
-                let mut memory_size = 0;
-                while let Some(batch) = streaming_data_update.data.next().await {
-                    match batch {
-                        Ok(batch) => {
-                            tracing::trace!("[refresh] Recevied {} rows for dataset: {dataset_name_copy}", batch.num_rows());
-                            num_rows += batch.num_rows();
-                            memory_size += batch.get_array_memory_size();
-                            yield Ok(batch);
-                        }
-                        Err(err) => {
-                            let mut is_data_receiving_err = is_data_receiving_err_ref_copy.write().await;
-                            *is_data_receiving_err = true;
-                            yield Err(err);
+        let observed_record_batch_stream = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::unfold(
+                (data_update.data, 0, 0),
+                move |(mut data_update_stream, mut num_rows, mut memory_size)| {
+                    let dataset_name = dataset_name_copy.clone();
+                    let is_data_receiving_err_ref_copy =
+                        Arc::clone(&is_data_receiving_err_ref_copy);
+                    let refresh_stat_ref_copy = Arc::clone(&refresh_stat_ref_copy);
+
+                    async move {
+                        if let Some(batch) = data_update_stream.next().await {
+                            match batch {
+                                Ok(batch) => {
+                                    tracing::trace!(
+                                        "[refresh] Received {} rows for dataset: {}",
+                                        batch.num_rows(),
+                                        dataset_name
+                                    );
+                                    num_rows += batch.num_rows();
+                                    memory_size += batch.get_array_memory_size();
+                                    Some((Ok(batch), (data_update_stream, num_rows, memory_size)))
+                                }
+                                Err(err) => {
+                                    let mut is_data_receiving_err =
+                                        is_data_receiving_err_ref_copy.write().await;
+                                    *is_data_receiving_err = true;
+                                    Some((Err(err), (data_update_stream, num_rows, memory_size)))
+                                }
+                            }
+                        } else {
+                            let mut refresh_stat = refresh_stat_ref_copy.write().await;
+                            *refresh_stat = Some(RefreshStat {
+                                num_rows,
+                                memory_size,
+                            });
+                            None
                         }
                     }
-                }
-
-                let mut refresh_stat = refresh_stat_ref_copy.write().await;
-                *refresh_stat = Some(RefreshStat {
-                    num_rows,
-                    memory_size,
-                });
-            }
-        });
+                },
+            ),
+        );
 
         let ctx = SessionContext::new();
 
@@ -252,7 +278,7 @@ impl RefreshTask {
             .accelerator
             .insert_into(
                 &ctx.state(),
-                Arc::new(RefreshExecutionPlan::new(Box::pin(
+                Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(
                     observed_record_batch_stream,
                 ))),
                 overwrite,
@@ -284,8 +310,6 @@ impl RefreshTask {
                 source: e,
             }));
         }
-
-        drop(timer);
 
         if let Some(refresh_stat) = refresh_stat.read().await.clone() {
             self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size);
@@ -348,6 +372,10 @@ impl RefreshTask {
 
             return Ok(());
         };
+
+        // TODO:
+        // 1. convert to StreamingDataUpdate and use write_streaming_data_update; we should not duplicate the code
+        // 1. remove DataUpdateExecutionPlan or rename StreamingDataUpdateExecutionPlan to just DataUpdateExecutionPlan
 
         let ctx = SessionContext::new();
 
