@@ -23,6 +23,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
@@ -508,32 +509,41 @@ impl Runtime {
             Arc::clone(&self.secrets_provider);
 
         // test dataset connectivity by attempting to get a read provider
-        if let Err(err) = data_connector.read_provider(&ds).await {
-            status::update_dataset(&ds.name, status::ComponentStatus::Error);
-            metrics::counter!("datasets_load_error").increment(1);
-            warn_spaced!(spaced_tracer, "{}{err}", "");
-            return UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
+        let read_provider = match data_connector.read_provider(&ds).await {
+            Ok(provider) => provider,
+            Err(err) => {
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                metrics::counter!("datasets_load_error").increment(1);
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .fail();
             }
-            .fail();
-        }
+        };
 
-        let data_connector = Arc::clone(&data_connector);
         match Runtime::register_dataset(
             &ds,
-            data_connector,
-            Arc::clone(&df),
-            &source,
-            Arc::clone(&shared_secrets_provider),
-            accelerated_table,
-            Arc::clone(&self.embeds),
+            RegisterDatasetContext {
+                data_connector: Arc::clone(&data_connector),
+                federated_read_table: read_provider,
+                df: Arc::clone(&df),
+                source,
+                secrets_provider: Arc::clone(&shared_secrets_provider),
+                accelerated_table,
+                embedding: Arc::clone(&self.embeds),
+            },
         )
         .await
         {
             Ok(()) => {
                 tracing::info!(
                     "{}",
-                    dataset_registered_trace(&ds, self.df.cache_provider().is_some())
+                    dataset_registered_trace(
+                        &data_connector,
+                        &ds,
+                        self.df.cache_provider().is_some()
+                    )
                 );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
@@ -646,10 +656,17 @@ impl Runtime {
         let acceleration_secret =
             Runtime::get_acceleration_secret(ds, Arc::clone(&self.secrets_provider)).await?;
 
+        let read_table = connector.read_provider(ds).await.map_err(|_| {
+            UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .build()
+        })?;
+
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), acceleration_secret)
+            .create_accelerated_table(ds, Arc::clone(&connector), read_table, acceleration_secret)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -727,13 +744,18 @@ impl Runtime {
 
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
-        data_connector: Arc<dyn DataConnector>,
-        df: Arc<DataFusion>,
-        source: &str,
-        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-        accelerated_table: Option<AcceleratedTable>,
-        embedding: Arc<RwLock<EmbeddingModelStore>>,
+        register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
+        let RegisterDatasetContext {
+            data_connector,
+            federated_read_table,
+            df,
+            source,
+            secrets_provider,
+            accelerated_table,
+            embedding,
+        } = register_dataset_ctx;
+
         let ds = ds.borrow();
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
@@ -758,8 +780,11 @@ impl Runtime {
             return Runtime::register_table(
                 df,
                 ds,
-                datafusion::Table::Federated(connector),
-                source,
+                datafusion::Table::Federated {
+                    data_connector: connector,
+                    federated_read_table,
+                },
+                &source,
             )
             .await;
         }
@@ -785,10 +810,11 @@ impl Runtime {
             ds,
             datafusion::Table::Accelerated {
                 source: connector,
+                federated_read_table,
                 acceleration_secret,
                 accelerated_table,
             },
-            source,
+            &source,
         )
         .await
     }
@@ -1291,4 +1317,14 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
+}
+
+pub struct RegisterDatasetContext {
+    data_connector: Arc<dyn DataConnector>,
+    federated_read_table: Arc<dyn TableProvider>,
+    df: Arc<DataFusion>,
+    source: String,
+    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    accelerated_table: Option<AcceleratedTable>,
+    embedding: Arc<RwLock<EmbeddingModelStore>>,
 }

@@ -20,6 +20,7 @@ use crate::secrets::Secret;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::util::{column_reference::ColumnReference, on_conflict::OnConflict};
+use datafusion::common::Constraint;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
@@ -42,12 +43,12 @@ use self::sqlite::SqliteAccelerator;
 pub mod arrow;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
-// #[cfg(feature = "mysql")]
-// pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+pub mod metadata;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -250,15 +251,15 @@ impl AcceleratorExternalTableBuilder {
 pub async fn create_accelerator_table(
     table_name: TableReference,
     schema: SchemaRef,
+    constraints: Option<&Constraints>,
     acceleration_settings: &acceleration::Acceleration,
     acceleration_secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
-    let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;
     let accelerator =
-        accelerator_guard
-            .get(&engine)
+        get_accelerator_engine(engine)
+            .await
             .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
             })?;
@@ -276,6 +277,15 @@ pub async fn create_accelerator_table(
             .options(acceleration_settings.params.clone())
             .indexes(acceleration_settings.indexes.clone())
             .secret(acceleration_secret);
+
+    // If there are constraints from the federated table, then add them to the accelerated table
+    // and automatically configure upsert behavior for them. This can be overridden by the user.
+    if let Some(constraints) = constraints {
+        external_table_builder = external_table_builder.constraints(constraints.clone());
+        let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
+        external_table_builder = external_table_builder
+            .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+    }
 
     if let Some(on_conflict) =
         acceleration_settings
@@ -308,4 +318,22 @@ pub async fn create_accelerator_table(
         .context(AccelerationCreationFailedSnafu)?;
 
     Ok(table_provider)
+}
+
+fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {
+    constraints
+        .iter()
+        .filter_map(|constraint| {
+            if let Constraint::PrimaryKey(col_indexes) = constraint {
+                Some(
+                    col_indexes
+                        .iter()
+                        .map(|&col_index| schema.field(col_index).name().to_string()),
+                )
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect()
 }

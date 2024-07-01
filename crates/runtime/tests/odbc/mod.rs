@@ -47,7 +47,7 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
         enabled: acceleration,
         mode: spicepod::component::dataset::acceleration::Mode::Memory,
         engine: Some(engine.to_string()),
-        refresh_mode: spicepod::component::dataset::acceleration::RefreshMode::Full,
+        refresh_mode: Some(spicepod::component::dataset::acceleration::RefreshMode::Full),
         refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 10")),
         ..Default::default()
     });

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::component::dataset::Dataset;
-use crate::dataconnector::AnyErrorResult;
 use crate::EmbeddingModelStore;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -94,17 +93,6 @@ impl DataConnector for EmbeddingConnector {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(self.wrap(inner, dataset).await),
             Some(Err(e)) => Some(Err(e)),
-            None => None,
-        }
-    }
-
-    async fn stream_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
-        match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap(inner, dataset).await.map_err(Into::into)),
-            Some(Err(e)) => Some(Err(e.into())),
             None => None,
         }
     }
