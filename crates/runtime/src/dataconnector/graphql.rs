@@ -576,11 +576,11 @@ impl GraphQL {
 
         client_builder = client_builder.default_headers(headers);
 
-        let unnest_depth = self
-            .params
-            .get("unnest_depth")
-            .unwrap_or(&"0".to_string())
-            .parse::<usize>();
+        let unnest_depth = if let Some(depth) = self.params.get("unnest_depth") {
+            depth.parse::<usize>()
+        } else {
+            Ok(0)
+        };
 
         let unnest_depth = match unnest_depth {
             Ok(depth) => Ok(depth),
