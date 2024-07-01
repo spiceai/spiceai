@@ -54,12 +54,12 @@ fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     params
 }
 
-pub(super) fn get_random_port() -> usize {
+pub fn get_random_port() -> usize {
     rand::thread_rng().gen_range(15432..65535)
 }
 
 #[instrument]
-pub(super) async fn start_postgres_docker_container(
+pub async fn start_postgres_docker_container(
     port: usize,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{PG_DOCKER_CONTAINER}-{port}");
@@ -71,7 +71,7 @@ pub(super) async fn start_postgres_docker_container(
     };
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("postgres:latest")
+        .image("debezium/postgres:16-alpine") // Same as the normal Postgres image with logical decoding enabled, which is needed for Debezium
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {

@@ -57,6 +57,7 @@ pub struct ContainerRunnerBuilder<'a> {
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
+    cmd: Option<Vec<&'a str>>,
 }
 
 impl<'a> ContainerRunnerBuilder<'a> {
@@ -67,6 +68,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             port_bindings: Vec::new(),
             env_vars: Vec::new(),
             healthcheck: None,
+            cmd: None,
         }
     }
 
@@ -90,6 +92,14 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    pub fn add_cmd(mut self, cmd: &'a str) -> Self {
+        match self.cmd {
+            Some(ref mut c) => c.push(cmd),
+            None => self.cmd = Some(vec![cmd]),
+        }
+        self
+    }
+
     pub fn build(self) -> Result<ContainerRunner<'a>, anyhow::Error> {
         let image = self
             .image
@@ -101,6 +111,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             port_bindings: self.port_bindings,
             env_vars: self.env_vars,
             healthcheck: self.healthcheck,
+            cmd: self.cmd,
         })
     }
 }
@@ -112,6 +123,7 @@ pub struct ContainerRunner<'a> {
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
+    cmd: Option<Vec<&'a str>>,
 }
 
 impl<'a> ContainerRunner<'a> {
@@ -162,6 +174,7 @@ impl<'a> ContainerRunner<'a> {
             env: Some(env_vars_str),
             host_config,
             healthcheck: self.healthcheck,
+            cmd: self.cmd,
             ..Default::default()
         };
 

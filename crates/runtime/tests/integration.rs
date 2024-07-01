@@ -39,6 +39,9 @@ mod results_cache;
 #[cfg(feature = "odbc")]
 mod odbc;
 
+#[cfg(feature = "debezium")]
+mod debezium;
+
 /// Modifies the runtime configuration of `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
