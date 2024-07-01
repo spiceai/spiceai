@@ -178,7 +178,6 @@ impl<'a>
                         yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
                     }
                     Err(e) => {
-                        println!("Yielding an error");
                         yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
                     }
                 }
