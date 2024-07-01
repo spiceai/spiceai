@@ -180,10 +180,14 @@ pub enum Error {
 pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
+        federated_read_table: Arc<dyn TableProvider>,
         acceleration_secret: Option<Secret>,
         accelerated_table: Option<AcceleratedTable>,
     },
-    Federated(Arc<dyn DataConnector>),
+    Federated {
+        data_connector: Arc<dyn DataConnector>,
+        federated_read_table: Arc<dyn TableProvider>,
+    },
     View(String),
 }
 
@@ -338,6 +342,7 @@ impl DataFusion {
         match table {
             Table::Accelerated {
                 source,
+                federated_read_table,
                 acceleration_secret,
                 accelerated_table,
             } => {
@@ -352,10 +357,21 @@ impl DataFusion {
 
                     return Ok(());
                 }
-                self.register_accelerated_table(dataset, source, acceleration_secret)
+                self.register_accelerated_table(
+                    dataset,
+                    source,
+                    federated_read_table,
+                    acceleration_secret,
+                )
+                .await?;
+            }
+            Table::Federated {
+                data_connector,
+                federated_read_table,
+            } => {
+                self.register_federated_table(dataset, data_connector, federated_read_table)
                     .await?;
             }
-            Table::Federated(source) => self.register_federated_table(dataset, source).await?,
             Table::View(sql) => self.register_view(dataset.name.clone(), sql)?,
         }
 
@@ -494,14 +510,12 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
+        federated_read_table: Arc<dyn TableProvider>,
         acceleration_secret: Option<Secret>,
     ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
         tracing::debug!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.mode() {
-            Mode::Read => source
-                .read_provider(dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?,
+            Mode::Read => federated_read_table,
             Mode::ReadWrite => source
                 .read_write_provider(dataset)
                 .await
@@ -595,10 +609,16 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
+        federated_read_table: Arc<dyn TableProvider>,
         acceleration_secret: Option<Secret>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, Arc::clone(&source), acceleration_secret)
+            .create_accelerated_table(
+                dataset,
+                Arc::clone(&source),
+                federated_read_table,
+                acceleration_secret,
+            )
             .await?;
 
         self.ctx
@@ -667,6 +687,7 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
+        federated_read_table: Arc<dyn TableProvider>,
     ) -> Result<()> {
         tracing::debug!("Registering federated table {dataset:?}");
         let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
@@ -675,10 +696,7 @@ impl DataFusion {
         }
 
         let source_table_provider = match dataset.mode() {
-            Mode::Read => source
-                .read_provider(dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?,
+            Mode::Read => federated_read_table,
             Mode::ReadWrite => source
                 .read_write_provider(dataset)
                 .await
