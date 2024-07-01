@@ -23,7 +23,7 @@ aws-config = { version = "1.1.10", optional = true }
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
 aws-sdk-sts = { version = "1.19.0", optional = true }
 axum = { version = "0.7.4", features = ["macros"] }
-base64 = "0.22.0"
+base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
 bytes = { version = "1", default-features = false }
@@ -77,7 +77,6 @@ prost = { version = "0.12.1", default-features = false, features = [
 r2d2 = { workspace = true, optional = true }
 regex = "1.10.3"
 reqwest = { version = "0.11.24", features = ["json"] }
-rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -123,6 +122,7 @@ clickhouse = [
   "data_components/clickhouse",
 ]
 databricks = ["data_components/databricks"]
+debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
 dremio = []
@@ -160,7 +160,6 @@ snowflake = [
 spark = ["data_components/spark_connect"]
 spiceai-dataset-test = []
 sqlite = [
-  "dep:rusqlite",
   "dep:tokio-rusqlite",
   "db_connection_pool/sqlite",
   "sql_provider_datafusion/sqlite",
