@@ -18,14 +18,14 @@ use std::sync::RwLock;
 use std::{any::Any, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::stream;
+use futures::{stream, TryStreamExt};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateType {
@@ -41,6 +41,36 @@ pub struct DataUpdate {
     /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
     /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
     pub update_type: UpdateType,
+}
+
+pub struct StreamingDataUpdate {
+    pub schema: SchemaRef,
+    pub data: SendableRecordBatchStream,
+    pub update_type: UpdateType,
+}
+
+impl StreamingDataUpdate {
+    #[must_use]
+    pub fn new(
+        schema: SchemaRef,
+        data: SendableRecordBatchStream,
+        update_type: UpdateType,
+    ) -> Self {
+        Self {
+            schema,
+            data,
+            update_type,
+        }
+    }
+
+    pub async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
+        let data = self.data.try_collect::<Vec<_>>().await?;
+        Ok(DataUpdate {
+            schema: self.schema,
+            data,
+            update_type: self.update_type,
+        })
+    }
 }
 
 pub struct DataUpdateExecutionPlan {

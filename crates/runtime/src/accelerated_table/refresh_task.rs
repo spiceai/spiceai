@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::{
-    array::{make_comparator, StructArray, TimestampNanosecondArray},
+    array::{make_comparator, RecordBatch, StructArray, TimestampNanosecondArray},
     datatypes::DataType,
 };
 use async_stream::stream;
@@ -31,7 +31,7 @@ use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema, SPICE_RUNTIME_SCHEMA},
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
+    dataupdate::{DataUpdate, DataUpdateExecutionPlan, StreamingDataUpdate, UpdateType},
     execution_plan::schema_cast::EnsureSchema,
     object_store_registry::default_runtime_env,
     status,
@@ -50,7 +50,7 @@ use datafusion::{
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{cast, col, Expr, Operator},
-    physical_plan::ExecutionPlanProperties,
+    physical_plan::{stream::RecordBatchStreamAdapter, ExecutionPlanProperties},
     prelude::SessionConfig,
     sql::TableReference,
 };
@@ -132,45 +132,92 @@ impl RefreshTask {
     }
 
     pub async fn run(&self) -> super::Result<()> {
+        let (refresh_retry_enabled, refresh_retry_max_attempts) = {
+            let refresh = self.refresh.read().await;
+            (
+                refresh.refresh_retry_enabled,
+                refresh.refresh_retry_max_attempts,
+            )
+        };
+
+        let max_retries = if refresh_retry_enabled {
+            refresh_retry_max_attempts
+        } else {
+            Some(0)
+        };
+
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(max_retries)
+            .build();
+
+        let dataset_name = self.dataset_name.clone();
+
+        retry(retry_strategy, || async {
+            self.run_once().await.map_err(|err| {
+                let labels = [("dataset", dataset_name.to_string())];
+                metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+                err
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
+            e
+        })
+    }
+
+    async fn run_once(&self) -> Result<(), RetryError<super::Error>> {
         self.mark_dataset_status(status::ComponentStatus::Refreshing)
             .await;
 
         let dataset_name = self.dataset_name.clone();
 
-        let refresh = self.refresh.read().await;
+        let mode = self.refresh.read().await.mode.clone();
 
         let timer = TimeMeasurement::new(
-            match refresh.mode {
+            match mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
             },
             vec![("dataset", dataset_name.to_string())],
         );
 
-        let get_data_update_result = match refresh.mode {
+        let get_data_update_result = match mode {
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
         };
 
-        let (start_time, data_update) = match get_data_update_result {
+        let (start_time, streaming_data_update) = match get_data_update_result {
             Ok((start_time, data_update)) => (start_time, data_update),
             Err(e) => {
-                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
+                tracing::warn!("Failed to load data for dataset {dataset_name}: {e}");
                 self.mark_dataset_status(status::ComponentStatus::Error)
                     .await;
-                return Err(e);
+                return Err(RetryError::transient(e));
+            }
+        };
+
+        let data_update = match streaming_data_update.collect_data().await {
+            Ok(data_update) => data_update,
+            Err(e) => {
+                tracing::warn!("Failed to load data for dataset {dataset_name}: {e}");
+                self.mark_dataset_status(status::ComponentStatus::Error)
+                    .await;
+                return Err(from_df_error(e));
             }
         };
 
         drop(timer);
 
-        self.write_data_update(start_time, data_update).await
+        self.write_data_update(start_time, data_update)
+            .await
+            .map_err(RetryError::permanent)
     }
 
     pub async fn get_full_or_incremental_append_update(
         &self,
         overwrite_timestamp_in_nano: Option<u128>,
-    ) -> super::Result<DataUpdate> {
+    ) -> super::Result<StreamingDataUpdate> {
         let dataset_name = self.dataset_name.clone();
         let refresh = self.refresh.read().await;
         let filter_converter = self.get_filter_converter(&refresh);
@@ -269,7 +316,7 @@ impl RefreshTask {
         }
     }
 
-    async fn get_full_update(&self) -> super::Result<(Option<SystemTime>, DataUpdate)> {
+    async fn get_full_update(&self) -> super::Result<(Option<SystemTime>, StreamingDataUpdate)> {
         let start = SystemTime::now();
         match self.get_full_or_incremental_append_update(None).await {
             Ok(data) => Ok((Some(start), data)),
@@ -279,7 +326,7 @@ impl RefreshTask {
 
     async fn get_incremental_append_update(
         &self,
-    ) -> super::Result<(Option<SystemTime>, DataUpdate)> {
+    ) -> super::Result<(Option<SystemTime>, StreamingDataUpdate)> {
         match self.timestamp_nanos_for_append_query().await {
             Ok(timestamp) => {
                 let start = SystemTime::now();
@@ -371,79 +418,38 @@ impl RefreshTask {
         }
     }
 
-    async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
+    async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<StreamingDataUpdate> {
         let refresh = Arc::clone(&self.refresh);
 
-        let ctx = self.refresh_df_context();
+        let mut ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
-        let (refresh_retry_enabled, refresh_retry_max_attempts) = {
+        let (sql, update_type) = {
             let refresh = refresh.read().await;
             (
-                refresh.refresh_retry_enabled,
-                refresh.refresh_retry_max_attempts,
+                refresh.sql.clone(),
+                match refresh.mode {
+                    RefreshMode::Full => UpdateType::Overwrite,
+                    RefreshMode::Append => UpdateType::Append,
+                },
             )
         };
 
-        let max_retries = if refresh_retry_enabled {
-            refresh_retry_max_attempts
-        } else {
-            Some(0)
-        };
-
-        let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(max_retries)
-            .build();
-
-        retry(retry_strategy, || async {
-            let mut ctx_clone = ctx.clone();
-
-            let (sql, update_type) = {
-                let refresh = refresh.read().await;
-                (
-                    refresh.sql.clone(),
-                    match refresh.mode {
-                        RefreshMode::Full => UpdateType::Overwrite,
-                        RefreshMode::Append => UpdateType::Append,
-                    },
-                )
-            };
-
-            let get_data_result = get_data(
-                &mut ctx_clone,
-                dataset_name.clone(),
-                Arc::clone(&federated),
-                sql,
-                filters.clone(),
-            )
-            .await;
-
-            match get_data_result {
-                Ok(data) => Ok(DataUpdate {
-                    schema: data.0,
-                    data: data.1,
-                    update_type,
-                }),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to get refresh data for dataset {}: {}",
-                        dataset_name,
-                        e
-                    );
-                    let labels = [("dataset", dataset_name.to_string())];
-                    metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
-
-                    if should_retry_df_error(&e) {
-                        Err(RetryError::transient(e))
-                    } else {
-                        Err(RetryError::permanent(e))
-                    }
-                }
-            }
-        })
+        let get_data_result = get_data(
+            &mut ctx,
+            dataset_name.clone(),
+            Arc::clone(&federated),
+            sql,
+            filters.clone(),
+        )
         .await
-        .context(super::UnableToGetDataFromConnectorSnafu)
+        .context(super::UnableToGetDataFromConnectorSnafu);
+
+        match get_data_result {
+            Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
+            Err(e) => Err(e),
+        }
     }
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
@@ -524,16 +530,15 @@ impl RefreshTask {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    async fn except_existing_records_from(&self, update: DataUpdate) -> super::Result<DataUpdate> {
+    async fn except_existing_records_from(
+        &self,
+        mut update: StreamingDataUpdate,
+    ) -> super::Result<StreamingDataUpdate> {
         let Some(value) = self.timestamp_nanos_for_append_query().await? else {
             return Ok(update);
         };
         let refresh = self.refresh.read().await;
         let Some(filter_converter) = self.get_filter_converter(&refresh) else {
-            return Ok(update);
-        };
-
-        if update.clone().data.is_empty() {
             return Ok(update);
         };
 
@@ -547,48 +552,19 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        let mut result = vec![];
+        let schema = Arc::clone(&update.schema);
+        let update_type = update.update_type.clone();
 
-        for update_data in update.clone().data {
-            let mut predicates = vec![];
-            let mut comparators = vec![];
-            let update_struct_array = StructArray::from(update_data.clone());
-            for existing in &existing_records {
-                let existing_array = StructArray::from(existing.clone());
-                comparators.push((
-                    existing.num_rows(),
-                    make_comparator(
-                        &update_struct_array,
-                        &existing_array,
-                        SortOptions::default(),
-                    )
-                    .context(super::FailedToFilterUpdatesSnafu)?,
-                ));
-            }
-
-            for i in 0..update_data.num_rows() {
-                let mut not_matched = true;
-                for (size, comparator) in &comparators {
-                    if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
-                        not_matched = false;
-                        break;
-                    }
+        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
+            stream! {
+                while let Some(batch) = update.data.next().await {
+                    let batch = filter_records(&batch?, &existing_records);
+                    yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                 }
-
-                predicates.push(not_matched);
             }
+        }));
 
-            let data = filter_record_batch(&update_data, &predicates.into())
-                .context(super::FailedToFilterUpdatesSnafu)?;
-
-            result.push(data);
-        }
-
-        Ok(DataUpdate {
-            schema: update.schema,
-            data: result,
-            update_type: update.update_type,
-        })
+        Ok(StreamingDataUpdate::new(schema, filtered_data, update_type))
     }
 
     async fn refresh_append_overlap_nanos(&self) -> u128 {
@@ -700,6 +676,42 @@ impl RefreshTask {
     }
 }
 
+fn filter_records(
+    update_data: &RecordBatch,
+    existing_records: &Vec<RecordBatch>,
+) -> super::Result<RecordBatch> {
+    let mut predicates = vec![];
+    let mut comparators = vec![];
+
+    let update_struct_array = StructArray::from(update_data.clone());
+    for existing in existing_records {
+        let existing_array = StructArray::from(existing.clone());
+        comparators.push((
+            existing.num_rows(),
+            make_comparator(
+                &update_struct_array,
+                &existing_array,
+                SortOptions::default(),
+            )
+            .context(super::FailedToFilterUpdatesSnafu)?,
+        ));
+    }
+
+    for i in 0..update_data.num_rows() {
+        let mut not_matched = true;
+        for (size, comparator) in &comparators {
+            if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
+                not_matched = false;
+                break;
+            }
+        }
+
+        predicates.push(not_matched);
+    }
+
+    filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+}
+
 fn should_retry_df_error(error: &DataFusionError) -> bool {
     match error {
         DataFusionError::Context(_, err) => should_retry_df_error(err.as_ref()),
@@ -707,5 +719,13 @@ fn should_retry_df_error(error: &DataFusionError) -> bool {
             false
         }
         _ => true,
+    }
+}
+
+fn from_df_error(error: DataFusionError) -> RetryError<super::Error> {
+    if should_retry_df_error(&error) {
+        RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error })
+    } else {
+        RetryError::permanent(super::Error::UnableToGetDataFromConnector { source: error })
     }
 }
