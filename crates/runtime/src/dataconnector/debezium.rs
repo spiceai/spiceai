@@ -178,7 +178,7 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => infer_metadata_from_kafka(dataset, &topic, self.kafka_brokers.clone()).await?,
+            None => get_metadata_from_kafka(dataset, &topic, self.kafka_brokers.clone()).await?,
         };
 
         let debezium_kafka = Arc::new(DebeziumKafka::new(
@@ -219,7 +219,7 @@ async fn set_metadata_to_accelerator(
     accelerated_metadata.set_metadata(metadata).await
 }
 
-async fn infer_metadata_from_kafka(
+async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
     kafka_brokers: String,
