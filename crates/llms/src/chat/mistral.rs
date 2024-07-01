@@ -26,7 +26,15 @@ use mistralrs::{
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
-use std::{path::Path, pin::Pin, str::FromStr, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
+use std::{
+    path::Path,
+    pin::Pin,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::mpsc::{channel, Sender};
 
 pub struct MistralLlama {
@@ -233,7 +241,7 @@ impl MistralLlama {
         is_streaming: bool,
         tx: Sender<MistralResponse>,
     ) -> MistralRequest {
-        MistralRequest::Normal(NormalRequest {            
+        MistralRequest::Normal(NormalRequest {
             messages: RequestMessage::Completion {
                 text: prompt,
                 echo_prompt: false,
@@ -249,7 +257,6 @@ impl MistralLlama {
             adapters: None,
         })
     }
-    
 }
 
 #[async_trait]
