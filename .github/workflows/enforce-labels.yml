@@ -9,6 +9,6 @@ jobs:
     steps:
     - uses: yogevbd/enforce-label-action@2.1.0
       with:
-        REQUIRED_LABELS_ANY: "kind/refactor,kind/bug,kind/enhancement,kind/documentation"
-        REQUIRED_LABELS_ANY_DESCRIPTION: "Select at least one label ['kind/refactor','kind/bug','kind/enhancement','kind/documentation']"
+        REQUIRED_LABELS_ANY: "kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization"
+        REQUIRED_LABELS_ANY_DESCRIPTION: "Select at least one label ['kind/refactor','kind/bug','kind/enhancement','kind/documentation', 'kind/optimization']"
         BANNED_LABELS: "invalid,wontfix,nomerge,duplicate"

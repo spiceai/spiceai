@@ -79,6 +79,11 @@ Please verify the syntax of your GraphQL query."#
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, PartialEq, Eq)]
+struct UnnestParameters {
+    depth: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct PaginationParameters {
     resource_name: String,
     count: usize,
@@ -176,6 +181,7 @@ struct GraphQLClient {
     endpoint: Url,
     query: String,
     pointer: String,
+    unnest_parameters: UnnestParameters,
     pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
 }
@@ -186,6 +192,7 @@ impl GraphQLClient {
         endpoint: Url,
         query: String,
         pointer: String,
+        unnest_parameters: UnnestParameters,
         pagination_parameters: Option<PaginationParameters>,
         auth: Option<Auth>,
     ) -> Self {
@@ -194,10 +201,81 @@ impl GraphQLClient {
             endpoint,
             query,
             pointer,
+            unnest_parameters,
             pagination_parameters,
             auth,
         }
     }
+}
+
+fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Result<Vec<Value>> {
+    let mut new_objects = Vec::new();
+    if let Value::Object(obj) = object {
+        let mut new_object = obj.clone();
+
+        // setup some loop controls
+        let mut depth_counter = 0;
+
+        loop {
+            if depth_counter >= unnest_parameters.depth {
+                break; // break if we've hit the unnest depth limit
+            }
+
+            // store additions and deletions
+            let mut additions = vec![];
+
+            new_object.retain(|_, value| {
+                match value {
+                    Value::Object(ref mut inner_obj) => {
+                        inner_obj.retain(|inner_key, inner_value| {
+                            additions.push((inner_key.clone(), inner_value.clone())); // add the inner key to the additions list
+                            false
+                        });
+
+                        // don't retain the inner object, because we're about to bump it up to the root object
+                        false
+                    }
+                    _ => true, // we don't need to do anything for non-object inner types
+                }
+            });
+
+            if additions.is_empty() {
+                break; // break if there's nothing else to do
+            }
+
+            // add the staged additions back to the root object
+            for (key, value) in additions {
+                new_object.insert(key, value);
+            }
+
+            // increment the depth counter
+            depth_counter += 1;
+        }
+
+        new_objects.push(Value::Object(new_object));
+    } else if let Value::Array(arr) = object {
+        new_objects.extend(arr.clone());
+    } else {
+        return Err(Error::InvalidObjectAccess {
+            // unnesting any other type is invalid
+            message: format!("Unsupported unnest type: {object}"),
+        });
+    }
+
+    Ok(new_objects)
+}
+
+fn unnest_json_objects(
+    unnest_parameters: &UnnestParameters,
+    objects: &[Value],
+) -> Result<Vec<Value>> {
+    Ok(objects
+        .iter()
+        .map(|obj| unnest_json_object(unnest_parameters, obj))
+        .collect::<Result<Vec<Vec<_>>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 impl GraphQLClient {
@@ -238,7 +316,7 @@ impl GraphQLClient {
                 .and_then(|x| x.get_next_cursor_from_response(&response))
         };
 
-        let unwrapped = match extracted_data {
+        let mut unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
             obj @ Value::Object(_) => Ok(vec![obj]),
             Value::Null => Err(Error::InvalidObjectAccess {
@@ -248,6 +326,10 @@ impl GraphQLClient {
                 message: "Primitive value access.".to_string(),
             }),
         }?;
+
+        if self.unnest_parameters.depth > 0 {
+            unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped)?;
+        }
 
         let schema = schema.unwrap_or(Arc::new(
             infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
@@ -263,6 +345,7 @@ impl GraphQLClient {
                 .context(ArrowInternalSnafu)?
                 .collect::<Result<Vec<_>, _>>()
                 .context(ArrowInternalSnafu)?;
+
             res.extend(batch);
         }
 
@@ -493,6 +576,25 @@ impl GraphQL {
 
         client_builder = client_builder.default_headers(headers);
 
+        let unnest_depth = if let Some(depth) = self.params.get("unnest_depth") {
+            depth.parse::<usize>()
+        } else {
+            Ok(0)
+        };
+
+        let unnest_depth = match unnest_depth {
+            Ok(depth) => Ok(depth),
+            Err(e) => Err(super::DataConnectorError::InvalidConfiguration {
+                dataconnector: "GraphQL".to_string(),
+                message: "`unnest_depth` is not an integer".to_string(),
+                source: e.into(),
+            }),
+        }?;
+
+        let unnest_parameters = UnnestParameters {
+            depth: unnest_depth,
+        };
+
         Ok(GraphQLClient::new(
             client_builder.build().map_err(|e| {
                 super::DataConnectorError::InvalidConfiguration {
@@ -504,6 +606,7 @@ impl GraphQL {
             endpoint,
             query,
             pointer,
+            unnest_parameters,
             pagination_parameters,
             auth,
         ))
@@ -536,6 +639,7 @@ impl DataConnector for GraphQL {
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
+    use serde_json::Value;
 
     use super::handle_http_error;
     use super::PaginationParameters;
@@ -770,5 +874,100 @@ mod tests {
                 assert!(e.to_string().contains(message));
             }
         }
+    }
+
+    #[test]
+    fn test_json_object_unnesting() {
+        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "b".to_string(),
+                Value::Number(1.into())
+            )]))
+        );
+
+        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let object =
+            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "d".to_string(),
+                Value::String("1".to_string())
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_json_object_unnesting_respects_unnest_depth() {
+        let unnest_parameters = super::UnnestParameters { depth: 0 };
+        let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "a".to_string(),
+                Value::Object(serde_json::Map::from_iter(vec![(
+                    "b".to_string(),
+                    Value::Number(1.into())
+                )]))
+            )]))
+        );
+
+        let unnest_parameters = super::UnnestParameters { depth: 1 };
+        let object =
+            serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "b".to_string(),
+                Value::Object(serde_json::Map::from_iter(vec![(
+                    "c".to_string(),
+                    Value::Object(serde_json::Map::from_iter(vec![(
+                        "d".to_string(),
+                        Value::String("1".to_string())
+                    )]))
+                )]))
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_json_array_unnesting() {
+        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let object = serde_json::from_str("[1, 2, 3]").expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest json array");
+        assert_eq!(result.len(), 3);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(obj, &Value::Number(1.into()));
+
+        let obj = result.get(1).expect("To get second unnested object");
+        assert_eq!(obj, &Value::Number(2.into()));
+
+        let obj = result.get(2).expect("To get third unnested object");
+        assert_eq!(obj, &Value::Number(3.into()));
     }
 }
