@@ -58,6 +58,7 @@ pub struct ContainerRunnerBuilder<'a> {
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     cmd: Option<Vec<&'a str>>,
+    network: Option<&'a str>,
 }
 
 impl<'a> ContainerRunnerBuilder<'a> {
@@ -69,6 +70,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             env_vars: Vec::new(),
             healthcheck: None,
             cmd: None,
+            network: None,
         }
     }
 
@@ -100,6 +102,11 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    pub fn network(mut self, network: &'a str) -> Self {
+        self.network = Some(network);
+        self
+    }
+
     pub fn build(self) -> Result<ContainerRunner<'a>, anyhow::Error> {
         let image = self
             .image
@@ -112,6 +119,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             env_vars: self.env_vars,
             healthcheck: self.healthcheck,
             cmd: self.cmd,
+            network: self.network,
         })
     }
 }
@@ -124,6 +132,7 @@ pub struct ContainerRunner<'a> {
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     cmd: Option<Vec<&'a str>>,
+    network: Option<&'a str>,
 }
 
 impl<'a> ContainerRunner<'a> {
@@ -159,6 +168,7 @@ impl<'a> ContainerRunner<'a> {
 
         let host_config = Some(HostConfig {
             port_bindings,
+            network_mode: self.network.map(String::from),
             ..Default::default()
         });
 

@@ -14,4 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::init_tracing;
+
 mod common;
+
+#[tokio::test]
+async fn test_debezium() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("debug"));
+
+    common::start_redpanda_debezium_docker_containers().await;
+
+    common::register_postgres_connector().await?;
+
+    Ok(())
+}
