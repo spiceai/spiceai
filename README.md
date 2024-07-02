@@ -100,6 +100,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
 | `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       |
 | `graphql`     | GraphQL                                                                                        | Alpha  | JSON                                                                                               |
+| `debezium`    | Debezium CDC                                                                                   | Alpha  | Kafka + JSON                                                                                               |
 
 ### Supported Data Stores/Accelerators
 
