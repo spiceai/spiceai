@@ -333,6 +333,11 @@ impl AcceleratedTable {
         Arc::clone(&self.federated)
     }
 
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
+    }
+
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
         let dataset_name = &self.dataset_name;
 

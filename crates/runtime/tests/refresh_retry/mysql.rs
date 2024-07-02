@@ -26,6 +26,9 @@ use crate::init_tracing;
 
 use app::AppBuilder;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
+use datafusion::{
+    datasource::TableProvider, physical_plan::collect, prelude::SessionContext, sql::TableReference,
+};
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{
     accelerated_table::{refresh_task::RefreshTask, AcceleratedTable},
@@ -100,8 +103,24 @@ async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTa
         table_name.into(),
         Arc::clone(&accelerated_table.get_federated_table()),
         accelerated_table.refresh_params(),
-        table,
+        accelerated_table.get_accelerator(),
     ))
+}
+
+async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn TableProvider>, String> {
+    let table = rt
+        .datafusion()
+        .ctx
+        .table_provider(table_name)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let accelerated_table = table
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .ok_or("table is not an AcceleratedTable")?;
+
+    Ok(Arc::clone(&accelerated_table.get_accelerator()))
 }
 
 #[tokio::test]
@@ -177,6 +196,15 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             .is_ok());
     });
 
+    // set custom refresh sql to check number of items loaded later
+    rt.datafusion()
+        .update_refresh_sql(
+            TableReference::parse_str("lineitem_retries"),
+            Some("SELECT * from lineitem_retries limit 10".to_string()),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Refresh should do retries and succeed
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
@@ -192,6 +220,22 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         tracing::error!("running_container.remove: {e}");
         e.to_string()
     })?;
+
+    // check that the accelerated table contains the expected number of rows
+    let accelerated_table = get_accelerator(&rt, "lineitem_retries").await?;
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+
+    let plan = accelerated_table
+        .scan(&state, None, &[], None)
+        .await
+        .expect("Scan plan can be constructed");
+
+    let result = collect(plan, ctx.task_ctx())
+        .await
+        .expect("Query successful");
+
+    assert_eq!(10, result.first().expect("result").num_rows());
 
     Ok(())
 }

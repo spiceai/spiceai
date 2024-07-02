@@ -18,14 +18,17 @@ use std::sync::RwLock;
 use std::{any::Any, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use async_stream::stream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::{stream, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateType {
@@ -71,6 +74,24 @@ impl StreamingDataUpdate {
             schema: self.schema,
             data,
             update_type: self.update_type,
+        })
+    }
+}
+
+impl TryFrom<DataUpdate> for StreamingDataUpdate {
+    type Error = DataFusionError;
+
+    fn try_from(data_update: DataUpdate) -> std::result::Result<Self, Self::Error> {
+        let schema = Arc::clone(&data_update.schema);
+        let data = Box::pin(MemoryStream::try_new(
+            data_update.data,
+            data_update.schema,
+            None,
+        )?) as SendableRecordBatchStream;
+        Ok(Self {
+            schema,
+            data,
+            update_type: data_update.update_type,
         })
     }
 }
@@ -151,5 +172,88 @@ impl ExecutionPlan for DataUpdateExecutionPlan {
             RecordBatchStreamAdapter::new(self.schema(), stream::iter(data.into_iter().map(Ok)));
 
         Ok(Box::pin(stream_adapter))
+    }
+}
+
+pub struct StreamingDataUpdateExecutionPlan {
+    record_batch_stream: Arc<Mutex<SendableRecordBatchStream>>,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl StreamingDataUpdateExecutionPlan {
+    #[must_use]
+    pub fn new(record_batch_stream: SendableRecordBatchStream) -> Self {
+        let schema = record_batch_stream.schema();
+        Self {
+            record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
+            schema: Arc::clone(&schema),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamingDataUpdateExecutionPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "StreamingDataUpdateExecutionPlan")
+    }
+}
+
+impl DisplayAs for StreamingDataUpdateExecutionPlan {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "StreamingDataUpdateExecutionPlan")
+    }
+}
+
+impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
+    fn name(&self) -> &'static str {
+        "StreamingDataUpdateExecutionPlan"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let schema = Arc::clone(&self.schema);
+
+        let record_batch_stream = Arc::clone(&self.record_batch_stream);
+
+        let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), {
+            stream! {
+                let mut stream = record_batch_stream.lock().await;
+                while let Some(batch) = stream.next().await {
+                    yield batch;
+                }
+            }
+        });
+        Ok(Box::pin(stream))
     }
 }
