@@ -12,14 +12,17 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-buffer.workspace = true
 arrow-flight.workspace = true
 arrow-odbc = { workspace = true, optional = true }
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 async-stream.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
 bytes = "1.6.0"
+chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
@@ -45,11 +48,13 @@ object_store = { workspace = true }
 odbc-api = { workspace = true, optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 r2d2 = { workspace = true, optional = true }
+rdkafka = { version = "0.36.2", optional = true }
 regex = "1.10.4"
 reqwest = { version = "0.11.24", features = ["json"] }
 rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "d937df525d7c237c717b42e6146494c524dbf267", features = [
@@ -66,9 +71,13 @@ tracing.workspace = true
 url = "2.5.0"
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+rdkafka = { version = "0.36.2", features = ["cmake-build"], optional = true }
+
 [features]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
 databricks = ["dep:deltalake", "spark_connect"]
+debezium = ["dep:serde_json", "dep:rdkafka"]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb"]
 flightsql = ["dep:tonic", "dep:r2d2"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]

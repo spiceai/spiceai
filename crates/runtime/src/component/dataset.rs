@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use acceleration::Engine;
 use data_components::util::column_reference;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
@@ -363,6 +364,10 @@ impl Dataset {
     #[must_use]
     pub fn is_file_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
+            if acceleration.engine == Engine::PostgreSQL {
+                return true;
+            }
+
             return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
         }
 

@@ -57,6 +57,9 @@ use datafusion::{
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 
 use super::refresh::Refresh;
+
+mod changes;
+
 pub struct RefreshTask {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
@@ -178,6 +181,7 @@ impl RefreshTask {
             match mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
+                RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
             vec![("dataset", dataset_name.to_string())],
         );
@@ -185,6 +189,7 @@ impl RefreshTask {
         let get_data_update_result = match mode {
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
+            RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
         let (start_time, streaming_data_update) = match get_data_update_result {
@@ -432,6 +437,7 @@ impl RefreshTask {
                 match refresh.mode {
                     RefreshMode::Full => UpdateType::Overwrite,
                     RefreshMode::Append => UpdateType::Append,
+                    RefreshMode::Changes => unreachable!("changes are handled upstream"),
                 },
             )
         };

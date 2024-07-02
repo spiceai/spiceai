@@ -30,17 +30,20 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.78"
-version = "0.15.0-alpha"
+version = "0.15.1-alpha"
 
 [workspace.dependencies]
 arrow = "52.0.0"
+arrow-buffer = "52.0.0"
 arrow-flight = "52.0.0"
 arrow-odbc = { version = "11.1.0" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
+base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
+chrono = "0.4.38"
 clap = { version = "4.4.14", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
   "tokio_io",

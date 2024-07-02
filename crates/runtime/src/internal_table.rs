@@ -89,7 +89,7 @@ pub async fn create_internal_accelerated_table(
     let source_table_provider = get_local_table_provider(name.clone(), &schema).await?;
 
     let accelerated_table_provider =
-        create_accelerator_table(name.clone(), Arc::clone(&schema), &acceleration, None)
+        create_accelerator_table(name.clone(), Arc::clone(&schema), None, &acceleration, None)
             .await
             .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
