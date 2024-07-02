@@ -117,7 +117,7 @@ impl Model {
     pub fn find_any_file_path(&self, file_type: ModelFileType) -> Option<String> {
         self.files
             .iter()
-            .find(|f| f.r#type == Some(file_type))
+            .find(|f| f.file_type() == Some(file_type))
             .map(|f| f.path.clone())
     }
 
@@ -187,7 +187,7 @@ impl Model {
             if let Some(id) = self.get_model_id() {
                 files.push(ModelFile {
                     path: id,
-                    name: "from_id".to_string(),
+                    name: Some("from_id".to_string()),
                     r#type: Some(ModelFileType::Weights),
                 });
             }
@@ -219,8 +219,10 @@ impl Model {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelFile {
     pub path: String,
-    pub name: String,
-    pub r#type: Option<ModelFileType>,
+    pub name: Option<String>,
+
+    /// Should use [`Self::file_type`] to access.
+    pub(crate) r#type: Option<ModelFileType>,
 }
 
 impl ModelFile {
