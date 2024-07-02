@@ -18,6 +18,10 @@ Rust uses system allocator by default which may struggle with this in some Opera
 2. [microsoft/mimalloc](https://github.com/microsoft/mimalloc)
 3. [microsoft/snmalloc](https://github.com/Microsoft/snmalloc)
 
+## First-Principles
+
+- **Align to industry standards**
+
 ## Decision
 
 Spice will use snmalloc as the default allocator.
