@@ -14,7 +14,7 @@ version.workspace = true
 arrow.workspace = true
 bigdecimal = "0.4.3"
 bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0" }
-chrono = "0.4.35"
+chrono.workspace = true
 chrono-tz = "0.8.6"
 rusqlite = { workspace = true, optional = true }
 sea-query = { version = "0.30.7", features = [

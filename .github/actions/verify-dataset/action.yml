@@ -30,10 +30,30 @@ runs:
           http://localhost:3000/v1/sql
         )
         echo $response | jq
-        table_exists=$(echo $response | jq '[.[] | select(.table_name == "${{ inputs.name }}")]' | jq 'length')
-        if [[ $table_exists -eq 0 ]]; then
-          echo "Unexpected response: table '${{ inputs.name }}' does not exist."
-          exit 1
+
+        full_name="${{ inputs.name }}"
+
+        # Split the full_name into schema and table_name if it contains a dot
+        if [[ $full_name == *"."* ]]; then
+          schema=$(echo $full_name | cut -d'.' -f1)
+          table_name=$(echo $full_name | cut -d'.' -f2)
+        else
+          schema=""
+          table_name=$full_name
+        fi
+
+        if [[ -n "$schema" ]]; then
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "'$table_name'" and .table_schema == "'$schema'")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table '$schema.$table_name' does not exist."
+            exit 1
+          fi
+        else
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "'$table_name'")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table '$table_name' does not exist."
+            exit 1
+          fi
         fi
 
     - name: Verify SQL REPL result count for table ${{ inputs.name }}

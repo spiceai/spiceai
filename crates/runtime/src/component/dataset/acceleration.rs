@@ -21,11 +21,11 @@ use std::{collections::HashMap, fmt::Display, time::Duration};
 pub mod constraints;
 pub mod on_conflict;
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RefreshMode {
-    #[default]
     Full,
     Append,
+    Changes,
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -33,6 +33,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
         match refresh_mode {
             spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
+            spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
         }
     }
 }
@@ -211,7 +212,7 @@ pub struct Acceleration {
 
     pub engine: Engine,
 
-    pub refresh_mode: RefreshMode,
+    pub refresh_mode: Option<RefreshMode>,
 
     pub refresh_check_interval: Option<String>,
 
@@ -313,7 +314,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
             engine,
-            refresh_mode: RefreshMode::from(acceleration.refresh_mode),
+            refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
             refresh_check_interval: acceleration.refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -346,7 +347,7 @@ impl Default for Acceleration {
             enabled: true,
             mode: Mode::Memory,
             engine: Engine::default(),
-            refresh_mode: RefreshMode::Full,
+            refresh_mode: None,
             refresh_check_interval: None,
             refresh_sql: None,
             refresh_data_window: None,

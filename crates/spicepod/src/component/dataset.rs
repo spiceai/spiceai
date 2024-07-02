@@ -122,12 +122,12 @@ pub mod acceleration {
 
     use crate::component::params::Params;
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
     pub enum RefreshMode {
-        #[default]
         Full,
         Append,
+        Changes,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -212,8 +212,8 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine: Option<String>,
 
-        #[serde(default)]
-        pub refresh_mode: RefreshMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_mode: Option<RefreshMode>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_check_interval: Option<String>,
@@ -276,7 +276,7 @@ pub mod acceleration {
                 enabled: true,
                 mode: Mode::Memory,
                 engine: None,
-                refresh_mode: RefreshMode::Full,
+                refresh_mode: None,
                 refresh_check_interval: None,
                 refresh_sql: None,
                 refresh_data_window: None,

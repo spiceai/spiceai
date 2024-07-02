@@ -156,6 +156,14 @@ impl DuckDBTableProviderFactory {
         self.db_path_param = db_path_param.to_string();
         self
     }
+
+    #[must_use]
+    pub fn duckdb_file_path(&self, name: &str, options: &HashMap<String, String>) -> String {
+        options
+            .get(&self.db_path_param)
+            .cloned()
+            .unwrap_or_else(|| format!("{name}.db"))
+    }
 }
 
 impl Default for DuckDBTableProviderFactory {
@@ -214,11 +222,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let pool: Arc<DuckDbConnectionPool> = Arc::new(match &mode {
             Mode::File => {
                 // open duckdb at given path or create a new one
-                let db_path = cmd
-                    .options
-                    .get(self.db_path_param.as_str())
-                    .cloned()
-                    .unwrap_or(format!("{name}.db"));
+                let db_path = self.duckdb_file_path(&name, &cmd.options);
 
                 DuckDbConnectionPool::new_file(&db_path, &self.access_mode)
                     .context(DbConnectionPoolSnafu)
@@ -308,7 +312,7 @@ impl DuckDB {
             .context(DbConnectionSnafu)
     }
 
-    fn duckdb_conn<'a>(
+    pub fn duckdb_conn<'a>(
         db_connection: &'a mut Box<
             dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>,
         >,

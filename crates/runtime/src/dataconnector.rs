@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
 use datafusion::dataframe::DataFrame;
@@ -55,6 +57,8 @@ use crate::object_store_registry::default_runtime_env;
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod databricks;
+#[cfg(feature = "debezium")]
+pub mod debezium;
 #[cfg(feature = "dremio")]
 pub mod dremio;
 #[cfg(feature = "duckdb")]
@@ -76,12 +80,11 @@ pub mod postgres;
 pub mod s3;
 #[cfg(feature = "ftp")]
 pub mod sftp;
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
-
-#[cfg(feature = "snowflake")]
-pub mod snowflake;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -154,6 +157,12 @@ pub enum DataConnectorError {
         dataconnector: String,
         message: String,
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Invalid configuration for {dataconnector}. {message}"))]
+    InvalidConfigurationNoSource {
+        dataconnector: String,
+        message: String,
     },
 
     #[snafu(display(
@@ -265,6 +274,8 @@ pub async fn register_all() {
     register_connector_factory("spark", spark::Spark::create).await;
     #[cfg(feature = "snowflake")]
     register_connector_factory("snowflake", snowflake::Snowflake::create).await;
+    #[cfg(feature = "debezium")]
+    register_connector_factory("debezium", debezium::Debezium::create).await;
 }
 
 pub trait DataConnectorFactory {
@@ -279,6 +290,13 @@ pub trait DataConnectorFactory {
 pub trait DataConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
+    /// Resolves the default refresh mode for the data connector.
+    ///
+    /// Most data connectors should keep this as `RefreshMode::Full`.
+    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
+        refresh_mode.unwrap_or(RefreshMode::Full)
+    }
+
     async fn read_provider(&self, dataset: &Dataset)
         -> DataConnectorResult<Arc<dyn TableProvider>>;
 
@@ -289,10 +307,11 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
-    async fn stream_provider(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    fn supports_changes_stream(&self) -> bool {
+        false
+    }
+
+    fn changes_stream(&self, _table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         None
     }
 

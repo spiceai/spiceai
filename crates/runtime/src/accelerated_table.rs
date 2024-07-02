@@ -25,6 +25,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
+use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionState;
@@ -91,6 +92,27 @@ pub enum Error {
     FailedToWriteData {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("The accelerated table does not support delete operations"))]
+    AcceleratedTableDoesntSupportDelete {},
+
+    #[snafu(display("Expected schema to have field '{field_name}' schema={schema}"))]
+    ExpectedSchemaToHaveField {
+        field_name: String,
+        schema: SchemaRef,
+    },
+
+    #[snafu(display("Expected field in schema '{field_name}' to have type '{expected_data_type}' schema={schema}"))]
+    ArrayDataTypeMismatch {
+        field_name: String,
+        expected_data_type: String,
+        schema: SchemaRef,
+    },
+
+    #[snafu(display(
+        "The type of the primary key '{data_type}' is not yet supported for change deletion."
+    ))]
+    PrimaryKeyTypeNotYetSupported { data_type: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -138,6 +160,7 @@ pub struct Builder {
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    changes_stream: Option<ChangesStream>,
 }
 
 impl Builder {
@@ -155,6 +178,7 @@ impl Builder {
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
             cache_provider: None,
+            changes_stream: None,
         }
     }
 
@@ -176,6 +200,22 @@ impl Builder {
         self
     }
 
+    /// Set the changes stream for the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode isn't `RefreshMode::Changes`.
+    pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
+        assert!(self.refresh.mode == RefreshMode::Changes);
+        self.changes_stream = Some(changes_stream);
+        self
+    }
+
+    /// Build the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode is `RefreshMode::Changes` and no changes stream is provided.
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
@@ -196,6 +236,15 @@ impl Builder {
                 (
                     refresh::AccelerationRefreshMode::Full(on_start_refresh),
                     Some(start_refresh),
+                )
+            }
+            RefreshMode::Changes => {
+                let Some(changes_stream) = self.changes_stream else {
+                    panic!("Changes stream is required for `RefreshMode::Changes`");
+                };
+                (
+                    refresh::AccelerationRefreshMode::Changes(changes_stream),
+                    None,
                 )
             }
         };
