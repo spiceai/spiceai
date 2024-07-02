@@ -20,7 +20,7 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 pub enum TransientError {
     #[snafu(display("{source}"))]
-    DataSourceConnectivityError {
+    DataRetrievalError {
         source: datafusion::error::DataFusionError,
     },
 }
@@ -46,9 +46,7 @@ pub fn detect_transient_data_retrieval_error(err: DataFusionError) -> DataFusion
         return err;
     }
 
-    DataFusionError::External(Box::new(TransientError::DataSourceConnectivityError {
-        source: err,
-    }))
+    DataFusionError::External(Box::new(TransientError::DataRetrievalError { source: err }))
 }
 
 fn is_invalid_query_error(error: &DataFusionError) -> bool {
