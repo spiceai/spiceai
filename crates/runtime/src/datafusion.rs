@@ -24,7 +24,9 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
-use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
+use crate::dataupdate::{
+    DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
+};
 use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secret;
 use crate::{embeddings, get_dependent_table_names};
@@ -175,6 +177,11 @@ pub enum Error {
 
     #[snafu(display("The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"))]
     ChangeSchemaWithoutDataField { source: ArrowError },
+
+    #[snafu(display("Unable to create streaming data update: {source}"))]
+    UnableToCreateStreamingUpdate {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub enum Table {
@@ -450,10 +457,14 @@ impl DataFusion {
         .context(SchemaMismatchSnafu)?;
 
         let overwrite = data_update.update_type == UpdateType::Overwrite;
+
+        let streaming_update = StreamingDataUpdate::try_from(data_update)
+            .context(UnableToCreateStreamingUpdateSnafu)?;
+
         let insert_plan = table_provider
             .insert_into(
                 &self.ctx.state(),
-                Arc::new(DataUpdateExecutionPlan::new(data_update)),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
                 overwrite,
             )
             .await

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::RwLock;
 use std::{any::Any, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
@@ -27,7 +26,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,85 +92,6 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
             data,
             update_type: data_update.update_type,
         })
-    }
-}
-
-pub struct DataUpdateExecutionPlan {
-    pub data_update: RwLock<DataUpdate>,
-    schema: SchemaRef,
-    properties: PlanProperties,
-}
-
-impl DataUpdateExecutionPlan {
-    #[must_use]
-    pub fn new(data_update: DataUpdate) -> Self {
-        let schema = Arc::clone(&data_update.schema);
-        Self {
-            data_update: RwLock::new(data_update),
-            schema: Arc::clone(&schema),
-            properties: PlanProperties::new(
-                EquivalenceProperties::new(schema),
-                Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
-            ),
-        }
-    }
-}
-
-impl std::fmt::Debug for DataUpdateExecutionPlan {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DataUpdateExecutionPlan")
-    }
-}
-
-impl DisplayAs for DataUpdateExecutionPlan {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DataUpdateExecutionPlan")
-    }
-}
-
-impl ExecutionPlan for DataUpdateExecutionPlan {
-    fn name(&self) -> &'static str {
-        "DataUpdateExecutionPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut data_update_guard = match self.data_update.write() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
-        let data = std::mem::take(&mut data_update_guard.data);
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), stream::iter(data.into_iter().map(Ok)));
-
-        Ok(Box::pin(stream_adapter))
     }
 }
 
