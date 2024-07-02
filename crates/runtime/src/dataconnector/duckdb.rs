@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
+use db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -28,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -42,7 +44,35 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDB {
-    duckdb_factory: DuckDBTableFactory,
+    file_factory: Option<Arc<DuckDBTableFactory>>,
+    memory_factory: DuckDBTableFactory,
+}
+impl DuckDB {
+    pub(crate) fn create_in_memory() -> AnyErrorResult<DuckDBTableFactory> {
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_memory(&AccessMode::Automatic).map_err(|source| {
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "duckdb".to_string(),
+                    source,
+                }
+            })?,
+        );
+
+        Ok(DuckDBTableFactory::new(pool))
+    }
+
+    pub(crate) fn create_file(path: &str) -> AnyErrorResult<DuckDBTableFactory> {
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly).map_err(|source| {
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "duckdb".to_string(),
+                    source,
+                }
+            })?,
+        );
+
+        Ok(DuckDBTableFactory::new(pool))
+    }
 }
 
 impl DataConnectorFactory for DuckDB {
@@ -51,30 +81,24 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            // data connector requires valid "open" parameter
-            let db_path: String =
-                params
-                    .get("open")
-                    .cloned()
-                    .ok_or(DataConnectorError::InvalidConfiguration {
-                        dataconnector: "duckdb".to_string(),
-                        message: "Missing required open parameter.".to_string(),
-                        source: "Missing open".into(),
-                    })?;
+            let file_factory = if let Some(db_path) = params.get("open") {
+                let file_factory = Self::create_file(db_path)?;
+                Some(Arc::new(file_factory))
+            } else {
+                None
+            };
 
-            // TODO: wire to dataset.mode once readwrite implemented for duckdb
-            let pool = Arc::new(
-                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly).map_err(|e| {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "duckdb".to_string(),
-                        source: e,
-                    }
-                })?,
-            );
+            let memory_factory = Self::create_in_memory().map_err(|e| {
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "duckdb".to_string(),
+                    source: e,
+                }
+            })?;
 
-            let duckdb_factory = DuckDBTableFactory::new(pool);
-
-            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Self {
+                file_factory,
+                memory_factory,
+            }) as Arc<dyn DataConnector>)
         })
     }
 }
@@ -89,12 +113,25 @@ impl DataConnector for DuckDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.duckdb_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "duckdb",
-                })?,
-        )
+        let path: TableReference = dataset.path().into();
+
+        // Load DuckDB functions in an in-memory pool, otherwise expect a file.
+        let factory = if is_table_function(&path) {
+            &self.memory_factory
+        } else {
+            &self
+                .file_factory
+                .clone()
+                .ok_or(DataConnectorError::InternalWithSource {
+                    dataconnector: "duckdb".to_string(),
+                    source: Box::new(Error::MissingDuckDBFile {}),
+                })?
+        };
+
+        Ok(Read::table_provider(factory, path).await.context(
+            super::UnableToGetReadProviderSnafu {
+                dataconnector: "duckdb",
+            },
+        )?)
     }
 }
