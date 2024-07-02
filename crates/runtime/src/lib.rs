@@ -177,6 +177,9 @@ pub enum Error {
     #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
     AcceleratedReadWriteTableWithoutReplication,
 
+    #[snafu(display("An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."))]
+    AcceleratedTableInvalidChanges { dataset_name: String },
+
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
@@ -508,6 +511,20 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
+
+        if let Some(acceleration) = &ds.acceleration {
+            if data_connector.resolve_refresh_mode(acceleration.refresh_mode)
+                == RefreshMode::Changes
+                && !data_connector.supports_changes_stream()
+            {
+                let err = AcceleratedTableInvalidChangesSnafu {
+                    dataset_name: ds.name.to_string(),
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+        }
 
         // test dataset connectivity by attempting to get a read provider
         let read_provider = match data_connector.read_provider(&ds).await {
