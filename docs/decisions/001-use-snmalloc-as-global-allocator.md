@@ -37,4 +37,4 @@ To address this, Spice ensures compatibility with primary operating systems thro
 
 ## Consequences
 
-- Implement snamalloc as th `global_allocator` in `spiced` `main.rs` via the [snmalloc-rs](https://crates.io/crates/snmalloc-rs) crate.
+- Implement snamalloc as the `global_allocator` in `spiced` `main.rs` via the [snmalloc-rs](https://crates.io/crates/snmalloc-rs) crate.
