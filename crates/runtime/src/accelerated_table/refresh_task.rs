@@ -184,7 +184,7 @@ impl RefreshTask {
 
         let mode = self.refresh.read().await.mode;
 
-        let _ = TimeMeasurement::new(
+        let _timer = TimeMeasurement::new(
             match mode {
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
