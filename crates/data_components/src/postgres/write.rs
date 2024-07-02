@@ -36,7 +36,7 @@ use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
     util::{
         constraints, on_conflict::OnConflict,
-        transient_error::detect_transient_data_retrieval_error,
+        retriable_error::detect_retriable_data_retrieval_error,
     },
 };
 
@@ -206,7 +206,7 @@ impl DataSink for PostgresDataSink {
         }
 
         while let Some(batch) = data.next().await {
-            let batch = batch.map_err(detect_transient_data_retrieval_error)?;
+            let batch = batch.map_err(detect_retriable_data_retrieval_error)?;
             let batch_num_rows = batch.num_rows();
 
             if batch_num_rows == 0 {

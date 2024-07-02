@@ -23,8 +23,8 @@ pub mod column_reference;
 pub mod constraints;
 pub mod indexes;
 pub mod on_conflict;
+pub mod retriable_error;
 pub mod secrets;
-pub mod transient_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

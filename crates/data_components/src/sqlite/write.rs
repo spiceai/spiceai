@@ -38,7 +38,7 @@ use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
     util::{
         constraints, on_conflict::OnConflict,
-        transient_error::detect_transient_data_retrieval_error,
+        retriable_error::detect_retriable_data_retrieval_error,
     },
 };
 
@@ -147,7 +147,7 @@ impl DataSink for SqliteDataSink {
         let data_batches: Vec<RecordBatch> = data_batches_result
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
-            .map_err(detect_transient_data_retrieval_error)?;
+            .map_err(detect_retriable_data_retrieval_error)?;
 
         constraints::validate_batch_with_constraints(&data_batches, self.sqlite.constraints())
             .await

@@ -32,7 +32,7 @@ use deltalake::{protocol::SaveMode, DeltaOps, DeltaTable, DeltaTableError};
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::util::transient_error::detect_transient_data_retrieval_error;
+use crate::util::retriable_error::detect_retriable_data_retrieval_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -134,7 +134,7 @@ impl DataSink for DeltaTableDataSink {
     ) -> datafusion::common::Result<u64> {
         let mut num_rows = 0;
         while let Some(batch) = data.next().await {
-            let batch = batch.map_err(detect_transient_data_retrieval_error)?;
+            let batch = batch.map_err(detect_retriable_data_retrieval_error)?;
             num_rows += batch.num_rows() as u64;
             let _ = DeltaOps(self.delta_table.clone())
                 .write([batch])

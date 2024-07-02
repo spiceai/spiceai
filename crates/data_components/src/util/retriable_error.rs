@@ -18,7 +18,7 @@ use datafusion::error::DataFusionError;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
-pub enum TransientError {
+pub enum RetriableError {
     #[snafu(display("{source}"))]
     DataRetrievalError {
         source: datafusion::error::DataFusionError,
@@ -26,27 +26,27 @@ pub enum TransientError {
 }
 
 #[must_use]
-pub fn is_df_transient_error(err: &DataFusionError) -> bool {
+pub fn is_df_retriable_error(err: &DataFusionError) -> bool {
     match err {
-        DataFusionError::External(err) => return err.downcast_ref::<TransientError>().is_some(),
-        DataFusionError::Context(_, err) => is_df_transient_error(err.as_ref()),
+        DataFusionError::External(err) => return err.downcast_ref::<RetriableError>().is_some(),
+        DataFusionError::Context(_, err) => is_df_retriable_error(err.as_ref()),
         _ => false,
     }
 }
 
 #[must_use]
-pub fn detect_transient_data_retrieval_error(err: DataFusionError) -> DataFusionError {
-    // don't wrap as transient errors related to invalid SQL, schema, query plan, etc.
+pub fn detect_retriable_data_retrieval_error(err: DataFusionError) -> DataFusionError {
+    // don't wrap as retriable errors related to invalid SQL, schema, query plan, etc.
     if is_invalid_query_error(&err) {
         return err;
     }
 
-    // already wrapped transient error
-    if is_df_transient_error(&err) {
+    // already wrapped RetriableError
+    if is_df_retriable_error(&err) {
         return err;
     }
 
-    DataFusionError::External(Box::new(TransientError::DataRetrievalError { source: err }))
+    DataFusionError::External(Box::new(RetriableError::DataRetrievalError { source: err }))
 }
 
 fn is_invalid_query_error(error: &DataFusionError) -> bool {
