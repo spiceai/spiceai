@@ -71,6 +71,9 @@ tracing.workspace = true
 url = "2.5.0"
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+rdkafka = { version = "0.36.2", features = ["cmake-build"], optional = true }
+
 [features]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
 databricks = ["dep:deltalake", "spark_connect"]
