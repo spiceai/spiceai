@@ -24,7 +24,7 @@ Spice will use snmalloc as the default allocator.
 
 **Why**:
 
-- snamlloc fixes the issue of continual memory growth under the same workload that system allocator couldn't handle. (debian bookworm)
+- snmalloc fixes the issue of continual memory growth under the same workload that system allocator couldn't handle. (debian bookworm)
 - Benchmarks and resource monitoring indicate that using snmalloc in Spice yields slightly higher query throughput with Arrow acceleration and reduces 10%-20% memory usage comparing to jemalloc and mimalloc.
 - DataFusion, Spice's core dependency, mentions using snmalloc-rs as [optimized configuration](https://datafusion.apache.org/user-guide/example-usage.html).
 - snmalloc is actively maintained and supported by Microsoft.
@@ -37,4 +37,4 @@ To address this, Spice ensures compatibility with primary operating systems thro
 
 ## Consequences
 
-- Implement snamalloc as the `global_allocator` in `spiced` `main.rs` via the [snmalloc-rs](https://crates.io/crates/snmalloc-rs) crate.
+- Implement snmalloc as the `global_allocator` in `spiced` `main.rs` via the [snmalloc-rs](https://crates.io/crates/snmalloc-rs) crate.
