@@ -33,6 +33,7 @@ use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultsCacheProvider;
+use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
@@ -175,6 +176,9 @@ pub enum Error {
 
     #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
     AcceleratedReadWriteTableWithoutReplication,
+
+    #[snafu(display("An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."))]
+    AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
@@ -508,6 +512,20 @@ impl Runtime {
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
+        if let Some(acceleration) = &ds.acceleration {
+            if data_connector.resolve_refresh_mode(acceleration.refresh_mode)
+                == RefreshMode::Changes
+                && !data_connector.supports_changes_stream()
+            {
+                let err = AcceleratedTableInvalidChangesSnafu {
+                    dataset_name: ds.name.to_string(),
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+        }
+
         // test dataset connectivity by attempting to get a read provider
         let read_provider = match data_connector.read_provider(&ds).await {
             Ok(provider) => provider,
@@ -618,7 +636,7 @@ impl Runtime {
         match self.load_dataset_connector(ds).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
-                if ds.is_accelerated() {
+                if Self::accelerated_dataset_supports_hot_reload(ds, &*connector) {
                     tracing::info!("Updating accelerated dataset {}...", &ds.name);
                     if let Ok(()) = &self
                         .reload_accelerated_dataset(ds, Arc::clone(&connector))
@@ -646,6 +664,31 @@ impl Runtime {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
             }
         }
+    }
+
+    fn accelerated_dataset_supports_hot_reload(
+        ds: &Dataset,
+        connector: &dyn DataConnector,
+    ) -> bool {
+        let Some(acceleration) = &ds.acceleration else {
+            return false;
+        };
+
+        // Datasets that configure changes and are file-accelerated automatically keep track of changes that survive restarts.
+        // Thus we don't need to "hot reload" them to try to keep their data intact.
+        if connector.supports_changes_stream()
+            && ds.is_file_accelerated()
+            && connector.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes
+        {
+            return false;
+        }
+
+        // File accelerated datasets don't support hot reload.
+        if ds.is_file_accelerated() {
+            return false;
+        }
+
+        true
     }
 
     async fn reload_accelerated_dataset(
@@ -870,8 +913,7 @@ impl Runtime {
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     pub async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
-        let params = in_embed.params.clone().unwrap_or_default();
-        let params_with_secrets = self.get_params_with_secrets(&params).await?;
+        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
 
         let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
             .boxed()

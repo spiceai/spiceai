@@ -46,8 +46,12 @@ jobs:
 
       - name: Check if Cargo.lock is updated
         run: |
-          # If this fails, run `cargo update` and commit the changes
-          cargo check --locked
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
 
   build:
     name: Build Go & Rust
