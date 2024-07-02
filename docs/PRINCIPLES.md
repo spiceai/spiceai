@@ -11,6 +11,7 @@ Spice is built upon a foundation of first principles.
 - Composable from community driven-components
 - First class extensibility
 - Leverage model versioning
+- Align to industry standards
 
 ### Secure by default
 
@@ -42,3 +43,7 @@ Spice is designed to be extended. All components are behind well-defined interfa
 ### Leverage model versioning
 
 Spice supports pulling the models in specific versions defined in a Spicepod, which ensures your ML applications are comparable and traceable.
+
+### Align to industry standards
+
+Spice uses industry standards like Apache Arrow and ONNX to improve performance, compatibility, and usability by leveraging open-source innovations.
