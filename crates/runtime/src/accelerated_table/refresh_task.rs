@@ -221,8 +221,10 @@ impl RefreshTask {
         let overwrite = data_update.update_type == UpdateType::Overwrite;
 
         let refresh_stat: Arc<RwLock<Option<RefreshStat>>> = Arc::new(RwLock::new(None));
-        let is_data_receiving_err: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
         let schema = Arc::clone(&data_update.schema);
+
+        let (notify_refresh_stat_available, on_refresh_stat_available) =
+            oneshot::channel::<RefreshStat>();
 
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
@@ -231,10 +233,9 @@ impl RefreshTask {
                     data_update.data,
                     RefreshStat::default(),
                     dataset_name.to_string(),
-                    Arc::clone(&refresh_stat),
-                    Arc::clone(&is_data_receiving_err),
+                    notify_refresh_stat_available,
                 ),
-                move |(mut stream, mut stat, ds_name, stat_lock, is_err_lock)| async move {
+                move |(mut stream, mut stat, ds_name, notify_refresh_stat_available)| async move {
                     if let Some(batch) = stream.next().await {
                         match batch {
                             Ok(batch) => {
@@ -245,15 +246,20 @@ impl RefreshTask {
                                 );
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
-                                Some((Ok(batch), (stream, stat, ds_name, stat_lock, is_err_lock)))
+                                Some((
+                                    Ok(batch),
+                                    (stream, stat, ds_name, notify_refresh_stat_available),
+                                ))
                             }
-                            Err(err) => {
-                                *is_err_lock.write().await = true;
-                                Some((Err(err), (stream, stat, ds_name, stat_lock, is_err_lock)))
-                            }
+                            Err(err) => Some((
+                                Err(err),
+                                (stream, stat, ds_name, notify_refresh_stat_available),
+                            )),
                         }
                     } else {
-                        *stat_lock.write().await = Some(stat);
+                        if let Err(err)  = notify_refresh_stat_available.send(stat) {
+                            tracing::error!("Failed to send refresh stat: {err}");
+                        }
                         None
                     }
                 },
@@ -288,18 +294,10 @@ impl RefreshTask {
             tracing::warn!("Failed to update {dataset_name}: {e}");
             self.mark_dataset_status(status::ComponentStatus::Error)
                 .await;
-
-            let is_data_receiving_err = is_data_receiving_err.read().await;
-            if *is_data_receiving_err {
-                return Err(retry_from_df_error(e));
-            }
-            // data acceleration error
-            return Err(RetryError::permanent(super::Error::FailedToWriteData {
-                source: e,
-            }));
+            return Err(retry_from_df_error(e));
         }
 
-        if let Some(refresh_stat) = refresh_stat.read().await.clone() {
+        if let Ok(refresh_stat) = on_refresh_stat_available.try_recv() {
             self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size);
         }
 
