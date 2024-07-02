@@ -47,6 +47,8 @@ jobs:
       - name: Check if Cargo.lock is updated
         run: |
           if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
             echo "Update Cargo.lock"
             exit 1
           fi
