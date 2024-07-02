@@ -47,7 +47,16 @@ pub struct DuckDB {
     file_factory: Option<Arc<DuckDBTableFactory>>,
     memory_factory: DuckDBTableFactory,
 }
+
 impl DuckDB {
+    /// Returns true if the [`Dataset`] should be loaded in the in-memory [`DuckDbConnectionPool`].
+    pub(crate) fn use_memory(dataset: &Dataset) -> bool {
+        let path: TableReference = dataset.path().into();
+        let has_db_file = dataset.params.contains_key("open");
+
+        !has_db_file && is_table_function(&path)
+    }
+
     pub(crate) fn create_in_memory() -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory(&AccessMode::Automatic).map_err(|source| {
@@ -113,10 +122,7 @@ impl DataConnector for DuckDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let path: TableReference = dataset.path().into();
-
-        // Load DuckDB functions in an in-memory pool, otherwise expect a file.
-        let factory = if is_table_function(&path) {
+        let factory = if Self::use_memory(dataset) {
             &self.memory_factory
         } else {
             &self
@@ -128,10 +134,10 @@ impl DataConnector for DuckDB {
                 })?
         };
 
-        Ok(Read::table_provider(factory, path).await.context(
-            super::UnableToGetReadProviderSnafu {
+        Ok(Read::table_provider(factory, dataset.path().into())
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "duckdb",
-            },
-        )?)
+            })?)
     }
 }
