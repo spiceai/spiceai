@@ -22,6 +22,7 @@ use async_stream::stream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
@@ -73,6 +74,24 @@ impl StreamingDataUpdate {
             schema: self.schema,
             data,
             update_type: self.update_type,
+        })
+    }
+}
+
+impl TryFrom<DataUpdate> for StreamingDataUpdate {
+    type Error = DataFusionError;
+
+    fn try_from(data_update: DataUpdate) -> std::result::Result<Self, Self::Error> {
+        let schema = Arc::clone(&data_update.schema);
+        let data = Box::pin(MemoryStream::try_new(
+            data_update.data,
+            data_update.schema,
+            None,
+        )?) as SendableRecordBatchStream;
+        Ok(Self {
+            schema,
+            data,
+            update_type: data_update.update_type,
         })
     }
 }
