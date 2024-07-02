@@ -41,6 +41,7 @@ use futures::StreamExt;
 use tokio::sync::RwLock;
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::util::transient_error::detect_transient_data_retrieval_error;
 
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
@@ -251,7 +252,12 @@ impl DataSink for MemSink {
         let mut new_batches = vec![vec![]; num_partitions];
         let mut i = 0;
         let mut row_count = 0;
-        while let Some(batch) = data.next().await.transpose()? {
+        while let Some(batch) = data
+            .next()
+            .await
+            .transpose()
+            .map_err(detect_transient_data_retrieval_error)?
+        {
             row_count += batch.num_rows();
             new_batches[i].push(batch);
             i = (i + 1) % num_partitions;

@@ -21,6 +21,9 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
+use data_components::util::transient_error::{
+    detect_transient_data_retrieval_error, is_df_transient_error,
+};
 use futures::{stream, Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -294,7 +297,7 @@ impl RefreshTask {
         };
 
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
-            tracing::warn!("Failed to update {dataset_name}: {e}");
+            tracing::warn!("Failed to update dataset {dataset_name}: {e}");
             self.mark_dataset_status(status::ComponentStatus::Error)
                 .await;
             return Err(retry_from_df_error(e));
@@ -497,7 +500,8 @@ impl RefreshTask {
             sql,
             filters.clone(),
         )
-        .await;
+        .await
+        .map_err(detect_transient_data_retrieval_error);
 
         match get_data_result {
             Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
@@ -765,22 +769,11 @@ fn filter_records(
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
 }
 
-fn should_retry_df_error(error: &DataFusionError) -> bool {
-    match error {
-        DataFusionError::Context(_, err) => should_retry_df_error(err.as_ref()),
-        DataFusionError::SQL(..) | DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
-            false
-        }
-        _ => true,
-    }
-}
-
 fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
-    if should_retry_df_error(&error) {
-        RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error })
-    } else {
-        RetryError::permanent(super::Error::UnableToGetDataFromConnector { source: error })
+    if is_df_transient_error(&error) {
+        return RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error });
     }
+    RetryError::permanent(super::Error::FailedToRefreshDataset { source: error })
 }
 
 fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {

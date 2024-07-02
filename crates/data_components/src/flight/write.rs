@@ -33,6 +33,8 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
+use crate::util::transient_error::detect_transient_data_retrieval_error;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to publish data to Flight endpoint: {source}"))]
@@ -130,7 +132,7 @@ impl DataSink for FlightDataSink {
         let mut flight_client = self.flight_client.clone();
 
         while let Some(batch) = data.next().await {
-            let batch = batch?;
+            let batch = batch.map_err(detect_transient_data_retrieval_error)?;
             num_rows += batch.num_rows() as u64;
 
             flight_client

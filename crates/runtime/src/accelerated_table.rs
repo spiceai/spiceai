@@ -59,6 +59,9 @@ pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
+    #[snafu(display("Dataset refresh failed with error: {source}"))]
+    FailedToRefreshDataset { source: DataFusionError },
+
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
         source: datafusion::error::DataFusionError,
