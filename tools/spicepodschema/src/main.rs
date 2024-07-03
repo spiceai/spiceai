@@ -16,14 +16,24 @@ limitations under the License.
 
 use schemars::schema_for;
 use spicepod::spec::SpicepodDefinition;
+use std::env;
 use std::fs::File;
 use std::io::Write;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() != 2 {
+        eprintln!("Usage: {} <output_filename>", args[0]);
+        std::process::exit(1);
+    }
+
+    let output_filename = &args[1];
+
     let schema = schema_for!(SpicepodDefinition);
     let json_schema = serde_json::to_string_pretty(&schema).unwrap();
 
-    let mut file = File::create("spicepod_schema.json").expect("Unable to create file");
+    let mut file = File::create(output_filename).expect("Unable to create file");
     file.write_all(json_schema.as_bytes())
         .expect("Unable to write data");
 }

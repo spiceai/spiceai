@@ -1,4 +1,3 @@
-
 name: Generate Spicepod JSON schema
 
 on:
@@ -14,28 +13,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
-    - name: Set up Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        override: true
+    - run: rustup toolchain install stable --profile minimal
 
     - name: Build Cargo project
       run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 
     - name: Run Cargo project
-      run: cargo run --manifest-path tools/spicepodschema/Cargo.toml
+      run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- spicepod-schema.json
 
     - name: Verify JSON schema file
       run: |
-        if [ -f "spicepod_schema.json" ]; then
+        if [ -f "spicepod-schema.json" ]; then
           echo "spicepod_schema.json file was successfully created."
           cat spicepod_schema.json
         else
           echo "spicepod_schema.json file was not created."
           exit 1
         fi
+
+    - name: Upload JSON schema artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: spicepod-schema
+        path: spicepod-schema.json
