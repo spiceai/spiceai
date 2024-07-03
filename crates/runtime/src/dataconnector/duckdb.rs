@@ -20,8 +20,6 @@ use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
-use db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -44,19 +42,10 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDB {
-    file_factory: Option<Arc<DuckDBTableFactory>>,
-    memory_factory: DuckDBTableFactory,
+    factory: DuckDBTableFactory,
 }
 
 impl DuckDB {
-    /// Returns true if the [`Dataset`] should be loaded in the in-memory [`DuckDbConnectionPool`].
-    pub(crate) fn use_memory(dataset: &Dataset) -> bool {
-        let path: TableReference = dataset.path().into();
-        let has_db_file = dataset.params.contains_key("open");
-
-        !has_db_file && is_table_function(&path)
-    }
-
     pub(crate) fn create_in_memory() -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory(&AccessMode::Automatic).map_err(|source| {
@@ -90,24 +79,13 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let file_factory = if let Some(db_path) = params.get("open") {
-                let file_factory = Self::create_file(db_path)?;
-                Some(Arc::new(file_factory))
+            let factory = if let Some(db_path) = params.get("open") {
+                Self::create_file(db_path)?
             } else {
-                None
+                Self::create_in_memory()?
             };
 
-            let memory_factory = Self::create_in_memory().map_err(|e| {
-                DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "duckdb".to_string(),
-                    source: e,
-                }
-            })?;
-
-            Ok(Arc::new(Self {
-                file_factory,
-                memory_factory,
-            }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Self { factory }) as Arc<dyn DataConnector>)
         })
     }
 }
@@ -122,18 +100,7 @@ impl DataConnector for DuckDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let factory = if Self::use_memory(dataset) {
-            &self.memory_factory
-        } else {
-            self.file_factory
-                .as_ref()
-                .ok_or(DataConnectorError::InternalWithSource {
-                    dataconnector: "duckdb".to_string(),
-                    source: Box::new(Error::MissingDuckDBFile {}),
-                })?
-        };
-
-        Ok(Read::table_provider(factory, dataset.path().into())
+        Ok(Read::table_provider(&self.factory, dataset.path().into())
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "duckdb",
