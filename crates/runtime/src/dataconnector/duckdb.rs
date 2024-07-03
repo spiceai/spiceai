@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
+use db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -100,12 +102,19 @@ impl DataConnector for DuckDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.duckdb_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "duckdb",
-                })?,
-        )
+        let path: TableReference = dataset.path().into();
+
+        if !(is_table_function(&path) || dataset.params.contains_key("open")) {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "duckdb".to_string(),
+                source: Box::new(Error::MissingDuckDBFile {}),
+            });
+        }
+
+        Ok(Read::table_provider(&self.duckdb_factory, path)
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "duckdb",
+            })?)
     }
 }
