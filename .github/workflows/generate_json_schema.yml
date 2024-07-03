@@ -3,8 +3,6 @@ name: Generate Spicepod JSON schema
 on:
   push:
     branches: [ trunk ]
-  pull_request:
-    branches: [ trunk ]
   workflow_dispatch:
 
 jobs:
