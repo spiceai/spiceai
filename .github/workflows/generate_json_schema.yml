@@ -3,6 +3,9 @@ name: Generate Spicepod JSON schema
 on:
   push:
     branches: [ trunk ]
+    paths:
+      - 'crates/spicepod/**'
+
   workflow_dispatch:
 
 jobs:
@@ -18,20 +21,38 @@ jobs:
       run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 
     - name: Run Cargo project
-      run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- spicepod-schema.json
+      run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
 
     - name: Verify JSON schema file
       run: |
-        if [ -f "spicepod-schema.json" ]; then
-          echo "spicepod-schema.json file was successfully created."
-          cat spicepod-schema.json
+        if [ -f ".schema/spicepod.schema.json" ]; then
+          echo ".schema/spicepod.schema.json file was successfully created."
+          cat .schema/spicepod.schema.json
         else
-          echo "spicepod-schema.json file was not created."
+          echo ".schema/spicepod.schema.json file was not created."
           exit 1
         fi
 
     - name: Upload JSON schema artifact
       uses: actions/upload-artifact@v3
       with:
-        name: spicepod-schema
-        path: spicepod-schema.json
+        name: spicepod.schema
+        path: .schema/spicepod.schema.json
+
+    - name: Create PR
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        git config --global user.name 'Spice Schema Bot'
+        git config --global user.email 'schema-bot@spice.ai'
+        git checkout -b schema/${GITHUB_RUN_ID}
+        git diff .schema/spicepod.schema.json
+        if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
+          git add .schema/spicepod.schema.json
+          git commit -m "Update spicepod.schema.json"
+          git push origin schema/${GITHUB_RUN_ID}
+          gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
+        else
+          echo "No changes detected"
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
