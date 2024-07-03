@@ -79,15 +79,13 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let factory = if let Some(db_path) = params.get("open") {
+            let duckdb_factory = if let Some(db_path) = params.get("open") {
                 Self::create_file(db_path)?
             } else {
                 Self::create_in_memory()?
             };
 
-            Ok(Arc::new(Self {
-                duckdb_factory: factory,
-            }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
         })
     }
 }
