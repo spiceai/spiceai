@@ -125,13 +125,10 @@ impl DataConnector for DuckDB {
         let factory = if Self::use_memory(dataset) {
             &self.memory_factory
         } else {
-            &self
-                .file_factory
-                .clone()
-                .ok_or(DataConnectorError::InternalWithSource {
-                    dataconnector: "duckdb".to_string(),
-                    source: Box::new(Error::MissingDuckDBFile {}),
-                })?
+            self.file_factory.as_ref().ok_or(DataConnectorError::InternalWithSource {
+                dataconnector: "duckdb".to_string(),
+                source: Box::new(Error::MissingDuckDBFile {}),
+            })?
         };
 
         Ok(Read::table_provider(factory, dataset.path().into())
