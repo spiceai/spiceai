@@ -34,7 +34,7 @@ use snafu::prelude::*;
 
 use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
-    util::{constraints, on_conflict::OnConflict},
+    util::{constraints, on_conflict::OnConflict, retriable_error::check_and_mark_retriable_error},
 };
 
 use super::{to_datafusion_error, Postgres};
@@ -203,7 +203,7 @@ impl DataSink for PostgresDataSink {
         }
 
         while let Some(batch) = data.next().await {
-            let batch = batch?;
+            let batch = batch.map_err(check_and_mark_retriable_error)?;
             let batch_num_rows = batch.num_rows();
 
             if batch_num_rows == 0 {

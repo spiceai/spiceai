@@ -32,6 +32,8 @@ use deltalake::{protocol::SaveMode, DeltaOps, DeltaTable, DeltaTableError};
 use futures::StreamExt;
 use snafu::prelude::*;
 
+use crate::util::retriable_error::check_and_mark_retriable_error;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to get Delta Lake table state"))]
@@ -132,7 +134,7 @@ impl DataSink for DeltaTableDataSink {
     ) -> datafusion::common::Result<u64> {
         let mut num_rows = 0;
         while let Some(batch) = data.next().await {
-            let batch = batch?;
+            let batch = batch.map_err(check_and_mark_retriable_error)?;
             num_rows += batch.num_rows() as u64;
             let _ = DeltaOps(self.delta_table.clone())
                 .write([batch])
