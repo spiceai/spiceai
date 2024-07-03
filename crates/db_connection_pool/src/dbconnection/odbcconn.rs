@@ -17,6 +17,7 @@ limitations under the License.
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -24,13 +25,17 @@ use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
+use async_stream::stream;
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use futures::lock::Mutex;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
+use odbc_api::parameter::CElement;
 use odbc_api::parameter::InputParameter;
 use odbc_api::Cursor;
 use odbc_api::CursorImpl;
@@ -42,14 +47,15 @@ use crate::DbConnectionPool;
 
 use super::AsyncDbConnection;
 use super::DbConnection;
+use super::GenericError;
 use super::Result;
 use odbc_api::Connection;
 
-pub trait ODBCSyncParameter: InputParameter + Sync {
+pub trait ODBCSyncParameter: InputParameter + Sync + Send + Clone {
     fn as_input_parameter(&self) -> &dyn InputParameter;
 }
 
-impl<T: InputParameter + Sync> ODBCSyncParameter for T {
+impl<T: InputParameter + Sync + Send + Clone> ODBCSyncParameter for T {
     fn as_input_parameter(&self) -> &dyn InputParameter {
         self
     }
@@ -72,6 +78,8 @@ pub enum Error {
     TryFromError { source: std::num::TryFromIntError },
     #[snafu(display("Unable to bind integer parameter: {source}"))]
     UnableToBindIntParameter { source: std::num::TryFromIntError },
+    #[snafu(display("Internal communication channel error: {message}"))]
+    ChannelError { message: String },
 }
 
 pub struct ODBCConnection<'a> {
@@ -79,7 +87,7 @@ pub struct ODBCConnection<'a> {
     pub params: Arc<HashMap<String, SecretString>>,
 }
 
-impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
+impl<'a, P: ODBCSyncParameter + 'static> DbConnection<Connection<'a>, P> for ODBCConnection<'a>
 where
     'a: 'static,
 {
@@ -91,13 +99,13 @@ where
         self
     }
 
-    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Connection<'a>, ODBCParameter>> {
+    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Connection<'a>, P>> {
         Some(self)
     }
 }
 
 #[async_trait]
-impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
+impl<'a, P: ODBCSyncParameter + 'static> AsyncDbConnection<Connection<'a>, P> for ODBCConnection<'a>
 where
     'a: 'static,
 {
@@ -132,34 +140,90 @@ where
         Ok(schema)
     }
 
-    async fn query_arrow(
-        &self,
-        sql: &str,
-        params: &[ODBCParameter],
-    ) -> Result<SendableRecordBatchStream> {
-        let cxn = self.conn.lock().await;
-        let mut prepared = cxn.prepare(sql)?;
-        let schema = Arc::new(arrow_schema_from(&mut prepared)?);
-        let mut statement = prepared.into_statement();
+    async fn query_arrow(&self, sql: &str, params: &[P]) -> Result<SendableRecordBatchStream> {
+        let (batch_tx, batch_rx): (
+            flume::Sender<Result<RecordBatch, Error>>,
+            flume::Receiver<Result<RecordBatch, Error>>,
+        ) = flume::unbounded();
 
-        bind_parameters(&mut statement, params)?;
+        let (schema_tx, schema_rx): (flume::Sender<Arc<Schema>>, flume::Receiver<Arc<Schema>>) =
+            flume::unbounded();
 
-        // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
-        let cursor = unsafe {
-            statement.execute().unwrap();
-            CursorImpl::new(statement.as_stmt_ref())
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+
+        let params = params.iter().map(|p| p.clone()).collect::<Vec<_>>();
+
+        let secrets = self.params.clone();
+
+        tokio::spawn(async move {
+            let cxn = conn.lock().await;
+            let mut prepared = cxn.prepare(&sql)?;
+            let schema = Arc::new(arrow_schema_from(&mut prepared)?);
+            match schema_tx.send(Arc::clone(&schema)) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Error::ChannelError {
+                        message: format!("{e}"),
+                    }
+                    .into())
+                }
+            };
+
+            let mut statement = prepared.into_statement();
+
+            bind_parameters(&mut statement, &params[..])?;
+
+            // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
+            let cursor = unsafe {
+                statement.execute().unwrap();
+                CursorImpl::new(statement.as_stmt_ref())
+            };
+
+            let reader = build_odbc_reader(cursor, &schema, &secrets)?;
+            for batch in reader {
+                match batch_tx.send(batch.context(ArrowSnafu)) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(Error::ChannelError {
+                            message: format!("{e}"),
+                        }
+                        .into())
+                    }
+                };
+            }
+
+            Ok::<_, GenericError>(())
+        });
+
+        let schema = match schema_rx.recv_async().await {
+            Ok(s) => Ok::<_, GenericError>(s),
+            Err(e) => Err(Error::ChannelError {
+                message: format!("{e}"),
+            }
+            .into()),
+        }?;
+
+        let output_stream = stream! {
+            while let Ok(batch) = batch_rx.recv_timeout(Duration::from_secs(5)) {
+                match batch {
+                    Ok(batch) => yield Ok(batch),
+                    Err(e) => {
+                        yield Err(DataFusionError::Execution(format!(
+                            "Failed to read ODBC batch: {e}"
+                        )))
+                    }
+                }
+            }
         };
 
-        let reader = build_odbc_reader(cursor, &schema, &self.params)?;
-        let mut results: Vec<RecordBatch> = vec![];
-        for batch in reader {
-            results.push(batch.context(ArrowSnafu)?);
-        }
-
-        Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            output_stream,
+        )))
     }
 
-    async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
+    async fn execute(&self, query: &str, params: &[P]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
@@ -212,7 +276,10 @@ fn build_odbc_reader<C: Cursor>(
 /// Binds parameter to an ODBC statement.
 ///
 /// `StatementImpl<'_>::bind_input_parameter` is unsafe.
-fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<()> {
+fn bind_parameters<P: ODBCSyncParameter>(
+    statement: &mut StatementImpl,
+    params: &[P],
+) -> Result<()> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
             statement
