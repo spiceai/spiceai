@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_yaml::{self, Value};
 use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, fmt::Debug};
 
@@ -27,6 +28,7 @@ use crate::component::{
 };
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
     V1Beta1,
@@ -38,12 +40,19 @@ impl Display for SpicepodVersion {
     }
 }
 
+/// # Spicepod Definition
+///
+/// A Spicepod definition is a YAML file that describes a Spicepod.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SpicepodDefinition {
+    /// The name of the Spicepod
     pub name: String,
 
+    /// The version of the Spicepod
     pub version: SpicepodVersion,
 
+    /// The kind of Spicepod
     pub kind: SpicepodKind,
 
     /// Optional runtime configuration
@@ -60,10 +69,9 @@ pub struct SpicepodDefinition {
     #[serde(default)]
     pub secrets: Secrets,
 
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    #[serde(default)]
-    pub metadata: HashMap<String, Value>,
-
+    // #[serde(skip_serializing_if = "HashMap::is_empty")]
+    // #[serde(default)]
+    // pub metadata: HashMap<String, Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub datasets: Vec<ComponentOrReference<Dataset>>,
@@ -86,6 +94,7 @@ pub struct SpicepodDefinition {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum SpicepodKind {
     Spicepod,
 }
