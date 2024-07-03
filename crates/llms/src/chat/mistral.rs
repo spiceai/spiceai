@@ -14,23 +14,40 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use super::{message_to_content, Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::{
+        ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionRequest,
+        CreateChatCompletionResponse, Role,
+    },
+};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mistralrs::{
     Constraint, Device, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder,
-    NormalRequest, Request as MistralRequest, RequestMessage, Response as MistralResponse,
-    SamplingParams, SchedulerMethod, TokenSource,
+    GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, ModelDType,
+    NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage,
+    Response as MistralResponse, SamplingParams, SchedulerMethod, TokenSource, Usage,
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use snafu::ResultExt;
-use std::{path::Path, pin::Pin, str::FromStr, sync::Arc};
+use std::{
+    path::Path,
+    pin::Pin,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::mpsc::{channel, Sender};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
+    counter: AtomicUsize,
 }
 
 impl MistralLlama {
@@ -75,6 +92,8 @@ impl MistralLlama {
             None,
             None,
             None,
+            None,
+            None,
         ))
     }
 
@@ -94,7 +113,7 @@ impl MistralLlama {
         .build()
         .load_model_from_path(
             &paths,
-            None,
+            &ModelDType::Auto,
             device,
             false,
             DeviceMapMetadata::dummy(),
@@ -120,7 +139,7 @@ impl MistralLlama {
         .build()
         .load_model_from_path(
             &paths,
-            None,
+            &ModelDType::Auto,
             device,
             false,
             DeviceMapMetadata::dummy(),
@@ -163,6 +182,7 @@ impl MistralLlama {
 
         Self::from_pipeline(pipeline)
     }
+
     fn get_device() -> Device {
         let default_device = {
             #[cfg(feature = "metal")]
@@ -196,14 +216,14 @@ impl MistralLlama {
             None,
             Some(model_parts[0].to_string()),
         );
-
+        let device = Self::get_device();
         let pipeline = builder
             .build(loader_type)
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
                 TokenSource::CacheToken,
-                None,
-                &Device::Cpu,
+                &ModelDType::Auto,
+                &device,
                 false,
                 DeviceMapMetadata::dummy(),
                 None,
@@ -222,30 +242,66 @@ impl MistralLlama {
                 })?),
             )
             .build(),
+            counter: AtomicUsize::new(0),
         })
     }
-}
 
-fn to_mistralrs_request(
-    prompt: String,
-    is_streaming: bool,
-    tx: Sender<MistralResponse>,
-) -> MistralRequest {
-    MistralRequest::Normal(NormalRequest {
-        messages: RequestMessage::Completion {
-            text: prompt,
-            echo_prompt: false,
-            best_of: 1,
-        },
-        sampling_params: SamplingParams::default(),
-        response: tx,
-        return_logprobs: false,
-        is_streaming,
-        id: 0,
-        constraint: Constraint::None,
-        suffix: None,
-        adapters: None,
-    })
+    fn to_mistralrs_request(
+        &self,
+        prompt: String,
+        is_streaming: bool,
+        tx: Sender<MistralResponse>,
+    ) -> MistralRequest {
+        MistralRequest::Normal(NormalRequest {
+            messages: RequestMessage::Completion {
+                text: prompt,
+                echo_prompt: false,
+                best_of: 1,
+            },
+            sampling_params: SamplingParams::default(),
+            response: tx,
+            return_logprobs: false,
+            is_streaming,
+            id: self.counter.fetch_add(1, Ordering::SeqCst),
+            constraint: Constraint::None,
+            suffix: None,
+            adapters: None,
+        })
+    }
+
+    async fn run_internal(&mut self, prompt: String) -> Result<Option<(String, Usage)>> {
+        let (snd, mut rcv) = channel::<MistralResponse>(10_000);
+        tracing::trace!("Sending request to pipeline");
+        self.pipeline
+            .get_sender()
+            .boxed()
+            .context(FailedToRunModelSnafu)?
+            .send(self.to_mistralrs_request(prompt, false, snd))
+            .await
+            .boxed()
+            .context(FailedToRunModelSnafu)?;
+        tracing::trace!("Request sent!");
+        match rcv.recv().await {
+            Some(response) => match response {
+                MistralResponse::CompletionDone(cr) => {
+                    let payload = cr.choices[0].text.clone();
+                    let usage = cr.usage;
+                    Ok(Some((payload, usage)))
+                }
+                MistralResponse::CompletionModelError(err_msg, _cr) => {
+                    Err(ChatError::FailedToRunModel {
+                        source: err_msg.into(),
+                    })
+                }
+                _ => Err(ChatError::FailedToRunModel {
+                    source: "Unexpected error occurred".into(),
+                }),
+            },
+            None => Err(ChatError::FailedToRunModel {
+                source: "Mistral pipeline unexpectedly closed".into(),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -263,7 +319,9 @@ impl Chat for MistralLlama {
         tracing::trace!("Sending request to pipeline");
         self.pipeline
             .get_sender()
-            .send(to_mistralrs_request(prompt, true, snd))
+            .boxed()
+            .context(FailedToRunModelSnafu)?
+            .send(self.to_mistralrs_request(prompt, true, snd))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
@@ -272,6 +330,17 @@ impl Chat for MistralLlama {
             while let Some(resp) = rcv.recv().await {
                 tracing::trace!("Received response from pipeline");
                 match resp {
+                    MistralResponse::CompletionChunk(chunk) => {
+                        if let Some(choice) = chunk.choices.first() {
+                            yield Ok(Some(choice.text.clone()));
+                            if choice.finish_reason.is_some() {
+                                break;
+                            }
+                        } else {
+                            yield Ok(None);
+                            break;
+                        }
+                    },
                     MistralResponse::Chunk(chunk) => {
                         if let Some(choice) = chunk.choices.first() {
                             yield Ok(Some(choice.delta.content.clone()));
@@ -307,30 +376,70 @@ impl Chat for MistralLlama {
     }
 
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
-        let (snd, mut rcv) = channel::<MistralResponse>(10_000);
-        tracing::trace!("Sending request to pipeline");
-        self.pipeline
-            .get_sender()
-            .send(to_mistralrs_request(prompt, false, snd))
-            .await
-            .boxed()
-            .context(FailedToRunModelSnafu)?;
-        tracing::trace!("Request sent!");
-        match rcv.recv().await {
-            Some(response) => match response {
-                MistralResponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
-                MistralResponse::CompletionModelError(err_msg, _cr) => {
-                    Err(ChatError::FailedToRunModel {
-                        source: err_msg.into(),
-                    })
-                }
-                _ => Err(ChatError::FailedToRunModel {
-                    source: "Unexpected error occurred".into(),
-                }),
-            },
-            None => Err(ChatError::FailedToRunModel {
-                source: "Mistral pipeline unexpectedly closed".into(),
-            }),
+        match self.run_internal(prompt).await? {
+            Some((response, _usage)) => Ok(Some(response)),
+            None => Ok(None),
         }
+    }
+
+    #[allow(deprecated, clippy::cast_possible_truncation)]
+    async fn chat_request(
+        &mut self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let model_id = req.model.clone();
+        let prompt = req
+            .messages
+            .iter()
+            .map(message_to_content)
+            .collect::<Vec<String>>()
+            .join("\n");
+        let (choices, usage): (Vec<ChatChoice>, Option<Usage>) =
+            match self.run_internal(prompt).await.map_err(|e| {
+                OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                })
+            })? {
+                Some((resp, usage)) => {
+                    let choice = vec![ChatChoice {
+                        message: ChatCompletionResponseMessage {
+                            content: Some(resp),
+                            tool_calls: None,
+                            role: Role::System,
+                            function_call: None,
+                        },
+                        index: 0,
+                        finish_reason: None,
+                        logprobs: None,
+                    }];
+                    (choice, Some(usage))
+                }
+                None => (vec![], None),
+            };
+
+        Ok(CreateChatCompletionResponse {
+            id: format!(
+                "{}-{}",
+                model_id.clone(),
+                thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(10)
+                    .map(char::from)
+                    .collect::<String>()
+            ),
+            choices,
+            model: model_id,
+            created: 0,
+            system_fingerprint: None,
+            object: "list".to_string(),
+            usage: usage.map(|u| CompletionUsage {
+                prompt_tokens: u.prompt_tokens as u32,
+                completion_tokens: u.completion_tokens as u32,
+                total_tokens: u.total_tokens as u32,
+            }),
+        })
     }
 }
