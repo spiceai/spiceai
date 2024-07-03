@@ -42,7 +42,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDB {
-    factory: DuckDBTableFactory,
+    duckdb_factory: DuckDBTableFactory,
 }
 
 impl DuckDB {
@@ -85,7 +85,7 @@ impl DataConnectorFactory for DuckDB {
                 Self::create_in_memory()?
             };
 
-            Ok(Arc::new(Self { factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Self { duckdb_factory: factory }) as Arc<dyn DataConnector>)
         })
     }
 }
@@ -100,7 +100,7 @@ impl DataConnector for DuckDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(&self.factory, dataset.path().into())
+        Ok(Read::table_provider(&self.duckdb_factory, dataset.path().into())
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "duckdb",
