@@ -85,6 +85,11 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
         }
     };
 
+    let data_update = data_update
+        .collect_data()
+        .await
+        .expect("should convert to DataUpdate");
+
     assert_eq!(data_update.data.len(), 1);
     assert_eq!(data_update.data[0].num_rows(), 0);
 
