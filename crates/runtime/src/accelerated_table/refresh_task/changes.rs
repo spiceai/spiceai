@@ -15,10 +15,7 @@ limitations under the License.
 */
 
 use super::RefreshTask;
-use crate::{
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
-    status,
-};
+use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use cache::QueryResultsCacheProvider;
@@ -26,8 +23,9 @@ use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{col, Expr};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -165,15 +163,16 @@ impl RefreshTask {
                         Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
                     );
 
+                    let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
+                        inner_data.schema(),
+                        Box::pin(stream::once(async { Ok(inner_data) })),
+                    ));
+
                     let insert_plan = self
                         .accelerator
                         .insert_into(
                             &session_state,
-                            Arc::new(DataUpdateExecutionPlan::new(DataUpdate {
-                                schema: inner_data.schema(),
-                                data: vec![inner_data],
-                                update_type: UpdateType::Append,
-                            })),
+                            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
                             false,
                         )
                         .await

@@ -33,6 +33,7 @@ use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
@@ -329,7 +330,7 @@ pub async fn get_data(
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,
-) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>), DataFusionError> {
+) -> Result<(SchemaRef, SendableRecordBatchStream), DataFusionError> {
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -345,9 +346,8 @@ pub async fn get_data(
         df = df.filter(filter)?;
     }
 
-    let batches = df.collect().await?;
-
-    Ok((table_provider.schema(), batches))
+    let record_batch_stream = df.execute_stream().await?;
+    Ok((table_provider.schema(), record_batch_stream))
 }
 
 pub trait ListingTableConnector: DataConnector {
