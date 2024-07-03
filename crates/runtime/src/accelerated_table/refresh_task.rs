@@ -21,9 +21,7 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::util::retriable_error::{
-    detect_retriable_data_retrieval_error, is_df_retriable_error,
-};
+use data_components::util::retriable_error::{check_and_mark_retriable_error, is_retriable_error};
 use futures::{stream, Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -501,7 +499,7 @@ impl RefreshTask {
             filters.clone(),
         )
         .await
-        .map_err(detect_retriable_data_retrieval_error);
+        .map_err(check_and_mark_retriable_error);
 
         match get_data_result {
             Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
@@ -770,7 +768,7 @@ fn filter_records(
 }
 
 fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
-    if is_df_retriable_error(&error) {
+    if is_retriable_error(&error) {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error });
     }
     RetryError::permanent(super::Error::FailedToRefreshDataset { source: error })
