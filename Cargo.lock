@@ -2970,6 +2970,7 @@ dependencies = [
  "clickhouse-rs",
  "datafusion",
  "duckdb",
+ "dyn-clone",
  "flume",
  "futures",
  "lazy_static",

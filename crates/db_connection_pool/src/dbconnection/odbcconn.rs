@@ -17,7 +17,6 @@ limitations under the License.
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -29,13 +28,12 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+use dyn_clone::DynClone;
 use futures::lock::Mutex;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
-use odbc_api::parameter::CElement;
 use odbc_api::parameter::InputParameter;
 use odbc_api::Cursor;
 use odbc_api::CursorImpl;
@@ -51,15 +49,17 @@ use super::GenericError;
 use super::Result;
 use odbc_api::Connection;
 
-pub trait ODBCSyncParameter: InputParameter + Sync + Send + Clone {
+pub trait ODBCSyncParameter: InputParameter + Sync + Send + DynClone {
     fn as_input_parameter(&self) -> &dyn InputParameter;
 }
 
-impl<T: InputParameter + Sync + Send + Clone> ODBCSyncParameter for T {
+impl<T: InputParameter + Sync + Send + DynClone> ODBCSyncParameter for T {
     fn as_input_parameter(&self) -> &dyn InputParameter {
         self
     }
 }
+
+dyn_clone::clone_trait_object!(ODBCSyncParameter);
 
 pub type ODBCParameter = Box<dyn ODBCSyncParameter>;
 pub type ODBCDbConnection<'a> = (dyn DbConnection<Connection<'a>, ODBCParameter>);
@@ -87,7 +87,7 @@ pub struct ODBCConnection<'a> {
     pub params: Arc<HashMap<String, SecretString>>,
 }
 
-impl<'a, P: ODBCSyncParameter + 'static> DbConnection<Connection<'a>, P> for ODBCConnection<'a>
+impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
@@ -99,13 +99,13 @@ where
         self
     }
 
-    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Connection<'a>, P>> {
+    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Connection<'a>, ODBCParameter>> {
         Some(self)
     }
 }
 
 #[async_trait]
-impl<'a, P: ODBCSyncParameter + 'static> AsyncDbConnection<Connection<'a>, P> for ODBCConnection<'a>
+impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
@@ -140,7 +140,12 @@ where
         Ok(schema)
     }
 
-    async fn query_arrow(&self, sql: &str, params: &[P]) -> Result<SendableRecordBatchStream> {
+    async fn query_arrow(
+        &self,
+        sql: &str,
+        params: &[ODBCParameter],
+    ) -> Result<SendableRecordBatchStream> {
+        // prepare some flume channels to communicate query results back from the thread
         let (batch_tx, batch_rx): (
             flume::Sender<Result<RecordBatch, Error>>,
             flume::Receiver<Result<RecordBatch, Error>>,
@@ -149,19 +154,21 @@ where
         let (schema_tx, schema_rx): (flume::Sender<Arc<Schema>>, flume::Receiver<Arc<Schema>>) =
             flume::unbounded();
 
-        let conn = self.conn.clone();
+        // clone internals and parameters to let the thread own them
+        let conn = Arc::clone(&self.conn); // clones the mutex not the connection, so we can .lock a connection inside the thread
         let sql = sql.to_string();
 
-        let params = params.iter().map(|p| p.clone()).collect::<Vec<_>>();
-
-        let secrets = self.params.clone();
+        // ODBCParameter is a dynamic trait object, so we can't use std::clone::Clone because it's not object safe
+        // DynClone provides an object-safe clone trait, which we use to clone the boxed parameters
+        let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
+        let secrets = Arc::clone(&self.params);
 
         tokio::spawn(async move {
             let cxn = conn.lock().await;
             let mut prepared = cxn.prepare(&sql)?;
             let schema = Arc::new(arrow_schema_from(&mut prepared)?);
             match schema_tx.send(Arc::clone(&schema)) {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) => {
                     return Err(Error::ChannelError {
                         message: format!("{e}"),
@@ -172,7 +179,7 @@ where
 
             let mut statement = prepared.into_statement();
 
-            bind_parameters(&mut statement, &params[..])?;
+            bind_parameters(&mut statement, &params)?;
 
             // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
             let cursor = unsafe {
@@ -183,7 +190,7 @@ where
             let reader = build_odbc_reader(cursor, &schema, &secrets)?;
             for batch in reader {
                 match batch_tx.send(batch.context(ArrowSnafu)) {
-                    Ok(_) => {}
+                    Ok(()) => {}
                     Err(e) => {
                         return Err(Error::ChannelError {
                             message: format!("{e}"),
@@ -196,6 +203,7 @@ where
             Ok::<_, GenericError>(())
         });
 
+        // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
         let schema = match schema_rx.recv_async().await {
             Ok(s) => Ok::<_, GenericError>(s),
             Err(e) => Err(Error::ChannelError {
@@ -205,7 +213,7 @@ where
         }?;
 
         let output_stream = stream! {
-            while let Ok(batch) = batch_rx.recv_timeout(Duration::from_secs(5)) {
+            while let Ok(batch) = batch_rx.recv_async().await {
                 match batch {
                     Ok(batch) => yield Ok(batch),
                     Err(e) => {
@@ -223,7 +231,7 @@ where
         )))
     }
 
-    async fn execute(&self, query: &str, params: &[P]) -> Result<u64> {
+    async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
@@ -276,10 +284,7 @@ fn build_odbc_reader<C: Cursor>(
 /// Binds parameter to an ODBC statement.
 ///
 /// `StatementImpl<'_>::bind_input_parameter` is unsafe.
-fn bind_parameters<P: ODBCSyncParameter>(
-    statement: &mut StatementImpl,
-    params: &[P],
-) -> Result<()> {
+fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<()> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
             statement

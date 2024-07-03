@@ -24,6 +24,7 @@ duckdb = { workspace = true, features = [
   "vtab",
   "vtab-arrow",
 ], optional = true }
+dyn-clone = "1.0.17"
 flume = "0.11.0"
 futures.workspace = true
 lazy_static = "1.4.0"
