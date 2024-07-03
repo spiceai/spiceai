@@ -8,8 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-
+  generate_schema:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,10 +25,10 @@ jobs:
     - name: Verify JSON schema file
       run: |
         if [ -f "spicepod-schema.json" ]; then
-          echo "spicepod_schema.json file was successfully created."
-          cat spicepod_schema.json
+          echo "spicepod-schema.json file was successfully created."
+          cat spicepod-schema.json
         else
-          echo "spicepod_schema.json file was not created."
+          echo "spicepod-schema.json file was not created."
           exit 1
         fi
 

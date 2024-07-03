@@ -45,7 +45,7 @@ impl ParamValue {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Params {
-    #[schemars(flatten)]
+    #[cfg_attr(feature = "schemars", schemars(flatten))]
     pub data: HashMap<String, ParamValue>,
 }
 
