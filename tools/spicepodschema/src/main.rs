@@ -31,9 +31,19 @@ fn main() {
     let output_filename = &args[1];
 
     let schema = schema_for!(SpicepodDefinition);
-    let json_schema = serde_json::to_string_pretty(&schema).unwrap();
 
-    let mut file = File::create(output_filename).expect("Unable to create file");
-    file.write_all(json_schema.as_bytes())
-        .expect("Unable to write data");
+    let Ok(json_schema) = serde_json::to_string_pretty(&schema) else {
+        eprintln!("Unable to serialize schema");
+        std::process::exit(1);
+    };
+
+    let Ok(mut file) = File::create(output_filename) else {
+        eprintln!("Unable to create file {output_filename}");
+        std::process::exit(1);
+    };
+
+    if file.write_all(json_schema.as_bytes()).is_err() {
+        eprintln!("Unable to write to file {output_filename}");
+        std::process::exit(1);
+    }
 }
