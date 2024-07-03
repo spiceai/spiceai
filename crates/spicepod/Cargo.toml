@@ -13,3 +13,8 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
 tracing.workspace = true
+schemars = { version = "0.8.19", optional = true }
+
+[features]
+default = []
+schemars = ["dep:schemars"]

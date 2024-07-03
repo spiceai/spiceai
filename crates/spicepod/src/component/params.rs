@@ -16,9 +16,12 @@ limitations under the License.
 
 use std::collections::HashMap;
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(untagged)]
 pub enum ParamValue {
     String(String),
@@ -40,7 +43,9 @@ impl ParamValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Params {
+    #[schemars(flatten)]
     pub data: HashMap<String, ParamValue>,
 }
 

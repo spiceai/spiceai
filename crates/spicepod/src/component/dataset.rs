@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{embeddings::ColumnEmbeddingConfig, params::Params, WithDependsOn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
@@ -27,6 +30,7 @@ pub enum Mode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TimeFormat {
     #[default]
@@ -43,6 +47,7 @@ impl std::fmt::Display for TimeFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
@@ -117,12 +122,15 @@ impl WithDependsOn<Dataset> for Dataset {
 }
 
 pub mod acceleration {
+    #[cfg(feature = "schemars")]
+    use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use std::{collections::HashMap, fmt::Display};
 
     use crate::component::params::Params;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
     pub enum RefreshMode {
         Full,
@@ -131,6 +139,7 @@ pub mod acceleration {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
     pub enum Mode {
         #[default]
@@ -149,6 +158,7 @@ pub mod acceleration {
 
     /// Behavior when a query on an accelerated table returns zero results.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "snake_case")]
     pub enum ZeroResultsAction {
         /// Return an empty result set. This is the default.
@@ -168,6 +178,7 @@ pub mod acceleration {
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
     pub enum IndexType {
         #[default]
@@ -185,6 +196,7 @@ pub mod acceleration {
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
     pub enum OnConflictBehavior {
         #[default]
@@ -202,6 +214,7 @@ pub mod acceleration {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     pub struct Acceleration {
         #[serde(default = "default_true")]
         pub enabled: bool,
@@ -298,9 +311,12 @@ pub mod acceleration {
 }
 
 pub mod replication {
+    #[cfg(feature = "schemars")]
+    use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     pub struct Replication {
         #[serde(default)]
         pub enabled: bool,

@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::WithDependsOn;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct View {
     pub name: String,
 
