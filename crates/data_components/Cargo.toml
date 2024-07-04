@@ -80,19 +80,18 @@ databricks = ["dep:deltalake", "spark_connect"]
 debezium = ["dep:serde_json", "dep:rdkafka"]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb", "datafusion-table-providers/duckdb"]
 flightsql = ["dep:tonic", "dep:r2d2"]
-mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "datafusion-table-providers/mysql"]
+mysql = ["dep:mysql_async", "datafusion-table-providers/mysql"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc"]
 postgres = [
   "dep:bb8",
   "dep:bb8-postgres",
   "dep:postgres-native-tls",
-  "arrow_sql_gen/postgres",
   "dep:tokio-postgres",
   "datafusion-table-providers/postgres"
 ]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "datafusion-table-providers/sqlite"]
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "datafusion-table-providers/sqlite"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
