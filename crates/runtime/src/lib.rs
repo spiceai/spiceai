@@ -43,7 +43,6 @@ use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
-use itertools::Itertools;
 use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
