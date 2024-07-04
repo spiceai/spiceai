@@ -139,7 +139,6 @@ models = ["model_components/full", "llms/mistralrs", "llms/candle"]
 mysql = [
   "dep:mysql_async",
   "db_connection_pool/mysql",
-  "arrow_sql_gen/mysql",
   "data_components/mysql",
 ]
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
@@ -148,7 +147,6 @@ postgres = [
   "dep:bb8-postgres",
   "dep:postgres-native-tls",
   "db_connection_pool/postgres",
-  "arrow_sql_gen/postgres",
   "data_components/postgres",
   "datafusion-table-providers/postgres",
 ]
@@ -162,7 +160,6 @@ spiceai-dataset-test = []
 sqlite = [
   "dep:tokio-rusqlite",
   "db_connection_pool/sqlite",
-  "arrow_sql_gen/sqlite",
   "data_components/sqlite",
 ]
 

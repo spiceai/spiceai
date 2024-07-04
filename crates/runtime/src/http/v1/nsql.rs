@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_sql_gen::statement::CreateTableBuilder;
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -28,6 +27,7 @@ use axum::{
     Extension, Json,
 };
 use datafusion::execution::context::SQLOptions;
+use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
 use llms::{
     chat::{Error as ChatError, Result as ChatResult},
     openai::MAX_COMPLETION_TOKENS,

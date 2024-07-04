@@ -59,7 +59,7 @@ clickhouse = [
   "dep:async-stream",
 ]
 duckdb = ["dep:duckdb", "dep:r2d2", "datafusion-table-providers/duckdb"]
-mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "datafusion-table-providers/mysql"]
+mysql = ["dep:mysql_async", "datafusion-table-providers/mysql"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio"]
 postgres = [
   "dep:bb8",
@@ -68,10 +68,9 @@ postgres = [
   "dep:native-tls",
   "dep:pem",
   "dep:tokio",
-  "arrow_sql_gen/postgres",
   "dep:tokio-postgres",
   "dep:async-stream",
   "datafusion-table-providers/postgres",
 ]
 snowflake = ["dep:snowflake-api", "dep:pkcs8"]
-sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "datafusion-table-providers/sqlite"]
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "datafusion-table-providers/sqlite"]
