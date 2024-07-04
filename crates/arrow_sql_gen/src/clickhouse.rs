@@ -34,7 +34,7 @@ use clickhouse_rs::{
 };
 use snafu::{ResultExt, Snafu};
 
-use crate::arrow::map_data_type_to_array_builder;
+use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
