@@ -24,8 +24,8 @@ duckdb = { workspace = true, features = [
   "vtab",
   "vtab-arrow",
 ], optional = true }
-dyn-clone = "1.0.17"
-flume = "0.11.0"
+dyn-clone = { version = "1.0.17", optional = true }
+flume = { version = "0.11.0", optional = true }
 futures.workspace = true
 lazy_static = "1.4.0"
 mysql_async = { workspace = true, optional = true }
@@ -61,7 +61,7 @@ clickhouse = [
 ]
 duckdb = ["dep:duckdb", "dep:r2d2"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
-odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio"]
+odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio", "dep:flume", "dep:dyn-clone"]
 postgres = [
   "dep:bb8",
   "dep:bb8-postgres",
