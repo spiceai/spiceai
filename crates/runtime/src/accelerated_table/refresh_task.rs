@@ -21,7 +21,9 @@ use arrow::{
 };
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::util::retriable_error::{check_and_mark_retriable_error, is_retriable_error};
+use datafusion_table_providers::util::retriable_error::{
+    check_and_mark_retriable_error, is_retriable_error,
+};
 use futures::{stream, Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;

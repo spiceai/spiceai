@@ -16,8 +16,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use data_components::util::secrets::to_secret_map;
-use db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::secrets::to_secret_map;
 
 use super::AcceleratedMetadataProvider;
 use super::{METADATA_DATASET_COLUMN, METADATA_METADATA_COLUMN, METADATA_TABLE_NAME};

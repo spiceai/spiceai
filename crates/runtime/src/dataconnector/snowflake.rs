@@ -19,13 +19,13 @@ use super::DataConnectorFactory;
 use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use crate::secrets::SecretMap;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use db_connection_pool::DbConnectionPool;
 use itertools::Itertools;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
@@ -37,7 +37,9 @@ use std::{collections::HashMap, future::Future};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("{source}"))]
-    UnableToCreateSnowflakeConnectionPool { source: db_connection_pool::Error },
+    UnableToCreateSnowflakeConnectionPool {
+        source: db_connection_pool::snowflakepool::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

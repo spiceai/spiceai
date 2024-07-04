@@ -31,10 +31,10 @@ use datafusion::{
         ExecutionPlan, Partitioning, PlanProperties,
     },
 };
+use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use sql_provider_datafusion::expr;
 use std::{any::Any, fmt, sync::Arc};
 
 use self::write::FlightTableWriter;

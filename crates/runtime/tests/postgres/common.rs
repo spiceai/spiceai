@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use bollard::secret::HealthConfig;
-use db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use secrecy::SecretString;
 // use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use rand::Rng;

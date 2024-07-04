@@ -20,10 +20,10 @@ use arrow::{
 };
 use async_stream::stream;
 use async_trait::async_trait;
+use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::tls::new_tls_flight_channel;
 use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
-use sql_provider_datafusion::expr;
 use std::{any::Any, fmt, sync::Arc, vec};
 
 use arrow_flight::{

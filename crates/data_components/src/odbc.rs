@@ -16,12 +16,15 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion_table_providers::sql::{
+    db_connection_pool as db_connection_pool_datafusion,
+    sql_provider_datafusion::{
+        expr::{self, Engine},
+        SqlTable,
+    },
+};
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
-use sql_provider_datafusion::{
-    expr::{self, Engine},
-    SqlTable,
-};
 use std::sync::Arc;
 
 use crate::Read;
@@ -30,17 +33,19 @@ use crate::Read;
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: db_connection_pool::dbconnection::GenericError,
+        source: db_connection_pool_datafusion::dbconnection::GenericError,
     },
     #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
     TableDoesntExist { table_name: String },
 
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: db_connection_pool::Error },
+    UnableToGetConnectionFromPool {
+        source: db_connection_pool_datafusion::Error,
+    },
 
     #[snafu(display("Unable to get schema: {source}"))]
     UnableToGetSchema {
-        source: db_connection_pool::dbconnection::Error,
+        source: db_connection_pool_datafusion::dbconnection::Error,
     },
 
     #[snafu(display("Unable to generate SQL: {source}"))]

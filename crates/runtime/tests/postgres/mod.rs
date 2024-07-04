@@ -20,9 +20,10 @@ use arrow::{
     array::TimestampMillisecondArray,
     datatypes::{DataType, TimeUnit},
 };
-use data_components::postgres::DynPostgresConnectionPool;
 use datafusion::execution::context::SessionContext;
-use sql_provider_datafusion::SqlTable;
+use datafusion_table_providers::{
+    postgres::DynPostgresConnectionPool, sql::sql_provider_datafusion::SqlTable,
+};
 
 use crate::init_tracing;
 

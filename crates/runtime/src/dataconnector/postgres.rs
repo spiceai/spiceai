@@ -17,10 +17,14 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
-use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::postgrespool::{self, PostgresConnectionPool};
+use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection;
+use datafusion_table_providers::sql::db_connection_pool::{
+    postgrespool::{self, PostgresConnectionPool},
+    Error as DbConnectionPoolError,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -32,7 +36,7 @@ use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
-    UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
+    UnableToCreatePostgresConnectionPool { source: DbConnectionPoolError },
 }
 
 pub struct Postgres {
@@ -104,10 +108,10 @@ impl DataConnector for Postgres {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {
-                    if let Some(db_connection_pool::dbconnection::Error::UndefinedTable {
+                    if let Some(dbconnection::Error::UndefinedTable {
                         table_name,
                         source: _,
-                    }) = err_source.downcast_ref::<db_connection_pool::dbconnection::Error>()
+                    }) = err_source.downcast_ref::<dbconnection::Error>()
                     {
                         return Err(DataConnectorError::InvalidTableName {
                             dataconnector: "postgres".to_string(),
