@@ -37,13 +37,13 @@ use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
-use dataconnector::AnyErrorResult;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
+use itertools::Itertools;
 use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
@@ -54,7 +54,7 @@ use secrets::{spicepod_secret_store_type, Secret, SecretMap};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
-use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
+use spicepod::component::model::{Model as SpicepodModel, ModelType};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tracing_util::dataset_registered_trace;
@@ -962,29 +962,6 @@ impl Runtime {
         }
     }
 
-    /// Combine the parameters for a model component with relevant secrets from the secrets provider.
-    pub async fn construct_model_params(
-        &self,
-        params: HashMap<String, String>,
-        source: Option<ModelSource>,
-    ) -> AnyErrorResult<SecretMap> {
-        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
-        let secrets_provider = shared_secrets_provider.read().await;
-
-        let secret = match source {
-            Some(m) => secrets_provider.get_secret(m.to_string().as_str()).await?,
-            None => None,
-        };
-
-        let mut params: SecretMap = SecretMap::from(params);
-        if let Some(secret) = secret {
-            for (k, v) in secret.iter() {
-                params.insert(k.to_string(), v.clone());
-            }
-        }
-        Ok(params)
-    }
-
     // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
     pub async fn load_model(&self, m: &SpicepodModel) {
         let source = m.get_source();
@@ -993,7 +970,7 @@ impl Runtime {
         measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
-        let params = match self.construct_model_params(m.params.clone(), source).await {
+        let params = match self.get_params_with_secrets(&m.params).await {
             Ok(s) => s,
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
