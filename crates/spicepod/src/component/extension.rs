@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Extension {
     #[serde(default = "default_true")]
     pub enabled: bool,

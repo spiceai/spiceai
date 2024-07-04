@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The secrets configuration for a Spicepod.
@@ -24,6 +26,7 @@ use serde::{Deserialize, Serialize};
 ///   store: file
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Secrets {
     pub store: SpiceSecretStore,
 }
@@ -37,6 +40,7 @@ impl Default for Secrets {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpiceSecretStore {
     File,
