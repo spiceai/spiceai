@@ -40,6 +40,7 @@ use odbc_api::CursorImpl;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use snafu::Snafu;
+use tokio::runtime::Handle;
 
 use crate::DbConnectionPool;
 
@@ -104,6 +105,16 @@ where
     }
 }
 
+fn blocking_channel_send<T>(channel: &flume::Sender<T>, item: T) -> Result<()> {
+    match channel.send(item) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(Error::ChannelError {
+            message: format!("{e}"),
+        }
+        .into()),
+    }
+}
+
 #[async_trait]
 impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
@@ -147,9 +158,9 @@ where
     ) -> Result<SendableRecordBatchStream> {
         // prepare some flume channels to communicate query results back from the thread
         let (batch_tx, batch_rx): (
-            flume::Sender<Result<RecordBatch, Error>>,
-            flume::Receiver<Result<RecordBatch, Error>>,
-        ) = flume::unbounded();
+            flume::Sender<Option<Result<RecordBatch, Error>>>,
+            flume::Receiver<Option<Result<RecordBatch, Error>>>,
+        ) = flume::bounded(4); // at the default ODBC row count of 65_536, we buffer max 262_144 rows
 
         let (schema_tx, schema_rx): (flume::Sender<Arc<Schema>>, flume::Receiver<Arc<Schema>>) =
             flume::unbounded();
@@ -163,19 +174,13 @@ where
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
         let secrets = Arc::clone(&self.params);
 
-        tokio::spawn(async move {
-            let cxn = conn.lock().await;
+        tokio::task::spawn_blocking(move || {
+            let handle = Handle::current();
+            let cxn = handle.block_on(async { conn.lock().await });
+
             let mut prepared = cxn.prepare(&sql)?;
             let schema = Arc::new(arrow_schema_from(&mut prepared)?);
-            match schema_tx.send(Arc::clone(&schema)) {
-                Ok(()) => {}
-                Err(e) => {
-                    return Err(Error::ChannelError {
-                        message: format!("{e}"),
-                    }
-                    .into())
-                }
-            };
+            blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
             let mut statement = prepared.into_statement();
 
@@ -189,16 +194,10 @@ where
 
             let reader = build_odbc_reader(cursor, &schema, &secrets)?;
             for batch in reader {
-                match batch_tx.send(batch.context(ArrowSnafu)) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        return Err(Error::ChannelError {
-                            message: format!("{e}"),
-                        }
-                        .into())
-                    }
-                };
+                blocking_channel_send(&batch_tx, Some(batch.context(ArrowSnafu)))?;
             }
+
+            blocking_channel_send(&batch_tx, None)?;
 
             Ok::<_, GenericError>(())
         });
@@ -213,12 +212,18 @@ where
         }?;
 
         let output_stream = stream! {
-            while let Ok(batch) = batch_rx.recv_async().await {
-                match batch {
-                    Ok(batch) => yield Ok(batch),
+            loop {
+                match batch_rx.recv_async().await {
+                    Ok(Some(batch)) => match batch {
+                        Ok(batch) => yield Ok(batch),
+                        Err(e) => yield Err(DataFusionError::Execution(format!(
+                            "Failed to read ODBC batch: {e}"
+                        )))
+                    },
+                    Ok(None) => break,
                     Err(e) => {
                         yield Err(DataFusionError::Execution(format!(
-                            "Failed to read ODBC batch: {e}"
+                            "ODBC reader closed unexpectedly: {e}"
                         )))
                     }
                 }

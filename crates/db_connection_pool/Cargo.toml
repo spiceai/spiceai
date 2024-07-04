@@ -44,7 +44,7 @@ rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
 tokio-postgres = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 tracing.workspace = true
