@@ -32,7 +32,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
 pub mod reader;
-mod spec;
+pub mod spec;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

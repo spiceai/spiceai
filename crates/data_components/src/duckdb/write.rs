@@ -20,6 +20,7 @@ use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
 use crate::util::constraints;
 use crate::util::on_conflict::OnConflict;
+use crate::util::retriable_error::check_and_mark_retriable_error;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::Constraints;
@@ -141,7 +142,8 @@ impl DataSink for DuckDBDataSink {
 
         let data_batches: Vec<RecordBatch> = data_batches_result
             .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(check_and_mark_retriable_error)?;
 
         constraints::validate_batch_with_constraints(&data_batches, self.duckdb.constraints())
             .await

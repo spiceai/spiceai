@@ -17,9 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, path::Path};
 
 use super::WithDependsOn;
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Model {
     pub from: String,
     pub name: String,
@@ -54,6 +57,7 @@ impl WithDependsOn<Model> for Model {
 
 /// Describe where the [`Model`] is sourced from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ModelSource {
     OpenAi,
     HuggingFace,
@@ -93,6 +97,7 @@ impl Display for ModelSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ModelType {
     Llm,
     Ml,
@@ -217,6 +222,7 @@ impl Model {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ModelFile {
     pub path: String,
     pub name: Option<String>,
@@ -246,6 +252,7 @@ impl ModelFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum ModelFileType {
     Weights,

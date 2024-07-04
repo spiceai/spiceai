@@ -36,7 +36,7 @@ use sql_provider_datafusion::expr::Engine;
 
 use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
-    util::{constraints, on_conflict::OnConflict},
+    util::{constraints, on_conflict::OnConflict, retriable_error::check_and_mark_retriable_error},
 };
 
 use super::{to_datafusion_error, Sqlite};
@@ -143,7 +143,8 @@ impl DataSink for SqliteDataSink {
 
         let data_batches: Vec<RecordBatch> = data_batches_result
             .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(check_and_mark_retriable_error)?;
 
         constraints::validate_batch_with_constraints(&data_batches, self.sqlite.constraints())
             .await

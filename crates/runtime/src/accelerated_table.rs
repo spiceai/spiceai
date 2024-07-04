@@ -59,6 +59,9 @@ pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
+    #[snafu(display("Dataset refresh failed with error: {source}"))]
+    FailedToRefreshDataset { source: DataFusionError },
+
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
         source: datafusion::error::DataFusionError,
@@ -331,6 +334,11 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.federated)
+    }
+
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
     }
 
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {

@@ -17,6 +17,8 @@ limitations under the License.
 use std::fmt::Debug;
 use std::path::PathBuf;
 
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -35,6 +37,7 @@ pub trait WithDependsOn<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ComponentReference {
     pub r#ref: String,
 
@@ -44,6 +47,7 @@ pub struct ComponentReference {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(untagged)]
 pub enum ComponentOrReference<T> {
     Component(T),

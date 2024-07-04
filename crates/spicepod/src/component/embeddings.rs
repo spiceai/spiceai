@@ -20,9 +20,12 @@ use super::{
     model::{ModelFile, ModelFileType},
     WithDependsOn,
 };
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Embeddings {
     pub from: String,
     pub name: String,
@@ -130,6 +133,7 @@ impl Display for EmbeddingPrefix {
 
 /// Configuration for if and how a dataset's column should be embedded.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ColumnEmbeddingConfig {
     pub column: String,
 

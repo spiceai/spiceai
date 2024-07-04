@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::RwLock;
 use std::{any::Any, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion::error::Result as DataFusionResult;
+use async_stream::stream;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::stream;
+use futures::{StreamExt, TryStreamExt};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateType {
@@ -45,18 +47,66 @@ pub struct DataUpdate {
     pub update_type: UpdateType,
 }
 
-pub struct DataUpdateExecutionPlan {
-    pub data_update: RwLock<DataUpdate>,
+pub struct StreamingDataUpdate {
+    pub schema: SchemaRef,
+    pub data: SendableRecordBatchStream,
+    pub update_type: UpdateType,
+}
+
+impl StreamingDataUpdate {
+    #[must_use]
+    pub fn new(
+        schema: SchemaRef,
+        data: SendableRecordBatchStream,
+        update_type: UpdateType,
+    ) -> Self {
+        Self {
+            schema,
+            data,
+            update_type,
+        }
+    }
+
+    pub async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
+        let data = self.data.try_collect::<Vec<_>>().await?;
+        Ok(DataUpdate {
+            schema: self.schema,
+            data,
+            update_type: self.update_type,
+        })
+    }
+}
+
+impl TryFrom<DataUpdate> for StreamingDataUpdate {
+    type Error = DataFusionError;
+
+    fn try_from(data_update: DataUpdate) -> std::result::Result<Self, Self::Error> {
+        let schema = Arc::clone(&data_update.schema);
+        let data = Box::pin(MemoryStream::try_new(
+            data_update.data,
+            data_update.schema,
+            None,
+        )?) as SendableRecordBatchStream;
+        Ok(Self {
+            schema,
+            data,
+            update_type: data_update.update_type,
+        })
+    }
+}
+
+pub struct StreamingDataUpdateExecutionPlan {
+    record_batch_stream: Arc<Mutex<SendableRecordBatchStream>>,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
-impl DataUpdateExecutionPlan {
+impl StreamingDataUpdateExecutionPlan {
     #[must_use]
-    pub fn new(data_update: DataUpdate) -> Self {
-        let schema = Arc::clone(&data_update.schema);
+    pub fn new(record_batch_stream: SendableRecordBatchStream) -> Self {
+        let schema = record_batch_stream.schema();
         Self {
-            data_update: RwLock::new(data_update),
+            record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
             schema: Arc::clone(&schema),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(schema),
@@ -67,21 +117,21 @@ impl DataUpdateExecutionPlan {
     }
 }
 
-impl std::fmt::Debug for DataUpdateExecutionPlan {
+impl std::fmt::Debug for StreamingDataUpdateExecutionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DataUpdateExecutionPlan")
+        write!(f, "StreamingDataUpdateExecutionPlan")
     }
 }
 
-impl DisplayAs for DataUpdateExecutionPlan {
+impl DisplayAs for StreamingDataUpdateExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DataUpdateExecutionPlan")
+        write!(f, "StreamingDataUpdateExecutionPlan")
     }
 }
 
-impl ExecutionPlan for DataUpdateExecutionPlan {
+impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
     fn name(&self) -> &'static str {
-        "DataUpdateExecutionPlan"
+        "StreamingDataUpdateExecutionPlan"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -112,14 +162,18 @@ impl ExecutionPlan for DataUpdateExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut data_update_guard = match self.data_update.write() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
-        let data = std::mem::take(&mut data_update_guard.data);
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), stream::iter(data.into_iter().map(Ok)));
+        let schema = Arc::clone(&self.schema);
 
-        Ok(Box::pin(stream_adapter))
+        let record_batch_stream = Arc::clone(&self.record_batch_stream);
+
+        let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), {
+            stream! {
+                let mut stream = record_batch_stream.lock().await;
+                while let Some(batch) = stream.next().await {
+                    yield batch;
+                }
+            }
+        });
+        Ok(Box::pin(stream))
     }
 }
