@@ -24,14 +24,17 @@ use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
+use async_stream::stream;
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::{self, AsyncDbConnection, DbConnection},
+    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
     DbConnectionPool,
 };
+use dyn_clone::DynClone;
 use futures::lock::Mutex;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
@@ -41,18 +44,23 @@ use odbc_api::CursorImpl;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use snafu::Snafu;
+use tokio::runtime::Handle;
 
 use odbc_api::Connection;
 
-pub trait ODBCSyncParameter: InputParameter + Sync {
+type Result<T, E = GenericError> = std::result::Result<T, E>;
+
+pub trait ODBCSyncParameter: InputParameter + Sync + Send + DynClone {
     fn as_input_parameter(&self) -> &dyn InputParameter;
 }
 
-impl<T: InputParameter + Sync> ODBCSyncParameter for T {
+impl<T: InputParameter + Sync + Send + DynClone> ODBCSyncParameter for T {
     fn as_input_parameter(&self) -> &dyn InputParameter {
         self
     }
 }
+
+dyn_clone::clone_trait_object!(ODBCSyncParameter);
 
 pub type ODBCParameter = Box<dyn ODBCSyncParameter>;
 pub type ODBCDbConnection<'a> = (dyn DbConnection<Connection<'a>, ODBCParameter>);
@@ -71,6 +79,8 @@ pub enum Error {
     TryFromError { source: std::num::TryFromIntError },
     #[snafu(display("Unable to bind integer parameter: {source}"))]
     UnableToBindIntParameter { source: std::num::TryFromIntError },
+    #[snafu(display("Internal communication channel error: {message}"))]
+    ChannelError { message: String },
 }
 
 pub struct ODBCConnection<'a> {
@@ -92,6 +102,16 @@ where
 
     fn as_async(&self) -> Option<&dyn AsyncDbConnection<Connection<'a>, ODBCParameter>> {
         Some(self)
+    }
+}
+
+fn blocking_channel_send<T>(channel: &flume::Sender<T>, item: T) -> Result<()> {
+    match channel.send(item) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(Error::ChannelError {
+            message: format!("{e}"),
+        }
+        .into()),
     }
 }
 
@@ -135,34 +155,88 @@ where
         &self,
         sql: &str,
         params: &[ODBCParameter],
-    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
-        let cxn = self.conn.lock().await;
-        let mut prepared = cxn.prepare(sql)?;
-        let schema = Arc::new(arrow_schema_from(&mut prepared)?);
-        let mut statement = prepared.into_statement();
+    ) -> Result<SendableRecordBatchStream> {
+        // prepare some flume channels to communicate query results back from the thread
+        let (batch_tx, batch_rx): (
+            flume::Sender<Option<Result<RecordBatch, Error>>>,
+            flume::Receiver<Option<Result<RecordBatch, Error>>>,
+        ) = flume::bounded(4); // at the default ODBC row count of 65_536, we buffer max 262_144 rows
 
-        bind_parameters(&mut statement, params)?;
+        let (schema_tx, schema_rx): (flume::Sender<Arc<Schema>>, flume::Receiver<Arc<Schema>>) =
+            flume::unbounded();
 
-        // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
-        let cursor = unsafe {
-            statement.execute().unwrap();
-            CursorImpl::new(statement.as_stmt_ref())
+        // clone internals and parameters to let the thread own them
+        let conn = Arc::clone(&self.conn); // clones the mutex not the connection, so we can .lock a connection inside the thread
+        let sql = sql.to_string();
+
+        // ODBCParameter is a dynamic trait object, so we can't use std::clone::Clone because it's not object safe
+        // DynClone provides an object-safe clone trait, which we use to clone the boxed parameters
+        let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
+        let secrets = Arc::clone(&self.params);
+
+        tokio::task::spawn_blocking(move || {
+            let handle = Handle::current();
+            let cxn = handle.block_on(async { conn.lock().await });
+
+            let mut prepared = cxn.prepare(&sql)?;
+            let schema = Arc::new(arrow_schema_from(&mut prepared)?);
+            blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
+
+            let mut statement = prepared.into_statement();
+
+            bind_parameters(&mut statement, &params)?;
+
+            // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
+            let cursor = unsafe {
+                statement.execute().unwrap();
+                CursorImpl::new(statement.as_stmt_ref())
+            };
+
+            let reader = build_odbc_reader(cursor, &schema, &secrets)?;
+            for batch in reader {
+                blocking_channel_send(&batch_tx, Some(batch.context(ArrowSnafu)))?;
+            }
+
+            blocking_channel_send(&batch_tx, None)?;
+
+            Ok::<_, GenericError>(())
+        });
+
+        // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
+        let schema = match schema_rx.recv_async().await {
+            Ok(s) => Ok::<_, GenericError>(s),
+            Err(e) => Err(Error::ChannelError {
+                message: format!("{e}"),
+            }
+            .into()),
+        }?;
+
+        let output_stream = stream! {
+            loop {
+                match batch_rx.recv_async().await {
+                    Ok(Some(batch)) => match batch {
+                        Ok(batch) => yield Ok(batch),
+                        Err(e) => yield Err(DataFusionError::Execution(format!(
+                            "Failed to read ODBC batch: {e}"
+                        )))
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        yield Err(DataFusionError::Execution(format!(
+                            "ODBC reader closed unexpectedly: {e}"
+                        )))
+                    }
+                }
+            }
         };
 
-        let reader = build_odbc_reader(cursor, &schema, &self.params)?;
-        let mut results: Vec<RecordBatch> = vec![];
-        for batch in reader {
-            results.push(batch.context(ArrowSnafu)?);
-        }
-
-        Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            output_stream,
+        )))
     }
 
-    async fn execute(
-        &self,
-        query: &str,
-        params: &[ODBCParameter],
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
@@ -243,7 +317,7 @@ mod tests {
     // This test crudely validates that parameters are being received by the ODBC driver
     #[cfg(feature = "odbc")]
     #[tokio::test]
-    async fn test_bind_parameters() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
         let pool = ODBCPool::new(Arc::new(HashMap::new())).expect("Must create ODBC pool");
         let env = pool.odbc_environment();

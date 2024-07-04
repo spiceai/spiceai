@@ -25,6 +25,8 @@ duckdb = { workspace = true, features = [
   "vtab",
   "vtab-arrow",
 ], optional = true }
+dyn-clone = { version = "1.0.17", optional = true }
+flume = { version = "0.11.0", optional = true }
 futures.workspace = true
 lazy_static = "1.4.0"
 mysql_async = { workspace = true, optional = true }
@@ -43,7 +45,7 @@ rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
 tokio-postgres = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 tracing.workspace = true
@@ -60,7 +62,7 @@ clickhouse = [
 ]
 duckdb = ["dep:duckdb", "dep:r2d2", "datafusion-table-providers/duckdb"]
 mysql = ["dep:mysql_async", "datafusion-table-providers/mysql"]
-odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio"]
+odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio", "dep:flume", "dep:dyn-clone"]
 postgres = [
   "dep:bb8",
   "dep:bb8-postgres",
