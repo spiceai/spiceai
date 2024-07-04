@@ -25,9 +25,11 @@ use std::{sync::Arc, time::Duration};
 use crate::init_tracing;
 
 use app::AppBuilder;
-use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use datafusion::{
     datasource::TableProvider, physical_plan::collect, prelude::SessionContext, sql::TableReference,
+};
+use datafusion_table_providers::sql::arrow_sql_gen::statement::{
+    CreateTableBuilder, InsertBuilder,
 };
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{

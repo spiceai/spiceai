@@ -16,7 +16,7 @@ bigdecimal = "0.4.3"
 bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0" }
 chrono.workspace = true
 chrono-tz = "0.8.6"
-rusqlite = { workspace = true, optional = true }
+datafusion-table-providers.workspace = true
 sea-query = { version = "0.30.7", features = [
   "backend-sqlite",
   "backend-postgres",
@@ -28,20 +28,12 @@ sea-query = { version = "0.30.7", features = [
 snafu.workspace = true
 time = "0.3.34"
 tokio.workspace = true
-tokio-postgres = { workspace = true, features = [
-  "with-chrono-0_4",
-  "with-uuid-1",
-], optional = true }
 tracing.workspace = true
 
 byteorder = "1.5.0"
 clickhouse-rs = { workspace = true, optional = true }
 fallible-iterator = "0.3.0"
-mysql_async = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs", "dep:uuid"]
-mysql = ["dep:mysql_async"]
-postgres = ["dep:tokio-postgres", "dep:uuid"]
-sqlite = ["dep:rusqlite"]
