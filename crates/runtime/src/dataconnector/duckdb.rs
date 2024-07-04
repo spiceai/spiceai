@@ -17,12 +17,13 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use async_trait::async_trait;
-use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use db_connection_pool::dbconnection::duckdbconn::is_table_function;
-use db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::duckdb::DuckDBTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::any::Any;
@@ -35,7 +36,7 @@ use super::{AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFact
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
-    UnableToCreateDuckDBConnectionPool { source: db_connection_pool::Error },
+    UnableToCreateDuckDBConnectionPool { source: DbConnectionPoolError },
 
     #[snafu(display("Missing required parameter: open"))]
     MissingDuckDBFile,
@@ -49,14 +50,12 @@ pub struct DuckDB {
 
 impl DuckDB {
     pub(crate) fn create_in_memory() -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
-            DuckDbConnectionPool::new_memory(&AccessMode::Automatic).map_err(|source| {
-                DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "duckdb".to_string(),
-                    source,
-                }
-            })?,
-        );
+        let pool = Arc::new(DuckDbConnectionPool::new_memory().map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "duckdb".to_string(),
+                source,
+            }
+        })?);
 
         Ok(DuckDBTableFactory::new(pool))
     }

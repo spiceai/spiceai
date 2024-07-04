@@ -27,12 +27,12 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
+    self, AsyncDbConnection, DbConnection,
+};
 use futures::lock::Mutex;
 use futures::{stream, Stream, StreamExt};
 use snafu::prelude::*;
-
-use super::Result;
-use super::{AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -75,7 +75,7 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
         self
     }
 
-    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<ClientHandle, &'a (dyn Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<ClientHandle, &'a (dyn Sync)>> {
         Some(self)
     }
 }
@@ -93,7 +93,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
     async fn get_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, dbconnection::Error> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
         let block = conn
@@ -104,11 +104,11 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
             .fetch_all()
             .await
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         let rec = block_to_arrow(&block)
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         Ok(rec.schema())
     }
@@ -117,7 +117,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         &self,
         sql: &str,
         _: &[&'a (dyn Sync)],
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
         let mut block_stream = conn.query_owned(sql).stream_blocks();
         let first_block = block_stream.next().await;
@@ -139,7 +139,11 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         Ok(Box::pin(stream_adapter))
     }
 
-    async fn execute(&self, query: &str, _: &[&'a (dyn Sync)]) -> Result<u64> {
+    async fn execute(
+        &self,
+        query: &str,
+        _: &[&'a (dyn Sync)],
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
         conn.execute(query).await.context(QuerySnafu)?;

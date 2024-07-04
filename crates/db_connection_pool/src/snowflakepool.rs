@@ -15,18 +15,16 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+};
 use pkcs8::{LineEnding, SecretDocument};
 use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
 use std::{collections::HashMap, fs, sync::Arc};
 
-use super::{DbConnectionPool, Result};
-
-use crate::{
-    dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection},
-    JoinPushDown,
-};
+use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,7 +77,7 @@ impl SnowflakeConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self> {
+    pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
         let username = params
             .get("username")
             .map(Secret::expose_secret)
@@ -130,15 +128,15 @@ impl SnowflakeConnectionPool {
                         .to_string()
                         .contains("error decoding response body")
                     {
-                        return Err(Box::new(Error::UnableToAuthenticateGeneric {}));
+                        return Err(Error::UnableToAuthenticateGeneric {});
                     };
 
-                    return Err(Box::new(Error::UnableToAuthenticate {
+                    return Err(Error::UnableToAuthenticate {
                         source: SnowflakeApiError::AuthError(auth_err),
-                    }));
+                    });
                 }
                 _ => {
-                    return Err(Box::new(Error::UnableToConnect { source: err }));
+                    return Err(Error::UnableToConnect { source: err });
                 }
             }
         }
@@ -164,7 +162,7 @@ fn init_snowflake_api_with_password_auth(
     warehouse: &Option<String>,
     role: &Option<String>,
     params: &HashMap<String, SecretString>,
-) -> Result<SnowflakeApi> {
+) -> Result<SnowflakeApi, Error> {
     let password = params
         .get("password")
         .map(Secret::expose_secret)
@@ -189,7 +187,7 @@ fn init_snowflake_api_with_keypair_auth(
     warehouse: &Option<String>,
     role: &Option<String>,
     params: &HashMap<String, SecretString>,
-) -> Result<SnowflakeApi> {
+) -> Result<SnowflakeApi, Error> {
     let private_key_path = params
         .get("snowflake_private_key_path")
         .map(Secret::expose_secret)
@@ -234,7 +232,10 @@ fn init_snowflake_api_with_keypair_auth(
 impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConnectionPool {
     async fn connect(
         &self,
-    ) -> Result<Box<dyn DbConnection<Arc<SnowflakeApi>, &'static (dyn Sync)>>> {
+    ) -> Result<
+        Box<dyn DbConnection<Arc<SnowflakeApi>, &'static (dyn Sync)>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let api = Arc::clone(&self.api);
 
         let conn = SnowflakeConnection { api };
@@ -247,7 +248,7 @@ impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConne
     }
 }
 
-fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<String> {
+fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<String, Error> {
     let encrypted_key_info = data
         .decode_msg::<pkcs8::EncryptedPrivateKeyInfo>()
         .context(UnableToParsePrivateKeySnafu)?;

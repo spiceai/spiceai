@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use data_components::clickhouse::ClickhouseTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
+use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use db_connection_pool::clickhousepool::{self, ClickhouseConnectionPool};
 use snafu::prelude::*;
 use std::any::Any;
@@ -32,7 +33,7 @@ use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Clickhouse connection pool: {source}"))]
-    UnableToCreateClickhouseConnectionPool { source: db_connection_pool::Error },
+    UnableToCreateClickhouseConnectionPool { source: DbConnectionPoolError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

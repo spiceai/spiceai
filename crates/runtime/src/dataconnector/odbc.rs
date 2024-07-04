@@ -33,7 +33,9 @@ use super::{DataConnector, DataConnectorFactory};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create ODBC connection pool: {source}"))]
-    UnableToCreateODBCConnectionPool { source: db_connection_pool::Error },
+    UnableToCreateODBCConnectionPool {
+        source: db_connection_pool::odbcpool::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

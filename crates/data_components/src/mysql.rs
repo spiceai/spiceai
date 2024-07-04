@@ -15,45 +15,11 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion::{
-    datasource::TableProvider,
-    sql::{unparser::dialect::MySqlDialect, TableReference},
-};
-use db_connection_pool::DbConnectionPool;
-use mysql_async::prelude::ToValue;
-use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion_table_providers::mysql::MySQLTableFactory;
 use std::sync::Arc;
 
 use crate::Read;
-
-// use self::write::PostgresTableWriter;
-
-// pub mod write;
-
-pub type MySQLConnectionPool =
-    dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> + Send + Sync;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to construct SQL table: {source}"))]
-    UnableToConstructSQLTable {
-        source: sql_provider_datafusion::Error,
-    },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub struct MySQLTableFactory {
-    pool: Arc<MySQLConnectionPool>,
-}
-
-impl MySQLTableFactory {
-    #[must_use]
-    pub fn new(pool: Arc<MySQLConnectionPool>) -> Self {
-        Self { pool }
-    }
-}
 
 #[async_trait]
 impl Read for MySQLTableFactory {
@@ -61,20 +27,6 @@ impl Read for MySQLTableFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let pool = Arc::clone(&self.pool);
-        let table_provider = Arc::new(
-            SqlTable::new("mysql", &pool, table_reference, None)
-                .await
-                .context(UnableToConstructSQLTableSnafu)?
-                .with_dialect(Arc::new(MySqlDialect {})),
-        );
-
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
-
-        Ok(table_provider)
+        self.table_provider(table_reference).await
     }
 }

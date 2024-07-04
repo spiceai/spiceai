@@ -41,7 +41,7 @@ use futures::StreamExt;
 use tokio::sync::RwLock;
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
-use crate::util::retriable_error::check_and_mark_retriable_error;
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;

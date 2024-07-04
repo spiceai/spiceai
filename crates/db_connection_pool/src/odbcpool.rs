@@ -17,12 +17,12 @@ limitations under the License.
 use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use async_trait::async_trait;
+use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
 use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
-use super::{DbConnectionPool, JoinPushDown, Result};
 use lazy_static::lazy_static;
 
 lazy_static! {
@@ -64,7 +64,7 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Result<Self> {
+    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Result<Self, Error> {
         let connection_string = params
             .get("odbc_connection_string")
             .map(Secret::expose_secret)
@@ -88,7 +88,9 @@ impl<'a> DbConnectionPool<Connection<'a>, ODBCParameter> for ODBCPool
 where
     'a: 'static,
 {
-    async fn connect(&self) -> Result<Box<ODBCDbConnection<'a>>> {
+    async fn connect(
+        &self,
+    ) -> Result<Box<ODBCDbConnection<'a>>, Box<dyn std::error::Error + Send + Sync>> {
         let cxn = self.pool.connect_with_connection_string(
             &self.connection_string,
             ConnectionOptions::default(),

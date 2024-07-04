@@ -32,7 +32,7 @@ use deltalake::{protocol::SaveMode, DeltaOps, DeltaTable, DeltaTableError};
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::util::retriable_error::check_and_mark_retriable_error;
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

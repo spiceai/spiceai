@@ -31,15 +31,14 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
+    self, AsyncDbConnection, DbConnection,
+};
 use futures::stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
-
-use super::AsyncDbConnection;
-use super::DbConnection;
-use super::Result;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -83,7 +82,7 @@ impl<'a> DbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection
         self
     }
 
-    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)>> {
         Some(self)
     }
 }
@@ -97,7 +96,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
     async fn get_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, dbconnection::Error> {
         let table = table_reference.to_quoted_string();
 
         let res = self
@@ -105,22 +104,24 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
             .exec(format!("SELECT * FROM {table} limit 1").as_str())
             .await
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         match res {
             snowflake_api::QueryResult::Arrow(record_batches) => {
                 let record_batch = snowflake_schema_cast(&record_batches[0])
                     .boxed()
-                    .context(super::UnableToGetSchemaSnafu)?;
+                    .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
                 let schema = record_batch.schema();
                 return Ok(Arc::clone(&schema));
             }
-            snowflake_api::QueryResult::Empty => Err(super::Error::UnableToGetSchema {
+            snowflake_api::QueryResult::Empty => Err(dbconnection::Error::UnableToGetSchema {
                 source: "Empty response".to_string().into(),
             }),
-            snowflake_api::QueryResult::Json(_json) => Err(super::Error::UnableToGetSchema {
-                source: "Unexpected response".to_string().into(),
-            }),
+            snowflake_api::QueryResult::Json(_json) => {
+                Err(dbconnection::Error::UnableToGetSchema {
+                    source: "Unexpected response".to_string().into(),
+                })
+            }
         }
     }
 
@@ -128,7 +129,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
         &self,
         sql: &str,
         _: &[&'a (dyn Sync)],
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let sql = sql.to_string();
 
         let stream = self
@@ -169,7 +170,11 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
         return Ok(Box::pin(stream_adapter));
     }
 
-    async fn execute(&self, _query: &str, _: &[&'a (dyn Sync)]) -> Result<u64> {
+    async fn execute(
+        &self,
+        _query: &str,
+        _: &[&'a (dyn Sync)],
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         return NotImplementedSnafu.fail()?;
     }
 }
