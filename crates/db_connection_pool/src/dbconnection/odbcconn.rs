@@ -30,6 +30,10 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection::{self, AsyncDbConnection, DbConnection},
+    DbConnectionPool,
+};
 use dyn_clone::DynClone;
 use futures::lock::Mutex;
 use odbc_api::handles::Statement;
@@ -42,12 +46,6 @@ use snafu::prelude::*;
 use snafu::Snafu;
 use tokio::runtime::Handle;
 
-use crate::DbConnectionPool;
-
-use super::AsyncDbConnection;
-use super::DbConnection;
-use super::GenericError;
-use super::Result;
 use odbc_api::Connection;
 
 pub trait ODBCSyncParameter: InputParameter + Sync + Send + DynClone {
@@ -100,7 +98,7 @@ where
         self
     }
 
-    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Connection<'a>, ODBCParameter>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Connection<'a>, ODBCParameter>> {
         Some(self)
     }
 }
@@ -131,7 +129,7 @@ where
     async fn get_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, dbconnection::Error> {
         let cxn = self.conn.lock().await;
 
         let mut prepared = cxn
@@ -140,12 +138,12 @@ where
                 table_reference.to_quoted_string()
             ))
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         let schema = Arc::new(
             arrow_schema_from(&mut prepared)
                 .boxed()
-                .context(super::UnableToGetSchemaSnafu)?,
+                .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
         );
 
         Ok(schema)
@@ -155,7 +153,7 @@ where
         &self,
         sql: &str,
         params: &[ODBCParameter],
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         // prepare some flume channels to communicate query results back from the thread
         let (batch_tx, batch_rx): (
             flume::Sender<Option<Result<RecordBatch, Error>>>,
@@ -236,7 +234,11 @@ where
         )))
     }
 
-    async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[ODBCParameter],
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
@@ -256,7 +258,7 @@ fn build_odbc_reader<C: Cursor>(
     cursor: C,
     schema: &Arc<Schema>,
     params: &HashMap<String, SecretString>,
-) -> Result<OdbcReader<C>> {
+) -> Result<OdbcReader<C>, Error> {
     let mut builder = OdbcReaderBuilder::new();
     builder.with_schema(Arc::clone(schema));
 
@@ -283,13 +285,13 @@ fn build_odbc_reader<C: Cursor>(
         builder.with_max_num_rows_per_batch(s);
     });
 
-    Ok(builder.build(cursor).context(ArrowODBCSnafu)?)
+    builder.build(cursor).context(ArrowODBCSnafu)
 }
 
 /// Binds parameter to an ODBC statement.
 ///
 /// `StatementImpl<'_>::bind_input_parameter` is unsafe.
-fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<()> {
+fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<(), Error> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
             statement
@@ -310,8 +312,6 @@ mod tests {
     use odbc_api::IntoParameter;
 
     use crate::odbcpool::ODBCPool;
-    use crate::Result;
-    use std::error::Error;
     use std::str;
 
     use super::*;
@@ -319,9 +319,7 @@ mod tests {
     // This test crudely validates that parameters are being received by the ODBC driver
     #[cfg(feature = "odbc")]
     #[tokio::test]
-    async fn test_bind_parameters() -> Result<(), Box<dyn Error + Send + Sync>> {
-        use odbc_api::Cursor;
-
+    async fn test_bind_parameters() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // It is possible to connect to the SQLite driver without an underlying file
         let pool = ODBCPool::new(Arc::new(HashMap::new())).expect("Must create ODBC pool");
         let env = pool.odbc_environment();

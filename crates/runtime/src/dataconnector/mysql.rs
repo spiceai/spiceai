@@ -17,11 +17,13 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
-use data_components::mysql::MySQLTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::mysqlpool::MySQLConnectionPool;
-use db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::{
+    DbConnectionPool, Error as DbConnectionPoolError,
+};
 use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
 use std::any::Any;
@@ -34,7 +36,7 @@ use super::{DataConnector, DataConnectorFactory};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create MySQL connection pool: {source}"))]
-    UnableToCreateMySQLConnectionPool { source: db_connection_pool::Error },
+    UnableToCreateMySQLConnectionPool { source: DbConnectionPoolError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

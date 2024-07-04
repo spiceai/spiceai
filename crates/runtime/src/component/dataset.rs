@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use acceleration::Engine;
-use data_components::util::column_reference;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
@@ -398,7 +398,7 @@ pub mod replication {
 mod tests {
     use std::collections::HashMap;
 
-    use data_components::util::column_reference::ColumnReference;
+    use datafusion_table_providers::util::column_reference::ColumnReference;
 
     use super::acceleration::{Acceleration, IndexType};
 
@@ -412,7 +412,7 @@ mod tests {
         let indexes_str = Acceleration::hashmap_to_option_string(&indexes_map);
         assert!(indexes_str == "foo:enabled;bar:unique" || indexes_str == "bar:unique;foo:enabled");
         let roundtrip_indexes_map: HashMap<String, IndexType> =
-            data_components::util::hashmap_from_option_string(&indexes_str);
+            datafusion_table_providers::util::hashmap_from_option_string(&indexes_str);
 
         let roundtrip_indexes_map = roundtrip_indexes_map
             .into_iter()
@@ -440,7 +440,7 @@ mod tests {
                 || indexes_str == "bar:unique;(foo, bar):enabled"
         );
         let roundtrip_indexes_map: HashMap<String, IndexType> =
-            data_components::util::hashmap_from_option_string(&indexes_str);
+            datafusion_table_providers::util::hashmap_from_option_string(&indexes_str);
 
         let roundtrip_indexes_map = roundtrip_indexes_map
             .into_iter()

@@ -16,14 +16,14 @@ limitations under the License.
 
 use std::{path::Path, sync::Arc};
 
-use data_components::duckdb::DuckDB;
+use datafusion_table_providers::duckdb::DuckDB;
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 
 use super::AcceleratedMetadataProvider;
 use super::{METADATA_DATASET_COLUMN, METADATA_METADATA_COLUMN, METADATA_TABLE_NAME};
 use crate::component::dataset::{acceleration::Engine, Dataset};
 use crate::dataaccelerator::{get_accelerator_engine, DuckDBAccelerator};
-use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 pub struct AcceleratedMetadataDuckDB {
     pool: Arc<DuckDbConnectionPool>,

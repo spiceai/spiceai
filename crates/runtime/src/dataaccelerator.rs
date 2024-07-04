@@ -19,12 +19,14 @@ use crate::secrets::ExposeSecret;
 use crate::secrets::Secret;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use data_components::util::{column_reference::ColumnReference, on_conflict::OnConflict};
 use datafusion::common::Constraint;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
+};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use lazy_static::lazy_static;
 use snafu::prelude::*;

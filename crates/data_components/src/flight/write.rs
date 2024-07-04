@@ -33,7 +33,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
-use crate::util::retriable_error::check_and_mark_retriable_error;
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

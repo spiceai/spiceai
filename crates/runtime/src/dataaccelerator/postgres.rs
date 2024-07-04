@@ -15,11 +15,14 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::postgres::PostgresTableProviderFactory;
+use data_components::delete::DeletionTableProviderAdapter;
 use datafusion::{
     datasource::{provider::TableProviderFactory, TableProvider},
     execution::context::SessionContext,
     logical_expr::CreateExternalTable,
+};
+use datafusion_table_providers::postgres::{
+    write::PostgresTableWriter, PostgresTableProviderFactory,
 };
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
@@ -67,9 +70,22 @@ impl DataAccelerator for PostgresAccelerator {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
-        TableProviderFactory::create(&self.postgres_factory, &ctx.state(), cmd)
-            .await
-            .context(UnableToCreateTableSnafu)
-            .boxed()
+        let table_provider =
+            TableProviderFactory::create(&self.postgres_factory, &ctx.state(), cmd)
+                .await
+                .context(UnableToCreateTableSnafu)
+                .boxed()?;
+
+        let Some(postgres_writer) = table_provider
+            .as_any()
+            .downcast_ref::<PostgresTableWriter>()
+        else {
+            unreachable!("PostgresTableWriter should be returned from PostgresTableProviderFactory")
+        };
+
+        let postgres_writer = Arc::new(postgres_writer.clone());
+
+        let deletion_adapter = DeletionTableProviderAdapter::new(postgres_writer);
+        Ok(Arc::new(deletion_adapter))
     }
 }

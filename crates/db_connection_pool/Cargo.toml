@@ -18,6 +18,7 @@ bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
 clickhouse-rs = { workspace = true, optional = true }
 datafusion.workspace = true
+datafusion-table-providers = { workspace = true }
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
@@ -59,8 +60,8 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "dep:async-stream",
 ]
-duckdb = ["dep:duckdb", "dep:r2d2"]
-mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
+duckdb = ["dep:duckdb", "dep:r2d2", "datafusion-table-providers/duckdb"]
+mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "datafusion-table-providers/mysql"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio", "dep:flume", "dep:dyn-clone"]
 postgres = [
   "dep:bb8",
@@ -72,6 +73,7 @@ postgres = [
   "arrow_sql_gen/postgres",
   "dep:tokio-postgres",
   "dep:async-stream",
+  "datafusion-table-providers/postgres",
 ]
 snowflake = ["dep:snowflake-api", "dep:pkcs8"]
-sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite"]
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "datafusion-table-providers/sqlite"]

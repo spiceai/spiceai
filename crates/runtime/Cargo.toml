@@ -36,6 +36,7 @@ dashmap = "5.5.3"
 data_components = { path = "../data_components" }
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
+datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 derive_builder = "0.20.0"
 dirs = "5.0.1"
@@ -83,7 +84,6 @@ serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
-sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 tokio.workspace = true
@@ -148,9 +148,9 @@ postgres = [
   "dep:bb8-postgres",
   "dep:postgres-native-tls",
   "db_connection_pool/postgres",
-  "sql_provider_datafusion/postgres",
   "arrow_sql_gen/postgres",
   "data_components/postgres",
+  "datafusion-table-providers/postgres",
 ]
 snowflake = [
   "dep:snowflake-api",
@@ -162,7 +162,6 @@ spiceai-dataset-test = []
 sqlite = [
   "dep:tokio-rusqlite",
   "db_connection_pool/sqlite",
-  "sql_provider_datafusion/sqlite",
   "arrow_sql_gen/sqlite",
   "data_components/sqlite",
 ]
