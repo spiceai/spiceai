@@ -56,7 +56,6 @@ pub mod sqlite;
 pub mod cdc;
 pub mod delete;
 pub mod object;
-pub mod util;
 
 #[async_trait]
 pub trait Read: Send + Sync {

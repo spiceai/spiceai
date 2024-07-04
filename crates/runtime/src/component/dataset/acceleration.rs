@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use data_components::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
 use std::{collections::HashMap, fmt::Display, time::Duration};
 

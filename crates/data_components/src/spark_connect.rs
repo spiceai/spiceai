@@ -38,11 +38,11 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
+use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 use futures::Stream;
 use spark_connect_rs::{
     client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
 };
-use sql_provider_datafusion::expr::{self, Engine};
 
 use std::error::Error;
 

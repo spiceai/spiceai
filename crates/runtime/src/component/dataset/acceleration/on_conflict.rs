@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use data_components::util::{column_reference::ColumnReference, on_conflict::OnConflict};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 
 use crate::component::dataset;
 

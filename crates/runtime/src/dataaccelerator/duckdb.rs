@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::duckdb::DuckDBTableProviderFactory;
+use data_components::delete::{get_deletion_provider, DeletionTableProviderAdapter};
 use datafusion::{
     datasource::{provider::TableProviderFactory, TableProvider},
     execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
 use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
@@ -62,9 +63,11 @@ impl DuckDBAccelerator {
         }
         let acceleration = dataset.acceleration.as_ref()?;
 
+        let mut params = acceleration.params.clone();
+
         Some(
             self.duckdb_factory
-                .duckdb_file_path(&dataset.name.to_string(), &acceleration.params),
+                .duckdb_file_path(&dataset.name.to_string(), &mut params),
         )
     }
 }
@@ -87,9 +90,19 @@ impl DataAccelerator for DuckDBAccelerator {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
-        TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), cmd)
+        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), cmd)
             .await
             .context(UnableToCreateTableSnafu)
-            .boxed()
+            .boxed()?;
+
+        let deletion_table_provider = get_deletion_provider(Arc::clone(&table_provider));
+
+        match deletion_table_provider {
+            Some(deletion_table_provider) => {
+                let deletion_adapter = DeletionTableProviderAdapter::new(deletion_table_provider);
+                Ok(Arc::new(deletion_adapter))
+            }
+            None => Ok(table_provider),
+        }
     }
 }

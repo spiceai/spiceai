@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::sqlite::SqliteTableFactory;
+use data_components::delete::{get_deletion_provider, DeletionTableProviderAdapter};
 use datafusion::{
     datasource::{provider::TableProviderFactory, TableProvider},
     execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
@@ -39,14 +40,14 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqliteAccelerator {
-    sqlite_factory: SqliteTableFactory,
+    sqlite_factory: SqliteTableProviderFactory,
 }
 
 impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sqlite_factory: SqliteTableFactory::new(),
+            sqlite_factory: SqliteTableProviderFactory::new(),
         }
     }
 
@@ -83,9 +84,19 @@ impl DataAccelerator for SqliteAccelerator {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
-        TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), cmd)
+        let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), cmd)
             .await
             .context(UnableToCreateTableSnafu)
-            .boxed()
+            .boxed()?;
+
+        let deletion_table_provider = get_deletion_provider(Arc::clone(&table_provider));
+
+        match deletion_table_provider {
+            Some(deletion_table_provider) => {
+                let deletion_adapter = DeletionTableProviderAdapter::new(deletion_table_provider);
+                Ok(Arc::new(deletion_adapter))
+            }
+            None => Ok(table_provider),
+        }
     }
 }

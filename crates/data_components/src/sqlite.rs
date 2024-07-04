@@ -14,371 +14,202 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
-    common::Constraints,
-    datasource::{provider::TableProviderFactory, TableProvider},
-    error::{DataFusionError, Result as DataFusionResult},
-    execution::context::SessionState,
-    logical_expr::CreateExternalTable,
-    sql::TableReference,
+    datasource::TableProvider, execution::context::SessionState, logical_expr::Expr,
+    physical_plan::ExecutionPlan,
 };
-use db_connection_pool::{
-    dbconnection::{sqliteconn::SqliteConnection, DbConnection},
-    sqlitepool::SqliteConnectionPool,
-    DbConnectionPool, Mode,
+use datafusion_table_providers::{
+    sql::sql_provider_datafusion::expr::Engine,
+    sqlite::{write::SqliteTableWriter, Sqlite},
+    util,
 };
-use rusqlite::{ToSql, Transaction};
-use snafu::prelude::*;
-use sql_provider_datafusion::{expr::Engine, SqlTable};
-use std::{collections::HashMap, sync::Arc};
-use tokio_rusqlite::Connection;
+use rusqlite::Transaction;
+use std::sync::Arc;
 
-use crate::{
-    delete::DeletionTableProviderAdapter,
-    util::{
-        self,
-        column_reference::{self, ColumnReference},
-        constraints::{self, get_primary_keys_from_constraints},
-        indexes::IndexType,
-        on_conflict::{self, OnConflict},
-    },
-};
-
-use self::write::SqliteTableWriter;
-
-pub mod write;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("DbConnectionError: {source}"))]
-    DbConnectionError {
-        source: db_connection_pool::dbconnection::GenericError,
-    },
-
-    #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError { source: db_connection_pool::Error },
-
-    #[snafu(display("Unable to downcast DbConnection to SqliteConnection"))]
-    UnableToDowncastDbConnection {},
-
-    #[snafu(display("Unable to construct SQLTable instance: {source}"))]
-    UnableToConstuctSqlTableProvider {
-        source: sql_provider_datafusion::Error,
-    },
-
-    #[snafu(display("Unable to create table in Sqlite: {source}"))]
-    UnableToCreateTable { source: tokio_rusqlite::Error },
-
-    #[snafu(display("Unable to insert data into the Sqlite table: {source}"))]
-    UnableToInsertIntoTable { source: rusqlite::Error },
-
-    #[snafu(display("Unable to insert data into the Sqlite table: {source}"))]
-    UnableToInsertIntoTableAsync { source: tokio_rusqlite::Error },
-
-    #[snafu(display("Unable to deleta all table data in Sqlite: {source}"))]
-    UnableToDeleteAllTableData { source: rusqlite::Error },
-
-    #[snafu(display("There is a dangling reference to the Sqlite struct in TableProviderFactory.create. This is a bug."))]
-    DanglingReferenceToSqlite,
-
-    #[snafu(display("Constraint Violation: {source}"))]
-    ConstraintViolation { source: constraints::Error },
-
-    #[snafu(display("Error parsing column reference: {source}"))]
-    UnableToParseColumnReference { source: column_reference::Error },
-
-    #[snafu(display("Error parsing on_conflict: {source}"))]
-    UnableToParseOnConflict { source: on_conflict::Error },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub struct SqliteTableFactory {
-    db_path_param: String,
-}
-
-impl SqliteTableFactory {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            db_path_param: "sqlite_file".to_string(),
-        }
-    }
-
-    #[must_use]
-    pub fn sqlite_file_path(&self, name: &str, options: &HashMap<String, String>) -> String {
-        options
-            .get(&self.db_path_param)
-            .cloned()
-            .unwrap_or_else(|| format!("{name}_sqlite.db"))
-    }
-}
-
-impl Default for SqliteTableFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-type DynSqliteConnectionPool =
-    dyn DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> + Send + Sync;
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
 #[async_trait]
-impl TableProviderFactory for SqliteTableFactory {
-    async fn create(
+impl DeletionTableProvider for SqliteTableWriter {
+    async fn delete_from(
         &self,
         _state: &SessionState,
-        cmd: &CreateExternalTable,
-    ) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let name = cmd.name.to_string();
-        let mut options = cmd.options.clone();
-        let mode = options.remove("mode").unwrap_or_default();
-        let mode: Mode = mode.as_str().into();
-
-        let indexes_option_str = options.remove("indexes");
-        let unparsed_indexes: HashMap<String, IndexType> = match indexes_option_str {
-            Some(indexes_str) => util::hashmap_from_option_string(&indexes_str),
-            None => HashMap::new(),
-        };
-
-        let unparsed_indexes = unparsed_indexes
-            .into_iter()
-            .map(|(key, value)| {
-                let columns = ColumnReference::try_from(key.as_str())
-                    .context(UnableToParseColumnReferenceSnafu)
-                    .map_err(to_datafusion_error);
-                (columns, value)
-            })
-            .collect::<Vec<(Result<ColumnReference, DataFusionError>, IndexType)>>();
-
-        let mut indexes: Vec<(ColumnReference, IndexType)> = Vec::new();
-        for (columns, index_type) in unparsed_indexes {
-            let columns = columns?;
-            indexes.push((columns, index_type));
-        }
-
-        let mut on_conflict: Option<OnConflict> = None;
-        if let Some(on_conflict_str) = options.remove("on_conflict") {
-            on_conflict = Some(
-                OnConflict::try_from(on_conflict_str.as_str())
-                    .context(UnableToParseOnConflictSnafu)
-                    .map_err(to_datafusion_error)?,
-            );
-        }
-
-        let db_path = self.sqlite_file_path(&name, &cmd.options);
-
-        let pool: Arc<SqliteConnectionPool> = Arc::new(
-            SqliteConnectionPool::new(&db_path, mode)
-                .await
-                .context(DbConnectionPoolSnafu)
-                .map_err(to_datafusion_error)?,
-        );
-
-        let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
-        let sqlite = Arc::new(Sqlite::new(
-            name.clone(),
-            Arc::clone(&schema),
-            Arc::clone(&pool),
-            cmd.constraints.clone(),
-        ));
-
-        let mut db_conn = sqlite.connect().await.map_err(to_datafusion_error)?;
-        let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn).map_err(to_datafusion_error)?;
-
-        let primary_keys = get_primary_keys_from_constraints(&cmd.constraints, &schema);
-
-        let table_exists = sqlite.table_exists(sqlite_conn).await;
-        if !table_exists {
-            let sqlite_in_conn = Arc::clone(&sqlite);
-            sqlite_conn
-                .conn
-                .call(move |conn| {
-                    let transaction = conn.transaction()?;
-                    sqlite_in_conn.create_table(&transaction, primary_keys)?;
-                    for index in indexes {
-                        sqlite_in_conn.create_index(
-                            &transaction,
-                            index.0.iter().collect(),
-                            index.1 == IndexType::Unique,
-                        )?;
-                    }
-                    transaction.commit()?;
-                    Ok(())
-                })
-                .await
-                .context(UnableToCreateTableSnafu)
-                .map_err(to_datafusion_error)?;
-        }
-
-        let dyn_pool: Arc<DynSqliteConnectionPool> = pool;
-
-        let read_provider = Arc::new(SqlTable::new_with_schema(
-            "sqlite",
-            &dyn_pool,
-            Arc::clone(&schema),
-            TableReference::bare(name.clone()),
-            Some(Engine::SQLite),
-        ));
-
-        let sqlite = Arc::into_inner(sqlite)
-            .context(DanglingReferenceToSqliteSnafu)
-            .map_err(to_datafusion_error)?;
-
-        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite, on_conflict);
-
-        let delete_adapter = DeletionTableProviderAdapter::new(read_write_provider);
-        Ok(Arc::new(delete_adapter))
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(SqliteDeletionSink::new(self.sqlite(), filters)),
+            &self.schema(),
+        )))
     }
 }
 
-fn to_datafusion_error(error: Error) -> DataFusionError {
-    DataFusionError::External(Box::new(error))
+struct SqliteDeletionSink {
+    sqlite: Arc<Sqlite>,
+    filters: Vec<Expr>,
 }
 
-#[derive(Clone)]
-pub struct Sqlite {
-    table_name: String,
-    schema: SchemaRef,
-    pool: Arc<SqliteConnectionPool>,
-    constraints: Constraints,
-}
-
-impl Sqlite {
-    #[must_use]
-    pub fn new(
-        table_name: String,
-        schema: SchemaRef,
-        pool: Arc<SqliteConnectionPool>,
-        constraints: Constraints,
-    ) -> Self {
+impl SqliteDeletionSink {
+    fn new(sqlite: Arc<Sqlite>, filters: &[Expr]) -> Self {
         Self {
-            table_name,
-            schema,
-            pool,
-            constraints,
+            sqlite,
+            filters: filters.to_vec(),
         }
     }
+}
 
-    #[must_use]
-    pub fn constraints(&self) -> &Constraints {
-        &self.constraints
-    }
+#[async_trait]
+impl DeletionSink for SqliteDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut db_conn = self.sqlite.connect().await?;
+        let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
+        let sqlite = Arc::clone(&self.sqlite);
+        let sql = util::filters_to_sql(&self.filters, Some(Engine::SQLite))?;
 
-    async fn connect(
-        &self,
-    ) -> Result<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
-        self.pool.connect().await.context(DbConnectionSnafu)
-    }
-
-    fn sqlite_conn<'a>(
-        db_connection: &'a mut Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>,
-    ) -> Result<&'a mut SqliteConnection> {
-        db_connection
-            .as_any_mut()
-            .downcast_mut::<SqliteConnection>()
-            .ok_or_else(|| UnableToDowncastDbConnectionSnafu {}.build())
-    }
-
-    async fn table_exists(&self, sqlite_conn: &mut SqliteConnection) -> bool {
-        let sql = format!(
-            r#"SELECT EXISTS (
-          SELECT 1
-          FROM sqlite_master
-          WHERE type='table'
-          AND name = '{name}'
-        )"#,
-            name = self.table_name
-        );
-        tracing::trace!("{sql}");
-
-        sqlite_conn
+        let count: u64 = sqlite_conn
             .conn
             .call(move |conn| {
-                let mut stmt = conn.prepare(&sql)?;
-                let exists = stmt.query_row([], |row| row.get(0))?;
-                Ok(exists)
+                let tx = conn.transaction()?;
+
+                let count = delete_from(sqlite.table_name(), &tx, &sql)?;
+
+                tx.commit()?;
+
+                Ok(count)
             })
-            .await
-            .unwrap_or(false)
-    }
-
-    fn insert_batch(
-        &self,
-        transaction: &Transaction<'_>,
-        batch: RecordBatch,
-        on_conflict: Option<&OnConflict>,
-    ) -> rusqlite::Result<()> {
-        let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
-
-        let sea_query_on_conflict =
-            on_conflict.map(|oc| oc.build_sea_query_on_conflict(&self.schema));
-
-        let sql = insert_table_builder
-            .build_sqlite(sea_query_on_conflict)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-
-        transaction.execute(&sql, [])?;
-
-        Ok(())
-    }
-
-    fn delete_all_table_data(&self, transaction: &Transaction<'_>) -> rusqlite::Result<()> {
-        transaction.execute(format!(r#"DELETE FROM "{}""#, self.table_name).as_str(), [])?;
-
-        Ok(())
-    }
-
-    fn delete_from(
-        &self,
-        transaction: &Transaction<'_>,
-        where_clause: &str,
-    ) -> rusqlite::Result<u64> {
-        transaction.execute(
-            format!(
-                r#"DELETE FROM "{}" WHERE {}"#,
-                self.table_name, where_clause
-            )
-            .as_str(),
-            [],
-        )?;
-        let count: u64 = transaction.query_row("SELECT changes()", [], |row| row.get(0))?;
+            .await?;
 
         Ok(count)
     }
+}
 
-    fn create_table(
-        &self,
-        transaction: &Transaction<'_>,
-        primary_keys: Vec<String>,
-    ) -> rusqlite::Result<()> {
-        let create_table_statement =
-            CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name)
-                .primary_keys(primary_keys);
-        let sql = create_table_statement.build_sqlite();
+fn delete_from(
+    table_name: &str,
+    transaction: &Transaction<'_>,
+    where_clause: &str,
+) -> rusqlite::Result<u64> {
+    transaction.execute(
+        format!(r#"DELETE FROM "{table_name}" WHERE {where_clause}"#).as_str(),
+        [],
+    )?;
+    let count: u64 = transaction.query_row("SELECT changes()", [], |row| row.get(0))?;
 
-        transaction.execute(&sql, [])?;
+    Ok(count)
+}
 
-        Ok(())
-    }
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
 
-    fn create_index(
-        &self,
-        transaction: &Transaction<'_>,
-        columns: Vec<&str>,
-        unique: bool,
-    ) -> rusqlite::Result<()> {
-        let mut index_builder = IndexBuilder::new(&self.table_name, columns);
-        if unique {
-            index_builder = index_builder.unique();
-        }
-        let sql = index_builder.build_sqlite();
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray, UInt64Array},
+        datatypes::{DataType, Schema},
+    };
+    use datafusion::{
+        common::{Constraints, TableReference, ToDFSchema},
+        datasource::provider::TableProviderFactory,
+        execution::context::SessionContext,
+        logical_expr::{cast, col, lit, CreateExternalTable},
+        physical_plan::{collect, test::exec::MockExec},
+        scalar::ScalarValue,
+    };
+    use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
 
-        transaction.execute(&sql, [])?;
+    use crate::delete::get_deletion_provider;
 
-        Ok(())
+    #[tokio::test]
+    #[allow(clippy::unreadable_literal)]
+    async fn test_round_trip_sqlite() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
+            arrow::datatypes::Field::new("time_int", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("test_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::empty(),
+            column_defaults: HashMap::default(),
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteTableProviderFactory::default()
+            .create(&ctx.state(), &external_table)
+            .await
+            .expect("table should be created");
+
+        let arr1 = StringArray::from(vec![
+            "1970-01-01",
+            "2012-12-01T11:11:11Z",
+            "2012-12-01T11:11:12Z",
+        ]);
+        let arr3 = Int64Array::from(vec![0, 1354360271, 1354360272]);
+        let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr1), Arc::new(arr3)])
+            .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), false)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let table =
+            get_deletion_provider(table).expect("table should be returned as deletion provider");
+
+        let filter = cast(
+            col("time_in_string"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        )
+        .lt(lit(ScalarValue::TimestampMillisecond(
+            Some(1354360272000),
+            None,
+        )));
+        let plan = table
+            .delete_from(&ctx.state(), &vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
+
+        let filter = col("time_int").lt(lit(1354360273));
+        let plan = table
+            .delete_from(&ctx.state(), &vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![1]);
+        assert_eq!(actual, &expected);
     }
 }

@@ -17,9 +17,11 @@ limitations under the License.
 use async_trait::async_trait;
 use clickhouse_rs::ClientHandle;
 use datafusion::{datasource::TableProvider, sql::TableReference};
-use db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::{
+    db_connection_pool::DbConnectionPool,
+    sql_provider_datafusion::{self, SqlTable},
+};
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
 use std::sync::Arc;
 
 use crate::Read;

@@ -23,17 +23,16 @@ use std::{
 
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
+use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::{ResultExt, Snafu};
 use url::Url;
 
-use crate::{
-    dbconnection::{clickhouseconn::ClickhouseConnection, DbConnection},
-    JoinPushDown,
-};
+use crate::dbconnection::clickhouseconn::ClickhouseConnection;
 
-use super::DbConnectionPool;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -206,7 +205,10 @@ async fn get_config_from_params(
 impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectionPool {
     async fn connect(
         &self,
-    ) -> super::Result<Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>> {
+    ) -> std::result::Result<
+        Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let pool = Arc::clone(&self.pool);
         let conn = match pool.get_handle().await {
             Ok(conn) => Ok(conn),
