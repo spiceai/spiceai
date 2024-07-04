@@ -31,7 +31,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::{self, AsyncDbConnection, DbConnection},
+    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
     DbConnectionPool,
 };
 use dyn_clone::DynClone;
@@ -47,6 +47,8 @@ use snafu::Snafu;
 use tokio::runtime::Handle;
 
 use odbc_api::Connection;
+
+type Result<T, E = GenericError> = std::result::Result<T, E>;
 
 pub trait ODBCSyncParameter: InputParameter + Sync + Send + DynClone {
     fn as_input_parameter(&self) -> &dyn InputParameter;
@@ -153,7 +155,7 @@ where
         &self,
         sql: &str,
         params: &[ODBCParameter],
-    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SendableRecordBatchStream> {
         // prepare some flume channels to communicate query results back from the thread
         let (batch_tx, batch_rx): (
             flume::Sender<Option<Result<RecordBatch, Error>>>,
@@ -234,11 +236,7 @@ where
         )))
     }
 
-    async fn execute(
-        &self,
-        query: &str,
-        params: &[ODBCParameter],
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
@@ -319,7 +317,7 @@ mod tests {
     // This test crudely validates that parameters are being received by the ODBC driver
     #[cfg(feature = "odbc")]
     #[tokio::test]
-    async fn test_bind_parameters() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
         let pool = ODBCPool::new(Arc::new(HashMap::new())).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
