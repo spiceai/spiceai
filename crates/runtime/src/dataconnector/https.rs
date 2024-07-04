@@ -66,7 +66,7 @@ impl ListingTableConnector for Https {
             }
         })?;
 
-        if let Some(p) = self.params.get("port") {
+        if let Some(p) = self.params.get("http_port") {
             let n = match p.parse::<u16>() {
                 Ok(n) => n,
                 Err(e) => {
@@ -95,7 +95,7 @@ impl ListingTableConnector for Https {
             };
         }
 
-        if let Some(p) = self.params.get("username") {
+        if let Some(p) = self.params.get("http_username") {
             if u.set_username(p).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
