@@ -47,7 +47,6 @@ use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::fmt;
-use std::path::{Path, PathBuf};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::Sender;
 use url::Url;
@@ -255,7 +254,7 @@ struct ScanContext {
     scan_state: GlobalScanState,
     task_context: Arc<TaskContext>,
     filter: Arc<dyn PhysicalExpr>,
-    limit: Option<usize>,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
 }
 
 impl ScanContext {
@@ -266,7 +265,7 @@ impl ScanContext {
         scan_state: GlobalScanState,
         task_context: Arc<TaskContext>,
         filter: Arc<dyn PhysicalExpr>,
-        limit: Option<usize>,
+        engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     ) -> Self {
         Self {
             tx,
@@ -275,7 +274,7 @@ impl ScanContext {
             scan_state,
             task_context,
             filter,
-            limit,
+            engine,
         }
     }
 }
@@ -386,7 +385,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             scan_state,
             context,
             Arc::clone(&self.filter),
-            self.limit,
+            Arc::clone(&self.engine),
         );
 
         tokio::task::spawn_blocking(move || {
@@ -396,7 +395,6 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             {
                 Ok(iter) => iter,
                 Err(e) => {
-                    tracing::error!("Error creating scan: {}", e);
                     tx.blocking_send(Err(e)).ok();
                     return;
                 }
@@ -406,12 +404,11 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
                 let data = match scan_result.map_err(map_delta_error_to_datafusion_err) {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!("Error scanning data: {}", e);
                         tx.blocking_send(Err(e)).ok();
                         continue;
                     }
                 };
-                if let Err(e) = delta_kernel::scan::state::visit_scan_files(
+                match delta_kernel::scan::state::visit_scan_files(
                     data.0.as_ref(),
                     data.1.as_ref(),
                     scan_context.clone(),
@@ -419,54 +416,26 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
                 )
                 .map_err(map_delta_error_to_datafusion_err)
                 {
-                    tracing::error!("Error visiting scan files: {}", e);
-                    tx.blocking_send(Err(e)).ok();
-                    continue;
+                    Ok(scan_context) => drop(scan_context),
+                    Err(e) => {
+                        tx.blocking_send(Err(e)).ok();
+                        continue;
+                    }
                 };
-                // let data: RecordBatch = match batch
-                //     .0
-                //     .into_any()
-                //     .downcast::<ArrowEngineData>()
-                //     .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
-                //     .map_err(map_delta_error_to_datafusion_err)
-                // {
-                //     Ok(data) => data.into(),
-                //     Err(e) => {
-                //         tracing::error!("Error converting engine data to record batch: {}", e);
-                //         tx.send(Err(e)).ok();
-                //         continue;
-                //     }
-                // };
-                // tracing::debug!("data: {:?}", data);
-                // tracing::debug!("num_rows: {}", data.num_rows());
-                // let mask = batch.1;
-                // tracing::debug!("mask: {:?}", mask);
-                // let batch = match filter_record_batch(&data, &mask.into())
-                //     .map_err(map_arrow_error_to_datafusion_err)
-                // {
-                //     Ok(batch) => batch,
-                //     Err(e) => {
-                //         tracing::error!("Error filtering record batch: {}", e);
-                //         tx.blocking_send(Err(e)).ok();
-                //         continue;
-                //     }
-                // };
-                // num_rows_processed += batch.num_rows();
-
-                // tracing::debug!("Sent batch");
-                // tx.blocking_send(Ok(batch)).ok();
             }
         });
 
         let receiver_stream = stream! {
             let mut num_rows_processed = 0;
+            let mut batch_num = 0;
             while let Some(batch) = rx.recv().await {
                 if let Ok(batch) = &batch {
                     num_rows_processed += batch.num_rows();
+                    batch_num += 1;
+                    tracing::debug!("Processed {num_rows_processed} rows so far: batch_num {batch_num}");
                 }
                 yield batch;
             }
-            tracing::debug!("Processed {} rows", num_rows_processed);
         };
 
         let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), receiver_stream);
@@ -491,12 +460,13 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
 fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
     size: i64,
     dv_info: DvInfo,
-    partition_values: HashMap<String, String>,
+    _partition_values: HashMap<String, String>,
 ) {
     let root_url = match Url::parse(&scan_context.scan_state.table_root) {
         Ok(url) => url,
@@ -528,23 +498,56 @@ fn handle_scan_file(
         }
     };
 
+    // get the selection vector (i.e. deletion vector)
+    let mut selection_vector =
+        match dv_info.get_selection_vector(scan_context.engine.as_ref(), &root_url) {
+            Ok(selection_vector) => selection_vector,
+            Err(e) => {
+                scan_context
+                    .tx
+                    .blocking_send(Err(datafusion::error::DataFusionError::Execution(format!(
+                        "Error getting selection vector: {e}",
+                    ))))
+                    .ok();
+                return;
+            }
+        };
+
     let tx = scan_context.tx.clone();
     tokio::task::spawn(async move {
         let mut stream = stream;
         while let Some(batch) = stream.next().await {
-            let batch = match batch {
+            let record_batch = match batch {
                 Ok(batch) => batch,
                 Err(e) => {
                     tx.send(Err(e)).await.ok();
                     continue;
                 }
             };
-            // TODO: Handle deletion vector
-            tx.send(Ok(batch)).await.ok();
+            // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+            // will cover the following results
+            let rest = selection_vector
+                .as_mut()
+                .map(|mask| mask.split_off(record_batch.num_rows()));
+            let batch = if let Some(mask) = selection_vector.clone() {
+                // apply the selection vector
+                filter_record_batch(&record_batch, &mask.into())
+                    .map_err(map_arrow_error_to_datafusion_err)
+            } else {
+                Ok(record_batch)
+            };
+            selection_vector = rest;
+            tx.send(batch).await.ok();
         }
     });
 }
 
 fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
+}
+
+fn map_arrow_error_to_datafusion_err(
+    e: arrow::error::ArrowError,
+) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(Box::new(e))
 }
