@@ -39,7 +39,7 @@ use datafusion::physical_plan::{
 };
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::scan::state::DvInfo;
+use delta_kernel::scan::state::{DvInfo, GlobalScanState};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
@@ -47,8 +47,10 @@ use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::Sender;
+use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -250,6 +252,7 @@ struct ScanContext {
     tx: Sender<Result<RecordBatch, datafusion::error::DataFusionError>>,
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     parquet_file_scan_config: FileScanConfig,
+    scan_state: GlobalScanState,
     task_context: Arc<TaskContext>,
     filter: Arc<dyn PhysicalExpr>,
     limit: Option<usize>,
@@ -260,6 +263,7 @@ impl ScanContext {
         tx: Sender<Result<RecordBatch, datafusion::error::DataFusionError>>,
         parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
         parquet_file_scan_config: FileScanConfig,
+        scan_state: GlobalScanState,
         task_context: Arc<TaskContext>,
         filter: Arc<dyn PhysicalExpr>,
         limit: Option<usize>,
@@ -268,6 +272,7 @@ impl ScanContext {
             tx,
             parquet_file_reader_factory,
             parquet_file_scan_config,
+            scan_state,
             task_context,
             filter,
             limit,
@@ -368,6 +373,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             .build()
             .map_err(map_delta_error_to_datafusion_err)?;
         let engine = Arc::clone(&self.engine);
+        let scan_state = scan.global_scan_state();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<RecordBatch, datafusion::error::DataFusionError>,
@@ -377,6 +383,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             tx.clone(),
             Arc::clone(&self.parquet_file_reader_factory),
             self.parquet_file_scan_config.clone(),
+            scan_state,
             context,
             Arc::clone(&self.filter),
             self.limit,
@@ -491,6 +498,19 @@ fn handle_scan_file(
     dv_info: DvInfo,
     partition_values: HashMap<String, String>,
 ) {
+    let root_url = match Url::parse(&scan_context.scan_state.table_root) {
+        Ok(url) => url,
+        Err(e) => {
+            scan_context
+                .tx
+                .blocking_send(Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Error parsing table root URL: {e}",
+                ))))
+                .ok();
+            return;
+        }
+    };
+    let path = format!("{}/{path}", root_url.path());
     let file_scan_config = scan_context
         .parquet_file_scan_config
         .clone()
@@ -515,12 +535,12 @@ fn handle_scan_file(
             let batch = match batch {
                 Ok(batch) => batch,
                 Err(e) => {
-                    tx.blocking_send(Err(e)).ok();
+                    tx.send(Err(e)).await.ok();
                     continue;
                 }
             };
             // TODO: Handle deletion vector
-            tx.blocking_send(Ok(batch)).ok();
+            tx.send(Ok(batch)).await.ok();
         }
     });
 }
