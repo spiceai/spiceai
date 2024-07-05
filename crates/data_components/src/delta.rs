@@ -19,27 +19,36 @@ use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_stream::stream;
 use async_trait::async_trait;
-use datafusion::common::project_schema;
+use datafusion::common::{project_schema, DFSchema};
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::DefaultParquetFileReaderFactory;
+use datafusion::datasource::physical_plan::{
+    FileScanConfig, ParquetExec, ParquetFileReaderFactory,
+};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::context::SessionState;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
+    PlanProperties,
 };
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::scan::state::DvInfo;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
+use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::fmt;
-use std::sync::mpsc;
 use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -179,15 +188,12 @@ impl TableProvider for DeltaTable {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, datafusion::error::DataFusionError> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        state: &SessionState,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -197,13 +203,30 @@ impl TableProvider for DeltaTable {
             .snapshot(self.engine.as_ref(), None)
             .map_err(map_delta_error_to_datafusion_err)?;
 
+        let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
+
+        let filter = conjunction(filters.to_vec()).unwrap_or_else(|| lit(true));
+        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
+
+        let store = self
+            .engine
+            .get_object_store_for_url(self.table.location())
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(
+                    "Failed to get object store for table location".to_string(),
+                )
+            })?;
+        let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(store))
+            as Arc<dyn ParquetFileReaderFactory>;
+
         Ok(Arc::new(DeltaTableExecutionPlan::try_new(
             snapshot,
             Arc::clone(&self.engine),
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
+            parquet_file_reader_factory,
             projection,
-            filters,
+            physical_expr,
             limit,
         )?))
     }
@@ -213,31 +236,74 @@ impl TableProvider for DeltaTable {
 struct DeltaTableExecutionPlan {
     snapshot: Arc<Snapshot>,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    projected_delta_schema: delta_kernel::schema::SchemaRef,
     projected_arrow_schema: SchemaRef,
+    projected_delta_schema: delta_kernel::schema::SchemaRef,
+    parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
+    parquet_file_scan_config: FileScanConfig,
+    filter: Arc<dyn PhysicalExpr>,
+    limit: Option<usize>,
     properties: PlanProperties,
-    filters: Vec<Expr>,
+}
+
+#[derive(Clone)]
+struct ScanContext {
+    tx: Sender<Result<RecordBatch, datafusion::error::DataFusionError>>,
+    parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
+    parquet_file_scan_config: FileScanConfig,
+    task_context: Arc<TaskContext>,
+    filter: Arc<dyn PhysicalExpr>,
     limit: Option<usize>,
 }
 
+impl ScanContext {
+    fn new(
+        tx: Sender<Result<RecordBatch, datafusion::error::DataFusionError>>,
+        parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
+        parquet_file_scan_config: FileScanConfig,
+        task_context: Arc<TaskContext>,
+        filter: Arc<dyn PhysicalExpr>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self {
+            tx,
+            parquet_file_reader_factory,
+            parquet_file_scan_config,
+            task_context,
+            filter,
+            limit,
+        }
+    }
+}
+
 impl DeltaTableExecutionPlan {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         snapshot: Snapshot,
         engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
         arrow_schema: &SchemaRef,
         delta_schema: delta_kernel::schema::SchemaRef,
+        parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
         projections: Option<&Vec<usize>>,
-        filters: &[Expr],
+        filter: Arc<dyn PhysicalExpr>,
         limit: Option<usize>,
     ) -> Result<Self, datafusion::error::DataFusionError> {
         let projected_arrow_schema = project_schema(arrow_schema, projections)?;
         let projected_delta_schema = project_delta_schema(arrow_schema, delta_schema, projections);
+
+        // FileScanConfig requires an ObjectStoreUrl, but it isn't actually used because we pass in a ParquetFileReaderFactory
+        // which specifies which object store to read from.
+        let parquet_file_scan_config =
+            FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::clone(arrow_schema))
+                .with_limit(limit)
+                .with_projection(projections.cloned());
         Ok(Self {
             snapshot: Arc::new(snapshot),
             engine,
             projected_arrow_schema: Arc::clone(&projected_arrow_schema),
             projected_delta_schema,
-            filters: filters.to_vec(),
+            parquet_file_reader_factory,
+            parquet_file_scan_config,
+            filter,
             limit,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_arrow_schema),
@@ -273,16 +339,11 @@ impl DisplayAs for DeltaTableExecutionPlan {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>();
-        let filters = self
-            .filters
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
         write!(
             f,
             "DeltaTableExecutionPlan projection=[{}] filters=[{}] limit=[{:?}]",
             columns.join(", "),
-            filters.join(", "),
+            self.filter,
             self.limit,
         )
     }
@@ -300,7 +361,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, datafusion::error::DataFusionError> {
         let scan = ScanBuilder::new(Arc::clone(&self.snapshot))
             .with_schema(Arc::clone(&self.projected_delta_schema))
@@ -310,62 +371,95 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<RecordBatch, datafusion::error::DataFusionError>,
-        >(0);
-        tokio::task::spawn_blocking(|| async move {
-            let mut num_rows_processed = 0;
+        >(1);
+
+        let scan_context = ScanContext::new(
+            tx.clone(),
+            Arc::clone(&self.parquet_file_reader_factory),
+            self.parquet_file_scan_config.clone(),
+            context,
+            Arc::clone(&self.filter),
+            self.limit,
+        );
+
+        tokio::task::spawn_blocking(move || {
             let scan_iter = match scan
                 .scan_data(engine.as_ref())
                 .map_err(map_delta_error_to_datafusion_err)
             {
                 Ok(iter) => iter,
                 Err(e) => {
-                    tx.send(Err(e)).await.ok();
+                    tracing::error!("Error creating scan: {}", e);
+                    tx.blocking_send(Err(e)).ok();
                     return;
                 }
             };
 
             for scan_result in scan_iter {
-                let batch = match scan_result.map_err(map_delta_error_to_datafusion_err) {
-                    Ok(batch) => batch,
+                let data = match scan_result.map_err(map_delta_error_to_datafusion_err) {
+                    Ok(data) => data,
                     Err(e) => {
-                        tx.send(Err(e)).await.ok();
+                        tracing::error!("Error scanning data: {}", e);
+                        tx.blocking_send(Err(e)).ok();
                         continue;
                     }
                 };
-                let data: RecordBatch = match batch
-                    .0
-                    .into_any()
-                    .downcast::<ArrowEngineData>()
-                    .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
-                    .map_err(map_delta_error_to_datafusion_err)
+                if let Err(e) = delta_kernel::scan::state::visit_scan_files(
+                    data.0.as_ref(),
+                    data.1.as_ref(),
+                    scan_context.clone(),
+                    handle_scan_file,
+                )
+                .map_err(map_delta_error_to_datafusion_err)
                 {
-                    Ok(data) => data.into(),
-                    Err(e) => {
-                        tx.send(Err(e)).await.ok();
-                        continue;
-                    }
+                    tracing::error!("Error visiting scan files: {}", e);
+                    tx.blocking_send(Err(e)).ok();
+                    continue;
                 };
-                let mask = batch.1;
-                let batch = match filter_record_batch(&data, &mask.into())
-                    .map_err(map_arrow_error_to_datafusion_err)
-                {
-                    Ok(batch) => batch,
-                    Err(e) => {
-                        tx.send(Err(e)).await.ok();
-                        continue;
-                    }
-                };
-                num_rows_processed += batch.num_rows();
+                // let data: RecordBatch = match batch
+                //     .0
+                //     .into_any()
+                //     .downcast::<ArrowEngineData>()
+                //     .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
+                //     .map_err(map_delta_error_to_datafusion_err)
+                // {
+                //     Ok(data) => data.into(),
+                //     Err(e) => {
+                //         tracing::error!("Error converting engine data to record batch: {}", e);
+                //         tx.send(Err(e)).ok();
+                //         continue;
+                //     }
+                // };
+                // tracing::debug!("data: {:?}", data);
+                // tracing::debug!("num_rows: {}", data.num_rows());
+                // let mask = batch.1;
+                // tracing::debug!("mask: {:?}", mask);
+                // let batch = match filter_record_batch(&data, &mask.into())
+                //     .map_err(map_arrow_error_to_datafusion_err)
+                // {
+                //     Ok(batch) => batch,
+                //     Err(e) => {
+                //         tracing::error!("Error filtering record batch: {}", e);
+                //         tx.blocking_send(Err(e)).ok();
+                //         continue;
+                //     }
+                // };
+                // num_rows_processed += batch.num_rows();
 
-                tx.send(Ok(batch)).await.ok();
+                // tracing::debug!("Sent batch");
+                // tx.blocking_send(Ok(batch)).ok();
             }
-            tracing::debug!("Processed {} rows", num_rows_processed);
         });
 
         let receiver_stream = stream! {
+            let mut num_rows_processed = 0;
             while let Some(batch) = rx.recv().await {
+                if let Ok(batch) = &batch {
+                    num_rows_processed += batch.num_rows();
+                }
                 yield batch;
             }
+            tracing::debug!("Processed {} rows", num_rows_processed);
         };
 
         let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), receiver_stream);
@@ -388,12 +482,49 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
     }
 }
 
-fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::External(Box::new(e))
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::cast_sign_loss)]
+fn handle_scan_file(
+    scan_context: &mut ScanContext,
+    path: &str,
+    size: i64,
+    dv_info: DvInfo,
+    partition_values: HashMap<String, String>,
+) {
+    let file_scan_config = scan_context
+        .parquet_file_scan_config
+        .clone()
+        .with_file(PartitionedFile::new(path, size as u64));
+    let exec = ParquetExec::builder(file_scan_config)
+        .with_parquet_file_reader_factory(Arc::clone(&scan_context.parquet_file_reader_factory))
+        .with_predicate(Arc::clone(&scan_context.filter))
+        .build();
+
+    let stream = match exec.execute(0, Arc::clone(&scan_context.task_context)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            scan_context.tx.blocking_send(Err(e)).ok();
+            return;
+        }
+    };
+
+    let tx = scan_context.tx.clone();
+    tokio::task::spawn(async move {
+        let mut stream = stream;
+        while let Some(batch) = stream.next().await {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tx.blocking_send(Err(e)).ok();
+                    continue;
+                }
+            };
+            // TODO: Handle deletion vector
+            tx.blocking_send(Ok(batch)).ok();
+        }
+    });
 }
 
-fn map_arrow_error_to_datafusion_err(
-    e: arrow::error::ArrowError,
-) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::ArrowError(e, None)
+fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
 }
