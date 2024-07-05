@@ -124,7 +124,7 @@ spice run
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler
+sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
 
 # Install Go
 export GO_VERSION="1.22.4"
