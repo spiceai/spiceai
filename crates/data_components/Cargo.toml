@@ -29,7 +29,7 @@ datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { git = "https://github.com/delta-incubator/delta-kernel-rs.git", rev = "43b2f256ff47cd7494196d1cf3257aaa73d1be83", features = ["default-engine"], optional = true }
+delta_kernel = { version = "0.1.1", features = ["default-engine"], optional = true }
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",

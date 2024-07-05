@@ -16,21 +16,31 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::sql::TableReference;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::{Engine, Table};
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::Table;
+use futures::stream;
+use futures::StreamExt;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
+use std::fmt;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::Read;
@@ -83,7 +93,7 @@ async fn get_delta_table(
     }
     //storage_options.insert(AWS_S3_ALLOW_UNSAFE_RENAME.to_string(), "true".to_string());
 
-    let delta_table = open_table_with_storage_options(table_uri, storage_options).await?;
+    let delta_table = DeltaTable::from(table_uri, storage_options)?;
 
     Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
 }
@@ -132,19 +142,18 @@ pub async fn resolve_table_uri(
 
 pub struct DeltaTable {
     table: Table,
-    engine: Box<dyn Engine>,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    schema: SchemaRef,
 }
 
 impl DeltaTable {
-    #[must_use]
-    pub fn from(table_location: String) -> Result<Self> {
+    pub fn from(table_location: String, storage_options: HashMap<String, String>) -> Result<Self> {
         let table = Table::try_from_uri(table_location).context(DeltaTableSnafu)?;
 
-        let options: HashMap<String, String> = HashMap::new();
-        let engine = Box::new(
+        let engine = Arc::new(
             DefaultEngine::try_new(
                 table.location(),
-                options,
+                storage_options,
                 Arc::new(TokioBackgroundExecutor::new()),
             )
             .context(DeltaTableSnafu)?,
@@ -154,32 +163,39 @@ impl DeltaTable {
             .snapshot(engine.as_ref(), None)
             .context(DeltaTableSnafu)?;
 
-        let scan = ScanBuilder::new(snapshot)
-            .build()
-            .context(DeltaTableSnafu)?;
+        let schema = Self::get_schema(&snapshot);
 
-        let mut batches = vec![];
-        for res in scan
-            .execute(engine.as_ref())
-            .context(DeltaTableSnafu)?
-            .into_iter()
-        {
-            let data = res.raw_data.context(DeltaTableSnafu)?;
-            let record_batch: RecordBatch = data
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
-                .context(DeltaTableSnafu)?
-                .into();
-            let batch = if let Some(mask) = res.mask {
-                filter_record_batch(&record_batch, &mask.into()).context(ArrowSnafu)?
-            } else {
-                record_batch
-            };
-            batches.push(batch);
+        Ok(Self {
+            table,
+            engine,
+            schema: Arc::new(schema),
+        })
+    }
+
+    fn get_schema(snapshot: &Snapshot) -> Schema {
+        let schema = snapshot.schema();
+
+        let mut fields: Vec<Field> = vec![];
+        for field in schema.fields() {
+            fields.push(Field::new(
+                field.name(),
+                map_delta_data_type_to_arrow_data_type(&field.data_type),
+                field.nullable,
+            ));
         }
 
-        Ok(Self { table, engine })
+        Schema::new(fields)
+    }
+}
+
+fn map_delta_data_type_to_arrow_data_type(
+    delta_data_type: &delta_kernel::schema::DataType,
+) -> DataType {
+    match delta_data_type {
+        delta_kernel::schema::DataType::Primitive(_) => todo!(),
+        delta_kernel::schema::DataType::Array(_) => todo!(),
+        delta_kernel::schema::DataType::Struct(_) => todo!(),
+        delta_kernel::schema::DataType::Map(_) => todo!(),
     }
 }
 
@@ -190,20 +206,169 @@ impl TableProvider for DeltaTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        unimplemented!()
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, datafusion::error::DataFusionError> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
     }
 
     async fn scan(
         &self,
         _state: &SessionState,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        unimplemented!()
+        let snapshot = self
+            .table
+            .snapshot(self.engine.as_ref(), None)
+            .map_err(map_delta_error_to_datafusion_err)?;
+
+        Ok(Arc::new(DeltaTableExecutionPlan::try_new(
+            snapshot,
+            Arc::clone(&self.engine),
+            &self.schema,
+            projection,
+            filters,
+            limit,
+        )?))
+    }
+}
+
+#[derive(Debug)]
+struct DeltaTableExecutionPlan {
+    snapshot: Arc<Snapshot>,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    projected_schema: SchemaRef,
+    properties: PlanProperties,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
+}
+
+impl DeltaTableExecutionPlan {
+    pub fn try_new(
+        snapshot: Snapshot,
+        engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        schema: &SchemaRef,
+        projections: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Self, datafusion::error::DataFusionError> {
+        let projected_schema = project_schema(schema, projections)?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            engine,
+            projected_schema: Arc::clone(&projected_schema),
+            filters: filters.to_vec(),
+            limit,
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
+        })
+    }
+}
+
+impl DisplayAs for DeltaTableExecutionPlan {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        let filters = self
+            .filters
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        write!(
+            f,
+            "DeltaTableExecutionPlan projection=[{}] filters=[{}] limit=[{:?}]",
+            columns.join(", "),
+            filters.join(", "),
+            self.limit,
+        )
+    }
+}
+
+impl ExecutionPlan for DeltaTableExecutionPlan {
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
-    fn table_type(&self) -> TableType {
-        todo!()
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.projected_schema)
     }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, datafusion::error::DataFusionError> {
+        let scan = ScanBuilder::new(Arc::clone(&self.snapshot))
+            .build()
+            .map_err(map_delta_error_to_datafusion_err)?;
+
+        let mut batches = vec![];
+        for res in scan
+            .execute(self.engine.as_ref())
+            .map_err(map_delta_error_to_datafusion_err)?
+        {
+            let data = res.raw_data.map_err(map_delta_error_to_datafusion_err)?;
+            let record_batch: RecordBatch = data
+                .into_any()
+                .downcast::<ArrowEngineData>()
+                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
+                .map_err(map_delta_error_to_datafusion_err)?
+                .into();
+            let batch = if let Some(mask) = res.mask {
+                filter_record_batch(&record_batch, &mask.into())
+                    .map_err(map_arrow_error_to_datafusion_err)?
+            } else {
+                record_batch
+            };
+            batches.push(batch);
+        }
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(self.schema(), stream::iter(batches).map(Ok));
+        Ok(Box::pin(stream_adapter))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
+        Ok(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
+}
+
+fn map_arrow_error_to_datafusion_err(
+    e: arrow::error::ArrowError,
+) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::ArrowError(e, None)
 }
