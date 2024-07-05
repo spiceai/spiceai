@@ -38,7 +38,7 @@ use snafu::{ResultExt, Snafu};
 use std::{any::Any, collections::HashMap, future::Future, io::Cursor, pin::Pin, sync::Arc};
 use url::Url;
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,8 +79,16 @@ Please verify the syntax of your GraphQL query."#
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, PartialEq, Eq)]
+enum OverwriteBehavior {
+    Error,
+    Overwrite,
+    Rename,
+}
+
+#[derive(Debug)]
 struct UnnestParameters {
     depth: usize,
+    overwrite_behavior: OverwriteBehavior,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -212,6 +220,7 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
     let mut new_objects = Vec::new();
     if let Value::Object(obj) = object {
         let mut new_object = obj.clone();
+        let mut key_counter: HashMap<String, usize> = HashMap::new();
 
         // setup some loop controls
         let mut depth_counter = 0;
@@ -245,7 +254,47 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
 
             // add the staged additions back to the root object
             for (key, value) in additions {
-                new_object.insert(key, value);
+                let new_key = match unnest_parameters.overwrite_behavior {
+                    OverwriteBehavior::Error => {
+                        if new_object.contains_key(&key) {
+                            return Err(Error::InvalidObjectAccess {
+                                message: format!(
+                                    "Column {key} already exists in the object and overwrite is set to error."
+                                ),
+                            });
+                        }
+
+                        key.clone()
+                    }
+                    OverwriteBehavior::Overwrite => key.clone(),
+                    OverwriteBehavior::Rename => {
+                        // if the key already exists, we need to rename it
+                        let mut new_key = key.clone();
+                        let counter = key_counter
+                            .entry(key.clone())
+                            .and_modify(|e| *e += 1)
+                            .or_insert(1);
+
+                        if new_object.contains_key(&key) {
+                            let Some(existing_value) = new_object.remove(&key) else {
+                                return Err(Error::InvalidObjectAccess {
+                                    message: format!("Column {key} already exists in the object and overwrite is set to rename, but the key does not exist."),
+                                });
+                            };
+
+                            new_object.insert(format!("{key}_{counter}"), existing_value);
+                            *counter += 1;
+                        }
+
+                        if *counter > 1 {
+                            new_key = format!("{key}_{counter}");
+                        }
+
+                        new_key
+                    }
+                };
+
+                new_object.insert(new_key, value);
             }
 
             // increment the depth counter
@@ -584,15 +633,33 @@ impl GraphQL {
 
         let unnest_depth = match unnest_depth {
             Ok(depth) => Ok(depth),
-            Err(e) => Err(super::DataConnectorError::InvalidConfiguration {
+            Err(e) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: "GraphQL".to_string(),
                 message: "`unnest_depth` is not an integer".to_string(),
                 source: e.into(),
             }),
         }?;
 
+        let unnest_duplicate_columns =
+            if let Some(duplicate_columns) = self.params.get("unnest_duplicate_columns") {
+                duplicate_columns
+            } else {
+                "error"
+            };
+
+        let overwrite_behavior = match unnest_duplicate_columns {
+            "error" => Ok(OverwriteBehavior::Error),
+            "overwrite" => Ok(OverwriteBehavior::Overwrite),
+            "rename" => Ok(OverwriteBehavior::Rename),
+            v => Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "GraphQL".to_string(),
+                message: format!("Invalid value for `unnest_duplicate_columns`: {v}"),
+            }),
+        }?;
+
         let unnest_parameters = UnnestParameters {
             depth: unnest_depth,
+            overwrite_behavior,
         };
 
         Ok(GraphQLClient::new(
@@ -640,6 +707,8 @@ impl DataConnector for GraphQL {
 mod tests {
     use reqwest::StatusCode;
     use serde_json::Value;
+
+    use crate::dataconnector::graphql::OverwriteBehavior;
 
     use super::handle_http_error;
     use super::PaginationParameters;
@@ -878,7 +947,10 @@ mod tests {
 
     #[test]
     fn test_json_object_unnesting() {
-        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let unnest_parameters = super::UnnestParameters {
+            depth: 100,
+            overwrite_behavior: OverwriteBehavior::Error,
+        };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
         let result =
             super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
@@ -893,7 +965,10 @@ mod tests {
             )]))
         );
 
-        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let unnest_parameters = super::UnnestParameters {
+            depth: 100,
+            overwrite_behavior: OverwriteBehavior::Error,
+        };
         let object =
             serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
         let result =
@@ -912,7 +987,10 @@ mod tests {
 
     #[test]
     fn test_json_object_unnesting_respects_unnest_depth() {
-        let unnest_parameters = super::UnnestParameters { depth: 0 };
+        let unnest_parameters = super::UnnestParameters {
+            depth: 0,
+            overwrite_behavior: OverwriteBehavior::Error,
+        };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
         let result =
             super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
@@ -930,7 +1008,10 @@ mod tests {
             )]))
         );
 
-        let unnest_parameters = super::UnnestParameters { depth: 1 };
+        let unnest_parameters = super::UnnestParameters {
+            depth: 1,
+            overwrite_behavior: OverwriteBehavior::Error,
+        };
         let object =
             serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
         let result =
@@ -955,7 +1036,10 @@ mod tests {
 
     #[test]
     fn test_json_array_unnesting() {
-        let unnest_parameters = super::UnnestParameters { depth: 100 };
+        let unnest_parameters = super::UnnestParameters {
+            depth: 100,
+            overwrite_behavior: OverwriteBehavior::Error,
+        };
         let object = serde_json::from_str("[1, 2, 3]").expect("Valid json");
         let result =
             super::unnest_json_object(&unnest_parameters, &object).expect("To unnest json array");
@@ -969,5 +1053,66 @@ mod tests {
 
         let obj = result.get(2).expect("To get third unnested object");
         assert_eq!(obj, &Value::Number(3.into()));
+    }
+
+    #[test]
+    fn test_unnesting_duplicate_column_names_errors() {
+        let unnest_parameters = super::UnnestParameters {
+            depth: 100,
+            overwrite_behavior: OverwriteBehavior::Error,
+        };
+        let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
+        let result = super::unnest_json_object(&unnest_parameters, &object);
+
+        assert!(result.is_err());
+
+        #[allow(clippy::unwrap_used)]
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid object access. Column a already exists in the object and overwrite is set to error."
+        );
+    }
+
+    #[test]
+    fn test_unnesting_duplicate_column_names_renames() {
+        let unnest_parameters = super::UnnestParameters {
+            depth: 100,
+            overwrite_behavior: OverwriteBehavior::Rename,
+        };
+        let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![
+                ("a_1".to_string(), Value::Number(1.into())),
+                ("a_2".to_string(), Value::Number(2.into()))
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_unnesting_duplicate_column_names_overwrites() {
+        let unnest_parameters = super::UnnestParameters {
+            depth: 100,
+            overwrite_behavior: OverwriteBehavior::Overwrite,
+        };
+        let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
+        let result =
+            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+        assert_eq!(result.len(), 1);
+
+        let obj = result.first().expect("To get first unnested object");
+        assert_eq!(
+            obj,
+            &Value::Object(serde_json::Map::from_iter(vec![(
+                "a".to_string(),
+                Value::Number(2.into())
+            )]))
+        );
     }
 }

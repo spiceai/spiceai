@@ -132,10 +132,10 @@ rm -rf /tmp/spice
 mkdir -p /tmp/spice
 cd /tmp/spice
 wget https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz
-tar xcvf go$GO_VERSION.linux-amd64.tar.gz
-mv ./go /usr/local/go
+tar xvfz go$GO_VERSION.linux-amd64.tar.gz
+sudo mv ./go /usr/local/go
 echo 'export PATH=$PATH:/usr/local/go/bin' >> $HOME/.profile
-source $HOME/.PROFILE
+source $HOME/.profile
 cd $HOME
 rm -rf /tmp/spice
 
