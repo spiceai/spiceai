@@ -308,6 +308,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let mut batches = vec![];
+        let mut num_rows_processed = 0;
         for res in scan
             .execute(self.engine.as_ref())
             .map_err(map_delta_error_to_datafusion_err)?
@@ -325,8 +326,10 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             } else {
                 record_batch
             };
+            num_rows_processed += batch.num_rows();
             batches.push(batch);
         }
+        tracing::debug!("Processed {} rows", num_rows_processed);
         let stream_adapter =
             RecordBatchStreamAdapter::new(self.schema(), stream::iter(batches).map(Ok));
         Ok(Box::pin(stream_adapter))
