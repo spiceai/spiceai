@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
@@ -108,14 +108,53 @@ impl DeltaTable {
     }
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
     delta_data_type: &delta_kernel::schema::DataType,
 ) -> DataType {
     match delta_data_type {
-        delta_kernel::schema::DataType::Primitive(_) => todo!(),
-        delta_kernel::schema::DataType::Array(_) => todo!(),
-        delta_kernel::schema::DataType::Struct(_) => todo!(),
-        delta_kernel::schema::DataType::Map(_) => todo!(),
+        delta_kernel::schema::DataType::Primitive(primitive_type) => match primitive_type {
+            delta_kernel::schema::PrimitiveType::String => DataType::Utf8,
+            delta_kernel::schema::PrimitiveType::Long => DataType::Int64,
+            delta_kernel::schema::PrimitiveType::Integer => DataType::Int32,
+            delta_kernel::schema::PrimitiveType::Short => DataType::Int16,
+            delta_kernel::schema::PrimitiveType::Byte => DataType::Int8,
+            delta_kernel::schema::PrimitiveType::Float => DataType::Float32,
+            delta_kernel::schema::PrimitiveType::Double => DataType::Float64,
+            delta_kernel::schema::PrimitiveType::Boolean => DataType::Boolean,
+            delta_kernel::schema::PrimitiveType::Binary => DataType::Binary,
+            delta_kernel::schema::PrimitiveType::Date => DataType::Date32,
+            delta_kernel::schema::PrimitiveType::Timestamp => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            }
+            delta_kernel::schema::PrimitiveType::TimestampNtz => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            delta_kernel::schema::PrimitiveType::Decimal(p, s) => {
+                DataType::Decimal128(*p, *s as i8)
+            }
+        },
+        delta_kernel::schema::DataType::Array(array_type) => DataType::List(Arc::new(Field::new(
+            "item",
+            map_delta_data_type_to_arrow_data_type(array_type.element_type()),
+            array_type.contains_null(),
+        ))),
+        delta_kernel::schema::DataType::Struct(struct_type) => {
+            let mut fields: Vec<Field> = vec![];
+            for field in struct_type.fields() {
+                fields.push(Field::new(
+                    field.name(),
+                    map_delta_data_type_to_arrow_data_type(field.data_type()),
+                    field.nullable,
+                ));
+            }
+            DataType::Struct(fields.into())
+        }
+        delta_kernel::schema::DataType::Map(map_type) => {
+            let key_type = map_delta_data_type_to_arrow_data_type(map_type.key_type());
+            let value_type = map_delta_data_type_to_arrow_data_type(map_type.value_type());
+            DataType::Dictionary(Box::new(key_type), Box::new(value_type))
+        }
     }
 }
 
