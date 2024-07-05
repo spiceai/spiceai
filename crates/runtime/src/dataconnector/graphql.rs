@@ -82,7 +82,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 enum OverwriteBehavior {
     Error,
     Overwrite,
-    Rename,
 }
 
 #[derive(Debug)]
@@ -219,7 +218,6 @@ impl GraphQLClient {
 fn unnest_json_object_duplicate_columns(
     unnest_parameters: &UnnestParameters,
     new_object: &mut Map<String, Value>,
-    key_counter: &mut HashMap<String, usize>,
     key: &str,
 ) -> Result<String> {
     match unnest_parameters.overwrite_behavior {
@@ -233,31 +231,6 @@ fn unnest_json_object_duplicate_columns(
             Ok(key.to_string())
         }
         OverwriteBehavior::Overwrite => Ok(key.to_string()),
-        OverwriteBehavior::Rename => {
-            // if the key already exists, we need to rename it
-            let mut new_key = key.to_string();
-            let counter = key_counter
-                .entry(key.to_string())
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-            if new_object.contains_key(key) {
-                let Some(existing_value) = new_object.remove(key) else {
-                    return Err(Error::InvalidObjectAccess {
-                        message: format!("Column '{key}' already exists in the object, but the key does not exist."),
-                    });
-                };
-
-                new_object.insert(format!("{key}_1"), existing_value);
-                *counter += 1;
-            }
-
-            if *counter > 1 {
-                new_key = format!("{key}_{counter}");
-            }
-
-            Ok(new_key)
-        }
     }
 }
 
@@ -265,7 +238,6 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
     let mut new_objects = Vec::new();
     if let Value::Object(obj) = object {
         let mut new_object = obj.clone();
-        let mut key_counter: HashMap<String, usize> = HashMap::new();
 
         // setup some loop controls
         let mut depth_counter = 0;
@@ -299,12 +271,8 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
 
             // add the staged additions back to the root object
             for (key, value) in additions {
-                let new_key = unnest_json_object_duplicate_columns(
-                    unnest_parameters,
-                    &mut new_object,
-                    &mut key_counter,
-                    &key,
-                )?;
+                let new_key =
+                    unnest_json_object_duplicate_columns(unnest_parameters, &mut new_object, &key)?;
 
                 new_object.insert(new_key, value);
             }
@@ -662,7 +630,6 @@ impl GraphQL {
         let overwrite_behavior = match unnest_duplicate_columns {
             "error" => Ok(OverwriteBehavior::Error),
             "overwrite" => Ok(OverwriteBehavior::Overwrite),
-            "rename" => Ok(OverwriteBehavior::Rename),
             v => Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "GraphQL".to_string(),
                 message: format!("Invalid value for `unnest_duplicate_columns`: {v}"),
@@ -1083,27 +1050,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Invalid object access. Column 'a' already exists in the object."
-        );
-    }
-
-    #[test]
-    fn test_unnesting_duplicate_column_names_renames() {
-        let unnest_parameters = super::UnnestParameters {
-            depth: 100,
-            overwrite_behavior: OverwriteBehavior::Rename,
-        };
-        let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
-        let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
-        assert_eq!(result.len(), 1);
-
-        let obj = result.first().expect("To get first unnested object");
-        assert_eq!(
-            obj,
-            &Value::Object(serde_json::Map::from_iter(vec![
-                ("a_1".to_string(), Value::Number(1.into())),
-                ("a_2".to_string(), Value::Number(2.into()))
-            ]))
         );
     }
 
