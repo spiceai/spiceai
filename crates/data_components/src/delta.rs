@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
@@ -34,11 +35,10 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
-use futures::stream;
-use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::fmt;
+use std::sync::mpsc;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Snafu)]
@@ -306,32 +306,69 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             .with_schema(Arc::clone(&self.projected_delta_schema))
             .build()
             .map_err(map_delta_error_to_datafusion_err)?;
+        let engine = Arc::clone(&self.engine);
 
-        let mut batches = vec![];
-        let mut num_rows_processed = 0;
-        for res in scan
-            .execute(self.engine.as_ref())
-            .map_err(map_delta_error_to_datafusion_err)?
-        {
-            let data = res.raw_data.map_err(map_delta_error_to_datafusion_err)?;
-            let record_batch: RecordBatch = data
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
-                .map_err(map_delta_error_to_datafusion_err)?
-                .into();
-            let batch = if let Some(mask) = res.mask {
-                filter_record_batch(&record_batch, &mask.into())
-                    .map_err(map_arrow_error_to_datafusion_err)?
-            } else {
-                record_batch
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<
+            Result<RecordBatch, datafusion::error::DataFusionError>,
+        >(0);
+        tokio::task::spawn_blocking(|| async move {
+            let mut num_rows_processed = 0;
+            let scan_iter = match scan
+                .scan_data(engine.as_ref())
+                .map_err(map_delta_error_to_datafusion_err)
+            {
+                Ok(iter) => iter,
+                Err(e) => {
+                    tx.send(Err(e)).await.ok();
+                    return;
+                }
             };
-            num_rows_processed += batch.num_rows();
-            batches.push(batch);
-        }
-        tracing::debug!("Processed {} rows", num_rows_processed);
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), stream::iter(batches).map(Ok));
+
+            for scan_result in scan_iter {
+                let batch = match scan_result.map_err(map_delta_error_to_datafusion_err) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        tx.send(Err(e)).await.ok();
+                        continue;
+                    }
+                };
+                let data: RecordBatch = match batch
+                    .0
+                    .into_any()
+                    .downcast::<ArrowEngineData>()
+                    .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
+                    .map_err(map_delta_error_to_datafusion_err)
+                {
+                    Ok(data) => data.into(),
+                    Err(e) => {
+                        tx.send(Err(e)).await.ok();
+                        continue;
+                    }
+                };
+                let mask = batch.1;
+                let batch = match filter_record_batch(&data, &mask.into())
+                    .map_err(map_arrow_error_to_datafusion_err)
+                {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        tx.send(Err(e)).await.ok();
+                        continue;
+                    }
+                };
+                num_rows_processed += batch.num_rows();
+
+                tx.send(Ok(batch)).await.ok();
+            }
+            tracing::debug!("Processed {} rows", num_rows_processed);
+        });
+
+        let receiver_stream = stream! {
+            while let Some(batch) = rx.recv().await {
+                yield batch;
+            }
+        };
+
+        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), receiver_stream);
         Ok(Box::pin(stream_adapter))
     }
 
