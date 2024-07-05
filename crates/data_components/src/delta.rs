@@ -55,7 +55,8 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DeltaTable {
     table: Table,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    schema: SchemaRef,
+    arrow_schema: SchemaRef,
+    delta_schema: delta_kernel::schema::SchemaRef,
 }
 
 impl DeltaTable {
@@ -83,12 +84,14 @@ impl DeltaTable {
             .snapshot(engine.as_ref(), None)
             .context(DeltaTableSnafu)?;
 
-        let schema = Self::get_schema(&snapshot);
+        let arrow_schema = Self::get_schema(&snapshot);
+        let delta_schema = snapshot.schema().clone();
 
         Ok(Self {
             table,
             engine,
-            schema: Arc::new(schema),
+            arrow_schema: Arc::new(arrow_schema),
+            delta_schema: Arc::new(delta_schema),
         })
     }
 
@@ -165,7 +168,7 @@ impl TableProvider for DeltaTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&self.arrow_schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -197,7 +200,8 @@ impl TableProvider for DeltaTable {
         Ok(Arc::new(DeltaTableExecutionPlan::try_new(
             snapshot,
             Arc::clone(&self.engine),
-            &self.schema,
+            &self.arrow_schema,
+            Arc::clone(&self.delta_schema),
             projection,
             filters,
             limit,
@@ -209,7 +213,8 @@ impl TableProvider for DeltaTable {
 struct DeltaTableExecutionPlan {
     snapshot: Arc<Snapshot>,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    projected_schema: SchemaRef,
+    projected_delta_schema: delta_kernel::schema::SchemaRef,
+    projected_arrow_schema: SchemaRef,
     properties: PlanProperties,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -219,20 +224,23 @@ impl DeltaTableExecutionPlan {
     pub fn try_new(
         snapshot: Snapshot,
         engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        schema: &SchemaRef,
+        arrow_schema: &SchemaRef,
+        delta_schema: delta_kernel::schema::SchemaRef,
         projections: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Self, datafusion::error::DataFusionError> {
-        let projected_schema = project_schema(schema, projections)?;
+        let projected_arrow_schema = project_schema(arrow_schema, projections)?;
+        let projected_delta_schema = project_delta_schema(arrow_schema, delta_schema, projections);
         Ok(Self {
             snapshot: Arc::new(snapshot),
             engine,
-            projected_schema: Arc::clone(&projected_schema),
+            projected_arrow_schema: Arc::clone(&projected_arrow_schema),
+            projected_delta_schema,
             filters: filters.to_vec(),
             limit,
             properties: PlanProperties::new(
-                EquivalenceProperties::new(projected_schema),
+                EquivalenceProperties::new(projected_arrow_schema),
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
             ),
@@ -240,10 +248,27 @@ impl DeltaTableExecutionPlan {
     }
 }
 
+fn project_delta_schema(
+    arrow_schema: &SchemaRef,
+    schema: delta_kernel::schema::SchemaRef,
+    projections: Option<&Vec<usize>>,
+) -> delta_kernel::schema::SchemaRef {
+    if let Some(projections) = projections {
+        let projected_fields = projections
+            .iter()
+            .filter_map(|i| schema.field(arrow_schema.field(*i).name()))
+            .cloned()
+            .collect::<Vec<_>>();
+        Arc::new(delta_kernel::schema::Schema::new(projected_fields))
+    } else {
+        schema
+    }
+}
+
 impl DisplayAs for DeltaTableExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let columns = self
-            .projected_schema
+            .projected_arrow_schema
             .fields()
             .iter()
             .map(|f| f.name().as_str())
@@ -269,7 +294,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.projected_schema)
+        Arc::clone(&self.projected_arrow_schema)
     }
 
     fn execute(
@@ -278,6 +303,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, datafusion::error::DataFusionError> {
         let scan = ScanBuilder::new(Arc::clone(&self.snapshot))
+            .with_schema(Arc::clone(&self.projected_delta_schema))
             .build()
             .map_err(map_delta_error_to_datafusion_err)?;
 
