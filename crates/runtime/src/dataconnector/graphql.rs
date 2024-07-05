@@ -33,7 +33,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT},
     RequestBuilder, StatusCode,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use snafu::{ResultExt, Snafu};
 use std::{any::Any, collections::HashMap, future::Future, io::Cursor, pin::Pin, sync::Arc};
 use url::Url;
@@ -216,6 +216,51 @@ impl GraphQLClient {
     }
 }
 
+fn unnest_json_object_duplicate_columns(
+    unnest_parameters: &UnnestParameters,
+    new_object: &mut Map<String, Value>,
+    key_counter: &mut HashMap<String, usize>,
+    key: &str,
+) -> Result<String> {
+    match unnest_parameters.overwrite_behavior {
+        OverwriteBehavior::Error => {
+            if new_object.contains_key(key) {
+                return Err(Error::InvalidObjectAccess {
+                    message: format!("Column '{key}' already exists in the object."),
+                });
+            }
+
+            Ok(key.to_string())
+        }
+        OverwriteBehavior::Overwrite => Ok(key.to_string()),
+        OverwriteBehavior::Rename => {
+            // if the key already exists, we need to rename it
+            let mut new_key = key.to_string();
+            let counter = key_counter
+                .entry(key.to_string())
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+
+            if new_object.contains_key(key) {
+                let Some(existing_value) = new_object.remove(key) else {
+                    return Err(Error::InvalidObjectAccess {
+                        message: format!("Column '{key}' already exists in the object, but the key does not exist."),
+                    });
+                };
+
+                new_object.insert(format!("{key}_1"), existing_value);
+                *counter += 1;
+            }
+
+            if *counter > 1 {
+                new_key = format!("{key}_{counter}");
+            }
+
+            Ok(new_key)
+        }
+    }
+}
+
 fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Result<Vec<Value>> {
     let mut new_objects = Vec::new();
     if let Value::Object(obj) = object {
@@ -254,45 +299,12 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
 
             // add the staged additions back to the root object
             for (key, value) in additions {
-                let new_key = match unnest_parameters.overwrite_behavior {
-                    OverwriteBehavior::Error => {
-                        if new_object.contains_key(&key) {
-                            return Err(Error::InvalidObjectAccess {
-                                message: format!(
-                                    "Column {key} already exists in the object and overwrite is set to error."
-                                ),
-                            });
-                        }
-
-                        key.clone()
-                    }
-                    OverwriteBehavior::Overwrite => key.clone(),
-                    OverwriteBehavior::Rename => {
-                        // if the key already exists, we need to rename it
-                        let mut new_key = key.clone();
-                        let counter = key_counter
-                            .entry(key.clone())
-                            .and_modify(|e| *e += 1)
-                            .or_insert(1);
-
-                        if new_object.contains_key(&key) {
-                            let Some(existing_value) = new_object.remove(&key) else {
-                                return Err(Error::InvalidObjectAccess {
-                                    message: format!("Column {key} already exists in the object and overwrite is set to rename, but the key does not exist."),
-                                });
-                            };
-
-                            new_object.insert(format!("{key}_{counter}"), existing_value);
-                            *counter += 1;
-                        }
-
-                        if *counter > 1 {
-                            new_key = format!("{key}_{counter}");
-                        }
-
-                        new_key
-                    }
-                };
+                let new_key = unnest_json_object_duplicate_columns(
+                    unnest_parameters,
+                    &mut new_object,
+                    &mut key_counter,
+                    &key,
+                )?;
 
                 new_object.insert(new_key, value);
             }
@@ -1070,7 +1082,7 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Invalid object access. Column a already exists in the object and overwrite is set to error."
+            "Invalid object access. Column 'a' already exists in the object."
         );
     }
 
