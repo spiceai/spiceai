@@ -32,6 +32,10 @@ pub mod runtime;
 pub mod secrets;
 pub mod view;
 
+pub trait Nameable {
+    fn name(&self) -> &str;
+}
+
 pub trait WithDependsOn<T> {
     fn depends_on(&self, depends_on: &[String]) -> T;
 }

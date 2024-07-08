@@ -18,7 +18,7 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{embeddings::ColumnEmbeddingConfig, params::Params, WithDependsOn};
+use super::{embeddings::ColumnEmbeddingConfig, params::Params, Nameable, WithDependsOn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -82,6 +82,12 @@ pub struct Dataset {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+}
+
+impl Nameable for Dataset {
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl Dataset {

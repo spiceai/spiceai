@@ -45,6 +45,8 @@ pub enum Error {
     },
     #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
     SpicepodNotFound { path: PathBuf },
+    #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
+    DuplicateComponent { component: String, name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -72,6 +74,23 @@ pub struct Spicepod {
     pub runtime: Runtime,
 }
 
+fn detect_duplicate_component_names(
+    component_type: &str,
+    components: &[impl component::Nameable],
+) -> Result<()> {
+    let mut component_names = vec![];
+    for component in components {
+        if component_names.contains(&component.name()) {
+            return Err(Error::DuplicateComponent {
+                component: component_type.to_string(),
+                name: component.name().to_string(),
+            });
+        }
+        component_names.push(component.name());
+    }
+    Ok(())
+}
+
 impl Spicepod {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         Self::load_from(&reader::StdFileSystem, path)
@@ -90,6 +109,7 @@ impl Spicepod {
 
         let spicepod_definition: SpicepodDefinition =
             serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
         let resolved_datasets = component::resolve_component_references(
             fs,
             &path,
@@ -117,6 +137,11 @@ impl Spicepod {
             "embeddings",
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
+        detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
+        detect_duplicate_component_names("view", &resolved_views[..])?;
+        detect_duplicate_component_names("model", &resolved_models[..])?;
+        detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
 
         Ok(from_definition(
             spicepod_definition,

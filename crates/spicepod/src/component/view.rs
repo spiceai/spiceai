@@ -18,7 +18,7 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::WithDependsOn;
+use super::{Nameable, WithDependsOn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -36,6 +36,12 @@ pub struct View {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+}
+
+impl Nameable for View {
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl View {
