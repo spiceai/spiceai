@@ -60,7 +60,7 @@ pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "databricks")]
-pub mod delta;
+pub mod delta_lake;
 #[cfg(feature = "dremio")]
 pub mod dremio;
 #[cfg(feature = "duckdb")]
@@ -249,7 +249,7 @@ pub async fn register_all() {
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::Databricks::create).await;
     #[cfg(feature = "databricks")]
-    register_connector_factory("delta", delta::Delta::create).await;
+    register_connector_factory("delta_lake", delta_lake::DeltaLake::create).await;
     #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
     register_connector_factory("file", file::File::create).await;

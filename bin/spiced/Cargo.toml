@@ -26,6 +26,7 @@ snmalloc-rs = "0.3.6"
 [features]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
+delta_lake = ["runtime/delta_lake"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
@@ -34,6 +35,7 @@ default = [
   "sqlite",
   "mysql",
   "flightsql",
+  "delta_lake",
   "databricks",
   "dremio",
   "clickhouse",

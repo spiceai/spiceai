@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
-use data_components::delta::DeltaTable;
+use data_components::delta_lake::DeltaTable;
 use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 use std::any::Any;
@@ -27,11 +27,11 @@ use std::{collections::HashMap, future::Future};
 
 use super::{DataConnector, DataConnectorFactory};
 
-pub struct Delta {
+pub struct DeltaLake {
     secret_map: SecretMap,
 }
 
-impl Delta {
+impl DeltaLake {
     #[must_use]
     pub fn new(secret: Option<Secret>, params: &Arc<HashMap<String, String>>) -> Self {
         let mut params: SecretMap = params.as_ref().into();
@@ -46,20 +46,20 @@ impl Delta {
     }
 }
 
-impl DataConnectorFactory for Delta {
+impl DataConnectorFactory for DeltaLake {
     fn create(
         secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let delta = Delta::new(secret, &params);
+            let delta = DeltaLake::new(secret, &params);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }
 }
 
 #[async_trait]
-impl DataConnector for Delta {
+impl DataConnector for DeltaLake {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -72,7 +72,7 @@ impl DataConnector for Delta {
         let delta = DeltaTable::from(delta_path, self.secret_map.clone().into_map())
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "delta",
+                dataconnector: "delta_lake",
             })?;
         Ok(Arc::new(delta))
     }

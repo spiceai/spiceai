@@ -66,7 +66,7 @@ impl Databricks {
     pub async fn new(secret: Option<Secret>, params: Arc<HashMap<String, String>>) -> Result<Self> {
         let mode = params.get("mode").cloned().unwrap_or_default();
 
-        if mode.as_str() == "delta" {
+        if mode.as_str() == "delta_lake" {
             let mut params: SecretMap = params.as_ref().into();
 
             if let Some(secret) = secret {
