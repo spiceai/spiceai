@@ -558,11 +558,6 @@ fn handle_scan_file(
             selection_vector = new_selection_vector;
         }
 
-        tracing::debug!(
-            "Parquet metadata: num_row_groups={}",
-            parquet_metadata.num_row_groups()
-        );
-
         // Create a ParquetAccessPlan that will be used to skip rows based on the selection vector
         let mut row_groups: Vec<RowGroupAccess> = vec![];
         let mut row_group_row_start = 0;
@@ -603,7 +598,7 @@ fn handle_scan_file(
             row_group_row_start += row_group.num_rows() as usize;
         }
 
-        tracing::debug!("Created ParquetAccessPlan with {row_groups:?} row groups");
+        tracing::debug!("Created ParquetAccessPlan with {row_groups:?}");
         let access_plan = ParquetAccessPlan::new(row_groups);
         partitioned_file = partitioned_file.with_extensions(Arc::new(access_plan));
     } else {
