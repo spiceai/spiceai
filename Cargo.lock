@@ -2962,7 +2962,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d03705612cd0e82f05d3694127f11e01ea60b6ed#d03705612cd0e82f05d3694127f11e01ea60b6ed"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b1645fca2b5779cce4a924f870585a91c54913f2#b1645fca2b5779cce4a924f870585a91c54913f2"
 dependencies = [
  "arrow",
  "async-stream",
@@ -6503,6 +6503,7 @@ dependencies = [
  "rand",
  "reqwest 0.12.5",
  "ring",
+ "rustls-pemfile 2.1.2",
  "serde",
  "serde_json",
  "snafu 0.7.5",
