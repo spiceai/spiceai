@@ -545,18 +545,13 @@ fn handle_scan_file(
             }
         };
 
-        let mut selection_vector = selection_vector.clone();
         let total_rows = parquet_metadata
             .row_groups()
             .iter()
             .map(RowGroupMetaData::num_rows)
             .sum::<i64>();
-        if selection_vector.len() < total_rows as usize {
-            // Extend the selection vector to the total number of rows in the file with true values
-            let mut new_selection_vector = vec![true; total_rows as usize];
-            new_selection_vector[..selection_vector.len()].copy_from_slice(&selection_vector);
-            selection_vector = new_selection_vector;
-        }
+
+        let selection_vector = get_full_selection_vector(selection_vector, total_rows as usize);
 
         // Create a ParquetAccessPlan that will be used to skip rows based on the selection vector
         let mut row_groups: Vec<RowGroupAccess> = vec![];
@@ -567,34 +562,12 @@ fn handle_scan_file(
                 "Row group {i} num_rows={} row_group_row_start={row_group_row_start}",
                 row_group.num_rows()
             );
-            if selection_vector
-                [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
-                .iter()
-                .all(|&x| !x)
-            {
-                row_groups.push(RowGroupAccess::Skip);
-                row_group_row_start += row_group.num_rows() as usize;
-                continue;
-            }
-            // If all rows in the row group are present, scan the full row group
-            if selection_vector
-                [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
-                .iter()
-                .all(|&x| x)
-            {
-                row_groups.push(RowGroupAccess::Scan);
-                row_group_row_start += row_group.num_rows() as usize;
-                continue;
-            }
-
-            let mask = selection_vector
-                [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
-                .to_vec();
-
-            // If some rows are deleted, add a row group access plan that skips the deleted rows
-            let row_selection = RowSelection::from_filters(&[mask.into()]);
-            row_groups.push(RowGroupAccess::Selection(row_selection));
-
+            let row_group_access = get_row_group_access(
+                &selection_vector,
+                row_group_row_start,
+                row_group.num_rows() as usize,
+            );
+            row_groups.push(row_group_access);
             row_group_row_start += row_group.num_rows() as usize;
         }
 
@@ -633,4 +606,80 @@ fn handle_scan_file(
 
 fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(Box::new(e))
+}
+
+fn get_row_group_access(
+    selection_vector: &[bool],
+    row_group_row_start: usize,
+    row_group_num_rows: usize,
+) -> RowGroupAccess {
+    // If all rows in the row group are deleted (i.e. not selected), skip the row group
+    if selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows]
+        .iter()
+        .all(|&x| !x)
+    {
+        return RowGroupAccess::Skip;
+    }
+    // If all rows in the row group are present (i.e. selected), scan the full row group
+    if selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows]
+        .iter()
+        .all(|&x| x)
+    {
+        return RowGroupAccess::Scan;
+    }
+
+    let mask =
+        selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows].to_vec();
+
+    // If some rows are deleted, get a row selection that skips the deleted rows
+    let row_selection = RowSelection::from_filters(&[mask.into()]);
+    RowGroupAccess::Selection(row_selection)
+}
+
+fn get_full_selection_vector(selection_vector: &[bool], total_rows: usize) -> Vec<bool> {
+    let mut new_selection_vector = vec![true; total_rows];
+    new_selection_vector[..selection_vector.len()].copy_from_slice(selection_vector);
+    new_selection_vector
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::parquet::arrow::arrow_reader::RowSelector;
+
+    use super::*;
+
+    #[test]
+    fn test_get_row_group_access() {
+        let selection_vector = &[true, true, true, true, true];
+        let row_group_row_start = 0;
+        let row_group_num_rows = 5;
+        let row_group_access =
+            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
+
+        assert_eq!(row_group_access, RowGroupAccess::Scan);
+
+        let selection_vector = &[false, false, false, false, false];
+        let row_group_row_start = 0;
+        let row_group_num_rows = 5;
+        let row_group_access =
+            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
+
+        assert_eq!(row_group_access, RowGroupAccess::Skip);
+
+        let selection_vector = &[true, true, true, false, true];
+        let row_group_row_start = 0;
+        let row_group_num_rows = 5;
+        let row_group_access =
+            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
+
+        let selectors = vec![
+            RowSelector::select(3),
+            RowSelector::skip(1),
+            RowSelector::select(1),
+        ];
+        assert_eq!(
+            row_group_access,
+            RowGroupAccess::Selection(selectors.into())
+        );
+    }
 }
