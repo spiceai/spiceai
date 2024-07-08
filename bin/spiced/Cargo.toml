@@ -13,7 +13,8 @@ app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
 futures = { workspace = true }
-metrics-exporter-prometheus = "0.13.0"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 runtime = { path = "../../crates/runtime" }
 snafu.workspace = true
 spice-cloud = { path = "../../crates/spice_cloud" }
@@ -26,6 +27,7 @@ snmalloc-rs = "0.3.6"
 [features]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
+delta_lake = ["runtime/delta_lake"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
@@ -34,6 +36,7 @@ default = [
   "sqlite",
   "mysql",
   "flightsql",
+  "delta_lake",
   "databricks",
   "dremio",
   "clickhouse",
@@ -58,4 +61,3 @@ snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 spice-cloud = []
 sqlite = ["runtime/sqlite"]
-

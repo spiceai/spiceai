@@ -33,20 +33,23 @@ import (
 )
 
 const (
-	apiKeyFlag         = "key"
-	accountFlag        = "account"
-	usernameFlag       = "username"
-	passwordFlag       = "password"
-	privateKeyPathFlag = "private-key-path"
-	passphraseFlag     = "passphrase"
-	token              = "token"
-	accessKeyFlag      = "access-key"
-	accessSecretFlag   = "access-secret"
-	sparkRemoteFlag    = "spark_remote"
-	awsRegion          = "aws-region"
-	awsAccessKeyId     = "aws-access-key-id"
-	awsSecret          = "aws-secret-access-key"
-	charset            = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	apiKeyFlag            = "key"
+	accountFlag           = "account"
+	usernameFlag          = "username"
+	passwordFlag          = "password"
+	privateKeyPathFlag    = "private-key-path"
+	passphraseFlag        = "passphrase"
+	token                 = "token"
+	accessKeyFlag         = "access-key"
+	accessSecretFlag      = "access-secret"
+	sparkRemoteFlag       = "spark_remote"
+	awsRegion             = "aws-region"
+	awsAccessKeyId        = "aws-access-key-id"
+	awsSecret             = "aws-secret-access-key"
+	azureAccountName      = "azure-storage-account-name"
+	azureAccessKey        = "azure-storage-access-key"
+	gcpServiceAccountPath = "google-service-account-path"
+	charset               = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 var loginCmd = &cobra.Command{
@@ -307,8 +310,14 @@ var databricksCmd = &cobra.Command{
 # Using Spark Connect
 spice login databricks --token <access-token>
 
-# Using Delta Lake directly
+# Using Delta Lake directly against AWS S3
 spice login databricks --token <access-token> --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
+
+# Using Delta Lake directly against Azure Blob Storage
+spice login databricks --token <access-token> --azure-storage-account-name <account-name> --azure-storage-access-key <access-key>
+
+# Using Delta Lake directly against Google Cloud Storage
+spice login databricks --token <access-token> --google-service-account-path /path/to/service-account.json
 
 # See more at: https://docs.spiceai.org/
 `,
@@ -324,10 +333,17 @@ spice login databricks --token <access-token> --aws-region <aws-region> --aws-ac
 			os.Exit(1)
 		}
 
+		params := map[string]string{
+			api.AUTH_PARAM_TOKEN: token,
+		}
+
 		awsRegion, err := cmd.Flags().GetString(awsRegion)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
+		}
+		if awsRegion != "" {
+			params[api.AUTH_PARAM_AWS_DEFAULT_REGION] = awsRegion
 		}
 
 		awsAccessKeyId, err := cmd.Flags().GetString(awsAccessKeyId)
@@ -335,24 +351,135 @@ spice login databricks --token <access-token> --aws-region <aws-region> --aws-ac
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
+		if awsAccessKeyId != "" {
+			params[api.AUTH_PARAM_AWS_ACCESS_KEY_ID] = awsAccessKeyId
+		}
 
 		awsSecret, err := cmd.Flags().GetString(awsSecret)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
+		if awsSecret != "" {
+			params[api.AUTH_PARAM_AWS_SECRET_ACCESS_KEY] = awsSecret
+		}
+
+		azureAccountName, err := cmd.Flags().GetString(azureAccountName)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if azureAccountName != "" {
+			params[api.AUTH_PARAM_AZURE_ACCOUNT_NAME] = azureAccountName
+		}
+
+		azureAccessKey, err := cmd.Flags().GetString(azureAccessKey)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if azureAccessKey != "" {
+			params[api.AUTH_PARAM_AZURE_ACCESS_KEY] = azureAccessKey
+		}
+
+		gcpServiceAccountPath, err := cmd.Flags().GetString(gcpServiceAccountPath)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if gcpServiceAccountPath != "" {
+			params[api.AUTH_PARAM_GCP_SERVICE_ACCOUNT_KEY_PATH] = gcpServiceAccountPath
+		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DATABRICKS, &api.Auth{
-			Params: map[string]string{
-				api.AUTH_PARAM_TOKEN:                 token,
-				api.AUTH_PARAM_AWS_DEFAULT_REGION:    awsRegion,
-				api.AUTH_PARAM_AWS_ACCESS_KEY_ID:     awsAccessKeyId,
-				api.AUTH_PARAM_AWS_SECRET_ACCESS_KEY: awsSecret,
-			},
+			Params: params,
 		},
 		)
 
 		cmd.Println(aurora.BrightGreen("Successfully logged in to Databricks"))
+	},
+}
+
+var deltaLakeCmd = &cobra.Command{
+	Use:   "delta_lake",
+	Short: "Configure credentials to access a Delta Lake table",
+	Example: `
+# Using Delta Lake with AWS S3
+spice login delta_lake --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
+
+# Using Delta Lake with Azure Blob Storage
+spice login delta_lake --azure-storage-account-name <account-name> --azure-storage-access-key <access-key>
+
+# Using Delta Lake with Google Cloud Storage
+spice login delta_lake --google-service-account-path /path/to/service-account.json
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: func(cmd *cobra.Command, args []string) {
+		params := map[string]string{
+			api.AUTH_PARAM_TOKEN: token,
+		}
+
+		awsRegion, err := cmd.Flags().GetString(awsRegion)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if awsRegion != "" {
+			params[api.AUTH_PARAM_AWS_DEFAULT_REGION] = awsRegion
+		}
+
+		awsAccessKeyId, err := cmd.Flags().GetString(awsAccessKeyId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if awsAccessKeyId != "" {
+			params[api.AUTH_PARAM_AWS_ACCESS_KEY_ID] = awsAccessKeyId
+		}
+
+		awsSecret, err := cmd.Flags().GetString(awsSecret)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if awsSecret != "" {
+			params[api.AUTH_PARAM_AWS_SECRET_ACCESS_KEY] = awsSecret
+		}
+
+		azureAccountName, err := cmd.Flags().GetString(azureAccountName)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if azureAccountName != "" {
+			params[api.AUTH_PARAM_AZURE_ACCOUNT_NAME] = azureAccountName
+		}
+
+		azureAccessKey, err := cmd.Flags().GetString(azureAccessKey)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if azureAccessKey != "" {
+			params[api.AUTH_PARAM_AZURE_ACCESS_KEY] = azureAccessKey
+		}
+
+		gcpServiceAccountPath, err := cmd.Flags().GetString(gcpServiceAccountPath)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		if gcpServiceAccountPath != "" {
+			params[api.AUTH_PARAM_GCP_SERVICE_ACCOUNT_KEY_PATH] = gcpServiceAccountPath
+		}
+
+		mergeAuthConfig(cmd, api.AUTH_TYPE_DELTA_LAKE, &api.Auth{
+			Params: params,
+		},
+		)
+
+		cmd.Println(aurora.BrightGreen("Successfully configured credentials for Delta Lake"))
 	},
 }
 
@@ -410,7 +537,18 @@ func init() {
 	databricksCmd.Flags().String(awsRegion, "", "AWS Region")
 	databricksCmd.Flags().String(awsAccessKeyId, "", "AWS Access Key ID")
 	databricksCmd.Flags().String(awsSecret, "", "AWS Secret Access Key")
+	databricksCmd.Flags().String(azureAccountName, "", "Azure Storage Account Name")
+	databricksCmd.Flags().String(azureAccessKey, "", "Azure Storage Access Key")
+	databricksCmd.Flags().String(gcpServiceAccountPath, "", "Google Service Account Path")
 	loginCmd.AddCommand(databricksCmd)
+
+	deltaLakeCmd.Flags().String(awsRegion, "", "AWS Region")
+	deltaLakeCmd.Flags().String(awsAccessKeyId, "", "AWS Access Key ID")
+	deltaLakeCmd.Flags().String(awsSecret, "", "AWS Secret Access Key")
+	deltaLakeCmd.Flags().String(azureAccountName, "", "Azure Storage Account Name")
+	deltaLakeCmd.Flags().String(azureAccessKey, "", "Azure Storage Access Key")
+	deltaLakeCmd.Flags().String(gcpServiceAccountPath, "", "Google Service Account Path")
+	loginCmd.AddCommand(deltaLakeCmd)
 
 	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")

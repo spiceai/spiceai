@@ -21,7 +21,7 @@ use secrecy::{ExposeSecret, Secret, SecretString};
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::delta::DeltaTable;
+use crate::delta_lake::DeltaTable;
 use crate::Read;
 
 #[derive(Clone)]

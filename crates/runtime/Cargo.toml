@@ -55,7 +55,7 @@ keyring = { version = "2.3.2", optional = true }
 lazy_static = "1.4.0"
 llms = { path = "../llms" }
 metrics.workspace = true
-metrics-exporter-prometheus = "0.13.0"
+metrics-exporter-prometheus.workspace = true
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
 ndarray = "0.15.3"
@@ -105,7 +105,7 @@ anyhow = "1.0.86"
 async-graphql = "7.0.5"
 async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
-metrics-util = "0.16.3"
+metrics-util = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
 rand = "0.8.5"
 tracing-subscriber.workspace = true
 
@@ -121,6 +121,7 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "data_components/clickhouse",
 ]
+delta_lake = ["data_components/delta_lake"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager"]
