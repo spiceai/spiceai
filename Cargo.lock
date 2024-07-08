@@ -5795,8 +5795,7 @@ dependencies = [
 [[package]]
 name = "metrics"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "884adb57038347dfbaf2d5065887b6cf4312330dc8e94bc30a1a839bd79d3261"
+source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
  "ahash 0.8.11",
  "portable-atomic",
@@ -5805,8 +5804,7 @@ dependencies = [
 [[package]]
 name = "metrics-exporter-prometheus"
 version = "0.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf0af7a0d7ced10c0151f870e5e3f3f8bc9ffc5992d32873566ca1f9169ae776"
+source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
  "base64 0.22.1",
  "http-body-util",
@@ -5856,8 +5854,7 @@ dependencies = [
 [[package]]
 name = "metrics-util"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4259040465c955f9f2f1a4a8a16dc46726169bca0f88e8fb2dbeced487c3e828"
+source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -9192,6 +9189,7 @@ dependencies = [
  "clap",
  "flightrepl",
  "futures",
+ "metrics 0.23.0",
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.3",
