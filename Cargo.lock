@@ -3066,7 +3066,6 @@ dependencies = [
  "datafusion-table-providers",
  "duckdb",
  "dyn-clone",
- "flume",
  "futures",
  "lazy_static",
  "mysql_async",
@@ -3849,9 +3848,6 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55ac459de2512911e4b674ce33cf20befaba382d05b62b008afc1c8b57cbf181"
 dependencies = [
- "futures-core",
- "futures-sink",
- "nanorand",
  "spin 0.9.8",
 ]
 
@@ -6117,15 +6113,6 @@ dependencies = [
  "time",
  "uuid 1.9.1",
  "zstd",
-]
-
-[[package]]
-name = "nanorand"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
-dependencies = [
- "getrandom",
 ]
 
 [[package]]
