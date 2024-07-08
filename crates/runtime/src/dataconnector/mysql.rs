@@ -58,6 +58,7 @@ impl DataConnectorFactory for MySQL {
                 "mysql_connection_string",
             );
             secret.insert_to_params(&mut params, "mysql_pass_key", "mysql_pass");
+            secret.insert_to_params(&mut params, "mysql_user_key", "mysql_user");
         }
 
         Box::pin(async move {
