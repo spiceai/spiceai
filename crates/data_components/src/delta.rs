@@ -388,7 +388,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
             Arc::clone(&self.engine),
         );
 
-        tokio::task::spawn_blocking(move || {
+        let join_handle = tokio::task::spawn_blocking(move || {
             let scan_iter = match scan
                 .scan_data(engine.as_ref())
                 .map_err(map_delta_error_to_datafusion_err)
@@ -436,6 +436,10 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
                 }
                 yield batch;
             }
+
+            if let Err(e) = join_handle.await {
+                yield Err(datafusion::error::DataFusionError::External(Box::new(e)));
+            };
         };
 
         let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), receiver_stream);
