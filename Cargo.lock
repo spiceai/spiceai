@@ -6503,6 +6503,7 @@ dependencies = [
  "rand",
  "reqwest 0.12.5",
  "ring",
+ "rustls-pemfile 2.1.2",
  "serde",
  "serde_json",
  "snafu 0.7.5",
