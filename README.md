@@ -15,14 +15,22 @@ Spice connects, fuses, and delivers data to applications, machine-learning model
 
 The Spice runtime, written in Rust, is built-with industry leading technologies such as [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQLite, and DuckDB.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
-  <img width="900" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/f71f227d-d7cd-418c-85b9-5c663a728491" />
-</picture>
+<div align="center">
+  <picture>
+    <img width="600" alt="How Spice works." src="https://github.com/spiceai/spiceai/assets/80174/7d93ae32-d6d8-437b-88d3-d64fe089e4b7" />
+  </picture>
+</div>
 
 ## Why Spice?
 
 Spice makes it easy and fast to query data from one or more sources using SQL. You can co-locate a managed dataset with your application or machine learning model, and accelerate it with Arrow in-memory, SQLite/DuckDB, or with attached PostgreSQL for fast, high-concurrency, low-latency queries. Accelerated engines give you flexibility and control over query cost and performance.
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
+    <img width="800" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/29e4421d-8942-4f2a-8397-e9d4fdeda36b" />
+  </picture>
+</div>
 
 ### How is Spice different?
 
@@ -45,20 +53,6 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 | Materialization            | Arrow/SQLite/DuckDB/PostgreSQL     | Intermediate Storage             | Reflections (Iceberg)            | Views & MergeTree       |
 | Query Result Caching       | Supported                          | Supported                        | Supported                        | Supported               |
 | Typical Configuration      | Single-Binary/Sidecar/Microservice | Coodinator+Executor w/ Zookeeper | Coodinator+Executor w/ Zookeeper              | Clickhouse Keeper+Nodes |
-
-### Before Spice
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/64a3216e-0bbb-48b0-bf98-72e656d690af">
-  <img width="750" alt="Before Spice" src="https://github.com/spiceai/spiceai/assets/80174/0550d682-cf3b-4b1b-a3bd-d8b3ad7d8caf" />
-</picture>
-
-### With Spice
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/02dbedb4-b209-4d08-bf83-4785a1bf886f">
-  <img width="900" alt="With Spice" src="https://github.com/spiceai/spiceai/assets/80174/b57514fe-d53d-42de-b8f0-97ae313c5708" />
-</picture>
 
 ### Example Use-Cases
 
