@@ -72,7 +72,8 @@ rdkafka = { version = "0.36.2", features = ["cmake-build"], optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
-databricks = ["dep:delta_kernel", "spark_connect"]
+delta_lake = ["dep:delta_kernel"]
+databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:serde_json", "dep:rdkafka"]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb", "datafusion-table-providers/duckdb"]
 flightsql = ["dep:tonic", "dep:r2d2"]
