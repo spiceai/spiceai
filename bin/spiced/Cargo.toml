@@ -13,7 +13,7 @@ app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
 futures = { workspace = true }
-metrics-exporter-prometheus = "0.13.0"
+metrics-exporter-prometheus = { workspace = true }
 runtime = { path = "../../crates/runtime" }
 snafu.workspace = true
 spice-cloud = { path = "../../crates/spice_cloud" }
@@ -58,4 +58,5 @@ snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 spice-cloud = []
 sqlite = ["runtime/sqlite"]
+
 

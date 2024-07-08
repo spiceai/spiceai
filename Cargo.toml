@@ -57,7 +57,8 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e2288500
 fundu = "2.0.0"
 futures = "0.3.30"
 itertools = "0.12"
-metrics = "0.22.0"
+metrics = "0.23.0"
+metrics-exporter-prometheus = "0.15.1"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.1" }
 odbc-api = { version = "7.0.0" }
