@@ -54,6 +54,9 @@
         - name: Build with only databricks
           run: cargo check --no-default-features --features databricks
   
+        - name: Build with only delta_lake
+          run: cargo check --no-default-features --features delta_lake
+  
         - name: Build with only dremio
           run: cargo check --no-default-features --features dremio
 
