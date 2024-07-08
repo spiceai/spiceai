@@ -40,6 +40,11 @@ const (
 	AUTH_PARAM_AWS_ACCESS_KEY_ID     = "AWS_ACCESS_KEY_ID"
 	AUTH_PARAM_AWS_SECRET_ACCESS_KEY = "AWS_SECRET_ACCESS_KEY"
 	AUTH_PARAM_SECRET                = "secret"
+
+	AUTH_PARAM_AZURE_ACCOUNT_NAME = "azure_storage_account_name"
+	AUTH_PARAM_AZURE_ACCESS_KEY = "azure_storage_access_key"
+
+	AUTH_PARAM_GCP_SERVICE_ACCOUNT_KEY_PATH = "google_service_account_path"
 )
 
 type Auth struct {
