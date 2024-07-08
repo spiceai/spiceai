@@ -17,15 +17,12 @@ limitations under the License.
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use deltalake::aws::storage::s3_constants::AWS_S3_ALLOW_UNSAFE_RENAME;
-use deltalake::open_table_with_storage_options;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use serde::Deserialize;
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
-use crate::{Read, ReadWrite};
-
-use crate::deltatable::write::DeltaTableWriter;
+use crate::delta_lake::DeltaTable;
+use crate::Read;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
@@ -44,42 +41,26 @@ impl Read for DatabricksDelta {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         get_delta_table(table_reference, Arc::clone(&self.params)).await
-    }
-}
-
-#[async_trait]
-impl ReadWrite for DatabricksDelta {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        let delta_table = get_delta_table(table_reference, Arc::clone(&self.params)).await?;
-
-        DeltaTableWriter::create(delta_table).map_err(Into::into)
     }
 }
 
 async fn get_delta_table(
     table_reference: TableReference,
     params: Arc<HashMap<String, SecretString>>,
-) -> Result<Arc<dyn TableProvider>, Box<dyn Error + Send + Sync>> {
-    // Needed to be able to load the s3:// scheme
-    deltalake::aws::register_handlers(None);
-    deltalake::azure::register_handlers(None);
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let table_uri = resolve_table_uri(table_reference, Arc::clone(&params)).await?;
 
     let mut storage_options = HashMap::new();
     for (key, value) in params.iter() {
-        if key == "token" {
+        if key == "token" || key == "endpoint" {
             continue;
         }
-        storage_options.insert(key.to_string(), value.expose_secret().to_string());
+        storage_options.insert(key.to_string(), value.clone());
     }
-    storage_options.insert(AWS_S3_ALLOW_UNSAFE_RENAME.to_string(), "true".to_string());
 
-    let delta_table = open_table_with_storage_options(table_uri, storage_options).await?;
+    let delta_table = DeltaTable::from(table_uri, storage_options)?;
 
     Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
 }
@@ -98,7 +79,7 @@ pub async fn resolve_table_uri(
         return Err("Endpoint not found in dataset params".into());
     };
 
-    let table_name = table_reference.table();
+    let table_name = table_reference.to_string();
 
     let mut token = "Token not found in auth provider";
     if let Some(token_secret_val) = params.get("token").map(Secret::expose_secret) {
@@ -116,7 +97,8 @@ pub async fn resolve_table_uri(
 
     if response.status().is_success() {
         let api_response: DatabricksTablesApiResponse = response.json().await?;
-        Ok(api_response.storage_location)
+        tracing::debug!("Databricks table URI: {}", api_response.storage_location);
+        Ok(format!("{}/", api_response.storage_location))
     } else {
         Err(format!(
             "Failed to retrieve databricks table URI. Status: {}",

@@ -19,7 +19,7 @@ use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
-use data_components::{Read, ReadWrite};
+use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
@@ -35,7 +35,7 @@ pub enum Error {
     #[snafu(display("Missing required parameter: endpoint"))]
     MissingEndpoint,
 
-    #[snafu(display("Missing required parameter: databricks-cluster-id"))]
+    #[snafu(display("Missing required parameter: databricks_cluster_id"))]
     MissingDatabricksClusterId,
 
     #[snafu(display("Missing required token. {message}"))]
@@ -50,11 +50,6 @@ pub enum Error {
         source: ns_lookup::Error,
     },
 
-    #[snafu(display(
-        "Invalid format '{format}' for mode '{mode}'. Valid combinations: s3/deltalake"
-    ))]
-    InvalidFormat { mode: String, format: String },
-
     #[snafu(display("{source}"))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -65,15 +60,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
-    read_write_provider: Arc<dyn ReadWrite>,
 }
 
 impl Databricks {
     pub async fn new(secret: Option<Secret>, params: Arc<HashMap<String, String>>) -> Result<Self> {
         let mode = params.get("mode").cloned().unwrap_or_default();
-        let format = params.get("format").cloned().unwrap_or_default();
 
-        if mode.as_str() == "s3" {
+        if mode.as_str() == "delta_lake" {
             let mut params: SecretMap = params.as_ref().into();
 
             if let Some(secret) = secret {
@@ -82,15 +75,10 @@ impl Databricks {
                 }
             }
 
-            if format == "deltalake" {
-                let databricks_delta = DatabricksDelta::new(Arc::new(params.into_map()));
-                Ok(Self {
-                    read_provider: Arc::new(databricks_delta.clone()),
-                    read_write_provider: Arc::new(databricks_delta),
-                })
-            } else {
-                InvalidFormatSnafu { mode, format }.fail()
-            }
+            let databricks_delta = DatabricksDelta::new(Arc::new(params.into_map()));
+            Ok(Self {
+                read_provider: Arc::new(databricks_delta.clone()),
+            })
         } else {
             let Some(endpoint) = params.get("endpoint") else {
                 return MissingEndpointSnafu.fail();
@@ -138,7 +126,6 @@ impl Databricks {
             .context(UnableToConstructDatabricksSparkSnafu)?;
             Ok(Self {
                 read_provider: Arc::new(databricks_spark.clone()),
-                read_write_provider: Arc::new(databricks_spark),
             })
         }
     }
@@ -174,21 +161,5 @@ impl DataConnector for Databricks {
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "databricks",
             })?)
-    }
-
-    async fn read_write_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let table_reference = TableReference::from(dataset.path());
-        let read_write_result = self
-            .read_write_provider
-            .table_provider(table_reference)
-            .await
-            .context(super::UnableToGetReadWriteProviderSnafu {
-                dataconnector: "databricks",
-            });
-
-        Some(read_write_result)
     }
 }

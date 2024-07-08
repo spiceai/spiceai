@@ -49,10 +49,10 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
   "tokio_io",
   "tls",
 ] }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f23af338e80e495b77fb38ced23f0ef88a94662c" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "c3f696adceaad7f579af7f163cb933e08d7f8ba1" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "c3f696adceaad7f579af7f163cb933e08d7f8ba1" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "149c3e9ec2cead44e66b4ca5efcb32ee77db0789" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f865563b1ae8670df21e9a054c5307112f85fbf6" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1becf0c961da12993009f53216ded2099c38d425" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "1becf0c961da12993009f53216ded2099c38d425" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b1645fca2b5779cce4a924f870585a91c54913f2" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
 fundu = "2.0.0"
 futures = "0.3.30"

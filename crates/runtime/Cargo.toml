@@ -121,6 +121,7 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "data_components/clickhouse",
 ]
+delta_lake = ["data_components/delta_lake"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager"]

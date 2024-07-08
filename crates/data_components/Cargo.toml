@@ -29,11 +29,7 @@ datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
-deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "488e36c8d7b24c3c3c3dd8be9a00437d0ad889c1", features = [
-  "datafusion-ext",
-  "s3",
-  "azure",
-], optional = true }
+delta_kernel = { version = "0.1.1", features = ["default-engine", "cloud"], optional = true }
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
@@ -76,7 +72,8 @@ rdkafka = { version = "0.36.2", features = ["cmake-build"], optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
-databricks = ["dep:deltalake", "spark_connect"]
+delta_lake = ["dep:delta_kernel"]
+databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:serde_json", "dep:rdkafka"]
 duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb", "datafusion-table-providers/duckdb"]
 flightsql = ["dep:tonic", "dep:r2d2"]
