@@ -5632,16 +5632,6 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2be3cbd384d4e955b231c895ce10685e3d8260c5ccffae898c96c723b0772835"
-dependencies = [
- "ahash 0.8.11",
- "portable-atomic",
-]
-
-[[package]]
-name = "metrics"
 version = "0.23.0"
 source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
@@ -5662,7 +5652,7 @@ dependencies = [
  "indexmap 2.2.6",
  "ipnet",
  "metrics 0.23.0",
- "metrics-util 0.17.0",
+ "metrics-util",
  "quanta",
  "thiserror",
  "tokio",
@@ -5682,34 +5672,19 @@ dependencies = [
 
 [[package]]
 name = "metrics-util"
-version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b07a5eb561b8cbc16be2d216faf7757f9baf3bfb94dbb0fae3df8387a5bb47f"
+version = "0.17.0"
+source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
  "aho-corasick",
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "indexmap 2.2.6",
- "metrics 0.22.3",
+ "metrics 0.23.0",
  "num_cpus",
  "ordered-float 4.2.0",
  "quanta",
  "radix_trie",
- "sketches-ddsketch",
-]
-
-[[package]]
-name = "metrics-util"
-version = "0.17.0"
-source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "metrics 0.23.0",
- "num_cpus",
- "quanta",
  "sketches-ddsketch",
 ]
 
@@ -8069,7 +8044,7 @@ dependencies = [
  "llms",
  "metrics 0.23.0",
  "metrics-exporter-prometheus",
- "metrics-util 0.16.3",
+ "metrics-util",
  "model_components",
  "mysql_async",
  "ndarray",
