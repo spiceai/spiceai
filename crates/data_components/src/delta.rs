@@ -512,7 +512,7 @@ fn handle_scan_file(
         }
     };
 
-    // get the selection vector (i.e. deletion vector)
+    // Get the selection vector (i.e. inverse deletion vector)
     let selection_vector =
         match dv_info.get_selection_vector(scan_context.engine.as_ref(), &root_url) {
             Ok(selection_vector) => selection_vector,
