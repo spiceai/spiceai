@@ -79,15 +79,14 @@ Please verify the syntax of your GraphQL query."#
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, PartialEq, Eq)]
-enum OverwriteBehavior {
+enum DuplicateBehavior {
     Error,
-    Overwrite,
 }
 
 #[derive(Debug)]
 struct UnnestParameters {
     depth: usize,
-    overwrite_behavior: OverwriteBehavior,
+    duplicate_behavior: DuplicateBehavior,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -220,8 +219,8 @@ fn unnest_json_object_duplicate_columns(
     new_object: &mut Map<String, Value>,
     key: &str,
 ) -> Result<String> {
-    match unnest_parameters.overwrite_behavior {
-        OverwriteBehavior::Error => {
+    match unnest_parameters.duplicate_behavior {
+        DuplicateBehavior::Error => {
             if new_object.contains_key(key) {
                 return Err(Error::InvalidObjectAccess {
                     message: format!("Column '{key}' already exists in the object."),
@@ -230,7 +229,6 @@ fn unnest_json_object_duplicate_columns(
 
             Ok(key.to_string())
         }
-        OverwriteBehavior::Overwrite => Ok(key.to_string()),
     }
 }
 
@@ -620,25 +618,9 @@ impl GraphQL {
             }),
         }?;
 
-        let unnest_duplicate_columns =
-            if let Some(duplicate_columns) = self.params.get("unnest_duplicate_columns") {
-                duplicate_columns
-            } else {
-                "error"
-            };
-
-        let overwrite_behavior = match unnest_duplicate_columns {
-            "error" => Ok(OverwriteBehavior::Error),
-            "overwrite" => Ok(OverwriteBehavior::Overwrite),
-            v => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "GraphQL".to_string(),
-                message: format!("Invalid value for `unnest_duplicate_columns`: {v}"),
-            }),
-        }?;
-
         let unnest_parameters = UnnestParameters {
             depth: unnest_depth,
-            overwrite_behavior,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
 
         Ok(GraphQLClient::new(
@@ -687,7 +669,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::Value;
 
-    use crate::dataconnector::graphql::OverwriteBehavior;
+    use crate::dataconnector::graphql::DuplicateBehavior;
 
     use super::handle_http_error;
     use super::PaginationParameters;
@@ -928,7 +910,7 @@ mod tests {
     fn test_json_object_unnesting() {
         let unnest_parameters = super::UnnestParameters {
             depth: 100,
-            overwrite_behavior: OverwriteBehavior::Error,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
         let result =
@@ -946,7 +928,7 @@ mod tests {
 
         let unnest_parameters = super::UnnestParameters {
             depth: 100,
-            overwrite_behavior: OverwriteBehavior::Error,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
         let object =
             serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
@@ -968,7 +950,7 @@ mod tests {
     fn test_json_object_unnesting_respects_unnest_depth() {
         let unnest_parameters = super::UnnestParameters {
             depth: 0,
-            overwrite_behavior: OverwriteBehavior::Error,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
         let result =
@@ -989,7 +971,7 @@ mod tests {
 
         let unnest_parameters = super::UnnestParameters {
             depth: 1,
-            overwrite_behavior: OverwriteBehavior::Error,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
         let object =
             serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
@@ -1017,7 +999,7 @@ mod tests {
     fn test_json_array_unnesting() {
         let unnest_parameters = super::UnnestParameters {
             depth: 100,
-            overwrite_behavior: OverwriteBehavior::Error,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str("[1, 2, 3]").expect("Valid json");
         let result =
@@ -1038,7 +1020,7 @@ mod tests {
     fn test_unnesting_duplicate_column_names_errors() {
         let unnest_parameters = super::UnnestParameters {
             depth: 100,
-            overwrite_behavior: OverwriteBehavior::Error,
+            duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
         let result = super::unnest_json_object(&unnest_parameters, &object);
@@ -1050,27 +1032,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Invalid object access. Column 'a' already exists in the object."
-        );
-    }
-
-    #[test]
-    fn test_unnesting_duplicate_column_names_overwrites() {
-        let unnest_parameters = super::UnnestParameters {
-            depth: 100,
-            overwrite_behavior: OverwriteBehavior::Overwrite,
-        };
-        let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
-        let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
-        assert_eq!(result.len(), 1);
-
-        let obj = result.first().expect("To get first unnested object");
-        assert_eq!(
-            obj,
-            &Value::Object(serde_json::Map::from_iter(vec![(
-                "a".to_string(),
-                Value::Number(2.into())
-            )]))
         );
     }
 }
