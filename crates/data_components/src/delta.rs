@@ -33,6 +33,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
+use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -544,6 +545,19 @@ fn handle_scan_file(
             }
         };
 
+        let mut selection_vector = selection_vector.clone();
+        let total_rows = parquet_metadata
+            .row_groups()
+            .iter()
+            .map(RowGroupMetaData::num_rows)
+            .sum::<i64>();
+        if selection_vector.len() < total_rows as usize {
+            // Extend the selection vector to the total number of rows in the file with true values
+            let mut new_selection_vector = vec![true; total_rows as usize];
+            new_selection_vector[..selection_vector.len()].copy_from_slice(&selection_vector);
+            selection_vector = new_selection_vector;
+        }
+
         tracing::debug!(
             "Parquet metadata: num_row_groups={}",
             parquet_metadata.num_row_groups()
@@ -561,7 +575,7 @@ fn handle_scan_file(
             if selection_vector
                 [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
                 .iter()
-                .all(|&x| x)
+                .all(|&x| !x)
             {
                 row_groups.push(RowGroupAccess::Skip);
                 row_group_row_start += row_group.num_rows() as usize;
@@ -571,7 +585,7 @@ fn handle_scan_file(
             if selection_vector
                 [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
                 .iter()
-                .all(|&x| !x)
+                .all(|&x| x)
             {
                 row_groups.push(RowGroupAccess::Scan);
                 row_group_row_start += row_group.num_rows() as usize;
