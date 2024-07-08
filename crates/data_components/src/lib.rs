@@ -32,7 +32,7 @@ pub mod debezium;
 #[cfg(feature = "debezium")]
 pub mod debezium_kafka;
 #[cfg(feature = "databricks")]
-pub mod deltatable;
+pub mod delta;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod flight;
