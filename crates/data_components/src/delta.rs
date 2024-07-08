@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
-use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::common::{project_schema, DFSchema};
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::parquet::DefaultParquetFileReaderFactory;
+use datafusion::datasource::physical_plan::parquet::{
+    DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
+};
 use datafusion::datasource::physical_plan::{
     FileScanConfig, ParquetExec, ParquetFileReaderFactory,
 };
@@ -31,7 +32,9 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
+use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
@@ -48,6 +51,7 @@ use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::fmt;
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
 use url::Url;
 
@@ -465,6 +469,7 @@ impl ExecutionPlan for DeltaTableExecutionPlan {
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_lines)]
 fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
@@ -485,25 +490,29 @@ fn handle_scan_file(
         }
     };
     let path = format!("{}/{path}", root_url.path());
-    let file_scan_config = scan_context
-        .parquet_file_scan_config
-        .clone()
-        .with_file(PartitionedFile::new(path, size as u64));
-    let exec = ParquetExec::builder(file_scan_config)
-        .with_parquet_file_reader_factory(Arc::clone(&scan_context.parquet_file_reader_factory))
-        .with_predicate(Arc::clone(&scan_context.filter))
-        .build();
 
-    let stream = match exec.execute(0, Arc::clone(&scan_context.task_context)) {
-        Ok(stream) => stream,
+    let mut partitioned_file = PartitionedFile::new(path.clone(), size as u64);
+
+    let mut parquet_file_reader = match scan_context.parquet_file_reader_factory.create_reader(
+        0,
+        partitioned_file.object_meta.clone().into(),
+        None,
+        &ExecutionPlanMetricsSet::new(),
+    ) {
+        Ok(reader) => reader,
         Err(e) => {
-            scan_context.tx.blocking_send(Err(e)).ok();
+            scan_context
+                .tx
+                .blocking_send(Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Error creating parquet file reader: {e}",
+                ))))
+                .ok();
             return;
         }
     };
 
     // get the selection vector (i.e. deletion vector)
-    let mut selection_vector =
+    let selection_vector =
         match dv_info.get_selection_vector(scan_context.engine.as_ref(), &root_url) {
             Ok(selection_vector) => selection_vector,
             Err(e) => {
@@ -517,41 +526,102 @@ fn handle_scan_file(
             }
         };
 
+    if let Some(selection_vector) = &selection_vector {
+        // TODO need to refactor this to happen in the plan phase, not the execute phase.
+        tracing::debug!("Selection vector: num_rows={}", selection_vector.len());
+        tracing::debug!("Selection vector: {:?}", selection_vector);
+        let handle = Handle::current();
+        let parquet_metadata = match handle.block_on(parquet_file_reader.get_metadata()) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                scan_context
+                    .tx
+                    .blocking_send(Err(datafusion::error::DataFusionError::Execution(format!(
+                        "Error getting parquet metadata: {e}",
+                    ))))
+                    .ok();
+                return;
+            }
+        };
+
+        tracing::debug!(
+            "Parquet metadata: num_row_groups={}",
+            parquet_metadata.num_row_groups()
+        );
+
+        // Create a ParquetAccessPlan that will be used to skip rows based on the selection vector
+        let mut row_groups: Vec<RowGroupAccess> = vec![];
+        let mut row_group_row_start = 0;
+        for (i, row_group) in parquet_metadata.row_groups().iter().enumerate() {
+            // If all rows in the row group are deleted, skip the row group
+            tracing::debug!(
+                "Row group {i} num_rows={} row_group_row_start={row_group_row_start}",
+                row_group.num_rows()
+            );
+            if selection_vector
+                [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
+                .iter()
+                .all(|&x| x)
+            {
+                row_groups.push(RowGroupAccess::Skip);
+                row_group_row_start += row_group.num_rows() as usize;
+                continue;
+            }
+            // If all rows in the row group are present, scan the full row group
+            if selection_vector
+                [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
+                .iter()
+                .all(|&x| !x)
+            {
+                row_groups.push(RowGroupAccess::Scan);
+                row_group_row_start += row_group.num_rows() as usize;
+                continue;
+            }
+
+            let mask = selection_vector
+                [row_group_row_start..row_group_row_start + row_group.num_rows() as usize]
+                .to_vec();
+
+            // If some rows are deleted, add a row group access plan that skips the deleted rows
+            let row_selection = RowSelection::from_filters(&[mask.into()]);
+            row_groups.push(RowGroupAccess::Selection(row_selection));
+
+            row_group_row_start += row_group.num_rows() as usize;
+        }
+
+        tracing::debug!("Created ParquetAccessPlan with {row_groups:?} row groups");
+        let access_plan = ParquetAccessPlan::new(row_groups);
+        partitioned_file = partitioned_file.with_extensions(Arc::new(access_plan));
+    } else {
+        tracing::debug!("No selection vector found for file {path}");
+    }
+
+    let file_scan_config = scan_context
+        .parquet_file_scan_config
+        .clone()
+        .with_file(partitioned_file);
+    let exec = ParquetExec::builder(file_scan_config)
+        .with_parquet_file_reader_factory(Arc::clone(&scan_context.parquet_file_reader_factory))
+        .with_predicate(Arc::clone(&scan_context.filter))
+        .build();
+
+    let stream = match exec.execute(0, Arc::clone(&scan_context.task_context)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            scan_context.tx.blocking_send(Err(e)).ok();
+            return;
+        }
+    };
+
     let tx = scan_context.tx.clone();
     tokio::task::spawn(async move {
         let mut stream = stream;
         while let Some(batch) = stream.next().await {
-            let record_batch = match batch {
-                Ok(batch) => batch,
-                Err(e) => {
-                    tx.send(Err(e)).await.ok();
-                    continue;
-                }
-            };
-            // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-            // will cover the following results
-            let rest = selection_vector
-                .as_mut()
-                .map(|mask| mask.split_off(record_batch.num_rows()));
-            let batch = if let Some(mask) = selection_vector.clone() {
-                // apply the selection vector
-                filter_record_batch(&record_batch, &mask.into())
-                    .map_err(map_arrow_error_to_datafusion_err)
-            } else {
-                Ok(record_batch)
-            };
-            selection_vector = rest;
             tx.send(batch).await.ok();
         }
     });
 }
 
 fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::External(Box::new(e))
-}
-
-fn map_arrow_error_to_datafusion_err(
-    e: arrow::error::ArrowError,
-) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(Box::new(e))
 }
