@@ -47,6 +47,7 @@ use snafu::Snafu;
 use tokio::runtime::Handle;
 
 use odbc_api::Connection;
+use tokio::sync::mpsc::Sender;
 
 type Result<T, E = GenericError> = std::result::Result<T, E>;
 
@@ -105,8 +106,8 @@ where
     }
 }
 
-fn blocking_channel_send<T>(channel: &flume::Sender<T>, item: T) -> Result<()> {
-    match channel.send(item) {
+fn blocking_channel_send<T>(channel: &Sender<T>, item: T) -> Result<()> {
+    match channel.blocking_send(item) {
         Ok(()) => Ok(()),
         Err(e) => Err(Error::ChannelError {
             message: format!("{e}"),
@@ -156,14 +157,9 @@ where
         sql: &str,
         params: &[ODBCParameter],
     ) -> Result<SendableRecordBatchStream> {
-        // prepare some flume channels to communicate query results back from the thread
-        let (batch_tx, batch_rx): (
-            flume::Sender<Option<Result<RecordBatch, Error>>>,
-            flume::Receiver<Option<Result<RecordBatch, Error>>>,
-        ) = flume::bounded(4); // at the default ODBC row count of 65_536, we buffer max 262_144 rows
-
-        let (schema_tx, schema_rx): (flume::Sender<Arc<Schema>>, flume::Receiver<Arc<Schema>>) =
-            flume::unbounded();
+        // prepare some tokio channels to communicate query results back from the thread
+        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
+        let (schema_tx, mut schema_rx) = tokio::sync::mpsc::channel::<Arc<Schema>>(1);
 
         // clone internals and parameters to let the thread own them
         let conn = Arc::clone(&self.conn); // clones the mutex not the connection, so we can .lock a connection inside the thread
@@ -174,7 +170,7 @@ where
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
         let secrets = Arc::clone(&self.params);
 
-        tokio::task::spawn_blocking(move || {
+        let join_handle = tokio::task::spawn_blocking(move || {
             let handle = Handle::current();
             let cxn = handle.block_on(async { conn.lock().await });
 
@@ -194,39 +190,30 @@ where
 
             let reader = build_odbc_reader(cursor, &schema, &secrets)?;
             for batch in reader {
-                blocking_channel_send(&batch_tx, Some(batch.context(ArrowSnafu)))?;
+                blocking_channel_send(&batch_tx, batch.context(ArrowSnafu)?)?;
             }
-
-            blocking_channel_send(&batch_tx, None)?;
 
             Ok::<_, GenericError>(())
         });
 
         // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
-        let schema = match schema_rx.recv_async().await {
-            Ok(s) => Ok::<_, GenericError>(s),
-            Err(e) => Err(Error::ChannelError {
-                message: format!("{e}"),
+        let schema = match schema_rx.recv().await {
+            Some(s) => Ok::<_, GenericError>(s),
+            None => Err(Error::ChannelError {
+                message: "Schema channel closed unexpectedly".to_string(),
             }
             .into()),
         }?;
 
         let output_stream = stream! {
-            loop {
-                match batch_rx.recv_async().await {
-                    Ok(Some(batch)) => match batch {
-                        Ok(batch) => yield Ok(batch),
-                        Err(e) => yield Err(DataFusionError::Execution(format!(
-                            "Failed to read ODBC batch: {e}"
-                        )))
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        yield Err(DataFusionError::Execution(format!(
-                            "ODBC reader closed unexpectedly: {e}"
-                        )))
-                    }
-                }
+            while let Some(batch) = batch_rx.recv().await {
+                yield Ok(batch);
+            }
+
+            if let Err(e) = join_handle.await {
+                yield Err(DataFusionError::Execution(format!(
+                    "Failed to execute ODBC query: {e}"
+                )))
             }
         };
 
