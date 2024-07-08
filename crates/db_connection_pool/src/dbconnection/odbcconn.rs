@@ -158,7 +158,7 @@ where
         params: &[ODBCParameter],
     ) -> Result<SendableRecordBatchStream> {
         // prepare some tokio channels to communicate query results back from the thread
-        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, Error>>(4);
+        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
         let (schema_tx, mut schema_rx) = tokio::sync::mpsc::channel::<Arc<Schema>>(1);
 
         // clone internals and parameters to let the thread own them
@@ -190,7 +190,7 @@ where
 
             let reader = build_odbc_reader(cursor, &schema, &secrets)?;
             for batch in reader {
-                blocking_channel_send(&batch_tx, batch.context(ArrowSnafu))?;
+                blocking_channel_send(&batch_tx, batch.context(ArrowSnafu)?)?;
             }
 
             Ok::<_, GenericError>(())
@@ -206,16 +206,8 @@ where
         }?;
 
         let output_stream = stream! {
-            loop {
-                match batch_rx.recv().await {
-                    Some(Ok(batch)) => yield Ok(batch),
-                    None => break,
-                    Some(Err(e)) => {
-                        yield Err(DataFusionError::Execution(format!(
-                            "Failed to read ODBC batch: {e}"
-                        )))
-                    }
-                }
+            while let Some(batch) = batch_rx.recv().await {
+                yield Ok(batch);
             }
 
             if let Err(e) = join_handle.await {
