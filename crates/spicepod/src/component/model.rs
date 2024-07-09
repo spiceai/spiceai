@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display, path::Path};
 
-use super::WithDependsOn;
+use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,12 @@ pub struct Model {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+}
+
+impl Nameable for Model {
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl WithDependsOn<Model> for Model {

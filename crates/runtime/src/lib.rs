@@ -360,13 +360,32 @@ impl Runtime {
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
     fn get_valid_views(app: &App, log_failures: bool) -> Vec<View> {
+        let datasets = Self::get_valid_datasets(app, log_failures)
+            .iter()
+            .map(|ds| ds.name.clone())
+            .collect::<HashSet<_>>();
+
         app.views
             .iter()
             .cloned()
             .map(View::try_from)
             .zip(&app.views)
             .filter_map(|(view, spicepod_view)| match view {
-                Ok(view) => Some(view),
+                Ok(view) => {
+                    // only load this view if the name isn't used by an existing dataset
+                    if datasets.contains(&view.name) {
+                        if log_failures {
+                            metrics::counter!("views_load_error").increment(1);
+                            tracing::error!(
+                                view = &spicepod_view.name,
+                                "View name is already in use by a dataset."
+                            );
+                        }
+                        None
+                    } else {
+                        Some(view)
+                    }
+                }
                 Err(e) => {
                     if log_failures {
                         metrics::counter!("views_load_error").increment(1);
