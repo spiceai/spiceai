@@ -232,6 +232,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
+pub struct LogErrors(pub bool);
+
 #[derive(Clone)]
 pub struct Runtime {
     instance_name: String,
@@ -338,13 +340,13 @@ impl Runtime {
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_datasets(app: &App, log_failures: bool) -> Vec<Dataset> {
+    fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Dataset> {
         Self::datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => Some(ds),
                 Err(e) => {
-                    if log_failures {
+                    if log_errors.0 {
                         status::update_dataset(
                             &TableReference::parse_str(&spicepod_ds.name),
                             status::ComponentStatus::Error,
@@ -403,7 +405,7 @@ impl Runtime {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, true);
+        let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
@@ -1150,8 +1152,8 @@ impl Runtime {
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
                 // check for new and updated datasets
-                let valid_datasets = Self::get_valid_datasets(&new_app, true);
-                let existing_datasets = Self::get_valid_datasets(current_app, false);
+                let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
+                let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
                 for ds in &valid_datasets {
                     if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
