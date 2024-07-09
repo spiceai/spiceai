@@ -23,7 +23,7 @@ use super::dataset::Dataset;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Catalog {
     pub provider: String,
-    pub provider_path: Option<String>,
+    pub catalog_id: Option<String>,
     pub name: TableReference,
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
@@ -35,11 +35,11 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
     fn try_from(catalog: spicepod_catalog::Catalog) -> std::result::Result<Self, Self::Error> {
         let table_reference = Dataset::parse_table_reference(&catalog.name)?;
         let provider = Catalog::provider(&catalog.from);
-        let provider_path = Catalog::provider_path(&catalog.from).map(String::from);
+        let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
 
         Ok(Catalog {
             provider: provider.to_string(),
-            provider_path,
+            catalog_id,
             name: table_reference,
             params: catalog
                 .params
@@ -59,7 +59,7 @@ impl Catalog {
     pub fn try_new(from: &str, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(Catalog {
             provider: Catalog::provider(from).to_string(),
-            provider_path: Catalog::provider_path(from).map(String::from),
+            catalog_id: Catalog::catalog_id(from).map(String::from),
             name: Dataset::parse_table_reference(name)?,
             params: HashMap::default(),
             dataset_params: HashMap::default(),
@@ -90,7 +90,7 @@ impl Catalog {
         from.split(':').next().unwrap_or(from)
     }
 
-    /// Returns the catalog provider path - the second part of the `from` field after the first `:`.
+    /// Returns the catalog id - the second part of the `from` field after the first `:`.
     ///
     /// # Examples
     ///
@@ -99,7 +99,7 @@ impl Catalog {
     ///
     /// let catalog = Catalog::try_new("foo:bar", "bar").expect("valid catalog");
     ///
-    /// assert_eq!(catalog.provider_path, Some("bar".to_string()));
+    /// assert_eq!(catalog.catalog_id, Some("bar".to_string()));
     /// ```
     ///
     /// ```
@@ -107,10 +107,10 @@ impl Catalog {
     ///
     /// let catalog = Catalog::try_new("foo", "bar").expect("valid catalog");
     ///
-    /// assert_eq!(catalog.provider_path, None);
+    /// assert_eq!(catalog.catalog_id, None);
     /// ```
     #[must_use]
-    fn provider_path(from: &str) -> Option<&str> {
+    fn catalog_id(from: &str) -> Option<&str> {
         match from.find(':') {
             Some(index) => Some(&from[index + 1..]),
             None => None,
