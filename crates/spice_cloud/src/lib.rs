@@ -71,7 +71,8 @@ impl SpiceExtension {
     }
 
     async fn get_spice_secret(&self, runtime: &Runtime) -> Result<Secret, Error> {
-        let secrets = runtime.secrets_provider.read().await;
+        let runtime_secrets_provider = runtime.secrets_provider();
+        let secrets = runtime_secrets_provider.read().await;
         let secret = secrets
             .get_secret("spiceai")
             .await

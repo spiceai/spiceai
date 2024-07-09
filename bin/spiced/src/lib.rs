@@ -19,17 +19,12 @@ limitations under the License.
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
-use futures::future::join_all;
-use futures::Future;
 use runtime::config::Config as RuntimeConfig;
 
-use runtime::datasets_health_monitor::DatasetsHealthMonitor;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
@@ -113,50 +108,19 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut rt: Runtime = Runtime::new(app, Arc::new(extension_factories)).await;
-
-    // mutable reference
-    rt.with_pods_watcher(pods_watcher);
-
-    rt.with_datasets_health_monitor(DatasetsHealthMonitor::new(Arc::clone(&rt.datafusion().ctx)));
-
-    rt.start_datasets_health_monitor();
+    let rt: Runtime = Runtime::builder()
+        .with_app_opt(app)
+        .with_extensions(extension_factories)
+        .with_pods_watcher(pods_watcher)
+        .with_datasets_health_monitor()
+        .build()
+        .await;
 
     let cloned_rt = rt.clone();
-    let server_thread =
-        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
-
-    rt.load_secrets().await;
-
-    rt.start_extensions().await;
-
-    if let Err(err) = rt
-        .start_metrics(args.metrics)
-        .await
-        .context(UnableToStartServersSnafu)
-    {
-        tracing::warn!("{err}");
-    }
-
-    #[cfg(feature = "models")]
-    rt.load_embeddings().await; // Must be loaded before datasets
-
-    let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
-        Box::pin(async {
-            if let Err(err) = rt.init_query_history().await {
-                tracing::warn!("Creating internal query history table: {err}");
-            };
-        }),
-        Box::pin(rt.init_results_cache()),
-        Box::pin(rt.load_datasets()),
-    ];
-
-    if cfg!(feature = "models") {
-        futures.push(Box::pin(rt.load_models()));
-    }
+    let server_thread = tokio::spawn(async move { cloned_rt.start_servers(args.runtime).await });
 
     tokio::select! {
-        _ = join_all(futures) => {},
+        () = rt.load_components() => {},
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },

@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use app::AppBuilder;
 
@@ -232,13 +231,13 @@ async fn test_graphql() -> Result<(), String> {
             "data.users",
         ))
         .build();
-    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let mut rt = Runtime::builder().with_app(app).build().await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
 
     let queries: QueryTests = vec![
@@ -308,13 +307,13 @@ async fn test_graphql_pagination() -> Result<(), String> {
             "data.paginatedUsers.users",
         ))
         .build();
-    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let mut rt = Runtime::builder().with_app(app).build().await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
 
     let queries: QueryTests = vec![

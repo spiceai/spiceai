@@ -22,7 +22,7 @@ use datafusion::{
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
 use futures::Future;
-use runtime::Runtime;
+use runtime::{datafusion::DataFusion, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -39,14 +39,11 @@ mod results_cache;
 #[cfg(feature = "odbc")]
 mod odbc;
 
-/// Modifies the runtime configuration of `DataFusion` to make test results reproducible across all machines.
+/// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn modify_runtime_datafusion_options(mut rt: Runtime) -> Runtime {
-    // Unwrap the Arc to get exclusive ownership of the DataFusion struct
-    let Ok(mut df) = Arc::try_unwrap(rt.df) else {
-        panic!("Expected to get exclusive ownership of the DataFusion struct");
-    };
+fn get_test_datafusion() -> Arc<DataFusion> {
+    let mut df = DataFusion::new();
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -59,8 +56,7 @@ fn modify_runtime_datafusion_options(mut rt: Runtime) -> Runtime {
 
     // Replace the old context with the modified one
     df.ctx = new_ctx.into();
-    rt.df = df.into();
-    rt
+    Arc::new(df)
 }
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
@@ -105,7 +101,7 @@ where
 {
     // Check the plan
     let plan_results = rt
-        .df
+        .datafusion()
         .ctx
         .sql(&format!("EXPLAIN {query}"))
         .await
@@ -119,7 +115,7 @@ where
     // Check the result
     if let Some(validate_result) = validate_result {
         let result_batches = rt
-            .df
+            .datafusion()
             .ctx
             .sql(query)
             .await

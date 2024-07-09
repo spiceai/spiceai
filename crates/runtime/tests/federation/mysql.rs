@@ -77,17 +77,21 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let df = get_test_datafusion();
+
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
     // Set a timeout for the test
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
-
-    let mut rt = crate::modify_runtime_datafusion_options(rt);
 
     let queries: QueryTests = vec![
         (
@@ -177,18 +181,23 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let df = get_test_datafusion();
+
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
     // Set a timeout for the test
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    let mut rt = crate::modify_runtime_datafusion_options(rt);
     let queries: QueryTests = vec![
         (
             "SELECT * FROM line inner join acc_line on acc_line.l_orderkey = line.l_orderkey LIMIT 10",
