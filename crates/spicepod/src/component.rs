@@ -23,6 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::reader;
+pub mod catalog;
 pub mod dataset;
 pub mod embeddings;
 pub mod extension;

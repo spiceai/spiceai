@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, fmt::Debug};
 
+use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
 use crate::component::runtime::Runtime;
 use crate::component::secrets::Secrets;
@@ -69,9 +70,10 @@ pub struct SpicepodDefinition {
     #[serde(default)]
     pub secrets: Secrets,
 
-    // #[serde(skip_serializing_if = "HashMap::is_empty")]
-    // #[serde(default)]
-    // pub metadata: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub catalogs: Vec<ComponentOrReference<Catalog>>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub datasets: Vec<ComponentOrReference<Dataset>>,
