@@ -85,10 +85,10 @@ jobs:
             REL_VERSION=${{ env.REL_VERSION }}
             CARGO_FEATURES=release,models
           tags: |
-            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-models-unstable
-            spiceai/spiceai:${{ env.REL_VERSION }}-models-unstable
-            ${{ env.LATEST_GHCR_TAG }}-models-unstable
-            ${{ env.LATEST_DOCKERHUB_TAG }}-models-unstable
+            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-models
+            spiceai/spiceai:${{ env.REL_VERSION }}-models
+            ${{ env.LATEST_GHCR_TAG }}-models
+            ${{ env.LATEST_DOCKERHUB_TAG }}-models
 
       - name: Image digest
         run: |
