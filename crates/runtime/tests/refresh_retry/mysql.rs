@@ -152,13 +152,13 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         .with_dataset(ds_default_retries)
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
 
     let refresh_task_no_retries = create_refresh_task(&rt, "lineitem_no_retries").await?;

@@ -18,7 +18,7 @@ limitations under the License.
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::spice_metrics::MetricsRecorder;
@@ -32,6 +32,7 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
+use builder::RuntimeBuilder;
 use cache::QueryResultsCacheProvider;
 use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
@@ -42,7 +43,7 @@ use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
-use futures::StreamExt;
+use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
@@ -60,15 +61,16 @@ use tracing_util::dataset_registered_trace;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 pub use util::shutdown_signal;
 use util::{retry, RetryError};
-use uuid::Uuid;
 
-use crate::extension::{Extension, ExtensionFactory};
+use crate::extension::Extension;
 pub mod accelerated_table;
+mod builder;
 pub mod component;
 pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
+pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
@@ -87,8 +89,6 @@ pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
 mod tracing_util;
-
-pub mod datasets_health_monitor;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -232,17 +232,21 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
+#[derive(Clone, Copy)]
+pub struct LogErrors(pub bool);
+
 #[derive(Clone)]
 pub struct Runtime {
     instance_name: String,
-    pub app: Arc<RwLock<Option<App>>>,
-    pub df: Arc<DataFusion>,
-    pub models: Arc<RwLock<HashMap<String, Model>>>,
-    pub llms: Arc<RwLock<LLMModelStore>>,
-    pub embeds: Arc<RwLock<EmbeddingModelStore>>,
-    pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
-    pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-    pub datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
+    app: Arc<RwLock<Option<App>>>,
+    df: Arc<DataFusion>,
+    models: Arc<RwLock<HashMap<String, Model>>>,
+    llms: Arc<RwLock<LLMModelStore>>,
+    embeds: Arc<RwLock<EmbeddingModelStore>>,
+    pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
+    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
+    metrics: Option<SocketAddr>,
 
     extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
@@ -250,47 +254,8 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub async fn new(
-        app: Option<app::App>,
-        extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
-    ) -> Self {
-        dataconnector::register_all().await;
-        dataaccelerator::register_all().await;
-
-        let hash = Uuid::new_v4().to_string()[..8].to_string();
-        let name = match &app {
-            Some(app) => app.name.clone(),
-            None => "spice".to_string(),
-        };
-
-        let mut rt = Runtime {
-            instance_name: format!("{name}-{hash}").to_string(),
-            app: Arc::new(RwLock::new(app)),
-            df: Arc::new(DataFusion::new()),
-            models: Arc::new(RwLock::new(HashMap::new())),
-            llms: Arc::new(RwLock::new(HashMap::new())),
-            embeds: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher: Arc::new(RwLock::new(None)),
-            secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
-            spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
-            extensions: Arc::new(RwLock::new(vec![])),
-            datasets_health_monitor: None,
-        };
-
-        let mut extensions: Vec<Box<dyn Extension>> = vec![];
-        for factory in extension_factories.iter() {
-            let mut extension = factory.create();
-            let extension_name = extension.name();
-            if let Err(err) = extension.initialize(&mut rt).await {
-                tracing::warn!("Failed to initialize extension {extension_name}: {err}");
-            } else {
-                extensions.push(extension);
-            };
-        }
-
-        rt.extensions = Arc::new(RwLock::new(extensions));
-
-        rt
+    pub fn builder() -> RuntimeBuilder {
+        RuntimeBuilder::new()
     }
 
     #[must_use]
@@ -298,7 +263,75 @@ impl Runtime {
         Arc::clone(&self.df)
     }
 
-    pub async fn start_extensions(&self) {
+    #[must_use]
+    pub fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
+        Arc::clone(&self.secrets_provider)
+    }
+
+    /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.
+    ///
+    /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
+    ///
+    /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
+    pub async fn start_servers(&self, config: Config) -> Result<()> {
+        self.start_metrics(self.metrics).await?;
+
+        let http_server_future = http::start(
+            config.http_bind_address,
+            Arc::clone(&self.app),
+            Arc::clone(&self.df),
+            Arc::clone(&self.models),
+            Arc::clone(&self.llms),
+            Arc::clone(&self.embeds),
+            config.clone().into(),
+            self.metrics,
+        );
+
+        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
+        let open_telemetry_server_future =
+            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
+        let pods_watcher_future = self.start_pods_watcher();
+
+        tokio::select! {
+            http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
+            flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
+            open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
+            pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
+            () = shutdown_signal() => {
+                tracing::info!("Goodbye!");
+                Ok(())
+            },
+        }
+    }
+
+    /// Will load all of the components of the Runtime, including datasets, models, and embeddings.
+    ///
+    /// The future returned by this function will not resolve until all components have been loaded.
+    pub async fn load_components(&self) {
+        self.load_secrets().await;
+        self.start_extensions().await;
+
+        #[cfg(feature = "models")]
+        self.load_embeddings().await; // Must be loaded before datasets
+
+        let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
+            Box::pin(async {
+                if let Err(err) = self.init_query_history().await {
+                    tracing::warn!("Creating internal query history table: {err}");
+                };
+            }),
+            Box::pin(self.init_results_cache()),
+            Box::pin(self.load_datasets()),
+        ];
+
+        if cfg!(feature = "models") {
+            futures.push(Box::pin(self.load_models()));
+        }
+
+        join_all(futures).await;
+    }
+
+    async fn start_extensions(&self) {
         let mut extensions = self.extensions.write().await;
         for i in 0..extensions.len() {
             if let Err(err) = extensions[i].on_start(self).await {
@@ -307,15 +340,7 @@ impl Runtime {
         }
     }
 
-    pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
-        self.pods_watcher = Arc::new(RwLock::new(Some(pods_watcher)));
-    }
-
-    pub fn with_datasets_health_monitor(&mut self, datasets_health_monitor: DatasetsHealthMonitor) {
-        self.datasets_health_monitor = Some(Arc::new(datasets_health_monitor));
-    }
-
-    pub async fn load_secrets(&self) {
+    async fn load_secrets(&self) {
         measure_scope_ms!("load_secrets");
         let mut secret_store = self.secrets_provider.write().await;
 
@@ -338,13 +363,13 @@ impl Runtime {
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_datasets(app: &App, log_failures: bool) -> Vec<Dataset> {
+    fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Dataset> {
         Self::datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => Some(ds),
                 Err(e) => {
-                    if log_failures {
+                    if log_errors.0 {
                         status::update_dataset(
                             &TableReference::parse_str(&spicepod_ds.name),
                             status::ComponentStatus::Error,
@@ -359,8 +384,8 @@ impl Runtime {
     }
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_views(app: &App, log_failures: bool) -> Vec<View> {
-        let datasets = Self::get_valid_datasets(app, log_failures)
+    fn get_valid_views(app: &App, log_errors: LogErrors) -> Vec<View> {
+        let datasets = Self::get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())
             .collect::<HashSet<_>>();
@@ -374,7 +399,7 @@ impl Runtime {
                 Ok(view) => {
                     // only load this view if the name isn't used by an existing dataset
                     if datasets.contains(&view.name) {
-                        if log_failures {
+                        if log_errors.0 {
                             metrics::counter!("views_load_error").increment(1);
                             tracing::error!(
                                 view = &spicepod_view.name,
@@ -387,7 +412,7 @@ impl Runtime {
                     }
                 }
                 Err(e) => {
-                    if log_failures {
+                    if log_errors.0 {
                         metrics::counter!("views_load_error").increment(1);
                         tracing::error!(view = &spicepod_view.name, "{e}");
                     }
@@ -397,13 +422,13 @@ impl Runtime {
             .collect()
     }
 
-    pub async fn load_datasets(&self) {
+    async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, true);
+        let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
@@ -425,7 +450,7 @@ impl Runtime {
     }
 
     fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
-        let views: Vec<View> = Self::get_valid_views(app, true);
+        let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
 
         for view in &views {
             if let Err(e) = self.load_view(view, valid_datasets) {
@@ -435,7 +460,7 @@ impl Runtime {
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
-    pub async fn load_dataset(&self, ds: &Dataset) {
+    async fn load_dataset(&self, ds: &Dataset) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
@@ -463,7 +488,7 @@ impl Runtime {
         .await;
     }
 
-    pub fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
+    fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
         let existing_tables = all_datasets
             .iter()
             .map(|d| d.name.clone())
@@ -483,7 +508,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
+    async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
@@ -517,7 +542,7 @@ impl Runtime {
         Ok(data_connector)
     }
 
-    pub async fn register_loaded_dataset(
+    async fn register_loaded_dataset(
         &self,
         ds: &Dataset,
         data_connector: Arc<dyn DataConnector>,
@@ -621,7 +646,7 @@ impl Runtime {
         }
     }
 
-    pub async fn remove_dataset(&self, ds: &Dataset) {
+    async fn remove_dataset(&self, ds: &Dataset) {
         if self.df.table_exists(ds.name.clone()) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
@@ -649,7 +674,7 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    pub async fn update_dataset(&self, ds: &Dataset) {
+    async fn update_dataset(&self, ds: &Dataset) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         match self.load_dataset_connector(ds).await {
             Ok(connector) => {
@@ -917,7 +942,7 @@ impl Runtime {
     }
 
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
-    pub async fn load_llm(&self, m: SpicepodModel, params: SecretMap) -> Result<Box<dyn Chat>> {
+    async fn load_llm(&self, m: SpicepodModel, params: SecretMap) -> Result<Box<dyn Chat>> {
         let mut l = try_to_chat_model(&m, &params.into_map())
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
@@ -930,7 +955,7 @@ impl Runtime {
     }
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
-    pub async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
+    async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
 
         let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
@@ -943,7 +968,7 @@ impl Runtime {
         Ok(l)
     }
 
-    pub async fn load_embeddings(&self) {
+    async fn load_embeddings(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for in_embed in &app.embeddings {
@@ -970,7 +995,7 @@ impl Runtime {
         }
     }
 
-    pub async fn load_models(&self) {
+    async fn load_models(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
@@ -981,7 +1006,7 @@ impl Runtime {
     }
 
     // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
-    pub async fn load_model(&self, m: &SpicepodModel) {
+    async fn load_model(&self, m: &SpicepodModel) {
         let source = m.get_source();
         let source_str = source.clone().map(|s| s.to_string()).unwrap_or_default();
         let model = m.clone();
@@ -1047,7 +1072,7 @@ impl Runtime {
         }
     }
 
-    pub async fn remove_model(&self, m: &SpicepodModel) {
+    async fn remove_model(&self, m: &SpicepodModel) {
         match m.model_type() {
             Some(ModelType::Ml) => {
                 let mut ml_map = self.models.write().await;
@@ -1065,13 +1090,13 @@ impl Runtime {
             .decrement(1.0);
     }
 
-    pub async fn update_model(&self, m: &SpicepodModel) {
+    async fn update_model(&self, m: &SpicepodModel) {
         status::update_model(&m.name, status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+    async fn start_metrics(&self, with_metrics: Option<SocketAddr>) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
             let mut recorder = MetricsRecorder::new(metrics_socket);
 
@@ -1093,46 +1118,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start_datasets_health_monitor(&self) {
-        if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
-            datasets_health_monitor.start();
-        }
-    }
-
-    pub async fn start_servers(
-        &self,
-        config: Config,
-        with_metrics: Option<SocketAddr>,
-    ) -> Result<()> {
-        let http_server_future = http::start(
-            config.http_bind_address,
-            Arc::clone(&self.app),
-            Arc::clone(&self.df),
-            Arc::clone(&self.models),
-            Arc::clone(&self.llms),
-            Arc::clone(&self.embeds),
-            config.clone().into(),
-            with_metrics,
-        );
-
-        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
-        let open_telemetry_server_future =
-            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
-        let pods_watcher_future = self.start_pods_watcher();
-
-        tokio::select! {
-            http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
-            flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
-            open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
-            pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
-            () = shutdown_signal() => {
-                tracing::info!("Goodbye!");
-                Ok(())
-            },
-        }
-    }
-
-    pub async fn start_pods_watcher(&self) -> notify::Result<()> {
+    async fn start_pods_watcher(&self) -> notify::Result<()> {
         let mut pods_watcher = self.pods_watcher.write().await;
         let Some(mut pods_watcher) = pods_watcher.take() else {
             return Ok(());
@@ -1150,8 +1136,8 @@ impl Runtime {
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
                 // check for new and updated datasets
-                let valid_datasets = Self::get_valid_datasets(&new_app, true);
-                let existing_datasets = Self::get_valid_datasets(current_app, false);
+                let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
+                let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
                 for ds in &valid_datasets {
                     if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {

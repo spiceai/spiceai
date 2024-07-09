@@ -16,17 +16,15 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use component::view::View;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
-use component::embeddings::Embeddings;
-use component::model::Model;
-use component::runtime::Runtime;
-use component::secrets::Secrets;
-use component::{dataset::Dataset, extension::Extension};
+use component::{
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, extension::Extension, model::Model,
+    runtime::Runtime, secrets::Secrets, view::View,
+};
 
 use spec::{SpicepodDefinition, SpicepodVersion};
 
@@ -60,6 +58,8 @@ pub struct Spicepod {
     pub extensions: HashMap<String, Extension>,
 
     pub secrets: Secrets,
+
+    pub catalogs: Vec<Catalog>,
 
     pub datasets: Vec<Dataset>,
 
@@ -118,6 +118,14 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_catalogs = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.catalogs,
+            "catalog",
+        )
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_views =
             component::resolve_component_references(fs, &path, &spicepod_definition.views, "view")
                 .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
@@ -145,6 +153,7 @@ impl Spicepod {
 
         Ok(from_definition(
             spicepod_definition,
+            resolved_catalogs,
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
@@ -177,6 +186,7 @@ impl Spicepod {
 #[must_use]
 fn from_definition(
     spicepod_definition: SpicepodDefinition,
+    catalogs: Vec<Catalog>,
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
@@ -187,6 +197,7 @@ fn from_definition(
         version: spicepod_definition.version,
         extensions: spicepod_definition.extensions,
         secrets: spicepod_definition.secrets,
+        catalogs,
         datasets,
         views,
         models,
