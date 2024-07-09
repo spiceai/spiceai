@@ -232,6 +232,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
+#[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
