@@ -380,7 +380,7 @@ impl Runtime {
                             metrics::counter!("views_load_error").increment(1);
                             tracing::error!(
                                 view = &spicepod_view.name,
-                                "One or more tables in the view's SQL statement do not exist."
+                                "View name is already in use by a dataset."
                             );
                         }
                         None
