@@ -623,7 +623,7 @@ impl Runtime {
         }
     }
 
-    pub async fn remove_dataset(&self, ds: &Dataset) {
+    async fn remove_dataset(&self, ds: &Dataset) {
         if self.df.table_exists(ds.name.clone()) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
@@ -651,7 +651,7 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    pub async fn update_dataset(&self, ds: &Dataset) {
+    async fn update_dataset(&self, ds: &Dataset) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         match self.load_dataset_connector(ds).await {
             Ok(connector) => {
