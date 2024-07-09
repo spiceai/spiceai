@@ -91,6 +91,7 @@ impl Catalog {
     }
 
     /// Returns the catalog id - the second part of the `from` field after the first `:`.
+    /// This is optional and will return the default catalog from the provider if not set.
     ///
     /// # Examples
     ///
