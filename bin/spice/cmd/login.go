@@ -111,9 +111,6 @@ spice login
 			var spicePod spec.SpicepodSpec
 			err = yaml.Unmarshal(spicepodBytes, &spicePod)
 			if err == nil {
-				if spicePod.Metadata != nil {
-					orgName = spicePod.Metadata["org"]
-				}
 				appName = spicePod.Name
 			}
 		}
