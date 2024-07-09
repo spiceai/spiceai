@@ -17,6 +17,7 @@ limitations under the License.
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, fmt::Debug};
 
@@ -69,6 +70,10 @@ pub struct SpicepodDefinition {
     /// Default value is `store: file`
     #[serde(default)]
     pub secrets: Secrets,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
