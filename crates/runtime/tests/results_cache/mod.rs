@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
@@ -58,10 +56,9 @@ async fn results_cache_system_queries() -> Result<(), String> {
         .with_dataset(make_s3_tpch_dataset("customer"))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
-    rt.load_secrets().await;
-    rt.load_datasets().await;
+    rt.load_components().await;
 
     assert!(
         execute_query_and_check_cache_status(&rt, "show tables", None)
@@ -82,7 +79,7 @@ async fn execute_query_and_check_cache_status(
     query: &str,
     expected_cache_status: Option<bool>,
 ) -> Result<Vec<RecordBatch>, String> {
-    let query = QueryBuilder::new(query.to_string(), Arc::clone(&rt.df), Protocol::Http).build();
+    let query = QueryBuilder::new(query.to_string(), rt.datafusion(), Protocol::Http).build();
 
     let query_result = query
         .run()

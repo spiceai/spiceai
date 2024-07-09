@@ -14,17 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
 
-use crate::{
-    init_tracing, modify_runtime_datafusion_options, run_query_and_check_results, ValidateFn,
-};
+use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
 
 #[cfg(feature = "mysql")]
 mod mysql;
@@ -47,12 +43,15 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let df = get_test_datafusion();
 
-    rt.load_secrets().await;
-    rt.load_datasets().await;
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
-    let mut rt = modify_runtime_datafusion_options(rt);
+    rt.load_components().await;
 
     let has_one_int_val = |result_batches: Vec<RecordBatch>| {
         for batch in result_batches {

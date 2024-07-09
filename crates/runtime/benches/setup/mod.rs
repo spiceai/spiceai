@@ -5,7 +5,7 @@ use spicepod::component::{
     dataset::{replication::Replication, Dataset, Mode},
     secrets::SpiceSecretStore,
 };
-use std::{process::Command, sync::Arc};
+use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
 /// The number of times to run each query in the benchmark.
@@ -18,15 +18,13 @@ pub(crate) async fn setup_benchmark(
 
     let app = build_app(upload_results_dataset);
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
-
-    rt.load_secrets().await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
 
     let benchmark_results =

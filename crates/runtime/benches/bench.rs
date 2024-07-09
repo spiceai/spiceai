@@ -73,7 +73,7 @@ async fn run_query_and_record_result(
     for _ in 0..benchmark_results.iterations() {
         let start_iter_time = get_current_unix_ms();
         let _ = rt
-            .df
+            .datafusion()
             .ctx
             .sql(query)
             .await
