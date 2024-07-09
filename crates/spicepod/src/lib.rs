@@ -77,18 +77,25 @@ pub struct Spicepod {
 fn detect_duplicate_component_names(
     component_type: &str,
     components: &[impl component::Nameable],
-) -> Result<()> {
-    let mut component_names = vec![];
+    related_components: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let mut component_names = if let Some(related_components) = related_components {
+        related_components.to_vec()
+    } else {
+        vec![]
+    };
+
     for component in components {
-        if component_names.contains(&component.name()) {
+        if component_names.contains(&component.name().to_string()) {
             return Err(Error::DuplicateComponent {
                 component: component_type.to_string(),
                 name: component.name().to_string(),
             });
         }
-        component_names.push(component.name());
+        component_names.push(component.name().to_string());
     }
-    Ok(())
+
+    Ok(component_names)
 }
 
 impl Spicepod {
@@ -138,10 +145,12 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
-        detect_duplicate_component_names("view", &resolved_views[..])?;
-        detect_duplicate_component_names("model", &resolved_models[..])?;
-        detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
+        let dataset_names =
+            detect_duplicate_component_names("dataset", &resolved_datasets[..], None)?;
+        detect_duplicate_component_names("view", &resolved_views[..], Some(&dataset_names[..]))?;
+
+        detect_duplicate_component_names("model", &resolved_models[..], None)?;
+        detect_duplicate_component_names("embedding", &resolved_embeddings[..], None)?;
 
         Ok(from_definition(
             spicepod_definition,
