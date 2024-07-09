@@ -138,13 +138,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - candle-core 0.5.1, Apache-2.0 OR MIT 
   <br/>https://github.com/huggingface/candle
 
-- candle-core 0.5.1, Apache-2.0 OR MIT 
+- candle-core 0.6.0, Apache-2.0 OR MIT 
   <br/>https://github.com/huggingface/candle
 
 - candle-examples 0.5.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-transformers 0.5.1, Apache-2.0 OR MIT 
   <br/>https://github.com/huggingface/candle
 
 - candle-transformers 0.5.1, Apache-2.0 OR MIT 
@@ -180,8 +177,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-federation-sql 0.1.3, Apache-2.0 
   <br/>
 
-- deltalake 0.18.0, Apache-2.0 
-  <br/>https://github.com/delta-io/delta.rs
+- datafusion-table-providers 0.1.0,  
+  <br/>https://github.com/datafusion-contrib/datafusion-table-providers
+
+- delta_kernel 0.1.1, Apache-2.0 
+  <br/>https://github.com/delta-incubator/delta-kernel-rs
 
 - derive_builder 0.20.0, Apache-2.0 OR MIT 
   <br/>https://github.com/colin-kiegel/rust-derive-builder
@@ -191,6 +191,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - duckdb 1.0.0, MIT 
   <br/>https://github.com/wangfenjin/duckdb-rs
+
+- dyn-clone 1.0.17, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/dyn-clone
 
 - fallible-iterator 0.2.0, Apache-2.0 OR MIT 
   <br/>https://github.com/sfackler/rust-fallible-iterator
@@ -237,19 +240,19 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - metrics 0.21.1, MIT 
   <br/>https://github.com/metrics-rs/metrics
 
-- metrics 0.22.3, MIT 
+- metrics 0.23.0, MIT 
   <br/>https://github.com/metrics-rs/metrics
 
-- metrics-exporter-prometheus 0.13.1, MIT 
+- metrics-exporter-prometheus 0.15.1, MIT 
   <br/>https://github.com/metrics-rs/metrics
 
-- metrics-util 0.16.3, MIT 
+- metrics-util 0.17.0, MIT 
   <br/>https://github.com/metrics-rs/metrics
 
-- mistralrs 0.1.11, MIT 
+- mistralrs 0.1.24, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
-- mistralrs-core 0.1.11, MIT 
+- mistralrs-core 0.1.24, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
 - moka 0.12.7, Apache-2.0 OR MIT 
@@ -266,9 +269,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - notify 6.1.1, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
-
-- object_store 0.9.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/apache/arrow-rs/tree/master/object_store
 
 - object_store 0.10.1, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs/tree/master/object_store
@@ -342,6 +342,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustyline 13.0.0, MIT 
   <br/>https://github.com/kkawakam/rustyline
 
+- schemars 0.8.21, MIT 
+  <br/>https://github.com/GREsau/schemars
+
 - sea-query 0.30.7, Apache-2.0 OR MIT 
   <br/>https://github.com/SeaQL/sea-query
 
@@ -362,6 +365,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - snafu 0.8.3, Apache-2.0 OR MIT 
   <br/>https://github.com/shepmaster/snafu
+
+- snmalloc-rs 0.3.6, MIT 
+  <br/>https://github.com/SchrodingerZhu/snmalloc-rs
 
 - snowflake-api 0.9.0, Apache-2.0 
   <br/>https://github.com/mycelial/snowflake-rs
@@ -435,6 +441,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - url 2.5.1, Apache-2.0 OR MIT 
   <br/>https://github.com/servo/rust-url
 
-- uuid 1.8.0, Apache-2.0 OR MIT 
+- uuid 0.8.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/uuid-rs/uuid
+
+- uuid 1.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
 
