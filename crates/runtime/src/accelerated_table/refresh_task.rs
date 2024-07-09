@@ -20,11 +20,10 @@ use arrow::{
     datatypes::DataType,
 };
 use async_stream::stream;
-use cache::QueryResultsCacheProvider;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
-use futures::{stream, Stream, StreamExt};
+use futures::{stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
@@ -34,7 +33,7 @@ use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema, SPICE_RUNTIME_SCHEMA},
-    dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
+    dataupdate::{StreamingDataUpdate, UpdateType},
     execution_plan::schema_cast::EnsureSchema,
     object_store_registry::default_runtime_env,
     status,
@@ -42,7 +41,6 @@ use crate::{
 };
 
 use super::refresh::get_timestamp;
-use super::UnableToCreateMemTableFromUpdateSnafu;
 
 use crate::component::dataset::TimeFormat;
 use std::time::UNIX_EPOCH;
@@ -54,7 +52,7 @@ use datafusion::{
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{cast, col, Expr, Operator},
-    physical_plan::{stream::RecordBatchStreamAdapter, ExecutionPlanProperties},
+    physical_plan::stream::RecordBatchStreamAdapter,
     prelude::SessionConfig,
     sql::TableReference,
 };
@@ -91,57 +89,6 @@ impl RefreshTask {
             refresh,
             accelerator,
         }
-    }
-
-    pub async fn start_streaming_append(
-        &self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-        ready_sender: Option<oneshot::Sender<()>>,
-    ) -> super::Result<()> {
-        self.mark_dataset_status(status::ComponentStatus::Refreshing)
-            .await;
-
-        let mut stream = Box::pin(self.get_append_stream());
-
-        let dataset_name = self.dataset_name.clone();
-
-        let mut ready_sender = ready_sender;
-
-        while let Some(update) = stream.next().await {
-            match update {
-                Ok((start_time, data_update)) => {
-                    // write_data_update updates dataset status and logs errors so we don't do this here
-                    if self
-                        .write_data_update(start_time, data_update)
-                        .await
-                        .is_ok()
-                    {
-                        if let Some(ready_sender) = ready_sender.take() {
-                            ready_sender.send(()).ok();
-                        }
-
-                        if let Some(cache_provider) = &cache_provider {
-                            if let Err(e) = cache_provider
-                                .invalidate_for_table(&dataset_name.to_string())
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name.to_string()
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Error getting update for dataset {dataset_name}: {e}");
-                    self.mark_dataset_status(status::ComponentStatus::Error)
-                        .await;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub async fn run(&self) -> super::Result<()> {
@@ -344,35 +291,6 @@ impl RefreshTask {
         self.get_data_update(filters).await
     }
 
-    async fn write_data_update(
-        &self,
-        start_time: Option<SystemTime>,
-        data_update: DataUpdate,
-    ) -> super::Result<()> {
-        if data_update.data.is_empty()
-            || data_update
-                .data
-                .first()
-                .map_or(false, |x| x.columns().is_empty())
-        {
-            if let Some(start_time) = start_time {
-                self.trace_dataset_loaded(start_time, 0, 0);
-            }
-
-            self.mark_dataset_status(status::ComponentStatus::Ready)
-                .await;
-
-            return Ok(());
-        };
-
-        let streaming_update = StreamingDataUpdate::try_from(data_update)
-            .context(UnableToCreateMemTableFromUpdateSnafu)?;
-
-        self.write_streaming_data_update(start_time, streaming_update)
-            .await
-            .map_err(inner_err_from_retry)
-    }
-
     async fn get_full_update(&self) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         match self.get_full_or_incremental_append_update(None).await {
             Ok(data) => Ok(data),
@@ -398,53 +316,6 @@ impl RefreshTask {
             Err(e) => {
                 tracing::error!("No latest timestamp is found: {e}");
                 Err(e)
-            }
-        }
-    }
-
-    fn get_append_stream(
-        &self,
-    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> {
-        let ctx = self.refresh_df_context();
-        let federated = Arc::clone(&self.federated);
-        let dataset_name = self.dataset_name.clone();
-
-        stream! {
-            let plan = federated
-                .scan(&ctx.state(), None, &[], None)
-                .await
-                .context(super::UnableToScanTableProviderSnafu {})?;
-
-            if plan.output_partitioning().partition_count() > 1 {
-                tracing::error!(
-                    "Append mode is not supported for datasets with multiple partitions: {dataset_name}"
-                );
-                return;
-            }
-
-            let schema = federated.schema();
-
-            let mut stream = plan
-                .execute(0, ctx.task_ctx())
-                .context(super::UnableToScanTableProviderSnafu {})?;
-            loop {
-                match stream.next().await {
-                    Some(Ok(batch)) => {
-                        yield Ok((None, DataUpdate {
-                            schema: Arc::clone(&schema),
-                            data: vec![batch],
-                            update_type: UpdateType::Append,
-                        }));
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!("Error reading data for dataset {dataset_name}: {e}");
-                        yield Err(super::Error::UnableToScanTableProvider { source: e });
-                    }
-                    None => {
-                        tracing::warn!("Append stream ended for dataset {dataset_name}");
-                        break;
-                    },
-                }
             }
         }
     }
@@ -774,12 +645,4 @@ fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error });
     }
     RetryError::permanent(super::Error::FailedToRefreshDataset { source: error })
-}
-
-fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
-    match error {
-        RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
-            inner_err
-        }
-    }
 }

@@ -224,15 +224,11 @@ impl Builder {
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Append => {
-                if self.refresh.time_column.is_none() {
-                    (refresh::AccelerationRefreshMode::Append(None), None)
-                } else {
-                    let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
-                    (
-                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
-                        Some(start_refresh),
-                    )
-                }
+                let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                (
+                    refresh::AccelerationRefreshMode::Append(on_start_refresh),
+                    Some(start_refresh),
+                )
             }
             RefreshMode::Full => {
                 let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);

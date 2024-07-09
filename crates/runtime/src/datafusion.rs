@@ -182,6 +182,9 @@ pub enum Error {
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Time_column parameter missing for append dataset"))]
+    TimeColumnMissingInAppendDataset {},
 }
 
 pub enum Table {
@@ -566,6 +569,11 @@ impl DataFusion {
         }
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+
+        // TODO: put check here, and return error
+        if dataset.time_column.is_none() && refresh_mode == RefreshMode::Append {
+            return Err(Error::TimeColumnMissingInAppendDataset {});
+        }
         let refresh = Refresh::new(
             dataset.time_column.clone(),
             dataset.time_format,
