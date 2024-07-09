@@ -18,7 +18,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use super::{
     model::{ModelFile, ModelFileType},
-    WithDependsOn,
+    Nameable, WithDependsOn,
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -43,6 +43,12 @@ pub struct Embeddings {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+}
+
+impl Nameable for Embeddings {
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl WithDependsOn<Embeddings> for Embeddings {
