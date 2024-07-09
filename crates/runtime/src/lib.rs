@@ -374,8 +374,6 @@ impl Runtime {
                 Ok(view) => {
                     // only load this view if the name isn't used by an existing dataset
                     if datasets.contains(&view.name) {
-                        Some(view)
-                    } else {
                         if log_failures {
                             metrics::counter!("views_load_error").increment(1);
                             tracing::error!(
@@ -384,6 +382,8 @@ impl Runtime {
                             );
                         }
                         None
+                    } else {
+                        Some(view)
                     }
                 }
                 Err(e) => {
