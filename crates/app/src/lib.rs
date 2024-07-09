@@ -21,6 +21,7 @@ use std::{collections::HashMap, path::PathBuf};
 use snafu::prelude::*;
 use spicepod::{
     component::{
+        catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
         extension::Extension,
@@ -39,6 +40,8 @@ pub struct App {
     pub secrets: Secrets,
 
     pub extensions: HashMap<String, Extension>,
+
+    pub catalogs: Vec<Catalog>,
 
     pub datasets: Vec<Dataset>,
 
@@ -68,6 +71,7 @@ pub struct AppBuilder {
     name: String,
     secrets: Secrets,
     extensions: HashMap<String, Extension>,
+    catalogs: Vec<Catalog>,
     datasets: Vec<Dataset>,
     views: Vec<View>,
     models: Vec<Model>,
@@ -82,6 +86,7 @@ impl AppBuilder {
             name: name.into(),
             secrets: Secrets::default(),
             extensions: HashMap::new(),
+            catalogs: vec![],
             datasets: vec![],
             views: vec![],
             models: vec![],
@@ -95,6 +100,7 @@ impl AppBuilder {
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
         self.secrets = spicepod.secrets.clone();
         self.extensions.extend(spicepod.extensions.clone());
+        self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
@@ -112,6 +118,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
         self.secrets = Secrets { store: secret };
+        self
+    }
+
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Catalog) -> AppBuilder {
+        self.catalogs.push(catalog);
         self
     }
 
@@ -151,6 +163,7 @@ impl AppBuilder {
             name: self.name,
             secrets: self.secrets,
             extensions: self.extensions,
+            catalogs: self.catalogs,
             datasets: self.datasets,
             views: self.views,
             models: self.models,
@@ -167,10 +180,15 @@ impl AppBuilder {
         let secrets = spicepod_root.secrets.clone();
         let runtime = spicepod_root.runtime.clone();
         let extensions = spicepod_root.extensions.clone();
+        let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+
+        for catalog in &spicepod_root.catalogs {
+            catalogs.push(catalog.clone());
+        }
 
         for dataset in &spicepod_root.datasets {
             datasets.push(dataset.clone());
@@ -197,6 +215,9 @@ impl AppBuilder {
                 Spicepod::load(&dependency_path).context(UnableToLoadSpicepodSnafu {
                     path: &dependency_path,
                 })?;
+            for catalog in &dependent_spicepod.catalogs {
+                catalogs.push(catalog.clone());
+            }
             for dataset in &dependent_spicepod.datasets {
                 datasets.push(dataset.clone());
             }
@@ -218,6 +239,7 @@ impl AppBuilder {
             name: root_spicepod_name,
             secrets,
             extensions,
+            catalogs,
             datasets,
             views,
             models,
