@@ -73,6 +73,23 @@ jobs:
             ${{ env.LATEST_GHCR_TAG }}
             ${{ env.LATEST_DOCKERHUB_TAG }}
 
+      - name: Build and push Docker images (models)
+        id: docker_build_models
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startswith(github.ref, 'refs/tags/v') }}
+          build-args: |
+            REL_VERSION=${{ env.REL_VERSION }}
+            CARGO_FEATURES=release,models
+          tags: |
+            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-models
+            spiceai/spiceai:${{ env.REL_VERSION }}-models
+            ${{ env.LATEST_GHCR_TAG }}-models
+            ${{ env.LATEST_DOCKERHUB_TAG }}-models
+
       - name: Image digest
         run: |
           echo ${{ steps.docker_build_slim.outputs.digest }}
