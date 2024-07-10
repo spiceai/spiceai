@@ -16,11 +16,11 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::{dataconnector::DataConnector, Runtime};
 use async_trait::async_trait;
 use datafusion::catalog::CatalogProvider;
+use globset::GlobSet;
 use snafu::prelude::*;
-
-use crate::{dataconnector::DataConnector, Runtime};
 use spicepod::component::extension::Extension as ExtensionComponent;
 
 pub type ExtensionManifest = ExtensionComponent;
@@ -60,6 +60,7 @@ pub trait Extension: Send + Sync {
     async fn catalog_provider(
         &self,
         _data_connector: Arc<dyn DataConnector>,
+        _filter: Option<GlobSet>,
     ) -> Option<Result<Arc<dyn CatalogProvider>>> {
         None
     }

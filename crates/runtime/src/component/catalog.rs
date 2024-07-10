@@ -14,14 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::Regex;
+use snafu::prelude::*;
 use spicepod::component::{catalog as spicepod_catalog, params::Params};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Catalog {
     pub provider: String,
     pub catalog_id: Option<String>,
     pub name: String,
+    pub include: Option<GlobSet>,
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
 }
@@ -33,10 +37,30 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
         let provider = Catalog::provider(&catalog.from);
         let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
 
+        let globset_builder = GlobSetBuilder::new();
+        let include_iter = catalog.include.iter().map(|i| Glob::new(i));
+        for glob in include_iter {
+            let glob = match glob {
+                Ok(g) => g,
+                Err(e) => panic!("Invalid glob pattern: {e}"),
+            };
+            globset_builder.add(glob);
+        }
+
+        let globset = match globset_builder.build() {
+            Ok(g) => g,
+            Err(e) => panic!("Unable to build globset: {e}"),
+        };
+
         Ok(Catalog {
             provider: provider.to_string(),
             catalog_id,
             name: catalog.name,
+            include: catalog
+                .include
+                .iter()
+                .map(|i| globset)
+                .collect::<Result<Vec<_>, Self::Error>>()?,
             params: catalog
                 .params
                 .as_ref()
@@ -57,9 +81,15 @@ impl Catalog {
             provider: Catalog::provider(from).to_string(),
             catalog_id: Catalog::catalog_id(from).map(String::from),
             name: name.into(),
+            include: Vec::default(),
             params: HashMap::default(),
             dataset_params: HashMap::default(),
         })
+    }
+
+    #[must_use]
+    pub fn should_include(&self, dataset_name: &str) -> bool {
+        self.include.iter().any(|i| i.is_match(dataset_name))
     }
 
     /// Returns the catalog provider - the first part of the `from` field before the first `:`.
