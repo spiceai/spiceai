@@ -18,9 +18,11 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
+use crate::Runtime;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
 use data_components::{Read, ReadWrite};
+use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
@@ -129,6 +131,26 @@ impl DataConnector for SpiceAI {
         });
 
         Some(read_write_result)
+    }
+
+    async fn catalog_provider(
+        self: Arc<Self>,
+        runtime: &Runtime,
+        catalog_id: Option<&str>,
+    ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
+        if catalog_id.is_some() {
+            return Some(Err(
+                super::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "spiceai".into(),
+                    message: "Catalog ID is not supported for SpiceAI data connector".into(),
+                },
+            ));
+        }
+
+        let spice_extension = runtime.extension("spice_cloud").await?;
+        let catalog_provider = spice_extension.catalog_provider(self).await?.ok()?;
+
+        Some(Ok(catalog_provider))
     }
 }
 

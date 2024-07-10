@@ -29,6 +29,7 @@ use crate::{
 
 pub struct RuntimeBuilder {
     app: Option<app::App>,
+    autoload_extensions: HashMap<String, Box<dyn ExtensionFactory>>,
     extensions: Vec<Box<dyn ExtensionFactory>>,
     pods_watcher: Option<podswatcher::PodsWatcher>,
     datasets_health_monitor_enabled: bool,
@@ -45,6 +46,7 @@ impl RuntimeBuilder {
             datasets_health_monitor_enabled: false,
             metrics: None,
             datafusion: None,
+            autoload_extensions: HashMap::new(),
         }
     }
 
@@ -60,6 +62,15 @@ impl RuntimeBuilder {
 
     pub fn with_extensions(mut self, extensions: Vec<Box<dyn ExtensionFactory>>) -> Self {
         self.extensions = extensions;
+        self
+    }
+
+    /// Extensions that will be automatically loaded if a component requests them and the user hasn't explicitly loaded it.
+    pub fn with_autoload_extensions(
+        mut self,
+        extensions: HashMap<String, Box<dyn ExtensionFactory>>,
+    ) -> Self {
+        self.autoload_extensions = extensions;
         self
     }
 
@@ -121,19 +132,20 @@ impl RuntimeBuilder {
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
-            extensions: Arc::new(RwLock::new(vec![])),
+            autoload_extensions: Arc::new(self.autoload_extensions),
+            extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
             metrics: self.metrics,
         };
 
-        let mut extensions: Vec<Box<dyn Extension>> = vec![];
+        let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {
             let mut extension = factory.create();
             let extension_name = extension.name();
-            if let Err(err) = extension.initialize(&mut rt).await {
+            if let Err(err) = extension.initialize(&rt).await {
                 tracing::warn!("Failed to initialize extension {extension_name}: {err}");
             } else {
-                extensions.push(extension);
+                extensions.insert(extension_name.into(), extension.into());
             };
         }
         rt.extensions = Arc::new(RwLock::new(extensions));

@@ -1,7 +1,26 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use datafusion::catalog::CatalogProvider;
 use snafu::prelude::*;
 
-use crate::Runtime;
+use crate::{dataconnector::DataConnector, Runtime};
 use spicepod::component::extension::Extension as ExtensionComponent;
 
 pub type ExtensionManifest = ExtensionComponent;
@@ -17,6 +36,11 @@ pub enum Error {
     UnableToStartExtension {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unable to get catalog provider: {source}"))]
+    UnableToGetCatalogProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -28,13 +52,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait Extension: Send + Sync {
     fn name(&self) -> &'static str;
-    // fn metrics_connector(&self) -> Option<Box<dyn MetricsConnector>> {
-    //     None
-    // }
 
-    async fn initialize(&mut self, runtime: &mut Runtime) -> Result<()>;
+    async fn initialize(&mut self, runtime: &Runtime) -> Result<()>;
 
-    async fn on_start(&mut self, runtime: &Runtime) -> Result<()>;
+    async fn on_start(&self, runtime: &Runtime) -> Result<()>;
+
+    async fn catalog_provider(
+        &self,
+        _data_connector: Arc<dyn DataConnector>,
+    ) -> Option<Result<Arc<dyn CatalogProvider>>> {
+        None
+    }
 }
 
 pub trait ExtensionFactory: Send + Sync {

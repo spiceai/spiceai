@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -110,7 +111,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     let rt: Runtime = Runtime::builder()
         .with_app_opt(app)
+        // User configured extensions
         .with_extensions(extension_factories)
+        // Extensions that will be auto-loaded if not explicitly loaded and requested by a component
+        .with_autoload_extensions(HashMap::from([(
+            "spice_cloud".to_string(),
+            Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
+        )]))
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
         .build()

@@ -42,6 +42,7 @@ use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
+use extension::ExtensionFactory;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
@@ -248,7 +249,8 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics: Option<SocketAddr>,
 
-    extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
+    autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
+    extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
@@ -266,6 +268,36 @@ impl Runtime {
     #[must_use]
     pub fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
         Arc::clone(&self.secrets_provider)
+    }
+
+    /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
+    pub async fn extension(&self, name: &str) -> Option<Arc<dyn Extension>> {
+        let extensions = self.extensions.read().await;
+
+        if let Some(extension) = extensions.get(name) {
+            return Some(Arc::clone(extension));
+        }
+        drop(extensions);
+
+        if let Some(autoload_factory) = self.autoload_extensions.get(name) {
+            let mut extensions = self.extensions.write().await;
+            let mut extension = autoload_factory.create();
+            let extension_name = extension.name().to_string();
+            if let Err(err) = extension.initialize(self).await {
+                tracing::error!("Unable to initialize extension {extension_name}: {err}");
+                return None;
+            }
+
+            if let Err(err) = extension.on_start(self).await {
+                tracing::error!("Unable to start extension {extension_name}: {err}");
+                return None;
+            }
+
+            extensions.insert(extension_name.clone(), extension.into());
+            return extensions.get(&extension_name).cloned();
+        }
+
+        None
     }
 
     /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.
@@ -333,9 +365,9 @@ impl Runtime {
 
     async fn start_extensions(&self) {
         let mut extensions = self.extensions.write().await;
-        for i in 0..extensions.len() {
-            if let Err(err) = extensions[i].on_start(self).await {
-                tracing::warn!("Failed to start extension: {err}");
+        for (name, extension) in extensions.iter_mut() {
+            if let Err(err) = extension.on_start(self).await {
+                tracing::warn!("Failed to start extension {name}: {err}");
             }
         }
     }
