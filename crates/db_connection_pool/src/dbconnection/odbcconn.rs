@@ -213,8 +213,6 @@ where
                     "Failed to execute ODBC query: {e}"
                 )))
             }
-
-            tracing::debug!("Handle finished without error");
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
