@@ -46,7 +46,7 @@ pub enum Error {
         actual_time_format: String,
     },
 
-    #[snafu(display(r#"time_column '{time_column}' is not found in dataset {table_name}"#))]
+    #[snafu(display(r#"time_column '{time_column}' was not found in dataset {table_name}"#))]
     NoTimeColumnFound {
         table_name: String,
         time_column: String,
