@@ -38,7 +38,7 @@ use super::refresh_task_runner::RefreshTaskRunner;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(r#"time_column "{time_column}" in dataset {table_name} has data type "{actual_time_format}", but time_format is configured as "{expected_time_format}""#))]
+    #[snafu(display(r#"time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"#))]
     TimeFormatMismatch {
         table_name: String,
         time_column: String,
@@ -46,7 +46,7 @@ pub enum Error {
         actual_time_format: String,
     },
 
-    #[snafu(display(r#"time_column "{time_column}" is not found in dataset {table_name}"#))]
+    #[snafu(display(r#"time_column '{time_column}' is not found in dataset {table_name}"#))]
     NoTimeColumnFound {
         table_name: String,
         time_column: String,
