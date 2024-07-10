@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::catalog::{schema::SchemaProvider, CatalogProvider};
+use datafusion::{
+    arrow::{self, datatypes::TimeUnit},
+    catalog::{schema::SchemaProvider, CatalogProvider},
+};
 use runtime::{
     component::dataset::Dataset,
     dataconnector::{DataConnector, DataConnectorError},
@@ -46,6 +49,40 @@ pub struct SpiceAICatalogProvider {
 #[derive(Debug, Deserialize)]
 struct DatasetSchemaResponse {
     name: String,
+    fields: Vec<Field>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Field {
+    name: String,
+    r#type: String,
+}
+
+/// Converts a Spice AI field to an Arrow field.
+///
+/// The schema returned by the /v1/schemas API doesn't contain the full type information,
+/// so we make some guesses (i.e. decimal/list types).
+///
+/// Once we support `FlightSQL` on the Spice.ai side, this can be removed.
+fn field_to_arrow(field: &Field) -> arrow::datatypes::Field {
+    let data_type = match field.r#type.to_ascii_lowercase().as_str() {
+        "bigint" => arrow::datatypes::DataType::Int64,
+        "varchar" => arrow::datatypes::DataType::Utf8,
+        "list" => arrow::datatypes::DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow::datatypes::DataType::Utf8,
+            false,
+        ))),
+        "decimal" => arrow::datatypes::DataType::Decimal128(38, 9),
+        "boolean" => arrow::datatypes::DataType::Boolean,
+        "integer" => arrow::datatypes::DataType::Int32,
+        "double" => arrow::datatypes::DataType::Float64,
+        "date" => arrow::datatypes::DataType::Date32,
+        "timestamp" => arrow::datatypes::DataType::Timestamp(TimeUnit::Millisecond, None),
+        _ => panic!("Unsupported data type: {}", field.r#type),
+    };
+
+    arrow::datatypes::Field::new(field.name.clone(), data_type, true)
 }
 
 impl SpiceAICatalogProvider {
@@ -80,6 +117,10 @@ impl SpiceAICatalogProvider {
                 ) else {
                     return acc;
                 };
+
+                let arrow_fields: Vec<_> = ds.fields.iter().map(field_to_arrow).collect();
+                let arrow_schema = arrow::datatypes::Schema::new(arrow_fields);
+                let dataset = dataset.with_schema(Arc::new(arrow_schema));
 
                 let schema = acc.entry(schema_name.to_string()).or_default();
                 schema.insert(table_name.to_string(), dataset);
