@@ -700,7 +700,7 @@ impl RefreshTask {
                 Some(TimeFormat::UnixSeconds) => {
                     value *= 1_000_000_000;
                 }
-                Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestampz)
+                Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestamptz)
                 | None => unreachable!(),
             }
         };

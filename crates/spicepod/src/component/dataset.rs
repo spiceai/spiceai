@@ -35,7 +35,7 @@ pub enum Mode {
 pub enum TimeFormat {
     #[default]
     Timestamp,
-    Timestampz,
+    Timestamptz,
     UnixSeconds,
     UnixMillis,
     #[serde(rename = "ISO8601")]

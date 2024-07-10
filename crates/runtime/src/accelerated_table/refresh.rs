@@ -143,7 +143,7 @@ impl Refresh {
                 }
             }
             arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
-                if time_format != TimeFormat::Timestampz {
+                if time_format != TimeFormat::Timestamptz {
                     invalid = true;
                 }
             }
@@ -1165,7 +1165,7 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::UnixMillis,
             TimeFormat::Timestamp,
-            TimeFormat::Timestampz,
+            TimeFormat::Timestamptz,
         ] {
             let refresh = Refresh::new(
                 Some("time".to_string()),
@@ -1188,7 +1188,7 @@ mod tests {
     fn test_validate_time_column_when_unix_timestamp_mismatch() {
         for format in [
             TimeFormat::Timestamp,
-            TimeFormat::Timestampz,
+            TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
         ] {
             let refresh = Refresh::new(
@@ -1217,7 +1217,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
-            TimeFormat::Timestampz,
+            TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
         ] {
             let refresh = Refresh::new(
@@ -1335,7 +1335,7 @@ mod tests {
     fn test_validate_time_column_when_timestampz_match() {
         let refresh = Refresh::new(
             Some("time".to_string()),
-            Some(TimeFormat::Timestampz),
+            Some(TimeFormat::Timestamptz),
             None,
             None,
             RefreshMode::Full,
