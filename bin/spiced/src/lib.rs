@@ -100,12 +100,10 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
-    if cfg!(feature = "spice-cloud") {
-        if let Some(app) = &app {
-            if let Some(manifest) = app.extensions.get("spice_cloud") {
-                let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
-                extension_factories.push(Box::new(spice_extension_factory));
-            }
+    if let Some(app) = &app {
+        if let Some(manifest) = app.extensions.get("spice_cloud") {
+            let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(spice_extension_factory));
         }
     }
 
