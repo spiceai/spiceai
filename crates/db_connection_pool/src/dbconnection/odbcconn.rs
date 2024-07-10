@@ -197,13 +197,29 @@ where
         });
 
         // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
-        let schema = match schema_rx.recv().await {
-            Some(s) => Ok::<_, GenericError>(s),
-            None => Err(Error::ChannelError {
-                message: "Schema channel closed unexpectedly".to_string(),
+        let Some(schema) = schema_rx.recv().await else {
+            if join_handle.is_finished() {
+                let result = join_handle.await?;
+                match result {
+                    Ok(()) => {
+                        // thread finished without erroring
+                        return Err(Error::ChannelError {
+                            message: "Thread finished before schema was received".to_string(),
+                        }
+                        .into());
+                    }
+                    Err(e) => {
+                        // otherwise return the thread error
+                        return Err(e);
+                    }
+                }
             }
-            .into()),
-        }?;
+
+            return Err(Error::ChannelError {
+                message: "Thread finished before schema was received".to_string(),
+            }
+            .into());
+        };
 
         let output_stream = stream! {
             while let Some(batch) = batch_rx.recv().await {
@@ -215,6 +231,8 @@ where
                     "Failed to execute ODBC query: {e}"
                 )))
             }
+
+            tracing::debug!("Handle finished without error");
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
