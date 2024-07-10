@@ -198,27 +198,9 @@ where
 
         // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
         let Some(schema) = schema_rx.recv().await else {
-            if join_handle.is_finished() {
-                let result = join_handle.await?;
-                match result {
-                    Ok(()) => {
-                        // thread finished without erroring
-                        return Err(Error::ChannelError {
-                            message: "Thread finished before schema was received".to_string(),
-                        }
-                        .into());
-                    }
-                    Err(e) => {
-                        // otherwise return the thread error
-                        return Err(e);
-                    }
-                }
-            }
-
-            return Err(Error::ChannelError {
-                message: "Thread finished before schema was received".to_string(),
-            }
-            .into());
+            // if the channel drops, the task errored
+            let err = join_handle.await?.expect_err("Task should have errored");
+            return Err(err);
         };
 
         let output_stream = stream! {
