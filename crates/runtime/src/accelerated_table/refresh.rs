@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_time_column_when_timestampz_mismatch() {
+    fn test_validate_time_column_when_timestamptz_mismatch() {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_time_column_when_timestampz_match() {
+    fn test_validate_time_column_when_timestamptz_match() {
         let refresh = Refresh::new(
             Some("time".to_string()),
             Some(TimeFormat::Timestamptz),
