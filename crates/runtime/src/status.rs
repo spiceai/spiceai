@@ -41,6 +41,10 @@ impl Display for ComponentStatus {
     }
 }
 
+pub fn update_catalog(catalog_name: impl Into<String>, status: ComponentStatus) {
+    gauge!("catalog/status", "catalog" => catalog_name.into()).set(f64::from(status as u32));
+}
+
 pub fn update_dataset(dataset: &TableReference, status: ComponentStatus) {
     let ds_name = dataset.to_string();
     gauge!("dataset/status", "dataset" => ds_name).set(f64::from(status as u32));

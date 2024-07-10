@@ -8970,6 +8970,7 @@ version = "0.15.2-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
+ "futures",
  "reqwest 0.11.27",
  "runtime",
  "serde",

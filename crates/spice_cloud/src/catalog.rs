@@ -15,23 +15,32 @@ limitations under the License.
 */
 
 use datafusion::catalog::{schema::SchemaProvider, CatalogProvider};
-use runtime::dataconnector::DataConnector;
+use runtime::{
+    component::dataset::Dataset,
+    dataconnector::{DataConnector, DataConnectorError},
+};
 use serde::Deserialize;
 use snafu::prelude::*;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
-use crate::SpiceExtension;
+use crate::{schema::SpiceAISchemaProvider, SpiceExtension};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to retrieve available datasets from Spice AI: {source}"))]
     UnableToRetrieveDatasets { source: super::Error },
+
+    #[snafu(display("{source}"))]
+    UnableToCreateSpiceDataset { source: runtime::Error },
+
+    #[snafu(display("{source}"))]
+    UnableToCreateSchema { source: DataConnectorError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SpiceAICatalogProvider {
-    datasets: Vec<DatasetSchemaResponse>,
+    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,7 +63,44 @@ impl SpiceAICatalogProvider {
             .await
             .context(UnableToRetrieveDatasetsSnafu)?;
 
-        Ok(Self { datasets })
+        tracing::debug!("Found {} Spice AI datasets", datasets.len());
+
+        let parsed_schemas: HashMap<String, HashMap<String, Dataset>> =
+            datasets.iter().fold(HashMap::new(), |mut acc, ds| {
+                let Some(schema_name) = get_schema_name(&ds.name) else {
+                    return acc;
+                };
+                let Some(table_name) = get_normalized_table_name(&ds.name) else {
+                    return acc;
+                };
+
+                let Ok(dataset) = Dataset::try_new(
+                    format!("spiceai:{}", &ds.name),
+                    &format!("{schema_name}.{table_name}"),
+                ) else {
+                    return acc;
+                };
+
+                let schema = acc.entry(schema_name.to_string()).or_default();
+                schema.insert(table_name.to_string(), dataset);
+
+                acc
+            });
+
+        let mut schemas = HashMap::new();
+        for (schema_name, schema_contents) in parsed_schemas {
+            let schema_provider = SpiceAISchemaProvider::try_new(
+                &schema_name,
+                Arc::clone(&data_connector),
+                schema_contents,
+            )
+            .await
+            .context(UnableToCreateSchemaSnafu)?;
+            let schema_provider = Arc::new(schema_provider) as Arc<dyn SchemaProvider>;
+            schemas.insert(schema_name, schema_provider);
+        }
+
+        Ok(Self { schemas })
     }
 }
 
@@ -67,26 +113,76 @@ impl CatalogProvider for SpiceAICatalogProvider {
 
     /// Retrieves the list of available schema names in this catalog.
     fn schema_names(&self) -> Vec<String> {
-        todo!();
+        self.schemas.keys().cloned().collect()
     }
 
     /// Retrieves a specific schema from the catalog by name, provided it exists.
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        todo!();
+        self.schemas.get(name).cloned()
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+/// Returns the schema name from a Spice AI dataset path.
+fn get_schema_name(name: &str) -> Option<&str> {
+    name.split('.').next()
+}
 
-//     #[tokio::test]
-//     async fn test_creation() {
-//         let spice_extension = SpiceExtension::default();
-//         let provider = SpiceAICatalogProvider::try_new(&spice_extension)
-//             .await
-//             .expect("to create provider");
+/// Returns the normalized table name from a Spice AI dataset path.
+///
+/// The normalization will take all characters after the first dot and replace any further dots with underscores
+fn get_normalized_table_name(name: &str) -> Option<String> {
+    if let Some(pos) = name.find('.') {
+        let suffix = &name[pos + 1..];
+        let normalized: String = suffix
+            .chars()
+            .map(|c| if c == '.' { '_' } else { c })
+            .collect();
+        Some(normalized)
+    } else {
+        None
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-//         dbg!(&provider.datasets);
-//     }
-// }
+    #[test]
+    fn test_get_normalized_table_name() {
+        struct TestCase<'a> {
+            input: &'a str,
+            expected: Option<&'a str>,
+        }
+
+        let test_cases = [
+            TestCase {
+                input: "nodots",
+                expected: None,
+            },
+            TestCase {
+                input: "single.dot",
+                expected: Some("dot"),
+            },
+            TestCase {
+                input: "multiple.dots.in.path",
+                expected: Some("dots_in_path"),
+            },
+            TestCase {
+                input: "trailing.dot.",
+                expected: Some("dot_"),
+            },
+            TestCase {
+                input: ".dot.at.start",
+                expected: Some("dot_at_start"),
+            },
+            TestCase {
+                input: ".",
+                expected: Some(""),
+            },
+        ];
+
+        for case in test_cases {
+            let result = get_normalized_table_name(case.input);
+            assert_eq!(result.as_deref(), case.expected, "input: {}", case.input);
+        }
+    }
+}

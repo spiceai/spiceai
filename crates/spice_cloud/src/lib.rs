@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use catalog::SpiceAICatalogProvider;
 use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
@@ -281,7 +282,13 @@ impl Extension for SpiceExtension {
         &self,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Result<Arc<dyn CatalogProvider>>> {
-        None
+        Some(
+            SpiceAICatalogProvider::try_new(self, data_connector)
+                .await
+                .map(|c| Arc::new(c) as Arc<dyn CatalogProvider>)
+                .boxed()
+                .map_err(|source| ExtensionError::UnableToGetCatalogProvider { source }),
+        )
     }
 }
 

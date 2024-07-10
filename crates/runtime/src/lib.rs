@@ -34,6 +34,7 @@ use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
 use cache::QueryResultsCacheProvider;
+use component::catalog::Catalog;
 use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
@@ -197,6 +198,9 @@ pub enum Error {
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
 
+    #[snafu(display("Unable to load data connector for catalog {catalog}"))]
+    UnableToLoadCatalogConnector { catalog: String },
+
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
         dataset: TableReference,
@@ -354,6 +358,7 @@ impl Runtime {
             }),
             Box::pin(self.init_results_cache()),
             Box::pin(self.load_datasets()),
+            Box::pin(self.load_catalogs()),
         ];
 
         if cfg!(feature = "models") {
@@ -361,6 +366,8 @@ impl Runtime {
         }
 
         join_all(futures).await;
+
+        self.df.mark_initial_load_complete();
     }
 
     async fn start_extensions(&self) {
@@ -394,6 +401,10 @@ impl Runtime {
         app.datasets.iter().cloned().map(Dataset::try_from)
     }
 
+    fn catalogs_iter(app: &App) -> impl Iterator<Item = Result<Catalog>> + '_ {
+        app.catalogs.iter().cloned().map(Catalog::try_from)
+    }
+
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Dataset> {
         Self::datasets_iter(app)
@@ -408,6 +419,27 @@ impl Runtime {
                         );
                         metrics::counter!("datasets_load_error").increment(1);
                         tracing::error!(dataset = &spicepod_ds.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns a list of valid catalogs from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_catalogs(app: &App, log_errors: LogErrors) -> Vec<Catalog> {
+        Self::catalogs_iter(app)
+            .zip(&app.catalogs)
+            .filter_map(|(catalog, spicepod_catalog)| match catalog {
+                Ok(catalog) => Some(catalog),
+                Err(e) => {
+                    if log_errors.0 {
+                        status::update_catalog(
+                            &spicepod_catalog.name,
+                            status::ComponentStatus::Error,
+                        );
+                        metrics::counter!("catalogs_load_error").increment(1);
+                        tracing::error!(catalog = &spicepod_catalog.name, "{e}");
                     }
                     None
                 }
@@ -454,6 +486,22 @@ impl Runtime {
             .collect()
     }
 
+    async fn load_catalogs(&self) {
+        let app_lock = self.app.read().await;
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
+
+        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(true));
+        let mut futures = vec![];
+        for catalog in &valid_catalogs {
+            status::update_catalog(&catalog.name, status::ComponentStatus::Initializing);
+            futures.push(self.load_catalog(catalog));
+        }
+
+        let _ = join_all(futures).await;
+    }
+
     async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
@@ -477,8 +525,6 @@ impl Runtime {
 
         // After all datasets have loaded, load the views.
         self.load_views(app, &valid_datasets);
-
-        self.df.mark_initial_load_complete();
     }
 
     fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
@@ -489,6 +535,34 @@ impl Runtime {
                 tracing::error!("Unable to load view: {e}");
             };
         }
+    }
+
+    async fn load_catalog(&self, catalog: &Catalog) {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
+
+        let _ = retry(retry_strategy, || async {
+            let connector = match self.load_catalog_connector(catalog).await {
+                Ok(connector) => connector,
+                Err(err) => {
+                    let catalog_name = &catalog.name;
+                    status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                    metrics::counter!("catalogs_load_error").increment(1);
+                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                    return Err(RetryError::transient(err));
+                }
+            };
+
+            if let Err(err) = self.register_catalog(catalog, connector).await {
+                return Err(RetryError::transient(err));
+            };
+
+            status::update_catalog(&catalog.name, status::ComponentStatus::Ready);
+
+            Ok(())
+        })
+        .await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -540,6 +614,40 @@ impl Runtime {
         Ok(())
     }
 
+    async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn DataConnector>> {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
+
+        let catalog = catalog.clone();
+
+        let secrets_provider = shared_secrets_provider.read().await;
+
+        let source = catalog.provider;
+        let params = Arc::new(catalog.dataset_params.clone());
+        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
+            &source,
+            &secrets_provider,
+            Arc::clone(&params),
+        )
+        .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let catalog_name = &catalog.name;
+                status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                metrics::counter!("catalogs_load_error").increment(1);
+                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: catalog_name.clone(),
+                }
+                .fail();
+            }
+        };
+
+        Ok(data_connector)
+    }
+
     async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
@@ -572,6 +680,30 @@ impl Runtime {
         };
 
         Ok(data_connector)
+    }
+
+    async fn register_catalog(
+        &self,
+        catalog: &Catalog,
+        data_connector: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        let catalog_provider = data_connector
+            .catalog_provider(self, catalog.catalog_id.as_deref())
+            .await
+            .context(UnableToLoadCatalogConnectorSnafu {
+                catalog: catalog.name.clone(),
+            })?
+            .map_err(|_| Error::UnableToLoadCatalogConnector {
+                catalog: catalog.name.clone(),
+            })?;
+
+        self.df
+            .register_catalog(&catalog.name, catalog_provider)
+            .map_err(|_| Error::UnableToLoadCatalogConnector {
+                catalog: catalog.name.clone(),
+            })?;
+
+        Ok(())
     }
 
     async fn register_loaded_dataset(
@@ -895,16 +1027,18 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            return Runtime::register_table(
-                df,
-                ds,
-                datafusion::Table::Federated {
-                    data_connector: connector,
-                    federated_read_table,
-                },
-                &source,
-            )
-            .await;
+            return df
+                .register_table(
+                    ds,
+                    datafusion::Table::Federated {
+                        data_connector: connector,
+                        federated_read_table,
+                    },
+                )
+                .await
+                .context(UnableToAttachDataConnectorSnafu {
+                    data_connector: source,
+                });
         }
 
         // ACCELERATED TABLE
@@ -923,8 +1057,7 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        Runtime::register_table(
-            df,
+        df.register_table(
             ds,
             datafusion::Table::Accelerated {
                 source: connector,
@@ -932,24 +1065,11 @@ impl Runtime {
                 acceleration_secret,
                 accelerated_table,
             },
-            &source,
         )
         .await
-    }
-
-    async fn register_table(
-        df: Arc<DataFusion>,
-        ds: &Dataset,
-        table: datafusion::Table,
-        source: &str,
-    ) -> Result<()> {
-        df.register_table(ds, table)
-            .await
-            .context(UnableToAttachDataConnectorSnafu {
-                data_connector: source,
-            })?;
-
-        Ok(())
+        .context(UnableToAttachDataConnectorSnafu {
+            data_connector: source,
+        })
     }
 
     async fn get_params_with_secrets(&self, params: &HashMap<String, String>) -> Result<SecretMap> {
