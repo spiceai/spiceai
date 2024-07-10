@@ -199,7 +199,15 @@ where
         // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
         let Some(schema) = schema_rx.recv().await else {
             // if the channel drops, the task errored
-            let err = join_handle.await?.expect_err("Task should have errored");
+            if !join_handle.is_finished() {
+                unreachable!("Schema channel should not have dropped before the task finished");
+            }
+
+            let result = join_handle.await?;
+            let Err(err) = result else {
+                unreachable!("Task should have errored");
+            };
+
             return Err(err);
         };
 
