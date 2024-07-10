@@ -420,7 +420,7 @@ mod tests {
 
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
-        datatypes::{DataType, Fields, Schema},
+        datatypes::{DataType, Field, Fields, Schema},
     };
     use data_components::arrow::write::MemTable;
     use datafusion::{physical_plan::collect, prelude::SessionContext};
@@ -1130,5 +1130,231 @@ mod tests {
             "should fetch all data from all fetched record batches as 3 seconds is enough to cover all time span in source with millis",
         )
         .await;
+    }
+
+    #[test]
+    fn test_validate_time_column_when_no_time_column() {
+        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
+        let schema = Arc::new(Schema::empty());
+        assert!(refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_validate_time_column_when_time_column_not_found() {
+        let refresh = Refresh::new(
+            Some("time".to_string()),
+            None,
+            None,
+            None,
+            RefreshMode::Full,
+            None,
+            None,
+        );
+        let schema = Arc::new(Schema::empty());
+        assert!(matches!(
+            refresh.validate_time_format("test_dataset".to_string(), &schema),
+            Err(Error::NoTimeColumnFound { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_time_column_when_iso8601_mismatch() {
+        for format in [
+            TimeFormat::UnixSeconds,
+            TimeFormat::UnixMillis,
+            TimeFormat::Timestamp,
+            TimeFormat::Timestampz,
+        ] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
+            assert!(matches!(
+                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                Err(Error::TimeFormatMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_unix_timestamp_mismatch() {
+        for format in [
+            TimeFormat::Timestamp,
+            TimeFormat::Timestampz,
+            TimeFormat::ISO8601,
+        ] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Int64,
+                false,
+            )]));
+            assert!(matches!(
+                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                Err(Error::TimeFormatMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_timestamp_mismatch() {
+        for format in [
+            TimeFormat::UnixMillis,
+            TimeFormat::UnixSeconds,
+            TimeFormat::Timestampz,
+            TimeFormat::ISO8601,
+        ] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                false,
+            )]));
+            assert!(matches!(
+                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                Err(Error::TimeFormatMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_timestampz_mismatch() {
+        for format in [
+            TimeFormat::UnixMillis,
+            TimeFormat::UnixSeconds,
+            TimeFormat::Timestamp,
+            TimeFormat::ISO8601,
+        ] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
+                false,
+            )]));
+            assert!(matches!(
+                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                Err(Error::TimeFormatMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_iso8601_match() {
+        for format in [TimeFormat::ISO8601] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
+            assert!(refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_unix_timestamp_match() {
+        for format in [TimeFormat::UnixMillis, TimeFormat::UnixSeconds] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Int64,
+                false,
+            )]));
+            assert!(refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_timestamp_match() {
+        for format in [TimeFormat::Timestamp] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                false,
+            )]));
+            assert!(refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_timestampz_match() {
+        for format in [TimeFormat::Timestampz] {
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(format),
+                None,
+                None,
+                RefreshMode::Full,
+                None,
+                None,
+            );
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
+                false,
+            )]));
+            assert!(refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok());
+        }
     }
 }
