@@ -61,7 +61,7 @@ impl SpiceAISchemaProvider {
         while let Some(table_result) = futures_unordered.next().await {
             let (name, table_provider) = table_result?;
             tables.insert(name, table_provider);
-            tracing::debug!("{} tables processed", tables.len());
+            tracing::trace!("{} tables processed", tables.len());
         }
 
         Ok(SpiceAISchemaProvider { tables })
