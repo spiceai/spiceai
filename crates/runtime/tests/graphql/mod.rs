@@ -228,7 +228,7 @@ async fn test_graphql() -> Result<(), String> {
             &format!("http://{addr}/graphql"),
             "test_graphql",
             "query { users { id name posts { id title content } } }",
-            "data.users",
+            "/data/users",
         ))
         .build();
     let mut rt = Runtime::builder().with_app(app).build().await;
@@ -304,7 +304,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
             &format!("http://{addr}/graphql"),
             "test_graphql",
             "query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
-            "data.paginatedUsers.users",
+            "/data/paginatedUsers/users",
         ))
         .build();
     let mut rt = Runtime::builder().with_app(app).build().await;
