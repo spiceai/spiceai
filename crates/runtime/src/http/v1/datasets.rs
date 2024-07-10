@@ -15,7 +15,7 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use crate::{component::dataset::Dataset, Runtime};
+use crate::{component::dataset::Dataset, LogErrors, Runtime};
 use app::App;
 use axum::{
     extract::Path,
@@ -74,7 +74,7 @@ pub(crate) async fn get(
             .into_response();
     };
 
-    let valid_datasets = Runtime::get_valid_datasets(readable_app, false);
+    let valid_datasets = Runtime::get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Dataset> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()

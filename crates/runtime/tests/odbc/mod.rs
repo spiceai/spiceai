@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use app::AppBuilder;
 use runtime::Runtime;
@@ -71,18 +71,18 @@ async fn databricks_odbc() -> Result<(), String> {
         ))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     // Set a timeout for the test
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_datasets() => {}
+        () = rt.load_components() => {}
     }
 
     let result = rt
-        .df
+        .datafusion()
         .ctx
         .sql("SELECT * FROM line LIMIT 10")
         .await
@@ -123,20 +123,20 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
             ))
             .build();
 
-        let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+        let rt = Runtime::builder().with_app(app).build().await;
 
         // Set a timeout for the test
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
-            () = rt.load_datasets() => {}
+            () = rt.load_components() => {}
         }
 
         assert!(
             wait_until_true(Duration::from_secs(10), || async {
                 let result = rt
-                    .df
+                    .datafusion()
                     .ctx
                     .sql("SELECT * FROM line LIMIT 10")
                     .await

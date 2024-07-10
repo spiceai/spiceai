@@ -445,7 +445,7 @@ mod tests {
                     _ => panic!("not testing this"),
                 }
 
-                sleep(Duration::from_micros(100));
+                sleep(Duration::from_millis(100));
             }
 
             false

@@ -16,17 +16,15 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use component::view::View;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
-use component::embeddings::Embeddings;
-use component::model::Model;
-use component::runtime::Runtime;
-use component::secrets::Secrets;
-use component::{dataset::Dataset, extension::Extension};
+use component::{
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, extension::Extension, model::Model,
+    runtime::Runtime, secrets::Secrets, view::View,
+};
 
 use spec::{SpicepodDefinition, SpicepodVersion};
 
@@ -45,6 +43,8 @@ pub enum Error {
     },
     #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
     SpicepodNotFound { path: PathBuf },
+    #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
+    DuplicateComponent { component: String, name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -59,6 +59,8 @@ pub struct Spicepod {
 
     pub secrets: Secrets,
 
+    pub catalogs: Vec<Catalog>,
+
     pub datasets: Vec<Dataset>,
 
     pub views: Vec<View>,
@@ -70,6 +72,23 @@ pub struct Spicepod {
     pub embeddings: Vec<Embeddings>,
 
     pub runtime: Runtime,
+}
+
+fn detect_duplicate_component_names(
+    component_type: &str,
+    components: &[impl component::Nameable],
+) -> Result<()> {
+    let mut component_names = vec![];
+    for component in components {
+        if component_names.contains(&component.name()) {
+            return Err(Error::DuplicateComponent {
+                component: component_type.to_string(),
+                name: component.name().to_string(),
+            });
+        }
+        component_names.push(component.name());
+    }
+    Ok(())
 }
 
 impl Spicepod {
@@ -90,11 +109,20 @@ impl Spicepod {
 
         let spicepod_definition: SpicepodDefinition =
             serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
         let resolved_datasets = component::resolve_component_references(
             fs,
             &path,
             &spicepod_definition.datasets,
             "dataset",
+        )
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
+        let resolved_catalogs = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.catalogs,
+            "catalog",
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
@@ -118,8 +146,14 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
+        detect_duplicate_component_names("view", &resolved_views[..])?;
+        detect_duplicate_component_names("model", &resolved_models[..])?;
+        detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
+
         Ok(from_definition(
             spicepod_definition,
+            resolved_catalogs,
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
@@ -152,6 +186,7 @@ impl Spicepod {
 #[must_use]
 fn from_definition(
     spicepod_definition: SpicepodDefinition,
+    catalogs: Vec<Catalog>,
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
@@ -162,6 +197,7 @@ fn from_definition(
         version: spicepod_definition.version,
         extensions: spicepod_definition.extensions,
         secrets: spicepod_definition.secrets,
+        catalogs,
         datasets,
         views,
         models,

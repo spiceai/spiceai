@@ -23,6 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::reader;
+pub mod catalog;
 pub mod dataset;
 pub mod embeddings;
 pub mod extension;
@@ -31,6 +32,10 @@ pub mod params;
 pub mod runtime;
 pub mod secrets;
 pub mod view;
+
+pub trait Nameable {
+    fn name(&self) -> &str;
+}
 
 pub trait WithDependsOn<T> {
     fn depends_on(&self, depends_on: &[String]) -> T;

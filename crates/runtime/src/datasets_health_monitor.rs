@@ -43,7 +43,7 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-pub struct DatasetAvailabilityInfo {
+struct DatasetAvailabilityInfo {
     name: String,
     table_provider: Arc<dyn TableProvider>,
     last_available_time: SystemTime,
@@ -59,12 +59,12 @@ impl DatasetAvailabilityInfo {
     }
 }
 
-pub enum AvailabilityVerificationResult {
+enum AvailabilityVerificationResult {
     Available,
     Unavailable(SystemTime, String),
 }
 
-pub struct DatasetsHealthMonitor {
+pub(crate) struct DatasetsHealthMonitor {
     df_ctx: Arc<SessionContext>,
     monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
 }

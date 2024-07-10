@@ -18,50 +18,47 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{Nameable, WithDependsOn};
+use super::{params::Params, WithDependsOn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct View {
+pub struct Catalog {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+
     pub name: String,
 
-    /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql: Option<String>,
+    pub params: Option<Params>,
 
-    /// Reference to a SQL file that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql_ref: Option<String>,
+    pub dataset_params: Option<Params>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
 }
 
-impl Nameable for View {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl View {
+impl Catalog {
     #[must_use]
-    pub fn new(name: String) -> Self {
-        Self {
+    pub fn new(from: String, name: String) -> Self {
+        Catalog {
+            from,
             name,
-            sql: None,
-            sql_ref: None,
+            params: None,
+            dataset_params: None,
             depends_on: Vec::default(),
         }
     }
 }
 
-impl WithDependsOn<View> for View {
-    fn depends_on(&self, depends_on: &[String]) -> View {
-        Self {
+impl WithDependsOn<Catalog> for Catalog {
+    fn depends_on(&self, depends_on: &[String]) -> Catalog {
+        Catalog {
+            from: self.from.clone(),
             name: self.name.clone(),
-            sql: self.sql.clone(),
-            sql_ref: self.sql_ref.clone(),
+            params: self.params.clone(),
+            dataset_params: self.dataset_params.clone(),
             depends_on: depends_on.to_vec(),
         }
     }
