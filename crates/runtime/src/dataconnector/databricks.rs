@@ -156,7 +156,7 @@ impl DataConnector for Databricks {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
-            .table_provider(table_reference)
+            .table_provider(table_reference, dataset.schema())
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "databricks",

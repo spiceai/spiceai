@@ -110,6 +110,7 @@ impl DataConnector for SpiceAI {
         Ok(Read::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
+            dataset.schema(),
         )
         .await
         .context(super::UnableToGetReadProviderSnafu {
@@ -124,6 +125,7 @@ impl DataConnector for SpiceAI {
         let read_write_result = ReadWrite::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
+            dataset.schema(),
         )
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
