@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use snafu::prelude::*;
 use spicepod::component::{catalog as spicepod_catalog, params::Params};
 use std::collections::HashMap;
 
@@ -38,19 +39,18 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
         let mut globset_opt: Option<GlobSet> = None;
         if !catalog.include.is_empty() {
             let mut globset_builder = GlobSetBuilder::new();
-            let include_iter = catalog.include.iter().map(|i| Glob::new(i));
+            let include_iter = catalog.include.iter().map(|pattern| {
+                Glob::new(pattern).context(crate::InvalidGlobPatternSnafu { pattern })
+            });
             for glob in include_iter {
-                let glob = match glob {
-                    Ok(g) => g,
-                    Err(e) => panic!("Invalid glob pattern: {e}"),
-                };
-                globset_builder.add(glob);
+                globset_builder.add(glob?);
             }
 
-            globset_opt = match globset_builder.build() {
-                Ok(g) => Some(g),
-                Err(e) => panic!("Unable to build globset: {e}"),
-            };
+            globset_opt = Some(
+                globset_builder
+                    .build()
+                    .context(crate::ErrorConvertingGlobSetToRegexSnafu)?,
+            );
         }
 
         Ok(Catalog {

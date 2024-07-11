@@ -238,6 +238,9 @@ pub enum Error {
         pattern: String,
         source: globset::Error,
     },
+
+    #[snafu(display("Error converting GlobSet to Regex: {source}"))]
+    ErrorConvertingGlobSetToRegex { source: globset::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
