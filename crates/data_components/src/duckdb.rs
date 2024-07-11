@@ -18,6 +18,7 @@ use crate::{
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
     Read, ReadWrite,
 };
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider, execution::context::SessionState, logical_expr::Expr,
@@ -96,6 +97,7 @@ impl Read for DuckDBTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.table_provider(table_reference).await
     }
@@ -106,6 +108,7 @@ impl ReadWrite for DuckDBTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.read_write_table_provider(table_reference).await
     }

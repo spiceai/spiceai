@@ -14,17 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::sql::TableReference;
 use spicepod::component::{catalog as spicepod_catalog, params::Params};
 use std::collections::HashMap;
-
-use super::dataset::Dataset;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Catalog {
     pub provider: String,
     pub catalog_id: Option<String>,
-    pub name: TableReference,
+    pub name: String,
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
 }
@@ -33,14 +30,13 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
     type Error = crate::Error;
 
     fn try_from(catalog: spicepod_catalog::Catalog) -> std::result::Result<Self, Self::Error> {
-        let table_reference = Dataset::parse_table_reference(&catalog.name)?;
         let provider = Catalog::provider(&catalog.from);
         let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
 
         Ok(Catalog {
             provider: provider.to_string(),
             catalog_id,
-            name: table_reference,
+            name: catalog.name,
             params: catalog
                 .params
                 .as_ref()
@@ -60,7 +56,7 @@ impl Catalog {
         Ok(Catalog {
             provider: Catalog::provider(from).to_string(),
             catalog_id: Catalog::catalog_id(from).map(String::from),
-            name: Dataset::parse_table_reference(name)?,
+            name: name.into(),
             params: HashMap::default(),
             dataset_params: HashMap::default(),
         })

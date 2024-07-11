@@ -168,6 +168,9 @@ pub enum Error {
     #[snafu(display("Table {schema}.{table} not registered"))]
     TableMissing { schema: String, table: String },
 
+    #[snafu(display("Catalog already exists: {catalog}"))]
+    CatalogAlreadyExists { catalog: String },
+
     #[snafu(display("Unable to get object store configuration: {source}"))]
     UnableToGetSchemaTable {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -341,6 +344,19 @@ impl DataFusion {
                 .map_err(|_| Error::UnableToLockDataWriters {})?
                 .insert(table_name);
         }
+
+        Ok(())
+    }
+
+    pub fn register_catalog(&self, name: &str, catalog: Arc<dyn CatalogProvider>) -> Result<()> {
+        if self.ctx.catalog(name).is_some() {
+            CatalogAlreadyExistsSnafu {
+                catalog: name.to_string(),
+            }
+            .fail()?;
+        }
+
+        self.ctx.register_catalog(name, catalog);
 
         Ok(())
     }

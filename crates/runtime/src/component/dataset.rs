@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use acceleration::Engine;
+use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
@@ -117,6 +118,7 @@ pub struct Dataset {
     pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
+    schema: Option<SchemaRef>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {
@@ -147,6 +149,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             time_format: dataset.time_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
+            schema: None,
         })
     }
 }
@@ -164,7 +167,19 @@ impl Dataset {
             time_format: None,
             acceleration: None,
             embeddings: Vec::default(),
+            schema: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub fn schema(&self) -> Option<SchemaRef> {
+        self.schema.clone()
     }
 
     #[must_use]

@@ -19,3 +19,4 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
+futures.workspace = true
