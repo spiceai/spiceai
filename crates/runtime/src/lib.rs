@@ -53,7 +53,6 @@ use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use regex::Regex;
 use secrets::{spicepod_secret_store_type, Secret, SecretMap};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
@@ -235,7 +234,10 @@ pub enum Error {
     },
 
     #[snafu(display("Invalid glob pattern {pattern}: {source}"))]
-    InvalidGlobPattern { source: globset::Error },
+    InvalidGlobPattern {
+        pattern: String,
+        source: globset::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -692,7 +694,7 @@ impl Runtime {
         catalog: &Catalog,
         data_connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let include: Option<GlobSet> = Some(catalog.include.clone());
+        let include: Option<GlobSet> = catalog.include.clone();
 
         let catalog_provider = data_connector
             .catalog_provider(self, catalog.catalog_id.as_deref(), include)

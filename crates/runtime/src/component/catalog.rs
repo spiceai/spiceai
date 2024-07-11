@@ -15,8 +15,6 @@ limitations under the License.
 */
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use regex::Regex;
-use snafu::prelude::*;
 use spicepod::component::{catalog as spicepod_catalog, params::Params};
 use std::collections::HashMap;
 
@@ -37,30 +35,29 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
         let provider = Catalog::provider(&catalog.from);
         let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
 
-        let globset_builder = GlobSetBuilder::new();
-        let include_iter = catalog.include.iter().map(|i| Glob::new(i));
-        for glob in include_iter {
-            let glob = match glob {
-                Ok(g) => g,
-                Err(e) => panic!("Invalid glob pattern: {e}"),
-            };
-            globset_builder.add(glob);
-        }
+        let mut globset_opt: Option<GlobSet> = None;
+        if !catalog.include.is_empty() {
+            let mut globset_builder = GlobSetBuilder::new();
+            let include_iter = catalog.include.iter().map(|i| Glob::new(i));
+            for glob in include_iter {
+                let glob = match glob {
+                    Ok(g) => g,
+                    Err(e) => panic!("Invalid glob pattern: {e}"),
+                };
+                globset_builder.add(glob);
+            }
 
-        let globset = match globset_builder.build() {
-            Ok(g) => g,
-            Err(e) => panic!("Unable to build globset: {e}"),
-        };
+            globset_opt = match globset_builder.build() {
+                Ok(g) => Some(g),
+                Err(e) => panic!("Unable to build globset: {e}"),
+            };
+        }
 
         Ok(Catalog {
             provider: provider.to_string(),
             catalog_id,
             name: catalog.name,
-            include: catalog
-                .include
-                .iter()
-                .map(|i| globset)
-                .collect::<Result<Vec<_>, Self::Error>>()?,
+            include: globset_opt,
             params: catalog
                 .params
                 .as_ref()
@@ -81,7 +78,7 @@ impl Catalog {
             provider: Catalog::provider(from).to_string(),
             catalog_id: Catalog::catalog_id(from).map(String::from),
             name: name.into(),
-            include: Vec::default(),
+            include: None,
             params: HashMap::default(),
             dataset_params: HashMap::default(),
         })

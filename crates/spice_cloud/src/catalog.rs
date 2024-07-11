@@ -18,7 +18,7 @@ use datafusion::{
     arrow::{self, datatypes::TimeUnit},
     catalog::{schema::SchemaProvider, CatalogProvider},
 };
-use regex::Regex;
+use globset::GlobSet;
 use runtime::{
     component::dataset::Dataset,
     dataconnector::{DataConnector, DataConnectorError},
@@ -95,7 +95,7 @@ impl SpiceAICatalogProvider {
     pub async fn try_new(
         extension: &SpiceExtension,
         data_connector: Arc<dyn DataConnector>,
-        filters: Option<Vec<Regex>>,
+        filters: Option<GlobSet>,
     ) -> Result<Self> {
         let datasets: Vec<DatasetSchemaResponse> = extension
             .get_json("/v1/schemas")
@@ -115,7 +115,7 @@ impl SpiceAICatalogProvider {
 
                 let dataset_name = format!("{schema_name}.{table_name}");
                 if let Some(filters) = &filters {
-                    if !filters.iter().any(|i| i.is_match(&dataset_name)) {
+                    if !filters.is_match(&dataset_name) {
                         return acc;
                     }
                 }
