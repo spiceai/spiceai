@@ -82,7 +82,7 @@ impl SchemaProvider for SpiceAISchemaProvider {
     }
 
     /// Retrieves a specific table from the schema by name, if it exists,
-    /// otherwise returns `None`.
+    /// otherwise returns `Ok(None)`.
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         let Some(table) = self.tables.get(name) else {
             return Ok(None);
