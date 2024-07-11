@@ -70,8 +70,8 @@ pub struct UnityCatalog {
     client: reqwest::Client,
 }
 
-pub struct Endpoint(String);
-pub struct CatalogId(String);
+pub struct Endpoint(pub String);
+pub struct CatalogId(pub String);
 
 impl UnityCatalog {
     #[must_use]
