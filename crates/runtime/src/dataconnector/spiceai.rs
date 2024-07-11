@@ -25,6 +25,7 @@ use data_components::{Read, ReadWrite};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use flight_client::FlightClient;
+use globset::GlobSet;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
@@ -139,6 +140,7 @@ impl DataConnector for SpiceAI {
         self: Arc<Self>,
         runtime: &Runtime,
         catalog_id: Option<&str>,
+        include: Option<GlobSet>,
     ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
         if catalog_id.is_some() {
             return Some(Err(
@@ -150,7 +152,10 @@ impl DataConnector for SpiceAI {
         }
 
         let spice_extension = runtime.extension("spice_cloud").await?;
-        let catalog_provider = spice_extension.catalog_provider(self).await?.ok()?;
+        let catalog_provider = spice_extension
+            .catalog_provider(self, include)
+            .await?
+            .ok()?;
 
         Some(Ok(catalog_provider))
     }

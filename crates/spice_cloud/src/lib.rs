@@ -19,6 +19,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use catalog::SpiceAICatalogProvider;
 use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
+use globset::GlobSet;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -281,9 +282,10 @@ impl Extension for SpiceExtension {
     async fn catalog_provider(
         &self,
         data_connector: Arc<dyn DataConnector>,
+        filters: Option<GlobSet>,
     ) -> Option<Result<Arc<dyn CatalogProvider>>> {
         Some(
-            SpiceAICatalogProvider::try_new(self, data_connector)
+            SpiceAICatalogProvider::try_new(self, data_connector, filters)
                 .await
                 .map(|c| Arc::new(c) as Arc<dyn CatalogProvider>)
                 .boxed()

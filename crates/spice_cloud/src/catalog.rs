@@ -18,6 +18,7 @@ use datafusion::{
     arrow::{self, datatypes::TimeUnit},
     catalog::{schema::SchemaProvider, CatalogProvider},
 };
+use globset::GlobSet;
 use runtime::{
     component::dataset::Dataset,
     dataconnector::{DataConnector, DataConnectorError},
@@ -94,6 +95,7 @@ impl SpiceAICatalogProvider {
     pub async fn try_new(
         extension: &SpiceExtension,
         data_connector: Arc<dyn DataConnector>,
+        filters: Option<GlobSet>,
     ) -> Result<Self> {
         let datasets: Vec<DatasetSchemaResponse> = extension
             .get_json("/v1/schemas")
@@ -111,10 +113,15 @@ impl SpiceAICatalogProvider {
                     return acc;
                 };
 
-                let Ok(dataset) = Dataset::try_new(
-                    format!("spiceai:{}", &ds.name),
-                    &format!("{schema_name}.{table_name}"),
-                ) else {
+                let dataset_name = format!("{schema_name}.{table_name}");
+                if let Some(filters) = &filters {
+                    if !filters.is_match(&dataset_name) {
+                        return acc;
+                    }
+                }
+
+                let Ok(dataset) = Dataset::try_new(format!("spiceai:{}", &ds.name), &dataset_name)
+                else {
                     return acc;
                 };
 
