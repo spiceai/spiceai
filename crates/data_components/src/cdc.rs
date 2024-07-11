@@ -31,6 +31,9 @@ pub enum CommitError {
     UnableToCommitChange {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Change committer not exist"))]
+    CommitterMissing {},
 }
 
 #[derive(Debug, Snafu)]
@@ -62,13 +65,16 @@ pub trait CommitChange {
 }
 
 pub struct ChangeEnvelope {
-    change_committer: Box<dyn CommitChange + Send>,
+    change_committer: Option<Box<dyn CommitChange + Send>>,
     pub change_batch: ChangeBatch,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
+    pub fn new(
+        change_committer: Option<Box<dyn CommitChange + Send>>,
+        change_batch: ChangeBatch,
+    ) -> Self {
         Self {
             change_committer,
             change_batch,
@@ -76,7 +82,10 @@ impl ChangeEnvelope {
     }
 
     pub fn commit(self) -> Result<(), CommitError> {
-        self.change_committer.commit()
+        if let Some(change_committer) = self.change_committer {
+            return change_committer.commit();
+        }
+        Err(CommitError::CommitterMissing {})
     }
 }
 

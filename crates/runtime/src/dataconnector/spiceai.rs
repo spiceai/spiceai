@@ -19,9 +19,13 @@ use super::DataConnectorFactory;
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
+use data_components::flight::stream::FlightTableStreamer;
 use data_components::flight::FlightFactory;
+use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
+use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
@@ -30,6 +34,7 @@ use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
+use tract_core::downcast_rs::Downcast;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -129,6 +134,23 @@ impl DataConnector for SpiceAI {
         });
 
         Some(read_write_result)
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        true
+    }
+
+    async fn append_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
+        let federated_table_provider_adaptor = table_provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()?;
+        let flight_table = federated_table_provider_adaptor
+            .table_provider
+            .as_any()
+            .downcast_ref::<FlightTable>()?;
+        let stream = flight_table.stream_changes().await;
+
+        Some(stream)
     }
 }
 

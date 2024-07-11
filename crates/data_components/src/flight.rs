@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{Read, ReadWrite};
+use crate::{
+    cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream},
+    Read, ReadWrite,
+};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow_flight::decode::DecodedPayload;
 use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -56,6 +60,14 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve schema"))]
     UnableToRetrieveSchema,
+
+    #[snafu(display("{source}"))]
+    UnableToDecodeFlightData {
+        source: arrow_flight::error::FlightError,
+    },
+
+    #[snafu(display("Unable to subscribe to data from the Flight endpoint: {source}"))]
+    UnableToSubscribeData { source: flight_client::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -112,6 +124,7 @@ pub struct FlightTable {
     name: &'static str,
     join_push_down_context: String,
     client: FlightClient,
+    primary_keys: Vec<String>,
     schema: SchemaRef,
     table_reference: TableReference,
 }
@@ -125,9 +138,12 @@ impl FlightTable {
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
+        // TODO: Retrieve primary keys
+        let primary_keys = Vec::<String>::new();
         Ok(Self {
             name,
             client: client.clone(),
+            primary_keys,
             schema,
             table_reference,
             join_push_down_context: format!("url={},username={}", client.url(), client.username()),
@@ -177,6 +193,33 @@ impl FlightTable {
             filters,
             limit,
         )?))
+    }
+
+    pub async fn stream_changes(&self) -> ChangesStream {
+        let schema = Arc::clone(&self.schema);
+        let primary_keys = self.primary_keys.clone();
+
+        let Ok(decoder) = self
+            .client
+            .clone()
+            .subscribe(&self.table_reference.to_string())
+            .await
+        else {
+            todo!()
+        };
+
+        let change_stream = decoder.map(|flight_data_result| {
+            flight_data_result
+                .map_err(|e| cdc::StreamError::SerdeJsonError("todo".to_string()))
+                .and_then(|flight_data| match flight_data.payload {
+                    DecodedPayload::RecordBatch(batch) => ChangeBatch::try_new(batch)
+                        .map(|rb| ChangeEnvelope::new(None, rb))
+                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string())),
+                    _ => Err(cdc::StreamError::SerdeJsonError("todo".to_string())),
+                })
+        });
+
+        Box::pin(change_stream)
     }
 }
 
