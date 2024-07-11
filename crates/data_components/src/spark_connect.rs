@@ -17,7 +17,7 @@ limitations under the License.
 use std::fmt;
 use std::sync::Arc;
 
-use crate::{Read, ReadWrite};
+use crate::Read;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
@@ -66,23 +66,14 @@ impl SparkConnect {
 }
 
 #[async_trait]
-impl ReadWrite for SparkConnect {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        let provider = get_table_provider(Arc::clone(&self.session), table_reference).await?;
-        Ok(provider)
-    }
-}
-
-#[async_trait]
 impl Read for SparkConnect {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        let provider = get_table_provider(Arc::clone(&self.session), table_reference).await?;
+        let provider =
+            get_table_provider(Arc::clone(&self.session), table_reference, schema).await?;
         Ok(provider)
     }
 }
@@ -90,6 +81,7 @@ impl Read for SparkConnect {
 async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: TableReference,
+    schema: Option<SchemaRef>,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
     let spark_table_reference = match table_reference {
         TableReference::Bare { ref table } => format!("`{table}`"),
@@ -106,7 +98,10 @@ async fn get_table_provider(
         }
     };
     let dataframe = spark_session.table(spark_table_reference.as_str())?;
-    let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
+    let arrow_schema = match schema {
+        Some(schema) => schema,
+        None => dataframe.clone().limit(0).collect().await?.schema(),
+    };
     Ok(Arc::new(SparkConnectTableProvider {
         dataframe,
         schema: arrow_schema,

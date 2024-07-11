@@ -78,9 +78,19 @@ impl Read for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider =
-            Arc::new(FlightTable::create(self.name, self.client.clone(), table_reference).await?);
+        let table_provider = match schema {
+            Some(schema) => Arc::new(FlightTable::create_with_schema(
+                self.name,
+                self.client.clone(),
+                table_reference,
+                schema,
+            )),
+            None => Arc::new(
+                FlightTable::create(self.name, self.client.clone(), table_reference).await?,
+            ),
+        };
 
         let table_provider = Arc::new(
             table_provider
@@ -97,8 +107,9 @@ impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let read_provider = Read::table_provider(self, table_reference.clone()).await?;
+        let read_provider = Read::table_provider(self, table_reference.clone(), schema).await?;
 
         Ok(FlightTableWriter::create(
             read_provider,
@@ -132,6 +143,22 @@ impl FlightTable {
             table_reference,
             join_push_down_context: format!("url={},username={}", client.url(), client.username()),
         })
+    }
+
+    pub fn create_with_schema(
+        name: &'static str,
+        client: FlightClient,
+        table_reference: impl Into<TableReference>,
+        schema: SchemaRef,
+    ) -> Self {
+        let table_reference = table_reference.into();
+        Self {
+            name,
+            client: client.clone(),
+            schema,
+            table_reference,
+            join_push_down_context: format!("url={},username={}", client.url(), client.username()),
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)]

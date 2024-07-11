@@ -104,7 +104,13 @@ impl DataConnector for Postgres {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        match Read::table_provider(&self.postgres_factory, dataset.path().into()).await {
+        match Read::table_provider(
+            &self.postgres_factory,
+            dataset.path().into(),
+            dataset.schema(),
+        )
+        .await
+        {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {

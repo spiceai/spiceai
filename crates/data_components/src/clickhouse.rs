@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use clickhouse_rs::ClientHandle;
 use datafusion::{datasource::TableProvider, sql::TableReference};
@@ -55,13 +56,23 @@ impl Read for ClickhouseTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let table_provider = Arc::new(
-            SqlTable::new("clickhouse", &pool, table_reference, None)
-                .await
-                .context(UnableToConstructSQLTableSnafu)?,
-        );
+        let table_provider = match schema {
+            Some(schema) => Arc::new(SqlTable::new_with_schema(
+                "clickhouse",
+                &pool,
+                schema,
+                table_reference,
+                None,
+            )),
+            None => Arc::new(
+                SqlTable::new("clickhouse", &pool, table_reference, None)
+                    .await
+                    .context(UnableToConstructSQLTableSnafu)?,
+            ),
+        };
 
         let table_provider = Arc::new(
             table_provider

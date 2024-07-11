@@ -16,11 +16,13 @@ limitations under the License.
 
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::Runtime;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
+use datafusion::catalog::CatalogProvider;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
@@ -150,6 +152,12 @@ pub enum DataConnectorError {
 
     #[snafu(display("Unable to get read write provider for {dataconnector}: {source}"))]
     UnableToGetReadWriteProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to get catalog provider for {dataconnector}: {source}"))]
+    UnableToGetCatalogProvider {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -323,6 +331,15 @@ pub trait DataConnector: Send + Sync {
         &self,
         _dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        None
+    }
+
+    /// Returns a DataFusion `CatalogProvider` which can automatically populate tables from a remote catalog.
+    async fn catalog_provider(
+        self: Arc<Self>,
+        _runtime: &Runtime,
+        _catalog_id: Option<&str>,
+    ) -> Option<DataConnectorResult<Arc<dyn CatalogProvider>>> {
         None
     }
 }

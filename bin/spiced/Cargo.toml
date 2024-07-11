@@ -43,7 +43,6 @@ default = [
   "spark",
   "snowflake",
   "ftp",
-  "spice-cloud",
   "debezium",
 ]
 dev = ["runtime/dev"]
@@ -59,5 +58,4 @@ postgres = ["runtime/postgres"]
 release = []
 snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
-spice-cloud = []
 sqlite = ["runtime/sqlite"]
