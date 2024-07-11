@@ -14,14 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::sql::TableReference;
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}"))]
     MissingParameter { parameter: String },
+
+    #[snafu(display("Unity Catalog API request failed: {source}"))]
+    ConnectionError { source: reqwest::Error },
+
+    #[snafu(display("Unity Catalog API request failed: {status}"))]
+    UnexpectedStatusCode { status: reqwest::StatusCode },
+
+    #[snafu(display("Could not parse {url} into a URL: {source}"))]
+    URLParseError {
+        url: String,
+        source: url::ParseError,
+    },
+
+    #[snafu(display(
+        "Invalid catalog URL structure {}, expected format: https://<host>/api/2.1/unity-catalog/catalogs/<catalog_id>",
+        url,
+    ))]
+    InvalidCatalogURL { url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -31,33 +52,240 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Could be replaced once <https://crates.io/crates/unitycatalog-client> is available.
 pub struct UnityCatalog {
     endpoint: String,
-    token: SecretString,
+    token: Option<SecretString>,
+    client: reqwest::Client,
 }
 
+pub struct Endpoint(String);
+pub struct CatalogId(String);
+
 impl UnityCatalog {
-    pub fn new(endpoint: impl Into<String>, token: SecretString) -> Self {
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(endpoint: Endpoint, token: Option<SecretString>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            endpoint: endpoint.0.trim_end_matches('/').to_string(),
             token,
+            client: reqwest::Client::new(),
         }
     }
 
     pub fn from_params(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
         let endpoint = params
             .get("endpoint")
-            .ok_or(Error::MissingParameter {
-                parameter: "endpoint".into(),
+            .context(MissingParameterSnafu {
+                parameter: "endpoint".to_string(),
             })?
-            .expose_secret()
-            .to_string();
+            .expose_secret();
 
-        let token = params
-            .get("token")
-            .ok_or(Error::MissingDatabricksToken {
-                parameter: "token".into(),
-            })?
-            .clone();
+        let token = params.get("token").cloned();
 
-        Ok(Self::new(endpoint, token))
+        Ok(Self::new(Endpoint(endpoint.to_string()), token))
     }
+
+    /// Parses a catalog url into the endpoint and catalog id.
+    ///
+    /// Example:
+    ///
+    /// `https://dbc-f34ee0b7-90f2.cloud.databricks.com/api/2.1/unity-catalog/catalogs/spiceai_sandbox`
+    ///
+    /// Returns `("https://dbc-f34ee0b7-90f2.cloud.databricks.com", "spiceai_sandbox")`
+    pub fn parse_catalog_url(url: &str) -> Result<(Endpoint, CatalogId)> {
+        let url = url.trim_end_matches('/');
+        let parsed_url = url.parse::<Url>().context(URLParseSnafu {
+            url: url.to_string(),
+        })?;
+
+        // Extract the endpoint
+        let endpoint = format!(
+            "{}://{}",
+            parsed_url.scheme(),
+            parsed_url.host_str().context(InvalidCatalogURLSnafu {
+                url: url.to_string()
+            })?
+        );
+
+        // Extract the catalog id from the path segments
+        let mut path_segments = parsed_url.path_segments().context(InvalidCatalogURLSnafu {
+            url: url.to_string(),
+        })?;
+
+        let mut parse_expected_segment = |expected_segment: &str| {
+            ensure!(
+                path_segments.next() == Some(expected_segment),
+                InvalidCatalogURLSnafu {
+                    url: url.to_string()
+                }
+            );
+            Ok(())
+        };
+
+        parse_expected_segment("api")?;
+        parse_expected_segment("2.1")?;
+        parse_expected_segment("unity-catalog")?;
+        parse_expected_segment("catalogs")?;
+
+        // The catalog ID is the last segment in the path
+        let catalog_id = path_segments.next().context(InvalidCatalogURLSnafu {
+            url: url.to_string(),
+        })?;
+
+        Ok((Endpoint(endpoint), CatalogId(catalog_id.to_string())))
+    }
+
+    pub async fn get_table(&self, table_reference: &TableReference) -> Result<Option<UCTable>> {
+        let table_name = table_reference.to_string();
+        let path = format!("/api/2.1/unity-catalog/tables/{table_name}");
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+
+        if response.status().is_success() {
+            let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
+            Ok(Some(api_response))
+        } else if response.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            UnexpectedStatusCodeSnafu {
+                status: response.status(),
+            }
+            .fail()
+        }
+    }
+
+    pub async fn get_catalog(&self, catalog_id: &str) -> Result<Option<UCCatalog>> {
+        let path = format!("/api/2.1/unity-catalog/catalogs/{catalog_id}");
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+
+        if response.status().is_success() {
+            let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
+            Ok(Some(api_response))
+        } else if response.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            UnexpectedStatusCodeSnafu {
+                status: response.status(),
+            }
+            .fail()
+        }
+    }
+
+    pub async fn get_schemas_in_catalog(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
+        let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+
+        if response.status().is_success() {
+            let api_response: UCSchemaEnvelope = response.json().await.context(ConnectionSnafu)?;
+            Ok(Some(api_response.schemas))
+        } else if response.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            UnexpectedStatusCodeSnafu {
+                status: response.status(),
+            }
+            .fail()
+        }
+    }
+
+    pub async fn get_tables_in_schema(
+        &self,
+        catalog_id: &str,
+        schema_name: &str,
+    ) -> Result<Option<Vec<UCTable>>> {
+        let path = format!(
+            "/api/2.1/unity-catalog/tables?catalog_name={catalog_id}&schema_name={schema_name}"
+        );
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+
+        if response.status().is_success() {
+            let api_response: UCTableEnvelope = response.json().await.context(ConnectionSnafu)?;
+            Ok(Some(api_response.tables))
+        } else if response.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            UnexpectedStatusCodeSnafu {
+                status: response.status(),
+            }
+            .fail()
+        }
+    }
+
+    fn get_req(&self, path: &str) -> reqwest::RequestBuilder {
+        let mut builder = self.client.get(format!("{}/{path}", self.endpoint));
+        if let Some(token) = &self.token {
+            builder = builder.bearer_auth(token.expose_secret());
+        }
+        builder
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCTableEnvelope {
+    pub tables: Vec<UCTable>,
+}
+
+/// Response from `/api/2.1/unity-catalog/tables/{table_name}`
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCTable {
+    pub name: String,
+    pub catalog_name: String,
+    pub schema_name: String,
+    pub table_type: String,
+    pub data_source_format: String,
+    pub columns: Vec<UCColumn>,
+    pub storage_location: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCColumn {
+    pub name: String,
+    pub type_text: String,
+    pub type_name: String,
+    pub position: i64,
+    pub type_precision: i64,
+    pub type_scale: i64,
+    pub type_json: String,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCCatalog {
+    pub name: String,
+    pub owner: String,
+    pub storage_root: String,
+    pub catalog_type: String,
+    pub metastore_id: String,
+    pub created_at: i64,
+    pub created_by: String,
+    pub updated_at: i64,
+    pub updated_by: String,
+    pub storage_location: String,
+    pub isolation_mode: String,
+    pub browse_only: bool,
+    pub id: String,
+    pub full_name: String,
+    pub securable_type: String,
+    pub securable_kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCSchemaEnvelope {
+    pub schemas: Vec<UCSchema>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCSchema {
+    pub name: String,
+    pub catalog_name: String,
+    pub owner: String,
+    pub comment: String,
+    pub metastore_id: String,
+    pub full_name: String,
+    pub created_at: i64,
+    pub created_by: String,
+    pub updated_at: i64,
+    pub updated_by: String,
+    pub catalog_type: String,
+    pub schema_id: String,
+    pub securable_type: String,
+    pub securable_kind: String,
+    pub browse_only: bool,
 }
