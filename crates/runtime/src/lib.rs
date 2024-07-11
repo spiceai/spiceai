@@ -46,7 +46,6 @@ use embeddings::connector::EmbeddingConnector;
 use extension::ExtensionFactory;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
-use globset::GlobSet;
 use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;

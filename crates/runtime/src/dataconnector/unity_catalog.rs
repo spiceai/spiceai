@@ -22,8 +22,11 @@ use crate::secrets::Secret;
 use crate::secrets::SecretMap;
 use crate::Runtime;
 use async_trait::async_trait;
+use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::provider::UnityCatalogProvider;
+use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
+use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -128,14 +131,16 @@ impl DataConnector for UnityCatalog {
             self.params.get("token").cloned(),
         ));
 
-        let table_creator = Arc::new(|table_reference: TableReference| {
-            todo!();
-        });
+        let dataset_params: SecretMap = catalog.dataset_params.clone().into();
+
+        let delta_table_creator =
+            Arc::new(DeltaTableFactory::new(Arc::new(dataset_params.into_map()))) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,
             catalog_id,
-            table_creator,
+            delta_table_creator,
+            table_reference_creator,
             catalog.include.clone(),
         )
         .await
@@ -151,4 +156,8 @@ impl DataConnector for UnityCatalog {
 
         Some(Ok(Arc::new(catalog_provider) as Arc<dyn CatalogProvider>))
     }
+}
+
+fn table_reference_creator(uc_table: UCTable) -> TableReference {
+    TableReference::bare(uc_table.storage_location)
 }

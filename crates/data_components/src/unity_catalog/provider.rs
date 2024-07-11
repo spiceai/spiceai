@@ -25,13 +25,9 @@ use globset::GlobSet;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use super::{CatalogId, Result, UCSchema, UnityCatalog};
+use crate::Read;
 
-pub type TableCreatorFn = dyn Fn(
-        TableReference,
-    ) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>
-    + Send
-    + Sync;
+use super::{CatalogId, Result, UCSchema, UCTable, UnityCatalog};
 
 pub struct UnityCatalogProvider {
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
@@ -41,7 +37,8 @@ impl UnityCatalogProvider {
     pub async fn try_new(
         client: Arc<UnityCatalog>,
         catalog_id: CatalogId,
-        table_creator: Arc<TableCreatorFn>,
+        table_creator: Arc<dyn Read>,
+        table_reference_creator: fn(UCTable) -> TableReference,
         include: Option<GlobSet>,
     ) -> Result<Self> {
         let schemas =
@@ -60,6 +57,7 @@ impl UnityCatalogProvider {
                 Arc::clone(&client),
                 &schema,
                 Arc::clone(&table_creator),
+                table_reference_creator,
                 include.clone(),
             )
             .await?;
@@ -105,7 +103,8 @@ impl UnityCatalogSchemaProvider {
     pub async fn try_new(
         client: Arc<UnityCatalog>,
         schema: &UCSchema,
-        table_creator: Arc<TableCreatorFn>,
+        table_creator: Arc<dyn Read>,
+        table_reference_creator: fn(UCTable) -> TableReference,
         include: Option<Arc<GlobSet>>,
     ) -> Result<Self> {
         let tables = client
@@ -118,12 +117,8 @@ impl UnityCatalogSchemaProvider {
 
         let mut tables_map = HashMap::new();
         for table in tables {
-            let table_reference = TableReference::Full {
-                catalog: table.catalog_name.into(),
-                schema: table.schema_name.into(),
-                table: table.name.into(),
-            };
-            let table_name = table_reference.table().to_string();
+            let table_name = table.name.to_string();
+            let table_reference = table_reference_creator(table);
 
             if let Some(include) = &include {
                 if !include.is_match(&table_name) {
@@ -131,11 +126,12 @@ impl UnityCatalogSchemaProvider {
                 }
             }
 
-            let table_provider = table_creator(table_reference.clone()).context(
-                super::UnableToGetTableProviderSnafu {
+            let table_provider = table_creator
+                .table_provider(table_reference.clone(), None)
+                .await
+                .context(super::UnableToGetTableProviderSnafu {
                     table_reference: table_reference.to_string(),
-                },
-            )?;
+                })?;
             tables_map.insert(table_name, table_provider);
         }
 
