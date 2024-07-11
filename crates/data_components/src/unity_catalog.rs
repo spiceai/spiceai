@@ -77,8 +77,13 @@ impl UnityCatalog {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(endpoint: Endpoint, token: Option<SecretString>) -> Self {
+        let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
+        if !endpoint_str.starts_with("http") {
+            endpoint_str = format!("https://{endpoint_str}");
+        }
+
         Self {
-            endpoint: endpoint.0.trim_end_matches('/').to_string(),
+            endpoint: endpoint_str,
             token,
             client: reqwest::Client::new(),
         }

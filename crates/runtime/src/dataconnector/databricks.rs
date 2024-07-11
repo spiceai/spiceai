@@ -216,8 +216,12 @@ impl DataConnector for Databricks {
         }
 
         let mode = self.params.get("mode").map(|v| v.expose_secret().as_str());
-        let table_creator = if let Some("delta_lake") = mode {
-            Arc::new(DeltaTableFactory::new(Arc::new(dataset_params.into_map()))) as Arc<dyn Read>
+        let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
+            (
+                Arc::new(DeltaTableFactory::new(Arc::new(dataset_params.into_map())))
+                    as Arc<dyn Read>,
+                table_reference_creator_delta_lake as fn(UCTable) -> Option<TableReference>,
+            )
         } else {
             let normal_params: HashMap<String, String> = dataset_params
                 .iter()
@@ -235,7 +239,10 @@ impl DataConnector for Databricks {
                 Err(e) => return Some(Err(e)),
             };
 
-            dataset_databricks.read_provider
+            (
+                dataset_databricks.read_provider,
+                table_reference_creator_spark as fn(UCTable) -> Option<TableReference>,
+            )
         };
 
         let catalog_provider = match UnityCatalogProvider::try_new(
@@ -261,11 +268,16 @@ impl DataConnector for Databricks {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn table_reference_creator(uc_table: UCTable) -> Option<TableReference> {
+fn table_reference_creator_spark(uc_table: UCTable) -> Option<TableReference> {
     let table_reference = TableReference::Full {
         catalog: uc_table.catalog_name.into(),
         schema: uc_table.schema_name.into(),
         table: uc_table.name.into(),
     };
     Some(table_reference)
+}
+
+fn table_reference_creator_delta_lake(uc_table: UCTable) -> Option<TableReference> {
+    let storage_location = uc_table.storage_location?;
+    Some(TableReference::bare(format!("{storage_location}/")))
 }
