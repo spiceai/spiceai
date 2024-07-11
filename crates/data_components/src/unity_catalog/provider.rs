@@ -21,16 +21,17 @@ use datafusion::{
     error::DataFusionError,
     sql::TableReference,
 };
+use globset::GlobSet;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use super::{Result, UCSchema, UnityCatalog};
+use super::{CatalogId, Result, UCSchema, UnityCatalog};
 
-pub type TableCreatorFn =
-    dyn Fn(
+pub type TableCreatorFn = dyn Fn(
         TableReference,
-    )
-        -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>
+    + Send
+    + Sync;
 
 pub struct UnityCatalogProvider {
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
@@ -39,16 +40,19 @@ pub struct UnityCatalogProvider {
 impl UnityCatalogProvider {
     pub async fn try_new(
         client: Arc<UnityCatalog>,
-        catalog_id: &str,
+        catalog_id: CatalogId,
         table_creator: Arc<TableCreatorFn>,
+        include: Option<GlobSet>,
     ) -> Result<Self> {
         let schemas =
             client
-                .list_schemas(catalog_id)
+                .list_schemas(&catalog_id.0)
                 .await?
                 .context(super::CatalogDoesntExistSnafu {
-                    catalog_id: catalog_id.to_string(),
+                    catalog_id: catalog_id.0,
                 })?;
+
+        let include = include.map(Arc::new);
 
         let mut schemas_map = HashMap::new();
         for schema in schemas {
@@ -56,6 +60,7 @@ impl UnityCatalogProvider {
                 Arc::clone(&client),
                 &schema,
                 Arc::clone(&table_creator),
+                include.clone(),
             )
             .await?;
             schemas_map.insert(
@@ -101,6 +106,7 @@ impl UnityCatalogSchemaProvider {
         client: Arc<UnityCatalog>,
         schema: &UCSchema,
         table_creator: Arc<TableCreatorFn>,
+        include: Option<Arc<GlobSet>>,
     ) -> Result<Self> {
         let tables = client
             .list_tables(&schema.catalog_name, &schema.name)
@@ -118,6 +124,13 @@ impl UnityCatalogSchemaProvider {
                 table: table.name.into(),
             };
             let table_name = table_reference.table().to_string();
+
+            if let Some(include) = &include {
+                if !include.is_match(&table_name) {
+                    continue;
+                }
+            }
+
             let table_provider = table_creator(table_reference.clone()).context(
                 super::UnableToGetTableProviderSnafu {
                     table_reference: table_reference.to_string(),

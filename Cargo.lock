@@ -2659,6 +2659,7 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
+ "globset",
  "itertools 0.12.1",
  "mysql_async",
  "object_store",

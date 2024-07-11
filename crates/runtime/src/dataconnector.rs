@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
@@ -38,7 +39,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
-use globset::GlobSet;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -90,6 +90,7 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
+pub mod unity_catalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -339,8 +340,7 @@ pub trait DataConnector: Send + Sync {
     async fn catalog_provider(
         self: Arc<Self>,
         _runtime: &Runtime,
-        _catalog_id: Option<&str>,
-        _filter: Option<GlobSet>,
+        _catalog: &Catalog,
     ) -> Option<DataConnectorResult<Arc<dyn CatalogProvider>>> {
         None
     }

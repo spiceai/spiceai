@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::secrets::{Secret, SecretMap};
 use crate::Runtime;
@@ -24,7 +25,6 @@ use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use globset::GlobSet;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -168,25 +168,9 @@ impl DataConnector for Databricks {
 
     async fn catalog_provider(
         self: Arc<Self>,
-        runtime: &Runtime,
-        catalog_id: Option<&str>,
-        include: Option<GlobSet>,
+        _runtime: &Runtime,
+        _catalog: &Catalog,
     ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
-        if catalog_id.is_some() {
-            return Some(Err(
-                super::DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "spiceai".into(),
-                    message: "Catalog ID is not supported for SpiceAI data connector".into(),
-                },
-            ));
-        }
-
-        let spice_extension = runtime.extension("spice_cloud").await?;
-        let catalog_provider = spice_extension
-            .catalog_provider(self, include)
-            .await?
-            .ok()?;
-
-        Some(Ok(catalog_provider))
+        todo!();
     }
 }

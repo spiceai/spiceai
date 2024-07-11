@@ -697,10 +697,8 @@ impl Runtime {
         catalog: &Catalog,
         data_connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let include: Option<GlobSet> = catalog.include.clone();
-
         let catalog_provider = data_connector
-            .catalog_provider(self, catalog.catalog_id.as_deref(), include)
+            .catalog_provider(self, catalog)
             .await
             .context(UnableToLoadCatalogConnectorSnafu {
                 catalog: catalog.name.clone(),
