@@ -197,13 +197,19 @@ where
         });
 
         // we need to wait for the schema first before we can build our RecordBatchStreamAdapter
-        let schema = match schema_rx.recv().await {
-            Some(s) => Ok::<_, GenericError>(s),
-            None => Err(Error::ChannelError {
-                message: "Schema channel closed unexpectedly".to_string(),
+        let Some(schema) = schema_rx.recv().await else {
+            // if the channel drops, the task errored
+            if !join_handle.is_finished() {
+                unreachable!("Schema channel should not have dropped before the task finished");
             }
-            .into()),
-        }?;
+
+            let result = join_handle.await?;
+            let Err(err) = result else {
+                unreachable!("Task should have errored");
+            };
+
+            return Err(err);
+        };
 
         let output_stream = stream! {
             while let Some(batch) = batch_rx.recv().await {
