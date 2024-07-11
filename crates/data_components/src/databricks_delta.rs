@@ -14,16 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::delta_lake::DeltaTable;
+use crate::unity_catalog::UnityCatalog;
+use crate::Read;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use secrecy::SecretString;
+use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
-
-use crate::delta_lake::DeltaTable;
-use crate::unity_catalog::UnityCatalog;
-use crate::Read;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
@@ -72,9 +72,9 @@ pub async fn resolve_table_uri(
     table_reference: TableReference,
     params: Arc<HashMap<String, SecretString>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let uc_client = UnityCatalog::from_params(&params)?;
+    let uc_client = UnityCatalog::from_params(&params).boxed()?;
 
-    let table_opt = uc_client.get_table(&table_reference).await?;
+    let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
     if let Some(table) = table_opt {
         Ok(table.storage_location)

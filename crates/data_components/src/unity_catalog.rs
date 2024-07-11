@@ -21,6 +21,8 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use url::Url;
 
+pub mod provider;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}"))]
@@ -43,6 +45,18 @@ pub enum Error {
         url,
     ))]
     InvalidCatalogURL { url: String },
+
+    #[snafu(display("The catalog {catalog_id} doesn't exist."))]
+    CatalogDoesntExist { catalog_id: String },
+
+    #[snafu(display("The schema {schema} doesn't exist in {catalog_id}."))]
+    SchemaDoesntExist { schema: String, catalog_id: String },
+
+    #[snafu(display("Couldn't get table provider for {table_reference}: {source}"))]
+    UnableToGetTableProvider {
+        table_reference: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -168,7 +182,7 @@ impl UnityCatalog {
         }
     }
 
-    pub async fn get_schemas_in_catalog(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
+    pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
         let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
@@ -185,7 +199,7 @@ impl UnityCatalog {
         }
     }
 
-    pub async fn get_tables_in_schema(
+    pub async fn list_tables(
         &self,
         catalog_id: &str,
         schema_name: &str,
