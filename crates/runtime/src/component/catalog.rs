@@ -84,11 +84,6 @@ impl Catalog {
         })
     }
 
-    #[must_use]
-    pub fn should_include(&self, dataset_name: &str) -> bool {
-        self.include.iter().any(|i| i.is_match(dataset_name))
-    }
-
     /// Returns the catalog provider - the first part of the `from` field before the first `:`.
     ///
     /// # Examples
