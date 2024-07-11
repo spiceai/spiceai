@@ -703,8 +703,8 @@ impl Runtime {
         catalog: &Catalog,
         data_connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        tracing::debug!(
-            "Registering catalog {} for {}",
+        tracing::info!(
+            "Registering catalog '{}' for {}",
             &catalog.name,
             &catalog.provider
         );
@@ -718,6 +718,22 @@ impl Runtime {
             .context(UnableToLoadCatalogConnectorSnafu {
                 catalog: catalog.name.clone(),
             })?;
+        let num_schemas = catalog_provider
+            .schema_names()
+            .iter()
+            .fold(0, |acc, schema| {
+                acc + catalog_provider
+                    .schema(schema)
+                    .map_or(0, |s| i32::from(!s.table_names().is_empty()))
+            });
+        let num_tables = catalog_provider
+            .schema_names()
+            .iter()
+            .fold(0, |acc, schema| {
+                acc + catalog_provider
+                    .schema(schema)
+                    .map_or(0, |s| s.table_names().len())
+            });
 
         self.df
             .register_catalog(&catalog.name, catalog_provider)
@@ -725,6 +741,13 @@ impl Runtime {
             .context(UnableToLoadCatalogConnectorSnafu {
                 catalog: catalog.name.clone(),
             })?;
+
+        tracing::info!(
+            "Registered catalog '{}' with {num_schemas} schema{} and {num_tables} table{}",
+            &catalog.name,
+            if num_schemas == 1 { "" } else { "s" },
+            if num_tables == 1 { "" } else { "s" },
+        );
 
         Ok(())
     }
@@ -1310,7 +1333,28 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                // check for new and updated datasets
+                // Check for new and updated catalogs
+                let valid_catalogs = Self::get_valid_catalogs(&new_app, LogErrors(true));
+                let existing_catalogs = Self::get_valid_catalogs(current_app, LogErrors(false));
+
+                for catalog in &valid_catalogs {
+                    if let Some(current_catalog) =
+                        existing_catalogs.iter().find(|c| c.name == catalog.name)
+                    {
+                        if catalog != current_catalog {
+                            // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
+                            self.load_catalog(catalog).await;
+                        }
+                    } else {
+                        status::update_catalog(
+                            &catalog.name,
+                            status::ComponentStatus::Initializing,
+                        );
+                        self.load_catalog(catalog).await;
+                    }
+                }
+
+                // Check for new and updated datasets
                 let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
                 let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
@@ -1322,6 +1366,21 @@ impl Runtime {
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
                         self.load_dataset(ds).await;
+                    }
+                }
+
+                // Remove datasets that are no longer in the app
+                for ds in &current_app.datasets {
+                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        let ds = match Dataset::try_from(ds.clone()) {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                                continue;
+                            }
+                        };
+                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
+                        self.remove_dataset(&ds).await;
                     }
                 }
 
@@ -1344,21 +1403,6 @@ impl Runtime {
                     if !new_app.models.iter().any(|m| m.name == model.name) {
                         status::update_model(&model.name, status::ComponentStatus::Disabled);
                         self.remove_model(model).await;
-                    }
-                }
-
-                // Remove datasets that are no longer in the app
-                for ds in &current_app.datasets {
-                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                        let ds = match Dataset::try_from(ds.clone()) {
-                            Ok(ds) => ds,
-                            Err(e) => {
-                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
-                                continue;
-                            }
-                        };
-                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds).await;
                     }
                 }
 
