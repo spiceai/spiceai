@@ -71,7 +71,7 @@ pub(super) async fn start_postgres_docker_container(
     };
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("postgres:latest")
+        .image("ghcr.io/spiceai/postgres:latest")
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
