@@ -50,7 +50,7 @@ pub async fn start_mysql_docker_container(
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("mysql:latest")
+        .image("public.ecr.aws/docker/library/mysql:latest")
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")
