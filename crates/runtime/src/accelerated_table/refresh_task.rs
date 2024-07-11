@@ -701,7 +701,7 @@ impl RefreshTask {
                     value *= 1_000_000_000;
                 }
                 Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestamptz)
-                | None => unreachable!(),
+                | None => unreachable!("refresh.validate_time_format should've returned error"),
             }
         };
 
