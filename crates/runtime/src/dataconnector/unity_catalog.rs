@@ -101,7 +101,7 @@ impl DataConnector for UnityCatalog {
 
     async fn catalog_provider(
         self: Arc<Self>,
-        _runtime: &Runtime,
+        runtime: &Runtime,
         catalog: &Catalog,
     ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
         let Some(catalog_id) = catalog.catalog_id.clone() else {
@@ -130,7 +130,27 @@ impl DataConnector for UnityCatalog {
             self.params.get("token").cloned(),
         ));
 
-        let dataset_params: SecretMap = catalog.dataset_params.clone().into();
+        let mut dataset_params: SecretMap = catalog.dataset_params.clone().into();
+
+        let secrets_provider = runtime.secrets_provider();
+        let dataset_secret = match secrets_provider
+            .read()
+            .await
+            .get_secret("delta_lake")
+            .await
+            .map_err(|source| super::DataConnectorError::UnableToReadSecrets {
+                dataconnector: "delta_lake".to_string(),
+                source,
+            }) {
+            Ok(secret) => secret,
+            Err(e) => return Some(Err(e)),
+        };
+
+        if let Some(secret) = dataset_secret {
+            for (key, value) in secret.iter() {
+                dataset_params.insert(key.to_string(), value.clone());
+            }
+        }
 
         let delta_table_creator =
             Arc::new(DeltaTableFactory::new(Arc::new(dataset_params.into_map()))) as Arc<dyn Read>;

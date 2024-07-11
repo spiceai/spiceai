@@ -62,7 +62,7 @@ pub mod clickhouse;
 pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "databricks")]
+#[cfg(feature = "delta_lake")]
 pub mod delta_lake;
 #[cfg(feature = "dremio")]
 pub mod dremio;
@@ -90,6 +90,7 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
+#[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
 #[derive(Debug, Snafu)]
@@ -160,6 +161,12 @@ pub enum DataConnectorError {
 
     #[snafu(display("Unable to get catalog provider for {dataconnector}: {source}"))]
     UnableToGetCatalogProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to read the secrets for {dataconnector}: {source}"))]
+    UnableToReadSecrets {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
