@@ -34,7 +34,6 @@ use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use tract_core::downcast_rs::Downcast;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -146,10 +145,11 @@ impl DataConnector for SpiceAI {
             .downcast_ref::<FederatedTableProviderAdaptor>()?;
         let flight_table = federated_table_provider_adaptor
             .table_provider
+            .as_ref()
+            .unwrap()
             .as_any()
             .downcast_ref::<FlightTable>()?;
         let stream = flight_table.stream_changes().await;
-
         Some(stream)
     }
 }
