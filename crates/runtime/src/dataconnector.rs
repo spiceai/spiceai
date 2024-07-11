@@ -258,7 +258,7 @@ pub async fn register_all() {
     register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::Databricks::create).await;
-    #[cfg(feature = "databricks")]
+    #[cfg(feature = "delta_lake")]
     register_connector_factory("delta_lake", delta_lake::DeltaLake::create).await;
     #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
@@ -290,6 +290,7 @@ pub async fn register_all() {
     register_connector_factory("snowflake", snowflake::Snowflake::create).await;
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::Debezium::create).await;
+    #[cfg(feature = "delta_lake")]
     register_connector_factory("unity_catalog", unity_catalog::UnityCatalog::create).await;
 }
 
