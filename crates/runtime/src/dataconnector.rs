@@ -290,6 +290,7 @@ pub async fn register_all() {
     register_connector_factory("snowflake", snowflake::Snowflake::create).await;
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::Debezium::create).await;
+    register_connector_factory("unity_catalog", unity_catalog::UnityCatalog::create).await;
 }
 
 pub trait DataConnectorFactory {

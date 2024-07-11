@@ -77,7 +77,14 @@ pub async fn resolve_table_uri(
     let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
     if let Some(table) = table_opt {
-        Ok(table.storage_location)
+        if let Some(storage_location) = table.storage_location {
+            Ok(storage_location)
+        } else {
+            Err(
+                format!("Databricks table {table_reference} does not have a storage location")
+                    .into(),
+            )
+        }
     } else {
         Err(format!("Databricks table {table_reference} does not exist").into())
     }

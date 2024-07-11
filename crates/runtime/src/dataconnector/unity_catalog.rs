@@ -77,7 +77,6 @@ impl DataConnectorFactory for UnityCatalog {
             }
         }
         Box::pin(async move {
-            // let (endpoint, catalog_id) = UnityCatalogClient::parse_catalog_url(url);
             let unity_catalog = Self { params };
             Ok(Arc::new(unity_catalog) as Arc<dyn DataConnector>)
         })
@@ -158,6 +157,7 @@ impl DataConnector for UnityCatalog {
     }
 }
 
-fn table_reference_creator(uc_table: UCTable) -> TableReference {
-    TableReference::bare(uc_table.storage_location)
+fn table_reference_creator(uc_table: UCTable) -> Option<TableReference> {
+    let storage_location = uc_table.storage_location?;
+    Some(TableReference::bare(format!("{storage_location}/")))
 }

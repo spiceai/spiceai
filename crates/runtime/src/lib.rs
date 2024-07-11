@@ -198,8 +198,14 @@ pub enum Error {
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
 
-    #[snafu(display("Unable to load data connector for catalog {catalog}"))]
-    UnableToLoadCatalogConnector { catalog: String },
+    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    UnableToLoadCatalogConnector {
+        catalog: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
+    DataConnectorDoesntSupportCatalogs { dataconnector: String },
 
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
@@ -564,6 +570,7 @@ impl Runtime {
             };
 
             if let Err(err) = self.register_catalog(catalog, connector).await {
+                tracing::error!("Unable to register catalog {}: {err}", &catalog.name);
                 return Err(RetryError::transient(err));
             };
 
@@ -633,7 +640,7 @@ impl Runtime {
         let secrets_provider = shared_secrets_provider.read().await;
 
         let source = catalog.provider;
-        let params = Arc::new(catalog.dataset_params.clone());
+        let params = Arc::new(catalog.params.clone());
         let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
             &source,
             &secrets_provider,
@@ -696,19 +703,26 @@ impl Runtime {
         catalog: &Catalog,
         data_connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
+        tracing::debug!(
+            "Registering catalog {} for {}",
+            &catalog.name,
+            &catalog.provider
+        );
         let catalog_provider = data_connector
             .catalog_provider(self, catalog)
             .await
-            .context(UnableToLoadCatalogConnectorSnafu {
-                catalog: catalog.name.clone(),
+            .context(DataConnectorDoesntSupportCatalogsSnafu {
+                dataconnector: catalog.provider.clone(),
             })?
-            .map_err(|_| Error::UnableToLoadCatalogConnector {
+            .boxed()
+            .context(UnableToLoadCatalogConnectorSnafu {
                 catalog: catalog.name.clone(),
             })?;
 
         self.df
             .register_catalog(&catalog.name, catalog_provider)
-            .map_err(|_| Error::UnableToLoadCatalogConnector {
+            .boxed()
+            .context(UnableToLoadCatalogConnectorSnafu {
                 catalog: catalog.name.clone(),
             })?;
 

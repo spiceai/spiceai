@@ -114,10 +114,15 @@ impl UnityCatalog {
         let endpoint = format!(
             "{}://{}",
             parsed_url.scheme(),
-            parsed_url.host_str().context(InvalidCatalogURLSnafu {
-                url: url.to_string()
-            })?
+            parsed_url
+                .host_str()
+                .map(|s| s.trim_end_matches('/'))
+                .context(InvalidCatalogURLSnafu {
+                    url: url.to_string()
+                })?
         );
+
+        tracing::debug!("parse_catalog_url: endpoint: {}", endpoint);
 
         // Extract the catalog id from the path segments
         let mut path_segments = parsed_url.path_segments().context(InvalidCatalogURLSnafu {
@@ -169,6 +174,8 @@ impl UnityCatalog {
         let path = format!("/api/2.1/unity-catalog/catalogs/{catalog_id}");
         let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
+        tracing::debug!("get_catalog: Response status: {}", response.status());
+
         if response.status().is_success() {
             let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
             Ok(Some(api_response))
@@ -185,6 +192,8 @@ impl UnityCatalog {
     pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
         let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+
+        tracing::debug!("list_schemas: Response status: {}", response.status());
 
         if response.status().is_success() {
             let api_response: UCSchemaEnvelope = response.json().await.context(ConnectionSnafu)?;
@@ -209,6 +218,8 @@ impl UnityCatalog {
         );
         let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
+        tracing::debug!("list_tables: Response status: {}", response.status());
+
         if response.status().is_success() {
             let api_response: UCTableEnvelope = response.json().await.context(ConnectionSnafu)?;
             Ok(Some(api_response.tables))
@@ -223,8 +234,11 @@ impl UnityCatalog {
     }
 
     fn get_req(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut builder = self.client.get(format!("{}/{path}", self.endpoint));
+        let full_url = format!("{}{path}", self.endpoint);
+        tracing::debug!("Sending request to {full_url}");
+        let mut builder = self.client.get(full_url);
         if let Some(token) = &self.token {
+            tracing::debug!("Adding bearer token to request");
             builder = builder.bearer_auth(token.expose_secret());
         }
         builder
@@ -242,10 +256,14 @@ pub struct UCTable {
     pub name: String,
     pub catalog_name: String,
     pub schema_name: String,
+    #[serde(default)]
     pub table_type: String,
+    #[serde(default)]
     pub data_source_format: String,
+    #[serde(default)]
     pub columns: Vec<UCColumn>,
-    pub storage_location: String,
+    #[serde(default)]
+    pub storage_location: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -38,7 +38,7 @@ impl UnityCatalogProvider {
         client: Arc<UnityCatalog>,
         catalog_id: CatalogId,
         table_creator: Arc<dyn Read>,
-        table_reference_creator: fn(UCTable) -> TableReference,
+        table_reference_creator: fn(UCTable) -> Option<TableReference>,
         include: Option<GlobSet>,
     ) -> Result<Self> {
         let schemas =
@@ -104,7 +104,7 @@ impl UnityCatalogSchemaProvider {
         client: Arc<UnityCatalog>,
         schema: &UCSchema,
         table_creator: Arc<dyn Read>,
-        table_reference_creator: fn(UCTable) -> TableReference,
+        table_reference_creator: fn(UCTable) -> Option<TableReference>,
         include: Option<Arc<GlobSet>>,
     ) -> Result<Self> {
         let tables = client
@@ -119,6 +119,10 @@ impl UnityCatalogSchemaProvider {
         for table in tables {
             let table_name = table.name.to_string();
             let table_reference = table_reference_creator(table);
+
+            let Some(table_reference) = table_reference else {
+                continue;
+            };
 
             if let Some(include) = &include {
                 if !include.is_match(&table_name) {
