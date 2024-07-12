@@ -35,8 +35,9 @@ jobs:
 
       - name: Pull the Postgres/MySQL images
         run: |
-          docker pull $CONTAINER_REGISTRY/postgres:latest
-          docker pull $CONTAINER_REGISTRY/mysql:latest
+          echo ${{ env.CONTAINER_REGISTRY }}
+          docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
+          docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
