@@ -57,6 +57,16 @@ pub struct ODBCPool {
     pool: &'static Environment,
     params: Arc<HashMap<String, SecretString>>,
     connection_string: String,
+    connection_id: String,
+}
+
+fn hash_string(val: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(val);
+    hasher.finalize().iter().fold(String::new(), |mut hash, b| {
+        hash.push_str(&format!("{b:02x}"));
+        hash
+    })
 }
 
 impl ODBCPool {
@@ -71,9 +81,13 @@ impl ODBCPool {
             .map(Secret::expose_secret)
             .map(ToString::to_string)
             .context(MissingConnectionStringSnafu)?;
+
+        let connection_id = hash_string(&connection_string);
+
         Ok(Self {
             params,
             connection_string,
+            connection_id,
             pool: &ENV,
         })
     }
@@ -82,15 +96,6 @@ impl ODBCPool {
     pub fn odbc_environment(&self) -> &'static Environment {
         self.pool
     }
-}
-
-fn hash_string(val: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(val);
-    hasher.finalize().iter().fold(String::new(), |mut hash, b| {
-        hash.push_str(&format!("{b:02x}"));
-        hash
-    })
 }
 
 #[async_trait]
@@ -118,6 +123,6 @@ where
         // It would be technically feasible to return JoinPushDown::AllowedFor(connection_string) here,
         // but we don't have a general way to strip out sensitive information from the connection string.
         // We could solve this by asking the user to explicly provide a join context in the parameters.
-        JoinPushDown::AllowedFor(hash_string(&self.connection_string))
+        JoinPushDown::AllowedFor(self.connection_id.clone())
     }
 }
