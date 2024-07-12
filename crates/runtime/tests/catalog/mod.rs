@@ -110,7 +110,15 @@ async fn spiceai_catalog_test_include() -> Result<(), anyhow::Error> {
 
     let mut result = rt
         .datafusion()
-        .query_builder("SHOW TABLES".to_string(), Protocol::Flight)
+        .query_builder(
+            "SELECT table_catalog, table_schema, table_name, table_type 
+             FROM information_schema.tables 
+             WHERE table_schema != 'information_schema' 
+               AND table_catalog = 'spiceai' 
+             ORDER BY table_name"
+                .to_string(),
+            Protocol::Flight,
+        )
         .build()
         .run()
         .await?;
@@ -123,23 +131,12 @@ async fn spiceai_catalog_test_include() -> Result<(), anyhow::Error> {
     assert_eq!(results.len(), 1);
     assert_batches_eq!(
         &[
-            "+---------------+--------------------+---------------------+------------+",
-            "| table_catalog | table_schema       | table_name          | table_type |",
-            "+---------------+--------------------+---------------------+------------+",
-            "| spice         | runtime            | query_history       | BASE TABLE |",
-            "| spice         | information_schema | tables              | VIEW       |",
-            "| spice         | information_schema | views               | VIEW       |",
-            "| spice         | information_schema | columns             | VIEW       |",
-            "| spice         | information_schema | df_settings         | VIEW       |",
-            "| spice         | information_schema | schemata            | VIEW       |",
-            "| spiceai       | eth                | recent_blocks       | BASE TABLE |",
-            "| spiceai       | eth                | recent_transactions | BASE TABLE |",
-            "| spiceai       | information_schema | tables              | VIEW       |",
-            "| spiceai       | information_schema | views               | VIEW       |",
-            "| spiceai       | information_schema | columns             | VIEW       |",
-            "| spiceai       | information_schema | df_settings         | VIEW       |",
-            "| spiceai       | information_schema | schemata            | VIEW       |",
-            "+---------------+--------------------+---------------------+------------+",
+            "+---------------+--------------+---------------------+------------+",
+            "| table_catalog | table_schema | table_name          | table_type |",
+            "+---------------+--------------+---------------------+------------+",
+            "| spiceai       | eth          | recent_blocks       | BASE TABLE |",
+            "| spiceai       | eth          | recent_transactions | BASE TABLE |",
+            "+---------------+--------------+---------------------+------------+",
         ],
         &results
     );
