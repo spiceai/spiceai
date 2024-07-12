@@ -23,12 +23,11 @@ use super::{params::Params, WithDependsOn};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Catalog {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
 
     pub name: String,
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

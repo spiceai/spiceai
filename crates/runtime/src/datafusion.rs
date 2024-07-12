@@ -168,9 +168,6 @@ pub enum Error {
     #[snafu(display("Table {schema}.{table} not registered"))]
     TableMissing { schema: String, table: String },
 
-    #[snafu(display("Catalog already exists: {catalog}"))]
-    CatalogAlreadyExists { catalog: String },
-
     #[snafu(display("Unable to get object store configuration: {source}"))]
     UnableToGetSchemaTable {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -349,13 +346,6 @@ impl DataFusion {
     }
 
     pub fn register_catalog(&self, name: &str, catalog: Arc<dyn CatalogProvider>) -> Result<()> {
-        if self.ctx.catalog(name).is_some() {
-            CatalogAlreadyExistsSnafu {
-                catalog: name.to_string(),
-            }
-            .fail()?;
-        }
-
         self.ctx.register_catalog(name, catalog);
 
         Ok(())
@@ -513,6 +503,11 @@ impl DataFusion {
     #[must_use]
     pub fn table_exists(&self, dataset_name: TableReference) -> bool {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn catalog_exists(&self, catalog: &str) -> bool {
+        self.ctx.catalog(catalog).is_some()
     }
 
     pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {

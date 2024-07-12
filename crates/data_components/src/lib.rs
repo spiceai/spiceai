@@ -53,6 +53,7 @@ pub mod snowflake;
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod unity_catalog;
 
 pub mod cdc;
 pub mod delete;

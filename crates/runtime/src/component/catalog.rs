@@ -24,9 +24,21 @@ pub struct Catalog {
     pub provider: String,
     pub catalog_id: Option<String>,
     pub name: String,
+    orig_include: Vec<String>,
     pub include: Option<GlobSet>,
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
+}
+
+impl PartialEq for Catalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.catalog_id == other.catalog_id
+            && self.name == other.name
+            && self.orig_include == other.orig_include
+            && self.params == other.params
+            && self.dataset_params == other.dataset_params
+    }
 }
 
 impl TryFrom<spicepod_catalog::Catalog> for Catalog {
@@ -57,6 +69,7 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
             provider: provider.to_string(),
             catalog_id,
             name: catalog.name,
+            orig_include: catalog.include.clone(),
             include: globset_opt,
             params: catalog
                 .params
@@ -78,6 +91,7 @@ impl Catalog {
             provider: Catalog::provider(from).to_string(),
             catalog_id: Catalog::catalog_id(from).map(String::from),
             name: name.into(),
+            orig_include: Vec::default(),
             include: None,
             params: HashMap::default(),
             dataset_params: HashMap::default(),

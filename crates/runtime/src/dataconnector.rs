@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
@@ -38,7 +39,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
-use globset::GlobSet;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -62,7 +62,7 @@ pub mod clickhouse;
 pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "databricks")]
+#[cfg(feature = "delta_lake")]
 pub mod delta_lake;
 #[cfg(feature = "dremio")]
 pub mod dremio;
@@ -90,6 +90,8 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
+#[cfg(feature = "delta_lake")]
+pub mod unity_catalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -159,6 +161,12 @@ pub enum DataConnectorError {
 
     #[snafu(display("Unable to get catalog provider for {dataconnector}: {source}"))]
     UnableToGetCatalogProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to read the secrets for {dataconnector}: {source}"))]
+    UnableToReadSecrets {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -257,7 +265,7 @@ pub async fn register_all() {
     register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::Databricks::create).await;
-    #[cfg(feature = "databricks")]
+    #[cfg(feature = "delta_lake")]
     register_connector_factory("delta_lake", delta_lake::DeltaLake::create).await;
     #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
@@ -289,6 +297,8 @@ pub async fn register_all() {
     register_connector_factory("snowflake", snowflake::Snowflake::create).await;
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::Debezium::create).await;
+    #[cfg(feature = "delta_lake")]
+    register_connector_factory("unity_catalog", unity_catalog::UnityCatalog::create).await;
 }
 
 pub trait DataConnectorFactory {
@@ -339,8 +349,7 @@ pub trait DataConnector: Send + Sync {
     async fn catalog_provider(
         self: Arc<Self>,
         _runtime: &Runtime,
-        _catalog_id: Option<&str>,
-        _filter: Option<GlobSet>,
+        _catalog: &Catalog,
     ) -> Option<DataConnectorResult<Arc<dyn CatalogProvider>>> {
         None
     }

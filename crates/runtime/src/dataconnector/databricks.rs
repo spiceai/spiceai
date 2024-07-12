@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::secrets::{Secret, SecretMap};
+use crate::Runtime;
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::Read;
+use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
@@ -161,5 +164,13 @@ impl DataConnector for Databricks {
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "databricks",
             })?)
+    }
+
+    async fn catalog_provider(
+        self: Arc<Self>,
+        _runtime: &Runtime,
+        _catalog: &Catalog,
+    ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
+        todo!();
     }
 }
