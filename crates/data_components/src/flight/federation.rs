@@ -8,8 +8,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
     sql::{
-        sqlparser::ast::{self, Interval},
-        unparser::dialect::Dialect,
+        unparser::dialect::{CustomDialectBuilder, Dialect, IntervalStyle},
         TableReference,
     },
 };
@@ -46,107 +45,6 @@ impl FlightTable {
     }
 }
 
-struct SpiceAIDialect {}
-
-impl Dialect for SpiceAIDialect {
-    fn supports_nulls_first_in_sort(&self) -> bool {
-        true
-    }
-
-    fn use_timestamp_for_date64(&self) -> bool {
-        true
-    }
-
-    fn custom_scalar_to_sql(
-        &self,
-        scalar: &datafusion::scalar::ScalarValue,
-    ) -> Option<datafusion::common::Result<ast::Expr>> {
-        match scalar {
-            datafusion::scalar::ScalarValue::IntervalYearMonth(v) => {
-                let Some(v) = v else { return None };
-                let interval = Interval {
-                    value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
-                        v.to_string(),
-                    ))),
-                    leading_field: Some(ast::DateTimeField::Month),
-                    leading_precision: None,
-                    last_field: None,
-                    fractional_seconds_precision: None,
-                };
-                Some(Ok(ast::Expr::Interval(interval)))
-            }
-            datafusion::scalar::ScalarValue::IntervalDayTime(v) => {
-                let Some(v) = v else { return None };
-                let days = v.days;
-                let secs = v.milliseconds / 1_000;
-                let mins = secs / 60;
-                let hours = mins / 60;
-
-                let secs = secs - (mins * 60);
-                let mins = mins - (hours * 60);
-
-                let millis = v.milliseconds % 1_000;
-                let interval = Interval {
-                    value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(format!(
-                        "{days} {hours}:{mins}:{secs}.{millis:3}"
-                    )))),
-                    leading_field: Some(ast::DateTimeField::Day),
-                    leading_precision: None,
-                    last_field: Some(ast::DateTimeField::Second),
-                    fractional_seconds_precision: None,
-                };
-                Some(Ok(ast::Expr::Interval(interval)))
-            }
-            datafusion::scalar::ScalarValue::IntervalMonthDayNano(v) => {
-                let Some(v) = v else {
-                    return None;
-                };
-
-                if v.months >= 0 && v.days == 0 && v.nanoseconds == 0 {
-                    let interval = Interval {
-                        value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
-                            v.months.to_string(),
-                        ))),
-                        leading_field: Some(ast::DateTimeField::Month),
-                        leading_precision: None,
-                        last_field: None,
-                        fractional_seconds_precision: None,
-                    };
-                    Some(Ok(ast::Expr::Interval(interval)))
-                } else if v.months == 0 && v.days >= 0 && v.nanoseconds % 1_000_000 == 0 {
-                    let days = v.days;
-                    let secs = v.nanoseconds / 1_000_000_000;
-                    let mins = secs / 60;
-                    let hours = mins / 60;
-
-                    let secs = secs - (mins * 60);
-                    let mins = mins - (hours * 60);
-
-                    let millis = (v.nanoseconds % 1_000_000_000) / 1_000_000;
-
-                    let interval = Interval {
-                        value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(format!(
-                            "{days} {hours}:{mins}:{secs}.{millis:03}"
-                        )))),
-                        leading_field: Some(ast::DateTimeField::Day),
-                        leading_precision: None,
-                        last_field: Some(ast::DateTimeField::Second),
-                        fractional_seconds_precision: None,
-                    };
-                    Some(Ok(ast::Expr::Interval(interval)))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
-        Some('"')
-    }
-}
-
 #[async_trait]
 impl SQLExecutor for FlightTable {
     fn name(&self) -> &str {
@@ -158,7 +56,13 @@ impl SQLExecutor for FlightTable {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(SpiceAIDialect {})
+        Arc::new(
+            CustomDialectBuilder::new()
+                .with_identifier_quote_style('"')
+                .with_use_timestamp_for_date64(true)
+                .with_interval_style(IntervalStyle::SQLStandard)
+                .build(),
+        )
     }
 
     fn execute(
@@ -182,69 +86,5 @@ impl SQLExecutor for FlightTable {
         FlightTable::get_schema(self.client.clone(), &TableReference::bare(table_name))
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::compute::kernels::cast_utils::{
-        parse_interval_day_time, parse_interval_month_day_nano, parse_interval_year_month,
-    };
-    use datafusion::{logical_expr::Expr, scalar::ScalarValue, sql::unparser::Unparser};
-
-    #[test]
-    fn test_custom_scalar_to_expr() {
-        use super::*;
-
-        let tests = [
-            (
-                ScalarValue::IntervalMonthDayNano(
-                    parse_interval_month_day_nano(
-                        "1 YEAR 1 MONTH 1 DAY 3 HOUR 10 MINUTE 20 SECOND",
-                    )
-                    .ok(),
-                ),
-                "INTERVAL '0 YEARS 13 MONS 1 DAYS 3 HOURS 10 MINS 20.000000000 SECS'",
-            ),
-            (
-                ScalarValue::IntervalMonthDayNano(parse_interval_month_day_nano("1.5 MONTH").ok()),
-                "INTERVAL '0 YEARS 1 MONS 15 DAYS 0 HOURS 0 MINS 0.000000000 SECS'",
-            ),
-            (
-                ScalarValue::IntervalMonthDayNano(parse_interval_month_day_nano("1 MONTH").ok()),
-                "INTERVAL '1' MONTH",
-            ),
-            (
-                ScalarValue::IntervalMonthDayNano(parse_interval_month_day_nano("1.5 DAY").ok()),
-                "INTERVAL '1 12:0:0.000' DAY TO SECOND",
-            ),
-            (
-                ScalarValue::IntervalMonthDayNano(
-                    parse_interval_month_day_nano("1.51234 DAY").ok(),
-                ),
-                "INTERVAL '1 12:17:46.176' DAY TO SECOND",
-            ),
-            (
-                ScalarValue::IntervalDayTime(parse_interval_day_time("1.51234 DAY").ok()),
-                "INTERVAL '1 12:17:46.176' DAY TO SECOND",
-            ),
-            (
-                ScalarValue::IntervalYearMonth(parse_interval_year_month("1 YEAR").ok()),
-                "INTERVAL '12' MONTH",
-            ),
-        ];
-
-        for (value, expected) in tests {
-            let dialect = SpiceAIDialect {};
-            let unparser = Unparser::new(&dialect);
-
-            let ast = unparser
-                .expr_to_sql(&Expr::Literal(value))
-                .expect("to be unparsed");
-
-            let actual = format!("{ast}");
-
-            assert_eq!(actual, expected);
-        }
     }
 }
