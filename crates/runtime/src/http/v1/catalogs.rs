@@ -23,11 +23,15 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use axum_extra::TypedHeader;
+use headers_accept::Accept;
+use mediatype::{
+    names::{APPLICATION, CSV, JSON, TEXT},
+    MediaType,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
-
-use crate::datafusion::DataFusion;
 
 use super::{convert_entry_to_csv, Format};
 
@@ -36,24 +40,21 @@ pub(crate) struct CatalogFilter {
     provider: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct CatalogQueryParams {
-    #[serde(default)]
-    format: Format,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct CatalogResponseItem {
-    pub from: String,
-    pub name: String,
+    pub provider: String,
+    pub name: Option<String>,
 }
+
+const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, None, &[]);
+const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
+const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
 
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Query(filter): Query<CatalogFilter>,
-    Query(params): Query<CatalogQueryParams>,
+    accept: Option<TypedHeader<Accept>>,
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
@@ -76,12 +77,21 @@ pub(crate) async fn get(
     let resp = catalogs
         .iter()
         .map(|d| CatalogResponseItem {
-            from: d.provider.clone(),
-            name: d.name.clone(),
+            provider: d.provider.clone(),
+            name: d.catalog_id.clone(),
         })
         .collect_vec();
 
-    match params.format {
+    let mut format = Format::Json;
+    if let Some(accept) = accept {
+        if let Some(media_type) = accept.negotiate(ACCEPT_LIST.iter()) {
+            if let ("text", "csv") = (media_type.ty.as_str(), media_type.subty.as_str()) {
+                format = Format::Csv;
+            }
+        }
+    }
+
+    match format {
         Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
         Format::Csv => match convert_entry_to_csv(&resp) {
             Ok(csv) => (status::StatusCode::OK, csv).into_response(),
