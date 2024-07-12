@@ -82,7 +82,7 @@ impl ODBCPool {
             .map(ToString::to_string)
             .context(MissingConnectionStringSnafu)?;
 
-        // hash the connection string to get a comparible connection ID
+        // hash the connection string to get a comparable connection ID
         // we do this to prevent exposing secrets in the EXPLAIN ... plan when using federated JoinPushDown
         let connection_id = hash_string(&connection_string);
 
