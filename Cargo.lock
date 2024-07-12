@@ -3057,6 +3057,7 @@ dependencies = [
  "r2d2",
  "rusqlite",
  "secrecy",
+ "sha2",
  "snafu 0.8.3",
  "snowflake-api",
  "tokio",

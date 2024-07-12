@@ -42,6 +42,7 @@ postgres-native-tls = { version = "0.5.0", optional = true }
 r2d2 = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
+sha2 = { version = "0.10.8", optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
@@ -61,7 +62,7 @@ clickhouse = [
 ]
 duckdb = ["dep:duckdb", "dep:r2d2", "datafusion-table-providers/duckdb"]
 mysql = ["dep:mysql_async", "datafusion-table-providers/mysql"]
-odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio", "dep:dyn-clone"]
+odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio", "dep:dyn-clone", "dep:sha2"]
 postgres = [
   "dep:bb8",
   "dep:bb8-postgres",

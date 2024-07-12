@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
 use secrecy::{ExposeSecret, Secret, SecretString};
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
@@ -83,6 +84,15 @@ impl ODBCPool {
     }
 }
 
+fn hash_string(val: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(val);
+    hasher.finalize().iter().fold(String::new(), |mut hash, b| {
+        hash.push_str(&format!("{b:02x}"));
+        hash
+    })
+}
+
 #[async_trait]
 impl<'a> DbConnectionPool<Connection<'a>, ODBCParameter> for ODBCPool
 where
@@ -108,6 +118,6 @@ where
         // It would be technically feasible to return JoinPushDown::AllowedFor(connection_string) here,
         // but we don't have a general way to strip out sensitive information from the connection string.
         // We could solve this by asking the user to explicly provide a join context in the parameters.
-        JoinPushDown::Disallow
+        JoinPushDown::AllowedFor(hash_string(&self.connection_string))
     }
 }
