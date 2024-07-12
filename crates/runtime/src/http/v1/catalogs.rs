@@ -43,7 +43,7 @@ pub(crate) struct CatalogFilter {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct CatalogResponseItem {
-    pub provider: String,
+    pub from: String,
     pub name: Option<String>,
 }
 
@@ -77,7 +77,7 @@ pub(crate) async fn get(
     let resp = catalogs
         .iter()
         .map(|d| CatalogResponseItem {
-            provider: d.provider.clone(),
+            from: d.provider.clone(),
             name: d.catalog_id.clone(),
         })
         .collect_vec();
