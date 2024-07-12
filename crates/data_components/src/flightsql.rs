@@ -95,16 +95,26 @@ impl Read for FlightSQLFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider = Arc::new(
-            FlightSQLTable::create(
+        let table_provider = match schema {
+            Some(schema) => Arc::new(FlightSQLTable::create_with_schema(
                 "flightsql",
                 &self.endpoint,
                 self.client.clone(),
                 table_reference,
-            )
-            .await?,
-        );
+                schema,
+            )),
+            None => Arc::new(
+                FlightSQLTable::create(
+                    "flightsql",
+                    &self.endpoint,
+                    self.client.clone(),
+                    table_reference,
+                )
+                .await?,
+            ),
+        };
 
         let table_provider = Arc::new(
             table_provider
@@ -141,6 +151,23 @@ impl FlightSQLTable {
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
         })
+    }
+
+    pub fn create_with_schema(
+        name: &'static str,
+        endpoint: &str,
+        client: FlightSqlServiceClient<Channel>,
+        table_reference: impl Into<TableReference>,
+        schema: SchemaRef,
+    ) -> Self {
+        let table_reference: TableReference = table_reference.into();
+        Self {
+            name,
+            client,
+            table_reference,
+            schema,
+            join_push_down_context: format!("endpoint={endpoint}"),
+        }
     }
 
     pub async fn from_static(

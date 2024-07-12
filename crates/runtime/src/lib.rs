@@ -34,6 +34,7 @@ use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
 use cache::QueryResultsCacheProvider;
+use component::catalog::Catalog;
 use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
@@ -42,6 +43,7 @@ use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
+use extension::ExtensionFactory;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
@@ -196,6 +198,15 @@ pub enum Error {
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
 
+    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    UnableToLoadCatalogConnector {
+        catalog: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
+    DataConnectorDoesntSupportCatalogs { dataconnector: String },
+
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
         dataset: TableReference,
@@ -226,6 +237,15 @@ pub enum Error {
     InvalidSpicepodDataset {
         source: crate::component::dataset::Error,
     },
+
+    #[snafu(display("Invalid glob pattern {pattern}: {source}"))]
+    InvalidGlobPattern {
+        pattern: String,
+        source: globset::Error,
+    },
+
+    #[snafu(display("Error converting GlobSet to Regex: {source}"))]
+    ErrorConvertingGlobSetToRegex { source: globset::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -248,7 +268,8 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics: Option<SocketAddr>,
 
-    extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
+    autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
+    extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
@@ -266,6 +287,36 @@ impl Runtime {
     #[must_use]
     pub fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
         Arc::clone(&self.secrets_provider)
+    }
+
+    /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
+    pub async fn extension(&self, name: &str) -> Option<Arc<dyn Extension>> {
+        let extensions = self.extensions.read().await;
+
+        if let Some(extension) = extensions.get(name) {
+            return Some(Arc::clone(extension));
+        }
+        drop(extensions);
+
+        if let Some(autoload_factory) = self.autoload_extensions.get(name) {
+            let mut extensions = self.extensions.write().await;
+            let mut extension = autoload_factory.create();
+            let extension_name = extension.name().to_string();
+            if let Err(err) = extension.initialize(self).await {
+                tracing::error!("Unable to initialize extension {extension_name}: {err}");
+                return None;
+            }
+
+            if let Err(err) = extension.on_start(self).await {
+                tracing::error!("Unable to start extension {extension_name}: {err}");
+                return None;
+            }
+
+            extensions.insert(extension_name.clone(), extension.into());
+            return extensions.get(&extension_name).cloned();
+        }
+
+        None
     }
 
     /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.
@@ -322,6 +373,7 @@ impl Runtime {
             }),
             Box::pin(self.init_results_cache()),
             Box::pin(self.load_datasets()),
+            Box::pin(self.load_catalogs()),
         ];
 
         if cfg!(feature = "models") {
@@ -329,13 +381,15 @@ impl Runtime {
         }
 
         join_all(futures).await;
+
+        self.df.mark_initial_load_complete();
     }
 
     async fn start_extensions(&self) {
         let mut extensions = self.extensions.write().await;
-        for i in 0..extensions.len() {
-            if let Err(err) = extensions[i].on_start(self).await {
-                tracing::warn!("Failed to start extension: {err}");
+        for (name, extension) in extensions.iter_mut() {
+            if let Err(err) = extension.on_start(self).await {
+                tracing::warn!("Failed to start extension {name}: {err}");
             }
         }
     }
@@ -362,6 +416,10 @@ impl Runtime {
         app.datasets.iter().cloned().map(Dataset::try_from)
     }
 
+    fn catalogs_iter(app: &App) -> impl Iterator<Item = Result<Catalog>> + '_ {
+        app.catalogs.iter().cloned().map(Catalog::try_from)
+    }
+
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Dataset> {
         Self::datasets_iter(app)
@@ -376,6 +434,27 @@ impl Runtime {
                         );
                         metrics::counter!("datasets_load_error").increment(1);
                         tracing::error!(dataset = &spicepod_ds.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns a list of valid catalogs from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_catalogs(app: &App, log_errors: LogErrors) -> Vec<Catalog> {
+        Self::catalogs_iter(app)
+            .zip(&app.catalogs)
+            .filter_map(|(catalog, spicepod_catalog)| match catalog {
+                Ok(catalog) => Some(catalog),
+                Err(e) => {
+                    if log_errors.0 {
+                        status::update_catalog(
+                            &spicepod_catalog.name,
+                            status::ComponentStatus::Error,
+                        );
+                        metrics::counter!("catalogs_load_error").increment(1);
+                        tracing::error!(catalog = &spicepod_catalog.name, "{e}");
                     }
                     None
                 }
@@ -422,6 +501,22 @@ impl Runtime {
             .collect()
     }
 
+    async fn load_catalogs(&self) {
+        let app_lock = self.app.read().await;
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
+
+        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(true));
+        let mut futures = vec![];
+        for catalog in &valid_catalogs {
+            status::update_catalog(&catalog.name, status::ComponentStatus::Initializing);
+            futures.push(self.load_catalog(catalog));
+        }
+
+        let _ = join_all(futures).await;
+    }
+
     async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
@@ -445,8 +540,6 @@ impl Runtime {
 
         // After all datasets have loaded, load the views.
         self.load_views(app, &valid_datasets);
-
-        self.df.mark_initial_load_complete();
     }
 
     fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
@@ -457,6 +550,35 @@ impl Runtime {
                 tracing::error!("Unable to load view: {e}");
             };
         }
+    }
+
+    async fn load_catalog(&self, catalog: &Catalog) {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
+
+        let _ = retry(retry_strategy, || async {
+            let connector = match self.load_catalog_connector(catalog).await {
+                Ok(connector) => connector,
+                Err(err) => {
+                    let catalog_name = &catalog.name;
+                    status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                    metrics::counter!("catalogs_load_error").increment(1);
+                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                    return Err(RetryError::transient(err));
+                }
+            };
+
+            if let Err(err) = self.register_catalog(catalog, connector).await {
+                tracing::error!("Unable to register catalog {}: {err}", &catalog.name);
+                return Err(RetryError::transient(err));
+            };
+
+            status::update_catalog(&catalog.name, status::ComponentStatus::Ready);
+
+            Ok(())
+        })
+        .await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -508,6 +630,40 @@ impl Runtime {
         Ok(())
     }
 
+    async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn DataConnector>> {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
+
+        let catalog = catalog.clone();
+
+        let secrets_provider = shared_secrets_provider.read().await;
+
+        let source = catalog.provider;
+        let params = Arc::new(catalog.params.clone());
+        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
+            &source,
+            &secrets_provider,
+            Arc::clone(&params),
+        )
+        .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let catalog_name = &catalog.name;
+                status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                metrics::counter!("catalogs_load_error").increment(1);
+                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: catalog_name.clone(),
+                }
+                .fail();
+            }
+        };
+
+        Ok(data_connector)
+    }
+
     async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
@@ -540,6 +696,60 @@ impl Runtime {
         };
 
         Ok(data_connector)
+    }
+
+    async fn register_catalog(
+        &self,
+        catalog: &Catalog,
+        data_connector: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        tracing::info!(
+            "Registering catalog '{}' for {}",
+            &catalog.name,
+            &catalog.provider
+        );
+        let catalog_provider = data_connector
+            .catalog_provider(self, catalog)
+            .await
+            .context(DataConnectorDoesntSupportCatalogsSnafu {
+                dataconnector: catalog.provider.clone(),
+            })?
+            .boxed()
+            .context(UnableToLoadCatalogConnectorSnafu {
+                catalog: catalog.name.clone(),
+            })?;
+        let num_schemas = catalog_provider
+            .schema_names()
+            .iter()
+            .fold(0, |acc, schema| {
+                acc + catalog_provider
+                    .schema(schema)
+                    .map_or(0, |s| i32::from(!s.table_names().is_empty()))
+            });
+        let num_tables = catalog_provider
+            .schema_names()
+            .iter()
+            .fold(0, |acc, schema| {
+                acc + catalog_provider
+                    .schema(schema)
+                    .map_or(0, |s| s.table_names().len())
+            });
+
+        self.df
+            .register_catalog(&catalog.name, catalog_provider)
+            .boxed()
+            .context(UnableToLoadCatalogConnectorSnafu {
+                catalog: catalog.name.clone(),
+            })?;
+
+        tracing::info!(
+            "Registered catalog '{}' with {num_schemas} schema{} and {num_tables} table{}",
+            &catalog.name,
+            if num_schemas == 1 { "" } else { "s" },
+            if num_tables == 1 { "" } else { "s" },
+        );
+
+        Ok(())
     }
 
     async fn register_loaded_dataset(
@@ -863,16 +1073,18 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            return Runtime::register_table(
-                df,
-                ds,
-                datafusion::Table::Federated {
-                    data_connector: connector,
-                    federated_read_table,
-                },
-                &source,
-            )
-            .await;
+            return df
+                .register_table(
+                    ds,
+                    datafusion::Table::Federated {
+                        data_connector: connector,
+                        federated_read_table,
+                    },
+                )
+                .await
+                .context(UnableToAttachDataConnectorSnafu {
+                    data_connector: source,
+                });
         }
 
         // ACCELERATED TABLE
@@ -891,8 +1103,7 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        Runtime::register_table(
-            df,
+        df.register_table(
             ds,
             datafusion::Table::Accelerated {
                 source: connector,
@@ -900,24 +1111,11 @@ impl Runtime {
                 acceleration_secret,
                 accelerated_table,
             },
-            &source,
         )
         .await
-    }
-
-    async fn register_table(
-        df: Arc<DataFusion>,
-        ds: &Dataset,
-        table: datafusion::Table,
-        source: &str,
-    ) -> Result<()> {
-        df.register_table(ds, table)
-            .await
-            .context(UnableToAttachDataConnectorSnafu {
-                data_connector: source,
-            })?;
-
-        Ok(())
+        .context(UnableToAttachDataConnectorSnafu {
+            data_connector: source,
+        })
     }
 
     async fn get_params_with_secrets(&self, params: &HashMap<String, String>) -> Result<SecretMap> {
@@ -1135,7 +1333,28 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                // check for new and updated datasets
+                // Check for new and updated catalogs
+                let valid_catalogs = Self::get_valid_catalogs(&new_app, LogErrors(true));
+                let existing_catalogs = Self::get_valid_catalogs(current_app, LogErrors(false));
+
+                for catalog in &valid_catalogs {
+                    if let Some(current_catalog) =
+                        existing_catalogs.iter().find(|c| c.name == catalog.name)
+                    {
+                        if catalog != current_catalog {
+                            // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
+                            self.load_catalog(catalog).await;
+                        }
+                    } else {
+                        status::update_catalog(
+                            &catalog.name,
+                            status::ComponentStatus::Initializing,
+                        );
+                        self.load_catalog(catalog).await;
+                    }
+                }
+
+                // Check for new and updated datasets
                 let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
                 let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
@@ -1147,6 +1366,21 @@ impl Runtime {
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
                         self.load_dataset(ds).await;
+                    }
+                }
+
+                // Remove datasets that are no longer in the app
+                for ds in &current_app.datasets {
+                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        let ds = match Dataset::try_from(ds.clone()) {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                                continue;
+                            }
+                        };
+                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
+                        self.remove_dataset(&ds).await;
                     }
                 }
 
@@ -1169,21 +1403,6 @@ impl Runtime {
                     if !new_app.models.iter().any(|m| m.name == model.name) {
                         status::update_model(&model.name, status::ComponentStatus::Disabled);
                         self.remove_model(model).await;
-                    }
-                }
-
-                // Remove datasets that are no longer in the app
-                for ds in &current_app.datasets {
-                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                        let ds = match Dataset::try_from(ds.clone()) {
-                            Ok(ds) => ds,
-                            Err(e) => {
-                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
-                                continue;
-                            }
-                        };
-                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds).await;
                     }
                 }
 

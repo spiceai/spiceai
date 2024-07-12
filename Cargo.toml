@@ -56,6 +56,7 @@ datafusion-table-providers = { git = "https://github.com/datafusion-contrib/data
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
 fundu = "2.0.0"
 futures = "0.3.30"
+globset = "0.4.14"
 itertools = "0.12"
 metrics = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
 metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
@@ -64,6 +65,7 @@ object_store = { version = "0.10.1" }
 odbc-api = { version = "7.0.0" }
 pem = "3.0.4"
 r2d2 = "0.8.10"
+regex = "1.10.3"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 secrecy = "0.8.0"
 serde = { version = "1.0.195", features = ["derive"] }

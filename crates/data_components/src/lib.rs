@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::{error::Error, sync::Arc};
 
+use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 
@@ -52,6 +53,7 @@ pub mod snowflake;
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod unity_catalog;
 
 pub mod cdc;
 pub mod delete;
@@ -62,6 +64,7 @@ pub trait Read: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -70,5 +73,6 @@ pub trait ReadWrite: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }

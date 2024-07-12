@@ -39,6 +39,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+globset.workspace = true
 itertools.workspace = true
 mysql_async = { workspace = true, optional = true }
 object_store = { workspace = true }

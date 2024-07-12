@@ -23,10 +23,12 @@ use super::{params::Params, WithDependsOn};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Catalog {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
 
     pub name: String,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
@@ -45,6 +47,7 @@ impl Catalog {
         Catalog {
             from,
             name,
+            include: Vec::default(),
             params: None,
             dataset_params: None,
             depends_on: Vec::default(),
@@ -57,6 +60,7 @@ impl WithDependsOn<Catalog> for Catalog {
         Catalog {
             from: self.from.clone(),
             name: self.name.clone(),
+            include: self.include.clone(),
             params: self.params.clone(),
             dataset_params: self.dataset_params.clone(),
             depends_on: depends_on.to_vec(),
