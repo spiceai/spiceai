@@ -195,31 +195,11 @@ impl FlightTable {
         )?))
     }
 
-    pub async fn stream_changes(&self) -> ChangesStream {
-        let schema = Arc::clone(&self.schema);
-        let primary_keys = self.primary_keys.clone();
+    pub fn stream_changes(&self) -> ChangesStream {
+        let append_stream =
+            subscribe_to_append_stream(self.client.clone(), self.table_reference.to_string());
 
-        let Ok(decoder) = self
-            .client
-            .clone()
-            .subscribe(&self.table_reference.to_string())
-            .await
-        else {
-            todo!()
-        };
-
-        let change_stream = decoder.map(|flight_data_result| {
-            flight_data_result
-                .map_err(|e| cdc::StreamError::SerdeJsonError("todo".to_string()))
-                .and_then(|flight_data| match flight_data.payload {
-                    DecodedPayload::RecordBatch(batch) => ChangeBatch::try_new(batch)
-                        .map(|rb| ChangeEnvelope::new(None, rb))
-                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string())),
-                    _ => Err(cdc::StreamError::SerdeJsonError("todo".to_string())),
-                })
-        });
-
-        Box::pin(change_stream)
+        Box::pin(append_stream)
     }
 }
 
@@ -412,6 +392,41 @@ fn query_to_stream(
             Err(error) => yield Err(to_execution_error(Error::Flight{ source: error}))
         }
     }
+}
+
+#[allow(clippy::match_same_arms)]
+pub fn subscribe_to_append_stream(
+    mut client: FlightClient,
+    table_reference: String,
+) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
+    let append_stream = stream! {
+        match client.subscribe(&table_reference).await {
+            Ok(mut stream) => {
+                while let Some(decoded_data) = stream.next().await {
+                    match decoded_data {
+                        Ok(decoded_data) => match decoded_data.payload {
+                          DecodedPayload::None => continue,
+                          DecodedPayload::Schema(_) => continue,
+                          DecodedPayload::RecordBatch(batch) => {
+                            match ChangeBatch::try_new(batch)
+                            .map(|rb| ChangeEnvelope::new(None, rb)) {
+                                Ok(change_batch) => yield Ok(change_batch),
+                                Err(e) => yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
+                            };
+                        },
+                        },
+                        Err(e) => {
+                            yield Err(cdc::StreamError::Flight(e.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                yield Err(cdc::StreamError::Flight(e.to_string()));
+            }
+        }
+    };
+    append_stream
 }
 
 #[allow(clippy::needless_pass_by_value)]

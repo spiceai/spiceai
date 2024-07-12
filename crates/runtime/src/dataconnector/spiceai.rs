@@ -149,7 +149,7 @@ impl DataConnector for SpiceAI {
             .unwrap()
             .as_any()
             .downcast_ref::<FlightTable>()?;
-        let stream = flight_table.stream_changes().await;
+        let stream = flight_table.stream_changes();
         Some(stream)
     }
 }

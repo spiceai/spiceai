@@ -46,6 +46,7 @@ pub enum ChangeBatchError {
 pub enum StreamError {
     Kafka(String),
     SerdeJsonError(String),
+    Flight(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -55,6 +56,7 @@ impl std::fmt::Display for StreamError {
         match self {
             StreamError::Kafka(e) => write!(f, "Kafka error: {e}"),
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
+            StreamError::Flight(e) => write!(f, "Flight error: {e}"),
         }
     }
 }
