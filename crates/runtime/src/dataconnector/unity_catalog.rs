@@ -130,7 +130,12 @@ impl DataConnector for UnityCatalog {
             self.params.get("token").cloned(),
         ));
 
-        let mut dataset_params: SecretMap = catalog.dataset_params.clone().into();
+        // Copy the catalog params into the dataset params, and allow user to override
+        let mut dataset_params: SecretMap = catalog.params.clone().into();
+
+        for (key, value) in &catalog.dataset_params {
+            dataset_params.insert(key.to_string(), value.clone().into());
+        }
 
         let secrets_provider = runtime.secrets_provider();
         let dataset_secret = match secrets_provider
