@@ -32,7 +32,7 @@ pub enum CommitError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Change committer not exist"))]
+    #[snafu(display("Change committer missing"))]
     CommitterMissing {},
 }
 
