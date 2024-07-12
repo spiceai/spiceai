@@ -44,7 +44,7 @@ pub(crate) struct CatalogFilter {
 #[serde(rename_all = "lowercase")]
 pub(crate) struct CatalogResponseItem {
     pub from: String,
-    pub name: Option<String>,
+    pub name: String,
 }
 
 const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, None, &[]);
@@ -77,8 +77,8 @@ pub(crate) async fn get(
     let resp = catalogs
         .iter()
         .map(|d| CatalogResponseItem {
-            from: d.provider.clone(),
-            name: d.catalog_id.clone(),
+            from: d.from.clone(),
+            name: d.name.clone(),
         })
         .collect_vec();
 
