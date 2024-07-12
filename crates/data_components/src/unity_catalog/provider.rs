@@ -53,6 +53,9 @@ impl UnityCatalogProvider {
 
         let mut schemas_map = HashMap::new();
         for schema in schemas {
+            if schema.name == "information_schema" {
+                continue;
+            }
             let schema_provider = UnityCatalogSchemaProvider::try_new(
                 Arc::clone(&client),
                 &schema,

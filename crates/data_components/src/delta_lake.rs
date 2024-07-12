@@ -100,7 +100,12 @@ impl DeltaTable {
 
         let storage_options: HashMap<String, String> = storage_options
             .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().clone()))
+            .filter_map(|(k, v)| {
+                if k == "token" || k == "endpoint" {
+                    return None;
+                }
+                Some((k, v.expose_secret().clone()))
+            })
             .collect();
 
         let engine = Arc::new(
