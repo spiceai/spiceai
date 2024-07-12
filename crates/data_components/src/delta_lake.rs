@@ -33,6 +33,7 @@ use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::sql::TableReference;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState};
@@ -41,8 +42,11 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::ops::Deref;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
+
+use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -54,6 +58,31 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub struct DeltaTableFactory {
+    params: Arc<HashMap<String, SecretString>>,
+}
+
+impl DeltaTableFactory {
+    #[must_use]
+    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Self {
+        Self { params }
+    }
+}
+
+#[async_trait]
+impl Read for DeltaTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+        _schema: Option<SchemaRef>,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let delta_path = table_reference.table().to_string();
+        let delta: DeltaTable =
+            DeltaTable::from(delta_path, self.params.deref().clone()).boxed()?;
+        Ok(Arc::new(delta))
+    }
+}
 
 pub struct DeltaTable {
     table: Table,
@@ -71,7 +100,12 @@ impl DeltaTable {
 
         let storage_options: HashMap<String, String> = storage_options
             .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().clone()))
+            .filter_map(|(k, v)| {
+                if k == "token" || k == "endpoint" {
+                    return None;
+                }
+                Some((k, v.expose_secret().clone()))
+            })
             .collect();
 
         let engine = Arc::new(

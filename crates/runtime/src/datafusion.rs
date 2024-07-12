@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::accelerated_table::refresh;
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
@@ -182,6 +183,9 @@ pub enum Error {
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("{source}"))]
+    InvalidTimeColumnTimeFormat { source: refresh::Error },
 }
 
 pub enum Table {
@@ -341,6 +345,12 @@ impl DataFusion {
         Ok(())
     }
 
+    pub fn register_catalog(&self, name: &str, catalog: Arc<dyn CatalogProvider>) -> Result<()> {
+        self.ctx.register_catalog(name, catalog);
+
+        Ok(())
+    }
+
     pub async fn register_table(&self, dataset: impl Borrow<Dataset>, table: Table) -> Result<()> {
         let dataset = dataset.borrow();
 
@@ -495,6 +505,11 @@ impl DataFusion {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
+    #[must_use]
+    pub fn catalog_exists(&self, catalog: &str) -> bool {
+        self.ctx.catalog(catalog).is_some()
+    }
+
     pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
@@ -551,7 +566,7 @@ impl DataFusion {
 
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
-            source_schema,
+            Arc::clone(&source_schema),
             source_table_provider.constraints(),
             &acceleration_settings,
             acceleration_secret,
@@ -579,6 +594,10 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
+
+        refresh
+            .validate_time_format(dataset.name.to_string(), &source_schema)
+            .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.clone(),

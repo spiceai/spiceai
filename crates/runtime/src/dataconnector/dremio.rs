@@ -97,25 +97,30 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.flight_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "dremio",
-                })?,
+        Ok(Read::table_provider(
+            &self.flight_factory,
+            dataset.path().into(),
+            dataset.schema(),
         )
+        .await
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "dremio",
+        })?)
     }
 
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let read_write_result =
-            ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadWriteProviderSnafu {
-                    dataconnector: "dremio",
-                });
+        let read_write_result = ReadWrite::table_provider(
+            &self.flight_factory,
+            dataset.path().into(),
+            dataset.schema(),
+        )
+        .await
+        .context(super::UnableToGetReadWriteProviderSnafu {
+            dataconnector: "dremio",
+        });
 
         Some(read_write_result)
     }

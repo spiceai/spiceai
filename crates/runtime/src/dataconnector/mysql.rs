@@ -90,7 +90,7 @@ impl DataConnector for MySQL {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
-            Read::table_provider(&self.mysql_factory, dataset.path().into())
+            Read::table_provider(&self.mysql_factory, dataset.path().into(), dataset.schema())
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "mysql",

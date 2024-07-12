@@ -49,6 +49,7 @@ duckdb = { workspace = true, features = [
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
+globset.workspace = true
 indexmap = "2.2.2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }
@@ -76,7 +77,7 @@ prost = { version = "0.12.1", default-features = false, features = [
   "prost-derive",
 ] }
 r2d2 = { workspace = true, optional = true }
-regex = "1.10.3"
+regex.workspace = true
 reqwest = { version = "0.11.24", features = ["json"] }
 secrecy.workspace = true
 serde.workspace = true
