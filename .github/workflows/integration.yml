@@ -9,12 +9,29 @@ on:
 
   workflow_dispatch:
 
+env:
+  CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
+
 jobs:
   build:
     name: Integration Tests
     runs-on: ubuntu-latest-16-cores
     steps:
       - uses: actions/checkout@v4
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        # This will fail for forks, so we only run it for the main repo
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      # Change the CONTAINER_REGISTRY to public.ecr.aws/docker/library/ if this is a fork
+      - name: Use public ECR for forks
+        if: github.repository != 'spiceai/spiceai'
+        run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

@@ -147,3 +147,8 @@ where
 
     false
 }
+
+fn container_registry() -> String {
+    std::env::var("CONTAINER_REGISTRY")
+        .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
+}

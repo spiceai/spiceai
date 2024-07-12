@@ -53,7 +53,7 @@ pub async fn start(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
 
 pub struct ContainerRunnerBuilder<'a> {
     name: &'a str,
-    image: Option<&'a str>,
+    image: Option<String>,
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
@@ -70,7 +70,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
         }
     }
 
-    pub fn image(mut self, image: &'a str) -> Self {
+    pub fn image(mut self, image: String) -> Self {
         self.image = Some(image);
         self
     }
@@ -108,7 +108,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
 pub struct ContainerRunner<'a> {
     name: &'a str,
     docker: Docker,
-    image: &'a str,
+    image: String,
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
@@ -158,7 +158,7 @@ impl<'a> ContainerRunner<'a> {
         let env_vars_str = env_vars.iter().map(String::as_str).collect::<Vec<&str>>();
 
         let config = Config::<&str> {
-            image: Some(self.image),
+            image: Some(&self.image),
             env: Some(env_vars_str),
             host_config,
             healthcheck: self.healthcheck,
@@ -205,7 +205,7 @@ impl<'a> ContainerRunner<'a> {
 
     async fn pull_image(&self) -> Result<(), anyhow::Error> {
         let options = Some(CreateImageOptions::<&str> {
-            from_image: self.image,
+            from_image: &self.image,
             ..Default::default()
         });
 
