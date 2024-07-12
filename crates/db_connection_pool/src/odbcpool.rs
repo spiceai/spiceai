@@ -120,9 +120,6 @@ where
     }
 
     fn join_push_down(&self) -> JoinPushDown {
-        // It would be technically feasible to return JoinPushDown::AllowedFor(connection_string) here,
-        // but we don't have a general way to strip out sensitive information from the connection string.
-        // We could solve this by asking the user to explicly provide a join context in the parameters.
         JoinPushDown::AllowedFor(self.connection_id.clone())
     }
 }
