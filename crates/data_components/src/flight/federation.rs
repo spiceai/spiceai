@@ -8,7 +8,8 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
     sql::{
-        unparser::dialect::{DefaultDialect, Dialect},
+        sqlparser::ast::{self, Interval},
+        unparser::dialect::{CustomDialect, DefaultDialect, Dialect},
         TableReference,
     },
 };
@@ -45,6 +46,71 @@ impl FlightTable {
     }
 }
 
+struct SpiceAIDialect {}
+
+impl Dialect for SpiceAIDialect {
+    fn supports_nulls_first_in_sort(&self) -> bool {
+        true
+    }
+
+    fn use_timestamp_for_date64(&self) -> bool {
+        true
+    }
+
+    fn custom_scalar_to_sql(
+        &self,
+        scalar: &datafusion::scalar::ScalarValue,
+    ) -> Option<datafusion::common::Result<ast::Expr>> {
+        dbg!(scalar);
+        match scalar {
+            datafusion::scalar::ScalarValue::IntervalYearMonth(_) => {
+                let interval = Interval {
+                    value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
+                        "1".to_string(),
+                    ))),
+                    leading_field: Some(ast::DateTimeField::Month),
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                };
+                Some(Ok(ast::Expr::Interval(interval)))
+            }
+            datafusion::scalar::ScalarValue::IntervalDayTime(_) => {
+                let interval = Interval {
+                    value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
+                        "1".to_string(),
+                    ))),
+                    leading_field: Some(ast::DateTimeField::Day),
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                };
+                Some(Ok(ast::Expr::Interval(interval)))
+            }
+            datafusion::scalar::ScalarValue::IntervalMonthDayNano(v) => {
+                let Some(v) = v else {
+                    return None;
+                };
+                let interval = Interval {
+                    value: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
+                        v.months.to_string(),
+                    ))),
+                    leading_field: Some(ast::DateTimeField::Month),
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                };
+                Some(Ok(ast::Expr::Interval(interval)))
+            }
+            _ => None,
+        }
+    }
+
+    fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+        Some('"')
+    }
+}
+
 #[async_trait]
 impl SQLExecutor for FlightTable {
     fn name(&self) -> &str {
@@ -56,7 +122,7 @@ impl SQLExecutor for FlightTable {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(DefaultDialect {})
+        Arc::new(SpiceAIDialect {})
     }
 
     fn execute(
