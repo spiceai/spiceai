@@ -204,6 +204,15 @@ impl<'a> ContainerRunner<'a> {
     }
 
     async fn pull_image(&self) -> Result<(), anyhow::Error> {
+        // Check if image is already pulled
+        let images = self.docker.list_images::<&str>(None).await?;
+        for image in images {
+            if image.repo_tags.iter().any(|t| t == &self.image) {
+                tracing::debug!("Docker image {} already pulled", self.image);
+                return Ok(());
+            }
+        }
+
         let options = Some(CreateImageOptions::<&str> {
             from_image: &self.image,
             ..Default::default()
