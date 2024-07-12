@@ -26,11 +26,13 @@ use runtime::{datafusion::DataFusion, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
+mod catalog;
 mod docker;
-// Run all tests in the `federation` module
 mod federation;
 mod graphql;
+#[cfg(feature = "mysql")]
 mod mysql;
+#[cfg(feature = "postgres")]
 mod postgres;
 mod refresh_retry;
 mod refresh_sql;
