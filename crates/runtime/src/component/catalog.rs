@@ -86,8 +86,8 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
 }
 
 impl Catalog {
-    pub fn try_new(from: &str, name: &str) -> std::result::Result<Self, crate::Error> {
-        Ok(Catalog {
+    pub fn new(from: &str, name: &str) -> Self {
+        Catalog {
             provider: Catalog::provider(from).to_string(),
             catalog_id: Catalog::catalog_id(from).map(String::from),
             name: name.into(),
@@ -95,7 +95,7 @@ impl Catalog {
             include: None,
             params: HashMap::default(),
             dataset_params: HashMap::default(),
-        })
+        }
     }
 
     /// Returns the catalog provider - the first part of the `from` field before the first `:`.
@@ -105,7 +105,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo:bar", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo:bar", "bar");
     ///
     /// assert_eq!(catalog.provider, "foo".to_string());
     /// ```
@@ -113,7 +113,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo", "bar");
     ///
     /// assert_eq!(catalog.provider, "foo".to_string());
     /// ```
@@ -130,7 +130,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo:bar", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo:bar", "bar");
     ///
     /// assert_eq!(catalog.catalog_id, Some("bar".to_string()));
     /// ```
@@ -138,7 +138,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo", "bar");
     ///
     /// assert_eq!(catalog.catalog_id, None);
     /// ```

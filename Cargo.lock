@@ -8092,6 +8092,7 @@ dependencies = [
  "serde_json",
  "snafu 0.8.3",
  "snowflake-api",
+ "spice-cloud",
  "spicepod",
  "ssh2",
  "suppaftp",
