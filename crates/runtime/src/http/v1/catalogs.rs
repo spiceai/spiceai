@@ -37,7 +37,7 @@ use super::{convert_entry_to_csv, Format};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CatalogFilter {
-    provider: Option<String>,
+    from: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,7 +66,7 @@ pub(crate) async fn get(
     };
 
     let valid_catalogs = Runtime::get_valid_catalogs(readable_app, LogErrors(false));
-    let catalogs: Vec<Catalog> = match filter.provider {
+    let catalogs: Vec<Catalog> = match filter.from {
         Some(provider) => valid_catalogs
             .into_iter()
             .filter(|d| d.provider == provider)
