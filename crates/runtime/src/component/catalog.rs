@@ -23,6 +23,7 @@ use std::collections::HashMap;
 pub struct Catalog {
     pub provider: String,
     pub catalog_id: Option<String>,
+    pub from: String,
     pub name: String,
     orig_include: Vec<String>,
     pub include: Option<GlobSet>,
@@ -32,8 +33,7 @@ pub struct Catalog {
 
 impl PartialEq for Catalog {
     fn eq(&self, other: &Self) -> bool {
-        self.provider == other.provider
-            && self.catalog_id == other.catalog_id
+        self.from == other.from
             && self.name == other.name
             && self.orig_include == other.orig_include
             && self.params == other.params
@@ -68,6 +68,7 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
         Ok(Catalog {
             provider: provider.to_string(),
             catalog_id,
+            from: catalog.from.clone(),
             name: catalog.name,
             orig_include: catalog.include.clone(),
             include: globset_opt,
@@ -86,16 +87,17 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
 }
 
 impl Catalog {
-    pub fn try_new(from: &str, name: &str) -> std::result::Result<Self, crate::Error> {
-        Ok(Catalog {
+    pub fn new(from: &str, name: &str) -> Self {
+        Catalog {
             provider: Catalog::provider(from).to_string(),
             catalog_id: Catalog::catalog_id(from).map(String::from),
+            from: from.into(),
             name: name.into(),
             orig_include: Vec::default(),
             include: None,
             params: HashMap::default(),
             dataset_params: HashMap::default(),
-        })
+        }
     }
 
     /// Returns the catalog provider - the first part of the `from` field before the first `:`.
@@ -105,7 +107,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo:bar", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo:bar", "bar");
     ///
     /// assert_eq!(catalog.provider, "foo".to_string());
     /// ```
@@ -113,7 +115,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo", "bar");
     ///
     /// assert_eq!(catalog.provider, "foo".to_string());
     /// ```
@@ -130,7 +132,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo:bar", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo:bar", "bar");
     ///
     /// assert_eq!(catalog.catalog_id, Some("bar".to_string()));
     /// ```
@@ -138,7 +140,7 @@ impl Catalog {
     /// ```
     /// use runtime::component::catalog::Catalog;
     ///
-    /// let catalog = Catalog::try_new("foo", "bar").expect("valid catalog");
+    /// let catalog = Catalog::new("foo", "bar");
     ///
     /// assert_eq!(catalog.catalog_id, None);
     /// ```

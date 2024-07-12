@@ -1403,6 +1403,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-extra"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be6ea09c9b96cb5076af0de2e383bd2bc0c18f827cf1967bdd353e0b910d733"
+dependencies = [
+ "axum 0.7.5",
+ "axum-core 0.4.3",
+ "bytes",
+ "futures-util",
+ "headers",
+ "http 1.1.0",
+ "http-body 1.0.0",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "serde",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "axum-macros"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4305,6 +4328,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "headers"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "322106e6bd0cba2d5ead589ddb8150a13d7c4217cf80d7c4f682ca994ccc6aa9"
+dependencies = [
+ "base64 0.21.7",
+ "bytes",
+ "headers-core",
+ "http 1.1.0",
+ "httpdate",
+ "mime",
+ "sha1",
+]
+
+[[package]]
+name = "headers-accept"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abac9ba15f15a44969425b5f334e3ed11b54e3b2b7289a7fe1850e5a4e7cac21"
+dependencies = [
+ "headers-core",
+ "http 1.1.0",
+ "mediatype",
+]
+
+[[package]]
+name = "headers-core"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54b4a22553d4242c49fddb9ba998a99962b5cc6f22cb5a3482bec22522403ce4"
+dependencies = [
+ "http 1.1.0",
+]
+
+[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5609,6 +5667,12 @@ dependencies = [
  "cfg-if",
  "digest",
 ]
+
+[[package]]
+name = "mediatype"
+version = "0.19.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8878cd8d1b3c8c8ae4b2ba0a36652b7cf192f618a599a7fbdfa25cffd4ea72dd"
 
 [[package]]
 name = "memchr"
@@ -8040,6 +8104,7 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "axum 0.7.5",
+ "axum-extra",
  "base64 0.22.1",
  "bb8",
  "bb8-postgres",
@@ -8063,11 +8128,13 @@ dependencies = [
  "fundu",
  "futures",
  "globset",
+ "headers-accept",
  "indexmap 2.2.6",
  "itertools 0.12.1",
  "keyring",
  "lazy_static",
  "llms",
+ "mediatype",
  "metrics 0.23.0",
  "metrics-exporter-prometheus",
  "metrics-util",
@@ -8093,6 +8160,7 @@ dependencies = [
  "serde_json",
  "snafu 0.8.3",
  "snowflake-api",
+ "spice-cloud",
  "spicepod",
  "ssh2",
  "suppaftp",
