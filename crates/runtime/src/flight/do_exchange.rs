@@ -64,11 +64,16 @@ pub(crate) async fn handle(
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    if !flight_svc.datafusion.is_writable(&data_path) {
+    if flight_svc
+        .datafusion
+        .get_table(data_path.clone())
+        .await
+        .is_none()
+    {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
-    };
+    }
 
     let channel_map = Arc::clone(&flight_svc.channel_map);
     let channel_map_read = channel_map.read().await;
