@@ -426,8 +426,7 @@ dependencies = [
 [[package]]
 name = "arrow-odbc"
 version = "11.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7494448da527944bd6decd9d2f18e853ec26d615fbbd07933bd62cfad4cbcae8"
+source = "git+https://github.com/peasee/arrow-odbc.git?rev=24ecbdfc2c482f1ce84c595ab1202530a37815d6#24ecbdfc2c482f1ce84c595ab1202530a37815d6"
 dependencies = [
  "arrow",
  "chrono",
@@ -6578,20 +6577,6 @@ dependencies = [
  "tracing",
  "url",
  "walkdir",
-]
-
-[[package]]
-name = "odbc-api"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f13064f9d099c4036c8e32229e1fa4dafdd4900ea6833471e089ae23a47707ce"
-dependencies = [
- "atoi",
- "log",
- "odbc-sys",
- "thiserror",
- "widestring",
- "winit",
 ]
 
 [[package]]
