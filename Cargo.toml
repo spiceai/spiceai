@@ -91,6 +91,6 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "361a7175744419ee602b4450cdc99b887695d3cb" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "fa8bf6be7309c4234523a1a47d005384125fc5d3" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f430401ef978c3687a1c8d10342c5032ce842952" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
