@@ -239,14 +239,6 @@ impl DataSink for MemSink {
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
 
-        if self.overwrite {
-            for partition in &self.batches {
-                let mut partition_vec = partition.write().await;
-                partition_vec.clear();
-                drop(partition_vec);
-            }
-        }
-
         // buffer up the data round robin style into num_partitions
 
         let mut new_batches = vec![vec![]; num_partitions];
@@ -263,10 +255,14 @@ impl DataSink for MemSink {
             i = (i + 1) % num_partitions;
         }
 
-        // write the outputs into the batches
-        for (target, mut batches) in self.batches.iter().zip(new_batches.into_iter()) {
-            // Append all the new batches in one go to minimize locking overhead
-            target.write().await.append(&mut batches);
+        let mut writable_targets: Vec<_> =
+            futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
+
+        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
+            if self.overwrite {
+                target.clear();
+            }
+            target.append(&mut batches);
         }
 
         Ok(row_count as u64)
