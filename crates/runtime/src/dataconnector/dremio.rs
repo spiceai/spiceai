@@ -58,12 +58,6 @@ pub struct Dremio {
     flight_factory: FlightFactory,
 }
 
-impl Dremio {
-    fn get_dialect() -> Arc<dyn Dialect> {
-        Arc::new(DremioDialect {})
-    }
-}
-
 pub struct DremioDialect {}
 
 impl Dialect for DremioDialect {
@@ -106,7 +100,8 @@ impl DataConnectorFactory for Dremio {
             )
             .await
             .context(UnableToCreateFlightClientSnafu)?;
-            let flight_factory = FlightFactory::new("dremio", flight_client, Dremio::get_dialect);
+            let flight_factory =
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
             Ok(Arc::new(Self { flight_factory }) as Arc<dyn DataConnector>)
         })
     }

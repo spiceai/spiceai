@@ -53,7 +53,7 @@ impl SQLExecutor for FlightTable {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        (self.get_dialect)()
+        Arc::clone(&self.dialect)
     }
 
     fn execute(

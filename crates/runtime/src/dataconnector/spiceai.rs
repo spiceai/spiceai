@@ -65,12 +65,6 @@ pub struct SpiceAI {
     flight_factory: FlightFactory,
 }
 
-impl SpiceAI {
-    fn get_dialect() -> Arc<dyn Dialect> {
-        Arc::new(SpiceCloudPlatformDialect {})
-    }
-}
-
 pub struct SpiceCloudPlatformDialect {}
 
 impl Dialect for SpiceCloudPlatformDialect {
@@ -116,7 +110,11 @@ impl DataConnectorFactory for SpiceAI {
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
-            let flight_factory = FlightFactory::new("spiceai", flight_client, SpiceAI::get_dialect);
+            let flight_factory = FlightFactory::new(
+                "spiceai",
+                flight_client,
+                Arc::new(SpiceCloudPlatformDialect {}),
+            );
             let spiceai = Self { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })
