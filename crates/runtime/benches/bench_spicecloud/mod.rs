@@ -28,8 +28,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q7", include_str!("tpch_q7.sql")),
         // Error: "query `tpch_q8` to results: External error: Schema error: No field named \"SUM(CASE WHEN all_nations.nation = Utf8(\"\"BRAZIL\"\") THEN all_nations.volume ELSE Int64(0) END)\". Valid fields are all_nations.o_year, \"SUM(CASE WHEN all_nations.tpch.nation = Utf8(\"\"BRAZIL\"\") THEN all_nations.volume ELSE Int64(0) END)\", \"SUM(all_nations.volume)\"."
         // ("tpch_q8", include_str!("tpch_q8.sql")),
-        // Error: "query `tpch_q9` to results: federation_optimizer_rule\ncaused by\nfederate_sql\ncaused by\nSchema error: No field named profit.\"tpch.nation\". Valid fields are profit.nation, profit.o_year, profit.amount."
-        // ("tpch_q9", include_str!("tpch_q9.sql")),
+        ("tpch_q9", include_str!("tpch_q9.sql")),
         ("tpch_q10", include_str!("tpch_q10.sql")),
         ("tpch_q11", include_str!("tpch_q11.sql")),
         ("tpch_q12", include_str!("tpch_q12.sql")),
