@@ -313,7 +313,7 @@ pub struct UCSchema {
     pub name: String,
     pub catalog_name: String,
     pub owner: String,
-    pub comment: String,
+    pub comment: Option<String>,
     pub metastore_id: String,
     pub full_name: String,
     pub created_at: i64,
