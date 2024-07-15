@@ -426,7 +426,7 @@ dependencies = [
 [[package]]
 name = "arrow-odbc"
 version = "11.2.0"
-source = "git+https://github.com/peasee/arrow-odbc.git?rev=24ecbdfc2c482f1ce84c595ab1202530a37815d6#24ecbdfc2c482f1ce84c595ab1202530a37815d6"
+source = "git+https://github.com/spiceai/arrow-odbc.git?rev=24ecbdfc2c482f1ce84c595ab1202530a37815d6#24ecbdfc2c482f1ce84c595ab1202530a37815d6"
 dependencies = [
  "arrow",
  "chrono",

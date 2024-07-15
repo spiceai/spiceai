@@ -36,7 +36,7 @@ version = "0.15.2-alpha"
 arrow = "52.0.0"
 arrow-buffer = "52.0.0"
 arrow-flight = "52.0.0"
-arrow-odbc = { git = "https://github.com/peasee/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
+arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
