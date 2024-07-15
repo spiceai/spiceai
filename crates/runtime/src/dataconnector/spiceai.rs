@@ -25,6 +25,9 @@ use data_components::flight::FlightFactory;
 use data_components::{Read, ReadWrite};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion::sql::unparser::dialect::Dialect;
+use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
@@ -62,6 +65,28 @@ pub struct SpiceAI {
     flight_factory: FlightFactory,
 }
 
+impl SpiceAI {
+    fn get_dialect() -> Arc<dyn Dialect> {
+        Arc::new(SpiceCloudPlatformDialect {})
+    }
+}
+
+pub struct SpiceCloudPlatformDialect {}
+
+impl Dialect for SpiceCloudPlatformDialect {
+    fn use_timestamp_for_date64(&self) -> bool {
+        true
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        IntervalStyle::SQLStandard
+    }
+
+    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+        DefaultDialect {}.identifier_quote_style(identifier)
+    }
+}
+
 impl DataConnectorFactory for SpiceAI {
     fn create(
         secret: Option<Secret>,
@@ -91,7 +116,7 @@ impl DataConnectorFactory for SpiceAI {
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
-            let flight_factory = FlightFactory::new("spiceai", flight_client);
+            let flight_factory = FlightFactory::new("spiceai", flight_client, SpiceAI::get_dialect);
             let spiceai = Self { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })

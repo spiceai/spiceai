@@ -30,6 +30,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
+    sql::unparser::dialect::Dialect,
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
@@ -64,12 +65,21 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct FlightFactory {
     name: &'static str,
     client: FlightClient,
+    get_dialect: fn() -> Arc<dyn Dialect>,
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(name: &'static str, client: FlightClient) -> Self {
-        Self { name, client }
+    pub fn new(
+        name: &'static str,
+        client: FlightClient,
+        get_dialect: fn() -> Arc<dyn Dialect>,
+    ) -> Self {
+        Self {
+            name,
+            client,
+            get_dialect,
+        }
     }
 }
 
@@ -86,9 +96,16 @@ impl Read for FlightFactory {
                 self.client.clone(),
                 table_reference,
                 schema,
+                self.get_dialect,
             )),
             None => Arc::new(
-                FlightTable::create(self.name, self.client.clone(), table_reference).await?,
+                FlightTable::create(
+                    self.name,
+                    self.client.clone(),
+                    table_reference,
+                    self.get_dialect,
+                )
+                .await?,
             ),
         };
 
@@ -124,6 +141,7 @@ pub struct FlightTable {
     join_push_down_context: String,
     client: FlightClient,
     schema: SchemaRef,
+    get_dialect: fn() -> Arc<dyn Dialect>,
     table_reference: TableReference,
 }
 
@@ -133,6 +151,7 @@ impl FlightTable {
         name: &'static str,
         client: FlightClient,
         table_reference: impl Into<TableReference>,
+        get_dialect: fn() -> Arc<dyn Dialect>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
@@ -141,6 +160,7 @@ impl FlightTable {
             client: client.clone(),
             schema,
             table_reference,
+            get_dialect,
             join_push_down_context: format!("url={},username={}", client.url(), client.username()),
         })
     }
@@ -150,6 +170,7 @@ impl FlightTable {
         client: FlightClient,
         table_reference: impl Into<TableReference>,
         schema: SchemaRef,
+        get_dialect: fn() -> Arc<dyn Dialect>,
     ) -> Self {
         let table_reference = table_reference.into();
         Self {
@@ -157,6 +178,7 @@ impl FlightTable {
             client: client.clone(),
             schema,
             table_reference,
+            get_dialect,
             join_push_down_context: format!("url={},username={}", client.url(), client.username()),
         }
     }

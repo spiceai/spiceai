@@ -7,10 +7,7 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
-    sql::{
-        unparser::dialect::{CustomDialectBuilder, Dialect, IntervalStyle},
-        TableReference,
-    },
+    sql::{unparser::dialect::Dialect, TableReference},
 };
 
 use super::{query_to_stream, FlightTable};
@@ -56,13 +53,7 @@ impl SQLExecutor for FlightTable {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(
-            CustomDialectBuilder::new()
-                .with_identifier_quote_style('"')
-                .with_use_timestamp_for_date64(true)
-                .with_interval_style(IntervalStyle::SQLStandard)
-                .build(),
-        )
+        (self.get_dialect)()
     }
 
     fn execute(
