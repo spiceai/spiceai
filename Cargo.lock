@@ -2733,7 +2733,7 @@ dependencies = [
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
- "duckdb 1.0.0 (git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115)",
+ "duckdb",
  "flight_client",
  "futures",
  "globset",
@@ -3082,7 +3082,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e3d3e5a8ccf3463b98523a71efdc6a46f4843a20#e3d3e5a8ccf3463b98523a71efdc6a46f4843a20"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c9976310089445e4676ef92c3108524133121cb1#c9976310089445e4676ef92c3108524133121cb1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -3096,7 +3096,7 @@ dependencies = [
  "datafusion",
  "datafusion-federation",
  "datafusion-federation-sql",
- "duckdb 1.0.0 (git+https://github.com/spiceai/duckdb-rs.git?rev=c7b8e22885001e2013493aebbaf190039d826c05)",
+ "duckdb",
  "fallible-iterator 0.3.0",
  "futures",
  "itertools 0.13.0",
@@ -3133,7 +3133,7 @@ dependencies = [
  "clickhouse-rs",
  "datafusion",
  "datafusion-table-providers",
- "duckdb 1.0.0 (git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115)",
+ "duckdb",
  "dyn-clone",
  "futures",
  "lazy_static",
@@ -3415,27 +3415,7 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink 0.8.4",
- "libduckdb-sys 1.0.0 (git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115)",
- "memchr",
- "num",
- "num-integer",
- "r2d2",
- "rust_decimal",
- "smallvec",
- "strum 0.25.0",
-]
-
-[[package]]
-name = "duckdb"
-version = "1.0.0"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=c7b8e22885001e2013493aebbaf190039d826c05#c7b8e22885001e2013493aebbaf190039d826c05"
-dependencies = [
- "arrow",
- "cast",
- "fallible-iterator 0.3.0",
- "fallible-streaming-iterator",
- "hashlink 0.8.4",
- "libduckdb-sys 1.0.0 (git+https://github.com/spiceai/duckdb-rs.git?rev=c7b8e22885001e2013493aebbaf190039d826c05)",
+ "libduckdb-sys",
  "memchr",
  "num",
  "num-integer",
@@ -5265,21 +5245,6 @@ checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
 name = "libduckdb-sys"
 version = "1.0.0"
 source = "git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115#85935dbbc64d2af1ca132ad7e2309a9d87bf3115"
-dependencies = [
- "autocfg",
- "cc",
- "flate2",
- "pkg-config",
- "serde",
- "serde_json",
- "tar",
- "vcpkg",
-]
-
-[[package]]
-name = "libduckdb-sys"
-version = "1.0.0"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=c7b8e22885001e2013493aebbaf190039d826c05#c7b8e22885001e2013493aebbaf190039d826c05"
 dependencies = [
  "autocfg",
  "cc",
@@ -8102,7 +8067,7 @@ dependencies = [
  "db_connection_pool",
  "derive_builder",
  "dirs",
- "duckdb 1.0.0 (git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115)",
+ "duckdb",
  "flight_client",
  "fundu",
  "futures",
