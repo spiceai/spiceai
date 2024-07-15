@@ -638,10 +638,6 @@ impl RefreshTask {
         let ctx = self.refresh_df_context();
         let refresh = self.refresh.read().await;
 
-        refresh
-            .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
-            .context(super::InvalidTimeColumnTimeFormatSnafu)?;
-
         let column =
             refresh
                 .time_column
@@ -697,11 +693,10 @@ impl RefreshTask {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
                 }
-                Some(TimeFormat::UnixSeconds) => {
+                Some(TimeFormat::UnixSeconds) | None => {
                     value *= 1_000_000_000;
                 }
-                Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestamptz)
-                | None => unreachable!("refresh.validate_time_format should've returned error"),
+                Some(TimeFormat::ISO8601) => (),
             }
         };
 
