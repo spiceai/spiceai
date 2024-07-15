@@ -34,8 +34,6 @@ pub enum Mode {
 #[serde(rename_all = "snake_case")]
 pub enum TimeFormat {
     #[default]
-    Timestamp,
-    Timestamptz,
     UnixSeconds,
     UnixMillis,
     #[serde(rename = "ISO8601")]
