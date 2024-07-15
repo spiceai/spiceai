@@ -36,7 +36,7 @@ version = "0.15.2-alpha"
 arrow = "52.0.0"
 arrow-buffer = "52.0.0"
 arrow-flight = "52.0.0"
-arrow-odbc = { version = "11.1.0" }
+arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
@@ -49,11 +49,11 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
   "tokio_io",
   "tls",
 ] }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f865563b1ae8670df21e9a054c5307112f85fbf6" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1becf0c961da12993009f53216ded2099c38d425" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "1becf0c961da12993009f53216ded2099c38d425" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8216e56dde181a2c49ae5be8ac6efc0798b61dc2" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
+datafusion = "40.0.0"
+datafusion-federation = "0.1"
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "f430401ef978c3687a1c8d10342c5032ce842952" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c9976310089445e4676ef92c3108524133121cb1" }
+duckdb = "1.0.0"
 fundu = "2.0.0"
 futures = "0.3.30"
 globset = "0.4.14"
@@ -62,7 +62,7 @@ metrics = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f3
 metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.1" }
-odbc-api = { version = "7.0.0" }
+odbc-api = { version = "8.1.2" }
 pem = "3.0.4"
 r2d2 = "0.8.10"
 regex = "1.10.3"
@@ -89,3 +89,8 @@ tonic = "0.11.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "361a7175744419ee602b4450cdc99b887695d3cb" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f430401ef978c3687a1c8d10342c5032ce842952" }
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }

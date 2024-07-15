@@ -19,7 +19,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use crate::accelerated_table::refresh;
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
@@ -183,9 +182,6 @@ pub enum Error {
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
-
-    #[snafu(display("{source}"))]
-    InvalidTimeColumnTimeFormat { source: refresh::Error },
 }
 
 pub enum Table {
@@ -237,10 +233,10 @@ impl DataFusion {
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
         let state = SessionState::new_with_config_rt(df_config, default_runtime_env())
-            .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
 
         let ctx = SessionContext::new_with_state(state);
+        ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
         ctx.register_udf(crate::datafusion::udf::Least::new().into());
@@ -566,7 +562,7 @@ impl DataFusion {
 
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
-            Arc::clone(&source_schema),
+            source_schema,
             source_table_provider.constraints(),
             &acceleration_settings,
             acceleration_secret,
@@ -594,10 +590,6 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-
-        refresh
-            .validate_time_format(dataset.name.to_string(), &source_schema)
-            .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.clone(),
