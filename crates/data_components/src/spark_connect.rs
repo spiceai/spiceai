@@ -235,6 +235,10 @@ impl DisplayAs for SparkConnectExecutionPlan {
 }
 
 impl ExecutionPlan for SparkConnectExecutionPlan {
+    fn name(&self) -> &str {
+        "SparkConnectExecutionPlan"
+    }
+
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
