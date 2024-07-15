@@ -232,7 +232,7 @@ impl DataFusion {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let mut state = SessionState::new_with_config_rt(df_config, default_runtime_env())
+        let state = SessionState::new_with_config_rt(df_config, default_runtime_env())
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
 
         let ctx = SessionContext::new_with_state(state);

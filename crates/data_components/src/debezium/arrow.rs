@@ -234,7 +234,7 @@ fn append_field_value_to_builder(
                 tz_builder.append_option(time_millis);
             }
             _ => TimestampNotSupportedSnafu {
-                unit: unit.clone(),
+                unit: *unit,
                 time_zone: time_zone.as_ref().map(|tz| tz.as_ref().to_string()),
             }
             .fail()?,
