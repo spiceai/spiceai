@@ -23,6 +23,9 @@ use data_components::flight::FlightFactory;
 use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion::sql::unparser::dialect::Dialect;
+use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
@@ -55,6 +58,22 @@ pub struct Dremio {
     flight_factory: FlightFactory,
 }
 
+pub struct DremioDialect {}
+
+impl Dialect for DremioDialect {
+    fn use_timestamp_for_date64(&self) -> bool {
+        true
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        IntervalStyle::SQLStandard
+    }
+
+    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+        DefaultDialect {}.identifier_quote_style(identifier)
+    }
+}
+
 impl DataConnectorFactory for Dremio {
     fn create(
         secret: Option<Secret>,
@@ -81,7 +100,8 @@ impl DataConnectorFactory for Dremio {
             )
             .await
             .context(UnableToCreateFlightClientSnafu)?;
-            let flight_factory = FlightFactory::new("dremio", flight_client);
+            let flight_factory =
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
             Ok(Arc::new(Self { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
