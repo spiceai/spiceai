@@ -51,16 +51,18 @@ runs:
         mv sccache-v0.8.1-i686-unknown-linux-musl/sccache $HOME/.cargo/bin/sccache
         chmod +x $HOME/.cargo/bin/sccache
         rm -rf sccache-v0.8.1-i686-unknown-linux-musl.tar.gz sccache-v0.8.1-i686-unknown-linux-musl
-        export SCCACHE_PATH=$HOME/.cargo/bin/sccache
 
+    - name: Initialize sccache environnement
+      shell: bash
+      run: |
+        echo SCCACHE_CACHE=$(sccache --show-stats | grep Local | cut -d '"' -f2) >> $GITHUB_ENV
+        echo DATE_STRING=$(date +'%Y%m%d') >> $GITHUB_ENV
+        echo SCCACHE_PATH=$HOME/.cargo/bin/sccache >> $GITHUB_ENV
+        sccache --stop-server
+    
     - name: Recover sccache cache
       uses: actions/cache@v3
       with:
         path: ${{env.SCCACHE_CACHE}}
         key: sccache-cache-${{runner.os}}-0-${{env.DATE_STRING}}
         restore-keys: sccache-cache-${{runner.os}}-0
-    
-    - name: Start sccache
-      shell: bash
-      working-directory: ${{github.workspace}}
-      run: sccache --start-server
