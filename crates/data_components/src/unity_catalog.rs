@@ -286,21 +286,6 @@ pub struct UCColumn {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCCatalog {
     pub name: String,
-    pub owner: String,
-    pub storage_root: String,
-    pub catalog_type: String,
-    pub metastore_id: String,
-    pub created_at: i64,
-    pub created_by: String,
-    pub updated_at: i64,
-    pub updated_by: String,
-    pub storage_location: String,
-    pub isolation_mode: String,
-    pub browse_only: bool,
-    pub id: String,
-    pub full_name: String,
-    pub securable_type: String,
-    pub securable_kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -312,17 +297,4 @@ pub struct UCSchemaEnvelope {
 pub struct UCSchema {
     pub name: String,
     pub catalog_name: String,
-    pub owner: String,
-    pub comment: String,
-    pub metastore_id: String,
-    pub full_name: String,
-    pub created_at: i64,
-    pub created_by: String,
-    pub updated_at: i64,
-    pub updated_by: String,
-    pub catalog_type: String,
-    pub schema_id: String,
-    pub securable_type: String,
-    pub securable_kind: String,
-    pub browse_only: bool,
 }
