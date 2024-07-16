@@ -52,7 +52,8 @@ use metrics::SetRecorderError;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use secrets::{spicepod_secret_store_type, Secret, SecretMap};
+use secrecy::SecretString;
+use secrets::{spicepod_secret_store_type, SecretMap};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
@@ -984,58 +985,24 @@ impl Runtime {
     async fn get_dataconnector_from_source(
         source: &str,
         secrets_provider: &secrets::SecretsProvider,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, String>,
     ) -> Result<Arc<dyn DataConnector>> {
-        let secret = secrets_provider.get_secret(source).await.context(
-            UnableToGetSecretForDataConnectorSnafu {
-                data_connector: source,
-            },
-        )?;
+        // let secret = secrets_provider.get_secret(source).await.context(
+        //     UnableToGetSecretForDataConnectorSnafu {
+        //         data_connector: source,
+        //     },
+        // )?;
 
-        match dataconnector::create_new_connector(source, secret, params).await {
+        // TODO inject secrets into params
+        let secret_map: SecretMap = params.into();
+
+        match dataconnector::create_new_connector(source, secret_map.into_map()).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,
             }
             .fail(),
         }
-    }
-
-    async fn get_acceleration_secret(
-        ds: &Dataset,
-        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-    ) -> Result<Option<Secret>> {
-        let source = ds.source();
-        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
-
-        let acceleration_settings =
-            ds.acceleration
-                .as_ref()
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: ds.name.to_string(),
-                })?;
-
-        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
-            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
-        }
-
-        let accelerator_engine = acceleration_settings.engine;
-        let secret_key = acceleration_settings
-            .engine_secret
-            .clone()
-            .unwrap_or(format!("{accelerator_engine}_engine").to_lowercase());
-
-        let secrets_provider_read_guard = secrets_provider.read().await;
-        let acceleration_secret = secrets_provider_read_guard
-            .get_secret(&secret_key)
-            .await
-            .context(UnableToGetSecretForDataConnectorSnafu {
-                data_connector: source,
-            })?;
-
-        drop(secrets_provider_read_guard);
-
-        Ok(acceleration_secret)
     }
 
     async fn register_dataset(
@@ -1095,7 +1062,11 @@ impl Runtime {
                     name: ds.name.to_string(),
                 })?;
         let accelerator_engine = acceleration_settings.engine;
-        let acceleration_secret = Runtime::get_acceleration_secret(ds, secrets_provider).await?;
+        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
+
+        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
+            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
+        }
 
         dataaccelerator::get_accelerator_engine(accelerator_engine)
             .await
@@ -1108,7 +1079,6 @@ impl Runtime {
             datafusion::Table::Accelerated {
                 source: connector,
                 federated_read_table,
-                acceleration_secret,
                 accelerated_table,
             },
         )

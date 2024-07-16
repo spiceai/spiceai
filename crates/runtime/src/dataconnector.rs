@@ -41,6 +41,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -51,7 +52,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::secrets::Secret;
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;
@@ -216,8 +216,7 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
 type NewDataConnectorFn = dyn Fn(
-        Option<Secret>,
-        Arc<HashMap<String, String>>,
+        HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
     + Send;
 
@@ -229,8 +228,7 @@ lazy_static! {
 pub async fn register_connector_factory(
     name: &str,
     connector_factory: impl Fn(
-            Option<Secret>,
-            Arc<HashMap<String, String>>,
+            HashMap<String, SecretString>,
         ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
         + Send
         + 'static,
@@ -248,15 +246,14 @@ pub async fn register_connector_factory(
 #[allow(clippy::implicit_hasher)]
 pub async fn create_new_connector(
     name: &str,
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
     let connector_factory = guard.get(name);
 
     match connector_factory {
-        Some(factory) => Some(factory(secret, params).await),
+        Some(factory) => Some(factory(params).await),
         None => None,
     }
 }
@@ -303,8 +300,7 @@ pub async fn register_all() {
 
 pub trait DataConnectorFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: Arc<HashMap<String, SecretString>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 }
 

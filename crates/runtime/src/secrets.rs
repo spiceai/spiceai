@@ -25,6 +25,7 @@ pub mod kubernetes;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -51,8 +52,27 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[async_trait]
-pub trait SecretStore {
-    async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>>;
+pub trait SecretStore: Send + Sync {
+    async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<String>>;
+
+    async fn get_fallback_secret(&self, key: &str) -> AnyErrorResult<Option<String>>;
+}
+
+pub struct Secrets {
+    stores: HashMap<String, Arc<dyn SecretStore>>,
+}
+
+pub struct ParamStr<'a>(&'a str);
+pub struct SecretKey<'a>(&'a str);
+
+impl Secrets {
+    async fn inject_secrets(&self, param_str: ParamStr<'_>) -> SecretString {
+        todo!();
+    }
+
+    async fn get_secret(&self, key: SecretKey<'_>) -> AnyErrorResult<Option<SecretString>> {
+        todo!();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,54 +137,6 @@ impl From<&HashMap<String, String>> for SecretMap {
         map.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Secret {
-    data: SecretMap,
-}
-
-impl Secret {
-    #[must_use]
-    pub fn new(data: HashMap<String, String>) -> Self {
-        let data = data
-            .into_iter()
-            .map(|(key, value)| (key, SecretString::from(value)))
-            .collect();
-
-        Self { data }
-    }
-
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<&str> {
-        let secret_value = self.data.get(key.to_lowercase().as_str())?;
-        let exposed_secret = secret_value.expose_secret();
-        Some(exposed_secret)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &SecretString)> {
-        self.data.iter()
-    }
-
-    pub fn add(&mut self, key: String, value: String) {
-        self.data.insert(key, SecretString::from(value));
-    }
-
-    pub fn insert_to_params(
-        &self,
-        params: &mut SecretMap,
-        secret_param_key: &str,
-        param_key: &str,
-    ) {
-        let secret_param_val = match params.get(secret_param_key) {
-            Some(val) => val.expose_secret(),
-            None => param_key,
-        };
-
-        if let Some(secret_val) = self.data.get(secret_param_val.to_lowercase().as_str()) {
-            params.insert(param_key.to_string(), secret_val.clone());
-        }
     }
 }
 
@@ -265,51 +237,6 @@ impl SecretsProvider {
 
         Ok(())
     }
-
-    /// # Errors
-    ///
-    /// Will return `None` if the secret store is not initialized or pass error from the secret store.
-    pub async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>> {
-        if let Some(ref secret_store) = self.secret_store {
-            secret_store.get_secret(secret_name).await
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-/// Retrieves an associated value from either the secret store or in the component's params. For
-/// secrets, the associated key into secrets, is the value associated to the `param`
-/// key: `secret_param_key`. Fallback to a hardcoded value in `params` (accessed via `param_key`)
-/// if:
-///   1. There is no provided secret
-///   2. There is no entry with key `secret_param_key` in params
-///   3. For a param entry `(secret_param_key, val)`, there is no secret with key `val`.
-///
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn get_secret_or_param(
-    params: &HashMap<String, String>,
-    secret: &Option<Secret>,
-    secret_param_key: &str,
-    param_key: &str,
-) -> Option<String> {
-    let secret_param_val = match params.get(secret_param_key) {
-        Some(val) => val,
-        None => param_key,
-    };
-
-    if let Some(secrets) = secret {
-        if let Some(secret_val) = secrets.get(secret_param_val) {
-            return Some(secret_val.to_string());
-        };
-    };
-
-    if let Some(param_val) = params.get(param_key) {
-        return Some(param_val.to_string());
-    };
-
-    None
 }
 
 #[cfg(test)]
