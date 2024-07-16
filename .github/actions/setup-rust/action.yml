@@ -53,13 +53,6 @@ runs:
         rm -rf sccache-v0.8.1-i686-unknown-linux-musl.tar.gz sccache-v0.8.1-i686-unknown-linux-musl
         export SCCACHE_PATH=$HOME/.cargo/bin/sccache
 
-    - name: Initialize sccache environnement
-      shell: bash
-      run: |
-        echo SCCACHE_CACHE=$(sccache --show-stats | grep Local | cut -d '"' -f2) >> $GITHUB_ENV
-        echo DATE_STRING=$(date +'%Y%m%d') >> $GITHUB_ENV
-        sccache --stop-server
-    
     - name: Recover sccache cache
       uses: actions/cache@v3
       with:
