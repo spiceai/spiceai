@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::accelerated_table::refresh;
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
@@ -182,6 +183,9 @@ pub enum Error {
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("{source}"))]
+    InvalidTimeColumnTimeFormat { source: refresh::Error },
 }
 
 pub enum Table {
@@ -562,7 +566,7 @@ impl DataFusion {
 
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
-            source_schema,
+            Arc::clone(&source_schema),
             source_table_provider.constraints(),
             &acceleration_settings,
             acceleration_secret,
@@ -590,6 +594,10 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
+
+        refresh
+            .validate_time_format(dataset.name.to_string(), &source_schema)
+            .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.clone(),
