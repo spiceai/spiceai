@@ -17,7 +17,6 @@ limitations under the License.
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::metadata::AcceleratedMetadata;
-use crate::secrets::Secret;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -26,6 +25,7 @@ use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
@@ -54,14 +54,14 @@ pub struct Debezium {
 }
 
 impl Debezium {
-    pub fn new(params: &Arc<HashMap<String, String>>) -> Result<Self> {
+    pub fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let transport = params
             .get("debezium_transport")
-            .map_or("kafka", String::as_str);
+            .map_or("kafka", |p| p.expose_secret());
 
         let message_format = params
             .get("debezium_message_format")
-            .map_or("json", String::as_str);
+            .map_or("json", |p| p.expose_secret());
 
         if transport != "kafka" {
             return InvalidTransportSnafu.fail();
@@ -72,6 +72,7 @@ impl Debezium {
 
         let kakfa_brokers = params
             .get("kafka_bootstrap_servers")
+            .map(|p| p.expose_secret())
             .context(MissingKafkaBootstrapServersSnafu)?;
 
         Ok(Self {
@@ -82,11 +83,10 @@ impl Debezium {
 
 impl DataConnectorFactory for Debezium {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let debezium = Debezium::new(&params)?;
+            let debezium = Debezium::new(params)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
     }

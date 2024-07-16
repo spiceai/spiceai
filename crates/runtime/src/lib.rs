@@ -633,68 +633,48 @@ impl Runtime {
 
     async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
-            Arc::clone(&self.secrets_provider);
-
         let catalog = catalog.clone();
 
-        let secrets_provider = shared_secrets_provider.read().await;
-
         let source = catalog.provider;
-        let params = Arc::new(catalog.params.clone());
-        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
-            &source,
-            &secrets_provider,
-            Arc::clone(&params),
-        )
-        .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let catalog_name = &catalog.name;
-                status::update_catalog(catalog_name, status::ComponentStatus::Error);
-                metrics::counter!("catalogs_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: catalog_name.clone(),
+        let params = catalog.params.clone();
+        let data_connector: Arc<dyn DataConnector> =
+            match self.get_dataconnector_from_source(&source, params).await {
+                Ok(data_connector) => data_connector,
+                Err(err) => {
+                    let catalog_name = &catalog.name;
+                    status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                    metrics::counter!("catalogs_load_error").increment(1);
+                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: catalog_name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-        };
+            };
 
         Ok(data_connector)
     }
 
     async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
-            Arc::clone(&self.secrets_provider);
-
         let ds = ds.clone();
 
-        let secrets_provider = shared_secrets_provider.read().await;
-
         let source = ds.source();
-        let params = Arc::new(ds.params.clone());
-        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
-            &source,
-            &secrets_provider,
-            Arc::clone(&params),
-        )
-        .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let ds_name = &ds.name;
-                status::update_dataset(ds_name, status::ComponentStatus::Error);
-                metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: ds.name.clone(),
+        let params = ds.params.clone();
+        let data_connector: Arc<dyn DataConnector> =
+            match self.get_dataconnector_from_source(&source, params).await {
+                Ok(data_connector) => data_connector,
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    status::update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::counter!("datasets_load_error").increment(1);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: ds.name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-        };
+            };
 
         Ok(data_connector)
     }
@@ -759,13 +739,9 @@ impl Runtime {
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
-        let df = Arc::clone(&self.df);
         let ds = ds.clone();
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
-            Arc::clone(&self.secrets_provider);
-
         if let Some(acceleration) = &ds.acceleration {
             if data_connector.resolve_refresh_mode(acceleration.refresh_mode)
                 == RefreshMode::Changes
@@ -794,19 +770,17 @@ impl Runtime {
             }
         };
 
-        match Runtime::register_dataset(
-            &ds,
-            RegisterDatasetContext {
-                data_connector: Arc::clone(&data_connector),
-                federated_read_table: read_provider,
-                df: Arc::clone(&df),
-                source,
-                secrets_provider: Arc::clone(&shared_secrets_provider),
-                accelerated_table,
-                embedding: Arc::clone(&self.embeds),
-            },
-        )
-        .await
+        match self
+            .register_dataset(
+                &ds,
+                RegisterDatasetContext {
+                    data_connector: Arc::clone(&data_connector),
+                    federated_read_table: read_provider,
+                    source,
+                    accelerated_table,
+                },
+            )
+            .await
         {
             Ok(()) => {
                 tracing::info!(
@@ -950,9 +924,6 @@ impl Runtime {
         ds: &Dataset,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let acceleration_secret =
-            Runtime::get_acceleration_secret(ds, Arc::clone(&self.secrets_provider)).await?;
-
         let read_table = connector.read_provider(ds).await.map_err(|_| {
             UnableToLoadDatasetConnectorSnafu {
                 dataset: ds.name.clone(),
@@ -963,7 +934,7 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), read_table, acceleration_secret)
+            .create_accelerated_table(ds, Arc::clone(&connector), read_table)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -983,8 +954,8 @@ impl Runtime {
     }
 
     async fn get_dataconnector_from_source(
+        &self,
         source: &str,
-        secrets_provider: &secrets::SecretsProvider,
         params: HashMap<String, String>,
     ) -> Result<Arc<dyn DataConnector>> {
         // let secret = secrets_provider.get_secret(source).await.context(
@@ -1006,17 +977,15 @@ impl Runtime {
     }
 
     async fn register_dataset(
+        &self,
         ds: impl Borrow<Dataset>,
         register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
         let RegisterDatasetContext {
             data_connector,
             federated_read_table,
-            df,
             source,
-            secrets_provider,
             accelerated_table,
-            embedding,
         } = register_dataset_ctx;
 
         let ds = ds.borrow();
@@ -1029,7 +998,7 @@ impl Runtime {
         } else {
             Arc::new(EmbeddingConnector::new(
                 data_connector,
-                Arc::clone(&embedding),
+                Arc::clone(&self.embeds),
             )) as Arc<dyn DataConnector>
         };
 
@@ -1040,7 +1009,8 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            return df
+            return self
+                .df
                 .register_table(
                     ds,
                     datafusion::Table::Federated {
@@ -1074,18 +1044,19 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        df.register_table(
-            ds,
-            datafusion::Table::Accelerated {
-                source: connector,
-                federated_read_table,
-                accelerated_table,
-            },
-        )
-        .await
-        .context(UnableToAttachDataConnectorSnafu {
-            data_connector: source,
-        })
+        self.df
+            .register_table(
+                ds,
+                datafusion::Table::Accelerated {
+                    source: connector,
+                    federated_read_table,
+                    accelerated_table,
+                },
+            )
+            .await
+            .context(UnableToAttachDataConnectorSnafu {
+                data_connector: source,
+            })
     }
 
     async fn get_params_with_secrets(&self, params: &HashMap<String, String>) -> Result<SecretMap> {
@@ -1094,17 +1065,7 @@ impl Runtime {
 
         let mut params_with_secrets: SecretMap = params.clone().into();
 
-        if let (Some(secret_name), Some(secret_key)) =
-            (params.get("secret_name"), params.get("secret_key"))
-        {
-            if let Some(secret) = secrets_provider
-                .get_secret(secret_name)
-                .await
-                .context(UnableToGetSecretForLLMSnafu)?
-            {
-                secret.insert_to_params(&mut params_with_secrets, secret_key, secret_key);
-            }
-        }
+        // TODO inject secrets into params
 
         Ok(params_with_secrets)
     }
@@ -1535,9 +1496,6 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
 pub struct RegisterDatasetContext {
     data_connector: Arc<dyn DataConnector>,
     federated_read_table: Arc<dyn TableProvider>,
-    df: Arc<DataFusion>,
     source: String,
-    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     accelerated_table: Option<AcceleratedTable>,
-    embedding: Arc<RwLock<EmbeddingModelStore>>,
 }

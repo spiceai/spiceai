@@ -75,7 +75,7 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Result<Self, Error> {
+    pub fn new(params: HashMap<String, SecretString>) -> Result<Self, Error> {
         let connection_string = params
             .get("odbc_connection_string")
             .map(Secret::expose_secret)
@@ -87,7 +87,7 @@ impl ODBCPool {
         let connection_id = hash_string(&connection_string);
 
         Ok(Self {
-            params,
+            params: params.into(),
             connection_string,
             connection_id,
             pool: &ENV,

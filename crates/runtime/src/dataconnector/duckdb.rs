@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -25,6 +24,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use duckdb::AccessMode;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -76,15 +76,15 @@ impl DuckDB {
 
 impl DataConnectorFactory for DuckDB {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let duckdb_factory = if let Some(db_path) = params.get("open") {
-                Self::create_file(db_path)?
-            } else {
-                Self::create_in_memory()?
-            };
+            let duckdb_factory =
+                if let Some(db_path) = params.get("open").map(|s| s.expose_secret()) {
+                    Self::create_file(db_path)?
+                } else {
+                    Self::create_in_memory()?
+                };
 
             Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
         })
