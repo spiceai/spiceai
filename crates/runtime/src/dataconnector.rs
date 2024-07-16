@@ -41,7 +41,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -300,7 +300,7 @@ pub async fn register_all() {
 
 pub trait DataConnectorFactory {
     fn create(
-        params: Arc<HashMap<String, SecretString>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 }
 
@@ -383,7 +383,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
-    fn get_params(&self) -> &HashMap<String, String>;
+    fn get_params(&self) -> &HashMap<String, SecretString>;
 
     #[must_use]
     fn get_session_context() -> SessionContext {
@@ -456,9 +456,15 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let params = self.get_params();
-        let extension = params.get("file_extension").cloned();
+        let extension = params
+            .get("file_extension")
+            .map(|f| f.expose_secret())
+            .cloned();
 
-        match params.get("file_format").map(String::as_str) {
+        match params
+            .get("file_format")
+            .map(|f| f.expose_secret().as_str())
+        {
             Some("csv") => Ok((
                 Some(self.get_csv_format(params)?),
                 extension.unwrap_or(".csv".to_string()),
@@ -495,25 +501,30 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_csv_format(
         &self,
-        params: &HashMap<String, String>,
+        params: &HashMap<String, SecretString>,
     ) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
     {
-        let has_header = params.get("has_header").map_or(true, |f| f == "true");
-        let quote = params
-            .get("quote")
-            .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
+        let has_header = params.get("has_header").map_or(true, |f| {
+            f.expose_secret().as_str().eq_ignore_ascii_case("true")
+        });
+        let quote = params.get("quote").map_or(b'"', |f| {
+            *f.expose_secret().as_bytes().first().unwrap_or(&b'"')
+        });
         let escape = params
             .get("escape")
-            .and_then(|f| f.as_bytes().first().copied());
-        let schema_infer_max_rec = params
-            .get("schema_infer_max_records")
-            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
-        let delimiter = params
-            .get("delimiter")
-            .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
-        let compression_type = params.get("compression_type").map_or("", |f| f);
+            .and_then(|f| f.expose_secret().as_bytes().first().copied());
+        let schema_infer_max_rec = params.get("schema_infer_max_records").map_or_else(
+            || 1000,
+            |f| usize::from_str(f.expose_secret().as_str()).map_or(1000, |f| f),
+        );
+        let delimiter = params.get("delimiter").map_or(b',', |f| {
+            *f.expose_secret().as_bytes().first().unwrap_or(&b',')
+        });
+        let compression_type = params
+            .get("compression_type")
+            .map_or("", |f| f.expose_secret().as_str());
 
         Ok(Arc::new(
             CsvFormat::default()
