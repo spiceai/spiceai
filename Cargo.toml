@@ -30,7 +30,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.78"
-version = "0.15.2-alpha"
+version = "0.16.0-beta"
 
 [workspace.dependencies]
 arrow = "52.0.0"
@@ -51,8 +51,8 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
 ] }
 datafusion = "40.0.0"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "f430401ef978c3687a1c8d10342c5032ce842952" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c9976310089445e4676ef92c3108524133121cb1" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "02081887de7b64dfd816ef86716f8b0853ae3196" }
 duckdb = "1.0.0"
 fundu = "2.0.0"
 futures = "0.3.30"
@@ -72,7 +72,7 @@ serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.1"
 serde_yaml = "0.9.30"
 snafu = "0.8.0"
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 tokio = { version = "1.35.1", features = [
@@ -92,5 +92,5 @@ uuid = "1.9.1"
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "fa8bf6be7309c4234523a1a47d005384125fc5d3" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f430401ef978c3687a1c8d10342c5032ce842952" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
