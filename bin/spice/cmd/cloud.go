@@ -110,7 +110,7 @@ var chatCmd = &cobra.Command{
 
 			for _, char := range message {
 				cmd.Printf("%c", char)
-				time.Sleep(30 * time.Millisecond)
+				time.Sleep(10 * time.Millisecond)
 			}
 
 			messages = append(messages, Message{Role: "assistant", Content: message})
