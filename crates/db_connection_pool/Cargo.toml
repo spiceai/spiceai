@@ -62,7 +62,13 @@ clickhouse = [
 ]
 duckdb = ["dep:duckdb", "dep:r2d2", "datafusion-table-providers/duckdb"]
 mysql = ["dep:mysql_async", "datafusion-table-providers/mysql"]
-odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio", "dep:dyn-clone", "dep:sha2"]
+odbc = [
+  "dep:odbc-api",
+  "dep:arrow-odbc",
+  "dep:tokio",
+  "dep:dyn-clone",
+  "dep:sha2",
+]
 postgres = [
   "dep:bb8",
   "dep:bb8-postgres",
@@ -75,4 +81,8 @@ postgres = [
   "datafusion-table-providers/postgres",
 ]
 snowflake = ["dep:snowflake-api", "dep:pkcs8"]
-sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "datafusion-table-providers/sqlite"]
+sqlite = [
+  "dep:rusqlite",
+  "dep:tokio-rusqlite",
+  "datafusion-table-providers/sqlite",
+]

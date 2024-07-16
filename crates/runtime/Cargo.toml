@@ -109,10 +109,10 @@ anyhow = "1.0.86"
 async-graphql = "7.0.5"
 async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
-metrics-util = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
+metrics-util = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
 rand = "0.8.5"
-tracing-subscriber.workspace = true
 spice-cloud = { path = "../spice_cloud" }
+tracing-subscriber.workspace = true
 
 [features]
 aws-secrets-manager = [
@@ -126,10 +126,10 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "data_components/clickhouse",
 ]
-delta_lake = ["data_components/delta_lake"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager"]
+delta_lake = ["data_components/delta_lake"]
 dev = []
 dremio = []
 duckdb = [
@@ -142,11 +142,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
 models = ["model_components/full", "llms/mistralrs", "llms/candle"]
-mysql = [
-  "dep:mysql_async",
-  "db_connection_pool/mysql",
-  "data_components/mysql",
-]
+mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
 postgres = [
   "dep:bb8",
