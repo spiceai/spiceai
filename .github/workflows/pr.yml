@@ -75,12 +75,16 @@ jobs:
 
       - run: make ci test
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
       
       - name: Run sccache stat for check
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
+      
+      - name: Cleanup sccache
+        working-directory: ${{github.workspace}}
+        shell: bash
+        run: sccache --stop-server
 
   build-docker:
     name: Build Docker Image
