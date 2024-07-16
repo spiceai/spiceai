@@ -17,17 +17,16 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 runtime = { path = "../../crates/runtime" }
 snafu.workspace = true
+snmalloc-rs = "0.3.6"
 spice-cloud = { path = "../../crates/spice_cloud" }
 spicepod = { path = "../../crates/spicepod" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-snmalloc-rs = "0.3.6"
 
 [features]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
-delta_lake = ["runtime/delta_lake"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
@@ -45,6 +44,7 @@ default = [
   "ftp",
   "debezium",
 ]
+delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["runtime/dremio"]
 duckdb = ["runtime/duckdb"]
