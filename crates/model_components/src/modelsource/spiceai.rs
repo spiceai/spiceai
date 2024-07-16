@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub struct SpiceAI {}
-
 use super::ModelSource;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, Secret, SecretString};
@@ -28,6 +26,11 @@ use std::string::ToString;
 use std::sync::Arc;
 
 use regex::Regex;
+
+pub const SPICEAI_SOURCE: &str = "spice.ai";
+pub const SPICEAI_PREFIX: &str = "spice.ai:";
+
+pub struct SpiceAI {}
 
 #[async_trait]
 impl ModelSource for SpiceAI {

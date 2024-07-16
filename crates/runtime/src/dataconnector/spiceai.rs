@@ -37,6 +37,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
+pub const SPICEAI_SOURCE: &str = "spice.ai";
+pub const SPICEAI_PREFIX: &str = "spice.ai:";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to parse SpiceAI dataset path: {dataset_path}"))]

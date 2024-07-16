@@ -19,8 +19,8 @@
           - name: Set up Spice.ai API Key
             run: |
               mkdir -p ~/.spice
-              echo "[spiceai]" > ~/.spice/auth
-              echo "  [spiceai.params]" >> ~/.spice/auth
+              echo "[spice.ai]" > ~/.spice/auth
+              echo "  [spice.ai.params]" >> ~/.spice/auth
               echo '    key = "${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' >> ~/.spice/auth
     
           - run: cargo bench -p runtime

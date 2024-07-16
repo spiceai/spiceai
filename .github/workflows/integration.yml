@@ -47,8 +47,8 @@ jobs:
       - name: Set up Spice.ai API Key
         run: |
           mkdir -p ~/.spice
-          echo "[spiceai]" > ~/.spice/auth
-          echo "  [spiceai.params]" >> ~/.spice/auth
+          echo "[spice.ai]" > ~/.spice/auth
+          echo "  [spice.ai.params]" >> ~/.spice/auth
           echo '    key = "${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' >> ~/.spice/auth
 
       - name: Run integration test

@@ -17,7 +17,7 @@ limitations under the License.
 package api
 
 const (
-	AUTH_TYPE_SPICE_AI        = "spiceai"
+	AUTH_TYPE_SPICE_AI        = "spice.ai"
 	AUTH_TYPE_DREMIO          = "dremio"
 	AUTH_TYPE_S3              = "s3"
 	AUTH_TYPE_DATABRICKS      = "databricks"

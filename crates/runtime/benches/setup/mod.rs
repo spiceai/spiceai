@@ -81,11 +81,11 @@ fn init_tracing() {
 }
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("spiceai:{path}"), name.to_string())
+    Dataset::new(format!("spice.ai:{path}"), name.to_string())
 }
 
 fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
-    let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
+    let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
     ds.mode = Mode::ReadWrite;
     ds.replication = Some(Replication { enabled: true });
     ds

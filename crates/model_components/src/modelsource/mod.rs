@@ -16,6 +16,8 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use crate::modelformat::ModelFormat;
+use crate::modelsource::spiceai::{SPICEAI_PREFIX, SPICEAI_SOURCE};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -23,8 +25,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
-
-use crate::modelformat::ModelFormat;
 
 #[cfg(feature = "full")]
 pub mod huggingface;
@@ -88,7 +88,7 @@ impl fmt::Display for ModelSourceType {
         match self {
             ModelSourceType::Huggingface => write!(f, "huggingface"),
             ModelSourceType::Local => write!(f, "file"),
-            ModelSourceType::SpiceAI => write!(f, "spiceai"),
+            ModelSourceType::SpiceAI => write!(f, "{SPICEAI_SOURCE}"),
         }
     }
 }
@@ -109,7 +109,7 @@ impl FromStr for ModelSourceType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            s if s.starts_with("spiceai:") => Ok(ModelSourceType::SpiceAI),
+            s if s.starts_with(SPICEAI_PREFIX) => Ok(ModelSourceType::SpiceAI),
             s if s.starts_with("huggingface:") => Ok(ModelSourceType::Huggingface),
             s if s.starts_with("file:/") => Ok(ModelSourceType::Local),
             _ => Err(ParseError {
@@ -168,7 +168,7 @@ pub fn source(from: &str) -> ModelSourceType {
 
 #[must_use]
 pub fn path(from: &str) -> String {
-    let sources = vec!["spiceai:"];
+    let sources = vec![SPICEAI_PREFIX];
 
     for source in &sources {
         if from.starts_with(source) {
