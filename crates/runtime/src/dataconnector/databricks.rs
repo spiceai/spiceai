@@ -74,7 +74,7 @@ impl Databricks {
     pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let mode = params
             .get("mode")
-            .map(|m| m.expose_secret())
+            .map(ExposeSecret::expose_secret)
             .cloned()
             .unwrap_or_default();
 

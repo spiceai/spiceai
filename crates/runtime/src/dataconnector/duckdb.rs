@@ -80,7 +80,7 @@ impl DataConnectorFactory for DuckDB {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
-                if let Some(db_path) = params.get("open").map(|s| s.expose_secret()) {
+                if let Some(db_path) = params.get("open").map(ExposeSecret::expose_secret) {
                     Self::create_file(db_path)?
                 } else {
                     Self::create_in_memory()?

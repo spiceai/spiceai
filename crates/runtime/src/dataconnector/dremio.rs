@@ -82,7 +82,7 @@ impl DataConnectorFactory for Dremio {
         Box::pin(async move {
             let endpoint: String = params
                 .get("endpoint")
-                .map(|s| s.expose_secret())
+                .map(ExposeSecret::expose_secret)
                 .cloned()
                 .context(MissingEndpointParameterSnafu)?;
 

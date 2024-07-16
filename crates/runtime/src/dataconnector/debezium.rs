@@ -54,14 +54,15 @@ pub struct Debezium {
 }
 
 impl Debezium {
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let transport = params
             .get("debezium_transport")
-            .map_or("kafka", |p| p.expose_secret());
+            .map_or("kafka", |p| p.expose_secret().as_str());
 
         let message_format = params
             .get("debezium_message_format")
-            .map_or("json", |p| p.expose_secret());
+            .map_or("json", |p| p.expose_secret().as_str());
 
         if transport != "kafka" {
             return InvalidTransportSnafu.fail();
@@ -72,7 +73,7 @@ impl Debezium {
 
         let kakfa_brokers = params
             .get("kafka_bootstrap_servers")
-            .map(|p| p.expose_secret())
+            .map(ExposeSecret::expose_secret)
             .context(MissingKafkaBootstrapServersSnafu)?;
 
         Ok(Self {

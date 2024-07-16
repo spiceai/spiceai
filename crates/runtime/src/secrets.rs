@@ -17,7 +17,6 @@ limitations under the License.
 #[cfg(feature = "aws-secrets-manager")]
 pub mod aws_secrets_manager;
 pub mod env;
-pub mod file;
 #[cfg(feature = "keyring-secret-store")]
 pub mod keyring;
 pub mod kubernetes;
@@ -32,7 +31,6 @@ use async_trait::async_trait;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
-use crate::secrets::file::FileSecretStore;
 use spicepod::component::secrets::SpiceSecretStore;
 
 pub use secrecy::ExposeSecret;
@@ -51,11 +49,12 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+pub struct WithPrefix(pub bool);
+
 #[async_trait]
 pub trait SecretStore: Send + Sync {
+    /// `get_secret` will load a secret from the secret store with the given key.
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<String>>;
-
-    async fn get_fallback_secret(&self, key: &str) -> AnyErrorResult<Option<String>>;
 }
 
 pub struct Secrets {
@@ -141,25 +140,23 @@ impl From<&HashMap<String, String>> for SecretMap {
 }
 
 pub enum SecretStoreType {
-    File,
     Env,
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
-    Kubernetes,
+    Kubernetes(String),
     #[cfg(feature = "aws-secrets-manager")]
-    AwsSecretsManager,
+    AwsSecretsManager(String),
 }
 
 #[must_use]
 pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStoreType> {
     match store {
-        SpiceSecretStore::File => Some(SecretStoreType::File),
         SpiceSecretStore::Env => Some(SecretStoreType::Env),
         #[cfg(feature = "keyring-secret-store")]
         SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
-        SpiceSecretStore::Kubernetes => Some(SecretStoreType::Kubernetes),
+        SpiceSecretStore::Kubernetes => todo!(),
         #[cfg(feature = "aws-secrets-manager")]
-        SpiceSecretStore::AwsSecretsManager => Some(SecretStoreType::AwsSecretsManager),
+        SpiceSecretStore::AwsSecretsManager => todo!(),
         #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
         _ => None,
     }
@@ -174,7 +171,7 @@ pub struct SecretsProvider {
 impl Default for SecretsProvider {
     fn default() -> Self {
         Self {
-            store: SecretStoreType::File,
+            store: SecretStoreType::Env,
             secret_store: None,
         }
     }
@@ -192,20 +189,9 @@ impl SecretsProvider {
     ///
     /// Returns an error if the secrets cannot be loaded.
     pub async fn load_secrets(&mut self) -> Result<()> {
-        match self.store {
-            SecretStoreType::File => {
-                let mut file_secret_store = FileSecretStore::new();
-
-                file_secret_store
-                    .load_secrets()
-                    .context(UnableToLoadSecretsSnafu)?;
-
-                self.secret_store = Some(Box::new(file_secret_store));
-            }
+        match &self.store {
             SecretStoreType::Env => {
                 let mut env_secret_store = env::EnvSecretStore::new();
-
-                env_secret_store.load_secrets();
 
                 self.secret_store = Some(Box::new(env_secret_store));
             }
@@ -213,8 +199,9 @@ impl SecretsProvider {
             SecretStoreType::Keyring => {
                 self.secret_store = Some(Box::new(keyring::KeyringSecretStore::new()));
             }
-            SecretStoreType::Kubernetes => {
-                let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
+            SecretStoreType::Kubernetes(secret_name) => {
+                let mut kubernetes_secret_store =
+                    kubernetes::KubernetesSecretStore::new(secret_name.clone());
 
                 kubernetes_secret_store
                     .init()
@@ -223,8 +210,8 @@ impl SecretsProvider {
                 self.secret_store = Some(Box::new(kubernetes_secret_store));
             }
             #[cfg(feature = "aws-secrets-manager")]
-            SecretStoreType::AwsSecretsManager => {
-                let secret_store = aws_secrets_manager::AwsSecretsManager::new();
+            SecretStoreType::AwsSecretsManager(secret_name) => {
+                let secret_store = aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
 
                 secret_store
                     .init()

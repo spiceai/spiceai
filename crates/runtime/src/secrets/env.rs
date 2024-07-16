@@ -14,17 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 
-use super::{Secret, SecretStore};
+use super::SecretStore;
 
 const ENV_SECRET_PREFIX: &str = "SPICE_SECRET_";
 
-pub struct EnvSecretStore {
-    secrets: HashMap<String, Secret>,
-}
+pub struct EnvSecretStore {}
 
 impl Default for EnvSecretStore {
     fn default() -> Self {
@@ -35,76 +31,25 @@ impl Default for EnvSecretStore {
 impl EnvSecretStore {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            secrets: HashMap::new(),
-        }
-    }
-
-    fn add_secret_value(&mut self, secret_name: &str, key: &str, value: &str) {
-        if let Some(secret) = self.secrets.get_mut(secret_name) {
-            secret.add(key.to_string(), value.to_string());
-        } else {
-            self.secrets.insert(
-                secret_name.to_string(),
-                Secret::new(
-                    vec![(key.to_string(), value.to_string())]
-                        .into_iter()
-                        .collect(),
-                ),
-            );
-        }
-    }
-
-    /// Load secrets from the environment.
-    /// It will search for environment variables formatted as `SPICE_SECRET_<SECRET-NAME>_<SECRET-KEY>` and add them to the secret store.
-    ///
-    /// Example:
-    /// ```shell
-    /// SPICE_SECRET_SPICEAI_MY_KEY_1=my_value_1
-    /// SPICE_SECRET_SPICEAI_MY_KEY_2=my_value_2
-    /// ```
-    /// will be compiled into
-    /// ```json
-    /// {
-    ///     "spiceai": {
-    ///         "my_key_1": "my_value_1",
-    ///         "my_key_2": "my_value_2"
-    ///     }
-    /// }
-    /// ```
-    pub fn load_secrets(&mut self) {
-        for (key, value) in std::env::vars() {
-            if !key.starts_with(ENV_SECRET_PREFIX) {
-                continue;
-            }
-
-            let Some((secret_name, key)) =
-                key.trim_start_matches(ENV_SECRET_PREFIX).split_once('_')
-            else {
-                continue;
-            };
-
-            if secret_name.is_empty() || key.is_empty() {
-                continue;
-            }
-
-            self.add_secret_value(
-                secret_name.to_lowercase().as_str(),
-                key.to_lowercase().as_str(),
-                value.as_str(),
-            );
-        }
+        Self {}
     }
 }
 
 #[async_trait]
 impl SecretStore for EnvSecretStore {
+    /// The key is case-sensitive. Calling `get_secret("my_key")` is distinct from `get_secret("MY_KEY")`.
+    ///
+    /// The convention is for environment variables to be uppercase, but this isn't required.
+    ///
+    /// <https://www.gnu.org/software/libc/manual/html_node/Environment-Variables.html>
+    /// > Names of environment variables are case-sensitive and must not contain the character ‘=’. System-defined environment variables are invariably uppercase.
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
-        if let Some(secret) = self.secrets.get(secret_name) {
-            return Ok(Some(secret.clone()));
+    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<String>> {
+        // TODO: Handle falling back to the spice generated prefix
+        match std::env::var(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(err) => Err(Box::new(err)),
         }
-
-        Ok(None)
     }
 }
