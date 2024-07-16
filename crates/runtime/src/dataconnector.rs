@@ -458,7 +458,7 @@ pub trait ListingTableConnector: DataConnector {
         let params = self.get_params();
         let extension = params
             .get("file_extension")
-            .map(|f| f.expose_secret())
+            .map(ExposeSecret::expose_secret)
             .cloned();
 
         match params
