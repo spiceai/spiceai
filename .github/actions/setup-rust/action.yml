@@ -41,3 +41,6 @@ runs:
       shell: pwsh
       run: |
         rustup toolchain install stable
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.5

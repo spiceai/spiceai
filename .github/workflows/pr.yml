@@ -74,6 +74,13 @@ jobs:
           os: 'linux'
 
       - run: make ci test
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+      
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
   build-docker:
     name: Build Docker Image
