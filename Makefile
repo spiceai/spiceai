@@ -8,6 +8,10 @@ all: build
 build-cli:
 	make -C bin/spice
 
+.PHONY: build-cli-dev
+build-cli-dev:
+	export DEV=true; make -C bin/spice
+
 .PHONY: build-runtime
 build-runtime:
 	make -C bin/spiced
@@ -125,6 +129,11 @@ install-dev: build-dev
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/debug/spiced ~/.spice/bin/spiced
+
+.PHONY: install-cli-dev
+install-cli-dev: build-cli-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
 
 ################################################################################
 # Target: modtidy                                                              #
