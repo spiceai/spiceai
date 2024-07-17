@@ -41,7 +41,6 @@ use component::view::View;
 use config::Config;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
-use datafusion_table_providers::util::secrets::to_secret_map;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use extension::ExtensionFactory;
@@ -953,14 +952,7 @@ impl Runtime {
         source: &str,
         params: HashMap<String, String>,
     ) -> Result<Arc<dyn DataConnector>> {
-        // let secret = secrets_provider.get_secret(source).await.context(
-        //     UnableToGetSecretForDataConnectorSnafu {
-        //         data_connector: source,
-        //     },
-        // )?;
-
-        // TODO inject secrets into params
-        let secret_map: HashMap<String, SecretString> = to_secret_map(params);
+        let secret_map = self.get_params_with_secrets(&params).await;
 
         match dataconnector::create_new_connector(source, secret_map).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
@@ -1057,7 +1049,7 @@ impl Runtime {
     async fn get_params_with_secrets(
         &self,
         params: &HashMap<String, String>,
-    ) -> Result<HashMap<String, SecretString>> {
+    ) -> HashMap<String, SecretString> {
         let shared_secrets = Arc::clone(&self.secrets);
         let secrets = shared_secrets.read().await;
 
@@ -1070,7 +1062,7 @@ impl Runtime {
             params_with_secrets.insert(k.clone(), secret);
         }
 
-        Ok(params_with_secrets)
+        params_with_secrets
     }
 
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -1092,7 +1084,7 @@ impl Runtime {
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
-        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
+        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
 
         let mut l = try_to_embedding(in_embed, &params_with_secrets)
             .boxed()
@@ -1149,19 +1141,7 @@ impl Runtime {
         measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
-        let params = match self.get_params_with_secrets(&m.params).await {
-            Ok(s) => s,
-            Err(e) => {
-                metrics::counter!("models_load_error").increment(1);
-                status::update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!(
-                    "Unable to load model '{}' from spicepod, error: {}",
-                    m.name,
-                    e,
-                );
-                return;
-            }
-        };
+        let params = self.get_params_with_secrets(&m.params).await;
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());

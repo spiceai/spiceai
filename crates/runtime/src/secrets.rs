@@ -14,23 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "aws-secrets-manager")]
-pub mod aws_secrets_manager;
-pub mod env;
-#[cfg(feature = "keyring-secret-store")]
-pub mod keyring;
-pub mod kubernetes;
-
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use lexer::SecretReplacementMatcher;
+pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
-
 use spicepod::component::secret::Secret as SpicepodSecret;
+use std::sync::Arc;
 
-pub use secrecy::ExposeSecret;
+mod lexer;
+pub mod stores;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -38,7 +32,9 @@ pub enum Error {
     UnableToLoadSecrets { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
-    UnableToInitializeAwsSecretsManager { source: aws_secrets_manager::Error },
+    UnableToInitializeAwsSecretsManager {
+        source: stores::aws_secrets_manager::Error,
+    },
 
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue,
@@ -110,7 +106,57 @@ impl Secrets {
     }
 
     pub async fn inject_secrets(&self, param_str: ParamStr<'_>) -> SecretString {
-        todo!();
+        tracing::trace!("Injecting secrets for: {}", param_str.0);
+        let mut result = String::new();
+        let mut last_end = 0;
+        for secret_replacement in SecretReplacementMatcher::new(param_str.0) {
+            tracing::debug!(
+                "Found secret replacement: Store name: {}, Key: {}, Span: {:?}",
+                secret_replacement.store_name,
+                secret_replacement.key,
+                secret_replacement.span,
+            );
+
+            // Append text from last match to the start of the current match
+            result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
+
+            // Get the secret value from the store
+            let secret = if let Some(store) = self.stores.get(&secret_replacement.store_name) {
+                match store.get_secret(&secret_replacement.key).await {
+                    Ok(Some(secret)) => secret.expose_secret().to_string(),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "Secret key {} not found in store: {}",
+                            secret_replacement.key,
+                            secret_replacement.store_name
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error getting secret: {}", e);
+                        continue;
+                    }
+                }
+            } else {
+                tracing::error!(
+                    "Secret store {} referenced in {} not found.",
+                    secret_replacement.store_name,
+                    param_str.0
+                );
+                continue;
+            };
+
+            // Replace the token with the desired string
+            result.push_str(&secret);
+
+            // Update the last end to the end of the current match
+            last_end = secret_replacement.span.end;
+        }
+
+        // Append the remaining text after the last match
+        result.push_str(&param_str.0[last_end..]);
+
+        SecretString::new(result)
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
@@ -200,7 +246,7 @@ fn secret_selector(from: &str) -> Option<&str> {
 }
 
 fn load_default_store() -> Arc<dyn SecretStore> {
-    Arc::new(env::EnvSecretStore::new())
+    Arc::new(stores::env::EnvSecretStore::new())
 }
 
 /// Loads the secret store from the provided secret store type.
@@ -211,17 +257,17 @@ fn load_default_store() -> Arc<dyn SecretStore> {
 async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn SecretStore>> {
     match store_type {
         SecretStoreType::Env => {
-            let env_secret_store = env::EnvSecretStore::new();
+            let env_secret_store = stores::env::EnvSecretStore::new();
 
             Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
         }
         #[cfg(feature = "keyring-secret-store")]
         SecretStoreType::Keyring => {
-            Ok(Arc::new(keyring::KeyringSecretStore::new()) as Arc<dyn SecretStore>)
+            Ok(Arc::new(stores::keyring::KeyringSecretStore::new()) as Arc<dyn SecretStore>)
         }
         SecretStoreType::Kubernetes(secret_name) => {
             let mut kubernetes_secret_store =
-                kubernetes::KubernetesSecretStore::new(secret_name.clone());
+                stores::kubernetes::KubernetesSecretStore::new(secret_name.clone());
 
             kubernetes_secret_store
                 .init()
@@ -231,7 +277,8 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
         }
         #[cfg(feature = "aws-secrets-manager")]
         SecretStoreType::AwsSecretsManager(secret_name) => {
-            let secret_store = aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
+            let secret_store =
+                stores::aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
 
             secret_store
                 .init()
@@ -245,6 +292,8 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     #[test]
     fn test_secret_store_provider() {
         assert_eq!("foo", super::secret_store_provider("foo:bar"));
@@ -255,5 +304,23 @@ mod tests {
     fn test_secret_selector() {
         assert_eq!(Some("bar"), super::secret_selector("foo:bar"));
         assert_eq!(None, super::secret_selector("foo"));
+    }
+
+    #[tokio::test]
+    async fn test_inject_secrets_env() {
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
+
+        std::env::set_var("MY_SECRET_KEY", "super_secret");
+
+        let result = secrets
+            .inject_secrets(super::ParamStr(
+                "This is a secret: ${{ env:MY_SECRET_KEY }}! 🫡",
+            ))
+            .await;
+        assert_eq!(
+            "This is a secret: super_secret! 🫡",
+            result.expose_secret().as_str()
+        );
     }
 }
