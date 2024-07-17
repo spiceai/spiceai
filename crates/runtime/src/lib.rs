@@ -54,7 +54,7 @@ use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
-use secrets::spicepod_secret_store_type;
+use secrets::ParamStr;
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
@@ -266,7 +266,7 @@ pub struct Runtime {
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
-    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics: Option<SocketAddr>,
 
@@ -287,8 +287,8 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
-        Arc::clone(&self.secrets_provider)
+    pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
+        Arc::clone(&self.secrets)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -357,11 +357,11 @@ impl Runtime {
         }
     }
 
-    /// Will load all of the components of the Runtime, including datasets, models, and embeddings.
+    /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded.
     pub async fn load_components(&self) {
-        self.load_secrets().await;
+        self.load_secret_stores().await;
         self.start_extensions().await;
 
         #[cfg(feature = "models")]
@@ -396,21 +396,15 @@ impl Runtime {
         }
     }
 
-    async fn load_secrets(&self) {
-        measure_scope_ms!("load_secrets");
-        let mut secret_store = self.secrets_provider.write().await;
+    async fn load_secret_stores(&self) {
+        measure_scope_ms!("load_secret_stores");
+        let mut secrets = self.secrets.write().await;
 
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
-                return;
+            if let Err(e) = secrets.load_from(&app.secret_stores).await {
+                tracing::error!("Error loading secret stores: {e}");
             };
-
-            secret_store.store = secret_store_type;
-        }
-
-        if let Err(e) = secret_store.load_secrets().await {
-            tracing::warn!("Unable to load secrets: {}", e);
         }
     }
 
@@ -1064,12 +1058,17 @@ impl Runtime {
         &self,
         params: &HashMap<String, String>,
     ) -> Result<HashMap<String, SecretString>> {
-        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
-        let secrets_provider = shared_secrets_provider.read().await;
+        let shared_secrets = Arc::clone(&self.secrets);
+        let secrets = shared_secrets.read().await;
 
-        let mut params_with_secrets: HashMap<String, SecretString> = to_secret_map(params.clone());
+        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
 
-        // TODO inject secrets into params
+        // Inject secrets from the user-supplied params.
+        // This will replace any instances of `${{ store:key }}` with the actual secret value.
+        for (k, v) in params {
+            let secret = secrets.inject_secrets(ParamStr(v)).await;
+            params_with_secrets.insert(k.clone(), secret);
+        }
 
         Ok(params_with_secrets)
     }

@@ -24,7 +24,7 @@ use std::{collections::HashMap, fmt::Debug};
 use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
 use crate::component::runtime::Runtime;
-use crate::component::secrets::Secrets;
+use crate::component::secret_stores::SecretStore;
 use crate::component::{
     dataset::Dataset, extension::Extension, model::Model, view::View, ComponentOrReference,
 };
@@ -67,9 +67,14 @@ pub struct SpicepodDefinition {
     pub extensions: HashMap<String, Extension>,
 
     /// Optional spicepod secrets configuration
-    /// Default value is `store: file`
+    /// Default value is:
+    /// ```yaml
+    /// secret_stores:
+    ///   - from: env
+    ///     name: env
+    /// ```
     #[serde(default)]
-    pub secrets: Secrets,
+    pub secret_stores: Vec<SecretStore>,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]

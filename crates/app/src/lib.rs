@@ -27,7 +27,7 @@ use spicepod::{
         extension::Extension,
         model::Model,
         runtime::{ResultsCache, Runtime},
-        secrets::{Secrets, SpiceSecretStore},
+        secret_stores::SecretStore,
         view::View,
     },
     Spicepod,
@@ -37,7 +37,7 @@ use spicepod::{
 pub struct App {
     pub name: String,
 
-    pub secrets: Secrets,
+    pub secret_stores: Vec<SecretStore>,
 
     pub extensions: HashMap<String, Extension>,
 
@@ -69,7 +69,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct AppBuilder {
     name: String,
-    secrets: Secrets,
+    secret_stores: Vec<SecretStore>,
     extensions: HashMap<String, Extension>,
     catalogs: Vec<Catalog>,
     datasets: Vec<Dataset>,
@@ -84,7 +84,7 @@ impl AppBuilder {
     pub fn new(name: impl Into<String>) -> AppBuilder {
         AppBuilder {
             name: name.into(),
-            secrets: Secrets::default(),
+            secret_stores: vec![],
             extensions: HashMap::new(),
             catalogs: vec![],
             datasets: vec![],
@@ -98,7 +98,7 @@ impl AppBuilder {
 
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
-        self.secrets = spicepod.secrets.clone();
+        self.secret_stores.extend(spicepod.secret_stores.clone());
         self.extensions.extend(spicepod.extensions.clone());
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
@@ -116,8 +116,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
-        self.secrets = Secrets { store: secret };
+    pub fn with_secret_store(mut self, secret_store: SecretStore) -> AppBuilder {
+        self.secret_stores.push(secret_store);
         self
     }
 
@@ -161,7 +161,7 @@ impl AppBuilder {
     pub fn build(self) -> App {
         App {
             name: self.name,
-            secrets: self.secrets,
+            secret_stores: self.secret_stores,
             extensions: self.extensions,
             catalogs: self.catalogs,
             datasets: self.datasets,
@@ -177,7 +177,7 @@ impl AppBuilder {
         let path = path.into();
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
-        let secrets = spicepod_root.secrets.clone();
+        let secret_stores = spicepod_root.secret_stores.clone();
         let runtime = spicepod_root.runtime.clone();
         let extensions = spicepod_root.extensions.clone();
         let mut catalogs: Vec<Catalog> = vec![];
@@ -237,7 +237,7 @@ impl AppBuilder {
 
         Ok(App {
             name: root_spicepod_name,
-            secrets,
+            secret_stores,
             extensions,
             catalogs,
             datasets,

@@ -23,7 +23,7 @@ use std::{fmt::Debug, path::PathBuf};
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, extension::Extension, model::Model,
-    runtime::Runtime, secrets::Secrets, view::View,
+    runtime::Runtime, secret_stores::SecretStore, view::View,
 };
 
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -36,13 +36,16 @@ pub mod spec;
 pub enum Error {
     #[snafu(display("Unable to parse spicepod.yaml: {source}"))]
     UnableToParseSpicepod { source: serde_yaml::Error },
+
     #[snafu(display("Unable to resolve spicepod components {}: {source}", path.display()))]
     UnableToResolveSpicepodComponents {
         source: component::Error,
         path: PathBuf,
     },
+
     #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
     SpicepodNotFound { path: PathBuf },
+
     #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
     DuplicateComponent { component: String, name: String },
 }
@@ -57,7 +60,7 @@ pub struct Spicepod {
 
     pub extensions: HashMap<String, Extension>,
 
-    pub secrets: Secrets,
+    pub secret_stores: Vec<SecretStore>,
 
     pub catalogs: Vec<Catalog>,
 
@@ -146,6 +149,7 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        detect_duplicate_component_names("secret_stores", &spicepod_definition.secret_stores[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
@@ -196,7 +200,7 @@ fn from_definition(
         name: spicepod_definition.name,
         version: spicepod_definition.version,
         extensions: spicepod_definition.extensions,
-        secrets: spicepod_definition.secrets,
+        secret_stores: spicepod_definition.secret_stores,
         catalogs,
         datasets,
         views,

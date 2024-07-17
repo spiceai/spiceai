@@ -30,7 +30,7 @@ pub mod extension;
 pub mod model;
 pub mod params;
 pub mod runtime;
-pub mod secrets;
+pub mod secret_stores;
 pub mod view;
 
 pub trait Nameable {
@@ -63,11 +63,13 @@ pub enum ComponentOrReference<T> {
 pub enum Error {
     #[snafu(display("Unable to convert the path into a string"))]
     UnableToConvertPath,
+
     #[snafu(display("Unable to parse spicepod component {}: {source}", path.display()))]
     UnableToParseSpicepodComponent {
         source: serde_yaml::Error,
         path: PathBuf,
     },
+
     #[snafu(display("The component referenced by {} does not exist", path.display()))]
     InvalidComponentReference { path: PathBuf },
 }

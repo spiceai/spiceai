@@ -21,18 +21,14 @@ pub mod env;
 pub mod keyring;
 pub mod kubernetes;
 
-use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
-use spicepod::component::secrets::SpiceSecretStore;
+use spicepod::component::secret_stores::SecretStore as SpicepodSecretStore;
 
 pub use secrecy::ExposeSecret;
 
@@ -43,8 +39,22 @@ pub enum Error {
 
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
     UnableToInitializeAwsSecretsManager { source: aws_secrets_manager::Error },
+
     #[snafu(display("Unable to parse secret value"))]
-    UnableToParseSecretValue {},
+    UnableToParseSecretValue,
+
+    #[snafu(display("Unknown secret store: {store}"))]
+    UnknownSecretStore { store: String },
+
+    #[snafu(display(
+        "The secret store {store} requires a secret selector. i.e. `from: {store}:my_secret_name`"
+    ))]
+    SecretStoreRequiresSecretSelector { store: String },
+
+    #[snafu(display(
+        "The secret store {store} should not specify a secret selector. i.e. `from: {store}`"
+    ))]
+    SecretStoreInvalidSecretSelector { store: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -63,17 +73,56 @@ pub struct Secrets {
     stores: IndexMap<String, Arc<dyn SecretStore>>,
 }
 
-pub struct ParamStr<'a>(&'a str);
-pub struct SecretKey<'a>(&'a str);
+pub struct ParamStr<'a>(pub &'a str);
+pub struct SecretKey<'a>(pub &'a str);
 
 impl Secrets {
-    async fn inject_secrets(&self, param_str: ParamStr<'_>) -> SecretString {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stores: IndexMap::new(),
+        }
+    }
+
+    /// Initializes the runtime secrets based on the provided secret store configuration.
+    ///
+    /// If no secret stores are provided, the default secret store is set to `env`.
+    pub async fn load_from(&mut self, secret_stores: &[SpicepodSecretStore]) -> Result<()> {
+        self.stores.clear();
+
+        for secret_store in secret_stores {
+            let store = spicepod_secret_store_type(secret_store)?;
+
+            let dyn_secret_store = load_secret_store(store).await?;
+
+            self.stores
+                .insert(secret_store.name.clone(), dyn_secret_store);
+        }
+
+        if self.stores.is_empty() {
+            let default_store = load_default_store();
+            self.stores.insert("env".to_string(), default_store);
+        }
+
+        // Reverse the order of the secret stores to maintain the expected precedence order.
+        self.stores.reverse();
+
+        Ok(())
+    }
+
+    pub async fn inject_secrets(&self, param_str: ParamStr<'_>) -> SecretString {
         todo!();
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
     async fn get_secret(&self, key: SecretKey<'_>) -> AnyErrorResult<Option<SecretString>> {
         todo!();
+    }
+}
+
+impl Default for Secrets {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -86,121 +135,126 @@ pub enum SecretStoreType {
     AwsSecretsManager(String),
 }
 
-#[must_use]
-pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStoreType> {
-    match store {
-        SpiceSecretStore::Env => Some(SecretStoreType::Env),
+fn spicepod_secret_store_type(store: &SpicepodSecretStore) -> Result<SecretStoreType> {
+    let provider = secret_store_provider(&store.from);
+    let selector = secret_selector(&store.from);
+    match provider {
+        "env" => {
+            require_no_selector(provider, selector)?;
+            Ok(SecretStoreType::Env)
+        }
         #[cfg(feature = "keyring-secret-store")]
-        SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
-        SpiceSecretStore::Kubernetes => todo!(),
+        "keyring" => {
+            require_no_selector(provider, selector)?;
+            Ok(SecretStoreType::Keyring)
+        }
+        "kubernetes" => Ok(SecretStoreType::Kubernetes(require_selector(
+            provider, selector,
+        )?)),
         #[cfg(feature = "aws-secrets-manager")]
-        SpiceSecretStore::AwsSecretsManager => todo!(),
-        #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
-        _ => None,
-    }
-}
-
-pub struct SecretsProvider {
-    pub store: SecretStoreType,
-
-    secret_store: Option<Box<dyn SecretStore + Send + Sync>>,
-}
-
-impl Default for SecretsProvider {
-    fn default() -> Self {
-        Self {
-            store: SecretStoreType::Env,
-            secret_store: None,
+        "aws_secrets_manager" => Ok(SecretStoreType::AwsSecretsManager(require_selector(
+            provider, selector,
+        )?)),
+        other => UnknownSecretStoreSnafu {
+            store: other.to_string(),
         }
+        .fail(),
     }
 }
 
-impl SecretsProvider {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
+    let Some(selector) = selector else {
+        return SecretStoreRequiresSecretSelectorSnafu {
+            store: provider.to_string(),
+        }
+        .fail()?;
+    };
+
+    Ok(selector.to_string())
+}
+
+fn require_no_selector(provider: &str, selector: Option<&str>) -> Result<()> {
+    if selector.is_some() {
+        SecretStoreInvalidSecretSelectorSnafu {
+            store: provider.to_string(),
+        }
+        .fail()?;
     }
 
-    /// Loads the secrets from the secret store.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the secrets cannot be loaded.
-    pub async fn load_secrets(&mut self) -> Result<()> {
-        match &self.store {
-            SecretStoreType::Env => {
-                let env_secret_store = env::EnvSecretStore::new();
+    Ok(())
+}
 
-                self.secret_store = Some(Box::new(env_secret_store));
-            }
-            #[cfg(feature = "keyring-secret-store")]
-            SecretStoreType::Keyring => {
-                self.secret_store = Some(Box::new(keyring::KeyringSecretStore::new()));
-            }
-            SecretStoreType::Kubernetes(secret_name) => {
-                let mut kubernetes_secret_store =
-                    kubernetes::KubernetesSecretStore::new(secret_name.clone());
+/// Returns the secret store provider - the first part of the `from` field before the first `:`.
+#[must_use]
+fn secret_store_provider(from: &str) -> &str {
+    from.split(':').next().unwrap_or(from)
+}
 
-                kubernetes_secret_store
-                    .init()
-                    .context(UnableToLoadSecretsSnafu)?;
+/// Returns the secret selector - the second part of the `from` field after the first `:`.
+/// This is optional.
+#[must_use]
+fn secret_selector(from: &str) -> Option<&str> {
+    match from.find(':') {
+        Some(index) => Some(&from[index + 1..]),
+        None => None,
+    }
+}
 
-                self.secret_store = Some(Box::new(kubernetes_secret_store));
-            }
-            #[cfg(feature = "aws-secrets-manager")]
-            SecretStoreType::AwsSecretsManager(secret_name) => {
-                let secret_store = aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
+fn load_default_store() -> Arc<dyn SecretStore> {
+    Arc::new(env::EnvSecretStore::new())
+}
 
-                secret_store
-                    .init()
-                    .await
-                    .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+/// Loads the secret store from the provided secret store type.
+///
+/// # Errors
+///
+/// Returns an error if the secrets cannot be loaded.
+async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn SecretStore>> {
+    match store_type {
+        SecretStoreType::Env => {
+            let env_secret_store = env::EnvSecretStore::new();
 
-                self.secret_store = Some(Box::new(secret_store));
-            }
+            Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
         }
+        #[cfg(feature = "keyring-secret-store")]
+        SecretStoreType::Keyring => {
+            Ok(Arc::new(keyring::KeyringSecretStore::new()) as Arc<dyn SecretStore>)
+        }
+        SecretStoreType::Kubernetes(secret_name) => {
+            let mut kubernetes_secret_store =
+                kubernetes::KubernetesSecretStore::new(secret_name.clone());
 
-        Ok(())
+            kubernetes_secret_store
+                .init()
+                .context(UnableToLoadSecretsSnafu)?;
+
+            Ok(Arc::new(kubernetes_secret_store) as Arc<dyn SecretStore>)
+        }
+        #[cfg(feature = "aws-secrets-manager")]
+        SecretStoreType::AwsSecretsManager(secret_name) => {
+            let secret_store = aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
+
+            secret_store
+                .init()
+                .await
+                .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+
+            Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use crate::secrets::{get_secret_or_param, Secret};
-
     #[test]
-    fn test_value_from_secret() {
-        let mut params = HashMap::new();
-        params.insert("secret_param".to_string(), "val".to_string());
-        params.insert("anything".to_string(), "no_the_val".to_string());
-
-        let secret = Secret::new(
-            vec![("val".to_string(), "secret_value".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(
-            Some("secret_value".to_string()),
-            get_secret_or_param(&params, &Some(secret), "secret_param", "anything")
-        );
+    fn test_secret_store_provider() {
+        assert_eq!("foo", super::secret_store_provider("foo:bar"));
+        assert_eq!("foo", super::secret_store_provider("foo"));
     }
 
     #[test]
-    fn test_value_from_fallback_to_secrets() {
-        let mut params = HashMap::new();
-        params.insert("secret_param".to_string(), "val_no_secret".to_string());
-        params.insert("anything".to_string(), "value_from_params".to_string());
-
-        let secret = Secret::new(
-            vec![("val".to_string(), "secret_value".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(
-            Some("value_from_params".to_string()),
-            get_secret_or_param(&params, &Some(secret), "secret_param", "anything")
-        );
+    fn test_secret_selector() {
+        assert_eq!(Some("bar"), super::secret_selector("foo:bar"));
+        assert_eq!(None, super::secret_selector("foo"));
     }
 }

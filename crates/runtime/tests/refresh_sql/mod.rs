@@ -20,7 +20,7 @@ use app::AppBuilder;
 use runtime::{accelerated_table::AcceleratedTable, Runtime};
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
-    secrets::SpiceSecretStore,
+    secret_stores::SpiceSecretStore,
 };
 
 use crate::init_tracing;
