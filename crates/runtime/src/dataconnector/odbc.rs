@@ -60,7 +60,10 @@ fn match_driver_to_dialect(driver: &str) -> Option<Arc<dyn Dialect + Send + Sync
         _ if driver.contains("postgres") => Some(Arc::new(PostgreSqlDialect {})), // odbcinst.ini profile name
         _ if driver.contains("psqlodbc") => Some(Arc::new(PostgreSqlDialect {})), // library filename
         _ if driver.contains("sqlite") => Some(Arc::new(SqliteDialect {})), // profile and library name
-        _ => None,
+        _ => {
+            tracing::debug!("No dialect detected for driver: {}", driver);
+            None
+        }
     }
 }
 
