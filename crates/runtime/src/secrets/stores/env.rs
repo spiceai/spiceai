@@ -38,16 +38,15 @@ impl EnvSecretStore {
 
 #[async_trait]
 impl SecretStore for EnvSecretStore {
-    /// The key is case-sensitive. Calling `get_secret("my_key")` is distinct from `get_secret("MY_KEY")`.
+    /// The key for std::env::var is case-sensitive. Calling `std::env::var("my_key")` is distinct from `std::env::var("MY_KEY")`.
     ///
-    /// The convention is for environment variables to be uppercase, but this isn't required.
-    ///
-    /// <https://www.gnu.org/software/libc/manual/html_node/Environment-Variables.html>
-    /// > Names of environment variables are case-sensitive and must not contain the character ‘=’. System-defined environment variables are invariably uppercase.
+    /// However, the convention is to use uppercase for environment variables - so to make the experience
+    /// consistent across secret stores that don't have this convention we will uppercase the key before
+    /// looking up the environment variable.
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         // TODO: Handle falling back to the spice generated prefix
-        match std::env::var(key) {
+        match std::env::var(key.to_ascii_uppercase()) {
             Ok(value) => Ok(Some(SecretString::new(value))),
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(err) => Err(Box::new(err)),
