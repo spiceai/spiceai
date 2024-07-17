@@ -22,7 +22,7 @@ use runtime::{
     Runtime,
 };
 use spicepod::component::{
-    dataset::Dataset, params::Params, runtime::ResultsCache, secret_stores::SpiceSecretStore,
+    dataset::Dataset, params::Params, runtime::ResultsCache, secret::SpiceSecretStore,
 };
 
 use crate::init_tracing;

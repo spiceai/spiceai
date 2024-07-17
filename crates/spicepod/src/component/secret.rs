@@ -24,7 +24,7 @@ use super::{params::Params, Nameable};
 ///
 /// Example:
 /// ```yaml
-/// secret_stores:
+/// secrets:
 ///   - from: env
 ///     name: env
 ///   - from: kubernetes:my_secret_name
@@ -32,7 +32,7 @@ use super::{params::Params, Nameable};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct SecretStore {
+pub struct Secret {
     pub from: String,
 
     pub name: String,
@@ -41,7 +41,7 @@ pub struct SecretStore {
     pub params: Option<Params>,
 }
 
-impl Nameable for SecretStore {
+impl Nameable for Secret {
     fn name(&self) -> &str {
         &self.name
     }

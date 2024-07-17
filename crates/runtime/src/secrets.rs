@@ -28,7 +28,7 @@ use indexmap::IndexMap;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
-use spicepod::component::secret_stores::SecretStore as SpicepodSecretStore;
+use spicepod::component::secret::Secret as SpicepodSecret;
 
 pub use secrecy::ExposeSecret;
 
@@ -87,16 +87,15 @@ impl Secrets {
     /// Initializes the runtime secrets based on the provided secret store configuration.
     ///
     /// If no secret stores are provided, the default secret store is set to `env`.
-    pub async fn load_from(&mut self, secret_stores: &[SpicepodSecretStore]) -> Result<()> {
+    pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
 
-        for secret_store in secret_stores {
-            let store = spicepod_secret_store_type(secret_store)?;
+        for secret in secrets {
+            let store_type = spicepod_secret_store_type(secret)?;
 
-            let dyn_secret_store = load_secret_store(store).await?;
+            let secret_store = load_secret_store(store_type).await?;
 
-            self.stores
-                .insert(secret_store.name.clone(), dyn_secret_store);
+            self.stores.insert(secret.name.clone(), secret_store);
         }
 
         if self.stores.is_empty() {
@@ -135,7 +134,7 @@ pub enum SecretStoreType {
     AwsSecretsManager(String),
 }
 
-fn spicepod_secret_store_type(store: &SpicepodSecretStore) -> Result<SecretStoreType> {
+fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType> {
     let provider = secret_store_provider(&store.from);
     let selector = secret_selector(&store.from);
     match provider {

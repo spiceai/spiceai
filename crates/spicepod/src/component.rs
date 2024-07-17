@@ -30,7 +30,7 @@ pub mod extension;
 pub mod model;
 pub mod params;
 pub mod runtime;
-pub mod secret_stores;
+pub mod secret;
 pub mod view;
 
 pub trait Nameable {

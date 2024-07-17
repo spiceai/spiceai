@@ -402,7 +402,7 @@ impl Runtime {
 
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            if let Err(e) = secrets.load_from(&app.secret_stores).await {
+            if let Err(e) = secrets.load_from(&app.secrets).await {
                 tracing::error!("Error loading secret stores: {e}");
             };
         }

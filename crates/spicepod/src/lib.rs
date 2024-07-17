@@ -23,7 +23,7 @@ use std::{fmt::Debug, path::PathBuf};
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, extension::Extension, model::Model,
-    runtime::Runtime, secret_stores::SecretStore, view::View,
+    runtime::Runtime, secret::Secret, view::View,
 };
 
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -60,7 +60,7 @@ pub struct Spicepod {
 
     pub extensions: HashMap<String, Extension>,
 
-    pub secret_stores: Vec<SecretStore>,
+    pub secrets: Vec<Secret>,
 
     pub catalogs: Vec<Catalog>,
 
@@ -149,7 +149,7 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        detect_duplicate_component_names("secret_stores", &spicepod_definition.secret_stores[..])?;
+        detect_duplicate_component_names("secrets", &spicepod_definition.secrets[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
@@ -200,7 +200,7 @@ fn from_definition(
         name: spicepod_definition.name,
         version: spicepod_definition.version,
         extensions: spicepod_definition.extensions,
-        secret_stores: spicepod_definition.secret_stores,
+        secrets: spicepod_definition.secrets,
         catalogs,
         datasets,
         views,
