@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	cloudKeyFlag = "cloud"
-	modelKeyFlag = "model"
+	cloudKeyFlag        = "cloud"
+	modelKeyFlag        = "model"
+	httpEndpointKeyFlag = "http-endpoint"
 )
 
 type Message struct {
@@ -71,18 +72,25 @@ spice chat --model <model> --cloud
 			cmd.Println(err)
 			os.Exit(1)
 		}
-
 		if model == "" {
 			cmd.Println("model is required")
 			os.Exit(1)
 		}
 
-		reader := bufio.NewReader(os.Stdin)
-
-		var spiceBaseUrl = "https://data.spiceai.io"
-		if os.Getenv("SPICE_BASE_URL") != "" {
-			spiceBaseUrl = os.Getenv("SPICE_BASE_URL")
+		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
+		if err != nil {
+			cmd.Println(err)
+			os.Exit(1)
 		}
+		if httpEndpoint == "" {
+			if cloud {
+				httpEndpoint = "https://data.spiceai.io"
+			} else {
+				httpEndpoint = "http://localhost:3000"
+			}
+		}
+
+		reader := bufio.NewReader(os.Stdin)
 
 		apiKey := os.Getenv("SPICE_API_KEY")
 
@@ -115,13 +123,13 @@ spice chat --model <model> --cloud
 			var response *http.Response
 
 			if cloud {
-				response, err = callCloudChat(spiceBaseUrl, apiKey, client, body)
+				response, err = callCloudChat(httpEndpoint, apiKey, client, body)
 				if err != nil {
 					cmd.Println(err)
 					os.Exit(1)
 				}
 			} else {
-				response, err = callLocalChat(client, body)
+				response, err = callLocalChat(httpEndpoint, client, body)
 				if err != nil {
 					cmd.Println(err)
 					os.Exit(1)
@@ -175,8 +183,8 @@ func spinner(done chan bool) {
 	}
 }
 
-func callLocalChat(client *http.Client, body *ChatRequestBody) (response *http.Response, err error) {
-	url := fmt.Sprintf("http://localhost:3000/v1/chat/completions")
+func callLocalChat(baseUrl string, client *http.Client, body *ChatRequestBody) (response *http.Response, err error) {
+	url := fmt.Sprintf("%s/v1/chat/completions", baseUrl)
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -219,8 +227,9 @@ func callCloudChat(baseUrl string, apiKey string, client *http.Client, body *Cha
 }
 
 func init() {
-	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat")
+	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
+	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:3000)")
 
 	RootCmd.AddCommand(chatCmd)
 }
