@@ -20,8 +20,10 @@ use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SqliteDialect};
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -36,6 +38,10 @@ pub enum Error {
     UnableToCreateODBCConnectionPool {
         source: db_connection_pool::odbcpool::Error,
     },
+    #[snafu(display("A required ODBC parameter is missing: {param}"))]
+    MissingParameter { param: String },
+    #[snafu(display("No ODBC driver was specified in the connection string"))]
+    NoDriverSpecified,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -45,6 +51,17 @@ where
     'a: 'static,
 {
     odbc_factory: ODBCTableFactory<'a>,
+}
+
+fn match_driver_to_dialect(driver: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+    match driver {
+        _ if driver.contains("mysql") => Some(Arc::new(MySqlDialect {})), // odbcinst.ini profile name
+        _ if driver.contains("libmyodbc") => Some(Arc::new(MySqlDialect {})), // library filename
+        _ if driver.contains("postgres") => Some(Arc::new(PostgreSqlDialect {})), // odbcinst.ini profile name
+        _ if driver.contains("psqlodbc") => Some(Arc::new(PostgreSqlDialect {})), // library filename
+        _ if driver.contains("sqlite") => Some(Arc::new(SqliteDialect {})), // profile and library name
+        _ => None,
+    }
 }
 
 impl<'a> DataConnectorFactory for ODBC<'a>
@@ -65,12 +82,27 @@ where
         }
 
         Box::pin(async move {
+            let driver = params
+                .get("odbc_connection_string")
+                .context(MissingParameterSnafu {
+                    param: "odbc_connection_string".to_string(),
+                })?
+                .expose_secret()
+                .to_lowercase();
+
+            let driver = driver
+                .split(';')
+                .find(|s| s.starts_with("driver="))
+                .context(NoDriverSpecifiedSnafu)?;
+
+            let dialect = match_driver_to_dialect(driver);
+
             let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
                 ODBCPool::new(Arc::new(params.into_map()))
                     .context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
-            let odbc_factory = ODBCTableFactory::new(pool);
+            let odbc_factory = ODBCTableFactory::new(pool, dialect);
 
             Ok(Arc::new(Self { odbc_factory }) as Arc<dyn DataConnector>)
         })
