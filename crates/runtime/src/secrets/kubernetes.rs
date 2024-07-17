@@ -21,7 +21,7 @@ use base64::{engine::general_purpose, Engine};
 use reqwest;
 use snafu::{ResultExt, Snafu};
 
-use super::{Secret, SecretStore};
+use super::SecretStore;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -158,19 +158,15 @@ impl KubernetesClient {
 }
 
 pub struct KubernetesSecretStore {
+    secret_name: String,
     kubernetes_client: KubernetesClient,
-}
-
-impl Default for KubernetesSecretStore {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl KubernetesSecretStore {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(secret_name: String) -> Self {
         Self {
+            secret_name,
             kubernetes_client: KubernetesClient::new(),
         }
     }
@@ -194,9 +190,9 @@ impl KubernetesSecretStore {
 #[async_trait]
 impl SecretStore for KubernetesSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
-        match self.kubernetes_client.get_secret(secret_name).await {
-            Ok(secret) => Ok(Some(Secret::new(secret.clone()))),
+    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<String>> {
+        match self.kubernetes_client.get_secret(&self.secret_name).await {
+            Ok(secret) => Ok(secret.get(key).cloned()),
             Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
     }

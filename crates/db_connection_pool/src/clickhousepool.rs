@@ -101,7 +101,7 @@ impl ClickhouseConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: Arc<HashMap<String, SecretString>>) -> Result<Self> {
+    pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let (options, compute_context) = get_config_from_params(&params).await?;
 
         let pool = Pool::new(options);
