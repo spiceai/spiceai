@@ -258,9 +258,6 @@ pub mod acceleration {
         pub params: Option<Params>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub engine_secret: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_period: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,7 +302,6 @@ pub mod acceleration {
                 refresh_retry_enabled: true,
                 refresh_retry_max_attempts: None,
                 params: None,
-                engine_secret: None,
                 retention_period: None,
                 retention_check_interval: None,
                 retention_check_enabled: false,

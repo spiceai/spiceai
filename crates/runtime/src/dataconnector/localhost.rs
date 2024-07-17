@@ -16,11 +16,11 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
@@ -81,11 +81,13 @@ impl LocalhostConnector {
 
 impl DataConnectorFactory for LocalhostConnector {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let schema = params.get("schema").ok_or(Error::MissingSchemaParameter)?;
+            let schema = params
+                .get("schema")
+                .map(ExposeSecret::expose_secret)
+                .ok_or(Error::MissingSchemaParameter)?;
 
             let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
                 UnableToParseSchemaSnafu {

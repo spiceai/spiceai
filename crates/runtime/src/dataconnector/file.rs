@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -29,7 +29,7 @@ use super::{
 };
 
 pub struct File {
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
 }
 
 impl std::fmt::Display for File {
@@ -40,8 +40,7 @@ impl std::fmt::Display for File {
 
 impl DataConnectorFactory for File {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
     }
@@ -52,7 +51,7 @@ impl ListingTableConnector for File {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }
 

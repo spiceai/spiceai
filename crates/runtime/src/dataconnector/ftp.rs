@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{get_secret_or_param, Secret};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -26,8 +26,7 @@ use url::{form_urlencoded, Url};
 use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
 
 pub struct FTP {
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
 }
 
 impl std::fmt::Display for FTP {
@@ -38,11 +37,10 @@ impl std::fmt::Display for FTP {
 
 impl DataConnectorFactory for FTP {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let ftp = Self { secret, params };
+            let ftp = Self { params };
             Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
         })
     }
@@ -53,7 +51,7 @@ impl ListingTableConnector for FTP {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }
 
@@ -61,15 +59,13 @@ impl ListingTableConnector for FTP {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(ftp_port) = self.params.get("ftp_port") {
+        if let Some(ftp_port) = self.params.get("ftp_port").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("port", ftp_port);
         }
-        if let Some(ftp_user) = self.params.get("ftp_user") {
+        if let Some(ftp_user) = self.params.get("ftp_user").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("user", ftp_user);
         }
-        if let Some(ftp_password) =
-            get_secret_or_param(&self.params, &self.secret, "ftp_pass_key", "ftp_pass")
-        {
+        if let Some(ftp_password) = self.params.get("ftp_pass").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("password", &ftp_password);
         }
         fragments.push(fragment_builder.finish());

@@ -18,7 +18,6 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use crate::Runtime;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
@@ -30,6 +29,8 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
@@ -83,8 +84,7 @@ impl Dialect for SpiceCloudPlatformDialect {
 
 impl DataConnectorFactory for SpiceAI {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
@@ -92,10 +92,9 @@ impl DataConnectorFactory for SpiceAI {
             "https://flight.spiceai.io".to_string()
         };
         Box::pin(async move {
-            let secret = secret.context(MissingRequiredSecretsSnafu)?;
-
             let url: String = params
                 .get("endpoint")
+                .map(ExposeSecret::expose_secret)
                 .cloned()
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
@@ -106,7 +105,10 @@ impl DataConnectorFactory for SpiceAI {
                 }
             })?;
 
-            let api_key = secret.get("key").unwrap_or_default();
+            let api_key = params
+                .get("key")
+                .map(|s| s.expose_secret().as_str())
+                .unwrap_or_default();
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
