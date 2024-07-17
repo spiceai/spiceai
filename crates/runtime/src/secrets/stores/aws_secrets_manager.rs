@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 use secrecy::SecretString;
 
-use super::SecretStore;
+use crate::secrets::SecretStore;
 
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 
@@ -90,7 +90,7 @@ impl AwsSecretsManager {
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
     #[must_use]
-    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<SecretString>> {
+    async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         tracing::trace!(
             "Getting secret {} from AWS Secrets Manager",
             self.secret_name
