@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
@@ -68,6 +69,9 @@ fn main() {
     }
 
     tracing::trace!("Starting Spice Runtime!");
+
+    // Install the default AWS LC RS crypto provider for rusttls
+    let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
         tracing::error!("Spice Runtime error: {err}");
