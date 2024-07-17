@@ -17,7 +17,6 @@ limitations under the License.
 use super::DataConnector;
 use super::DataConnectorFactory;
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
 use data_components::Read;
@@ -28,6 +27,8 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -76,16 +77,14 @@ impl Dialect for DremioDialect {
 
 impl DataConnectorFactory for Dremio {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let secret = secret.context(MissingSecretsSnafu)?;
-
             let endpoint: String = params
                 .get("endpoint")
-                .context(MissingEndpointParameterSnafu)?
-                .clone();
+                .map(ExposeSecret::expose_secret)
+                .cloned()
+                .context(MissingEndpointParameterSnafu)?;
 
             verify_endpoint_connection(&endpoint)
                 .await
@@ -95,8 +94,14 @@ impl DataConnectorFactory for Dremio {
 
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                secret.get("username").unwrap_or_default(),
-                secret.get("password").unwrap_or_default(),
+                params
+                    .get("username")
+                    .map(|p| p.expose_secret().as_str())
+                    .unwrap_or_default(),
+                params
+                    .get("password")
+                    .map(|p| p.expose_secret().as_str())
+                    .unwrap_or_default(),
             )
             .await
             .context(UnableToCreateFlightClientSnafu)?;

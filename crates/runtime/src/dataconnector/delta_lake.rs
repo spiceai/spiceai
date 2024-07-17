@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -34,28 +34,19 @@ pub struct DeltaLake {
 
 impl DeltaLake {
     #[must_use]
-    pub fn new(secret: Option<Secret>, params: &Arc<HashMap<String, String>>) -> Self {
-        let mut params: SecretMap = params.as_ref().into();
-
-        if let Some(secret) = secret {
-            for (key, value) in secret.iter() {
-                params.insert(key.to_string(), value.clone());
-            }
-        }
-
+    pub fn new(params: HashMap<String, SecretString>) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(Arc::new(params.into_map())),
+            delta_table_factory: DeltaTableFactory::new(params),
         }
     }
 }
 
 impl DataConnectorFactory for DeltaLake {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let delta = DeltaLake::new(secret, &params);
+            let delta = DeltaLake::new(params);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }
