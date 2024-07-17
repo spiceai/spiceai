@@ -24,6 +24,8 @@ use snafu::{ResultExt, Snafu};
 
 use crate::secrets::SecretStore;
 
+const SPICE_KEY_PREFIX: &str = "spice_";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to read K8S token: {source}"))]
@@ -193,7 +195,13 @@ impl SecretStore for KubernetesSecretStore {
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         match self.kubernetes_client.get_secret(&self.secret_name).await {
-            Ok(secret) => Ok(secret.get(key).cloned().map(SecretString::new)),
+            Ok(secret) => {
+                if let Some(value) = secret.get(key) {
+                    return Ok(Some(SecretString::new(value.clone())));
+                }
+                let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
+                Ok(secret.get(&prefixed_key).cloned().map(SecretString::new))
+            }
             Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
     }

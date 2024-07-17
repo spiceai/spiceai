@@ -19,7 +19,7 @@ use secrecy::SecretString;
 
 use crate::secrets::SecretStore;
 
-const ENV_SECRET_PREFIX: &str = "SPICE_SECRET_";
+const ENV_SECRET_PREFIX: &str = "SPICE_";
 
 pub struct EnvSecretStore {}
 
@@ -45,10 +45,18 @@ impl SecretStore for EnvSecretStore {
     /// looking up the environment variable.
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
-        // TODO: Handle falling back to the spice generated prefix
-        match std::env::var(key.to_ascii_uppercase()) {
+        let upper_key = key.to_uppercase();
+        match std::env::var(&upper_key) {
             Ok(value) => Ok(Some(SecretString::new(value))),
-            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotPresent) => {
+                // If the key isn't found by the explicit key, try with SPICE_ prefixed
+                let prefixed_key = format!("{ENV_SECRET_PREFIX}{upper_key}");
+                match std::env::var(prefixed_key) {
+                    Ok(value) => Ok(Some(SecretString::new(value))),
+                    Err(std::env::VarError::NotPresent) => Ok(None),
+                    Err(err) => Err(Box::new(err)),
+                }
+            }
             Err(err) => Err(Box::new(err)),
         }
     }
