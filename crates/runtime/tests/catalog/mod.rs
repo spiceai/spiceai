@@ -23,7 +23,7 @@ use runtime::Runtime;
 use runtime::{datafusion::query::Protocol, extension::ExtensionFactory};
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
-use spicepod::component::secrets::SpiceSecretStore;
+use spicepod::component::secret::SpiceSecretStore;
 use std::collections::HashMap;
 
 #[tokio::test]

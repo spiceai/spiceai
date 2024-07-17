@@ -27,7 +27,7 @@ use spicepod::{
         extension::Extension,
         model::Model,
         runtime::{ResultsCache, Runtime},
-        secrets::{Secrets, SpiceSecretStore},
+        secret::Secret,
         view::View,
     },
     Spicepod,
@@ -37,7 +37,7 @@ use spicepod::{
 pub struct App {
     pub name: String,
 
-    pub secrets: Secrets,
+    pub secrets: Vec<Secret>,
 
     pub extensions: HashMap<String, Extension>,
 
@@ -69,7 +69,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct AppBuilder {
     name: String,
-    secrets: Secrets,
+    secrets: Vec<Secret>,
     extensions: HashMap<String, Extension>,
     catalogs: Vec<Catalog>,
     datasets: Vec<Dataset>,
@@ -84,7 +84,7 @@ impl AppBuilder {
     pub fn new(name: impl Into<String>) -> AppBuilder {
         AppBuilder {
             name: name.into(),
-            secrets: Secrets::default(),
+            secrets: vec![],
             extensions: HashMap::new(),
             catalogs: vec![],
             datasets: vec![],
@@ -98,7 +98,7 @@ impl AppBuilder {
 
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
-        self.secrets = spicepod.secrets.clone();
+        self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
@@ -116,8 +116,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
-        self.secrets = Secrets { store: secret };
+    pub fn with_secret(mut self, secret: Secret) -> AppBuilder {
+        self.secrets.push(secret);
         self
     }
 

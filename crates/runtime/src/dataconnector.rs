@@ -628,10 +628,12 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_table_providers::util::secrets::to_secret_map;
+
     use super::*;
 
     struct TestConnector {
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     }
 
     impl std::fmt::Display for TestConnector {
@@ -642,8 +644,7 @@ mod tests {
 
     impl DataConnectorFactory for TestConnector {
         fn create(
-            _secret: Option<Secret>,
-            params: Arc<HashMap<String, String>>,
+            params: HashMap<String, SecretString>,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };
@@ -657,7 +658,7 @@ mod tests {
             self
         }
 
-        fn get_params(&self) -> &HashMap<String, String> {
+        fn get_params(&self) -> &HashMap<String, SecretString> {
             &self.params
         }
 
@@ -673,7 +674,7 @@ mod tests {
 
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
-            params: params.into(),
+            params: to_secret_map(params),
         };
         let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
 
