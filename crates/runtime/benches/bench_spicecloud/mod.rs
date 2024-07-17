@@ -26,14 +26,12 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q5", include_str!("tpch_q5.sql")),
         ("tpch_q6", include_str!("tpch_q6.sql")),
         ("tpch_q7", include_str!("tpch_q7.sql")),
-        // Error: "query `tpch_q8` to results: External error: Schema error: No field named \"SUM(CASE WHEN all_nations.nation = Utf8(\"\"BRAZIL\"\") THEN all_nations.volume ELSE Int64(0) END)\". Valid fields are all_nations.o_year, \"SUM(CASE WHEN all_nations.tpch.nation = Utf8(\"\"BRAZIL\"\") THEN all_nations.volume ELSE Int64(0) END)\", \"SUM(all_nations.volume)\"."
-        // ("tpch_q8", include_str!("tpch_q8.sql")),
+        ("tpch_q8", include_str!("tpch_q8.sql")),
         ("tpch_q9", include_str!("tpch_q9.sql")),
         ("tpch_q10", include_str!("tpch_q10.sql")),
         ("tpch_q11", include_str!("tpch_q11.sql")),
         ("tpch_q12", include_str!("tpch_q12.sql")),
-        // Error: "query `tpch_q13` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.customer' not found ...
-        // ("tpch_q13", include_str!("tpch_q13.sql")),
+        ("tpch_q13", include_str!("tpch_q13.sql")),
         ("tpch_q14", include_str!("tpch_q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
 
