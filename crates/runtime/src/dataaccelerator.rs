@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
-use crate::secrets::{ExposeSecret, SecretMap};
+use crate::secrets::ExposeSecret;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -24,6 +24,7 @@ use datafusion::{
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers::util::secrets::to_secret_map;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -263,12 +264,13 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
-    let secret_map: SecretMap = acceleration_settings.params.clone().into();
+    let secret_map: HashMap<String, SecretString> =
+        to_secret_map(acceleration_settings.params.clone());
     // TODO: inject secrets into acceleration settings
     let mut external_table_builder =
         AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
-            .options(secret_map.into_map())
+            .options(secret_map)
             .indexes(acceleration_settings.indexes.clone());
 
     // If there are constraints from the federated table, then add them to the accelerated table

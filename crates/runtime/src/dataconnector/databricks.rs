@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::secrets::SecretMap;
 use crate::Runtime;
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
@@ -28,6 +27,7 @@ use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::util::secrets::to_secret_map;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
@@ -189,7 +189,8 @@ impl DataConnector for Databricks {
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
-        let mut dataset_params: SecretMap = catalog.params.clone().into();
+        let mut dataset_params: HashMap<String, SecretString> =
+            to_secret_map(catalog.params.clone());
 
         for (key, value) in &catalog.dataset_params {
             dataset_params.insert(key.to_string(), value.clone().into());
@@ -200,22 +201,19 @@ impl DataConnector for Databricks {
         let mode = self.params.get("mode").map(|v| v.expose_secret().as_str());
         let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
             (
-                Arc::new(DeltaTableFactory::new(dataset_params.into_map())) as Arc<dyn Read>,
+                Arc::new(DeltaTableFactory::new(dataset_params)) as Arc<dyn Read>,
                 table_reference_creator_delta_lake as fn(UCTable) -> Option<TableReference>,
             )
         } else {
-            let dataset_databricks =
-                match Databricks::new(dataset_params.into_map())
-                    .await
-                    .map_err(
-                        |source| super::DataConnectorError::UnableToGetCatalogProvider {
-                            dataconnector: "databricks".to_string(),
-                            source: source.into(),
-                        },
-                    ) {
-                    Ok(dataset_databricks) => dataset_databricks,
-                    Err(e) => return Some(Err(e)),
-                };
+            let dataset_databricks = match Databricks::new(dataset_params).await.map_err(|source| {
+                super::DataConnectorError::UnableToGetCatalogProvider {
+                    dataconnector: "databricks".to_string(),
+                    source: source.into(),
+                }
+            }) {
+                Ok(dataset_databricks) => dataset_databricks,
+                Err(e) => return Some(Err(e)),
+            };
 
             (
                 dataset_databricks.read_provider,

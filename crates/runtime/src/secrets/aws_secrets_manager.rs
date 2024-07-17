@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+use secrecy::SecretString;
 
 use super::SecretStore;
 
@@ -89,7 +90,7 @@ impl AwsSecretsManager {
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
     #[must_use]
-    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<String>> {
+    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<SecretString>> {
         tracing::trace!(
             "Getting secret {} from AWS Secrets Manager",
             self.secret_name
@@ -125,12 +126,13 @@ impl SecretStore for AwsSecretsManager {
 
         if let Some(secret_str) = secret_value.secret_string() {
             let data = parse_json_to_hashmap(secret_str)?;
-            return Ok(data.get(key).cloned());
+            return Ok(data.get(key).cloned().map(SecretString::new));
         }
 
         Ok(None)
     }
 }
+
 /// Parses a JSON string into a `HashMap<String, String>`.
 ///
 /// # Errors
