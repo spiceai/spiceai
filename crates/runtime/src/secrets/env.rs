@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 
 use super::SecretStore;
 
@@ -44,10 +45,10 @@ impl SecretStore for EnvSecretStore {
     /// <https://www.gnu.org/software/libc/manual/html_node/Environment-Variables.html>
     /// > Names of environment variables are case-sensitive and must not contain the character ‘=’. System-defined environment variables are invariably uppercase.
     #[must_use]
-    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<String>> {
+    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<SecretString>> {
         // TODO: Handle falling back to the spice generated prefix
         match std::env::var(key) {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => Ok(Some(SecretString::new(value))),
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(err) => Err(Box::new(err)),
         }

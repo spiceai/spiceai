@@ -52,7 +52,7 @@ fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
 headers-accept = "0.1.3"
-indexmap = "2.2.2"
+indexmap = "2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }
 lazy_static = "1.4.0"

@@ -55,7 +55,7 @@ impl DataConnectorFactory for FlightSQL {
         Box::pin(async move {
             let endpoint: String = params
                 .get("endpoint")
-                .map(|s| s.expose_secret())
+                .map(ExposeSecret::expose_secret)
                 .cloned()
                 .context(MissingEndpointParameterSnafu)?;
             let flight_channel = new_tls_flight_channel(&endpoint)
