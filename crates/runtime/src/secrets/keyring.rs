@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use keyring::Entry;
+use secrecy::SecretString;
 use snafu::Snafu;
 
 use super::SecretStore;
@@ -55,7 +56,7 @@ impl KeyringSecretStore {
 #[async_trait]
 impl SecretStore for KeyringSecretStore {
     #[must_use]
-    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<String>> {
+    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<SecretString>> {
         let entry = match Entry::new(key, "spiced") {
             Ok(entry) => entry,
             Err(keyring::Error::NoEntry) => {
@@ -67,7 +68,7 @@ impl SecretStore for KeyringSecretStore {
         };
 
         let secret = match entry.get_password() {
-            Ok(secret) => secret,
+            Ok(secret) => SecretString::new(secret),
             Err(keyring::Error::NoEntry) => {
                 return Ok(None);
             }

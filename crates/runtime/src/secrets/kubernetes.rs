@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine};
 use reqwest;
+use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 
 use super::SecretStore;
@@ -190,9 +191,9 @@ impl KubernetesSecretStore {
 #[async_trait]
 impl SecretStore for KubernetesSecretStore {
     #[must_use]
-    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<String>> {
+    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<SecretString>> {
         match self.kubernetes_client.get_secret(&self.secret_name).await {
-            Ok(secret) => Ok(secret.get(key).cloned()),
+            Ok(secret) => Ok(secret.get(key).cloned().map(SecretString::new)),
             Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
     }
