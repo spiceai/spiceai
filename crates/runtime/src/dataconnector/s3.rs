@@ -17,7 +17,7 @@ limitations under the License.
 use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -43,17 +43,15 @@ pub enum Error {
 }
 
 pub struct S3 {
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
 }
 
 impl DataConnectorFactory for S3 {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let s3 = Self { secret, params };
+            let s3 = Self { params };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
     }
@@ -70,7 +68,7 @@ impl ListingTableConnector for S3 {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }
 
@@ -78,21 +76,19 @@ impl ListingTableConnector for S3 {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(region) = self.params.get("region") {
+        if let Some(region) = self.params.get("region").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("region", region);
         }
-        if let Some(endpoint) = self.params.get("endpoint") {
+        if let Some(endpoint) = self.params.get("endpoint").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("endpoint", endpoint);
         }
-        if let Some(secret) = &self.secret {
-            if let Some(key) = secret.get("key") {
-                fragment_builder.append_pair("key", key);
-            };
-            if let Some(secret) = secret.get("secret") {
-                fragment_builder.append_pair("secret", secret);
-            };
-        }
-        if let Some(timeout) = self.params.get("timeout") {
+        if let Some(key) = self.params.get("key").map(ExposeSecret::expose_secret) {
+            fragment_builder.append_pair("key", key);
+        };
+        if let Some(secret) = self.params.get("secret").map(ExposeSecret::expose_secret) {
+            fragment_builder.append_pair("secret", secret);
+        };
+        if let Some(timeout) = self.params.get("timeout").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("timeout", timeout);
         }
         fragments.push(fragment_builder.finish());

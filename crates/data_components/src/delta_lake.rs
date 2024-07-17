@@ -42,7 +42,6 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::ops::Deref;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -60,12 +59,12 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DeltaTableFactory {
-    params: Arc<HashMap<String, SecretString>>,
+    params: HashMap<String, SecretString>,
 }
 
 impl DeltaTableFactory {
     #[must_use]
-    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Self {
+    pub fn new(params: HashMap<String, SecretString>) -> Self {
         Self { params }
     }
 }
@@ -78,8 +77,7 @@ impl Read for DeltaTableFactory {
         _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.deref().clone()).boxed()?;
+        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone()).boxed()?;
         Ok(Arc::new(delta))
     }
 }

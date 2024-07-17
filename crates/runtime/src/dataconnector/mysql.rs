@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -25,6 +24,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     DbConnectionPool, Error as DbConnectionPoolError,
 };
 use mysql_async::prelude::ToValue;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -47,19 +47,12 @@ pub struct MySQL {
 
 impl DataConnectorFactory for MySQL {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
-        if let Some(secret) = secret {
-            secret.insert_to_params(
-                &mut params,
-                "mysql_connection_string_key",
-                "mysql_connection_string",
-            );
-            secret.insert_to_params(&mut params, "mysql_pass_key", "mysql_pass");
-            secret.insert_to_params(&mut params, "mysql_user_key", "mysql_user");
-        }
+        // Required secrets:
+        // - mysql_connection_string
+        // - mysql_pass
+        // - mysql_user
 
         Box::pin(async move {
             let pool: Arc<
@@ -67,7 +60,7 @@ impl DataConnectorFactory for MySQL {
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(Arc::new(params.into_map()))
+                MySQLConnectionPool::new(params.into())
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );
