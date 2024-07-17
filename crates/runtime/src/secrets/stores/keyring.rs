@@ -19,7 +19,7 @@ use keyring::Entry;
 use secrecy::SecretString;
 use snafu::Snafu;
 
-use super::SecretStore;
+use crate::secrets::SecretStore;
 
 const KEYRING_SECRET_PREFIX: &str = "spice_secret_";
 
@@ -56,7 +56,7 @@ impl KeyringSecretStore {
 #[async_trait]
 impl SecretStore for KeyringSecretStore {
     #[must_use]
-    async fn get_secret(&self, key: &str) -> super::AnyErrorResult<Option<SecretString>> {
+    async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         let entry = match Entry::new(key, "spiced") {
             Ok(entry) => entry,
             Err(keyring::Error::NoEntry) => {

@@ -14,23 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "aws-secrets-manager")]
-pub mod aws_secrets_manager;
-pub mod env;
-#[cfg(feature = "keyring-secret-store")]
-pub mod keyring;
-pub mod kubernetes;
-
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use indexmap::IndexMap;
+pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
-
 use spicepod::component::secret::Secret as SpicepodSecret;
+use std::sync::Arc;
 
-pub use secrecy::ExposeSecret;
+mod lexer;
+pub mod stores;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -38,7 +31,9 @@ pub enum Error {
     UnableToLoadSecrets { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
-    UnableToInitializeAwsSecretsManager { source: aws_secrets_manager::Error },
+    UnableToInitializeAwsSecretsManager {
+        source: stores::aws_secrets_manager::Error,
+    },
 
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue,
@@ -200,7 +195,7 @@ fn secret_selector(from: &str) -> Option<&str> {
 }
 
 fn load_default_store() -> Arc<dyn SecretStore> {
-    Arc::new(env::EnvSecretStore::new())
+    Arc::new(stores::env::EnvSecretStore::new())
 }
 
 /// Loads the secret store from the provided secret store type.
@@ -211,17 +206,17 @@ fn load_default_store() -> Arc<dyn SecretStore> {
 async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn SecretStore>> {
     match store_type {
         SecretStoreType::Env => {
-            let env_secret_store = env::EnvSecretStore::new();
+            let env_secret_store = stores::env::EnvSecretStore::new();
 
             Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
         }
         #[cfg(feature = "keyring-secret-store")]
         SecretStoreType::Keyring => {
-            Ok(Arc::new(keyring::KeyringSecretStore::new()) as Arc<dyn SecretStore>)
+            Ok(Arc::new(stores::keyring::KeyringSecretStore::new()) as Arc<dyn SecretStore>)
         }
         SecretStoreType::Kubernetes(secret_name) => {
             let mut kubernetes_secret_store =
-                kubernetes::KubernetesSecretStore::new(secret_name.clone());
+                stores::kubernetes::KubernetesSecretStore::new(secret_name.clone());
 
             kubernetes_secret_store
                 .init()
@@ -231,7 +226,8 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
         }
         #[cfg(feature = "aws-secrets-manager")]
         SecretStoreType::AwsSecretsManager(secret_name) => {
-            let secret_store = aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
+            let secret_store =
+                stores::aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
 
             secret_store
                 .init()

@@ -1524,6 +1524,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "beef"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
+
+[[package]]
 name = "bigdecimal"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5464,6 +5470,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "logos"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "161971eb88a0da7ae0c333e1063467c5b5727e7fb6b710b8db4814eade3a42e8"
+dependencies = [
+ "logos-derive",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e31badd9de5131fdf4921f6473d457e3dd85b11b7f091ceb50e4df7c3eeb12a"
+dependencies = [
+ "beef",
+ "fnv",
+ "lazy_static",
+ "proc-macro2",
+ "quote",
+ "regex-syntax 0.8.4",
+ "syn 2.0.71",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c2a69b3eb68d5bd595107c9ee58d7e07fe2bb5e360cc85b0f084dedac80de0a"
+dependencies = [
+ "logos-codegen",
+]
+
+[[package]]
 name = "lrtable"
 version = "0.13.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8063,6 +8102,7 @@ dependencies = [
  "keyring",
  "lazy_static",
  "llms",
+ "logos",
  "mediatype",
  "metrics 0.23.0",
  "metrics-exporter-prometheus",
