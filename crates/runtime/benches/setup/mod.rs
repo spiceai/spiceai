@@ -3,7 +3,7 @@ use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::{
     dataset::{replication::Replication, Dataset, Mode},
-    secrets::SpiceSecretStore,
+    secret::SpiceSecretStore,
 };
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
