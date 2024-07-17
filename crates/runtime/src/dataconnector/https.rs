@@ -87,7 +87,7 @@ impl ListingTableConnector for Https {
             .get("http_password")
             .map(|s| s.expose_secret().as_str())
         {
-            if u.set_password(Some(&p)).is_err() {
+            if u.set_password(Some(p)).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                         dataconnector: "https".to_string(),
