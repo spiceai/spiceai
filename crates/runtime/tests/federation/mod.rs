@@ -18,7 +18,7 @@ use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
-use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
+use spicepod::component::{dataset::Dataset, secret::SpiceSecretStore};
 
 use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
 
