@@ -18,7 +18,6 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::secrets::SecretMap;
 use crate::Runtime;
 use async_trait::async_trait;
 use data_components::delta_lake::DeltaTableFactory;
@@ -29,6 +28,7 @@ use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::util::secrets::to_secret_map;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
@@ -120,7 +120,8 @@ impl DataConnector for UnityCatalog {
         ));
 
         // Copy the catalog params into the dataset params, and allow user to override
-        let mut dataset_params: SecretMap = catalog.params.clone().into();
+        let mut dataset_params: HashMap<String, SecretString> =
+            to_secret_map(catalog.params.clone());
 
         for (key, value) in &catalog.dataset_params {
             dataset_params.insert(key.to_string(), value.clone().into());
@@ -128,8 +129,7 @@ impl DataConnector for UnityCatalog {
 
         // TODO inject secrets into params
 
-        let delta_table_creator =
-            Arc::new(DeltaTableFactory::new(dataset_params.into_map())) as Arc<dyn Read>;
+        let delta_table_creator = Arc::new(DeltaTableFactory::new(dataset_params)) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,

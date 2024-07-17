@@ -41,6 +41,7 @@ use component::view::View;
 use config::Config;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use datafusion_table_providers::util::secrets::to_secret_map;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use extension::ExtensionFactory;
@@ -53,7 +54,7 @@ use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
-use secrets::{spicepod_secret_store_type, SecretMap};
+use secrets::spicepod_secret_store_type;
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
@@ -965,9 +966,9 @@ impl Runtime {
         // )?;
 
         // TODO inject secrets into params
-        let secret_map: SecretMap = params.into();
+        let secret_map: HashMap<String, SecretString> = to_secret_map(params);
 
-        match dataconnector::create_new_connector(source, secret_map.into_map()).await {
+        match dataconnector::create_new_connector(source, secret_map).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,
@@ -1059,11 +1060,14 @@ impl Runtime {
             })
     }
 
-    async fn get_params_with_secrets(&self, params: &HashMap<String, String>) -> Result<SecretMap> {
+    async fn get_params_with_secrets(
+        &self,
+        params: &HashMap<String, String>,
+    ) -> Result<HashMap<String, SecretString>> {
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        let mut params_with_secrets: SecretMap = params.clone().into();
+        let mut params_with_secrets: HashMap<String, SecretString> = to_secret_map(params.clone());
 
         // TODO inject secrets into params
 
@@ -1071,8 +1075,12 @@ impl Runtime {
     }
 
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
-    async fn load_llm(&self, m: SpicepodModel, params: SecretMap) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params.into_map())
+    async fn load_llm(
+        &self,
+        m: SpicepodModel,
+        params: HashMap<String, SecretString>,
+    ) -> Result<Box<dyn Chat>> {
+        let mut l = try_to_chat_model(&m, &params)
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1087,7 +1095,7 @@ impl Runtime {
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
 
-        let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
+        let mut l = try_to_embedding(in_embed, &params_with_secrets)
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()
@@ -1170,7 +1178,7 @@ impl Runtime {
                     m.name, e,
                 )),
             },
-            Some(ModelType::Ml) => match Model::load(m.clone(), params.into_map()).await {
+            Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
                 Ok(in_m) => {
                     let mut model_map = self.models.write().await;
                     model_map.insert(m.name.clone(), in_m);
