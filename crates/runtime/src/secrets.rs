@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use lexer::SecretReplacementMatcher;
 pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -105,7 +106,57 @@ impl Secrets {
     }
 
     pub async fn inject_secrets(&self, param_str: ParamStr<'_>) -> SecretString {
-        todo!();
+        tracing::trace!("Injecting secrets for: {}", param_str.0);
+        let mut result = String::new();
+        let mut last_end = 0;
+        for secret_replacement in SecretReplacementMatcher::new(param_str.0) {
+            tracing::debug!(
+                "Found secret replacement: Store name: {}, Key: {}, Span: {:?}",
+                secret_replacement.store_name,
+                secret_replacement.key,
+                secret_replacement.span,
+            );
+
+            // Append text from last match to the start of the current match
+            result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
+
+            // Get the secret value from the store
+            let secret = if let Some(store) = self.stores.get(&secret_replacement.store_name) {
+                match store.get_secret(&secret_replacement.key).await {
+                    Ok(Some(secret)) => secret.expose_secret().to_string(),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "Secret key {} not found in store: {}",
+                            secret_replacement.key,
+                            secret_replacement.store_name
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error getting secret: {}", e);
+                        continue;
+                    }
+                }
+            } else {
+                tracing::error!(
+                    "Secret store {} referenced in {} not found.",
+                    secret_replacement.store_name,
+                    param_str.0
+                );
+                continue;
+            };
+
+            // Replace the token with the desired string
+            result.push_str(&secret);
+
+            // Update the last end to the end of the current match
+            last_end = secret_replacement.span.end;
+        }
+
+        // Append the remaining text after the last match
+        result.push_str(&param_str.0[last_end..]);
+
+        SecretString::new(result)
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
@@ -241,6 +292,8 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     #[test]
     fn test_secret_store_provider() {
         assert_eq!("foo", super::secret_store_provider("foo:bar"));
@@ -251,5 +304,23 @@ mod tests {
     fn test_secret_selector() {
         assert_eq!(Some("bar"), super::secret_selector("foo:bar"));
         assert_eq!(None, super::secret_selector("foo"));
+    }
+
+    #[tokio::test]
+    async fn test_inject_secrets_env() {
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
+
+        std::env::set_var("MY_SECRET_KEY", "super_secret");
+
+        let result = secrets
+            .inject_secrets(super::ParamStr(
+                "This is a secret: ${{ env:MY_SECRET_KEY }}! 🫡",
+            ))
+            .await;
+        assert_eq!(
+            "This is a secret: super_secret! 🫡",
+            result.expose_secret().as_str()
+        );
     }
 }
