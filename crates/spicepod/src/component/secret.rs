@@ -18,34 +18,31 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::{params::Params, Nameable};
+
 /// The secrets configuration for a Spicepod.
 ///
 /// Example:
 /// ```yaml
 /// secrets:
-///   store: env
+///   - from: env
+///     name: env
+///   - from: kubernetes:my_secret_name
+///     name: k8s
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct Secrets {
-    pub store: SpiceSecretStore,
+pub struct Secret {
+    pub from: String,
+
+    pub name: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 }
 
-impl Default for Secrets {
-    fn default() -> Self {
-        Self {
-            store: SpiceSecretStore::Env,
-        }
+impl Nameable for Secret {
+    fn name(&self) -> &str {
+        &self.name
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum SpiceSecretStore {
-    Env,
-    Kubernetes,
-    Keyring,
-    #[serde(rename = "aws_secrets_manager")]
-    AwsSecretsManager,
 }
