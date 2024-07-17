@@ -228,8 +228,6 @@ pub struct Acceleration {
 
     pub params: HashMap<String, String>,
 
-    pub engine_secret: Option<String>,
-
     pub retention_period: Option<String>,
 
     pub retention_check_interval: Option<String>,
@@ -329,7 +327,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
-            engine_secret: acceleration.engine_secret,
             retention_period: acceleration.retention_period,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
@@ -355,7 +352,6 @@ impl Default for Acceleration {
             refresh_retry_enabled: true,
             refresh_retry_max_attempts: None,
             params: HashMap::default(),
-            engine_secret: None,
             retention_period: None,
             retention_check_interval: None,
             retention_check_enabled: false,

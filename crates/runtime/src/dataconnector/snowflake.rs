@@ -20,10 +20,9 @@ use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use secrecy::SecretString;
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
-use crate::secrets::SecretMap;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -50,36 +49,17 @@ pub struct Snowflake {
 
 impl DataConnectorFactory for Snowflake {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
-        if let Some(secret) = secret {
-            secret.insert_to_params(&mut params, "username_key", "username");
-            secret.insert_to_params(&mut params, "account_key", "account");
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_warehouse_key",
-                "snowflake_warehouse",
-            );
-            secret.insert_to_params(&mut params, "snowflake_role_key", "snowflake_role");
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_auth_type_key",
-                "snowflake_auth_type",
-            );
-            secret.insert_to_params(&mut params, "password_key", "password");
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_private_key_path_key",
-                "snowflake_private_key_path",
-            );
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_private_key_passphrase_key",
-                "snowflake_private_key_passphrase",
-            );
-        }
+        // Required secrets:
+        // - username
+        // - account
+        // - snowflake_warehouse
+        // - snowflake_role
+        // - snowflake_auth_type
+        // - password
+        // - snowflake_private_key_path
+        // - snowflake_private_key_passphrase
 
         Box::pin(async move {
             let pool: Arc<

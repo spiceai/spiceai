@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// Example:
 /// ```yaml
 /// secrets:
-///   store: file
+///   store: env
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -34,7 +34,7 @@ pub struct Secrets {
 impl Default for Secrets {
     fn default() -> Self {
         Self {
-            store: SpiceSecretStore::File,
+            store: SpiceSecretStore::Env,
         }
     }
 }
@@ -43,7 +43,6 @@ impl Default for Secrets {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpiceSecretStore {
-    File,
     Env,
     Kubernetes,
     Keyring,
