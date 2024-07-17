@@ -28,6 +28,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use indexmap::IndexMap;
 use secrecy::SecretString;
 use snafu::prelude::*;
 
@@ -49,16 +50,17 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-pub struct WithPrefix(pub bool);
-
 #[async_trait]
 pub trait SecretStore: Send + Sync {
     /// `get_secret` will load a secret from the secret store with the given key.
-    async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<String>>;
+    async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>>;
 }
 
 pub struct Secrets {
-    stores: HashMap<String, Arc<dyn SecretStore>>,
+    // Use an IndexMap to maintain the order of the secret stores.
+    // This order is the reverse of the order in which the secret stores are defined in the SpicePod.
+    // This maintains the precedence order we want, since we will search through the secret stores in their order here.
+    stores: IndexMap<String, Arc<dyn SecretStore>>,
 }
 
 pub struct ParamStr<'a>(&'a str);
@@ -69,73 +71,9 @@ impl Secrets {
         todo!();
     }
 
+    /// Gets a secret key from the connected secret stores in precedence order.
     async fn get_secret(&self, key: SecretKey<'_>) -> AnyErrorResult<Option<SecretString>> {
         todo!();
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SecretMap(HashMap<String, SecretString>);
-
-impl SecretMap {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(HashMap::new())
-    }
-
-    #[must_use]
-    pub fn into_map(self) -> HashMap<String, SecretString> {
-        self.0
-    }
-}
-
-impl Default for SecretMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Deref for SecretMap {
-    type Target = HashMap<String, SecretString>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for SecretMap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl FromIterator<(String, SecretString)> for SecretMap {
-    fn from_iter<T: IntoIterator<Item = (String, SecretString)>>(iter: T) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
-
-impl FromIterator<(String, String)> for SecretMap {
-    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
-        Self(
-            iter.into_iter()
-                .map(|(k, v)| (k, SecretString::from(v)))
-                .collect(),
-        )
-    }
-}
-
-impl From<HashMap<String, String>> for SecretMap {
-    fn from(map: HashMap<String, String>) -> Self {
-        map.into_iter().collect()
-    }
-}
-
-impl From<&HashMap<String, String>> for SecretMap {
-    fn from(map: &HashMap<String, String>) -> Self {
-        map.iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
     }
 }
 
@@ -191,7 +129,7 @@ impl SecretsProvider {
     pub async fn load_secrets(&mut self) -> Result<()> {
         match &self.store {
             SecretStoreType::Env => {
-                let mut env_secret_store = env::EnvSecretStore::new();
+                let env_secret_store = env::EnvSecretStore::new();
 
                 self.secret_store = Some(Box::new(env_secret_store));
             }
