@@ -63,12 +63,24 @@ impl EnvSecretStore {
             match dotenvy::from_path(path) {
                 Ok(()) => return,
                 Err(err) => {
-                    tracing::warn!("Error opening path {}: {err}", path.display());
+                    if matches!(err, dotenvy::Error::LineParse(_, _)) {
+                        tracing::warn!("{err}");
+                    } else {
+                        tracing::warn!("Error opening path {}: {err}", path.display());
+                    }
                 }
             };
         }
-        dotenvy::from_filename(".env.local").ok();
-        dotenvy::from_filename(".env").ok();
+        if let Err(err) = dotenvy::from_filename(".env.local") {
+            if matches!(err, dotenvy::Error::LineParse(_, _)) {
+                tracing::warn!(".env.local: {err}");
+            }
+        };
+        if let Err(err) = dotenvy::from_filename(".env") {
+            if matches!(err, dotenvy::Error::LineParse(_, _)) {
+                tracing::warn!(".env: {err}");
+            }
+        };
     }
 }
 
