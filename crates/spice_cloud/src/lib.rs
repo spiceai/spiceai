@@ -34,6 +34,7 @@ use runtime::{
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnector, DataConnectorError},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
+    secrets::ExposeSecret,
     spice_metrics::get_metrics_table_reference,
     Runtime,
 };
@@ -106,11 +107,15 @@ impl SpiceExtension {
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
-        todo!()
-        // let secret = self.get_spice_secret(runtime).await?;
-        // let api_key = secret.get("key").ok_or(Error::SpiceApiKeyNotFound {})?;
+        let secret = runtime.secrets();
+        let secret = secret.read().await;
+        let api_key = secret
+            .get_secret("SPICE_API_KEY")
+            .await
+            .context(UnableToGetSpiceSecretSnafu)?
+            .ok_or(Error::SpiceApiKeyNotFound {})?;
 
-        // Ok(api_key.to_string())
+        Ok(api_key.expose_secret().to_string())
     }
 
     async fn connect(&self) -> Result<SpiceCloudConnectResponse, Error> {

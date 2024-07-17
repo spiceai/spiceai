@@ -56,6 +56,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+pub const SECRETS: &str = "secrets";
+
 #[async_trait]
 pub trait SecretStore: Send + Sync {
     /// `get_secret` will load a secret from the secret store with the given key.
@@ -70,7 +72,6 @@ pub struct Secrets {
 }
 
 pub struct ParamStr<'a>(pub &'a str);
-pub struct SecretKey<'a>(pub &'a str);
 
 impl Secrets {
     #[must_use]
@@ -121,28 +122,14 @@ impl Secrets {
             result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
 
             // Get the secret value from the store
-            let secret = if let Some(store) = self.stores.get(&secret_replacement.store_name) {
-                match store.get_secret(&secret_replacement.key).await {
-                    Ok(Some(secret)) => secret.expose_secret().to_string(),
-                    Ok(None) => {
-                        tracing::warn!(
-                            "Secret key {} not found in store: {}",
-                            secret_replacement.key,
-                            secret_replacement.store_name
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!("Error getting secret: {}", e);
-                        continue;
-                    }
-                }
-            } else {
-                tracing::error!(
-                    "Secret store {} referenced in {} not found.",
-                    secret_replacement.store_name,
-                    param_str.0
-                );
+            let Some(secret) = self
+                .get_store_secret(
+                    &param_str,
+                    &secret_replacement.store_name,
+                    &secret_replacement.key,
+                )
+                .await
+            else {
                 continue;
             };
 
@@ -160,8 +147,60 @@ impl Secrets {
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
-    async fn get_secret(&self, key: SecretKey<'_>) -> AnyErrorResult<Option<SecretString>> {
-        todo!();
+    pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        for store in self.stores.values() {
+            match store.get_secret(key).await {
+                Ok(Some(secret)) => return Ok(Some(secret)),
+                Ok(None) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn get_store_secret(
+        &self,
+        param_str: &ParamStr<'_>,
+        store_name: &str,
+        key: &str,
+    ) -> Option<String> {
+        // This is a special case for loading secrets across stores in precedence order
+        if store_name == SECRETS {
+            match self.get_secret(key).await {
+                Ok(Some(secret)) => return Some(secret.expose_secret().to_string()),
+                Ok(None) => {
+                    tracing::error!("Key '{key}' not found in any connected secrets.");
+                    return None;
+                }
+                Err(e) => {
+                    tracing::error!("Error getting secret: {}", e);
+                    return None;
+                }
+            }
+        }
+
+        let secret = if let Some(store) = self.stores.get(store_name) {
+            match store.get_secret(key).await {
+                Ok(Some(secret)) => secret.expose_secret().to_string(),
+                Ok(None) => {
+                    tracing::error!("Key {key} not found in secret: {store_name}");
+                    return None;
+                }
+                Err(e) => {
+                    tracing::error!("Error getting secret: {}", e);
+                    return None;
+                }
+            }
+        } else {
+            tracing::error!(
+                "Secret '{store_name}' referenced in {} not found.",
+                param_str.0
+            );
+            return None;
+        };
+
+        Some(secret)
     }
 }
 
