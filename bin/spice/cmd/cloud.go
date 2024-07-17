@@ -79,7 +79,11 @@ spice chat --model <model> --cloud
 
 		reader := bufio.NewReader(os.Stdin)
 
-		spiceBaseUrl := os.Getenv("SPICE_BASE_URL")
+		var spiceBaseUrl = "https://data.spiceai.io"
+		if os.Getenv("SPICE_BASE_URL") != "" {
+			spiceBaseUrl = os.Getenv("SPICE_BASE_URL")
+		}
+
 		apiKey := os.Getenv("SPICE_API_KEY")
 
 		client := &http.Client{}
