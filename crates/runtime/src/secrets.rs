@@ -22,6 +22,7 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::secret::Secret as SpicepodSecret;
 use std::sync::Arc;
+use stores::env::EnvSecretStoreBuilder;
 
 mod lexer;
 pub mod stores;
@@ -212,6 +213,7 @@ impl Default for Secrets {
 
 pub enum SecretStoreType {
     Env,
+    EnvCustomPath(String),
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
     Kubernetes(String),
@@ -225,6 +227,12 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
     match provider {
         "env" => {
             require_no_selector(provider, selector)?;
+            if let Some(params) = store.params.as_ref() {
+                let params = params.as_string_map();
+                if let Some(path) = params.get("file_path") {
+                    return Ok(SecretStoreType::EnvCustomPath(path.to_string()));
+                }
+            }
             Ok(SecretStoreType::Env)
         }
         #[cfg(feature = "keyring-secret-store")]
@@ -285,7 +293,7 @@ fn secret_selector(from: &str) -> Option<&str> {
 }
 
 fn load_default_store() -> Arc<dyn SecretStore> {
-    Arc::new(stores::env::EnvSecretStore::new())
+    Arc::new(EnvSecretStoreBuilder::new().build())
 }
 
 /// Loads the secret store from the provided secret store type.
@@ -296,7 +304,12 @@ fn load_default_store() -> Arc<dyn SecretStore> {
 async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn SecretStore>> {
     match store_type {
         SecretStoreType::Env => {
-            let env_secret_store = stores::env::EnvSecretStore::new();
+            let env_secret_store = EnvSecretStoreBuilder::new().build();
+
+            Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
+        }
+        SecretStoreType::EnvCustomPath(path) => {
+            let env_secret_store = EnvSecretStoreBuilder::new().with_path(path.into()).build();
 
             Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
         }

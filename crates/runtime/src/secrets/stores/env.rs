@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use secrecy::SecretString;
 
@@ -21,18 +23,52 @@ use crate::secrets::SecretStore;
 
 const ENV_SECRET_PREFIX: &str = "SPICE_";
 
-pub struct EnvSecretStore {}
+pub struct EnvSecretStoreBuilder {
+    path: Option<PathBuf>,
+}
 
-impl Default for EnvSecretStore {
+impl Default for EnvSecretStoreBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EnvSecretStore {
+impl EnvSecretStoreBuilder {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self { path: None }
+    }
+
+    #[must_use]
+    pub fn with_path(mut self, path: PathBuf) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> EnvSecretStore {
+        let env = EnvSecretStore { path: self.path };
+        env.load();
+        env
+    }
+}
+
+pub struct EnvSecretStore {
+    path: Option<PathBuf>,
+}
+
+impl EnvSecretStore {
+    fn load(&self) {
+        if let Some(path) = &self.path {
+            match dotenvy::from_path(path) {
+                Ok(()) => return,
+                Err(err) => {
+                    tracing::warn!("Error opening path {}: {err}", path.display());
+                }
+            };
+        }
+        dotenvy::from_filename(".env.local").ok();
+        dotenvy::from_filename(".env").ok();
     }
 }
 
