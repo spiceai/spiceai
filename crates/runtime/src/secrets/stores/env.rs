@@ -94,17 +94,17 @@ impl SecretStore for EnvSecretStore {
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         let upper_key = key.to_uppercase();
-        match std::env::var(&upper_key) {
+
+        // First try looking for `SPICE_MY_KEY` and then `MY_KEY`
+        let prefixed_key = format!("{ENV_SECRET_PREFIX}{upper_key}");
+        match std::env::var(prefixed_key) {
             Ok(value) => Ok(Some(SecretString::new(value))),
-            Err(std::env::VarError::NotPresent) => {
-                // If the key isn't found by the explicit key, try with SPICE_ prefixed
-                let prefixed_key = format!("{ENV_SECRET_PREFIX}{upper_key}");
-                match std::env::var(prefixed_key) {
-                    Ok(value) => Ok(Some(SecretString::new(value))),
-                    Err(std::env::VarError::NotPresent) => Ok(None),
-                    Err(err) => Err(Box::new(err)),
-                }
-            }
+            // If the prefixed key is not found, try the original key
+            Err(std::env::VarError::NotPresent) => match std::env::var(upper_key) {
+                Ok(value) => Ok(Some(SecretString::new(value))),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(err) => Err(Box::new(err)),
+            },
             Err(err) => Err(Box::new(err)),
         }
     }

@@ -51,21 +51,19 @@ impl KeyringSecretStore {
 impl SecretStore for KeyringSecretStore {
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
-        let entry = match Entry::new(key, "spiced") {
+        // First try looking for `spice_my_key` and then `my_key`
+        let prefixed_key = format!("{KEYRING_SECRET_PREFIX}{key}");
+        let entry = match Entry::new(&prefixed_key, "spiced") {
             Ok(entry) => entry,
-            Err(keyring::Error::NoEntry) => {
-                // If the key isn't found by the explicit key, try with SPICE_ prefixed
-                let prefixed_key = format!("{KEYRING_SECRET_PREFIX}{key}");
-                match Entry::new(&prefixed_key, "spiced") {
-                    Ok(entry) => entry,
-                    Err(keyring::Error::NoEntry) => {
-                        return Ok(None);
-                    }
-                    Err(err) => {
-                        return Err(Box::new(Error::UnableToGetSecret { source: err }));
-                    }
+            Err(keyring::Error::NoEntry) => match Entry::new(key, "spiced") {
+                Ok(entry) => entry,
+                Err(keyring::Error::NoEntry) => {
+                    return Ok(None);
                 }
-            }
+                Err(err) => {
+                    return Err(Box::new(Error::UnableToGetSecret { source: err }));
+                }
+            },
             Err(err) => {
                 return Err(Box::new(Error::UnableToGetSecret { source: err }));
             }
