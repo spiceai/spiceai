@@ -1,8 +1,10 @@
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
-use runtime::{dataupdate::DataUpdate, Runtime};
+use clap::builder::Str;
+use runtime::{dataconnector, dataupdate::DataUpdate, Runtime};
 use spicepod::component::{
     dataset::{replication::Replication, Dataset, Mode},
+    params::Params,
     secrets::SpiceSecretStore,
 };
 use std::process::Command;
@@ -11,12 +13,27 @@ use tracing_subscriber::EnvFilter;
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
+pub enum DataConnector {
+    Postgres,
+    SpiceAI,
+}
+
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
+    dataconnector: DataConnector,
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = build_app(upload_results_dataset);
+    let app =
+        match dataconnector {
+            DataConnector::Postgres => PostgresBenchAppBuilder::new(upload_results_dataset)
+                .build_app(upload_results_dataset),
+            DataConnector::SpiceAI => SpiceAIBenchAppBuilder::new(upload_results_dataset)
+                .build_app(upload_results_dataset),
+            _ => {
+                unimplemented!()
+            }
+        };
 
     let rt = Runtime::builder().with_app(app).build().await;
 
@@ -43,28 +60,6 @@ pub(crate) async fn write_benchmark_results(
         .map_err(|e| e.to_string())
 }
 
-fn build_app(upload_results_dataset: &Option<String>) -> App {
-    let mut app_builder = AppBuilder::new("runtime_benchmark_test")
-        .with_secret_store(SpiceSecretStore::File)
-        .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
-        .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
-        .with_dataset(make_spiceai_dataset("tpch.part", "part"))
-        .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
-        .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
-        .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
-        .with_dataset(make_spiceai_dataset("tpch.region", "region"))
-        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"));
-
-    if let Some(upload_results_dataset) = upload_results_dataset {
-        app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
-            upload_results_dataset,
-            "oss_benchmarks",
-        ));
-    }
-
-    app_builder.build()
-}
-
 fn init_tracing() {
     let filter = match std::env::var("SPICED_LOG").ok() {
         Some(level) => EnvFilter::new(level),
@@ -78,17 +73,6 @@ fn init_tracing() {
         .with_ansi(true)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
-}
-
-fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("spiceai:{path}"), name.to_string())
-}
-
-fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
-    let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
-    ds.mode = Mode::ReadWrite;
-    ds.replication = Some(Replication { enabled: true });
-    ds
 }
 
 // This should also append "-dirty" if there are uncommitted changes
@@ -131,4 +115,66 @@ fn get_branch_name() -> String {
             |_| "unknown".to_string(),
             |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
         )
+}
+
+trait BenchAppBuilder {
+    fn build_app(&self, upload_results_dataset: Option<&str>) -> App {
+        let mut app_builder = AppBuilder::new("runtime_benchmark_test")
+            .with_secret_store(SpiceSecretStore::File)
+            .with_dataset(self.make_dataset("tpch.customer", "customer"))
+            .with_dataset(self.make_dataset("tpch.lineitem", "lineitem"))
+            .with_dataset(self.make_dataset("tpch.part", "part"))
+            .with_dataset(self.make_dataset("tpch.partsupp", "partsupp"))
+            .with_dataset(self.make_dataset("tpch.orders", "orders"))
+            .with_dataset(self.make_dataset("tpch.nation", "nation"))
+            .with_dataset(self.make_dataset("tpch.region", "region"))
+            .with_dataset(self.make_dataset("tpch.supplier", "supplier"));
+
+        if let Some(upload_results_dataset) = upload_results_dataset {
+            app_builder = app_builder
+                .with_dataset(self.make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
+        }
+    }
+    fn make_dataset(&self, path: &str, name: &str) -> Dataset;
+    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset;
+}
+
+struct SpiceAIBenchAppBuilder {}
+
+impl BenchAppBuilder for SpiceAIBenchAppBuilder {
+    fn make_dataset(&self, path: &str, name: &str) -> Dataset {
+        Dataset::new(format!("spiceai:{path}"), name.to_string())
+    }
+
+    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset {
+        let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
+        ds.mode = Mode::ReadWrite;
+        ds.replication = Some(Replication { enabled: true });
+        ds
+    }
+}
+
+struct PostgresBenchAppBuilder {}
+
+impl PostgresBenchAppBuilder {
+    fn get_postgres_params() -> Option<Params> {
+        // Get postgres params from github secret?
+        todo!()
+    }
+}
+
+impl BenchAppBuilder for PostgresBenchAppBuilder {
+    fn make_dataset(&self, path: &str, name: &str) -> Dataset {
+        let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
+        ddataset.params = Self::get_postgres_params();
+        dataset
+    }
+
+    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset {
+        let mut ds = Dataset::new(format!("postgres:{path}"), name.to_string());
+        ds.mode = Mode::ReadWrite;
+        dataset.params = Self::get_postgres_params();
+        ds.replication = Some(Replication { enabled: true });
+        ds
+    }
 }

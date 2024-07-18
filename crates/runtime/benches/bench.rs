@@ -33,10 +33,10 @@ async fn main() -> Result<(), String> {
         upload_results_dataset = Some(env_var);
     }
 
-    let (mut benchmark_results, mut rt) = setup::setup_benchmark(&upload_results_dataset).await;
+    let (mut benchmark_results, mut rt) =
+        setup::setup_benchmark(&upload_results_dataset, setup::DataConnector::SpiceAI).await;
 
     bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
-
     let data_update: DataUpdate = benchmark_results.into();
 
     let display_records = data_update.data.clone();
