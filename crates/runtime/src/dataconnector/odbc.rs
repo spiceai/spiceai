@@ -56,17 +56,37 @@ where
     odbc_factory: ODBCTableFactory<'a>,
 }
 
-const SUPPORTED_DIALECTS: [&str; 3] = ["mysql", "postgresql", "sqlite"];
-fn match_driver_to_dialect(driver: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver {
-        _ if driver.contains("mysql") => Some(Arc::new(MySqlDialect {})), // odbcinst.ini profile name
-        _ if driver.contains("libmyodbc") => Some(Arc::new(MySqlDialect {})), // library filename
-        _ if driver.contains("postgres") => Some(Arc::new(PostgreSqlDialect {})), // odbcinst.ini profile name
-        _ if driver.contains("psqlodbc") => Some(Arc::new(PostgreSqlDialect {})), // library filename
-        _ if driver.contains("sqlite") => Some(Arc::new(SqliteDialect {})), // profile and library name
-        _ => {
-            tracing::debug!("No dialect detected for driver: {}", driver);
-            None
+#[derive(Debug, PartialEq, Eq)]
+enum ODBCDriver {
+    MySql,
+    PostgreSql,
+    Sqlite,
+    Unknown,
+}
+
+impl From<&str> for ODBCDriver {
+    fn from(val: &str) -> Self {
+        match val {
+            _ if val.contains("mysql") => ODBCDriver::MySql, // odbcinst.ini profile name
+            _ if val.contains("libmyodbc") => ODBCDriver::MySql, // library filename
+            _ if val.contains("postgres") => ODBCDriver::PostgreSql, // odbcinst.ini profile name
+            _ if val.contains("psqlodbc") => ODBCDriver::PostgreSql, // library filename
+            _ if val.contains("sqlite") => ODBCDriver::Sqlite, // profile and library name
+            _ => {
+                tracing::debug!("Unknown ODBC driver detected: {}", val);
+                ODBCDriver::Unknown
+            }
+        }
+    }
+}
+
+impl From<ODBCDriver> for Option<Arc<dyn Dialect + Send + Sync>> {
+    fn from(val: ODBCDriver) -> Self {
+        match val {
+            ODBCDriver::MySql => Some(Arc::new(MySqlDialect {})),
+            ODBCDriver::PostgreSql => Some(Arc::new(PostgreSqlDialect {})),
+            ODBCDriver::Sqlite => Some(Arc::new(SqliteDialect {})),
+            ODBCDriver::Unknown => None,
         }
     }
 }
@@ -89,15 +109,17 @@ where
         }
 
         Box::pin(async move {
-            let driver = if let Some(sql_dialect) = params.get("sql_dialect") {
-                if SUPPORTED_DIALECTS.contains(&sql_dialect.expose_secret().as_str()) {
-                    Ok::<_, GenericError>(sql_dialect.expose_secret().clone())
-                } else {
+            let dialect = if let Some(sql_dialect) = params.get("sql_dialect") {
+                let driver: ODBCDriver =
+                    Into::<ODBCDriver>::into(sql_dialect.expose_secret().as_str());
+                if driver == ODBCDriver::Unknown {
                     Err(Error::InvalidParameter {
                         param: "sql_dialect".to_string(),
                         msg: "Only 'mysql', 'postgresql', and 'sqlite' are supported".to_string(),
                     }
                     .into())
+                } else {
+                    Ok::<_, GenericError>(driver.into())
                 }
             } else {
                 let driver = params
@@ -113,10 +135,8 @@ where
                     .find(|s| s.starts_with("driver="))
                     .context(NoDriverSpecifiedSnafu)?;
 
-                Ok(driver.to_string())
+                Ok(Into::<ODBCDriver>::into(driver).into())
             }?;
-
-            let dialect = match_driver_to_dialect(&driver);
 
             let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
                 ODBCPool::new(Arc::new(params.into_map()))
