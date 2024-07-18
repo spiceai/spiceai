@@ -386,6 +386,25 @@ impl Runtime {
         self.df.mark_initial_load_complete();
     }
 
+    pub async fn get_params_with_secrets(
+        &self,
+        params: &HashMap<String, String>,
+    ) -> HashMap<String, SecretString> {
+        let shared_secrets = Arc::clone(&self.secrets);
+        let secrets = shared_secrets.read().await;
+
+        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+        // Inject secrets from the user-supplied params.
+        // This will replace any instances of `${{ store:key }}` with the actual secret value.
+        for (k, v) in params {
+            let secret = secrets.inject_secrets(ParamStr(v)).await;
+            params_with_secrets.insert(k.clone(), secret);
+        }
+
+        params_with_secrets
+    }
+
     async fn start_extensions(&self) {
         let mut extensions = self.extensions.write().await;
         for (name, extension) in extensions.iter_mut() {
@@ -1044,25 +1063,6 @@ impl Runtime {
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
             })
-    }
-
-    async fn get_params_with_secrets(
-        &self,
-        params: &HashMap<String, String>,
-    ) -> HashMap<String, SecretString> {
-        let shared_secrets = Arc::clone(&self.secrets);
-        let secrets = shared_secrets.read().await;
-
-        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-        // Inject secrets from the user-supplied params.
-        // This will replace any instances of `${{ store:key }}` with the actual secret value.
-        for (k, v) in params {
-            let secret = secrets.inject_secrets(ParamStr(v)).await;
-            params_with_secrets.insert(k.clone(), secret);
-        }
-
-        params_with_secrets
     }
 
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.

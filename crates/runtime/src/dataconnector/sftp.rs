@@ -91,7 +91,7 @@ impl ListingTableConnector for SFTP {
             .get("sftp_pass")
             .map(ExposeSecret::expose_secret)
         {
-            fragment_builder.append_pair("password", &sftp_password);
+            fragment_builder.append_pair("password", sftp_password);
         }
         fragments.push(fragment_builder.finish());
 

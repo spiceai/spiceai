@@ -27,7 +27,6 @@ use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use datafusion_table_providers::util::secrets::to_secret_map;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
@@ -190,13 +189,15 @@ impl DataConnector for Databricks {
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =
-            to_secret_map(catalog.params.clone());
+            runtime.get_params_with_secrets(&catalog.params).await;
 
-        for (key, value) in &catalog.dataset_params {
-            dataset_params.insert(key.to_string(), value.clone().into());
+        let secret_dataset_params = runtime
+            .get_params_with_secrets(&catalog.dataset_params)
+            .await;
+
+        for (key, value) in secret_dataset_params {
+            dataset_params.insert(key, value);
         }
-
-        // TODO inject secrets into params
 
         let mode = self.params.get("mode").map(|v| v.expose_secret().as_str());
         let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
