@@ -31,7 +31,7 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
         name.to_string(),
     );
     test_dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "parquet".to_string())]
+        vec![("s3_file_format".to_string(), "parquet".to_string())]
             .into_iter()
             .collect(),
     ));
