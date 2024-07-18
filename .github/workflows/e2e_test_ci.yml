@@ -241,8 +241,6 @@ jobs:
         working-directory: test_app
         run: |
           echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
-          # configure env secret store
-          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
 
       - name: Start spice runtime
@@ -319,14 +317,12 @@ jobs:
         run: |
           echo -e "test_postgresql_table\neth recent blocks\npostgres:test_postgresql_table\ny" | spice dataset configure
           # configure pg credentials
-          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password\n  pg_sslmode: disable" >> ./datasets/test_postgresql_table/dataset.yaml
-          # configure env secret store
-          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_sslmode: disable" >> ./datasets/test_postgresql_table/dataset.yaml
           cat spicepod.yaml
 
       - name: Start spice runtime
         env:
-          SPICE_SECRET_POSTGRES_PASSWORD: postgres
+          SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
           spice run &> spice.log &
@@ -376,7 +372,7 @@ jobs:
           mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
           mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
 
-      - name: Install MysqlSQL (MacOS)
+      - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
           brew install mysql
@@ -392,7 +388,7 @@ jobs:
       - name: Check MySQL
         run: echo 'SELECT VERSION();' | mysql -h localhost -utest_user -ppassword
 
-      - name: Prepare MysqlSQL dataset
+      - name: Prepare MySQL dataset
         run: |
 
           mysql -h localhost -utest_user -ppassword testdb < test/scripts/setup-data-mysql.sql
@@ -418,14 +414,12 @@ jobs:
         run: |
           echo -e "test_mysql_table\neth recent blocks\nmysql:test_mysql_table\ny" | spice dataset configure
           # configure mysql credentials
-          echo -e "params:\n  mysql_host: localhost\n  mysql_tcp_port: 3306\n  mysql_db: testdb\n  mysql_user: test_user\n  mysql_pass_key: password\n  mysql_sslmode: disabled" >> ./datasets/test_mysql_table/dataset.yaml
-          # configure env secret store
-          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          echo -e "params:\n  mysql_host: localhost\n  mysql_tcp_port: 3306\n  mysql_db: testdb\n  mysql_user: test_user\n  mysql_sslmode: disabled" >> ./datasets/test_mysql_table/dataset.yaml
           cat spicepod.yaml
 
       - name: Start spice runtime
         env:
-          SPICE_SECRET_MYSQL_PASSWORD: password
+          SPICE_MYSQL_PASS: password
         working-directory: test_app
         run: |
           spice run &> spice.log &
@@ -517,14 +511,12 @@ jobs:
         run: |
           echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
           # configure clickhouse credentials
-          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass_key: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
-          # configure env secret store
-          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
           cat spicepod.yaml
 
       - name: Start spice runtime
         env:
-          SPICE_SECRET_CLICKHOUSE_PASSWORD: password
+          SPICE_CLICKHOUSE_PASS: password
         working-directory: test_app
         run: |
           spice run &> spice.log &
@@ -712,10 +704,7 @@ jobs:
           echo "      pg_port: '5432'" >> spicepod.yaml
           echo "      pg_db: testdb" >> spicepod.yaml
           echo "      pg_user: postgres" >> spicepod.yaml
-          echo "      pg_pass_key: password" >> spicepod.yaml
           echo "      pg_sslmode: disable" >> spicepod.yaml
-          # configure env secret store
-          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
 
       - name: Start spice runtime
