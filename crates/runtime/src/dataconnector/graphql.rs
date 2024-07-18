@@ -545,10 +545,12 @@ pub struct GraphQL {
 pub struct GraphQLFactory {}
 
 impl GraphQLFactory {
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
 
+    #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }

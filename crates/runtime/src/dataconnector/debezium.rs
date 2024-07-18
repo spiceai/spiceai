@@ -86,10 +86,12 @@ impl Debezium {
 pub struct DebeziumFactory {}
 
 impl DebeziumFactory {
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
 
+    #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }

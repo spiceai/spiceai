@@ -50,10 +50,12 @@ pub struct S3 {
 pub struct S3Factory {}
 
 impl S3Factory {
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
 
+    #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }

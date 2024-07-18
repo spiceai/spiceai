@@ -78,10 +78,12 @@ impl DuckDB {
 pub struct DuckDBFactory {}
 
 impl DuckDBFactory {
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
 
+    #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }

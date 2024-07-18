@@ -839,7 +839,7 @@ mod tests {
         hashmap.insert("prefix_key2".to_string(), "value2".to_string());
         hashmap.insert("key3".to_string(), "value3".to_string());
 
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix_");
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
 
         let mut expected = HashMap::new();
         expected.insert("key1".to_string(), "value1".to_string());
@@ -854,7 +854,7 @@ mod tests {
         hashmap.insert("key1".to_string(), "value1".to_string());
         hashmap.insert("key2".to_string(), "value2".to_string());
 
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix_");
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
 
         let expected = HashMap::new();
 
@@ -865,7 +865,7 @@ mod tests {
     fn test_empty_hashmap() {
         let hashmap: HashMap<String, String> = HashMap::new();
 
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix_");
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
 
         let expected: HashMap<String, String> = HashMap::new();
 
@@ -878,10 +878,11 @@ mod tests {
         hashmap.insert("prefix_".to_string(), "value1".to_string());
         hashmap.insert("prefix_key2".to_string(), "value2".to_string());
 
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix_");
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
 
         let mut expected = HashMap::new();
-        expected.insert("".to_string(), "value1".to_string());
+        expected.insert(String::new(), "value1".to_string());
+        expected.insert("key2".to_string(), "value2".to_string());
 
         assert_eq!(result, expected);
     }
