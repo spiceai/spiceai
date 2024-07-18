@@ -360,7 +360,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded.
     pub async fn load_components(&self) {
-        self.load_secret_stores().await;
+        self.load_secrets().await;
         self.start_extensions().await;
 
         #[cfg(feature = "models")]
@@ -414,7 +414,7 @@ impl Runtime {
         }
     }
 
-    async fn load_secret_stores(&self) {
+    async fn load_secrets(&self) {
         measure_scope_ms!("load_secret_stores");
         let mut secrets = self.secrets.write().await;
 
@@ -973,7 +973,7 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let secret_map = self.get_params_with_secrets(&params).await;
 
-        match dataconnector::create_new_connector(source, secret_map).await {
+        match dataconnector::create_new_connector(source, secret_map, self.secrets()).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,

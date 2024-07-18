@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Invalid value for debezium_message_format: Valid values: 'json'"))]
     InvalidMessageFormat,
 
-    #[snafu(display("Missing required parameter: kafka_bootstrap_servers"))]
+    #[snafu(display("Missing required parameter: debezium_kafka_bootstrap_servers"))]
     MissingKafkaBootstrapServers,
 }
 
@@ -57,11 +57,11 @@ impl Debezium {
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let transport = params
-            .get("debezium_transport")
+            .get("transport")
             .map_or("kafka", |p| p.expose_secret().as_str());
 
         let message_format = params
-            .get("debezium_message_format")
+            .get("message_format")
             .map_or("json", |p| p.expose_secret().as_str());
 
         if transport != "kafka" {
@@ -82,14 +82,38 @@ impl Debezium {
     }
 }
 
-impl DataConnectorFactory for Debezium {
+#[derive(Default, Copy, Clone)]
+pub struct DebeziumFactory {}
+
+impl DebeziumFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DebeziumFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let debezium = Debezium::new(params)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "debezium"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 

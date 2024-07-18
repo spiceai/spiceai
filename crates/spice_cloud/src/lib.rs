@@ -34,10 +34,11 @@ use runtime::{
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnector, DataConnectorError},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
-    secrets::ExposeSecret,
+    secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
     Runtime,
 };
+use tokio::sync::RwLock;
 
 pub mod catalog;
 pub mod schema;
@@ -189,6 +190,7 @@ impl SpiceExtension {
             Acceleration::default(),
             refresh,
             retention,
+            runtime.secrets(),
         )
         .await
         .boxed()
@@ -300,6 +302,7 @@ impl ExtensionFactory for SpiceExtensionFactory {
 async fn get_spiceai_table_provider(
     name: &str,
     cloud_dataset_path: &str,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
     let mut dataset = Dataset::try_new(cloud_dataset_path.to_string(), name)
         .boxed()
@@ -308,7 +311,7 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let data_connector = create_new_connector("spiceai", HashMap::new())
+    let data_connector = create_new_connector("spiceai", HashMap::new(), secrets)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
@@ -333,8 +336,10 @@ pub async fn create_synced_internal_accelerated_table(
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_spiceai_table_provider(table_reference.table(), from).await?;
+    let source_table_provider =
+        get_spiceai_table_provider(table_reference.table(), from, secrets).await?;
 
     let accelerated_table_provider = create_accelerator_table(
         table_reference.clone(),

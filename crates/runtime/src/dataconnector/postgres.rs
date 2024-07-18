@@ -43,19 +43,31 @@ pub struct Postgres {
     postgres_factory: PostgresTableFactory,
 }
 
-impl DataConnectorFactory for Postgres {
+#[derive(Default, Copy, Clone)]
+pub struct PostgresFactory {}
+
+impl PostgresFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for PostgresFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        // Required secrets:
-        // - pg_connection_string
-        // - pg_pass
-
         Box::pin(async move {
-            match PostgresConnectionPool::new(Arc::new(params)).await {
+            match PostgresConnectionPool::new(params).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
-                    Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                    Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
                     postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
@@ -84,6 +96,14 @@ impl DataConnectorFactory for Postgres {
                 },
             }
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "pg"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string", "user", "pass"]
     }
 }
 

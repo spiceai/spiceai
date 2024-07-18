@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use bollard::secret::HealthConfig;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use secrecy::SecretString;
-// use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use rand::Rng;
+use secrecy::SecretString;
 use tracing::instrument;
 
 use crate::{
@@ -100,7 +99,7 @@ pub(super) async fn start_postgres_docker_container(
 pub(super) async fn get_postgres_connection_pool(
     port: usize,
 ) -> Result<PostgresConnectionPool, anyhow::Error> {
-    let pool = PostgresConnectionPool::new(Arc::new(get_pg_params(port))).await?;
+    let pool = PostgresConnectionPool::new(get_pg_params(port)).await?;
 
     Ok(pool)
 }

@@ -77,7 +77,7 @@ impl ODBCPool {
     /// Returns an error if there is a problem creating the connection pool.
     pub fn new(params: HashMap<String, SecretString>) -> Result<Self, Error> {
         let connection_string = params
-            .get("odbc_connection_string")
+            .get("connection_string")
             .map(Secret::expose_secret)
             .map(ToString::to_string)
             .context(MissingConnectionStringSnafu)?;

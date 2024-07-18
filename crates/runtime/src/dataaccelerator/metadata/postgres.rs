@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
 
@@ -35,7 +33,7 @@ impl AcceleratedMetadataPostgres {
             return Err("Dataset is not accelerated.".into());
         };
 
-        let secret_map = Arc::new(to_secret_map(acceleration.params.clone()));
+        let secret_map = to_secret_map(acceleration.params.clone());
 
         let pool = PostgresConnectionPool::new(secret_map)
             .await
