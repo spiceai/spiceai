@@ -47,6 +47,7 @@ duckdb = { workspace = true, features = [
   "vtab",
   "vtab-arrow",
 ], optional = true }
+dotenvy = "0.15"
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true

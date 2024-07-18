@@ -14,25 +14,73 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use secrecy::SecretString;
 
 use crate::secrets::SecretStore;
 
-const ENV_SECRET_PREFIX: &str = "SPICE_SECRET_";
+const ENV_SECRET_PREFIX: &str = "SPICE_";
 
-pub struct EnvSecretStore {}
+pub struct EnvSecretStoreBuilder {
+    path: Option<PathBuf>,
+}
 
-impl Default for EnvSecretStore {
+impl Default for EnvSecretStoreBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EnvSecretStore {
+impl EnvSecretStoreBuilder {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self { path: None }
+    }
+
+    #[must_use]
+    pub fn with_path(mut self, path: PathBuf) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> EnvSecretStore {
+        let env = EnvSecretStore { path: self.path };
+        env.load();
+        env
+    }
+}
+
+pub struct EnvSecretStore {
+    path: Option<PathBuf>,
+}
+
+impl EnvSecretStore {
+    fn load(&self) {
+        if let Some(path) = &self.path {
+            match dotenvy::from_path(path) {
+                Ok(()) => return,
+                Err(err) => {
+                    if matches!(err, dotenvy::Error::LineParse(_, _)) {
+                        tracing::warn!("{err}");
+                    } else {
+                        tracing::warn!("Error opening path {}: {err}", path.display());
+                    }
+                }
+            };
+        }
+        if let Err(err) = dotenvy::from_filename(".env.local") {
+            if matches!(err, dotenvy::Error::LineParse(_, _)) {
+                tracing::warn!(".env.local: {err}");
+            }
+        };
+        if let Err(err) = dotenvy::from_filename(".env") {
+            if matches!(err, dotenvy::Error::LineParse(_, _)) {
+                tracing::warn!(".env: {err}");
+            }
+        };
     }
 }
 
@@ -45,10 +93,18 @@ impl SecretStore for EnvSecretStore {
     /// looking up the environment variable.
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
-        // TODO: Handle falling back to the spice generated prefix
-        match std::env::var(key.to_ascii_uppercase()) {
+        let upper_key = key.to_uppercase();
+        match std::env::var(&upper_key) {
             Ok(value) => Ok(Some(SecretString::new(value))),
-            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotPresent) => {
+                // If the key isn't found by the explicit key, try with SPICE_ prefixed
+                let prefixed_key = format!("{ENV_SECRET_PREFIX}{upper_key}");
+                match std::env::var(prefixed_key) {
+                    Ok(value) => Ok(Some(SecretString::new(value))),
+                    Err(std::env::VarError::NotPresent) => Ok(None),
+                    Err(err) => Err(Box::new(err)),
+                }
+            }
             Err(err) => Err(Box::new(err)),
         }
     }
