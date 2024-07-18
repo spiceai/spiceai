@@ -23,7 +23,10 @@ use spicepod::component::{
 };
 use tracing::instrument;
 
-use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+use crate::{
+    container_registry,
+    docker::{ContainerRunnerBuilder, RunningContainer},
+};
 
 pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
@@ -50,7 +53,7 @@ pub async fn start_mysql_docker_container(
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("mysql:latest")
+        .image(format!("{}mysql:latest", container_registry()))
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")

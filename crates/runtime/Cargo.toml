@@ -23,6 +23,7 @@ aws-config = { version = "1.1.10", optional = true }
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
 aws-sdk-sts = { version = "1.19.0", optional = true }
 axum = { version = "0.7.4", features = ["macros"] }
+axum-extra = { version = "0.9.3", features = ["typed-header"] }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
@@ -49,11 +50,14 @@ duckdb = { workspace = true, features = [
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
+globset.workspace = true
+headers-accept = "0.1.3"
 indexmap = "2.2.2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }
 lazy_static = "1.4.0"
 llms = { path = "../llms" }
+mediatype = "0.19.18"
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 model_components = { path = "../model_components" }
@@ -62,7 +66,7 @@ ndarray = "0.15.3"
 notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http"] }
-odbc-api = { version = "7.0.0", optional = true }
+odbc-api = { workspace = true, optional = true }
 once_cell = "1.19.0"
 opentelemetry-proto = { version = "0.4.0", features = [
   "gen-tonic-messages",
@@ -76,7 +80,7 @@ prost = { version = "0.12.1", default-features = false, features = [
   "prost-derive",
 ] }
 r2d2 = { workspace = true, optional = true }
-regex = "1.10.3"
+regex.workspace = true
 reqwest = { version = "0.11.24", features = ["json"] }
 secrecy.workspace = true
 serde.workspace = true
@@ -105,8 +109,9 @@ anyhow = "1.0.86"
 async-graphql = "7.0.5"
 async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
-metrics-util = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
+metrics-util = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
 rand = "0.8.5"
+spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
 
 [features]
@@ -121,10 +126,10 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "data_components/clickhouse",
 ]
-delta_lake = ["data_components/delta_lake"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager"]
+delta_lake = ["data_components/delta_lake"]
 dev = []
 dremio = []
 duckdb = [
@@ -137,11 +142,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
 models = ["model_components/full", "llms/mistralrs", "llms/candle"]
-mysql = [
-  "dep:mysql_async",
-  "db_connection_pool/mysql",
-  "data_components/mysql",
-]
+mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
 postgres = [
   "dep:bb8",

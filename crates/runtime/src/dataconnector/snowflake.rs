@@ -119,10 +119,12 @@ impl DataConnector for Snowflake {
             })
             .join(".");
 
-        Ok(Read::table_provider(&self.table_factory, path.into())
-            .await
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "snowflake",
-            })?)
+        Ok(
+            Read::table_provider(&self.table_factory, path.into(), dataset.schema())
+                .await
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "snowflake",
+                })?,
+        )
     }
 }

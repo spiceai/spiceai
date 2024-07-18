@@ -91,7 +91,7 @@ where
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
-            Read::table_provider(&self.odbc_factory, dataset.path().into())
+            Read::table_provider(&self.odbc_factory, dataset.path().into(), dataset.schema())
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "odbc",

@@ -23,7 +23,10 @@ use secrecy::SecretString;
 use rand::Rng;
 use tracing::instrument;
 
-use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+use crate::{
+    container_registry,
+    docker::{ContainerRunnerBuilder, RunningContainer},
+};
 
 const PG_PASSWORD: &str = "runtime-integration-test-pw";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
@@ -71,7 +74,7 @@ pub(super) async fn start_postgres_docker_container(
     };
 
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("postgres:latest")
+        .image(format!("{}postgres:latest", container_registry()))
         .add_port_binding(5432, port)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {

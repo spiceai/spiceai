@@ -14,15 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::delta_lake::DeltaTable;
+use crate::unity_catalog::UnityCatalog;
+use crate::Read;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrecy::{ExposeSecret, Secret, SecretString};
-use serde::Deserialize;
+use secrecy::SecretString;
+use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
-
-use crate::delta_lake::DeltaTable;
-use crate::Read;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
@@ -41,6 +42,7 @@ impl Read for DatabricksDelta {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         get_delta_table(table_reference, Arc::clone(&self.params)).await
     }
@@ -65,45 +67,25 @@ async fn get_delta_table(
     Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
 }
 
-#[derive(Deserialize)]
-struct DatabricksTablesApiResponse {
-    storage_location: String,
-}
-
 #[allow(clippy::implicit_hasher)]
 pub async fn resolve_table_uri(
     table_reference: TableReference,
     params: Arc<HashMap<String, SecretString>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(endpoint) = params.get("endpoint").map(Secret::expose_secret) else {
-        return Err("Endpoint not found in dataset params".into());
-    };
+    let uc_client = UnityCatalog::from_params(&params).boxed()?;
 
-    let table_name = table_reference.to_string();
+    let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
-    let mut token = "Token not found in auth provider";
-    if let Some(token_secret_val) = params.get("token").map(Secret::expose_secret) {
-        token = token_secret_val;
-    };
-
-    let url = format!(
-        "{}/api/2.1/unity-catalog/tables/{}",
-        endpoint.trim_end_matches('/'),
-        table_name
-    );
-
-    let client = reqwest::Client::new();
-    let response = client.get(&url).bearer_auth(token).send().await?;
-
-    if response.status().is_success() {
-        let api_response: DatabricksTablesApiResponse = response.json().await?;
-        tracing::debug!("Databricks table URI: {}", api_response.storage_location);
-        Ok(format!("{}/", api_response.storage_location))
+    if let Some(table) = table_opt {
+        if let Some(storage_location) = table.storage_location {
+            Ok(storage_location)
+        } else {
+            Err(
+                format!("Databricks table {table_reference} does not have a storage location")
+                    .into(),
+            )
+        }
     } else {
-        Err(format!(
-            "Failed to retrieve databricks table URI. Status: {}",
-            response.status()
-        )
-        .into())
+        Err(format!("Databricks table {table_reference} does not exist").into())
     }
 }
