@@ -110,8 +110,7 @@ where
 
         Box::pin(async move {
             let dialect = if let Some(sql_dialect) = params.get("sql_dialect") {
-                let driver: ODBCDriver =
-                    Into::<ODBCDriver>::into(sql_dialect.expose_secret().as_str());
+                let driver: ODBCDriver = ODBCDriver::from(sql_dialect.expose_secret().as_str());
                 if driver == ODBCDriver::Unknown {
                     Err(Error::InvalidParameter {
                         param: "sql_dialect".to_string(),
@@ -135,7 +134,7 @@ where
                     .find(|s| s.starts_with("driver="))
                     .context(NoDriverSpecifiedSnafu)?;
 
-                Ok(Into::<ODBCDriver>::into(driver).into())
+                Ok(ODBCDriver::from(driver).into())
             }?;
 
             let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
