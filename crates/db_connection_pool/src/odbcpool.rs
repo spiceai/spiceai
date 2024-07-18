@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
 use secrecy::{ExposeSecret, Secret, SecretString};
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
@@ -56,6 +57,16 @@ pub struct ODBCPool {
     pool: &'static Environment,
     params: Arc<HashMap<String, SecretString>>,
     connection_string: String,
+    connection_id: String,
+}
+
+fn hash_string(val: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(val);
+    hasher.finalize().iter().fold(String::new(), |mut hash, b| {
+        hash.push_str(&format!("{b:02x}"));
+        hash
+    })
 }
 
 impl ODBCPool {
@@ -70,9 +81,15 @@ impl ODBCPool {
             .map(Secret::expose_secret)
             .map(ToString::to_string)
             .context(MissingConnectionStringSnafu)?;
+
+        // hash the connection string to get a comparable connection ID
+        // we do this to prevent exposing secrets in the EXPLAIN ... plan when using federated JoinPushDown
+        let connection_id = hash_string(&connection_string);
+
         Ok(Self {
             params,
             connection_string,
+            connection_id,
             pool: &ENV,
         })
     }
@@ -105,9 +122,6 @@ where
     }
 
     fn join_push_down(&self) -> JoinPushDown {
-        // It would be technically feasible to return JoinPushDown::AllowedFor(connection_string) here,
-        // but we don't have a general way to strip out sensitive information from the connection string.
-        // We could solve this by asking the user to explicly provide a join context in the parameters.
-        JoinPushDown::Disallow
+        JoinPushDown::AllowedFor(self.connection_id.clone())
     }
 }

@@ -3,6 +3,8 @@ BASE_PACKAGE_NAME := github.com/spiceai/spiceai
 GIT_SHA := $(shell git rev-parse --short HEAD)
 FILE_VERSION := $(shell cat ../../version.txt)
 
+TAGS := $(if $(SPICE_CLI_FEATURES),--tags $(SPICE_CLI_FEATURES),)
+
 ifdef REL_VERSION
 	SPICE_VERSION := $(REL_VERSION)
 	SPICED_FEATURES := --features release
@@ -22,5 +24,5 @@ ifeq ($(OS),Windows_NT)
 	go build -v -ldflags=$(LDFLAGS) -o ..\..\target\release\spice.exe
 else
 	mkdir -p ../../target/release 2> /dev/null || true
-	go build -v -ldflags=$(LDFLAGS) -o ../../target/release/spice
+	go build -v -ldflags=$(LDFLAGS) -o ../../target/release/spice $(TAGS)
 endif

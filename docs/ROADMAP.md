@@ -1,6 +1,6 @@
 # Spice.ai OSS Roadmap
 
-A living doc that describes the Spice.ai roadmap, updated based on community and customer feedback.
+Describes the Spice roadmap, updated based on community and customer feedback.
 
 If you have a feature request or suggestion, please [get in touch](https://github.com/spiceai/spiceai#-connect-with-us)!
 
@@ -64,17 +64,35 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## v1.1 (Oct 2024)
 
-- AWS Glue catalog provider (alpha)
+- Bugfixes
+
+## v2 (2025)
+
+- AI Gateway
+  - Embeddings
+  - Model Providers
+    - Anthropic
+- Policies
+  - Security
+- Extensible Middleware
+  - AuthN Providers
 
 ## Features being considered
 
 - S3 data connector Iceberg support
-- Intelligent (AI-powered) accelerators
-- Kafka data connector
-- GraphQL API
-- BigQuery data connector
-- Key/Value API
-  - RocksDB data accelerator
-  - DynamoDB data connector
-- CLI publish Spicepods to [spicerack.org](https://spicerack.org)
-- MotherDuck data connector
+- Data Connectors
+  - MotherDuck
+  - BigQuery
+  - Kafka
+  - Sharepoint
+  - Google Docs
+- Catalog Providers
+  - Iceberg Catalogs
+  - AWS Glue
+- APIs
+  - GraphQL API
+  - Key/Value API
+    - RocksDB data accelerator
+    - DynamoDB data connector
+- CLI
+  - Spicepod publish to [spicerack.org](https://spicerack.org)

@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::{error::Error, sync::Arc};
 use uuid::Uuid;
 
-use crate::{spark_connect::SparkConnect, Read, ReadWrite};
+use crate::{spark_connect::SparkConnect, Read};
 
 #[derive(Clone)]
 pub struct DatabricksSparkConnect {
@@ -43,21 +44,12 @@ impl DatabricksSparkConnect {
 }
 
 #[async_trait]
-impl ReadWrite for DatabricksSparkConnect {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        Ok(ReadWrite::table_provider(&self.spark_connect, table_reference).await?)
-    }
-}
-
-#[async_trait]
 impl Read for DatabricksSparkConnect {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        Ok(Read::table_provider(&self.spark_connect, table_reference).await?)
+        Ok(Read::table_provider(&self.spark_connect, table_reference, schema).await?)
     }
 }

@@ -30,13 +30,13 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.78"
-version = "0.15.2-alpha"
+version = "0.16.0-beta"
 
 [workspace.dependencies]
 arrow = "52.0.0"
 arrow-buffer = "52.0.0"
 arrow-flight = "52.0.0"
-arrow-odbc = { version = "11.1.0" }
+arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
@@ -49,28 +49,31 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
   "tokio_io",
   "tls",
 ] }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f865563b1ae8670df21e9a054c5307112f85fbf6" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1becf0c961da12993009f53216ded2099c38d425" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "1becf0c961da12993009f53216ded2099c38d425" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b1645fca2b5779cce4a924f870585a91c54913f2" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7b8e22885001e2013493aebbaf190039d826c05" }
+datafusion = "40.0.0"
+datafusion-federation = "0.1"
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "02081887de7b64dfd816ef86716f8b0853ae3196" }
+duckdb = "1.0.0"
 fundu = "2.0.0"
 futures = "0.3.30"
+globset = "0.4.14"
 itertools = "0.12"
-metrics = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
-metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe"}
+metrics = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
+metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.1" }
-odbc-api = { version = "7.0.0" }
+odbc-api = { version = "8.1.2" }
 pem = "3.0.4"
 r2d2 = "0.8.10"
+regex = "1.10.3"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+rustls = "0.23"
 secrecy = "0.8.0"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.1"
 serde_yaml = "0.9.30"
 snafu = "0.8.0"
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 tokio = { version = "1.35.1", features = [
@@ -87,3 +90,8 @@ tonic = "0.11.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "1d5fe15ecc6ffcc899a3f8afff977372fbf4645e" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }

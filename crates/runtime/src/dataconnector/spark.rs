@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use data_components::spark_connect::SparkConnect;
-use data_components::{Read, ReadWrite};
+use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
@@ -56,7 +56,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Spark {
     read_provider: Arc<dyn Read>,
-    read_write_provider: Arc<dyn ReadWrite>,
 }
 
 impl Spark {
@@ -79,7 +78,6 @@ impl Spark {
             .context(UnableToConstructSparkConnectSnafu)?;
         Ok(Self {
             read_provider: Arc::new(spark.clone()),
-            read_write_provider: Arc::new(spark),
         })
     }
 }
@@ -130,26 +128,10 @@ impl DataConnector for Spark {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
-            .table_provider(table_reference)
+            .table_provider(table_reference, dataset.schema())
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "spark",
             })?)
-    }
-
-    async fn read_write_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let table_reference = TableReference::from(dataset.path());
-        let read_write_result = self
-            .read_write_provider
-            .table_provider(table_reference)
-            .await
-            .context(super::UnableToGetReadWriteProviderSnafu {
-                dataconnector: "spark",
-            });
-
-        Some(read_write_result)
     }
 }

@@ -52,6 +52,7 @@ pub(crate) fn routes(
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
+        .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
             "/v1/datasets/:name/acceleration/refresh",

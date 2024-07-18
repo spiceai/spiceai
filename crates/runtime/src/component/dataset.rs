@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use acceleration::Engine;
+use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
@@ -80,6 +81,8 @@ impl From<spicepod_dataset::Mode> for Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TimeFormat {
     #[default]
+    Timestamp,
+    Timestamptz,
     UnixSeconds,
     UnixMillis,
     ISO8601,
@@ -91,6 +94,8 @@ impl From<spicepod_dataset::TimeFormat> for TimeFormat {
             spicepod_dataset::TimeFormat::UnixSeconds => TimeFormat::UnixSeconds,
             spicepod_dataset::TimeFormat::UnixMillis => TimeFormat::UnixMillis,
             spicepod_dataset::TimeFormat::ISO8601 => TimeFormat::ISO8601,
+            spicepod_dataset::TimeFormat::Timestamp => TimeFormat::Timestamp,
+            spicepod_dataset::TimeFormat::Timestamptz => TimeFormat::Timestamptz,
         }
     }
 }
@@ -113,6 +118,7 @@ pub struct Dataset {
     pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
+    schema: Option<SchemaRef>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {
@@ -143,6 +149,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             time_format: dataset.time_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
+            schema: None,
         })
     }
 }
@@ -160,7 +167,19 @@ impl Dataset {
             time_format: None,
             acceleration: None,
             embeddings: Vec::default(),
+            schema: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub fn schema(&self) -> Option<SchemaRef> {
+        self.schema.clone()
     }
 
     #[must_use]

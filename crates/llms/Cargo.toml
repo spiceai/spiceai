@@ -32,8 +32,8 @@ candle-examples = { version = "0.5.0", optional = true }
 candle-transformers = { version = "0.5.0", optional = true }
 
 ## `mistralrs` feature packages
-candle-core-rs = { package = "candle-core", git = "https://github.com/spiceai/candle.git", rev="41aaac4dd80e64af6b9b8e02197fa58feb5809b3", optional = true }
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev="6258d473ec76c19b7794d3d30993f485fa37060b", optional = true }
+candle-core-rs = { package = "candle-core", git = "https://github.com/spiceai/candle.git", rev = "41aaac4dd80e64af6b9b8e02197fa58feb5809b3", optional = true }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "6258d473ec76c19b7794d3d30993f485fa37060b", optional = true }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "6258d473ec76c19b7794d3d30993f485fa37060b", optional = true, package = "mistralrs-core" }
 rand = "0.8.5"
 tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "dde326b330ecb609201110d4725928a6e977f0dd" }
