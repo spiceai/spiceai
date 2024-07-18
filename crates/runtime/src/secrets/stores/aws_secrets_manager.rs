@@ -124,13 +124,13 @@ impl SecretStore for AwsSecretsManager {
             }
         };
 
+        let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
         if let Some(secret_str) = secret_value.secret_string() {
             let data = parse_json_to_hashmap(secret_str)?;
-            if let Some(value) = data.get(key) {
+            if let Some(value) = data.get(&prefixed_key) {
                 return Ok(Some(SecretString::new(value.clone())));
             }
-            let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
-            return Ok(data.get(&prefixed_key).cloned().map(SecretString::new));
+            return Ok(data.get(key).cloned().map(SecretString::new));
         }
 
         Ok(None)
