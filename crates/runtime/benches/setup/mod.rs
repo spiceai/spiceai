@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
+#[derive(Clone)]
 pub enum DataConnector {
     Postgres,
     SpiceAI,
@@ -118,6 +119,14 @@ fn get_branch_name() -> String {
 }
 
 trait BenchAppBuilder {
+    fn build_app(&self, upload_results_dataset: &Option<String>) -> App;
+    fn make_dataset(&self, path: &str, name: &str) -> Dataset;
+    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset;
+}
+
+struct SpiceAIBenchAppBuilder {}
+
+impl BenchAppBuilder for SpiceAIBenchAppBuilder {
     fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
         let mut app_builder = AppBuilder::new("runtime_benchmark_test")
             .with_secret_store(SpiceSecretStore::File)
@@ -138,14 +147,6 @@ trait BenchAppBuilder {
         app_builder.build()
     }
 
-    fn make_dataset(&self, path: &str, name: &str) -> Dataset;
-
-    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset;
-}
-
-struct SpiceAIBenchAppBuilder {}
-
-impl BenchAppBuilder for SpiceAIBenchAppBuilder {
     fn make_dataset(&self, path: &str, name: &str) -> Dataset {
         Dataset::new(format!("spiceai:{path}"), name.to_string())
     }
@@ -162,12 +163,47 @@ struct PostgresBenchAppBuilder {}
 
 impl PostgresBenchAppBuilder {
     fn get_postgres_params() -> Option<Params> {
+        let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap();
+        let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap();
+        let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap();
+        let pg_db = std::env::var("PG_BENCHMARK_PG_DB").unwrap();
+        let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap();
         // Get postgres params from github secret?
-        todo!()
+        Some(Params::from_string_map(
+            vec![
+                ("pg_host".to_string(), pg_host),
+                ("pg_user".to_string(), pg_user),
+                ("pg_db".to_string(), pg_db),
+                ("pg_pass".to_string(), pg_pass),
+                ("pg_sslmode".to_string(), pg_sslmode),
+            ]
+            .into_iter()
+            .collect(),
+        ))
     }
 }
 
 impl BenchAppBuilder for PostgresBenchAppBuilder {
+    fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
+        let mut app_builder = AppBuilder::new("runtime_benchmark_test")
+            .with_secret_store(SpiceSecretStore::File)
+            .with_dataset(self.make_dataset("customer", "customer"))
+            .with_dataset(self.make_dataset("lineitem", "lineitem"))
+            .with_dataset(self.make_dataset("part", "part"))
+            .with_dataset(self.make_dataset("partsupp", "partsupp"))
+            .with_dataset(self.make_dataset("orders", "orders"))
+            .with_dataset(self.make_dataset("nation", "nation"))
+            .with_dataset(self.make_dataset("region", "region"))
+            .with_dataset(self.make_dataset("supplier", "supplier"));
+
+        if let Some(upload_results_dataset) = upload_results_dataset {
+            app_builder = app_builder
+                .with_dataset(self.make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
+        }
+
+        app_builder.build()
+    }
+
     fn make_dataset(&self, path: &str, name: &str) -> Dataset {
         let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
         dataset.params = Self::get_postgres_params();

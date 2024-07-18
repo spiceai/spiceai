@@ -23,10 +23,17 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+mod bench_postgres;
 mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    // let _ = run_benchmark_test(setup::DataConnector::SpiceAI).await;
+    let _ = run_benchmark_test(setup::DataConnector::Postgres).await;
+    Ok(())
+}
+
+async fn run_benchmark_test(dataconnector: setup::DataConnector) -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");
@@ -34,9 +41,17 @@ async fn main() -> Result<(), String> {
     }
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(&upload_results_dataset, setup::DataConnector::SpiceAI).await;
+        setup::setup_benchmark(&upload_results_dataset, dataconnector.clone()).await;
 
-    bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+    match dataconnector {
+        setup::DataConnector::SpiceAI => {
+            bench_spicecloud::run(&mut rt, &mut benchmark_results).await?
+        }
+        setup::DataConnector::Postgres => {
+            bench_postgres::run(&mut rt, &mut benchmark_results).await?
+        }
+    }
+
     let data_update: DataUpdate = benchmark_results.into();
 
     let display_records = data_update.data.clone();
