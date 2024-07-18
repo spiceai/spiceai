@@ -793,7 +793,7 @@ jobs:
             echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
             echo "    name: customer" >> spicepod.yaml
             echo "    params:" >> spicepod.yaml
-            echo "      file_format: parquet" >> spicepod.yaml
+            echo "      s3_file_format: parquet" >> spicepod.yaml
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
             echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml

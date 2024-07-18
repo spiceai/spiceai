@@ -127,7 +127,7 @@ impl DataConnector for DuckDB {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path: TableReference = dataset.path().into();
 
-        if !(is_table_function(&path) || dataset.params.contains_key("open")) {
+        if !(is_table_function(&path) || dataset.params.contains_key("duckdb_open")) {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "duckdb".to_string(),
                 source: Box::new(Error::MissingDuckDBFile {}),
