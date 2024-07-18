@@ -557,17 +557,17 @@ impl GraphQL {
         let mut client_builder = reqwest::Client::builder();
         let token = self
             .params
-            .get("auth_token")
+            .get("token")
             .map(ExposeSecret::expose_secret)
             .cloned();
         let user = self
             .params
-            .get("auth_user")
+            .get("user")
             .map(ExposeSecret::expose_secret)
             .cloned();
         let pass = self
             .params
-            .get("auth_pass")
+            .get("pass")
             .map(ExposeSecret::expose_secret)
             .cloned();
 
@@ -591,10 +591,10 @@ impl GraphQL {
             .params
             .get("json_path")
             .map(ExposeSecret::expose_secret)
-            .ok_or("`json_path` not found in params".into())
+            .ok_or("`graphql_json_path` not found in params".into())
             .context(super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
-                message: "`json_path` not found in params",
+                message: "`graphql_json_path` not found in params",
             })?
             .clone();
         let pointer = format!("/{}", json_path.replace('.', "/"));
@@ -629,7 +629,7 @@ impl GraphQL {
             Ok(depth) => Ok(depth),
             Err(e) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: "GraphQL".to_string(),
-                message: "`unnest_depth` is not an integer".to_string(),
+                message: "`graphql_unnest_depth` is not an integer".to_string(),
                 source: e.into(),
             }),
         }?;
@@ -661,6 +661,14 @@ impl GraphQL {
 impl DataConnector for GraphQL {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "graphql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token", "user", "pass"]
     }
 
     async fn read_provider(

@@ -120,6 +120,14 @@ impl DataConnector for LocalhostConnector {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "localhost"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     async fn read_provider(
         &self,
         _dataset: &Dataset,

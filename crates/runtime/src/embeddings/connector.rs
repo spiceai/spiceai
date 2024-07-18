@@ -103,4 +103,12 @@ impl DataConnector for EmbeddingConnector {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
+
+    fn prefix(&self) -> &'static str {
+        self.inner_connector.prefix()
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        self.inner_connector.autoload_secrets()
+    }
 }

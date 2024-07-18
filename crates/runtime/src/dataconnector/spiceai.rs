@@ -106,7 +106,7 @@ impl DataConnectorFactory for SpiceAI {
             })?;
 
             let api_key = params
-                .get("key")
+                .get("api_key")
                 .map(|s| s.expose_secret().as_str())
                 .unwrap_or_default();
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
@@ -127,6 +127,14 @@ impl DataConnectorFactory for SpiceAI {
 impl DataConnector for SpiceAI {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spiceai"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["api_key"]
     }
 
     async fn read_provider(

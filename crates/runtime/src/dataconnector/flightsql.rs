@@ -83,6 +83,14 @@ impl DataConnector for FlightSQL {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "flightsql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["username", "password"]
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,

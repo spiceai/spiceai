@@ -77,6 +77,14 @@ where
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "odbc"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string"]
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,

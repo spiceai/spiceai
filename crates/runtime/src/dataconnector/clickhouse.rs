@@ -93,6 +93,14 @@ impl DataConnector for Clickhouse {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "clickhouse"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string", "pass"]
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,

@@ -60,9 +60,7 @@ pub struct Spark {
 
 impl Spark {
     async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
-        let conn = params
-            .get("spark_remote")
-            .map(|s| s.expose_secret().as_str());
+        let conn = params.get("remote").map(|s| s.expose_secret().as_str());
         let Some(conn) = conn else {
             return MissingSparkRemoteSnafu.fail();
         };
@@ -113,6 +111,14 @@ impl DataConnectorFactory for Spark {
 impl DataConnector for Spark {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spark"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["remote"]
     }
 
     async fn read_provider(

@@ -58,6 +58,29 @@ impl DataConnector for DeltaLake {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "delta_lake"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[
+            // S3 Parameters
+            "aws_region",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_endpoint",
+            // Azure Parameters
+            "azure_storage_account_name",
+            "azure_storage_account_key",
+            "azure_storage_client_id",
+            "azure_storage_client_secret",
+            "azure_storage_sas_key",
+            "azure_storage_endpoint",
+            // Google Storage Parameters
+            "google_service_account",
+        ]
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,

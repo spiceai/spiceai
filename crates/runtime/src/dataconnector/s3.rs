@@ -68,6 +68,14 @@ impl ListingTableConnector for S3 {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "s3"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["region", "endpoint", "key", "secret"]
+    }
+
     fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }

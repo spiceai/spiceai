@@ -51,6 +51,14 @@ impl ListingTableConnector for Https {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "http"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["username", "password"]
+    }
+
     fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }
@@ -64,11 +72,7 @@ impl ListingTableConnector for Https {
             }
         })?;
 
-        if let Some(p) = self
-            .params
-            .get("http_port")
-            .map(ExposeSecret::expose_secret)
-        {
+        if let Some(p) = self.params.get("port").map(ExposeSecret::expose_secret) {
             let n = match p.parse::<u16>() {
                 Ok(n) => n,
                 Err(e) => {
@@ -84,7 +88,7 @@ impl ListingTableConnector for Https {
 
         if let Some(p) = self
             .params
-            .get("http_password")
+            .get("password")
             .map(|s| s.expose_secret().as_str())
         {
             if u.set_password(Some(p)).is_err() {
@@ -98,7 +102,7 @@ impl ListingTableConnector for Https {
 
         if let Some(p) = self
             .params
-            .get("http_username")
+            .get("username")
             .map(|s| s.expose_secret().as_str())
         {
             if u.set_username(p).is_err() {

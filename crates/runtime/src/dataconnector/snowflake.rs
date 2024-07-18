@@ -51,16 +51,6 @@ impl DataConnectorFactory for Snowflake {
     fn create(
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        // Required secrets:
-        // - username
-        // - account
-        // - snowflake_warehouse
-        // - snowflake_role
-        // - snowflake_auth_type
-        // - password
-        // - snowflake_private_key_path
-        // - snowflake_private_key_passphrase
-
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
@@ -81,6 +71,23 @@ impl DataConnectorFactory for Snowflake {
 impl DataConnector for Snowflake {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "snowflake"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[
+            "username",
+            "account",
+            "warehouse",
+            "role",
+            "auth_type",
+            "password",
+            "private_key_path",
+            "private_key_passphrase",
+        ]
     }
 
     async fn read_provider(

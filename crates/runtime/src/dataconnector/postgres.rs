@@ -52,7 +52,7 @@ impl DataConnectorFactory for Postgres {
         // - pg_pass
 
         Box::pin(async move {
-            match PostgresConnectionPool::new(Arc::new(params)).await {
+            match PostgresConnectionPool::new(params).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
@@ -91,6 +91,14 @@ impl DataConnectorFactory for Postgres {
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "pg"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string", "user", "pass"]
     }
 
     async fn read_provider(

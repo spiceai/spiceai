@@ -38,7 +38,7 @@ use super::{DataConnector, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: endpoint"))]
+    #[snafu(display("Missing required parameter: databricks_endpoint"))]
     MissingEndpoint,
 
     #[snafu(display("Missing required parameter: databricks_cluster_id"))]
@@ -89,7 +89,7 @@ impl Databricks {
             };
             let user = params.get("user").map(std::borrow::ToOwned::to_owned);
             let mut databricks_use_ssl = true;
-            if let Some(databricks_use_ssl_value) = params.get("databricks_use_ssl") {
+            if let Some(databricks_use_ssl_value) = params.get("spark_use_ssl") {
                 let databricks_use_ssl_value = databricks_use_ssl_value.expose_secret();
                 databricks_use_ssl = match databricks_use_ssl_value.as_str() {
                     "true" => true,
@@ -102,10 +102,7 @@ impl Databricks {
                     }
                 };
             }
-            let ((Some(cluster_id), _) | (_, Some(cluster_id))) = (
-                params.get("databricks_cluster_id"),
-                params.get("databricks-cluster-id"),
-            ) else {
+            let Some(cluster_id) = params.get("cluster_id") else {
                 return MissingDatabricksClusterIdSnafu.fail();
             };
             let Some(token) = params.get("token") else {
@@ -146,6 +143,14 @@ impl DataConnectorFactory for Databricks {
 impl DataConnector for Databricks {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "databricks"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token", "pass"]
     }
 
     async fn read_provider(

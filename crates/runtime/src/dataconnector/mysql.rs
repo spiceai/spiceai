@@ -49,18 +49,13 @@ impl DataConnectorFactory for MySQL {
     fn create(
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        // Required secrets:
-        // - mysql_connection_string
-        // - mysql_pass
-        // - mysql_user
-
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(params.into())
+                MySQLConnectionPool::new(params)
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );
@@ -76,6 +71,14 @@ impl DataConnectorFactory for MySQL {
 impl DataConnector for MySQL {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "mysql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string", "user", "pass"]
     }
 
     async fn read_provider(

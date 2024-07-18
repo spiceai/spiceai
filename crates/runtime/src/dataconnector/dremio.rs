@@ -118,6 +118,14 @@ impl DataConnector for Dremio {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "dremio"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["username", "password"]
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,

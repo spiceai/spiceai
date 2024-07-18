@@ -77,6 +77,14 @@ impl DataConnector for UnityCatalog {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "unity_catalog"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token"]
+    }
+
     async fn read_provider(
         &self,
         _dataset: &Dataset,

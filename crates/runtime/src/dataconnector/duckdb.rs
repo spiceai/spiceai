@@ -97,6 +97,14 @@ impl DataConnector for DuckDB {
         self
     }
 
+    fn prefix(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,

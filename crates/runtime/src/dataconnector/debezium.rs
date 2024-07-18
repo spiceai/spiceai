@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Invalid value for debezium_message_format: Valid values: 'json'"))]
     InvalidMessageFormat,
 
-    #[snafu(display("Missing required parameter: kafka_bootstrap_servers"))]
+    #[snafu(display("Missing required parameter: debezium_kafka_bootstrap_servers"))]
     MissingKafkaBootstrapServers,
 }
 
@@ -57,11 +57,11 @@ impl Debezium {
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let transport = params
-            .get("debezium_transport")
+            .get("transport")
             .map_or("kafka", |p| p.expose_secret().as_str());
 
         let message_format = params
-            .get("debezium_message_format")
+            .get("message_format")
             .map_or("json", |p| p.expose_secret().as_str());
 
         if transport != "kafka" {
@@ -101,6 +101,14 @@ impl DataConnector for Debezium {
 
     fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
         refresh_mode.unwrap_or(RefreshMode::Changes)
+    }
+
+    fn prefix(&self) -> &'static str {
+        "debezium"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 
     async fn read_provider(

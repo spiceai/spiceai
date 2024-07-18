@@ -34,7 +34,7 @@ pub struct File {
 
 impl std::fmt::Display for File {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "File")
+        write!(f, "file")
     }
 }
 
@@ -49,6 +49,14 @@ impl DataConnectorFactory for File {
 impl ListingTableConnector for File {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn prefix(&self) -> &'static str {
+        "file"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 
     fn get_params(&self) -> &HashMap<String, SecretString> {

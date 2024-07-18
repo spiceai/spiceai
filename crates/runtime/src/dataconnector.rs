@@ -319,6 +319,25 @@ pub trait DataConnector: Send + Sync {
     async fn read_provider(&self, dataset: &Dataset)
         -> DataConnectorResult<Arc<dyn TableProvider>>;
 
+    /// The prefix to use for parameters and secrets for this `DataConnector`.
+    ///
+    /// Any parameter specified in `params` not prefixed with this value will be ignored.
+    ///
+    /// ## Example
+    ///
+    /// If the prefix is `pg` then the following parameters are accepted:
+    ///
+    /// - `pg_host` -> `host`
+    /// - `pg_port` -> `port`
+    ///
+    /// The prefix will be stripped from the parameter name before being passed to the data connector.
+    fn prefix(&self) -> &'static str;
+
+    /// Specify which secrets the runtime should attempt to autoload from the configured secret stores.
+    ///
+    /// Will automatically be prefixed by `prefix`.
+    fn autoload_secrets(&self) -> &'static [&'static str];
+
     async fn read_write_provider(
         &self,
         _dataset: &Dataset,
@@ -384,6 +403,10 @@ pub trait ListingTableConnector: DataConnector {
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
     fn get_params(&self) -> &HashMap<String, SecretString>;
+
+    fn prefix(&self) -> &'static str;
+
+    fn autoload_secrets(&self) -> &'static [&'static str];
 
     #[must_use]
     fn get_session_context() -> SessionContext {
@@ -624,6 +647,14 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             }
         }
     }
+
+    fn prefix(&self) -> &'static str {
+        ListingTableConnector::prefix(self)
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        ListingTableConnector::autoload_secrets(self)
+    }
 }
 
 #[cfg(test)]
@@ -669,6 +700,14 @@ mod tests {
                     dataconnector: format!("{self}"),
                     message: "Invalid URL".to_string(),
                 })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "test"
+        }
+
+        fn autoload_secrets(&self) -> &'static [&'static str] {
+            &[]
         }
     }
 
