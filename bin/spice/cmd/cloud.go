@@ -155,9 +155,11 @@ spice chat --model <model> --cloud
 					continue
 				}
 
-				token := chatResponse.Choices[0].Delta.Content
-				cmd.Printf("%s", token)
-				responseMessage = responseMessage + token
+				if len(chatResponse.Choices) > 0 {
+					token := chatResponse.Choices[0].Delta.Content
+					cmd.Printf("%s", token)
+					responseMessage = responseMessage + token
+				}
 			}
 
 			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
