@@ -82,14 +82,36 @@ impl Debezium {
     }
 }
 
-impl DataConnectorFactory for Debezium {
+#[derive(Default, Copy, Clone)]
+pub struct DebeziumFactory {}
+
+impl DebeziumFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DebeziumFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let debezium = Debezium::new(params)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "debezium"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 
@@ -101,14 +123,6 @@ impl DataConnector for Debezium {
 
     fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
         refresh_mode.unwrap_or(RefreshMode::Changes)
-    }
-
-    fn prefix(&self) -> &'static str {
-        "debezium"
-    }
-
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[]
     }
 
     async fn read_provider(

@@ -74,27 +74,34 @@ impl DuckDB {
     }
 }
 
-impl DataConnectorFactory for DuckDB {
+#[derive(Default, Copy, Clone)]
+pub struct DuckDBFactory {}
+
+impl DuckDBFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DuckDBFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
                 if let Some(db_path) = params.get("open").map(ExposeSecret::expose_secret) {
-                    Self::create_file(db_path)?
+                    DuckDB::create_file(db_path)?
                 } else {
-                    Self::create_in_memory()?
+                    DuckDB::create_in_memory()?
                 };
 
-            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-#[async_trait]
-impl DataConnector for DuckDB {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -103,6 +110,13 @@ impl DataConnector for DuckDB {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &[]
+    }
+}
+
+#[async_trait]
+impl DataConnector for DuckDB {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

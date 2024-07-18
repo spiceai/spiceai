@@ -541,14 +541,36 @@ pub struct GraphQL {
     params: HashMap<String, SecretString>,
 }
 
-impl DataConnectorFactory for GraphQL {
+#[derive(Default, Copy, Clone)]
+pub struct GraphQLFactory {}
+
+impl GraphQLFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for GraphQLFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let graphql = Self { params };
+            let graphql = GraphQL { params };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "graphql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token", "user", "pass"]
     }
 }
 
@@ -661,14 +683,6 @@ impl GraphQL {
 impl DataConnector for GraphQL {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn prefix(&self) -> &'static str {
-        "graphql"
-    }
-
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["token", "user", "pass"]
     }
 
     async fn read_provider(

@@ -47,8 +47,22 @@ pub struct Snowflake {
     table_factory: SnowflakeTableFactory,
 }
 
-impl DataConnectorFactory for Snowflake {
+#[derive(Default, Copy, Clone)]
+pub struct SnowflakeFactory {}
+
+impl SnowflakeFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SnowflakeFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
@@ -62,15 +76,8 @@ impl DataConnectorFactory for Snowflake {
 
             let table_factory = SnowflakeTableFactory::new(pool);
 
-            Ok(Arc::new(Self { table_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Snowflake { table_factory }) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-#[async_trait]
-impl DataConnector for Snowflake {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -88,6 +95,13 @@ impl DataConnector for Snowflake {
             "private_key_path",
             "private_key_passphrase",
         ]
+    }
+}
+
+#[async_trait]
+impl DataConnector for Snowflake {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

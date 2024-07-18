@@ -35,20 +35,28 @@ impl std::fmt::Display for FTP {
     }
 }
 
-impl DataConnectorFactory for FTP {
-    fn create(
-        params: HashMap<String, SecretString>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            let ftp = Self { params };
-            Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
-        })
+#[derive(Default, Copy, Clone)]
+pub struct FTPFactory {}
+
+impl FTPFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
 
-impl ListingTableConnector for FTP {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl DataConnectorFactory for FTPFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move {
+            let ftp = FTP { params };
+            Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {
@@ -57,6 +65,12 @@ impl ListingTableConnector for FTP {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["user", "pass"]
+    }
+}
+
+impl ListingTableConnector for FTP {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn get_params(&self) -> &HashMap<String, SecretString> {

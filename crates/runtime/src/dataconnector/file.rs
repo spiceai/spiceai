@@ -38,17 +38,25 @@ impl std::fmt::Display for File {
     }
 }
 
-impl DataConnectorFactory for File {
-    fn create(
-        params: HashMap<String, SecretString>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
+#[derive(Default, Copy, Clone)]
+pub struct FileFactory {}
+
+impl FileFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
 
-impl ListingTableConnector for File {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl DataConnectorFactory for FileFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move { Ok(Arc::new(File { params }) as Arc<dyn DataConnector>) })
     }
 
     fn prefix(&self) -> &'static str {
@@ -57,6 +65,12 @@ impl ListingTableConnector for File {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &[]
+    }
+}
+
+impl ListingTableConnector for File {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn get_params(&self) -> &HashMap<String, SecretString> {

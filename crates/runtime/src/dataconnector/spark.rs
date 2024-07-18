@@ -75,8 +75,22 @@ impl Spark {
     }
 }
 
-impl DataConnectorFactory for Spark {
+#[derive(Default, Copy, Clone)]
+pub struct SparkFactory {}
+
+impl SparkFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SparkFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
@@ -105,13 +119,6 @@ impl DataConnectorFactory for Spark {
             }
         })
     }
-}
-
-#[async_trait]
-impl DataConnector for Spark {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn prefix(&self) -> &'static str {
         "spark"
@@ -119,6 +126,13 @@ impl DataConnector for Spark {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["remote"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for Spark {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

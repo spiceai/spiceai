@@ -18,7 +18,7 @@ use super::{DataConnector, DataConnectorFactory};
 use crate::component::dataset::Dataset;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
-use data_components::flightsql::FlightSQLFactory;
+use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
@@ -45,11 +45,25 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
-    pub flightsql_factory: FlightSQLFactory,
+    pub flightsql_factory: DataComponentFlightSQLFactory,
 }
 
-impl DataConnectorFactory for FlightSQL {
+#[derive(Default, Copy, Clone)]
+pub struct FlightSQLFactory {}
+
+impl FlightSQLFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for FlightSQLFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
@@ -71,16 +85,9 @@ impl DataConnectorFactory for FlightSQL {
                     .await
                     .context(UnableToPerformHandshakeSnafu)?;
             };
-            let flightsql_factory = FlightSQLFactory::new(client, endpoint);
-            Ok(Arc::new(Self { flightsql_factory }) as Arc<dyn DataConnector>)
+            let flightsql_factory = DataComponentFlightSQLFactory::new(client, endpoint);
+            Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-#[async_trait]
-impl DataConnector for FlightSQL {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -89,6 +96,13 @@ impl DataConnector for FlightSQL {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["username", "password"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for FlightSQL {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

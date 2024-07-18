@@ -47,24 +47,40 @@ where
     odbc_factory: ODBCTableFactory<'a>,
 }
 
-impl<'a> DataConnectorFactory for ODBC<'a>
-where
-    'a: 'static,
-{
+#[derive(Default, Copy, Clone)]
+pub struct ODBCFactory {}
+
+impl ODBCFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for ODBCFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        // Required secrets:
-        // - odbc_connection_string
-
         Box::pin(async move {
-            let pool: Arc<ODBCDbConnectionPool<'a>> =
+            let pool: Arc<ODBCDbConnectionPool> =
                 Arc::new(ODBCPool::new(params).context(UnableToCreateODBCConnectionPoolSnafu)?);
 
             let odbc_factory = ODBCTableFactory::new(pool);
 
-            Ok(Arc::new(Self { odbc_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(ODBC { odbc_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "odbc"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string"]
     }
 }
 
@@ -75,14 +91,6 @@ where
 {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn prefix(&self) -> &'static str {
-        "odbc"
-    }
-
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["connection_string"]
     }
 
     async fn read_provider(

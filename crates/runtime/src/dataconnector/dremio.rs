@@ -75,8 +75,22 @@ impl Dialect for DremioDialect {
     }
 }
 
-impl DataConnectorFactory for Dremio {
+#[derive(Default, Copy, Clone)]
+pub struct DremioFactory {}
+
+impl DremioFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DremioFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
@@ -107,15 +121,8 @@ impl DataConnectorFactory for Dremio {
             .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
                 FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
-            Ok(Arc::new(Self { flight_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-#[async_trait]
-impl DataConnector for Dremio {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -124,6 +131,13 @@ impl DataConnector for Dremio {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["username", "password"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for Dremio {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

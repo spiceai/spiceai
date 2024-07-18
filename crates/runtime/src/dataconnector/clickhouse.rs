@@ -42,15 +42,29 @@ pub struct Clickhouse {
     clickhouse_factory: ClickhouseTableFactory,
 }
 
-impl DataConnectorFactory for Clickhouse {
+#[derive(Default, Copy, Clone)]
+pub struct ClickhouseFactory {}
+
+impl ClickhouseFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for ClickhouseFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match ClickhouseConnectionPool::new(params).await {
                 Ok(pool) => {
                     let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
-                    Ok(Arc::new(Self { clickhouse_factory }) as Arc<dyn DataConnector>)
+                    Ok(Arc::new(Clickhouse { clickhouse_factory }) as Arc<dyn DataConnector>)
                 }
 
                 Err(e) => match e {
@@ -85,13 +99,6 @@ impl DataConnectorFactory for Clickhouse {
             }
         })
     }
-}
-
-#[async_trait]
-impl DataConnector for Clickhouse {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn prefix(&self) -> &'static str {
         "clickhouse"
@@ -99,6 +106,13 @@ impl DataConnector for Clickhouse {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["connection_string", "pass"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for Clickhouse {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

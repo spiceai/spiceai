@@ -128,21 +128,28 @@ impl Databricks {
     }
 }
 
-impl DataConnectorFactory for Databricks {
+#[derive(Default, Clone, Copy)]
+pub struct DatabricksFactory {}
+
+impl DatabricksFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DatabricksFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let databricks = Databricks::new(params).await?;
             Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-#[async_trait]
-impl DataConnector for Databricks {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -151,6 +158,13 @@ impl DataConnector for Databricks {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["token", "pass"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for Databricks {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

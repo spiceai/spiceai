@@ -46,26 +46,28 @@ pub struct S3 {
     params: HashMap<String, SecretString>,
 }
 
-impl DataConnectorFactory for S3 {
+#[derive(Default, Copy, Clone)]
+pub struct S3Factory {}
+
+impl S3Factory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for S3Factory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let s3 = Self { params };
+            let s3 = S3 { params };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-impl std::fmt::Display for S3 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "S3")
-    }
-}
-
-impl ListingTableConnector for S3 {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -74,6 +76,18 @@ impl ListingTableConnector for S3 {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["region", "endpoint", "key", "secret"]
+    }
+}
+
+impl std::fmt::Display for S3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "s3")
+    }
+}
+
+impl ListingTableConnector for S3 {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn get_params(&self) -> &HashMap<String, SecretString> {

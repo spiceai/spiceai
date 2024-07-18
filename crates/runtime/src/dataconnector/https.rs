@@ -38,17 +38,25 @@ impl std::fmt::Display for Https {
     }
 }
 
-impl DataConnectorFactory for Https {
-    fn create(
-        params: HashMap<String, SecretString>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
+#[derive(Default, Copy, Clone)]
+pub struct HttpsFactory {}
+
+impl HttpsFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
 
-impl ListingTableConnector for Https {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl DataConnectorFactory for HttpsFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move { Ok(Arc::new(Https { params }) as Arc<dyn DataConnector>) })
     }
 
     fn prefix(&self) -> &'static str {
@@ -57,6 +65,12 @@ impl ListingTableConnector for Https {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["username", "password"]
+    }
+}
+
+impl ListingTableConnector for Https {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn get_params(&self) -> &HashMap<String, SecretString> {

@@ -63,18 +63,25 @@ pub struct UnityCatalog {
     params: HashMap<String, SecretString>,
 }
 
-impl DataConnectorFactory for UnityCatalog {
-    fn create(
-        params: HashMap<String, SecretString>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
+#[derive(Default, Copy, Clone)]
+pub struct UnityCatalogFactory {}
+
+impl UnityCatalogFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
 
-#[async_trait]
-impl DataConnector for UnityCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl DataConnectorFactory for UnityCatalogFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move { Ok(Arc::new(UnityCatalog { params }) as Arc<dyn DataConnector>) })
     }
 
     fn prefix(&self) -> &'static str {
@@ -83,6 +90,13 @@ impl DataConnector for UnityCatalog {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["token"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for UnityCatalog {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(

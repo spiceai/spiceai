@@ -82,8 +82,22 @@ impl Dialect for SpiceCloudPlatformDialect {
     }
 }
 
-impl DataConnectorFactory for SpiceAI {
+#[derive(Default, Copy, Clone)]
+pub struct SpiceAIFactory {}
+
+impl SpiceAIFactory {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SpiceAIFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url = if cfg!(feature = "dev") {
@@ -117,16 +131,9 @@ impl DataConnectorFactory for SpiceAI {
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
             );
-            let spiceai = Self { flight_factory };
+            let spiceai = SpiceAI { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })
-    }
-}
-
-#[async_trait]
-impl DataConnector for SpiceAI {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn prefix(&self) -> &'static str {
@@ -135,6 +142,13 @@ impl DataConnector for SpiceAI {
 
     fn autoload_secrets(&self) -> &'static [&'static str] {
         &["api_key"]
+    }
+}
+
+#[async_trait]
+impl DataConnector for SpiceAI {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(
