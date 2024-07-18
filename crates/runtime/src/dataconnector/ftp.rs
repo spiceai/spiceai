@@ -66,7 +66,7 @@ impl ListingTableConnector for FTP {
             fragment_builder.append_pair("user", ftp_user);
         }
         if let Some(ftp_password) = self.params.get("ftp_pass").map(ExposeSecret::expose_secret) {
-            fragment_builder.append_pair("password", &ftp_password);
+            fragment_builder.append_pair("password", ftp_password);
         }
         fragments.push(fragment_builder.finish());
 
