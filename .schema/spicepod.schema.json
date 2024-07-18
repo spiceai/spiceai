@@ -9,6 +9,12 @@
     "version"
   ],
   "properties": {
+    "catalogs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ComponentOrReference_for_Catalog"
+      }
+    },
     "datasets": {
       "type": "array",
       "items": {
@@ -41,6 +47,10 @@
           "$ref": "#/definitions/SpicepodKind"
         }
       ]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
     },
     "models": {
       "type": "array",
@@ -222,6 +232,53 @@
         }
       }
     },
+    "Catalog": {
+      "type": "object",
+      "required": [
+        "from",
+        "name"
+      ],
+      "properties": {
+        "dataset_params": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "from": {
+          "type": "string"
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "ColumnEmbeddingConfig": {
       "description": "Configuration for if and how a dataset's column should be embedded.",
       "type": "object",
@@ -246,6 +303,16 @@
           "type": "string"
         }
       }
+    },
+    "ComponentOrReference_for_Catalog": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Catalog"
+        },
+        {
+          "$ref": "#/definitions/ComponentReference"
+        }
+      ]
     },
     "ComponentOrReference_for_Dataset": {
       "anyOf": [

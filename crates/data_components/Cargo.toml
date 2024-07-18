@@ -29,7 +29,10 @@ datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { version = "0.1.1", features = ["default-engine", "cloud"], optional = true }
+delta_kernel = { version = "0.1.1", features = [
+  "default-engine",
+  "cloud",
+], optional = true }
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
@@ -39,6 +42,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+globset.workspace = true
 itertools.workspace = true
 mysql_async = { workspace = true, optional = true }
 object_store = { workspace = true }
@@ -72,10 +76,15 @@ rdkafka = { version = "0.36.2", features = ["cmake-build"], optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
-delta_lake = ["dep:delta_kernel"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:serde_json", "dep:rdkafka"]
-duckdb = ["dep:duckdb", "dep:r2d2", "db_connection_pool/duckdb", "datafusion-table-providers/duckdb"]
+delta_lake = ["dep:delta_kernel"]
+duckdb = [
+  "dep:duckdb",
+  "dep:r2d2",
+  "db_connection_pool/duckdb",
+  "datafusion-table-providers/duckdb",
+]
 flightsql = ["dep:tonic", "dep:r2d2"]
 mysql = ["dep:mysql_async", "datafusion-table-providers/mysql"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc"]
@@ -84,11 +93,15 @@ postgres = [
   "dep:bb8-postgres",
   "dep:postgres-native-tls",
   "dep:tokio-postgres",
-  "datafusion-table-providers/postgres"
+  "datafusion-table-providers/postgres",
 ]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "datafusion-table-providers/sqlite"]
+sqlite = [
+  "dep:rusqlite",
+  "dep:tokio-rusqlite",
+  "datafusion-table-providers/sqlite",
+]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

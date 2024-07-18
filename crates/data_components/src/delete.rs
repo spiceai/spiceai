@@ -72,6 +72,10 @@ impl DisplayAs for DeletionExec {
 }
 
 impl ExecutionPlan for DeletionExec {
+    fn name(&self) -> &str {
+        "DeletionExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

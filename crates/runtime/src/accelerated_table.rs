@@ -116,6 +116,9 @@ pub enum Error {
         "The type of the primary key '{data_type}' is not yet supported for change deletion."
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
+
+    #[snafu(display("{source}"))]
+    InvalidTimeColumnTimeFormat { source: refresh::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

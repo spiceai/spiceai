@@ -34,6 +34,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
+    sql::unparser::dialect::Dialect,
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
@@ -76,12 +77,17 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct FlightFactory {
     name: &'static str,
     client: FlightClient,
+    dialect: Arc<dyn Dialect>,
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(name: &'static str, client: FlightClient) -> Self {
-        Self { name, client }
+    pub fn new(name: &'static str, client: FlightClient, dialect: Arc<dyn Dialect>) -> Self {
+        Self {
+            name,
+            client,
+            dialect,
+        }
     }
 }
 
@@ -90,9 +96,26 @@ impl Read for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider =
-            Arc::new(FlightTable::create(self.name, self.client.clone(), table_reference).await?);
+        let table_provider = match schema {
+            Some(schema) => Arc::new(FlightTable::create_with_schema(
+                self.name,
+                self.client.clone(),
+                table_reference,
+                schema,
+                Arc::clone(&self.dialect),
+            )),
+            None => Arc::new(
+                FlightTable::create(
+                    self.name,
+                    self.client.clone(),
+                    table_reference,
+                    Arc::clone(&self.dialect),
+                )
+                .await?,
+            ),
+        };
 
         let table_provider = Arc::new(
             table_provider
@@ -109,8 +132,9 @@ impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
+        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let read_provider = Read::table_provider(self, table_reference.clone()).await?;
+        let read_provider = Read::table_provider(self, table_reference.clone(), schema).await?;
 
         Ok(FlightTableWriter::create(
             read_provider,
@@ -126,6 +150,7 @@ pub struct FlightTable {
     client: FlightClient,
     primary_keys: Vec<String>,
     schema: SchemaRef,
+    dialect: Arc<dyn Dialect>,
     table_reference: TableReference,
 }
 
@@ -135,6 +160,7 @@ impl FlightTable {
         name: &'static str,
         client: FlightClient,
         table_reference: impl Into<TableReference>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
@@ -146,8 +172,27 @@ impl FlightTable {
             primary_keys,
             schema,
             table_reference,
+            dialect,
             join_push_down_context: format!("url={},username={}", client.url(), client.username()),
         })
+    }
+
+    pub fn create_with_schema(
+        name: &'static str,
+        client: FlightClient,
+        table_reference: impl Into<TableReference>,
+        schema: SchemaRef,
+        dialect: Arc<dyn Dialect>,
+    ) -> Self {
+        let table_reference = table_reference.into();
+        Self {
+            name,
+            client: client.clone(),
+            schema,
+            table_reference,
+            dialect,
+            join_push_down_context: format!("url={},username={}", client.url(), client.username()),
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)]

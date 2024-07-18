@@ -73,6 +73,10 @@ impl fmt::Debug for SchemaCastScanExec {
 }
 
 impl ExecutionPlan for SchemaCastScanExec {
+    fn name(&self) -> &str {
+        "SchemaCastScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

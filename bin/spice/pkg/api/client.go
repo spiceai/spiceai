@@ -73,6 +73,10 @@ func (s *SpiceApiClient) Init() error {
 	return nil
 }
 
+func (s *SpiceApiClient) GetBaseUrl() string {
+	return s.baseUrl
+}
+
 func (s *SpiceApiClient) GetAuthUrl(authCode string) string {
 	return fmt.Sprintf("%s/auth/token?code=%s", s.baseUrl, authCode)
 }

@@ -576,18 +576,17 @@ impl GraphQL {
                 message: "Invalid URL in dataset `from` definition",
             },
         )?;
-        let json_path = self
+        let json_pointer = self
             .params
-            .get("json_path")
-            .ok_or("`json_path` not found in params".into())
+            .get("json_pointer")
+            .ok_or("`json_pointer` not found in params".into())
             .context(super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
-                message: "`json_path` not found in params",
+                message: "`json_pointer` not found in params",
             })?
             .to_owned();
-        let pointer = format!("/{}", json_path.replace('.', "/"));
 
-        let pagination_parameters = PaginationParameters::parse(&query, &pointer);
+        let pagination_parameters = PaginationParameters::parse(&query, &json_pointer);
 
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
@@ -633,7 +632,7 @@ impl GraphQL {
             })?,
             endpoint,
             query,
-            pointer,
+            json_pointer,
             unnest_parameters,
             pagination_parameters,
             auth,

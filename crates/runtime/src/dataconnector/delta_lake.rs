@@ -17,7 +17,8 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
-use data_components::delta_lake::DeltaTable;
+use data_components::delta_lake::DeltaTableFactory;
+use data_components::Read;
 use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 use std::any::Any;
@@ -28,7 +29,7 @@ use std::{collections::HashMap, future::Future};
 use super::{DataConnector, DataConnectorFactory};
 
 pub struct DeltaLake {
-    secret_map: SecretMap,
+    delta_table_factory: DeltaTableFactory,
 }
 
 impl DeltaLake {
@@ -42,7 +43,9 @@ impl DeltaLake {
             }
         }
 
-        Self { secret_map: params }
+        Self {
+            delta_table_factory: DeltaTableFactory::new(Arc::new(params.into_map())),
+        }
     }
 }
 
@@ -68,12 +71,14 @@ impl DataConnector for DeltaLake {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let delta_path = dataset.path();
-        let delta = DeltaTable::from(delta_path, self.secret_map.clone().into_map())
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "delta_lake",
-            })?;
-        Ok(Arc::new(delta))
+        Ok(Read::table_provider(
+            &self.delta_table_factory,
+            dataset.path().into(),
+            dataset.schema(),
+        )
+        .await
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "delta_lake",
+        })?)
     }
 }

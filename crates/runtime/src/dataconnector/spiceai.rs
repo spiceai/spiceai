@@ -16,16 +16,22 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
+use crate::Runtime;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use data_components::flight::stream::FlightTableStreamer;
 use data_components::flight::FlightFactory;
 use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
+use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion::sql::unparser::dialect::Dialect;
+use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
@@ -63,6 +69,22 @@ pub struct SpiceAI {
     flight_factory: FlightFactory,
 }
 
+pub struct SpiceCloudPlatformDialect {}
+
+impl Dialect for SpiceCloudPlatformDialect {
+    fn use_timestamp_for_date64(&self) -> bool {
+        true
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        IntervalStyle::SQLStandard
+    }
+
+    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+        DefaultDialect {}.identifier_quote_style(identifier)
+    }
+}
+
 impl DataConnectorFactory for SpiceAI {
     fn create(
         secret: Option<Secret>,
@@ -92,7 +114,11 @@ impl DataConnectorFactory for SpiceAI {
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
-            let flight_factory = FlightFactory::new("spiceai", flight_client);
+            let flight_factory = FlightFactory::new(
+                "spiceai",
+                flight_client,
+                Arc::new(SpiceCloudPlatformDialect {}),
+            );
             let spiceai = Self { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })
@@ -112,6 +138,7 @@ impl DataConnector for SpiceAI {
         Ok(Read::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
+            dataset.schema(),
         )
         .await
         .context(super::UnableToGetReadProviderSnafu {
@@ -126,6 +153,7 @@ impl DataConnector for SpiceAI {
         let read_write_result = ReadWrite::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
+            dataset.schema(),
         )
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
@@ -151,6 +179,29 @@ impl DataConnector for SpiceAI {
             .downcast_ref::<FlightTable>()?;
         let stream = flight_table.stream_changes();
         Some(stream)
+  }
+  
+    async fn catalog_provider(
+        self: Arc<Self>,
+        runtime: &Runtime,
+        catalog: &Catalog,
+    ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
+        if catalog.catalog_id.is_some() {
+            return Some(Err(
+                super::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "spiceai".into(),
+                    message: "Catalog ID is not supported for SpiceAI data connector".into(),
+                },
+            ));
+        }
+
+        let spice_extension = runtime.extension("spice_cloud").await?;
+        let catalog_provider = spice_extension
+            .catalog_provider(self, catalog.include.clone())
+            .await?
+            .ok()?;
+
+        Some(Ok(catalog_provider))
     }
 }
 
