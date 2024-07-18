@@ -216,11 +216,6 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-type NewDataConnectorFn = dyn Fn(
-        HashMap<String, SecretString>,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
-    + Send;
-
 lazy_static! {
     static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>> =
         Mutex::new(HashMap::new());
@@ -255,13 +250,22 @@ pub async fn create_new_connector(
             let mut params = remove_prefix_from_hashmap_keys(params, factory.prefix());
 
             // Try to autoload secrets that might be missing from params.
-            for secret_key in factory.autoload_secrets().into_iter().map(|s| *s) {
+            for secret_key in factory.autoload_secrets().iter().copied() {
+                let secret_key_with_prefix = format!("{}_{secret_key}", factory.prefix());
+                tracing::debug!(
+                    "Attempting to autoload secret for {name}: {secret_key_with_prefix}",
+                );
                 if params.contains_key(secret_key) {
                     continue;
                 }
-                let secret = secrets.read().await.get_secret(secret_key).await;
+                let secret = secrets
+                    .read()
+                    .await
+                    .get_secret(&secret_key_with_prefix)
+                    .await;
                 if let Ok(Some(secret)) = secret {
-                    tracing::debug!("Autoloading secret for {name}: {secret_key}",);
+                    tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
+                    // Insert without the prefix into the params
                     params.insert(secret_key.to_string(), secret);
                 }
             }
@@ -667,7 +671,12 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 /// Filters out keys in a hashmap that do not start with the specified prefix, and removes the prefix from the keys that remain.
 ///
 /// It also logs a warning for each key that is filtered out.
+///
+/// # Panics
+///
+/// Panics if `prefix` ends with an underscore.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn remove_prefix_from_hashmap_keys<V>(
     hashmap: HashMap<String, V>,
     prefix: &str,
