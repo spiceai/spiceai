@@ -248,6 +248,7 @@ pub async fn create_new_connector(
     match connector_factory {
         Some(factory) => {
             let mut params = remove_prefix_from_hashmap_keys(params, factory.prefix());
+            let secret_guard = secrets.read().await;
 
             // Try to autoload secrets that might be missing from params.
             for secret_key in factory.autoload_secrets().iter().copied() {
@@ -258,11 +259,7 @@ pub async fn create_new_connector(
                 if params.contains_key(secret_key) {
                     continue;
                 }
-                let secret = secrets
-                    .read()
-                    .await
-                    .get_secret(&secret_key_with_prefix)
-                    .await;
+                let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
                 if let Ok(Some(secret)) = secret {
                     tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
                     // Insert without the prefix into the params
