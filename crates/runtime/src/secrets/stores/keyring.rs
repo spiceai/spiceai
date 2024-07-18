@@ -21,7 +21,7 @@ use snafu::Snafu;
 
 use crate::secrets::SecretStore;
 
-const KEYRING_SECRET_PREFIX: &str = "spice_secret_";
+const KEYRING_SECRET_PREFIX: &str = "spice_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -30,12 +30,6 @@ pub enum Error {
 
     #[snafu(display("Unable to get keyring secret value: {source}"))]
     UnableToGetSecretValue { source: keyring::Error },
-
-    #[snafu(display("Unable to parse keyring secret value: {source}"))]
-    UnableToParseSecretValue { source: serde_json::Error },
-
-    #[snafu(display("Invalid keyring secret value: JSON object is expected"))]
-    InvalidJsonFormat {},
 }
 
 pub struct KeyringSecretStore {}
@@ -60,7 +54,17 @@ impl SecretStore for KeyringSecretStore {
         let entry = match Entry::new(key, "spiced") {
             Ok(entry) => entry,
             Err(keyring::Error::NoEntry) => {
-                return Ok(None);
+                // If the key isn't found by the explicit key, try with SPICE_ prefixed
+                let prefixed_key = format!("{KEYRING_SECRET_PREFIX}{key}");
+                match Entry::new(&prefixed_key, "spiced") {
+                    Ok(entry) => entry,
+                    Err(keyring::Error::NoEntry) => {
+                        return Ok(None);
+                    }
+                    Err(err) => {
+                        return Err(Box::new(Error::UnableToGetSecret { source: err }));
+                    }
+                }
             }
             Err(err) => {
                 return Err(Box::new(Error::UnableToGetSecret { source: err }));

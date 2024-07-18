@@ -29,7 +29,7 @@ use aws_sdk_secretsmanager::{self};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-const SPICE_SECRET_PREFIX: &str = "spice_secret_";
+const SPICE_KEY_PREFIX: &str = "spice_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -126,7 +126,11 @@ impl SecretStore for AwsSecretsManager {
 
         if let Some(secret_str) = secret_value.secret_string() {
             let data = parse_json_to_hashmap(secret_str)?;
-            return Ok(data.get(key).cloned().map(SecretString::new));
+            if let Some(value) = data.get(key) {
+                return Ok(Some(SecretString::new(value.clone())));
+            }
+            let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
+            return Ok(data.get(&prefixed_key).cloned().map(SecretString::new));
         }
 
         Ok(None)
