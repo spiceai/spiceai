@@ -1,7 +1,9 @@
-use arrow_ipc::Duration;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
+use crate::setup::{BenchAppBuilder, DataConnector};
+use app::{App, AppBuilder};
+use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -12,8 +14,6 @@ pub(crate) async fn run(
     for (query_name, query) in test_queries {
         super::run_query_and_record_result(rt, benchmark_results, query_name, query).await?;
     }
-
-    // std::thread::sleep(Duration::from_secs(10));
 
     Ok(())
 }
@@ -67,4 +67,35 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
             include_str!("../tpch_queries/tpch_simple_q5.sql"),
         ),
     ]
+}
+
+pub struct SpiceAIBenchAppBuilder {}
+
+impl BenchAppBuilder for SpiceAIBenchAppBuilder {
+    fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
+        let mut app_builder = AppBuilder::new("runtime_benchmark_test")
+            .with_secret_store(SpiceSecretStore::File)
+            .with_dataset(self.make_dataset("tpch.customer", "customer"))
+            .with_dataset(self.make_dataset("tpch.lineitem", "lineitem"))
+            .with_dataset(self.make_dataset("tpch.part", "part"))
+            .with_dataset(self.make_dataset("tpch.partsupp", "partsupp"))
+            .with_dataset(self.make_dataset("tpch.orders", "orders"))
+            .with_dataset(self.make_dataset("tpch.nation", "nation"))
+            .with_dataset(self.make_dataset("tpch.region", "region"))
+            .with_dataset(self.make_dataset("tpch.supplier", "supplier"));
+
+        if let Some(upload_results_dataset) = upload_results_dataset {
+            app_builder = app_builder.with_dataset(self.make_rw_dataset(
+                upload_results_dataset,
+                "oss_benchmarks",
+                DataConnector::SpiceAI,
+            ));
+        }
+
+        app_builder.build()
+    }
+
+    fn make_dataset(&self, path: &str, name: &str) -> Dataset {
+        Dataset::new(format!("spiceai:{path}"), name.to_string())
+    }
 }

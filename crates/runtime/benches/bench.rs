@@ -41,7 +41,7 @@ async fn run_benchmark_test(dataconnector: setup::DataConnector) -> Result<(), S
     }
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(&upload_results_dataset, dataconnector.clone()).await;
+        setup::setup_benchmark(&upload_results_dataset, dataconnector).await;
 
     match dataconnector {
         setup::DataConnector::SpiceAI => {
