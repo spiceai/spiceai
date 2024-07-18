@@ -45,30 +45,49 @@ pub struct MySQL {
     mysql_factory: MySQLTableFactory,
 }
 
-impl DataConnectorFactory for MySQL {
+#[derive(Default, Copy, Clone)]
+pub struct MySQLFactory {}
+
+impl MySQLFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for MySQLFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        // Required secrets:
-        // - mysql_connection_string
-        // - mysql_pass
-        // - mysql_user
-
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(params.into())
+                MySQLConnectionPool::new(params)
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );
 
             let mysql_factory = MySQLTableFactory::new(pool);
 
-            Ok(Arc::new(Self { mysql_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(MySQL { mysql_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "mysql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string", "user", "pass"]
     }
 }
 

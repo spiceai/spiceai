@@ -74,20 +74,44 @@ impl DuckDB {
     }
 }
 
-impl DataConnectorFactory for DuckDB {
+#[derive(Default, Copy, Clone)]
+pub struct DuckDBFactory {}
+
+impl DuckDBFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DuckDBFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
                 if let Some(db_path) = params.get("open").map(ExposeSecret::expose_secret) {
-                    Self::create_file(db_path)?
+                    DuckDB::create_file(db_path)?
                 } else {
-                    Self::create_in_memory()?
+                    DuckDB::create_in_memory()?
                 };
 
-            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 

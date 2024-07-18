@@ -541,14 +541,38 @@ pub struct GraphQL {
     params: HashMap<String, SecretString>,
 }
 
-impl DataConnectorFactory for GraphQL {
+#[derive(Default, Copy, Clone)]
+pub struct GraphQLFactory {}
+
+impl GraphQLFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for GraphQLFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let graphql = Self { params };
+            let graphql = GraphQL { params };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "graphql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token", "user", "pass"]
     }
 }
 
@@ -557,17 +581,17 @@ impl GraphQL {
         let mut client_builder = reqwest::Client::builder();
         let token = self
             .params
-            .get("auth_token")
+            .get("token")
             .map(ExposeSecret::expose_secret)
             .cloned();
         let user = self
             .params
-            .get("auth_user")
+            .get("user")
             .map(ExposeSecret::expose_secret)
             .cloned();
         let pass = self
             .params
-            .get("auth_pass")
+            .get("pass")
             .map(ExposeSecret::expose_secret)
             .cloned();
 
@@ -591,10 +615,10 @@ impl GraphQL {
             .params
             .get("json_path")
             .map(ExposeSecret::expose_secret)
-            .ok_or("`json_path` not found in params".into())
+            .ok_or("`graphql_json_path` not found in params".into())
             .context(super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
-                message: "`json_path` not found in params",
+                message: "`graphql_json_path` not found in params",
             })?
             .clone();
         let pointer = format!("/{}", json_path.replace('.', "/"));
@@ -629,7 +653,7 @@ impl GraphQL {
             Ok(depth) => Ok(depth),
             Err(e) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: "GraphQL".to_string(),
-                message: "`unnest_depth` is not an integer".to_string(),
+                message: "`graphql_unnest_depth` is not an integer".to_string(),
                 source: e.into(),
             }),
         }?;

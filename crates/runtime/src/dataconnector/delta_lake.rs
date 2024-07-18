@@ -41,14 +41,53 @@ impl DeltaLake {
     }
 }
 
-impl DataConnectorFactory for DeltaLake {
+#[derive(Default, Copy, Clone)]
+pub struct DeltaLakeFactory {}
+
+impl DeltaLakeFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DeltaLakeFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let delta = DeltaLake::new(params);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "delta_lake"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[
+            // S3 Parameters
+            "aws_region",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_endpoint",
+            // Azure Parameters
+            "azure_storage_account_name",
+            "azure_storage_account_key",
+            "azure_storage_client_id",
+            "azure_storage_client_secret",
+            "azure_storage_sas_key",
+            "azure_storage_endpoint",
+            // Google Storage Parameters
+            "google_service_account",
+        ]
     }
 }
 

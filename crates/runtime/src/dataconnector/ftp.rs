@@ -31,18 +31,42 @@ pub struct FTP {
 
 impl std::fmt::Display for FTP {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FTP")
+        write!(f, "ftp")
     }
 }
 
-impl DataConnectorFactory for FTP {
+#[derive(Default, Copy, Clone)]
+pub struct FTPFactory {}
+
+impl FTPFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for FTPFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let ftp = Self { params };
+            let ftp = FTP { params };
             Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "ftp"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["user", "pass"]
     }
 }
 
@@ -59,13 +83,13 @@ impl ListingTableConnector for FTP {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(ftp_port) = self.params.get("ftp_port").map(ExposeSecret::expose_secret) {
+        if let Some(ftp_port) = self.params.get("port").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("port", ftp_port);
         }
-        if let Some(ftp_user) = self.params.get("ftp_user").map(ExposeSecret::expose_secret) {
+        if let Some(ftp_user) = self.params.get("user").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("user", ftp_user);
         }
-        if let Some(ftp_password) = self.params.get("ftp_pass").map(ExposeSecret::expose_secret) {
+        if let Some(ftp_password) = self.params.get("pass").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("password", ftp_password);
         }
         fragments.push(fragment_builder.finish());

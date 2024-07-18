@@ -79,8 +79,24 @@ impl LocalhostConnector {
     }
 }
 
-impl DataConnectorFactory for LocalhostConnector {
+#[derive(Default, Copy, Clone)]
+pub struct LocalhostConnectorFactory {}
+
+impl LocalhostConnectorFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for LocalhostConnectorFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
@@ -107,10 +123,16 @@ impl DataConnectorFactory for LocalhostConnector {
                 .build_schema(columns)
                 .context(UnableToParseSchemaFromColumnDefinitionsSnafu)?;
 
-            Ok(Arc::new(LocalhostConnector {
-                schema: Arc::new(schema),
-            }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(LocalhostConnector::new(Arc::new(schema))) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "localhost"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 

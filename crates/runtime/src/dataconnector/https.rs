@@ -38,11 +38,35 @@ impl std::fmt::Display for Https {
     }
 }
 
-impl DataConnectorFactory for Https {
+#[derive(Default, Copy, Clone)]
+pub struct HttpsFactory {}
+
+impl HttpsFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for HttpsFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(Https { params }) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "http"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["username", "password"]
     }
 }
 
@@ -64,11 +88,7 @@ impl ListingTableConnector for Https {
             }
         })?;
 
-        if let Some(p) = self
-            .params
-            .get("http_port")
-            .map(ExposeSecret::expose_secret)
-        {
+        if let Some(p) = self.params.get("port").map(ExposeSecret::expose_secret) {
             let n = match p.parse::<u16>() {
                 Ok(n) => n,
                 Err(e) => {
@@ -84,7 +104,7 @@ impl ListingTableConnector for Https {
 
         if let Some(p) = self
             .params
-            .get("http_password")
+            .get("password")
             .map(|s| s.expose_secret().as_str())
         {
             if u.set_password(Some(p)).is_err() {
@@ -98,7 +118,7 @@ impl ListingTableConnector for Https {
 
         if let Some(p) = self
             .params
-            .get("http_username")
+            .get("username")
             .map(|s| s.expose_secret().as_str())
         {
             if u.set_username(p).is_err() {

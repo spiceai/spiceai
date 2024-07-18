@@ -40,22 +40,42 @@ pub struct SFTP {
 
 impl std::fmt::Display for SFTP {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SFTP")
+        write!(f, "sftp")
     }
 }
 
-impl DataConnectorFactory for SFTP {
+#[derive(Default, Copy, Clone)]
+pub struct SFTPFactory {}
+
+impl SFTPFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SFTPFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        // Required secrets:
-        // - sftp_user
-        // - sftp_pass
-        // - sftp_port
         Box::pin(async move {
-            let sftp = Self { params };
+            let sftp = SFTP { params };
             Ok(Arc::new(sftp) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "sftp"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["user", "pass"]
     }
 }
 
@@ -72,25 +92,13 @@ impl ListingTableConnector for SFTP {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(sftp_port) = self
-            .params
-            .get("sftp_port")
-            .map(ExposeSecret::expose_secret)
-        {
+        if let Some(sftp_port) = self.params.get("port").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("port", sftp_port);
         }
-        if let Some(sftp_user) = self
-            .params
-            .get("sftp_user")
-            .map(ExposeSecret::expose_secret)
-        {
+        if let Some(sftp_user) = self.params.get("user").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("user", sftp_user);
         }
-        if let Some(sftp_password) = self
-            .params
-            .get("sftp_pass")
-            .map(ExposeSecret::expose_secret)
-        {
+        if let Some(sftp_password) = self.params.get("pass").map(ExposeSecret::expose_secret) {
             fragment_builder.append_pair("password", sftp_password);
         }
         fragments.push(fragment_builder.finish());

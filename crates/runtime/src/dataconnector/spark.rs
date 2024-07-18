@@ -60,9 +60,7 @@ pub struct Spark {
 
 impl Spark {
     async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
-        let conn = params
-            .get("spark_remote")
-            .map(|s| s.expose_secret().as_str());
+        let conn = params.get("remote").map(|s| s.expose_secret().as_str());
         let Some(conn) = conn else {
             return MissingSparkRemoteSnafu.fail();
         };
@@ -77,8 +75,24 @@ impl Spark {
     }
 }
 
-impl DataConnectorFactory for Spark {
+#[derive(Default, Copy, Clone)]
+pub struct SparkFactory {}
+
+impl SparkFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SparkFactory {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
@@ -106,6 +120,14 @@ impl DataConnectorFactory for Spark {
                 },
             }
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spark"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["remote"]
     }
 }
 

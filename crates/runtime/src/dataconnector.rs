@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::secrets::Secrets;
 use crate::Runtime;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -49,7 +50,7 @@ use std::fmt::Display;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use std::future::Future;
@@ -215,27 +216,18 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-type NewDataConnectorFn = dyn Fn(
-        HashMap<String, SecretString>,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
-    + Send;
-
 lazy_static! {
-    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Box<NewDataConnectorFn>>> =
+    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>> =
         Mutex::new(HashMap::new());
 }
 
 pub async fn register_connector_factory(
     name: &str,
-    connector_factory: impl Fn(
-            HashMap<String, SecretString>,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
-        + Send
-        + 'static,
+    connector_factory: Arc<dyn DataConnectorFactory>,
 ) {
     let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
-    registry.insert(name.to_string(), Box::new(connector_factory));
+    registry.insert(name.to_string(), connector_factory);
 }
 
 /// Create a new `DataConnector` by name.
@@ -247,61 +239,108 @@ pub async fn register_connector_factory(
 pub async fn create_new_connector(
     name: &str,
     params: HashMap<String, SecretString>,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
     let connector_factory = guard.get(name);
 
     match connector_factory {
-        Some(factory) => Some(factory(params).await),
+        Some(factory) => {
+            let mut params = remove_prefix_from_hashmap_keys(params, factory.prefix());
+            let secret_guard = secrets.read().await;
+
+            // Try to autoload secrets that might be missing from params.
+            for secret_key in factory.autoload_secrets().iter().copied() {
+                let secret_key_with_prefix = format!("{}_{secret_key}", factory.prefix());
+                tracing::debug!(
+                    "Attempting to autoload secret for {name}: {secret_key_with_prefix}",
+                );
+                if params.contains_key(secret_key) {
+                    continue;
+                }
+                let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+                if let Ok(Some(secret)) = secret {
+                    tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
+                    // Insert without the prefix into the params
+                    params.insert(secret_key.to_string(), secret);
+                }
+            }
+            let result = factory.create(params).await;
+            Some(result)
+        }
         None => None,
     }
 }
 
 pub async fn register_all() {
-    register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
+    register_connector_factory("localhost", localhost::LocalhostConnectorFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
-    register_connector_factory("databricks", databricks::Databricks::create).await;
+    register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
     #[cfg(feature = "delta_lake")]
-    register_connector_factory("delta_lake", delta_lake::DeltaLake::create).await;
+    register_connector_factory("delta_lake", delta_lake::DeltaLakeFactory::new_arc()).await;
     #[cfg(feature = "dremio")]
-    register_connector_factory("dremio", dremio::Dremio::create).await;
-    register_connector_factory("file", file::File::create).await;
+    register_connector_factory("dremio", dremio::DremioFactory::new_arc()).await;
+    register_connector_factory("file", file::FileFactory::new_arc()).await;
     #[cfg(feature = "flightsql")]
-    register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
-    register_connector_factory("s3", s3::S3::create).await;
+    register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
+    register_connector_factory("s3", s3::S3Factory::new_arc()).await;
     #[cfg(feature = "ftp")]
-    register_connector_factory("ftp", ftp::FTP::create).await;
-    register_connector_factory("http", https::Https::create).await;
-    register_connector_factory("https", https::Https::create).await;
+    register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
+    register_connector_factory("http", https::HttpsFactory::new_arc()).await;
+    register_connector_factory("https", https::HttpsFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
-    register_connector_factory("sftp", sftp::SFTP::create).await;
-    register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
+    register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
+    register_connector_factory("spiceai", spiceai::SpiceAIFactory::new_arc()).await;
     #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQL::create).await;
+    register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
     #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::Postgres::create).await;
+    register_connector_factory("postgres", postgres::PostgresFactory::new_arc()).await;
     #[cfg(feature = "duckdb")]
-    register_connector_factory("duckdb", duckdb::DuckDB::create).await;
+    register_connector_factory("duckdb", duckdb::DuckDBFactory::new_arc()).await;
     #[cfg(feature = "clickhouse")]
-    register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
-    register_connector_factory("graphql", graphql::GraphQL::create).await;
+    register_connector_factory("clickhouse", clickhouse::ClickhouseFactory::new_arc()).await;
+    register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
     #[cfg(feature = "odbc")]
-    register_connector_factory("odbc", odbc::ODBC::create).await;
+    register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
     #[cfg(feature = "spark")]
-    register_connector_factory("spark", spark::Spark::create).await;
+    register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
     #[cfg(feature = "snowflake")]
-    register_connector_factory("snowflake", snowflake::Snowflake::create).await;
+    register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
     #[cfg(feature = "debezium")]
-    register_connector_factory("debezium", debezium::Debezium::create).await;
+    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
     #[cfg(feature = "delta_lake")]
-    register_connector_factory("unity_catalog", unity_catalog::UnityCatalog::create).await;
+    register_connector_factory(
+        "unity_catalog",
+        unity_catalog::UnityCatalogFactory::new_arc(),
+    )
+    .await;
 }
 
-pub trait DataConnectorFactory {
+pub trait DataConnectorFactory: Send + Sync {
     fn create(
+        &self,
         params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
+
+    /// The prefix to use for parameters and secrets for this `DataConnector`.
+    ///
+    /// Any parameter specified in `params` not prefixed with this value will be ignored.
+    ///
+    /// ## Example
+    ///
+    /// If the prefix is `pg` then the following parameters are accepted:
+    ///
+    /// - `pg_host` -> `host`
+    /// - `pg_port` -> `port`
+    ///
+    /// The prefix will be stripped from the parameter name before being passed to the data connector.
+    fn prefix(&self) -> &'static str;
+
+    /// Specify which secrets the runtime should attempt to autoload from the configured secret stores.
+    ///
+    /// Will automatically be prefixed by `prefix`.
+    fn autoload_secrets(&self) -> &'static [&'static str];
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -626,6 +665,37 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 }
 
+/// Filters out keys in a hashmap that do not start with the specified prefix, and removes the prefix from the keys that remain.
+///
+/// It also logs a warning for each key that is filtered out.
+///
+/// # Panics
+///
+/// Panics if `prefix` ends with an underscore.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn remove_prefix_from_hashmap_keys<V>(
+    hashmap: HashMap<String, V>,
+    prefix: &str,
+) -> HashMap<String, V> {
+    assert!(
+        !prefix.ends_with('_'),
+        "Prefix must not end with an underscore"
+    );
+    let prefix = format!("{prefix}_");
+    hashmap
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if key.starts_with(&prefix) {
+                Some((key[prefix.len()..].to_string(), value))
+            } else {
+                tracing::warn!("Ignoring parameter {key}: does not start with `{prefix}`");
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -644,12 +714,21 @@ mod tests {
 
     impl DataConnectorFactory for TestConnector {
         fn create(
+            &self,
             params: HashMap<String, SecretString>,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };
                 Ok(Arc::new(connector) as Arc<dyn DataConnector>)
             })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "test"
+        }
+
+        fn autoload_secrets(&self) -> &'static [&'static str] {
+            &[]
         }
     }
 
@@ -748,5 +827,60 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
+    }
+
+    #[test]
+    fn test_remove_prefix() {
+        let mut hashmap = HashMap::new();
+        hashmap.insert("prefix_key1".to_string(), "value1".to_string());
+        hashmap.insert("prefix_key2".to_string(), "value2".to_string());
+        hashmap.insert("key3".to_string(), "value3".to_string());
+
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
+
+        let mut expected = HashMap::new();
+        expected.insert("key1".to_string(), "value1".to_string());
+        expected.insert("key2".to_string(), "value2".to_string());
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_no_prefix() {
+        let mut hashmap = HashMap::new();
+        hashmap.insert("key1".to_string(), "value1".to_string());
+        hashmap.insert("key2".to_string(), "value2".to_string());
+
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
+
+        let expected = HashMap::new();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_empty_hashmap() {
+        let hashmap: HashMap<String, String> = HashMap::new();
+
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
+
+        let expected: HashMap<String, String> = HashMap::new();
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_full_prefix() {
+        let mut hashmap = HashMap::new();
+        hashmap.insert("prefix_".to_string(), "value1".to_string());
+        hashmap.insert("prefix_key2".to_string(), "value2".to_string());
+
+        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
+
+        let mut expected = HashMap::new();
+        expected.insert(String::new(), "value1".to_string());
+        expected.insert("key2".to_string(), "value2".to_string());
+
+        assert_eq!(result, expected);
     }
 }
