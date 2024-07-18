@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SqliteDialect};
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion::sql::unparser::dialect::{
+    DefaultDialect, Dialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
+};
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
 use secrecy::ExposeSecret;
@@ -56,6 +57,14 @@ where
     odbc_factory: ODBCTableFactory<'a>,
 }
 
+pub struct SQLDialectParam(String);
+impl SQLDialectParam {
+    #[must_use]
+    pub fn new(val: &str) -> Self {
+        Self(val.to_string())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ODBCDriver {
     MySql,
@@ -86,7 +95,23 @@ impl From<ODBCDriver> for Option<Arc<dyn Dialect + Send + Sync>> {
             ODBCDriver::MySql => Some(Arc::new(MySqlDialect {})),
             ODBCDriver::PostgreSql => Some(Arc::new(PostgreSqlDialect {})),
             ODBCDriver::Sqlite => Some(Arc::new(SqliteDialect {})),
-            ODBCDriver::Unknown => None,
+            ODBCDriver::Unknown => Some(Arc::new(DefaultDialect {})),
+        }
+    }
+}
+
+impl TryFrom<SQLDialectParam> for Option<Arc<dyn Dialect + Send + Sync>> {
+    type Error = Error;
+
+    fn try_from(val: SQLDialectParam) -> Result<Self> {
+        match val.0.as_str() {
+            "mysql" => Ok(Some(Arc::new(MySqlDialect {}))),
+            "postgresql" => Ok(Some(Arc::new(PostgreSqlDialect {}))),
+            "sqlite" => Ok(Some(Arc::new(SqliteDialect {}))),
+            _ => Err(Error::InvalidParameter {
+                param: "sql_dialect".to_string(),
+                msg: "Only 'mysql', 'postgresql', and 'sqlite' are supported".to_string(),
+            }),
         }
     }
 }
@@ -110,16 +135,8 @@ where
 
         Box::pin(async move {
             let dialect = if let Some(sql_dialect) = params.get("sql_dialect") {
-                let driver: ODBCDriver = ODBCDriver::from(sql_dialect.expose_secret().as_str());
-                if driver == ODBCDriver::Unknown {
-                    Err(Error::InvalidParameter {
-                        param: "sql_dialect".to_string(),
-                        msg: "Only 'mysql', 'postgresql', and 'sqlite' are supported".to_string(),
-                    }
-                    .into())
-                } else {
-                    Ok::<_, GenericError>(driver.into())
-                }
+                let sql_dialect = SQLDialectParam::new(sql_dialect.expose_secret().as_str());
+                sql_dialect.try_into()
             } else {
                 let driver = params
                     .get("odbc_connection_string")
