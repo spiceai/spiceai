@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
-use crate::secrets::ExposeSecret;
+use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -24,7 +24,6 @@ use datafusion::{
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::util::secrets::to_secret_map;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -32,7 +31,7 @@ use lazy_static::lazy_static;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use self::arrow::ArrowAccelerator;
 
@@ -247,6 +246,7 @@ pub async fn create_accelerator_table(
     schema: SchemaRef,
     constraints: Option<&Constraints>,
     acceleration_settings: &acceleration::Acceleration,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
@@ -264,13 +264,20 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
-    let secret_map: HashMap<String, SecretString> =
-        to_secret_map(acceleration_settings.params.clone());
-    // TODO: inject secrets into acceleration settings
+    let secret_guard = secrets.read().await;
+    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+    // Inject secrets from the user-supplied params.
+    // This will replace any instances of `${{ store:key }}` with the actual secret value.
+    for (k, v) in &acceleration_settings.params {
+        let secret = secret_guard.inject_secrets(ParamStr(v)).await;
+        params_with_secrets.insert(k.clone(), secret);
+    }
+
     let mut external_table_builder =
         AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
-            .options(secret_map)
+            .options(params_with_secrets)
             .indexes(acceleration_settings.indexes.clone());
 
     // If there are constraints from the federated table, then add them to the accelerated table

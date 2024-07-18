@@ -947,7 +947,7 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), read_table)
+            .create_accelerated_table(ds, Arc::clone(&connector), read_table, self.secrets())
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -1057,6 +1057,7 @@ impl Runtime {
                     source: connector,
                     federated_read_table,
                     accelerated_table,
+                    secrets: self.secrets(),
                 },
             )
             .await
