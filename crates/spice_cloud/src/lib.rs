@@ -339,13 +339,14 @@ pub async fn create_synced_internal_accelerated_table(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
-        get_spiceai_table_provider(table_reference.table(), from, secrets).await?;
+        get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets)).await?;
 
     let accelerated_table_provider = create_accelerator_table(
         table_reference.clone(),
         source_table_provider.schema(),
         None,
         &acceleration,
+        secrets,
     )
     .await
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;
