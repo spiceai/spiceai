@@ -128,7 +128,7 @@ pub trait BenchAppBuilder {
 
     fn make_rw_dataset(&self, path: &str, name: &str, dataconnector: DataConnector) -> Dataset {
         let mut ds = Dataset::new(
-            format!("spiceai:{}.{}", path, dataconnector),
+            format!("spiceai:{}_{}", path, dataconnector),
             name.to_string(),
         );
         ds.mode = Mode::ReadWrite;
