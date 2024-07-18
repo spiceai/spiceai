@@ -111,7 +111,7 @@ impl SpiceExtension {
         let secret = runtime.secrets();
         let secret = secret.read().await;
         let api_key = secret
-            .get_secret("SPICE_API_KEY")
+            .get_secret("spiceai_api_key")
             .await
             .context(UnableToGetSpiceSecretSnafu)?
             .ok_or(Error::SpiceApiKeyNotFound {})?;

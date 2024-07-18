@@ -210,8 +210,8 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
 fn make_graphql_dataset(path: &str, name: &str, query: &str, json_path: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
     let params = HashMap::from([
-        ("json_path".to_string(), json_path.to_string()),
-        ("query".to_string(), query.to_string()),
+        ("graphql_json_path".to_string(), json_path.to_string()),
+        ("graphql_query".to_string(), query.to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
