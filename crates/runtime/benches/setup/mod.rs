@@ -23,16 +23,17 @@ pub(crate) async fn setup_benchmark(
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app =
-        match dataconnector {
-            DataConnector::Postgres => PostgresBenchAppBuilder::new(upload_results_dataset)
-                .build_app(upload_results_dataset),
-            DataConnector::SpiceAI => SpiceAIBenchAppBuilder::new(upload_results_dataset)
-                .build_app(upload_results_dataset),
-            _ => {
-                unimplemented!()
-            }
-        };
+    let app = match dataconnector {
+        DataConnector::Postgres => {
+            PostgresBenchAppBuilder::build_app(&PostgresBenchAppBuilder {}, upload_results_dataset)
+        }
+        DataConnector::SpiceAI => {
+            SpiceAIBenchAppBuilder::build_app(&SpiceAIBenchAppBuilder {}, upload_results_dataset)
+        }
+        _ => {
+            unimplemented!()
+        }
+    };
 
     let rt = Runtime::builder().with_app(app).build().await;
 
@@ -117,7 +118,7 @@ fn get_branch_name() -> String {
 }
 
 trait BenchAppBuilder {
-    fn build_app(&self, upload_results_dataset: Option<&str>) -> App {
+    fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
         let mut app_builder = AppBuilder::new("runtime_benchmark_test")
             .with_secret_store(SpiceSecretStore::File)
             .with_dataset(self.make_dataset("tpch.customer", "customer"))
@@ -133,8 +134,12 @@ trait BenchAppBuilder {
             app_builder = app_builder
                 .with_dataset(self.make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
         }
+
+        app_builder.build()
     }
+
     fn make_dataset(&self, path: &str, name: &str) -> Dataset;
+
     fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset;
 }
 
@@ -165,15 +170,15 @@ impl PostgresBenchAppBuilder {
 impl BenchAppBuilder for PostgresBenchAppBuilder {
     fn make_dataset(&self, path: &str, name: &str) -> Dataset {
         let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
-        ddataset.params = Self::get_postgres_params();
+        dataset.params = Self::get_postgres_params();
         dataset
     }
 
     fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset {
-        let mut ds = Dataset::new(format!("postgres:{path}"), name.to_string());
-        ds.mode = Mode::ReadWrite;
+        let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
+        dataset.mode = Mode::ReadWrite;
         dataset.params = Self::get_postgres_params();
-        ds.replication = Some(Replication { enabled: true });
-        ds
+        dataset.replication = Some(Replication { enabled: true });
+        dataset
     }
 }
