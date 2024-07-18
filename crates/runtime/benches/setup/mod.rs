@@ -1,6 +1,5 @@
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
-use clap::builder::Str;
 use runtime::{dataconnector, dataupdate::DataUpdate, Runtime};
 use spicepod::component::{
     dataset::{replication::Replication, Dataset, Mode},
