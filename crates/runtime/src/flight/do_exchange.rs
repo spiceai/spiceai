@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
-use datafusion::sql::TableReference;
+use data_components::cdc::changes_schema;
+use datafusion::{catalog::schema, sql::TableReference};
 use futures::{stream, StreamExt};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, Streaming};
@@ -97,6 +98,8 @@ pub(crate) async fn handle(
                     for batch in &data_update.data {
                         if !schema_sent {
                             let schema = batch.schema();
+                            let schema = changes_schema(schema.as_ref());
+
                             flights
                                 .push(FlightData::from(SchemaAsIpc::new(&schema, &write_options)));
                             schema_sent = true;
