@@ -326,6 +326,90 @@ pub async fn register_all() {
     .await;
 }
 
+pub struct Parameter {
+    pub name: &'static str,
+    pub required: bool,
+    pub secret: bool,
+    pub description: &'static str,
+    pub help_link: &'static str,
+    pub examples: &'static [&'static str],
+    pub r#type: ParameterType,
+}
+
+impl Parameter {
+    pub const fn connector(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            secret: false,
+            description: "",
+            help_link: "",
+            examples: &[],
+            r#type: ParameterType::Connector,
+        }
+    }
+
+    pub const fn runtime(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            secret: false,
+            description: "",
+            help_link: "",
+            examples: &[],
+            r#type: ParameterType::Runtime,
+        }
+    }
+
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    pub const fn secret(mut self) -> Self {
+        self.secret = true;
+        self
+    }
+
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    pub const fn help_link(mut self, help_link: &'static str) -> Self {
+        self.help_link = help_link;
+        self
+    }
+
+    pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
+        self.examples = examples;
+        self
+    }
+}
+
+#[derive(Default)]
+pub enum ParameterType {
+    /// A parameter which tells Spice how to connect to the underlying data source.
+    ///
+    /// These parameters are automatically prefixed with the data connector's prefix.
+    ///
+    /// # Examples
+    ///
+    /// In Postgres, the `host` is a Connector parameter and would be auto-prefixed with `pg_`.
+    #[default]
+    Connector,
+    /// Other parameters which control how the runtime interacts with the data source, but does
+    /// not affect the actual connection.
+    ///
+    /// These parameters are not prefixed with the data connector's prefix.
+    ///
+    /// # Examples
+    ///
+    /// In Databricks, the `mode` parameter is used to select which connection to use, and thus is
+    /// not a Connector parameter.
+    Runtime,
+}
+
 pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
@@ -334,7 +418,7 @@ pub trait DataConnectorFactory: Send + Sync {
 
     /// The prefix to use for parameters and secrets for this `DataConnector`.
     ///
-    /// Any parameter specified in `params` not prefixed with this value will be ignored.
+    /// This prefix is applied to any `ParameterType::Connector` parameters.
     ///
     /// ## Example
     ///
@@ -346,10 +430,10 @@ pub trait DataConnectorFactory: Send + Sync {
     /// The prefix will be stripped from the parameter name before being passed to the data connector.
     fn prefix(&self) -> &'static str;
 
-    /// Specify which secrets the runtime should attempt to autoload from the configured secret stores.
+    /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
     ///
-    /// Will automatically be prefixed by `prefix`.
-    fn autoload_secrets(&self) -> &'static [&'static str];
+    /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
+    fn parameters(&self) -> &'static [Parameter];
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
