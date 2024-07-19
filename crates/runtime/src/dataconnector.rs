@@ -258,82 +258,18 @@ pub async fn create_new_connector(
         return None;
     };
 
-    let full_prefix = format!("{}_", factory.prefix());
-
-    // Convert the user-provided parameters into the format expected by the data connector
-    let mut params: Vec<(String, SecretString)> = params
-        .into_iter()
-        .filter_map(|(key, value)| {
-            let mut unprefixed_key = key.as_str();
-            let mut has_prefix = false;
-            if key.starts_with(&full_prefix) {
-                has_prefix = true;
-                unprefixed_key = &key[full_prefix.len()..];
-            }
-
-            let spec = factory
-                .parameters()
-                .iter()
-                .find(|p| p.name == unprefixed_key);
-
-            let Some(spec) = spec else {
-                tracing::warn!("Ignoring parameter {key}: not supported for {name}.");
-                return None;
-            };
-
-            if !has_prefix && spec.r#type.is_prefixed() {
-                tracing::warn!(
-                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {name}."
-                );
-                return None;
-            }
-
-            Some((key[full_prefix.len()..].to_string(), value))
-        })
-        .collect();
-    let secret_guard = secrets.read().await;
-
-    // Try to autoload secrets that might be missing from params.
-    for secret_key in factory
-        .parameters()
-        .iter()
-        .filter_map(|p| if p.secret { Some(p) } else { None })
+    let params = match Parameters::try_new(
+        name,
+        params.into_iter().collect(),
+        factory.prefix(),
+        secrets,
+        factory.parameters(),
+    )
+    .await
     {
-        let secret_key_with_prefix = format!("{}_{}", factory.prefix(), secret_key.name);
-        tracing::debug!("Attempting to autoload secret for {name}: {secret_key_with_prefix}",);
-        if params.iter().any(|p| p.0 == secret_key.name) {
-            continue;
-        }
-        let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
-        if let Ok(Some(secret)) = secret {
-            tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
-            // Insert without the prefix into the params
-            params.push((secret_key.name.to_string(), secret));
-        }
-    }
-
-    // Check if all required parameters are present
-    for parameter in factory.parameters() {
-        // If the parameter is missing and has a default value, add it to the params
-        let missing = !params.iter().any(|p| p.0 == parameter.name);
-        if missing {
-            if let Some(default_value) = parameter.default {
-                params.push((parameter.name.to_string(), default_value.to_string().into()));
-                continue;
-            }
-        }
-
-        if parameter.required && missing {
-            return Some(Err(Box::new(
-                DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: name.to_string(),
-                    message: format!("Missing required parameter: {}", parameter.name),
-                },
-            )));
-        }
-    }
-
-    let params = Parameters::new(params, factory.prefix(), factory.parameters());
+        Ok(params) => params,
+        Err(e) => return Some(Err(e)),
+    };
 
     let result = factory.create(params).await;
     Some(result)
@@ -448,6 +384,89 @@ impl<'a> ExposedParamLookup<'a> {
 }
 
 impl Parameters {
+    pub async fn try_new(
+        connector_name: &str,
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        secrets: Arc<RwLock<Secrets>>,
+        all_params: &'static [ParameterSpec],
+    ) -> AnyErrorResult<Self> {
+        let full_prefix = format!("{prefix}_");
+
+        // Convert the user-provided parameters into the format expected by the data connector
+        let mut params: Vec<(String, SecretString)> = params
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let mut unprefixed_key = key.as_str();
+                let mut has_prefix = false;
+                if key.starts_with(&full_prefix) {
+                    has_prefix = true;
+                    unprefixed_key = &key[full_prefix.len()..];
+                }
+
+                let spec = all_params.iter().find(|p| p.name == unprefixed_key);
+
+                let Some(spec) = spec else {
+                    tracing::warn!("Ignoring parameter {key}: not supported for {connector_name}.");
+                    return None;
+                };
+
+                if !has_prefix && spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {connector_name}."
+                );
+                    return None;
+                }
+
+                Some((key[full_prefix.len()..].to_string(), value))
+            })
+            .collect();
+        let secret_guard = secrets.read().await;
+
+        // Try to autoload secrets that might be missing from params.
+        for secret_key in all_params
+            .iter()
+            .filter_map(|p| if p.secret { Some(p) } else { None })
+        {
+            let secret_key_with_prefix = format!("{prefix}_{}", secret_key.name);
+            tracing::debug!(
+                "Attempting to autoload secret for {connector_name}: {secret_key_with_prefix}",
+            );
+            if params.iter().any(|p| p.0 == secret_key.name) {
+                continue;
+            }
+            let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+            if let Ok(Some(secret)) = secret {
+                tracing::debug!(
+                    "Autoloading secret for {connector_name}: {secret_key_with_prefix}",
+                );
+                // Insert without the prefix into the params
+                params.push((secret_key.name.to_string(), secret));
+            }
+        }
+
+        // Check if all required parameters are present
+        for parameter in all_params {
+            // If the parameter is missing and has a default value, add it to the params
+            let missing = !params.iter().any(|p| p.0 == parameter.name);
+            if missing {
+                if let Some(default_value) = parameter.default {
+                    params.push((parameter.name.to_string(), default_value.to_string().into()));
+                    continue;
+                }
+            }
+
+            if parameter.required && missing {
+                return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: connector_name.to_string(),
+                    message: format!("Missing required parameter: {}", parameter.name),
+                }));
+            }
+        }
+
+        Ok(Parameters::new(params, prefix, all_params))
+    }
+
     pub fn new(
         params: Vec<(String, SecretString)>,
         prefix: &'static str,
