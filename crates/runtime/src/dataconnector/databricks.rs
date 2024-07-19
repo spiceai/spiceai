@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -70,14 +70,10 @@ pub struct Databricks {
 }
 
 impl Databricks {
-    pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
-        let mode = params
-            .get("mode")
-            .map(ExposeSecret::expose_secret)
-            .cloned()
-            .unwrap_or_default();
+    pub async fn new(params: Parameters) -> Result<Self> {
+        let mode = params.get("mode").expose().ok().unwrap_or_default();
 
-        if mode.as_str() == "delta_lake" {
+        if mode == "delta_lake" {
             let databricks_delta = DatabricksDelta::new(params.clone());
             Ok(Self {
                 read_provider: Arc::new(databricks_delta.clone()),
@@ -143,10 +139,21 @@ impl DatabricksFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("token")
+        .secret()
+        .description("The personal access token used to authenticate against the DataBricks API."),
+    ParameterSpec::runtime("mode")
+        .description("The execution mode for querying against Databricks.")
+        .default("spark_connect"),
+    ParameterSpec::connector("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
+    ParameterSpec::connector("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
+];
+
 impl DataConnectorFactory for DatabricksFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let databricks = Databricks::new(params).await?;
@@ -158,8 +165,8 @@ impl DataConnectorFactory for DatabricksFactory {
         "databricks"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["token", "pass"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &PARAMETERS
     }
 }
 

@@ -14,22 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    str::{FromStr, ParseBoolError},
-    sync::Arc,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
 };
-use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use secrecy::{ExposeSecret, Secret, SecretString};
-use snafu::{ResultExt, Snafu};
-use url::Url;
+use snafu::Snafu;
 
 use crate::dbconnection::clickhouseconn::ClickhouseConnection;
 
@@ -42,21 +34,10 @@ pub enum Error {
         source: clickhouse_rs::errors::ConnectionError,
     },
 
-    #[snafu(display("InvalidConnectionStringError: {source}"))]
-    InvalidConnectionStringError {
-        source: clickhouse_rs::errors::Error,
-    },
-
     #[snafu(display("ConnectionTlsError: {source}"))]
     ConnectionTlsError {
         source: clickhouse_rs::errors::ConnectionError,
     },
-
-    #[snafu(display("Unable to parse the connection string as a URL: {source}"))]
-    UnableToParseConnectionString { source: url::ParseError },
-
-    #[snafu(display("Unable to sanitize the connection string"))]
-    UnableToSanitizeConnectionString,
 
     #[snafu(display("ConnectionPoolRunError: {source}"))]
     ConnectionPoolRunError {
@@ -69,25 +50,6 @@ pub enum Error {
     InvalidUsernameOrPasswordError {
         source: clickhouse_rs::errors::Error,
     },
-
-    #[snafu(display("Cannot connect to ClickHouse on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
-    InvalidHostOrPortError {
-        source: Box<dyn std::error::Error + Sync + Send>,
-        host: String,
-        port: String,
-    },
-
-    #[snafu(display("Missing required parameter: {parameter_name}"))]
-    MissingRequiredParameterForConnection { parameter_name: String },
-
-    #[snafu(display("Invalid secure parameter value {parameter_name}"))]
-    InvalidSecureParameterValueError {
-        parameter_name: String,
-        source: ParseBoolError,
-    },
-
-    #[snafu(display("Invalid clickhouse_connection_timeout value: {source}"))]
-    InvalidConnectionTimeoutValue { source: std::num::ParseIntError },
 }
 
 pub struct ClickhouseConnectionPool {
@@ -97,19 +59,14 @@ pub struct ClickhouseConnectionPool {
 
 impl ClickhouseConnectionPool {
     // Creates a new instance of `ClickhouseConnectionPool`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
-        let (options, compute_context) = get_config_from_params(&params).await?;
-
+    #[must_use]
+    pub fn new(options: Options, compute_context: String) -> Self {
         let pool = Pool::new(options);
 
-        Ok(Self {
+        Self {
             pool: Arc::new(pool),
             join_push_down: JoinPushDown::AllowedFor(compute_context),
-        })
+        }
     }
 }
 

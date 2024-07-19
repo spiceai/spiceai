@@ -261,7 +261,7 @@ pub async fn create_new_connector(
     let full_prefix = format!("{}_", factory.prefix());
 
     // Convert the user-provided parameters into the format expected by the data connector
-    let mut params: HashMap<String, ParameterValue> = params
+    let mut params: Vec<(String, SecretString)> = params
         .into_iter()
         .filter_map(|(key, value)| {
             let mut unprefixed_key = key.as_str();
@@ -288,10 +288,7 @@ pub async fn create_new_connector(
                 return None;
             }
 
-            Some((
-                key[full_prefix.len()..].to_string(),
-                ParameterValue::new(value, spec, factory.prefix()),
-            ))
+            Some((key[full_prefix.len()..].to_string(), value))
         })
         .collect();
     let secret_guard = secrets.read().await;
@@ -304,23 +301,29 @@ pub async fn create_new_connector(
     {
         let secret_key_with_prefix = format!("{}_{}", factory.prefix(), secret_key.name);
         tracing::debug!("Attempting to autoload secret for {name}: {secret_key_with_prefix}",);
-        if params.contains_key(secret_key.name) {
+        if params.iter().any(|p| p.0 == secret_key.name) {
             continue;
         }
         let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
         if let Ok(Some(secret)) = secret {
             tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
             // Insert without the prefix into the params
-            params.insert(
-                secret_key.name.to_string(),
-                ParameterValue::new(secret, secret_key, factory.prefix()),
-            );
+            params.push((secret_key.name.to_string(), secret));
         }
     }
 
     // Check if all required parameters are present
     for parameter in factory.parameters() {
-        if parameter.required && !params.contains_key(parameter.name) {
+        // If the parameter is missing and has a default value, add it to the params
+        let missing = !params.iter().any(|p| p.0 == parameter.name);
+        if missing {
+            if let Some(default_value) = parameter.default {
+                params.push((parameter.name.to_string(), default_value.to_string().into()));
+                continue;
+            }
+        }
+
+        if parameter.required && missing {
             return Some(Err(Box::new(
                 DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: name.to_string(),
@@ -381,14 +384,72 @@ pub async fn register_all() {
 }
 
 pub struct Parameters {
-    params: HashMap<String, ParameterValue>,
+    params: Vec<(String, SecretString)>,
     prefix: &'static str,
     all_params: &'static [ParameterSpec],
 }
 
+#[derive(Debug, Clone)]
+pub struct UserParam(String);
+
+impl Display for UserParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub enum ParamLookup<'a> {
+    Present(&'a SecretString),
+    Absent(UserParam),
+}
+
+impl<'a> ParamLookup<'a> {
+    pub fn ok(&self) -> Option<&'a SecretString> {
+        match self {
+            ParamLookup::Present(s) => Some(*s),
+            ParamLookup::Absent(_) => None,
+        }
+    }
+
+    pub fn expose(self) -> ExposedParamLookup<'a> {
+        match self {
+            ParamLookup::Present(s) => ExposedParamLookup::Present(s.expose_secret()),
+            ParamLookup::Absent(s) => ExposedParamLookup::Absent(s),
+        }
+    }
+
+    pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a SecretString, E> {
+        match self {
+            ParamLookup::Present(s) => Ok(s),
+            ParamLookup::Absent(s) => Err(f(s)),
+        }
+    }
+}
+
+pub enum ExposedParamLookup<'a> {
+    Present(&'a str),
+    Absent(UserParam),
+}
+
+impl<'a> ExposedParamLookup<'a> {
+    pub fn ok(self) -> Option<&'a str> {
+        match self {
+            ExposedParamLookup::Present(s) => Some(s),
+            ExposedParamLookup::Absent(_) => None,
+        }
+    }
+
+    pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a str, E> {
+        match self {
+            ExposedParamLookup::Present(s) => Ok(s),
+            ExposedParamLookup::Absent(s) => Err(f(s)),
+        }
+    }
+}
+
 impl Parameters {
     pub fn new(
-        params: HashMap<String, ParameterValue>,
+        params: Vec<(String, SecretString)>,
         prefix: &'static str,
         all_params: &'static [ParameterSpec],
     ) -> Self {
@@ -400,54 +461,29 @@ impl Parameters {
     }
 
     pub fn to_secret_map(&self) -> HashMap<String, SecretString> {
-        self.params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.value.clone()))
-            .collect()
+        self.params.iter().cloned().collect()
     }
 
-    /// Returns the `ParameterValue` for the given name, or the `ParameterSpec` corresponding to the absent parameter if not found.
+    /// Returns the `SecretString` for the given parameter, or the user-facing parameter name of the missing parameter.
     ///
     /// # Panics
     ///
     /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
-    pub fn get(&self, name: &str) -> Result<&ParameterValue, &ParameterSpec> {
+    pub fn get<'a>(&'a self, name: &str) -> ParamLookup<'a> {
         let spec = if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
             spec
         } else {
             panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory.");
         };
 
-        if let Some(param_value) = self.params.get(&prefixed_name) {
-            Ok(param_value)
+        if let Some(param_value) = self.params.iter().find(|p| p.0 == name) {
+            ParamLookup::Present(&param_value.1)
         } else {
-            Err(spec)
-        }
-    }
-}
-
-pub struct ParameterValue {
-    pub value: SecretString,
-    pub spec: &'static ParameterSpec,
-    pub prefix: &'static str,
-}
-
-impl ParameterValue {
-    pub fn new(value: SecretString, spec: &'static ParameterSpec, prefix: &'static str) -> Self {
-        Self {
-            value,
-            spec,
-            prefix,
-        }
-    }
-}
-
-impl Display for ParameterValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.prefix.is_empty() {
-            write!(f, "{}", self.spec.name)
-        } else {
-            write!(f, "{}_{}", self.prefix, self.spec.name)
+            ParamLookup::Absent(if self.prefix.is_empty() {
+                UserParam(spec.name.to_string())
+            } else {
+                UserParam(format!("{}_{}", self.prefix, spec.name))
+            })
         }
     }
 }
@@ -455,6 +491,7 @@ impl Display for ParameterValue {
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,
+    pub default: Option<&'static str>,
     pub secret: bool,
     pub description: &'static str,
     pub help_link: &'static str,
@@ -467,6 +504,7 @@ impl ParameterSpec {
         Self {
             name,
             required: false,
+            default: None,
             secret: false,
             description: "",
             help_link: "",
@@ -479,6 +517,7 @@ impl ParameterSpec {
         Self {
             name,
             required: false,
+            default: None,
             secret: false,
             description: "",
             help_link: "",
@@ -489,6 +528,11 @@ impl ParameterSpec {
 
     pub const fn required(mut self) -> Self {
         self.required = true;
+        self
+    }
+
+    pub const fn default(mut self, default: &'static str) -> Self {
+        self.default = Some(default);
         self
     }
 
