@@ -20,10 +20,12 @@ use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::Retention;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
+use crate::secrets::Secrets;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},
@@ -85,13 +87,19 @@ pub async fn create_internal_accelerated_table(
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider = get_local_table_provider(name.clone(), &schema).await?;
 
-    let accelerated_table_provider =
-        create_accelerator_table(name.clone(), Arc::clone(&schema), None, &acceleration, None)
-            .await
-            .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let accelerated_table_provider = create_accelerator_table(
+        name.clone(),
+        Arc::clone(&schema),
+        None,
+        &acceleration,
+        secrets,
+    )
+    .await
+    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
         name.clone(),

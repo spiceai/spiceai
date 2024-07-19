@@ -101,7 +101,7 @@ impl ClickhouseConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: Arc<HashMap<String, SecretString>>) -> Result<Self> {
+    pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let (options, compute_context) = get_config_from_params(&params).await?;
 
         let pool = Pool::new(options);
@@ -121,32 +121,29 @@ async fn get_config_from_params(
     params: &HashMap<String, SecretString>,
 ) -> Result<(Options, String)> {
     let connection_string =
-        if let Some(clickhouse_connection_string) = params.get("clickhouse_connection_string") {
+        if let Some(clickhouse_connection_string) = params.get("connection_string") {
             clickhouse_connection_string.expose_secret().to_string()
         } else {
-            let user = params
-                .get("clickhouse_user")
-                .map(Secret::expose_secret)
-                .ok_or(Error::MissingRequiredParameterForConnection {
+            let user = params.get("user").map(Secret::expose_secret).ok_or(
+                Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_user".to_string(),
-                })?;
+                },
+            )?;
             let password = params
-                .get("clickhouse_pass")
+                .get("pass")
                 .map(Secret::expose_secret)
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            let host = params
-                .get("clickhouse_host")
-                .map(Secret::expose_secret)
-                .ok_or(Error::MissingRequiredParameterForConnection {
+            let host = params.get("host").map(Secret::expose_secret).ok_or(
+                Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_tcp_host".to_string(),
-                })?;
-            let port = params
-                .get("clickhouse_tcp_port")
-                .map(Secret::expose_secret)
-                .ok_or(Error::MissingRequiredParameterForConnection {
+                },
+            )?;
+            let port = params.get("tcp_port").map(Secret::expose_secret).ok_or(
+                Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_port".to_string(),
-                })?;
+                },
+            )?;
 
             let port_in_usize = u16::from_str(port)
                 .map_err(std::convert::Into::into)
@@ -155,12 +152,11 @@ async fn get_config_from_params(
                 .await
                 .map_err(std::convert::Into::into)
                 .context(InvalidHostOrPortSnafu { host, port })?;
-            let db = params
-                .get("clickhouse_db")
-                .map(Secret::expose_secret)
-                .ok_or(Error::MissingRequiredParameterForConnection {
+            let db = params.get("db").map(Secret::expose_secret).ok_or(
+                Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_db".to_string(),
-                })?;
+                },
+            )?;
 
             format!("tcp://{user}:{password}@{host}:{port}/{db}")
         };
@@ -178,10 +174,7 @@ async fn get_config_from_params(
         options = options.connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
     }
 
-    if let Some(connection_timeout) = params
-        .get("clickhouse_connection_timeout")
-        .map(Secret::expose_secret)
-    {
+    if let Some(connection_timeout) = params.get("connection_timeout").map(Secret::expose_secret) {
         let connection_timeout = connection_timeout
             .parse::<u64>()
             .context(InvalidConnectionTimeoutValueSnafu)?;
@@ -189,7 +182,7 @@ async fn get_config_from_params(
     }
 
     let secure = params
-        .get("clickhouse_secure")
+        .get("secure")
         .map(Secret::expose_secret)
         .map(|s| s.parse::<bool>())
         .transpose()

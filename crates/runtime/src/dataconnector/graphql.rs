@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{get_secret_or_param, Secret};
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_trait::async_trait;
@@ -33,6 +32,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT},
     RequestBuilder, StatusCode,
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Map, Value};
 use snafu::{ResultExt, Snafu};
 use std::{any::Any, collections::HashMap, future::Future, io::Cursor, pin::Pin, sync::Arc};
@@ -538,32 +538,67 @@ impl TableProvider for GraphQLTableProvider {
 }
 
 pub struct GraphQL {
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
 }
 
-impl DataConnectorFactory for GraphQL {
+#[derive(Default, Copy, Clone)]
+pub struct GraphQLFactory {}
+
+impl GraphQLFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for GraphQLFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let graphql = Self { secret, params };
+            let graphql = GraphQL { params };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "graphql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token", "user", "pass"]
     }
 }
 
 impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
         let mut client_builder = reqwest::Client::builder();
-        let token = get_secret_or_param(&self.params, &self.secret, "auth_token_key", "auth_token");
-        let user = get_secret_or_param(&self.params, &self.secret, "auth_user_key", "auth_user");
-        let pass = get_secret_or_param(&self.params, &self.secret, "auth_pass_key", "auth_pass");
+        let token = self
+            .params
+            .get("token")
+            .map(ExposeSecret::expose_secret)
+            .cloned();
+        let user = self
+            .params
+            .get("user")
+            .map(ExposeSecret::expose_secret)
+            .cloned();
+        let pass = self
+            .params
+            .get("pass")
+            .map(ExposeSecret::expose_secret)
+            .cloned();
 
         let query = self
             .params
             .get("query")
+            .map(ExposeSecret::expose_secret)
             .ok_or("`query` not found in params".into())
             .context(super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
@@ -579,10 +614,11 @@ impl GraphQL {
         let json_pointer = self
             .params
             .get("json_pointer")
-            .ok_or("`json_pointer` not found in params".into())
+            .map(ExposeSecret::expose_secret)
+            .ok_or("`graphql_json_pointer` not found in params".into())
             .context(super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
-                message: "`json_pointer` not found in params",
+                message: "`graphql_json_pointer` not found in params",
             })?
             .to_owned();
 
@@ -602,7 +638,11 @@ impl GraphQL {
 
         client_builder = client_builder.default_headers(headers);
 
-        let unnest_depth = if let Some(depth) = self.params.get("unnest_depth") {
+        let unnest_depth = if let Some(depth) = self
+            .params
+            .get("unnest_depth")
+            .map(ExposeSecret::expose_secret)
+        {
             depth.parse::<usize>()
         } else {
             Ok(0)
@@ -612,7 +652,7 @@ impl GraphQL {
             Ok(depth) => Ok(depth),
             Err(e) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: "GraphQL".to_string(),
-                message: "`unnest_depth` is not an integer".to_string(),
+                message: "`graphql_unnest_depth` is not an integer".to_string(),
                 source: e.into(),
             }),
         }?;

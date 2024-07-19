@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -47,33 +47,42 @@ where
     odbc_factory: ODBCTableFactory<'a>,
 }
 
-impl<'a> DataConnectorFactory for ODBC<'a>
-where
-    'a: 'static,
-{
-    fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
-        if let Some(secret) = secret {
-            secret.insert_to_params(
-                &mut params,
-                "odbc_connection_string_key",
-                "odbc_connection_string",
-            );
-        }
+#[derive(Default, Copy, Clone)]
+pub struct ODBCFactory {}
 
+impl ODBCFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for ODBCFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
-                ODBCPool::new(Arc::new(params.into_map()))
-                    .context(UnableToCreateODBCConnectionPoolSnafu)?,
-            );
+            let pool: Arc<ODBCDbConnectionPool> =
+                Arc::new(ODBCPool::new(params).context(UnableToCreateODBCConnectionPoolSnafu)?);
 
             let odbc_factory = ODBCTableFactory::new(pool);
 
-            Ok(Arc::new(Self { odbc_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(ODBC { odbc_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "odbc"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string"]
     }
 }
 

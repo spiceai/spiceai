@@ -20,10 +20,9 @@ use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use secrecy::SecretString;
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
-use crate::secrets::SecretMap;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -48,39 +47,26 @@ pub struct Snowflake {
     table_factory: SnowflakeTableFactory,
 }
 
-impl DataConnectorFactory for Snowflake {
-    fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
-        if let Some(secret) = secret {
-            secret.insert_to_params(&mut params, "username_key", "username");
-            secret.insert_to_params(&mut params, "account_key", "account");
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_warehouse_key",
-                "snowflake_warehouse",
-            );
-            secret.insert_to_params(&mut params, "snowflake_role_key", "snowflake_role");
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_auth_type_key",
-                "snowflake_auth_type",
-            );
-            secret.insert_to_params(&mut params, "password_key", "password");
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_private_key_path_key",
-                "snowflake_private_key_path",
-            );
-            secret.insert_to_params(
-                &mut params,
-                "snowflake_private_key_passphrase_key",
-                "snowflake_private_key_passphrase",
-            );
-        }
+#[derive(Default, Copy, Clone)]
+pub struct SnowflakeFactory {}
 
+impl SnowflakeFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SnowflakeFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
@@ -92,8 +78,25 @@ impl DataConnectorFactory for Snowflake {
 
             let table_factory = SnowflakeTableFactory::new(pool);
 
-            Ok(Arc::new(Self { table_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Snowflake { table_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "snowflake"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[
+            "username",
+            "account",
+            "warehouse",
+            "role",
+            "auth_type",
+            "password",
+            "private_key_path",
+            "private_key_passphrase",
+        ]
     }
 }
 

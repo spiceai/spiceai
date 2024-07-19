@@ -27,12 +27,12 @@ use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
-    pub params: Arc<HashMap<String, SecretString>>,
+    pub params: HashMap<String, SecretString>,
 }
 
 impl DatabricksDelta {
     #[must_use]
-    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Self {
+    pub fn new(params: HashMap<String, SecretString>) -> Self {
         Self { params }
     }
 }
@@ -44,18 +44,18 @@ impl Read for DatabricksDelta {
         table_reference: TableReference,
         _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        get_delta_table(table_reference, Arc::clone(&self.params)).await
+        get_delta_table(table_reference, &self.params).await
     }
 }
 
 async fn get_delta_table(
     table_reference: TableReference,
-    params: Arc<HashMap<String, SecretString>>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    let table_uri = resolve_table_uri(table_reference, Arc::clone(&params)).await?;
+    let table_uri = resolve_table_uri(table_reference, params).await?;
 
     let mut storage_options = HashMap::new();
-    for (key, value) in params.iter() {
+    for (key, value) in params {
         if key == "token" || key == "endpoint" {
             continue;
         }
@@ -70,9 +70,9 @@ async fn get_delta_table(
 #[allow(clippy::implicit_hasher)]
 pub async fn resolve_table_uri(
     table_reference: TableReference,
-    params: Arc<HashMap<String, SecretString>>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let uc_client = UnityCatalog::from_params(&params).boxed()?;
+    let uc_client = UnityCatalog::from_params(params).boxed()?;
 
     let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
