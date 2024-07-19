@@ -40,7 +40,7 @@ pub struct Config {
     #[arg(
         long = "open_telemetry",
         value_name = "OPEN_TELEMETRY_BIND_ADDRESS",
-        default_value = "127.0.0.1:50052",
+        default_value = "127.0.0.1:50091",
         action
     )]
     pub open_telemetry_bind_address: SocketAddr,
