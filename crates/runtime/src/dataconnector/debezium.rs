@@ -17,7 +17,6 @@ limitations under the License.
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::metadata::AcceleratedMetadata;
-use crate::secrets::Secret;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -26,6 +25,7 @@ use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Invalid value for debezium_message_format: Valid values: 'json'"))]
     InvalidMessageFormat,
 
-    #[snafu(display("Missing required parameter: kafka_bootstrap_servers"))]
+    #[snafu(display("Missing required parameter: debezium_kafka_bootstrap_servers"))]
     MissingKafkaBootstrapServers,
 }
 
@@ -54,14 +54,15 @@ pub struct Debezium {
 }
 
 impl Debezium {
-    pub fn new(params: &Arc<HashMap<String, String>>) -> Result<Self> {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         let transport = params
-            .get("debezium_transport")
-            .map_or("kafka", String::as_str);
+            .get("transport")
+            .map_or("kafka", |p| p.expose_secret().as_str());
 
         let message_format = params
-            .get("debezium_message_format")
-            .map_or("json", String::as_str);
+            .get("message_format")
+            .map_or("json", |p| p.expose_secret().as_str());
 
         if transport != "kafka" {
             return InvalidTransportSnafu.fail();
@@ -72,6 +73,7 @@ impl Debezium {
 
         let kakfa_brokers = params
             .get("kafka_bootstrap_servers")
+            .map(ExposeSecret::expose_secret)
             .context(MissingKafkaBootstrapServersSnafu)?;
 
         Ok(Self {
@@ -80,15 +82,38 @@ impl Debezium {
     }
 }
 
-impl DataConnectorFactory for Debezium {
+#[derive(Default, Copy, Clone)]
+pub struct DebeziumFactory {}
+
+impl DebeziumFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DebeziumFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let debezium = Debezium::new(&params)?;
+            let debezium = Debezium::new(params)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "debezium"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 

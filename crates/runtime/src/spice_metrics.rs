@@ -26,6 +26,7 @@ use chrono::Utc;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::spawn;
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
@@ -35,6 +36,7 @@ use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::DataUpdate;
 use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
+use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -95,6 +97,7 @@ impl MetricsRecorder {
             Acceleration::default(),
             Refresh::default(),
             retention,
+            Arc::new(RwLock::new(Secrets::default())),
         )
         .await
         .context(UnableToCreateMetricsTableSnafu)?;

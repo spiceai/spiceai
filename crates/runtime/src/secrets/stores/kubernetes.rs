@@ -19,9 +19,12 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine};
 use reqwest;
+use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 
-use super::{Secret, SecretStore};
+use crate::secrets::SecretStore;
+
+const SPICE_KEY_PREFIX: &str = "spice_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -158,19 +161,15 @@ impl KubernetesClient {
 }
 
 pub struct KubernetesSecretStore {
+    secret_name: String,
     kubernetes_client: KubernetesClient,
-}
-
-impl Default for KubernetesSecretStore {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl KubernetesSecretStore {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(secret_name: String) -> Self {
         Self {
+            secret_name,
             kubernetes_client: KubernetesClient::new(),
         }
     }
@@ -194,9 +193,16 @@ impl KubernetesSecretStore {
 #[async_trait]
 impl SecretStore for KubernetesSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
-        match self.kubernetes_client.get_secret(secret_name).await {
-            Ok(secret) => Ok(Some(Secret::new(secret.clone()))),
+    async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
+        // First try looking for `spice_my_key` and then `my_key`
+        let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
+        match self.kubernetes_client.get_secret(&self.secret_name).await {
+            Ok(secret) => {
+                if let Some(value) = secret.get(&prefixed_key) {
+                    return Ok(Some(SecretString::new(value.clone())));
+                }
+                Ok(secret.get(key).cloned().map(SecretString::new))
+            }
             Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
     }

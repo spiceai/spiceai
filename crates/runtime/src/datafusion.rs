@@ -29,7 +29,7 @@ use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
 use crate::object_store_registry::default_runtime_env;
-use crate::secrets::Secret;
+use crate::secrets::Secrets;
 use crate::{embeddings, get_dependent_table_names};
 
 use arrow::datatypes::Schema;
@@ -50,6 +50,7 @@ use query::{Protocol, QueryBuilder};
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::time::{sleep, Instant};
 
 pub mod query;
@@ -192,8 +193,8 @@ pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         federated_read_table: Arc<dyn TableProvider>,
-        acceleration_secret: Option<Secret>,
         accelerated_table: Option<AcceleratedTable>,
+        secrets: Arc<TokioRwLock<Secrets>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -360,8 +361,8 @@ impl DataFusion {
             Table::Accelerated {
                 source,
                 federated_read_table,
-                acceleration_secret,
                 accelerated_table,
+                secrets,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -374,13 +375,8 @@ impl DataFusion {
 
                     return Ok(());
                 }
-                self.register_accelerated_table(
-                    dataset,
-                    source,
-                    federated_read_table,
-                    acceleration_secret,
-                )
-                .await?;
+                self.register_accelerated_table(dataset, source, federated_read_table, secrets)
+                    .await?;
             }
             Table::Federated {
                 data_connector,
@@ -537,7 +533,7 @@ impl DataFusion {
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
         federated_read_table: Arc<dyn TableProvider>,
-        acceleration_secret: Option<Secret>,
+        secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
         tracing::debug!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.mode() {
@@ -569,7 +565,7 @@ impl DataFusion {
             Arc::clone(&source_schema),
             source_table_provider.constraints(),
             &acceleration_settings,
-            acceleration_secret,
+            secrets,
         )
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
@@ -641,15 +637,10 @@ impl DataFusion {
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
         federated_read_table: Arc<dyn TableProvider>,
-        acceleration_secret: Option<Secret>,
+        secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(
-                dataset,
-                Arc::clone(&source),
-                federated_read_table,
-                acceleration_secret,
-            )
+            .create_accelerated_table(dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
 
         self.ctx

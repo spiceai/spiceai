@@ -18,8 +18,9 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+use secrecy::SecretString;
 
-use super::{Secret, SecretStore};
+use crate::secrets::SecretStore;
 
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 
@@ -28,7 +29,7 @@ use aws_sdk_secretsmanager::{self};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-const SPICE_SECRET_PREFIX: &str = "spice_secret_";
+const SPICE_KEY_PREFIX: &str = "spice_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -51,19 +52,15 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Copy, Clone)]
-pub struct AwsSecretsManager {}
-
-impl Default for AwsSecretsManager {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Debug, Clone)]
+pub struct AwsSecretsManager {
+    secret_name: String,
 }
 
 impl AwsSecretsManager {
     #[must_use]
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(secret_name: String) -> Self {
+        Self { secret_name }
     }
 
     /// Initializes AWS configuration and verifies AWS credentials.
@@ -73,7 +70,7 @@ impl AwsSecretsManager {
     /// This function will return an error:
     /// - If the AWS configuration cannot be loaded.
     /// - If the call to STS `get_caller_identity` fails, which might be due to invalid or expired AWS credentials.
-    pub async fn init(self) -> Result<()> {
+    pub async fn init(&self) -> Result<()> {
         let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
             .load()
             .await;
@@ -93,10 +90,11 @@ impl AwsSecretsManager {
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
-        let secret_name = format!("{SPICE_SECRET_PREFIX}{secret_name}");
-
-        tracing::trace!("Getting secret {} from AWS Secrets Manager", secret_name);
+    async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
+        tracing::trace!(
+            "Getting secret {} from AWS Secrets Manager",
+            self.secret_name
+        );
 
         let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
             .load()
@@ -104,7 +102,12 @@ impl SecretStore for AwsSecretsManager {
 
         let asm = aws_sdk_secretsmanager::Client::new(&config);
 
-        let secret_value = match asm.get_secret_value().secret_id(&secret_name).send().await {
+        let secret_value = match asm
+            .get_secret_value()
+            .secret_id(&self.secret_name)
+            .send()
+            .await
+        {
             Ok(secret) => secret,
             Err(SdkError::ServiceError(e)) => {
                 // It is expected that not all parameters are present in secrets.
@@ -121,14 +124,19 @@ impl SecretStore for AwsSecretsManager {
             }
         };
 
+        let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
         if let Some(secret_str) = secret_value.secret_string() {
             let data = parse_json_to_hashmap(secret_str)?;
-            return Ok(Some(Secret::new(data)));
+            if let Some(value) = data.get(&prefixed_key) {
+                return Ok(Some(SecretString::new(value.clone())));
+            }
+            return Ok(data.get(key).cloned().map(SecretString::new));
         }
 
         Ok(None)
     }
 }
+
 /// Parses a JSON string into a `HashMap<String, String>`.
 ///
 /// # Errors

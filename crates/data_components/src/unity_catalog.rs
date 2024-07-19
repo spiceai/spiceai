@@ -252,6 +252,7 @@ impl UnityCatalog {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCTableEnvelope {
+    #[serde(default)]
     pub tables: Vec<UCTable>,
 }
 
@@ -290,6 +291,7 @@ pub struct UCCatalog {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCSchemaEnvelope {
+    #[serde(default)]
     pub schemas: Vec<UCSchema>,
 }
 

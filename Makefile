@@ -39,6 +39,8 @@ nextest:
 
 .PHONY: test-integration
 test-integration:
+	# Test if .env file exists, and login to Spice if not
+	@test -f .env || (`spice login`)
 	@cargo test -p runtime --test integration --features postgres,mysql,spiceai-dataset-test -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset

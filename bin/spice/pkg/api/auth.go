@@ -17,37 +17,33 @@ limitations under the License.
 package api
 
 const (
-	AUTH_TYPE_SPICE_AI        = "spiceai"
-	AUTH_TYPE_DREMIO          = "dremio"
-	AUTH_TYPE_S3              = "s3"
-	AUTH_TYPE_DATABRICKS      = "databricks"
-	AUTH_TYPE_DELTA_LAKE      = "delta_lake"
-	AUTH_TYPE_POSTGRES        = "postgres"
-	AUTH_TYPE_POSTGRES_ENGINE = "postgres_engine"
-	AUTH_TYPE_SNOWFLAKE       = "snowflake"
-	AUTH_TYPE_SPARK           = "spark"
-	AUTH_PARAM_PG_PASSWORD    = "pg_pass"
+	AUTH_TYPE_SPICE_AI   = "SPICEAI"
+	AUTH_TYPE_DREMIO     = "DREMIO"
+	AUTH_TYPE_S3         = "S3"
+	AUTH_TYPE_DATABRICKS = "DATABRICKS"
+	AUTH_TYPE_DELTA_LAKE = "DELTA_LAKE"
+	AUTH_TYPE_POSTGRES   = "PG"
+	AUTH_TYPE_SNOWFLAKE  = "SNOWFLAKE"
+	AUTH_TYPE_SPARK      = "SPARK"
 
-	AUTH_PARAM_KEY                              = "key"
-	AUTH_PARAM_ACCOUNT                          = "account"
-	AUTH_PARAM_PASSWORD                         = "password"
-	AUTH_PARAM_USERNAME                         = "username"
-	AUTH_PARAM_TOKEN                            = "token"
-	AUTH_PARAM_SPARK_REMOTE                     = "spark_remote"
-	AUTH_PARAM_SNOWFLAKE_PRIVATE_KEY_PATH       = "snowflake_private_key_path"
-	AUTH_PARAM_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE = "snowflake_private_key_passphrase"
+	AUTH_PARAM_API_KEY                = "API_KEY"
+	AUTH_PARAM_KEY                    = "KEY"
+	AUTH_PARAM_ACCOUNT                = "ACCOUNT"
+	AUTH_PARAM_PASS                   = "PASS"
+	AUTH_PARAM_PASSWORD               = "PASSWORD"
+	AUTH_PARAM_USERNAME               = "USERNAME"
+	AUTH_PARAM_TOKEN                  = "TOKEN"
+	AUTH_PARAM_REMOTE                 = "REMOTE"
+	AUTH_PARAM_PRIVATE_KEY_PATH       = "PRIVATE_KEY_PATH"
+	AUTH_PARAM_PRIVATE_KEY_PASSPHRASE = "PRIVATE_KEY_PASSPHRASE"
 
 	AUTH_PARAM_AWS_DEFAULT_REGION    = "AWS_DEFAULT_REGION"
 	AUTH_PARAM_AWS_ACCESS_KEY_ID     = "AWS_ACCESS_KEY_ID"
 	AUTH_PARAM_AWS_SECRET_ACCESS_KEY = "AWS_SECRET_ACCESS_KEY"
-	AUTH_PARAM_SECRET                = "secret"
+	AUTH_PARAM_SECRET                = "SECRET"
 
-	AUTH_PARAM_AZURE_ACCOUNT_NAME = "azure_storage_account_name"
-	AUTH_PARAM_AZURE_ACCESS_KEY   = "azure_storage_access_key"
+	AUTH_PARAM_AZURE_ACCOUNT_NAME = "AZURE_STORAGE_ACCOUNT_NAME"
+	AUTH_PARAM_AZURE_ACCESS_KEY   = "AZURE_STORAGE_ACCESS_KEY"
 
-	AUTH_PARAM_GCP_SERVICE_ACCOUNT_KEY_PATH = "google_service_account_path"
+	AUTH_PARAM_GCP_SERVICE_ACCOUNT_KEY_PATH = "GOOGLE_SERVICE_ACCOUNT_PATH"
 )
-
-type Auth struct {
-	Params map[string]string `json:"params,omitempty" csv:"params" toml:"params,omitempty"`
-}
