@@ -254,32 +254,86 @@ pub async fn create_new_connector(
 
     let connector_factory = guard.get(name);
 
-    match connector_factory {
-        Some(factory) => {
-            let mut params = remove_prefix_from_hashmap_keys(params, factory.prefix());
-            let secret_guard = secrets.read().await;
+    let Some(factory) = connector_factory else {
+        return None;
+    };
 
-            // Try to autoload secrets that might be missing from params.
-            for secret_key in factory.autoload_secrets().iter().copied() {
-                let secret_key_with_prefix = format!("{}_{secret_key}", factory.prefix());
-                tracing::debug!(
-                    "Attempting to autoload secret for {name}: {secret_key_with_prefix}",
-                );
-                if params.contains_key(secret_key) {
-                    continue;
-                }
-                let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
-                if let Ok(Some(secret)) = secret {
-                    tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
-                    // Insert without the prefix into the params
-                    params.insert(secret_key.to_string(), secret);
-                }
+    let full_prefix = format!("{}_", factory.prefix());
+
+    // Convert the user-provided parameters into the format expected by the data connector
+    let mut params: HashMap<String, ParameterValue> = params
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let mut unprefixed_key = key.as_str();
+            let mut has_prefix = false;
+            if key.starts_with(&full_prefix) {
+                has_prefix = true;
+                unprefixed_key = &key[full_prefix.len()..];
             }
-            let result = factory.create(params).await;
-            Some(result)
+
+            let spec = factory
+                .parameters()
+                .iter()
+                .find(|p| p.name == unprefixed_key);
+
+            let Some(spec) = spec else {
+                tracing::warn!("Ignoring parameter {key}: not supported for {name}.");
+                return None;
+            };
+
+            if !has_prefix && spec.r#type.is_prefixed() {
+                tracing::warn!(
+                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {name}."
+                );
+                return None;
+            }
+
+            Some((
+                key[full_prefix.len()..].to_string(),
+                ParameterValue::new(value, spec, factory.prefix()),
+            ))
+        })
+        .collect();
+    let secret_guard = secrets.read().await;
+
+    // Try to autoload secrets that might be missing from params.
+    for secret_key in factory
+        .parameters()
+        .iter()
+        .filter_map(|p| if p.secret { Some(p) } else { None })
+    {
+        let secret_key_with_prefix = format!("{}_{}", factory.prefix(), secret_key.name);
+        tracing::debug!("Attempting to autoload secret for {name}: {secret_key_with_prefix}",);
+        if params.contains_key(secret_key.name) {
+            continue;
         }
-        None => None,
+        let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+        if let Ok(Some(secret)) = secret {
+            tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
+            // Insert without the prefix into the params
+            params.insert(
+                secret_key.name.to_string(),
+                ParameterValue::new(secret, secret_key, factory.prefix()),
+            );
+        }
     }
+
+    // Check if all required parameters are present
+    for parameter in factory.parameters() {
+        if parameter.required && !params.contains_key(parameter.name) {
+            return Some(Err(Box::new(
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: name.to_string(),
+                    message: format!("Missing required parameter: {}", parameter.name),
+                },
+            )));
+        }
+    }
+
+    let params = Parameters::new(params, factory.prefix(), factory.parameters());
+
+    let result = factory.create(params).await;
+    Some(result)
 }
 
 pub async fn register_all() {
@@ -326,7 +380,79 @@ pub async fn register_all() {
     .await;
 }
 
-pub struct Parameter {
+pub struct Parameters {
+    params: HashMap<String, ParameterValue>,
+    prefix: &'static str,
+    all_params: &'static [ParameterSpec],
+}
+
+impl Parameters {
+    pub fn new(
+        params: HashMap<String, ParameterValue>,
+        prefix: &'static str,
+        all_params: &'static [ParameterSpec],
+    ) -> Self {
+        Self {
+            params,
+            prefix,
+            all_params,
+        }
+    }
+
+    pub fn to_secret_map(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .collect()
+    }
+
+    /// Returns the `ParameterValue` for the given name, or the `ParameterSpec` corresponding to the absent parameter if not found.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
+    pub fn get(&self, name: &str) -> Result<&ParameterValue, &ParameterSpec> {
+        let spec = if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
+            spec
+        } else {
+            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory.");
+        };
+
+        if let Some(param_value) = self.params.get(&prefixed_name) {
+            Ok(param_value)
+        } else {
+            Err(spec)
+        }
+    }
+}
+
+pub struct ParameterValue {
+    pub value: SecretString,
+    pub spec: &'static ParameterSpec,
+    pub prefix: &'static str,
+}
+
+impl ParameterValue {
+    pub fn new(value: SecretString, spec: &'static ParameterSpec, prefix: &'static str) -> Self {
+        Self {
+            value,
+            spec,
+            prefix,
+        }
+    }
+}
+
+impl Display for ParameterValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.prefix.is_empty() {
+            write!(f, "{}", self.spec.name)
+        } else {
+            write!(f, "{}_{}", self.prefix, self.spec.name)
+        }
+    }
+}
+
+pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,
     pub secret: bool,
@@ -336,7 +462,7 @@ pub struct Parameter {
     pub r#type: ParameterType,
 }
 
-impl Parameter {
+impl ParameterSpec {
     pub const fn connector(name: &'static str) -> Self {
         Self {
             name,
@@ -387,7 +513,7 @@ impl Parameter {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy, PartialEq)]
 pub enum ParameterType {
     /// A parameter which tells Spice how to connect to the underlying data source.
     ///
@@ -410,10 +536,16 @@ pub enum ParameterType {
     Runtime,
 }
 
+impl ParameterType {
+    pub const fn is_prefixed(&self) -> bool {
+        matches!(self, Self::Connector)
+    }
+}
+
 pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
     /// The prefix to use for parameters and secrets for this `DataConnector`.
@@ -433,7 +565,7 @@ pub trait DataConnectorFactory: Send + Sync {
     /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
     ///
     /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
-    fn parameters(&self) -> &'static [Parameter];
+    fn parameters(&self) -> &'static [ParameterSpec];
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -758,37 +890,6 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 }
 
-/// Filters out keys in a hashmap that do not start with the specified prefix, and removes the prefix from the keys that remain.
-///
-/// It also logs a warning for each key that is filtered out.
-///
-/// # Panics
-///
-/// Panics if `prefix` ends with an underscore.
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn remove_prefix_from_hashmap_keys<V>(
-    hashmap: HashMap<String, V>,
-    prefix: &str,
-) -> HashMap<String, V> {
-    assert!(
-        !prefix.ends_with('_'),
-        "Prefix must not end with an underscore"
-    );
-    let prefix = format!("{prefix}_");
-    hashmap
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if key.starts_with(&prefix) {
-                Some((key[prefix.len()..].to_string(), value))
-            } else {
-                tracing::warn!("Ignoring parameter {key}: does not start with `{prefix}`");
-                None
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -820,7 +921,7 @@ mod tests {
             "test"
         }
 
-        fn autoload_secrets(&self) -> &'static [&'static str] {
+        fn parameters(&self) -> &'static [ParameterSpec] {
             &[]
         }
     }
