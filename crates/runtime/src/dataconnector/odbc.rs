@@ -109,7 +109,7 @@ impl TryFrom<SQLDialectParam> for Option<Arc<dyn Dialect + Send + Sync>> {
             "postgresql" => Ok(Some(Arc::new(PostgreSqlDialect {}))),
             "sqlite" => Ok(Some(Arc::new(SqliteDialect {}))),
             _ => Err(Error::InvalidParameter {
-                param: "sql_dialect".to_string(),
+                param: "odbc_sql_dialect".to_string(),
                 msg: "Only 'mysql', 'postgresql', and 'sqlite' are supported".to_string(),
             }),
         }
@@ -142,7 +142,7 @@ impl DataConnectorFactory for ODBCFactory {
                 sql_dialect.try_into()
             } else {
                 let driver = params
-                    .get("odbc_connection_string")
+                    .get("connection_string")
                     .context(MissingParameterSnafu {
                         param: "odbc_connection_string".to_string(),
                     })?
