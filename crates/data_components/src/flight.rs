@@ -52,7 +52,7 @@ pub enum Error {
     #[snafu(display("Unable to query Arrow Flight: {source}"))]
     Flight { source: flight_client::Error },
 
-    #[snafu(display("Unable to get schema from Flight for table {table}: {source}"))]
+    #[snafu(display("Unable to get schema from Arrow Flight for table {table}: {source}"))]
     UnableToGetSchema {
         source: flight_client::Error,
         table: String,
