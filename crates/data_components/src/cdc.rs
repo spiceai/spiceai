@@ -31,9 +31,6 @@ pub enum CommitError {
     UnableToCommitChange {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("Change committer missing"))]
-    CommitterMissing {},
 }
 
 #[derive(Debug, Snafu)]
@@ -56,7 +53,7 @@ impl std::fmt::Display for StreamError {
         match self {
             StreamError::Kafka(e) => write!(f, "Kafka error: {e}"),
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
-            StreamError::Flight(e) => write!(f, "Flight error: {e}"),
+            StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
         }
     }
 }
@@ -86,8 +83,8 @@ impl ChangeEnvelope {
     pub fn commit(self) -> Result<(), CommitError> {
         if let Some(change_committer) = self.change_committer {
             return change_committer.commit();
-        }
-        Err(CommitError::CommitterMissing {})
+        };
+        Ok(())
     }
 }
 

@@ -67,8 +67,8 @@ pub enum Error {
         source: arrow_flight::error::FlightError,
     },
 
-    #[snafu(display("Unable to subscribe to data from the Flight endpoint: {source}"))]
-    UnableToSubscribeData { source: flight_client::Error },
+    #[snafu(display("Unable to subscribe to data from the Arrow Flight endpoint: {source}"))]
+    UnableToSubscribeToFlightData { source: flight_client::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -148,7 +148,6 @@ pub struct FlightTable {
     name: &'static str,
     join_push_down_context: String,
     client: FlightClient,
-    primary_keys: Vec<String>,
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
     table_reference: TableReference,
@@ -164,12 +163,9 @@ impl FlightTable {
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
-        // TODO: Retrieve primary keys
-        let primary_keys = Vec::<String>::new();
         Ok(Self {
             name,
             client: client.clone(),
-            primary_keys,
             schema,
             table_reference,
             dialect,
@@ -189,7 +185,6 @@ impl FlightTable {
         Self {
             name,
             client: client.clone(),
-            primary_keys,
             schema,
             table_reference,
             dialect,
@@ -441,19 +436,17 @@ fn query_to_stream(
     }
 }
 
-#[allow(clippy::match_same_arms)]
 pub fn subscribe_to_append_stream(
     mut client: FlightClient,
     table_reference: String,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
-    let append_stream = stream! {
+    stream! {
         match client.subscribe(&table_reference).await {
             Ok(mut stream) => {
                 while let Some(decoded_data) = stream.next().await {
                     match decoded_data {
                         Ok(decoded_data) => match decoded_data.payload {
-                          DecodedPayload::None => continue,
-                          DecodedPayload::Schema(_) => continue,
+                          DecodedPayload::None | DecodedPayload::Schema(_)=> continue,
                           DecodedPayload::RecordBatch(batch) => {
                             match ChangeBatch::try_new(batch)
                             .map(|rb| ChangeEnvelope::new(None, rb)) {
@@ -472,8 +465,7 @@ pub fn subscribe_to_append_stream(
                 yield Err(cdc::StreamError::Flight(e.to_string()));
             }
         }
-    };
-    append_stream
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
