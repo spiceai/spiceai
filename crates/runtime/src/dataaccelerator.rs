@@ -270,7 +270,7 @@ pub async fn create_accelerator_table(
     // Inject secrets from the user-supplied params.
     // This will replace any instances of `${ store:key }` with the actual secret value.
     for (k, v) in &acceleration_settings.params {
-        let secret = secret_guard.inject_secrets(ParamStr(v)).await;
+        let secret = secret_guard.inject_secrets(k, ParamStr(v)).await;
         params_with_secrets.insert(k.clone(), secret);
     }
 
