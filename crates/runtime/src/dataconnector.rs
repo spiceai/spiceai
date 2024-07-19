@@ -489,8 +489,6 @@ impl Parameters {
     ///
     /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
     pub fn get<'a>(&'a self, name: &str) -> ParamLookup<'a> {
-        let spec = self.describe(name);
-
         if let Some(param_value) = self.params.iter().find(|p| p.0 == name) {
             ParamLookup::Present(&param_value.1)
         } else {

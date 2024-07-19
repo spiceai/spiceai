@@ -16,9 +16,8 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
 
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{any::Any, pin::Pin, sync::Arc};
 
 use crate::component::dataset::Dataset;
 use datafusion::{
@@ -37,12 +36,12 @@ use datafusion::{
 use futures::Future;
 use snafu::prelude::*;
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(r#"Missing required parameter "schema": The localhost connector requires specifying the schema up-front as a SQL CREATE TABLE statement."#))]
-    MissingSchemaParameter,
+    #[snafu(display(r#"Missing required parameter "{parameter}": The localhost connector requires specifying the schema up-front as a SQL CREATE TABLE statement."#))]
+    MissingSchemaParameter { parameter: String },
 
     #[snafu(display(
         "Unable to parse schema as a valid SQL statement: {source}\nSchema:\n{schema}"
@@ -94,16 +93,19 @@ impl LocalhostConnectorFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("schema")
+    .description("The schema of the table as a CREATE TABLE statement.")];
+
 impl DataConnectorFactory for LocalhostConnectorFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let schema = params
                 .get("schema")
-                .map(ExposeSecret::expose_secret)
-                .ok_or(Error::MissingSchemaParameter)?;
+                .expose()
+                .ok_or_else(|p| Error::MissingSchemaParameter { parameter: p.0 })?;
 
             let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
                 UnableToParseSchemaSnafu {
@@ -131,8 +133,8 @@ impl DataConnectorFactory for LocalhostConnectorFactory {
         "localhost"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
