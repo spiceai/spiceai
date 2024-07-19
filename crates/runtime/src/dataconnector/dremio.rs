@@ -17,6 +17,7 @@ limitations under the License.
 use super::DataConnector;
 use super::DataConnectorFactory;
 use crate::component::dataset::Dataset;
+use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
 use data_components::Read;
@@ -146,15 +147,34 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(
+        match Read::table_provider(
             &self.flight_factory,
             dataset.path().into(),
             dataset.schema(),
         )
         .await
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "dremio",
-        })?)
+        {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(data_components::flight::Error::UnableToGetSchema {
+                    source: _,
+                    table,
+                }) = e.downcast_ref::<data_components::flight::Error>()
+                {
+                    tracing::debug!("{e}");
+                    return Err(DataConnectorError::UnableToGetSchema {
+                        dataconnector: "dremio".to_string(),
+                        dataset_name: dataset.name.to_string(),
+                        table_name: table.clone(),
+                    });
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "dremio".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 
     async fn read_write_provider(
