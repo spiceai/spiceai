@@ -28,10 +28,10 @@ use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
-use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
+use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
@@ -179,8 +179,8 @@ impl DataConnector for SpiceAI {
             .downcast_ref::<FlightTable>()?;
         let stream = flight_table.stream_changes();
         Some(stream)
-  }
-  
+    }
+
     async fn catalog_provider(
         self: Arc<Self>,
         runtime: &Runtime,
