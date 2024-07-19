@@ -25,7 +25,7 @@ pub struct ReplacementMatch {
 #[derive(Logos, Debug, PartialEq)]
 #[logos(skip r"[ \t\n\f]+")] // Ignore whitespace between tokens
 enum SecretReplacementToken {
-    #[token("${{")]
+    #[token("${")]
     Start,
 
     #[regex(r"[a-zA-Z][a-zA-Z0-9_-]*", |lex| lex.slice().to_owned())]
@@ -34,7 +34,7 @@ enum SecretReplacementToken {
     #[token(":")]
     Colon,
 
-    #[token("}}")]
+    #[token("}")]
     End,
 }
 
