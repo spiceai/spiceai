@@ -398,7 +398,7 @@ impl Runtime {
         // Inject secrets from the user-supplied params.
         // This will replace any instances of `${ store:key }` with the actual secret value.
         for (k, v) in params {
-            let secret = secrets.inject_secrets(ParamStr(v)).await;
+            let secret = secrets.inject_secrets(k, ParamStr(v)).await;
             params_with_secrets.insert(k.clone(), secret);
         }
 
