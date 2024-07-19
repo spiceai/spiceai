@@ -186,7 +186,7 @@ jobs:
   #       working-directory: test_app
   #       timeout-minutes: 1
   #       run: |
-  #         while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+  #         while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
   #     - name: Add spiceai/quickstart
   #       working-directory: test_app
