@@ -55,7 +55,7 @@ pub struct ReplConfig {
     #[arg(
         long,
         value_name = "HTTP_ENDPOINT",
-        default_value = "http://localhost:3000",
+        default_value = "http://localhost:8090",
         help_heading = "SQL REPL"
     )]
     pub http_endpoint: String,
