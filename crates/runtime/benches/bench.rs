@@ -45,10 +45,10 @@ async fn run_benchmark_test(dataconnector: setup::DataConnector) -> Result<(), S
 
     match dataconnector {
         setup::DataConnector::SpiceAI => {
-            bench_spicecloud::run(&mut rt, &mut benchmark_results).await?
+            bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
         setup::DataConnector::Postgres => {
-            bench_postgres::run(&mut rt, &mut benchmark_results).await?
+            bench_postgres::run(&mut rt, &mut benchmark_results).await?;
         }
     }
 
