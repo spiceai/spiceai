@@ -109,7 +109,7 @@ impl DataConnectorFactory for LocalhostConnectorFactory {
 
             let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
                 UnableToParseSchemaSnafu {
-                    schema: schema.clone(),
+                    schema: schema.to_string(),
                 },
             )?;
             ensure!(statements.len() == 1, OneStatementExpectedSnafu);

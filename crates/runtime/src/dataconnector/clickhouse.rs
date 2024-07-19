@@ -277,7 +277,7 @@ async fn get_config_from_params(params: Parameters) -> Result<(Options, String)>
         .get("secure")
         .expose()
         .ok()
-        .map(|s| s.parse::<bool>())
+        .map(str::parse)
         .transpose()
         .context(InvalidSecureParameterValueSnafu {
             parameter_name: "clickhouse_secure".to_string(),

@@ -66,12 +66,13 @@ pub struct Databricks {
 impl Databricks {
     pub async fn new(params: Parameters) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
-        let endpoint = params.get("endpoint").expose().ok_or_else(|p| {
-            return MissingParameterSnafu { parameter: p.0 }.build();
-        })?;
-        let token = params.get("token").ok_or_else(|p| {
-            return MissingParameterSnafu { parameter: p.0 }.build();
-        })?;
+        let endpoint = params
+            .get("endpoint")
+            .expose()
+            .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+        let token = params
+            .get("token")
+            .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
         if mode == "delta_lake" {
             let databricks_delta = DatabricksDelta::new(
@@ -98,9 +99,9 @@ impl Databricks {
                     }
                 };
             }
-            let cluster_id = params.get("cluster_id").ok_or_else(|p| {
-                return MissingParameterSnafu { parameter: p.0 }.build();
-            })?;
+            let cluster_id = params
+                .get("cluster_id")
+                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
             let databricks_spark = DatabricksSparkConnect::new(
                 endpoint.to_string(),
                 user.map(str::to_string),
@@ -136,10 +137,10 @@ impl Databricks {
             }
         })?;
         let token = self.params.get("token").ok_or_else(|p| {
-            return super::DataConnectorError::InvalidConfigurationNoSource {
+            super::DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "databricks".into(),
                 message: format!("Missing required parameter: {}", p.0),
-            };
+            }
         })?;
 
         let unity_catalog = UnityCatalog::new(Endpoint(endpoint.to_string()), Some(token.clone()));

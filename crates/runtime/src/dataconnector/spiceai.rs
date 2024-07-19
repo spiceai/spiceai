@@ -119,8 +119,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .get("endpoint")
                 .expose()
                 .ok()
-                .map(str::to_string)
-                .unwrap_or(default_flight_url);
+                .map_or(default_flight_url, str::to_string);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
             verify_endpoint_connection(&url).await.with_context(|_| {

@@ -33,6 +33,7 @@ pub struct DeltaLake {
 
 impl DeltaLake {
     #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters) -> Self {
         Self {
             delta_table_factory: DeltaTableFactory::new(params.to_secret_map()),

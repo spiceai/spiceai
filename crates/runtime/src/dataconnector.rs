@@ -254,9 +254,7 @@ pub async fn create_new_connector(
 
     let connector_factory = guard.get(name);
 
-    let Some(factory) = connector_factory else {
-        return None;
-    };
+    let factory = connector_factory?;
 
     let params = match Parameters::try_new(
         name,
@@ -371,6 +369,7 @@ pub enum ExposedParamLookup<'a> {
 }
 
 impl<'a> ExposedParamLookup<'a> {
+    #[must_use]
     pub fn ok(self) -> Option<&'a str> {
         match self {
             ExposedParamLookup::Present(s) => Some(s),
@@ -427,10 +426,7 @@ impl Parameters {
         let secret_guard = secrets.read().await;
 
         // Try to autoload secrets that might be missing from params.
-        for secret_key in all_params
-            .iter()
-            .filter_map(|p| if p.secret { Some(p) } else { None })
-        {
+        for secret_key in all_params.iter().filter(|p| p.secret) {
             let secret_key_with_prefix = format!("{prefix}_{}", secret_key.name);
             tracing::debug!(
                 "Attempting to autoload secret for {connector_name}: {secret_key_with_prefix}",
@@ -470,6 +466,7 @@ impl Parameters {
         Ok(Parameters::new(params, prefix, all_params))
     }
 
+    #[must_use]
     pub fn new(
         params: Vec<(String, SecretString)>,
         prefix: &'static str,
@@ -482,15 +479,13 @@ impl Parameters {
         }
     }
 
+    #[must_use]
     pub fn to_secret_map(&self) -> HashMap<String, SecretString> {
         self.params.iter().cloned().collect()
     }
 
     /// Returns the `SecretString` for the given parameter, or the user-facing parameter name of the missing parameter.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
+    #[must_use]
     pub fn get<'a>(&'a self, name: &str) -> ParamLookup<'a> {
         if let Some(param_value) = self.params.iter().find(|p| p.0 == name) {
             ParamLookup::Present(&param_value.1)
@@ -499,6 +494,12 @@ impl Parameters {
         }
     }
 
+    /// Gets the `ParameterSpec` for the given parameter name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
+    #[must_use]
     pub fn describe(&self, name: &str) -> &ParameterSpec {
         if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
             spec
@@ -508,6 +509,7 @@ impl Parameters {
     }
 
     /// Retrieves the user-facing parameter name for the given parameter.
+    #[must_use]
     pub fn user_param(&self, name: &str) -> UserParam {
         let spec = self.describe(name);
 
@@ -531,6 +533,7 @@ pub struct ParameterSpec {
 }
 
 impl ParameterSpec {
+    #[must_use]
     pub const fn connector(name: &'static str) -> Self {
         Self {
             name,
@@ -544,6 +547,7 @@ impl ParameterSpec {
         }
     }
 
+    #[must_use]
     pub const fn runtime(name: &'static str) -> Self {
         Self {
             name,
@@ -557,31 +561,37 @@ impl ParameterSpec {
         }
     }
 
+    #[must_use]
     pub const fn required(mut self) -> Self {
         self.required = true;
         self
     }
 
+    #[must_use]
     pub const fn default(mut self, default: &'static str) -> Self {
         self.default = Some(default);
         self
     }
 
+    #[must_use]
     pub const fn secret(mut self) -> Self {
         self.secret = true;
         self
     }
 
+    #[must_use]
     pub const fn description(mut self, description: &'static str) -> Self {
         self.description = description;
         self
     }
 
+    #[must_use]
     pub const fn help_link(mut self, help_link: &'static str) -> Self {
         self.help_link = help_link;
         self
     }
 
+    #[must_use]
     pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
         self.examples = examples;
         self
@@ -612,6 +622,7 @@ pub enum ParameterType {
 }
 
 impl ParameterType {
+    #[must_use]
     pub const fn is_prefixed(&self) -> bool {
         matches!(self, Self::Connector)
     }
@@ -978,7 +989,7 @@ mod tests {
     use super::*;
 
     struct TestConnector {
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     }
 
     impl std::fmt::Display for TestConnector {
@@ -990,7 +1001,7 @@ mod tests {
     impl DataConnectorFactory for TestConnector {
         fn create(
             &self,
-            params: HashMap<String, SecretString>,
+            params: Parameters,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };
@@ -1012,7 +1023,7 @@ mod tests {
             self
         }
 
-        fn get_params(&self) -> &HashMap<String, SecretString> {
+        fn get_params(&self) -> &Parameters {
             &self.params
         }
 
@@ -1102,60 +1113,5 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
-    }
-
-    #[test]
-    fn test_remove_prefix() {
-        let mut hashmap = HashMap::new();
-        hashmap.insert("prefix_key1".to_string(), "value1".to_string());
-        hashmap.insert("prefix_key2".to_string(), "value2".to_string());
-        hashmap.insert("key3".to_string(), "value3".to_string());
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let mut expected = HashMap::new();
-        expected.insert("key1".to_string(), "value1".to_string());
-        expected.insert("key2".to_string(), "value2".to_string());
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_no_prefix() {
-        let mut hashmap = HashMap::new();
-        hashmap.insert("key1".to_string(), "value1".to_string());
-        hashmap.insert("key2".to_string(), "value2".to_string());
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let expected = HashMap::new();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_empty_hashmap() {
-        let hashmap: HashMap<String, String> = HashMap::new();
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let expected: HashMap<String, String> = HashMap::new();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_full_prefix() {
-        let mut hashmap = HashMap::new();
-        hashmap.insert("prefix_".to_string(), "value1".to_string());
-        hashmap.insert("prefix_key2".to_string(), "value2".to_string());
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let mut expected = HashMap::new();
-        expected.insert(String::new(), "value1".to_string());
-        expected.insert("key2".to_string(), "value2".to_string());
-
-        assert_eq!(result, expected);
     }
 }

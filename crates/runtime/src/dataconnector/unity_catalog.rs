@@ -186,7 +186,7 @@ impl DataConnector for UnityCatalog {
 
         let client = Arc::new(UnityCatalogClient::new(
             endpoint,
-            self.params.get("token").ok().map(|s| s.clone()),
+            self.params.get("token").ok().cloned(),
         ));
 
         // Copy the catalog params into the dataset params, and allow user to override
