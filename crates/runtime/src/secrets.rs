@@ -107,8 +107,8 @@ impl Secrets {
         Ok(())
     }
 
-    pub async fn inject_secrets(&self, param_str: ParamStr<'_>) -> SecretString {
-        tracing::trace!("Injecting secrets for: {}", param_str.0);
+    pub async fn inject_secrets(&self, key: &str, param_str: ParamStr<'_>) -> SecretString {
+        tracing::trace!("Injecting secrets for: {}", key);
         let mut result = String::new();
         let mut last_end = 0;
         for secret_replacement in SecretReplacementMatcher::new(param_str.0) {
@@ -366,9 +366,10 @@ mod tests {
         std::env::set_var("MY_SECRET_KEY", "super_secret");
 
         let result = secrets
-            .inject_secrets(super::ParamStr(
-                "This is a secret: ${ env:MY_SECRET_KEY }! 🫡",
-            ))
+            .inject_secrets(
+                "MY_SECRET_KEY",
+                super::ParamStr("This is a secret: ${ env:MY_SECRET_KEY }! 🫡"),
+            )
             .await;
         assert_eq!(
             "This is a secret: super_secret! 🫡",
