@@ -99,7 +99,7 @@ spice chat --model <model> --cloud
 		var messages []Message = []Message{}
 
 		for {
-			cmd.Print(">>> ")
+			cmd.Print("chat> ")
 
 			message, err := reader.ReadString('\n')
 			if err != nil {
@@ -136,10 +136,10 @@ spice chat --model <model> --cloud
 				}
 			}
 
-			done <- true
-
 			scanner := bufio.NewScanner(response.Body)
 			var responseMessage = ""
+
+			doneLoading := false
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
@@ -153,6 +153,11 @@ spice chat --model <model> --cloud
 				if err != nil {
 					cmd.Println(err)
 					continue
+				}
+
+				if !doneLoading {
+					done <- true
+					doneLoading = true
 				}
 
 				token := chatResponse.Choices[0].Delta.Content
