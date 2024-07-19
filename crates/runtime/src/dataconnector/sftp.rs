@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -115,13 +114,13 @@ impl ListingTableConnector for SFTP {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(sftp_port) = self.params.get("port").map(ExposeSecret::expose_secret) {
+        if let Some(sftp_port) = self.params.get("port").expose().ok() {
             fragment_builder.append_pair("port", sftp_port);
         }
-        if let Some(sftp_user) = self.params.get("user").map(ExposeSecret::expose_secret) {
+        if let Some(sftp_user) = self.params.get("user").expose().ok() {
             fragment_builder.append_pair("user", sftp_user);
         }
-        if let Some(sftp_password) = self.params.get("pass").map(ExposeSecret::expose_secret) {
+        if let Some(sftp_password) = self.params.get("pass").expose().ok() {
             fragment_builder.append_pair("password", sftp_password);
         }
         fragments.push(fragment_builder.finish());
