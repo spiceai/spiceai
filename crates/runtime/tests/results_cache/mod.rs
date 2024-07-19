@@ -21,9 +21,7 @@ use runtime::{
     datafusion::query::{Protocol, QueryBuilder},
     Runtime,
 };
-use spicepod::component::{
-    dataset::Dataset, params::Params, runtime::ResultsCache, secrets::SpiceSecretStore,
-};
+use spicepod::component::{dataset::Dataset, params::Params, runtime::ResultsCache};
 
 use crate::init_tracing;
 
@@ -33,7 +31,7 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
         name.to_string(),
     );
     test_dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "parquet".to_string())]
+        vec![("s3_file_format".to_string(), "parquet".to_string())]
             .into_iter()
             .collect(),
     ));
@@ -52,7 +50,6 @@ async fn results_cache_system_queries() -> Result<(), String> {
 
     let app = AppBuilder::new("cache_test")
         .with_results_cache(results_cache)
-        .with_secret_store(SpiceSecretStore::File)
         .with_dataset(make_s3_tpch_dataset("customer"))
         .build();
 

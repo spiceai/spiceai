@@ -207,11 +207,11 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
     Ok((tx, addr))
 }
 
-fn make_graphql_dataset(path: &str, name: &str, query: &str, json_path: &str) -> Dataset {
+fn make_graphql_dataset(path: &str, name: &str, query: &str, json_pointer: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
     let params = HashMap::from([
-        ("json_path".to_string(), json_path.to_string()),
-        ("query".to_string(), query.to_string()),
+        ("graphql_json_pointer".to_string(), json_pointer.to_string()),
+        ("graphql_query".to_string(), query.to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -228,7 +228,7 @@ async fn test_graphql() -> Result<(), String> {
             &format!("http://{addr}/graphql"),
             "test_graphql",
             "query { users { id name posts { id title content } } }",
-            "data.users",
+            "/data/users",
         ))
         .build();
     let mut rt = Runtime::builder().with_app(app).build().await;
@@ -304,7 +304,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
             &format!("http://{addr}/graphql"),
             "test_graphql",
             "query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
-            "data.paginatedUsers.users",
+            "/data/paginatedUsers/users",
         ))
         .build();
     let mut rt = Runtime::builder().with_app(app).build().await;

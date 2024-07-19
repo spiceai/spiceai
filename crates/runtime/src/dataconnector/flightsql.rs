@@ -16,13 +16,13 @@ limitations under the License.
 
 use super::{DataConnector, DataConnectorFactory};
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
-use data_components::flightsql::FlightSQLFactory;
+use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -36,23 +36,42 @@ pub enum Error {
 
     #[snafu(display("Unable to construct TLS flight client: {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
+
+    #[snafu(display("Unable to perform FlightSQL handshake: {source}"))]
+    UnableToPerformHandshake { source: arrow::error::ArrowError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
-    pub flightsql_factory: FlightSQLFactory,
+    pub flightsql_factory: DataComponentFlightSQLFactory,
 }
 
-impl DataConnectorFactory for FlightSQL {
+#[derive(Default, Copy, Clone)]
+pub struct FlightSQLFactory {}
+
+impl FlightSQLFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for FlightSQLFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
                 .get("endpoint")
+                .map(ExposeSecret::expose_secret)
                 .cloned()
                 .context(MissingEndpointParameterSnafu)?;
             let flight_channel = new_tls_flight_channel(&endpoint)
@@ -60,17 +79,25 @@ impl DataConnectorFactory for FlightSQL {
                 .context(UnableToConstructTlsChannelSnafu)?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
-            if let Some(s) = secret {
-                let _ = client
-                    .handshake(
-                        s.get("username").unwrap_or_default(),
-                        s.get("password").unwrap_or_default(),
-                    )
-                    .await;
+            let username = params.get("username").map(|s| s.expose_secret().as_str());
+            let password = params.get("password").map(|s| s.expose_secret().as_str());
+            if let (Some(username), Some(password)) = (username, password) {
+                client
+                    .handshake(username, password)
+                    .await
+                    .context(UnableToPerformHandshakeSnafu)?;
             };
-            let flightsql_factory = FlightSQLFactory::new(client, endpoint);
-            Ok(Arc::new(Self { flightsql_factory }) as Arc<dyn DataConnector>)
+            let flightsql_factory = DataComponentFlightSQLFactory::new(client, endpoint);
+            Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "flightsql"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["username", "password"]
     }
 }
 

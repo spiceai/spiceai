@@ -91,16 +91,16 @@ impl SnowflakeConnectionPool {
         let account = account.replace('.', "-");
 
         let warehouse = params
-            .get("snowflake_warehouse")
+            .get("warehouse")
             .map(Secret::expose_secret)
             .map(ToString::to_string);
         let role = params
-            .get("snowflake_role")
+            .get("role")
             .map(Secret::expose_secret)
             .map(ToString::to_string);
 
         let auth_type = params
-            .get("snowflake_auth_type")
+            .get("auth_type")
             .map(Secret::expose_secret)
             .map_or_else(|| "snowflake".to_string(), ToString::to_string)
             .to_lowercase();
@@ -189,7 +189,7 @@ fn init_snowflake_api_with_keypair_auth(
     params: &HashMap<String, SecretString>,
 ) -> Result<SnowflakeApi, Error> {
     let private_key_path = params
-        .get("snowflake_private_key_path")
+        .get("private_key_path")
         .map(Secret::expose_secret)
         .context(MissingRequiredSecretSnafu {
             name: "snowflake_private_key_path",
@@ -205,7 +205,7 @@ fn init_snowflake_api_with_keypair_auth(
 
     if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
         let passphrase = params
-            .get("snowflake_private_key_passphrase")
+            .get("private_key_passphrase")
             .map(Secret::expose_secret)
             .context(MissingRequiredSecretSnafu {
                 name: "snowflake_private_key_passphrase",

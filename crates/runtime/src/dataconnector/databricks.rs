@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use crate::Runtime;
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
@@ -28,7 +27,7 @@ use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -39,7 +38,7 @@ use super::{DataConnector, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: endpoint"))]
+    #[snafu(display("Missing required parameter: databricks_endpoint"))]
     MissingEndpoint,
 
     #[snafu(display("Missing required parameter: databricks_cluster_id"))]
@@ -67,23 +66,19 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
-    params: SecretMap,
+    params: HashMap<String, SecretString>,
 }
 
 impl Databricks {
-    pub async fn new(secret: Option<Secret>, params: Arc<HashMap<String, String>>) -> Result<Self> {
-        let mode = params.get("mode").cloned().unwrap_or_default();
-
-        let mut params: SecretMap = params.as_ref().into();
-
-        if let Some(secret) = secret {
-            for (key, value) in secret.iter() {
-                params.insert(key.to_string(), value.clone());
-            }
-        }
+    pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
+        let mode = params
+            .get("mode")
+            .map(ExposeSecret::expose_secret)
+            .cloned()
+            .unwrap_or_default();
 
         if mode.as_str() == "delta_lake" {
-            let databricks_delta = DatabricksDelta::new(Arc::new(params.clone().into_map()));
+            let databricks_delta = DatabricksDelta::new(params.clone());
             Ok(Self {
                 read_provider: Arc::new(databricks_delta.clone()),
                 params,
@@ -94,7 +89,7 @@ impl Databricks {
             };
             let user = params.get("user").map(std::borrow::ToOwned::to_owned);
             let mut databricks_use_ssl = true;
-            if let Some(databricks_use_ssl_value) = params.get("databricks_use_ssl") {
+            if let Some(databricks_use_ssl_value) = params.get("spark_use_ssl") {
                 let databricks_use_ssl_value = databricks_use_ssl_value.expose_secret();
                 databricks_use_ssl = match databricks_use_ssl_value.as_str() {
                     "true" => true,
@@ -107,10 +102,7 @@ impl Databricks {
                     }
                 };
             }
-            let ((Some(cluster_id), _) | (_, Some(cluster_id))) = (
-                params.get("databricks_cluster_id"),
-                params.get("databricks-cluster-id"),
-            ) else {
+            let Some(cluster_id) = params.get("cluster_id") else {
                 return MissingDatabricksClusterIdSnafu.fail();
             };
             let Some(token) = params.get("token") else {
@@ -136,15 +128,38 @@ impl Databricks {
     }
 }
 
-impl DataConnectorFactory for Databricks {
+#[derive(Default, Clone, Copy)]
+pub struct DatabricksFactory {}
+
+impl DatabricksFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DatabricksFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let databricks = Databricks::new(secret, Arc::clone(&params)).await?;
+            let databricks = Databricks::new(params).await?;
             Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "databricks"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token", "pass"]
     }
 }
 
@@ -194,52 +209,30 @@ impl DataConnector for Databricks {
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
-        let mut dataset_params: SecretMap = catalog.params.clone().into();
+        let mut dataset_params: HashMap<String, SecretString> =
+            runtime.get_params_with_secrets(&catalog.params).await;
 
-        for (key, value) in &catalog.dataset_params {
-            dataset_params.insert(key.to_string(), value.clone().into());
-        }
+        let secret_dataset_params = runtime
+            .get_params_with_secrets(&catalog.dataset_params)
+            .await;
 
-        let secrets_provider = runtime.secrets_provider();
-        let dataset_secret = match secrets_provider
-            .read()
-            .await
-            .get_secret("databricks")
-            .await
-            .map_err(|source| super::DataConnectorError::UnableToReadSecrets {
-                dataconnector: "databricks".to_string(),
-                source,
-            }) {
-            Ok(secret) => secret,
-            Err(e) => return Some(Err(e)),
-        };
-
-        if let Some(secret) = dataset_secret {
-            for (key, value) in secret.iter() {
-                dataset_params.insert(key.to_string(), value.clone());
-            }
+        for (key, value) in secret_dataset_params {
+            dataset_params.insert(key, value);
         }
 
         let mode = self.params.get("mode").map(|v| v.expose_secret().as_str());
         let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
             (
-                Arc::new(DeltaTableFactory::new(Arc::new(dataset_params.into_map())))
-                    as Arc<dyn Read>,
+                Arc::new(DeltaTableFactory::new(dataset_params)) as Arc<dyn Read>,
                 table_reference_creator_delta_lake as fn(UCTable) -> Option<TableReference>,
             )
         } else {
-            let normal_params: HashMap<String, String> = dataset_params
-                .iter()
-                .map(|(k, v)| (k.clone(), v.expose_secret().clone()))
-                .collect();
-            let dataset_databricks = match Databricks::new(None, Arc::new(normal_params))
-                .await
-                .map_err(
-                    |source| super::DataConnectorError::UnableToGetCatalogProvider {
-                        dataconnector: "databricks".to_string(),
-                        source: source.into(),
-                    },
-                ) {
+            let dataset_databricks = match Databricks::new(dataset_params).await.map_err(|source| {
+                super::DataConnectorError::UnableToGetCatalogProvider {
+                    dataconnector: "databricks".to_string(),
+                    source: source.into(),
+                }
+            }) {
                 Ok(dataset_databricks) => dataset_databricks,
                 Err(e) => return Some(Err(e)),
             };

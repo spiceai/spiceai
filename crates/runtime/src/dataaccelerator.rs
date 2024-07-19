@@ -15,8 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
-use crate::secrets::ExposeSecret;
-use crate::secrets::Secret;
+use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -29,9 +28,10 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use lazy_static::lazy_static;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use self::arrow::ArrowAccelerator;
 
@@ -120,8 +120,7 @@ pub struct AcceleratorExternalTableBuilder {
     schema: SchemaRef,
     engine: Engine,
     mode: Mode,
-    options: Option<HashMap<String, String>>,
-    secret: Option<Secret>,
+    options: Option<HashMap<String, SecretString>>,
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
@@ -136,7 +135,6 @@ impl AcceleratorExternalTableBuilder {
             engine,
             mode: Mode::Memory,
             options: None,
-            secret: None,
             indexes: HashMap::new(),
             constraints: None,
             on_conflict: None,
@@ -162,14 +160,8 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn options(mut self, options: HashMap<String, String>) -> Self {
+    pub fn options(mut self, options: HashMap<String, SecretString>) -> Self {
         self.options = Some(options);
-        self
-    }
-
-    #[must_use]
-    pub fn secret(mut self, secret: Option<Secret>) -> Self {
-        self.secret = secret;
         self
     }
 
@@ -199,18 +191,17 @@ impl AcceleratorExternalTableBuilder {
     pub fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
 
-        let mut options = self.options.unwrap_or_default();
+        let mut options: HashMap<String, String> = self
+            .options
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect();
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
         let mode = self.mode;
         options.insert("mode".to_string(), mode.to_string());
-
-        if let Some(secret) = self.secret {
-            for (k, v) in secret.iter() {
-                options.insert(k.to_string(), v.expose_secret().to_string());
-            }
-        }
 
         if !self.indexes.is_empty() {
             let indexes_option_str = Acceleration::hashmap_to_option_string(&self.indexes);
@@ -255,7 +246,7 @@ pub async fn create_accelerator_table(
     schema: SchemaRef,
     constraints: Option<&Constraints>,
     acceleration_settings: &acceleration::Acceleration,
-    acceleration_secret: Option<Secret>,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
@@ -273,12 +264,21 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
+    let secret_guard = secrets.read().await;
+    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+    // Inject secrets from the user-supplied params.
+    // This will replace any instances of `${{ store:key }}` with the actual secret value.
+    for (k, v) in &acceleration_settings.params {
+        let secret = secret_guard.inject_secrets(ParamStr(v)).await;
+        params_with_secrets.insert(k.clone(), secret);
+    }
+
     let mut external_table_builder =
         AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
-            .options(acceleration_settings.params.clone())
-            .indexes(acceleration_settings.indexes.clone())
-            .secret(acceleration_secret);
+            .options(params_with_secrets)
+            .indexes(acceleration_settings.indexes.clone());
 
     // If there are constraints from the federated table, then add them to the accelerated table
     // and automatically configure upsert behavior for them. This can be overridden by the user.

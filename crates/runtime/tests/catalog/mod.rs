@@ -23,7 +23,6 @@ use runtime::Runtime;
 use runtime::{datafusion::query::Protocol, extension::ExtensionFactory};
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
-use spicepod::component::secrets::SpiceSecretStore;
 use std::collections::HashMap;
 
 #[tokio::test]
@@ -31,7 +30,6 @@ use std::collections::HashMap;
 async fn spiceai_catalog_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("spiceai_catalog_test")
-        .with_secret_store(SpiceSecretStore::File)
         .with_catalog(Catalog::new("spiceai".to_string(), "spiceai".to_string()))
         .build();
 
@@ -85,7 +83,6 @@ async fn spiceai_catalog_test_include() -> Result<(), anyhow::Error> {
         "eth.recent_transactions".to_string(),
     ];
     let app = AppBuilder::new("spiceai_catalog_test")
-        .with_secret_store(SpiceSecretStore::File)
         .with_catalog(catalog)
         .build();
 
