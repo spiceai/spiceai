@@ -16,6 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow::array::{Array, ListArray, StringArray, StructArray};
+use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
 use data_components::cdc::changes_schema;
@@ -103,7 +106,6 @@ pub(crate) async fn handle(
                     for batch in &data_update.data {
                         if !schema_sent {
                             let schema = batch.schema();
-                            let schema = changes_schema(schema.as_ref());
 
                             flights
                                 .push(FlightData::from(SchemaAsIpc::new(&schema, &write_options)));
@@ -152,10 +154,33 @@ pub(crate) async fn handle(
 
         for batch in &results {
             let schema = batch.schema();
+            let row_count = batch.num_rows();
+
+            let op_data = vec!["r"; row_count];
+            let op_array = StringArray::from(op_data);
+
+            let primary_keys_array = ListArray::new_null(
+                Arc::new(Field::new("item", DataType::Utf8, false)),
+                row_count,
+            );
+
+            let data_array = StructArray::from(batch.clone());
+
+            let new_schema = Arc::new(changes_schema(schema.as_ref()));
+            let new_record_batch = RecordBatch::try_new(
+                new_schema.clone(),
+                vec![
+                    Arc::new(op_array),
+                    Arc::new(primary_keys_array),
+                    Arc::new(data_array),
+                ],
+            )
+            .expect("Failed to create new RecordBatch");
+
             let data_update = DataUpdate {
-                data: vec![batch.clone()],
-                schema,
-                update_type: UpdateType::Append,
+                data: vec![new_record_batch.clone()],
+                schema: new_schema,
+                update_type: UpdateType::Changes,
             };
             let _ = tx.send(data_update);
         }
