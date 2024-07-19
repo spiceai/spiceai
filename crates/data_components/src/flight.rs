@@ -49,16 +49,13 @@ pub enum Error {
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
 
-    #[snafu(display("Unable to query Flight: {source}"))]
-    Flight { source: flight_client::Error },
-
-    #[snafu(display("Unable to get schema from Flight for table {table}: {source}"))]
+    #[snafu(display("Unable to get schema from Arrow Flight for table {table}: {source}"))]
     UnableToGetSchema {
         source: flight_client::Error,
         table: String,
     },
 
-    #[snafu(display("Unable to query Flight: {source}"))]
+    #[snafu(display("Unable to query Arrow Flight: {source}"))]
     ArrowFlight { source: FlightError },
 
     #[snafu(display("Unable to retrieve schema"))]
@@ -419,7 +416,7 @@ fn query_to_stream(
                     }
                 }
             }
-            Err(error) => yield Err(to_execution_error(Error::Flight{ source: error}))
+            Err(error) => yield Err(to_execution_error(Error::ArrowFlight{ source: error}))
         }
     }
 }
