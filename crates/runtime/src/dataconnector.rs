@@ -194,6 +194,15 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
+    #[snafu(display(
+        "Failed to get schema for {dataconnector} dataset {dataset_name}. Ensure the table '{table_name}' exists in the data source."
+    ))]
+    UnableToGetSchema {
+        dataconnector: String,
+        dataset_name: String,
+        table_name: String,
+    },
+
     #[snafu(display("{dataconnector} Data Connector Error: {source}"))]
     InternalWithSource {
         dataconnector: String,

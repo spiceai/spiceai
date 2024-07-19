@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::DataConnector;
+use super::DataConnectorError;
 use super::DataConnectorFactory;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -157,15 +158,34 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(
+        match Read::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
             dataset.schema(),
         )
         .await
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "spiceai",
-        })?)
+        {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(data_components::flight::Error::UnableToGetSchema {
+                    source: _,
+                    table,
+                }) = e.downcast_ref::<data_components::flight::Error>()
+                {
+                    tracing::debug!("{e}");
+                    return Err(DataConnectorError::UnableToGetSchema {
+                        dataconnector: "spice.ai".to_string(),
+                        dataset_name: dataset.name.to_string(),
+                        table_name: table.clone(),
+                    });
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "spice.ai".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 
     async fn read_write_provider(
