@@ -367,7 +367,7 @@ mod tests {
 
         let result = secrets
             .inject_secrets(super::ParamStr(
-                "This is a secret: ${{ env:MY_SECRET_KEY }}! 🫡",
+                "This is a secret: ${ env:MY_SECRET_KEY }! 🫡",
             ))
             .await;
         assert_eq!(

@@ -396,7 +396,7 @@ impl Runtime {
         let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
 
         // Inject secrets from the user-supplied params.
-        // This will replace any instances of `${{ store:key }}` with the actual secret value.
+        // This will replace any instances of `${ store:key }` with the actual secret value.
         for (k, v) in params {
             let secret = secrets.inject_secrets(ParamStr(v)).await;
             params_with_secrets.insert(k.clone(), secret);
