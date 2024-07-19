@@ -3,7 +3,7 @@ use runtime::Runtime;
 use crate::results::BenchmarkResultsBuilder;
 use crate::setup::{BenchAppBuilder, DataConnector};
 use app::{App, AppBuilder};
-use spicepod::component::{dataset::Dataset, params::Params, secrets::SpiceSecretStore};
+use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -90,7 +90,6 @@ impl PostgresBenchAppBuilder {
 impl BenchAppBuilder for PostgresBenchAppBuilder {
     fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
         let mut app_builder = AppBuilder::new("runtime_benchmark_test")
-            .with_secret_store(SpiceSecretStore::File)
             .with_dataset(self.make_dataset("customer", "customer"))
             .with_dataset(self.make_dataset("lineitem", "lineitem"))
             .with_dataset(self.make_dataset("part", "part"))

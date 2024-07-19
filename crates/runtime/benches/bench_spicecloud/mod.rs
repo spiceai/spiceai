@@ -3,7 +3,7 @@ use runtime::Runtime;
 use crate::results::BenchmarkResultsBuilder;
 use crate::setup::{BenchAppBuilder, DataConnector};
 use app::{App, AppBuilder};
-use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
+use spicepod::component::dataset::Dataset;
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -74,7 +74,6 @@ pub struct SpiceAIBenchAppBuilder {}
 impl BenchAppBuilder for SpiceAIBenchAppBuilder {
     fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
         let mut app_builder = AppBuilder::new("runtime_benchmark_test")
-            .with_secret_store(SpiceSecretStore::File)
             .with_dataset(self.make_dataset("tpch.customer", "customer"))
             .with_dataset(self.make_dataset("tpch.lineitem", "lineitem"))
             .with_dataset(self.make_dataset("tpch.part", "part"))
