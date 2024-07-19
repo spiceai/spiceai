@@ -24,7 +24,7 @@ exit()
 ########################################
 #   DO NOT COMMENT OUT THE LINE BELOW  #
 ########################################
-client = Client(API_KEY, 'grpc://127.0.0.1:50051')
+client = Client(API_KEY, 'grpc://127.0.0.1:50090')
 
 ###########################
 #   Spice AI Datasource   #
@@ -98,7 +98,7 @@ while True:
 def simulate_runtime_duckdb(user_id):
     #print("User " + str(user_id) + " started")
     # make a new client for each user
-    client = Client(API_KEY, 'grpc://127.0.0.1:50051')
+    client = Client(API_KEY, 'grpc://127.0.0.1:50090')
     start = time.time()
     # make a query
     data = client.query('SELECT * FROM eth_recent_blocks_duckdb DESC;')
@@ -111,7 +111,7 @@ def simulate_runtime_duckdb(user_id):
 def simulate_runtime_arrow_mem(user_id):
     #print("User " + str(user_id) + " started")
     # make a new client for each user
-    client = Client(API_KEY, 'grpc://127.0.0.1:50051')
+    client = Client(API_KEY, 'grpc://127.0.0.1:50090')
     start = time.time()
     # make a query
     data = client.query('SELECT * FROM eth_recent_blocks DESC;')

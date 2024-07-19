@@ -159,9 +159,9 @@ Example output will be shown as follows:
 ```bash
 Spice.ai runtime starting...
 Using latest 'local' runtime version.
-2024-06-03T23:21:26.819978Z  INFO spiced: Metrics listening on 127.0.0.1:9000
+2024-06-03T23:21:26.819978Z  INFO spiced: Metrics listening on 127.0.0.1:9090
 2024-06-03T23:21:26.821863Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
-2024-06-03T23:21:26.821898Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-06-03T23:21:26.821898Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50090
 2024-06-03T23:21:26.821958Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 2024-06-03T23:21:26.822128Z  INFO runtime: Initialized results cache; max size: 128.00 MiB, item ttl: 1s
 ```

@@ -31,7 +31,7 @@ pub struct Config {
     #[arg(
         long = "flight",
         value_name = "FLIGHT_BIND_ADDRESS",
-        default_value = "127.0.0.1:50051",
+        default_value = "127.0.0.1:50090",
         action
     )]
     pub flight_bind_address: SocketAddr,

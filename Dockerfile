@@ -42,7 +42,7 @@ fi
 
 COPY --from=build /root/spiced /usr/local/bin/spiced
 
-EXPOSE 8090 50051
+EXPOSE 8090 50090
 
 WORKDIR /app
 

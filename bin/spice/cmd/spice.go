@@ -24,7 +24,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-const PROM_ENDPOINT = "http://localhost:9000"
+const PROM_ENDPOINT = "http://localhost:9090"
 
 var RootCmd = &cobra.Command{
 	Use:   "spice",

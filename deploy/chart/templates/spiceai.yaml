@@ -42,9 +42,9 @@ spec:
               "--http",
               "0.0.0.0:8090",
               "--metrics",
-              "0.0.0.0:9000",
+              "0.0.0.0:9090",
               "--flight",
-              "0.0.0.0:50051",
+              "0.0.0.0:50090",
               "--open_telemetry",
               "0.0.0.0:50052"
             ]
@@ -55,9 +55,9 @@ spec:
           ports:
             - containerPort: 8090
               name: http
-            - containerPort: 9000
+            - containerPort: 9090
               name: metrics
-            - containerPort: 50051
+            - containerPort: 50090
               name: flight
             - containerPort: 50052
               name: otel
@@ -101,9 +101,9 @@ spec:
   ports:
     - port: 8090
       name: http
-    - port: 9000
+    - port: 9090
       name: metrics
-    - port: 50051
+    - port: 50090
       name: flight
     - port: 50052
       name: otel

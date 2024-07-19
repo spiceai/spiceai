@@ -173,7 +173,7 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd() (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	cmd := exec.Command(spiceCMD, "--metrics", "127.0.0.1:9000")
+	cmd := exec.Command(spiceCMD, "--metrics", "127.0.0.1:9090")
 
 	return cmd, nil
 }

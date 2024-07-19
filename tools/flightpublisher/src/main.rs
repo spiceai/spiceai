@@ -33,7 +33,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "FLIGHT_ENDPOINT",
-        default_value = "http://localhost:50051"
+        default_value = "http://localhost:50090"
     )]
     pub flight_endpoint: String,
 
