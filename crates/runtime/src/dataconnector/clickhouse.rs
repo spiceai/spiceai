@@ -178,7 +178,7 @@ impl DataConnectorFactory for ClickhouseFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &PARAMETERS
+        PARAMETERS
     }
 }
 

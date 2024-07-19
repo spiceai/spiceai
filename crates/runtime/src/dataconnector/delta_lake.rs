@@ -19,14 +19,13 @@ use async_trait::async_trait;
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 pub struct DeltaLake {
     delta_table_factory: DeltaTableFactory,
@@ -34,9 +33,9 @@ pub struct DeltaLake {
 
 impl DeltaLake {
     #[must_use]
-    pub fn new(params: HashMap<String, SecretString>) -> Self {
+    pub fn new(params: Parameters) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(params),
+            delta_table_factory: DeltaTableFactory::new(params.to_secret_map()),
         }
     }
 }
@@ -56,10 +55,49 @@ impl DeltaLakeFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    // S3 storage options
+    ParameterSpec::connector("aws_region")
+        .description("The AWS region to use for S3 storage.")
+        .secret(),
+    ParameterSpec::connector("aws_access_key_id")
+        .description("The AWS access key ID to use for S3 storage.")
+        .secret(),
+    ParameterSpec::connector("aws_secret_access_key")
+        .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::connector("aws_endpoint")
+        .description("The AWS endpoint to use for S3 storage.")
+        .secret(),
+    // Azure storage options
+    ParameterSpec::connector("azure_storage_account_name")
+        .description("The storage account to use for Azure storage.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_account_key")
+        .description("The storage account key to use for Azure storage.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_client_id")
+        .description("The service principal client id for accessing the storage account.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_client_secret")
+        .description("The service principal client secret for accessing the storage account.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_sas_key")
+        .description("The shared access signature key for accessing the storage account.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_endpoint")
+        .description("The endpoint for the Azure Blob storage account.")
+        .secret(),
+    // GCS storage options
+    ParameterSpec::connector("google_service_account")
+        .description("Filesystem path to the Google service account JSON key file.")
+        .secret(),
+];
+
 impl DataConnectorFactory for DeltaLakeFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let delta = DeltaLake::new(params);
@@ -71,23 +109,8 @@ impl DataConnectorFactory for DeltaLakeFactory {
         "delta_lake"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[
-            // S3 Parameters
-            "aws_region",
-            "aws_access_key_id",
-            "aws_secret_access_key",
-            "aws_endpoint",
-            // Azure Parameters
-            "azure_storage_account_name",
-            "azure_storage_account_key",
-            "azure_storage_client_id",
-            "azure_storage_client_secret",
-            "azure_storage_sas_key",
-            "azure_storage_endpoint",
-            // Google Storage Parameters
-            "google_service_account",
-        ]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

@@ -302,7 +302,7 @@ impl DataConnectorFactory for DatabricksFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &PARAMETERS
+        PARAMETERS
     }
 }
 

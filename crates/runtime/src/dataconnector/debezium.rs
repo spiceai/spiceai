@@ -125,7 +125,7 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &PARAMETERS
+        PARAMETERS
     }
 }
 

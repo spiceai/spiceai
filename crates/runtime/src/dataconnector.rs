@@ -710,7 +710,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
-    fn get_params(&self) -> &HashMap<String, SecretString>;
+    fn get_params(&self) -> &Parameters;
 
     #[must_use]
     fn get_session_context() -> SessionContext {
@@ -785,13 +785,11 @@ pub trait ListingTableConnector: DataConnector {
         let params = self.get_params();
         let extension = params
             .get("file_extension")
-            .map(ExposeSecret::expose_secret)
-            .cloned();
+            .expose()
+            .ok()
+            .map(str::to_string);
 
-        match params
-            .get("file_format")
-            .map(|f| f.expose_secret().as_str())
-        {
+        match params.get("file_format").expose().ok() {
             Some("csv") => Ok((
                 Some(self.get_csv_format(params)?),
                 extension.unwrap_or(".csv".to_string()),
@@ -826,32 +824,40 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
-    fn get_csv_format(
-        &self,
-        params: &HashMap<String, SecretString>,
-    ) -> DataConnectorResult<Arc<CsvFormat>>
+    fn get_csv_format(&self, params: &Parameters) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
     {
-        let has_header = params.get("has_header").map_or(true, |f| {
-            f.expose_secret().as_str().eq_ignore_ascii_case("true")
-        });
-        let quote = params.get("quote").map_or(b'"', |f| {
-            *f.expose_secret().as_bytes().first().unwrap_or(&b'"')
-        });
+        let has_header = params
+            .get("csv_has_header")
+            .expose()
+            .ok()
+            .map_or(true, |f| f.eq_ignore_ascii_case("true"));
+        let quote = params
+            .get("csv_quote")
+            .expose()
+            .ok()
+            .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
         let escape = params
-            .get("escape")
-            .and_then(|f| f.expose_secret().as_bytes().first().copied());
-        let schema_infer_max_rec = params.get("schema_infer_max_records").map_or_else(
-            || 1000,
-            |f| usize::from_str(f.expose_secret().as_str()).map_or(1000, |f| f),
-        );
-        let delimiter = params.get("delimiter").map_or(b',', |f| {
-            *f.expose_secret().as_bytes().first().unwrap_or(&b',')
-        });
+            .get("csv_escape")
+            .expose()
+            .ok()
+            .and_then(|f| f.as_bytes().first().copied());
+        let schema_infer_max_rec = params
+            .get("csv_schema_infer_max_records")
+            .expose()
+            .ok()
+            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
+        let delimiter = params
+            .get("csv_delimiter")
+            .expose()
+            .ok()
+            .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
         let compression_type = params
-            .get("compression_type")
-            .map_or("", |f| f.expose_secret().as_str());
+            .get("file_compression_type")
+            .expose()
+            .ok()
+            .unwrap_or_default();
 
         Ok(Arc::new(
             CsvFormat::default()
