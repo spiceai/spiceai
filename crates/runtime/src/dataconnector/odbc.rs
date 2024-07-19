@@ -20,7 +20,8 @@ use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
-    DefaultDialect, Dialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
+    CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect, MySqlDialect, PostgreSqlDialect,
+    SqliteDialect,
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
@@ -70,7 +71,14 @@ enum ODBCDriver {
     MySql,
     PostgreSql,
     Sqlite,
+    Databricks,
     Unknown,
+}
+
+fn databricks_dialect() -> CustomDialect {
+    CustomDialectBuilder::new()
+        .with_identifier_quote_style('`')
+        .build()
 }
 
 impl From<&str> for ODBCDriver {
@@ -81,6 +89,8 @@ impl From<&str> for ODBCDriver {
             _ if val.contains("postgres") => ODBCDriver::PostgreSql, // odbcinst.ini profile name
             _ if val.contains("psqlodbc") => ODBCDriver::PostgreSql, // library filename
             _ if val.contains("sqlite") => ODBCDriver::Sqlite, // profile and library name
+            _ if val.contains("libsparkodbc") => ODBCDriver::Databricks, // library filename
+            _ if val.contains("databricks") => ODBCDriver::Databricks, // profile name
             _ => {
                 tracing::debug!("Unknown ODBC driver detected: {}", val);
                 ODBCDriver::Unknown
@@ -95,6 +105,7 @@ impl From<ODBCDriver> for Option<Arc<dyn Dialect + Send + Sync>> {
             ODBCDriver::MySql => Some(Arc::new(MySqlDialect {})),
             ODBCDriver::PostgreSql => Some(Arc::new(PostgreSqlDialect {})),
             ODBCDriver::Sqlite => Some(Arc::new(SqliteDialect {})),
+            ODBCDriver::Databricks => Some(Arc::new(databricks_dialect())),
             ODBCDriver::Unknown => Some(Arc::new(DefaultDialect {})),
         }
     }
@@ -108,9 +119,11 @@ impl TryFrom<SQLDialectParam> for Option<Arc<dyn Dialect + Send + Sync>> {
             "mysql" => Ok(Some(Arc::new(MySqlDialect {}))),
             "postgresql" => Ok(Some(Arc::new(PostgreSqlDialect {}))),
             "sqlite" => Ok(Some(Arc::new(SqliteDialect {}))),
+            "databricks" => Ok(Some(Arc::new(databricks_dialect()))),
             _ => Err(Error::InvalidParameter {
                 param: "odbc_sql_dialect".to_string(),
-                msg: "Only 'mysql', 'postgresql', and 'sqlite' are supported".to_string(),
+                msg: "Only 'mysql', 'postgresql', 'sqlite', and 'databricks' are supported"
+                    .to_string(),
             }),
         }
     }
