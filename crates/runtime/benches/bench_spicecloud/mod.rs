@@ -47,8 +47,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         // ("tpch_q22", include_str!("tpch_q22.sql")),
         ("tpch_simple_q1", include_str!("tpch_simple_q1.sql")),
         ("tpch_simple_q2", include_str!("tpch_simple_q2.sql")),
-        // Error: "query `tpch_simple_q3` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.lineitem' not found
-        // ("tpch_simple_q3", include_str!("tpch_simple_q3.sql")),
+        ("tpch_simple_q3", include_str!("tpch_simple_q3.sql")),
         ("tpch_simple_q4", include_str!("tpch_simple_q4.sql")),
         ("tpch_simple_q5", include_str!("tpch_simple_q5.sql")),
     ]
