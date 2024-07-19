@@ -1039,7 +1039,7 @@ mod tests {
 
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
-            params: to_secret_map(params),
+            params: Parameters::new(to_secret_map(params).into_iter().collect(), "test", &[]),
         };
         let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
 
