@@ -17,6 +17,8 @@ limitations under the License.
 use super::DataConnector;
 use super::DataConnectorError;
 use super::DataConnectorFactory;
+use super::ParameterSpec;
+use super::Parameters;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
@@ -30,14 +32,12 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
-use secrecy::ExposeSecret;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -47,8 +47,8 @@ pub enum Error {
     #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
     UnableToPublishData { source: flight_client::Error },
 
-    #[snafu(display("Missing required secrets"))]
-    MissingRequiredSecrets,
+    #[snafu(display("Missing required parameter: {parameter}"))]
+    MissingRequiredParameter { parameter: String },
 
     #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
     UnableToVerifyEndpointConnection {
@@ -98,10 +98,16 @@ impl SpiceAIFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("api_key").secret(),
+    ParameterSpec::connector("token").secret(),
+    ParameterSpec::connector("endpoint"),
+];
+
 impl DataConnectorFactory for SpiceAIFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
@@ -111,8 +117,9 @@ impl DataConnectorFactory for SpiceAIFactory {
         Box::pin(async move {
             let url: String = params
                 .get("endpoint")
-                .map(ExposeSecret::expose_secret)
-                .cloned()
+                .expose()
+                .ok()
+                .map(str::to_string)
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
@@ -124,8 +131,8 @@ impl DataConnectorFactory for SpiceAIFactory {
 
             let api_key = params
                 .get("api_key")
-                .map(|s| s.expose_secret().as_str())
-                .unwrap_or_default();
+                .expose()
+                .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
@@ -143,8 +150,8 @@ impl DataConnectorFactory for SpiceAIFactory {
         "spiceai"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["api_key"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -174,14 +181,14 @@ impl DataConnector for SpiceAI {
                 {
                     tracing::debug!("{e}");
                     return Err(DataConnectorError::UnableToGetSchema {
-                        dataconnector: "spice.ai".to_string(),
+                        dataconnector: "spiceai".to_string(),
                         dataset_name: dataset.name.to_string(),
                         table_name: table.clone(),
                     });
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "spice.ai".to_string(),
+                    dataconnector: "spiceai".to_string(),
                     source: e,
                 });
             }
