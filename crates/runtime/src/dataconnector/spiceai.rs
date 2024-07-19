@@ -181,7 +181,7 @@ impl DataConnector for SpiceAI {
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "spic.ai".to_string(),
+                    dataconnector: "spice.ai".to_string(),
                     source: e,
                 });
             }
