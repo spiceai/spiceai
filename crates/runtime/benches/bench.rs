@@ -28,7 +28,7 @@ mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let _ = run_benchmark_test(setup::DataConnector::SpiceAI).await;
+    // let _ = run_benchmark_test(setup::DataConnector::SpiceAI).await;
     let _ = run_benchmark_test(setup::DataConnector::Postgres).await;
     Ok(())
 }
