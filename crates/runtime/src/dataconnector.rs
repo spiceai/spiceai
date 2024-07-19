@@ -319,6 +319,7 @@ pub async fn register_all() {
     .await;
 }
 
+#[derive(Clone)]
 pub struct Parameters {
     params: Vec<(String, SecretString)>,
     prefix: &'static str,
@@ -340,6 +341,7 @@ pub enum ParamLookup<'a> {
 }
 
 impl<'a> ParamLookup<'a> {
+    #[must_use]
     pub fn ok(&self) -> Option<&'a SecretString> {
         match self {
             ParamLookup::Present(s) => Some(*s),
@@ -347,6 +349,7 @@ impl<'a> ParamLookup<'a> {
         }
     }
 
+    #[must_use]
     pub fn expose(self) -> ExposedParamLookup<'a> {
         match self {
             ParamLookup::Present(s) => ExposedParamLookup::Present(s.expose_secret()),
