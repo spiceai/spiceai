@@ -51,5 +51,4 @@ type AccelerationSpec struct {
 	RefreshSql           string            `json:"refresh_sql,omitempty" csv:"refresh_sql" yaml:"refresh_sql,omitempty"`
 	Retention            time.Duration     `json:"retention,omitempty" csv:"retention" yaml:"retention,omitempty"`
 	Params               map[string]string `json:"params,omitempty" csv:"params" yaml:"params,omitempty"`
-	EngineSecret         string            `json:"engine_secret,omitempty" csv:"engine_secret" yaml:"engine_secret,omitempty"`
 }

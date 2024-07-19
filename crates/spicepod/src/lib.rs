@@ -23,7 +23,7 @@ use std::{fmt::Debug, path::PathBuf};
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, extension::Extension, model::Model,
-    runtime::Runtime, secrets::Secrets, view::View,
+    runtime::Runtime, secret::Secret, view::View,
 };
 
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -36,13 +36,16 @@ pub mod spec;
 pub enum Error {
     #[snafu(display("Unable to parse spicepod.yaml: {source}"))]
     UnableToParseSpicepod { source: serde_yaml::Error },
+
     #[snafu(display("Unable to resolve spicepod components {}: {source}", path.display()))]
     UnableToResolveSpicepodComponents {
         source: component::Error,
         path: PathBuf,
     },
+
     #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
     SpicepodNotFound { path: PathBuf },
+
     #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
     DuplicateComponent { component: String, name: String },
 }
@@ -57,7 +60,7 @@ pub struct Spicepod {
 
     pub extensions: HashMap<String, Extension>,
 
-    pub secrets: Secrets,
+    pub secrets: Vec<Secret>,
 
     pub catalogs: Vec<Catalog>,
 
@@ -146,6 +149,7 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        detect_duplicate_component_names("secrets", &spicepod_definition.secrets[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;

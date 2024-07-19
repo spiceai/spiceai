@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -29,21 +29,44 @@ use super::{
 };
 
 pub struct File {
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
 }
 
 impl std::fmt::Display for File {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "File")
+        write!(f, "file")
     }
 }
 
-impl DataConnectorFactory for File {
+#[derive(Default, Copy, Clone)]
+pub struct FileFactory {}
+
+impl FileFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for FileFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(File { params }) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "file"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 
@@ -52,7 +75,7 @@ impl ListingTableConnector for File {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }
 

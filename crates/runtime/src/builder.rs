@@ -130,7 +130,7 @@ impl RuntimeBuilder {
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
-            secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
+            secrets: Arc::new(RwLock::new(secrets::Secrets::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),

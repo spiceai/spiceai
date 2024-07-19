@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{get_secret_or_param, Secret};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -29,8 +29,7 @@ use super::{
 };
 
 pub struct Https {
-    params: Arc<HashMap<String, String>>,
-    secret: Option<Secret>,
+    params: HashMap<String, SecretString>,
 }
 
 impl std::fmt::Display for Https {
@@ -39,12 +38,35 @@ impl std::fmt::Display for Https {
     }
 }
 
-impl DataConnectorFactory for Https {
+#[derive(Default, Copy, Clone)]
+pub struct HttpsFactory {}
+
+impl HttpsFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for HttpsFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params, secret }) as Arc<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(Https { params }) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "http"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["username", "password"]
     }
 }
 
@@ -53,7 +75,7 @@ impl ListingTableConnector for Https {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &HashMap<String, SecretString> {
         &self.params
     }
 
@@ -66,7 +88,7 @@ impl ListingTableConnector for Https {
             }
         })?;
 
-        if let Some(p) = self.params.get("http_port") {
+        if let Some(p) = self.params.get("port").map(ExposeSecret::expose_secret) {
             let n = match p.parse::<u16>() {
                 Ok(n) => n,
                 Err(e) => {
@@ -80,13 +102,12 @@ impl ListingTableConnector for Https {
             let _ = u.set_port(Some(n));
         };
 
-        if let Some(p) = get_secret_or_param(
-            &self.params,
-            &self.secret,
-            "http_password_key",
-            "http_password",
-        ) {
-            if u.set_password(Some(&p)).is_err() {
+        if let Some(p) = self
+            .params
+            .get("password")
+            .map(|s| s.expose_secret().as_str())
+        {
+            if u.set_password(Some(p)).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                         dataconnector: "https".to_string(),
@@ -95,7 +116,11 @@ impl ListingTableConnector for Https {
             };
         }
 
-        if let Some(p) = self.params.get("http_username") {
+        if let Some(p) = self
+            .params
+            .get("username")
+            .map(|s| s.expose_secret().as_str())
+        {
             if u.set_username(p).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {

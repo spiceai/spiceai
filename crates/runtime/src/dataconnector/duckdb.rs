@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -25,6 +24,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use duckdb::AccessMode;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -74,20 +74,44 @@ impl DuckDB {
     }
 }
 
-impl DataConnectorFactory for DuckDB {
+#[derive(Default, Copy, Clone)]
+pub struct DuckDBFactory {}
+
+impl DuckDBFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for DuckDBFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let duckdb_factory = if let Some(db_path) = params.get("open") {
-                Self::create_file(db_path)?
-            } else {
-                Self::create_in_memory()?
-            };
+            let duckdb_factory =
+                if let Some(db_path) = params.get("open").map(ExposeSecret::expose_secret) {
+                    DuckDB::create_file(db_path)?
+                } else {
+                    DuckDB::create_in_memory()?
+                };
 
-            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 
@@ -103,7 +127,7 @@ impl DataConnector for DuckDB {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path: TableReference = dataset.path().into();
 
-        if !(is_table_function(&path) || dataset.params.contains_key("open")) {
+        if !(is_table_function(&path) || dataset.params.contains_key("duckdb_open")) {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "duckdb".to_string(),
                 source: Box::new(Error::MissingDuckDBFile {}),

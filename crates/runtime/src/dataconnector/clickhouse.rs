@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::clickhouse::ClickhouseTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use db_connection_pool::clickhousepool::{self, ClickhouseConnectionPool};
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -42,27 +42,31 @@ pub struct Clickhouse {
     clickhouse_factory: ClickhouseTableFactory,
 }
 
-impl DataConnectorFactory for Clickhouse {
+#[derive(Default, Copy, Clone)]
+pub struct ClickhouseFactory {}
+
+impl ClickhouseFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for ClickhouseFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut secret_params: SecretMap = params.as_ref().into();
-
-        if let Some(secret) = secret {
-            secret.insert_to_params(
-                &mut secret_params,
-                "clickhouse_connection_string_key",
-                "clickhouse_connection_string",
-            );
-            secret.insert_to_params(&mut secret_params, "clickhouse_pass_key", "clickhouse_pass");
-        }
-
         Box::pin(async move {
-            match ClickhouseConnectionPool::new(Arc::new(secret_params.into_map())).await {
+            match ClickhouseConnectionPool::new(params).await {
                 Ok(pool) => {
                     let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
-                    Ok(Arc::new(Self { clickhouse_factory }) as Arc<dyn DataConnector>)
+                    Ok(Arc::new(Clickhouse { clickhouse_factory }) as Arc<dyn DataConnector>)
                 }
 
                 Err(e) => match e {
@@ -96,6 +100,14 @@ impl DataConnectorFactory for Clickhouse {
                 },
             }
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "clickhouse"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["connection_string", "pass"]
     }
 }
 

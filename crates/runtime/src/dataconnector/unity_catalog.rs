@@ -18,8 +18,6 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
-use crate::secrets::SecretMap;
 use crate::Runtime;
 use async_trait::async_trait;
 use data_components::delta_lake::DeltaTableFactory;
@@ -30,6 +28,7 @@ use data_components::Read;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -61,25 +60,38 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct UnityCatalog {
-    params: SecretMap,
+    params: HashMap<String, SecretString>,
 }
 
-impl DataConnectorFactory for UnityCatalog {
-    fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
+#[derive(Default, Copy, Clone)]
+pub struct UnityCatalogFactory {}
 
-        if let Some(secret) = secret {
-            for (key, value) in secret.iter() {
-                params.insert(key.to_string(), value.clone());
-            }
-        }
-        Box::pin(async move {
-            let unity_catalog = Self { params };
-            Ok(Arc::new(unity_catalog) as Arc<dyn DataConnector>)
-        })
+impl UnityCatalogFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for UnityCatalogFactory {
+    fn create(
+        &self,
+        params: HashMap<String, SecretString>,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move { Ok(Arc::new(UnityCatalog { params }) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "unity_catalog"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["token"]
     }
 }
 
@@ -131,34 +143,18 @@ impl DataConnector for UnityCatalog {
         ));
 
         // Copy the catalog params into the dataset params, and allow user to override
-        let mut dataset_params: SecretMap = catalog.params.clone().into();
+        let mut dataset_params: HashMap<String, SecretString> =
+            runtime.get_params_with_secrets(&catalog.params).await;
 
-        for (key, value) in &catalog.dataset_params {
-            dataset_params.insert(key.to_string(), value.clone().into());
+        let secret_dataset_params = runtime
+            .get_params_with_secrets(&catalog.dataset_params)
+            .await;
+
+        for (key, value) in secret_dataset_params {
+            dataset_params.insert(key, value);
         }
 
-        let secrets_provider = runtime.secrets_provider();
-        let dataset_secret = match secrets_provider
-            .read()
-            .await
-            .get_secret("delta_lake")
-            .await
-            .map_err(|source| super::DataConnectorError::UnableToReadSecrets {
-                dataconnector: "delta_lake".to_string(),
-                source,
-            }) {
-            Ok(secret) => secret,
-            Err(e) => return Some(Err(e)),
-        };
-
-        if let Some(secret) = dataset_secret {
-            for (key, value) in secret.iter() {
-                dataset_params.insert(key.to_string(), value.clone());
-            }
-        }
-
-        let delta_table_creator =
-            Arc::new(DeltaTableFactory::new(Arc::new(dataset_params.into_map()))) as Arc<dyn Read>;
+        let delta_table_creator = Arc::new(DeltaTableFactory::new(dataset_params)) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,

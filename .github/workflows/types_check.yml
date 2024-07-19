@@ -141,9 +141,7 @@ jobs:
       - name: Configure Spice secrets
         if: matrix.acceleration.engine == 'postgres'
         run: |
-          echo "[postgres_engine]" >> $HOME/.spice/auth
-          echo "  [postgres_engine.params]" >> $HOME/.spice/auth
-          echo "    pg_connection_string = 'host=localhost port=5432 dbname=testdb user=postgres password=postgres sslmode=disable'" >> $HOME/.spice/auth
+          echo 'PG_CONNECTION_STRING = "host=localhost port=5432 dbname=testdb user=postgres password=postgres sslmode=disable"' > .env
   
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres

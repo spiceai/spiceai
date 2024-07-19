@@ -18,10 +18,7 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 use runtime::{accelerated_table::AcceleratedTable, Runtime};
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    secrets::SpiceSecretStore,
-};
+use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
 
 use crate::init_tracing;
 
@@ -43,7 +40,6 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
 
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("refresh_sql_pushdown")
-        .with_secret_store(SpiceSecretStore::File)
         .with_dataset(make_spiceai_dataset(
             "eth.traces",
             "traces",
