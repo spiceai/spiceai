@@ -95,23 +95,23 @@ mod tests {
 
     #[test]
     fn test_secret_lexer_basic() {
-        let input = "Hello ${{ secret:my_secret }} world";
+        let input = "Hello ${ secret:my_secret } world";
         let lexer = SecretReplacementMatcher::new(input);
 
         let matches: Vec<ReplacementMatch> = lexer.collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].store_name, "secret");
         assert_eq!(matches[0].key, "my_secret");
-        assert_eq!(matches[0].span, 6..29);
+        assert_eq!(matches[0].span, 6..27);
     }
 
     #[test]
     fn test_secret_lexer_whitespace_variations() {
         let inputs = vec![
-            ("Hello ${{secret:my_secret}} world", 27),
-            ("Hello ${{ secret: my_secret }} world", 30),
-            ("Hello ${{  secret:my_secret  }} world", 31),
-            ("Hello ${{secret :my_secret}} world", 28),
+            ("Hello ${secret:my_secret} world", 25),
+            ("Hello ${ secret: my_secret } world", 28),
+            ("Hello ${  secret:my_secret  } world", 29),
+            ("Hello ${secret :my_secret} world", 26),
         ];
 
         for (input, expected_end) in inputs {
@@ -127,29 +127,29 @@ mod tests {
 
     #[test]
     fn test_secret_lexer_multiple_matches() {
-        let input = "Start ${{ secret:my_secret1 }} middle ${{ secret:my_secret2 }} end";
+        let input = "Start ${ secret:my_secret1 } middle ${ secret:my_secret2 } end";
         let lexer = SecretReplacementMatcher::new(input);
 
         let matches: Vec<ReplacementMatch> = lexer.collect();
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].store_name, "secret");
         assert_eq!(matches[0].key, "my_secret1");
-        assert_eq!(matches[0].span, 6..30);
+        assert_eq!(matches[0].span, 6..28);
 
         assert_eq!(matches[1].store_name, "secret");
         assert_eq!(matches[1].key, "my_secret2");
-        assert_eq!(matches[1].span, 38..62);
+        assert_eq!(matches[1].span, 36..58);
     }
 
     #[test]
     fn test_secret_lexer_invalid_formats() {
         let inputs = vec![
-            "Hello ${{secret:}} world",             // Missing key
-            "Hello ${{:my_secret}} world",          // Missing store name
-            "Hello ${{ secret my_secret }} world",  // Missing colon
-            "Hello ${{ secret: my secret }} world", // Invalid key format
-            "Hello ${{secret}} world",              // Missing colon and key
-            "Hello ${ secret:my_secret } world",    // Missing outer curly braces
+            "Hello ${secret:} world",              // Missing key
+            "Hello ${:my_secret} world",           // Missing store name
+            "Hello ${ secret my_secret } world",   // Missing colon
+            "Hello ${ secret: my secret } world",  // Invalid key format
+            "Hello ${secret} world",               // Missing colon and key
+            "Hello ${{ secret:my_secret }} world", // Invalid style
         ];
 
         for input in inputs {
