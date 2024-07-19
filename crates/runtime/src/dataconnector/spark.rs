@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use data_components::spark_connect::SparkConnect;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -59,18 +59,11 @@ pub struct Spark {
 }
 
 impl Spark {
-    async fn new(
-        secret: Arc<Option<Secret>>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Result<Self> {
-        let plain_text_connection = params.get("spark_remote");
-        let secret_connection = secret.as_ref().as_ref().and_then(|s| s.get("spark_remote"));
-        let conn = match (plain_text_connection, secret_connection) {
-            (Some(_), Some(_)) => DuplicatedSparkRemoteSnafu.fail(),
-            (_, Some(conn)) => Ok(conn),
-            (Some(conn), _) => Ok(conn.as_str()),
-            _ => MissingSparkRemoteSnafu.fail(),
-        }?;
+    async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
+        let conn = params.get("remote").map(|s| s.expose_secret().as_str());
+        let Some(conn) = conn else {
+            return MissingSparkRemoteSnafu.fail();
+        };
         SparkConnect::validate_connection_string(conn)
             .context(InvalidEndpointSnafu { endpoint: conn })?;
         let spark = SparkConnect::from_connection(conn)
@@ -82,13 +75,28 @@ impl Spark {
     }
 }
 
-impl DataConnectorFactory for Spark {
+#[derive(Default, Copy, Clone)]
+pub struct SparkFactory {}
+
+impl SparkFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for SparkFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match Spark::new(Arc::new(secret), params).await {
+            match Spark::new(params).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
                 Err(e) => match e {
                     Error::DuplicatedSparkRemote
@@ -112,6 +120,14 @@ impl DataConnectorFactory for Spark {
                 },
             }
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spark"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &["remote"]
     }
 }
 

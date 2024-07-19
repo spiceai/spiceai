@@ -263,15 +263,6 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn engine_secret(&self) -> Option<String> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.engine_secret.clone();
-        }
-
-        None
-    }
-
-    #[must_use]
     pub fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             if let Some(refresh_check_interval) = &acceleration.refresh_check_interval {

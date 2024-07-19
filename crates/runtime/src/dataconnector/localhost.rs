@@ -16,11 +16,11 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
@@ -79,13 +79,31 @@ impl LocalhostConnector {
     }
 }
 
-impl DataConnectorFactory for LocalhostConnector {
+#[derive(Default, Copy, Clone)]
+pub struct LocalhostConnectorFactory {}
+
+impl LocalhostConnectorFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for LocalhostConnectorFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: HashMap<String, SecretString>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let schema = params.get("schema").ok_or(Error::MissingSchemaParameter)?;
+            let schema = params
+                .get("schema")
+                .map(ExposeSecret::expose_secret)
+                .ok_or(Error::MissingSchemaParameter)?;
 
             let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
                 UnableToParseSchemaSnafu {
@@ -105,10 +123,16 @@ impl DataConnectorFactory for LocalhostConnector {
                 .build_schema(columns)
                 .context(UnableToParseSchemaFromColumnDefinitionsSnafu)?;
 
-            Ok(Arc::new(LocalhostConnector {
-                schema: Arc::new(schema),
-            }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(LocalhostConnector::new(Arc::new(schema))) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "localhost"
+    }
+
+    fn autoload_secrets(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 
