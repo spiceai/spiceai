@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameter};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -56,6 +56,25 @@ impl ClickhouseFactory {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
+
+const PARAMETERS: &[Parameter] = &[
+    // clickhouse_connection_string
+    Parameter::connector("connection_string").secret(),
+    // clickhouse_pass
+    Parameter::connector("pass").secret(),
+    // clickhouse_user
+    Parameter::connector("user"),
+    // clickhouse_host
+    Parameter::connector("host"),
+    // clickhouse_tcp_port
+    Parameter::connector("tcp_port"),
+    // clickhouse_db
+    Parameter::connector("db"),
+    // clickhouse_secure
+    Parameter::connector("secure"),
+    // connection_timeout
+    Parameter::runtime("connection_timeout"),
+];
 
 impl DataConnectorFactory for ClickhouseFactory {
     fn create(
@@ -106,8 +125,8 @@ impl DataConnectorFactory for ClickhouseFactory {
         "clickhouse"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["connection_string", "pass"]
+    fn parameters(&self) -> &'static [Parameter] {
+        &PARAMETERS
     }
 }
 
