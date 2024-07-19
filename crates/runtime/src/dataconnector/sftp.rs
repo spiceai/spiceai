@@ -15,15 +15,18 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
+    Parameters,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -35,7 +38,7 @@ pub enum Error {
 }
 
 pub struct SFTP {
-    params: HashMap<String, SecretString>,
+    params: Parameters,
 }
 
 impl std::fmt::Display for SFTP {
@@ -59,10 +62,30 @@ impl SFTPFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("port").description("The port to connect to."),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
 impl DataConnectorFactory for SFTPFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let sftp = SFTP { params };
@@ -74,8 +97,8 @@ impl DataConnectorFactory for SFTPFactory {
         "sftp"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["user", "pass"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -84,7 +107,7 @@ impl ListingTableConnector for SFTP {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, SecretString> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 
