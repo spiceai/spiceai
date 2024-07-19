@@ -489,20 +489,31 @@ impl Parameters {
     ///
     /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
     pub fn get<'a>(&'a self, name: &str) -> ParamLookup<'a> {
-        let spec = if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
-            spec
-        } else {
-            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory.");
-        };
+        let spec = self.describe(name);
 
         if let Some(param_value) = self.params.iter().find(|p| p.0 == name) {
             ParamLookup::Present(&param_value.1)
         } else {
-            ParamLookup::Absent(if self.prefix.is_empty() {
-                UserParam(spec.name.to_string())
-            } else {
-                UserParam(format!("{}_{}", self.prefix, spec.name))
-            })
+            ParamLookup::Absent(self.user_param(name))
+        }
+    }
+
+    pub fn describe(&self, name: &str) -> &ParameterSpec {
+        if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
+            spec
+        } else {
+            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory.");
+        }
+    }
+
+    /// Retrieves the user-facing parameter name for the given parameter.
+    pub fn user_param(&self, name: &str) -> UserParam {
+        let spec = self.describe(name);
+
+        if self.prefix.is_empty() {
+            UserParam(spec.name.to_string())
+        } else {
+            UserParam(format!("{}_{}", self.prefix, spec.name))
         }
     }
 }

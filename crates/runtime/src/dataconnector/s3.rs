@@ -125,15 +125,6 @@ impl ListingTableConnector for S3 {
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
-        // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
-        // using a fragment with / suffix to trick df to think this is still a collection
-        // will need to raise an issue with DF to use url without query and fragment to decide if
-        // is_collection
-        // PR: https://github.com/apache/datafusion/pull/10419/files
-        if dataset.from.ends_with('/') {
-            fragments.push("dfiscollectionbugworkaround=hack/".into());
-        }
-
         s3_url.set_fragment(Some(&fragments.join("&")));
 
         Ok(s3_url)

@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -106,13 +105,13 @@ impl ListingTableConnector for FTP {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(ftp_port) = self.params.get("port").map(ExposeSecret::expose_secret) {
+        if let Some(ftp_port) = self.params.get("port").expose().ok() {
             fragment_builder.append_pair("port", ftp_port);
         }
-        if let Some(ftp_user) = self.params.get("user").map(ExposeSecret::expose_secret) {
+        if let Some(ftp_user) = self.params.get("user").expose().ok() {
             fragment_builder.append_pair("user", ftp_user);
         }
-        if let Some(ftp_password) = self.params.get("pass").map(ExposeSecret::expose_secret) {
+        if let Some(ftp_password) = self.params.get("pass").expose().ok() {
             fragment_builder.append_pair("password", ftp_password);
         }
         fragments.push(fragment_builder.finish());
@@ -124,10 +123,6 @@ impl ListingTableConnector for FTP {
                     dataconnector: format!("{self}"),
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
-
-        if dataset.from.ends_with('/') {
-            fragments.push("dfiscollectionbugworkaround=hack/".into());
-        }
 
         ftp_url.set_fragment(Some(&fragments.join("&")));
 

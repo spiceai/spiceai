@@ -111,10 +111,6 @@ impl ListingTableConnector for SFTP {
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
-        if dataset.from.ends_with('/') {
-            fragments.push("dfiscollectionbugworkaround=hack/".into());
-        }
-
         ftp_url.set_fragment(Some(&fragments.join("&")));
 
         Ok(ftp_url)
