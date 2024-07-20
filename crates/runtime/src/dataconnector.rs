@@ -1037,9 +1037,24 @@ mod tests {
         }
     }
 
+    const TEST_PARAMETERS: &[ParameterSpec] = &[
+        ParameterSpec::runtime("file_extension"),
+        ParameterSpec::runtime("file_format"),
+        ParameterSpec::runtime("csv_has_header"),
+        ParameterSpec::runtime("csv_quote"),
+        ParameterSpec::runtime("csv_escape"),
+        ParameterSpec::runtime("csv_schema_infer_max_records"),
+        ParameterSpec::runtime("csv_delimiter"),
+        ParameterSpec::runtime("file_compression_type"),
+    ];
+
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
-            params: Parameters::new(to_secret_map(params).into_iter().collect(), "test", &[]),
+            params: Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                "test",
+                TEST_PARAMETERS,
+            ),
         };
         let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
 
