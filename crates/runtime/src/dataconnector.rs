@@ -254,32 +254,23 @@ pub async fn create_new_connector(
 
     let connector_factory = guard.get(name);
 
-    match connector_factory {
-        Some(factory) => {
-            let mut params = remove_prefix_from_hashmap_keys(params, factory.prefix());
-            let secret_guard = secrets.read().await;
+    let factory = connector_factory?;
 
-            // Try to autoload secrets that might be missing from params.
-            for secret_key in factory.autoload_secrets().iter().copied() {
-                let secret_key_with_prefix = format!("{}_{secret_key}", factory.prefix());
-                tracing::debug!(
-                    "Attempting to autoload secret for {name}: {secret_key_with_prefix}",
-                );
-                if params.contains_key(secret_key) {
-                    continue;
-                }
-                let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
-                if let Ok(Some(secret)) = secret {
-                    tracing::debug!("Autoloading secret for {name}: {secret_key_with_prefix}",);
-                    // Insert without the prefix into the params
-                    params.insert(secret_key.to_string(), secret);
-                }
-            }
-            let result = factory.create(params).await;
-            Some(result)
-        }
-        None => None,
-    }
+    let params = match Parameters::try_new(
+        name,
+        params.into_iter().collect(),
+        factory.prefix(),
+        secrets,
+        factory.parameters(),
+    )
+    .await
+    {
+        Ok(params) => params,
+        Err(e) => return Some(Err(e)),
+    };
+
+    let result = factory.create(params).await;
+    Some(result)
 }
 
 pub async fn register_all() {
@@ -326,15 +317,326 @@ pub async fn register_all() {
     .await;
 }
 
+#[derive(Clone)]
+pub struct Parameters {
+    params: Vec<(String, SecretString)>,
+    prefix: &'static str,
+    all_params: &'static [ParameterSpec],
+}
+
+#[derive(Debug, Clone)]
+pub struct UserParam(String);
+
+impl Display for UserParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub enum ParamLookup<'a> {
+    Present(&'a SecretString),
+    Absent(UserParam),
+}
+
+impl<'a> ParamLookup<'a> {
+    #[must_use]
+    pub fn ok(&self) -> Option<&'a SecretString> {
+        match self {
+            ParamLookup::Present(s) => Some(*s),
+            ParamLookup::Absent(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn expose(self) -> ExposedParamLookup<'a> {
+        match self {
+            ParamLookup::Present(s) => ExposedParamLookup::Present(s.expose_secret()),
+            ParamLookup::Absent(s) => ExposedParamLookup::Absent(s),
+        }
+    }
+
+    pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a SecretString, E> {
+        match self {
+            ParamLookup::Present(s) => Ok(s),
+            ParamLookup::Absent(s) => Err(f(s)),
+        }
+    }
+}
+
+pub enum ExposedParamLookup<'a> {
+    Present(&'a str),
+    Absent(UserParam),
+}
+
+impl<'a> ExposedParamLookup<'a> {
+    #[must_use]
+    pub fn ok(self) -> Option<&'a str> {
+        match self {
+            ExposedParamLookup::Present(s) => Some(s),
+            ExposedParamLookup::Absent(_) => None,
+        }
+    }
+
+    pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a str, E> {
+        match self {
+            ExposedParamLookup::Present(s) => Ok(s),
+            ExposedParamLookup::Absent(s) => Err(f(s)),
+        }
+    }
+}
+
+impl Parameters {
+    pub async fn try_new(
+        connector_name: &str,
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        secrets: Arc<RwLock<Secrets>>,
+        all_params: &'static [ParameterSpec],
+    ) -> AnyErrorResult<Self> {
+        let full_prefix = format!("{prefix}_");
+
+        // Convert the user-provided parameters into the format expected by the data connector
+        let mut params: Vec<(String, SecretString)> = params
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let mut unprefixed_key = key.as_str();
+                let mut has_prefix = false;
+                if key.starts_with(&full_prefix) {
+                    has_prefix = true;
+                    unprefixed_key = &key[full_prefix.len()..];
+                }
+
+                let spec = all_params.iter().find(|p| p.name == unprefixed_key);
+
+                let Some(spec) = spec else {
+                    tracing::warn!("Ignoring parameter {key}: not supported for {connector_name}.");
+                    return None;
+                };
+
+                if !has_prefix && spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {connector_name}."
+                );
+                    return None;
+                }
+
+                Some((key[full_prefix.len()..].to_string(), value))
+            })
+            .collect();
+        let secret_guard = secrets.read().await;
+
+        // Try to autoload secrets that might be missing from params.
+        for secret_key in all_params.iter().filter(|p| p.secret) {
+            let secret_key_with_prefix = format!("{prefix}_{}", secret_key.name);
+            tracing::debug!(
+                "Attempting to autoload secret for {connector_name}: {secret_key_with_prefix}",
+            );
+            if params.iter().any(|p| p.0 == secret_key.name) {
+                continue;
+            }
+            let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+            if let Ok(Some(secret)) = secret {
+                tracing::debug!(
+                    "Autoloading secret for {connector_name}: {secret_key_with_prefix}",
+                );
+                // Insert without the prefix into the params
+                params.push((secret_key.name.to_string(), secret));
+            }
+        }
+
+        // Check if all required parameters are present
+        for parameter in all_params {
+            // If the parameter is missing and has a default value, add it to the params
+            let missing = !params.iter().any(|p| p.0 == parameter.name);
+            if missing {
+                if let Some(default_value) = parameter.default {
+                    params.push((parameter.name.to_string(), default_value.to_string().into()));
+                    continue;
+                }
+            }
+
+            if parameter.required && missing {
+                return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: connector_name.to_string(),
+                    message: format!("Missing required parameter: {}", parameter.name),
+                }));
+            }
+        }
+
+        Ok(Parameters::new(params, prefix, all_params))
+    }
+
+    #[must_use]
+    pub fn new(
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        all_params: &'static [ParameterSpec],
+    ) -> Self {
+        Self {
+            params,
+            prefix,
+            all_params,
+        }
+    }
+
+    #[must_use]
+    pub fn to_secret_map(&self) -> HashMap<String, SecretString> {
+        self.params.iter().cloned().collect()
+    }
+
+    /// Returns the `SecretString` for the given parameter, or the user-facing parameter name of the missing parameter.
+    #[must_use]
+    pub fn get<'a>(&'a self, name: &str) -> ParamLookup<'a> {
+        if let Some(param_value) = self.params.iter().find(|p| p.0 == name) {
+            ParamLookup::Present(&param_value.1)
+        } else {
+            ParamLookup::Absent(self.user_param(name))
+        }
+    }
+
+    /// Gets the `ParameterSpec` for the given parameter name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
+    #[must_use]
+    pub fn describe(&self, name: &str) -> &ParameterSpec {
+        if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
+            spec
+        } else {
+            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory.");
+        }
+    }
+
+    /// Retrieves the user-facing parameter name for the given parameter.
+    #[must_use]
+    pub fn user_param(&self, name: &str) -> UserParam {
+        let spec = self.describe(name);
+
+        if self.prefix.is_empty() {
+            UserParam(spec.name.to_string())
+        } else {
+            UserParam(format!("{}_{}", self.prefix, spec.name))
+        }
+    }
+}
+
+pub struct ParameterSpec {
+    pub name: &'static str,
+    pub required: bool,
+    pub default: Option<&'static str>,
+    pub secret: bool,
+    pub description: &'static str,
+    pub help_link: &'static str,
+    pub examples: &'static [&'static str],
+    pub r#type: ParameterType,
+}
+
+impl ParameterSpec {
+    #[must_use]
+    pub const fn connector(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            default: None,
+            secret: false,
+            description: "",
+            help_link: "",
+            examples: &[],
+            r#type: ParameterType::Connector,
+        }
+    }
+
+    #[must_use]
+    pub const fn runtime(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            default: None,
+            secret: false,
+            description: "",
+            help_link: "",
+            examples: &[],
+            r#type: ParameterType::Runtime,
+        }
+    }
+
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn default(mut self, default: &'static str) -> Self {
+        self.default = Some(default);
+        self
+    }
+
+    #[must_use]
+    pub const fn secret(mut self) -> Self {
+        self.secret = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    #[must_use]
+    pub const fn help_link(mut self, help_link: &'static str) -> Self {
+        self.help_link = help_link;
+        self
+    }
+
+    #[must_use]
+    pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
+        self.examples = examples;
+        self
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum ParameterType {
+    /// A parameter which tells Spice how to connect to the underlying data source.
+    ///
+    /// These parameters are automatically prefixed with the data connector's prefix.
+    ///
+    /// # Examples
+    ///
+    /// In Postgres, the `host` is a Connector parameter and would be auto-prefixed with `pg_`.
+    #[default]
+    Connector,
+    /// Other parameters which control how the runtime interacts with the data source, but does
+    /// not affect the actual connection.
+    ///
+    /// These parameters are not prefixed with the data connector's prefix.
+    ///
+    /// # Examples
+    ///
+    /// In Databricks, the `mode` parameter is used to select which connection to use, and thus is
+    /// not a Connector parameter.
+    Runtime,
+}
+
+impl ParameterType {
+    #[must_use]
+    pub const fn is_prefixed(&self) -> bool {
+        matches!(self, Self::Connector)
+    }
+}
+
 pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
     /// The prefix to use for parameters and secrets for this `DataConnector`.
     ///
-    /// Any parameter specified in `params` not prefixed with this value will be ignored.
+    /// This prefix is applied to any `ParameterType::Connector` parameters.
     ///
     /// ## Example
     ///
@@ -346,10 +648,10 @@ pub trait DataConnectorFactory: Send + Sync {
     /// The prefix will be stripped from the parameter name before being passed to the data connector.
     fn prefix(&self) -> &'static str;
 
-    /// Specify which secrets the runtime should attempt to autoload from the configured secret stores.
+    /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
     ///
-    /// Will automatically be prefixed by `prefix`.
-    fn autoload_secrets(&self) -> &'static [&'static str];
+    /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
+    fn parameters(&self) -> &'static [ParameterSpec];
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -431,7 +733,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
-    fn get_params(&self) -> &HashMap<String, SecretString>;
+    fn get_params(&self) -> &Parameters;
 
     #[must_use]
     fn get_session_context() -> SessionContext {
@@ -506,13 +808,11 @@ pub trait ListingTableConnector: DataConnector {
         let params = self.get_params();
         let extension = params
             .get("file_extension")
-            .map(ExposeSecret::expose_secret)
-            .cloned();
+            .expose()
+            .ok()
+            .map(str::to_string);
 
-        match params
-            .get("file_format")
-            .map(|f| f.expose_secret().as_str())
-        {
+        match params.get("file_format").expose().ok() {
             Some("csv") => Ok((
                 Some(self.get_csv_format(params)?),
                 extension.unwrap_or(".csv".to_string()),
@@ -547,32 +847,40 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
-    fn get_csv_format(
-        &self,
-        params: &HashMap<String, SecretString>,
-    ) -> DataConnectorResult<Arc<CsvFormat>>
+    fn get_csv_format(&self, params: &Parameters) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
     {
-        let has_header = params.get("has_header").map_or(true, |f| {
-            f.expose_secret().as_str().eq_ignore_ascii_case("true")
-        });
-        let quote = params.get("quote").map_or(b'"', |f| {
-            *f.expose_secret().as_bytes().first().unwrap_or(&b'"')
-        });
+        let has_header = params
+            .get("csv_has_header")
+            .expose()
+            .ok()
+            .map_or(true, |f| f.eq_ignore_ascii_case("true"));
+        let quote = params
+            .get("csv_quote")
+            .expose()
+            .ok()
+            .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
         let escape = params
-            .get("escape")
-            .and_then(|f| f.expose_secret().as_bytes().first().copied());
-        let schema_infer_max_rec = params.get("schema_infer_max_records").map_or_else(
-            || 1000,
-            |f| usize::from_str(f.expose_secret().as_str()).map_or(1000, |f| f),
-        );
-        let delimiter = params.get("delimiter").map_or(b',', |f| {
-            *f.expose_secret().as_bytes().first().unwrap_or(&b',')
-        });
+            .get("csv_escape")
+            .expose()
+            .ok()
+            .and_then(|f| f.as_bytes().first().copied());
+        let schema_infer_max_rec = params
+            .get("csv_schema_infer_max_records")
+            .expose()
+            .ok()
+            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
+        let delimiter = params
+            .get("csv_delimiter")
+            .expose()
+            .ok()
+            .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
         let compression_type = params
-            .get("compression_type")
-            .map_or("", |f| f.expose_secret().as_str());
+            .get("file_compression_type")
+            .expose()
+            .ok()
+            .unwrap_or_default();
 
         Ok(Arc::new(
             CsvFormat::default()
@@ -674,37 +982,6 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 }
 
-/// Filters out keys in a hashmap that do not start with the specified prefix, and removes the prefix from the keys that remain.
-///
-/// It also logs a warning for each key that is filtered out.
-///
-/// # Panics
-///
-/// Panics if `prefix` ends with an underscore.
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn remove_prefix_from_hashmap_keys<V>(
-    hashmap: HashMap<String, V>,
-    prefix: &str,
-) -> HashMap<String, V> {
-    assert!(
-        !prefix.ends_with('_'),
-        "Prefix must not end with an underscore"
-    );
-    let prefix = format!("{prefix}_");
-    hashmap
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if key.starts_with(&prefix) {
-                Some((key[prefix.len()..].to_string(), value))
-            } else {
-                tracing::warn!("Ignoring parameter {key}: does not start with `{prefix}`");
-                None
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -712,7 +989,7 @@ mod tests {
     use super::*;
 
     struct TestConnector {
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     }
 
     impl std::fmt::Display for TestConnector {
@@ -724,7 +1001,7 @@ mod tests {
     impl DataConnectorFactory for TestConnector {
         fn create(
             &self,
-            params: HashMap<String, SecretString>,
+            params: Parameters,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };
@@ -736,7 +1013,7 @@ mod tests {
             "test"
         }
 
-        fn autoload_secrets(&self) -> &'static [&'static str] {
+        fn parameters(&self) -> &'static [ParameterSpec] {
             &[]
         }
     }
@@ -746,7 +1023,7 @@ mod tests {
             self
         }
 
-        fn get_params(&self) -> &HashMap<String, SecretString> {
+        fn get_params(&self) -> &Parameters {
             &self.params
         }
 
@@ -760,9 +1037,24 @@ mod tests {
         }
     }
 
+    const TEST_PARAMETERS: &[ParameterSpec] = &[
+        ParameterSpec::runtime("file_extension"),
+        ParameterSpec::runtime("file_format"),
+        ParameterSpec::runtime("csv_has_header"),
+        ParameterSpec::runtime("csv_quote"),
+        ParameterSpec::runtime("csv_escape"),
+        ParameterSpec::runtime("csv_schema_infer_max_records"),
+        ParameterSpec::runtime("csv_delimiter"),
+        ParameterSpec::runtime("file_compression_type"),
+    ];
+
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
-            params: to_secret_map(params),
+            params: Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                "test",
+                TEST_PARAMETERS,
+            ),
         };
         let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
 
@@ -836,60 +1128,5 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
-    }
-
-    #[test]
-    fn test_remove_prefix() {
-        let mut hashmap = HashMap::new();
-        hashmap.insert("prefix_key1".to_string(), "value1".to_string());
-        hashmap.insert("prefix_key2".to_string(), "value2".to_string());
-        hashmap.insert("key3".to_string(), "value3".to_string());
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let mut expected = HashMap::new();
-        expected.insert("key1".to_string(), "value1".to_string());
-        expected.insert("key2".to_string(), "value2".to_string());
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_no_prefix() {
-        let mut hashmap = HashMap::new();
-        hashmap.insert("key1".to_string(), "value1".to_string());
-        hashmap.insert("key2".to_string(), "value2".to_string());
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let expected = HashMap::new();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_empty_hashmap() {
-        let hashmap: HashMap<String, String> = HashMap::new();
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let expected: HashMap<String, String> = HashMap::new();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_full_prefix() {
-        let mut hashmap = HashMap::new();
-        hashmap.insert("prefix_".to_string(), "value1".to_string());
-        hashmap.insert("prefix_key2".to_string(), "value2".to_string());
-
-        let result = remove_prefix_from_hashmap_keys(hashmap, "prefix");
-
-        let mut expected = HashMap::new();
-        expected.insert(String::new(), "value1".to_string());
-        expected.insert("key2".to_string(), "value2".to_string());
-
-        assert_eq!(result, expected);
     }
 }

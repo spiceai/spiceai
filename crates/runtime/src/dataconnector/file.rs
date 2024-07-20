@@ -15,21 +15,20 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::Url;
 
 use super::{
     DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
-    ListingTableConnector,
+    ListingTableConnector, ParameterSpec, Parameters,
 };
 
 pub struct File {
-    params: HashMap<String, SecretString>,
+    params: Parameters,
 }
 
 impl std::fmt::Display for File {
@@ -53,10 +52,26 @@ impl FileFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
 impl DataConnectorFactory for FileFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(File { params }) as Arc<dyn DataConnector>) })
     }
@@ -65,8 +80,8 @@ impl DataConnectorFactory for FileFactory {
         "file"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -75,7 +90,7 @@ impl ListingTableConnector for File {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, SecretString> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 

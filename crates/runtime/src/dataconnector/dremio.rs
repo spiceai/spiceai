@@ -16,6 +16,8 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::ParameterSpec;
+use super::Parameters;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
@@ -28,21 +30,16 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
-use secrecy::ExposeSecret;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: endpoint"))]
-    MissingEndpointParameter,
-
-    #[snafu(display("Missing required secrets"))]
-    MissingSecrets,
+    #[snafu(display("Missing required parameter: {parameter}"))]
+    MissingParameter { parameter: String },
 
     #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
     UnableToVerifyEndpointConnection {
@@ -91,17 +88,25 @@ impl DremioFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("endpoint"),
+];
+
 impl DataConnectorFactory for DremioFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
                 .get("endpoint")
-                .map(ExposeSecret::expose_secret)
-                .cloned()
-                .context(MissingEndpointParameterSnafu)?;
+                .expose()
+                .ok_or_else(|p| Error::MissingParameter {
+                    parameter: p.to_string(),
+                })?
+                .to_string();
 
             verify_endpoint_connection(&endpoint)
                 .await
@@ -111,14 +116,8 @@ impl DataConnectorFactory for DremioFactory {
 
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                params
-                    .get("username")
-                    .map(|p| p.expose_secret().as_str())
-                    .unwrap_or_default(),
-                params
-                    .get("password")
-                    .map(|p| p.expose_secret().as_str())
-                    .unwrap_or_default(),
+                params.get("username").expose().ok().unwrap_or_default(),
+                params.get("password").expose().ok().unwrap_or_default(),
             )
             .await
             .context(UnableToCreateFlightClientSnafu)?;
@@ -132,8 +131,8 @@ impl DataConnectorFactory for DremioFactory {
         "dremio"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["username", "password"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

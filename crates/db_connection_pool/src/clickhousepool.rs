@@ -14,22 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    str::{FromStr, ParseBoolError},
-    sync::Arc,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
 };
-use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use secrecy::{ExposeSecret, Secret, SecretString};
-use snafu::{ResultExt, Snafu};
-use url::Url;
+use snafu::Snafu;
 
 use crate::dbconnection::clickhouseconn::ClickhouseConnection;
 
@@ -42,21 +34,10 @@ pub enum Error {
         source: clickhouse_rs::errors::ConnectionError,
     },
 
-    #[snafu(display("InvalidConnectionStringError: {source}"))]
-    InvalidConnectionStringError {
-        source: clickhouse_rs::errors::Error,
-    },
-
     #[snafu(display("ConnectionTlsError: {source}"))]
     ConnectionTlsError {
         source: clickhouse_rs::errors::ConnectionError,
     },
-
-    #[snafu(display("Unable to parse the connection string as a URL: {source}"))]
-    UnableToParseConnectionString { source: url::ParseError },
-
-    #[snafu(display("Unable to sanitize the connection string"))]
-    UnableToSanitizeConnectionString,
 
     #[snafu(display("ConnectionPoolRunError: {source}"))]
     ConnectionPoolRunError {
@@ -69,25 +50,6 @@ pub enum Error {
     InvalidUsernameOrPasswordError {
         source: clickhouse_rs::errors::Error,
     },
-
-    #[snafu(display("Cannot connect to ClickHouse on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
-    InvalidHostOrPortError {
-        source: Box<dyn std::error::Error + Sync + Send>,
-        host: String,
-        port: String,
-    },
-
-    #[snafu(display("Missing required parameter: {parameter_name}"))]
-    MissingRequiredParameterForConnection { parameter_name: String },
-
-    #[snafu(display("Invalid secure parameter value {parameter_name}"))]
-    InvalidSecureParameterValueError {
-        parameter_name: String,
-        source: ParseBoolError,
-    },
-
-    #[snafu(display("Invalid clickhouse_connection_timeout value: {source}"))]
-    InvalidConnectionTimeoutValue { source: std::num::ParseIntError },
 }
 
 pub struct ClickhouseConnectionPool {
@@ -97,101 +59,15 @@ pub struct ClickhouseConnectionPool {
 
 impl ClickhouseConnectionPool {
     // Creates a new instance of `ClickhouseConnectionPool`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
-        let (options, compute_context) = get_config_from_params(&params).await?;
-
+    #[must_use]
+    pub fn new(options: Options, compute_context: String) -> Self {
         let pool = Pool::new(options);
 
-        Ok(Self {
+        Self {
             pool: Arc::new(pool),
             join_push_down: JoinPushDown::AllowedFor(compute_context),
-        })
+        }
     }
-}
-
-const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Returns a Clickhouse `Options` based on user-provided parameters.
-/// Also returns the sanitized connection string for use as a federation `compute_context`.
-async fn get_config_from_params(
-    params: &HashMap<String, SecretString>,
-) -> Result<(Options, String)> {
-    let connection_string =
-        if let Some(clickhouse_connection_string) = params.get("connection_string") {
-            clickhouse_connection_string.expose_secret().to_string()
-        } else {
-            let user = params.get("user").map(Secret::expose_secret).ok_or(
-                Error::MissingRequiredParameterForConnection {
-                    parameter_name: "clickhouse_user".to_string(),
-                },
-            )?;
-            let password = params
-                .get("pass")
-                .map(Secret::expose_secret)
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let host = params.get("host").map(Secret::expose_secret).ok_or(
-                Error::MissingRequiredParameterForConnection {
-                    parameter_name: "clickhouse_tcp_host".to_string(),
-                },
-            )?;
-            let port = params.get("tcp_port").map(Secret::expose_secret).ok_or(
-                Error::MissingRequiredParameterForConnection {
-                    parameter_name: "clickhouse_port".to_string(),
-                },
-            )?;
-
-            let port_in_usize = u16::from_str(port)
-                .map_err(std::convert::Into::into)
-                .context(InvalidHostOrPortSnafu { host, port })?;
-            verify_ns_lookup_and_tcp_connect(host, port_in_usize)
-                .await
-                .map_err(std::convert::Into::into)
-                .context(InvalidHostOrPortSnafu { host, port })?;
-            let db = params.get("db").map(Secret::expose_secret).ok_or(
-                Error::MissingRequiredParameterForConnection {
-                    parameter_name: "clickhouse_db".to_string(),
-                },
-            )?;
-
-            format!("tcp://{user}:{password}@{host}:{port}/{db}")
-        };
-
-    let mut sanitized_connection_string =
-        Url::parse(&connection_string).context(UnableToParseConnectionStringSnafu)?;
-    sanitized_connection_string
-        .set_password(None)
-        .map_err(|()| Error::UnableToSanitizeConnectionString)?;
-
-    let mut options =
-        Options::from_str(&connection_string).context(InvalidConnectionStringSnafu)?;
-    if !connection_string.contains("connection_timeout") {
-        // Default timeout of 500ms is not enough in some cases.
-        options = options.connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
-    }
-
-    if let Some(connection_timeout) = params.get("connection_timeout").map(Secret::expose_secret) {
-        let connection_timeout = connection_timeout
-            .parse::<u64>()
-            .context(InvalidConnectionTimeoutValueSnafu)?;
-        options = options.connection_timeout(Duration::from_millis(connection_timeout));
-    }
-
-    let secure = params
-        .get("secure")
-        .map(Secret::expose_secret)
-        .map(|s| s.parse::<bool>())
-        .transpose()
-        .context(InvalidSecureParameterValueSnafu {
-            parameter_name: "clickhouse_secure".to_string(),
-        })?;
-    options = options.secure(secure.unwrap_or(true));
-
-    Ok((options, sanitized_connection_string.to_string()))
 }
 
 #[async_trait]
