@@ -1,25 +1,30 @@
 ---
-    name: benchmark tests
+name: benchmark tests
 
-    on:
-      workflow_dispatch:
+on:
+  workflow_dispatch:
 
-    jobs:
-      build:
-        name: Benchmark Tests
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
+jobs:
+  build:
+    name: Benchmark Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-          - name: Set up Rust
-            uses: ./.github/actions/setup-rust
-            with:
-              os: 'linux'
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
 
-          - name: Set up Spice.ai API Key
-            run: |
-              echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
+      - name: Set up Spice.ai API Key
+        run: |
+          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
-          - run: cargo bench -p runtime
-            env:
-                UPLOAD_RESULTS_DATASET: "spiceai.tests.oss_benchmarks"
+      - run: cargo bench -p runtime --features postgres
+        env:
+          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          PG_BENCHMARK_PG_HOST: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_HOST }}
+          PG_BENCHMARK_PG_USER: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_USER }}
+          PG_BENCHMARK_PG_PASS: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_PASS }}
+          PG_BENCHMARK_PG_SSLMODE: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_SSLMODE }}
+          PG_BENCHMARK_PG_DBNAME: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_DBNAME }}
