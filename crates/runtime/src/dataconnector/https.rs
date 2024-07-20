@@ -15,21 +15,20 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::Url;
 
 use super::{
     DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,
-    ListingTableConnector,
+    ListingTableConnector, ParameterSpec, Parameters,
 };
 
 pub struct Https {
-    params: HashMap<String, SecretString>,
+    params: Parameters,
 }
 
 impl std::fmt::Display for Https {
@@ -53,10 +52,30 @@ impl HttpsFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("port").description("The port to connect to."),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
 impl DataConnectorFactory for HttpsFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(Https { params }) as Arc<dyn DataConnector>) })
     }
@@ -65,8 +84,8 @@ impl DataConnectorFactory for HttpsFactory {
         "http"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["username", "password"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -75,7 +94,7 @@ impl ListingTableConnector for Https {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, SecretString> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 
@@ -88,13 +107,16 @@ impl ListingTableConnector for Https {
             }
         })?;
 
-        if let Some(p) = self.params.get("port").map(ExposeSecret::expose_secret) {
+        if let Some(p) = self.params.get("port").expose().ok() {
             let n = match p.parse::<u16>() {
                 Ok(n) => n,
                 Err(e) => {
                     return Err(DataConnectorError::InvalidConfiguration {
                         dataconnector: "https".to_string(),
-                        message: format!("Invalid port parameter: {e}"),
+                        message: format!(
+                            "Invalid `{}` parameter: {e}",
+                            self.params.user_param("port")
+                        ),
                         source: Box::new(e),
                     });
                 }
@@ -102,11 +124,7 @@ impl ListingTableConnector for Https {
             let _ = u.set_port(Some(n));
         };
 
-        if let Some(p) = self
-            .params
-            .get("password")
-            .map(|s| s.expose_secret().as_str())
-        {
+        if let Some(p) = self.params.get("password").expose().ok() {
             if u.set_password(Some(p)).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
@@ -116,11 +134,7 @@ impl ListingTableConnector for Https {
             };
         }
 
-        if let Some(p) = self
-            .params
-            .get("username")
-            .map(|s| s.expose_secret().as_str())
-        {
+        if let Some(p) = self.params.get("username").expose().ok() {
             if u.set_username(p).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {

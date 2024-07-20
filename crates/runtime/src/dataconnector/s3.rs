@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
+    Parameters,
+};
 
 use crate::component::dataset::Dataset;
-use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
+use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
 
 #[derive(Debug, Snafu)]
@@ -43,7 +45,7 @@ pub enum Error {
 }
 
 pub struct S3 {
-    params: HashMap<String, SecretString>,
+    params: Parameters,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -61,10 +63,32 @@ impl S3Factory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("region").secret(),
+    ParameterSpec::connector("endpoint").secret(),
+    ParameterSpec::connector("key").secret(),
+    ParameterSpec::connector("secret").secret(),
+    ParameterSpec::runtime("client_timeout"),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
 impl DataConnectorFactory for S3Factory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let s3 = S3 { params };
@@ -76,8 +100,8 @@ impl DataConnectorFactory for S3Factory {
         "s3"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["region", "endpoint", "key", "secret"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -92,7 +116,7 @@ impl ListingTableConnector for S3 {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, SecretString> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 
@@ -100,19 +124,19 @@ impl ListingTableConnector for S3 {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(region) = self.params.get("region").map(ExposeSecret::expose_secret) {
+        if let Some(region) = self.params.get("region").expose().ok() {
             fragment_builder.append_pair("region", region);
         }
-        if let Some(endpoint) = self.params.get("endpoint").map(ExposeSecret::expose_secret) {
+        if let Some(endpoint) = self.params.get("endpoint").expose().ok() {
             fragment_builder.append_pair("endpoint", endpoint);
         }
-        if let Some(key) = self.params.get("key").map(ExposeSecret::expose_secret) {
+        if let Some(key) = self.params.get("key").expose().ok() {
             fragment_builder.append_pair("key", key);
         };
-        if let Some(secret) = self.params.get("secret").map(ExposeSecret::expose_secret) {
+        if let Some(secret) = self.params.get("secret").expose().ok() {
             fragment_builder.append_pair("secret", secret);
         };
-        if let Some(timeout) = self.params.get("timeout").map(ExposeSecret::expose_secret) {
+        if let Some(timeout) = self.params.get("client_timeout").expose().ok() {
             fragment_builder.append_pair("timeout", timeout);
         }
         fragments.push(fragment_builder.finish());
@@ -124,15 +148,6 @@ impl ListingTableConnector for S3 {
                     dataconnector: format!("{self}"),
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
-
-        // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
-        // using a fragment with / suffix to trick df to think this is still a collection
-        // will need to raise an issue with DF to use url without query and fragment to decide if
-        // is_collection
-        // PR: https://github.com/apache/datafusion/pull/10419/files
-        if dataset.from.ends_with('/') {
-            fragments.push("dfiscollectionbugworkaround=hack/".into());
-        }
 
         s3_url.set_fragment(Some(&fragments.join("&")));
 
