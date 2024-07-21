@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::delta_lake::DeltaTable;
 use crate::unity_catalog::UnityCatalog;
 use crate::Read;
+use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -27,13 +27,65 @@ use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
-    pub params: HashMap<String, SecretString>,
+    endpoint: Endpoint,
+    token: SecretString,
+    storage_options: HashMap<String, SecretString>,
 }
 
 impl DatabricksDelta {
     #[must_use]
-    pub fn new(params: HashMap<String, SecretString>) -> Self {
-        Self { params }
+    pub fn new(
+        endpoint: Endpoint,
+        token: SecretString,
+        storage_options: HashMap<String, SecretString>,
+    ) -> Self {
+        Self {
+            endpoint,
+            token,
+            storage_options,
+        }
+    }
+
+    async fn get_delta_table(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let table_uri = self.resolve_table_uri(table_reference).await?;
+
+        let mut storage_options = HashMap::new();
+        for (key, value) in &self.storage_options {
+            if key == "token" || key == "endpoint" {
+                continue;
+            }
+            storage_options.insert(key.to_string(), value.clone());
+        }
+
+        let delta_table = DeltaTable::from(table_uri, storage_options)?;
+
+        Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
+    }
+
+    #[allow(clippy::implicit_hasher)]
+    pub async fn resolve_table_uri(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let uc_client = UnityCatalog::new(self.endpoint.clone(), Some(self.token.clone()));
+
+        let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
+
+        if let Some(table) = table_opt {
+            if let Some(storage_location) = table.storage_location {
+                Ok(storage_location)
+            } else {
+                Err(
+                    format!("Databricks table {table_reference} does not have a storage location")
+                        .into(),
+                )
+            }
+        } else {
+            Err(format!("Databricks table {table_reference} does not exist").into())
+        }
     }
 }
 
@@ -44,48 +96,6 @@ impl Read for DatabricksDelta {
         table_reference: TableReference,
         _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        get_delta_table(table_reference, &self.params).await
-    }
-}
-
-async fn get_delta_table(
-    table_reference: TableReference,
-    params: &HashMap<String, SecretString>,
-) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    let table_uri = resolve_table_uri(table_reference, params).await?;
-
-    let mut storage_options = HashMap::new();
-    for (key, value) in params {
-        if key == "token" || key == "endpoint" {
-            continue;
-        }
-        storage_options.insert(key.to_string(), value.clone());
-    }
-
-    let delta_table = DeltaTable::from(table_uri, storage_options)?;
-
-    Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
-}
-
-#[allow(clippy::implicit_hasher)]
-pub async fn resolve_table_uri(
-    table_reference: TableReference,
-    params: &HashMap<String, SecretString>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let uc_client = UnityCatalog::from_params(params).boxed()?;
-
-    let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
-
-    if let Some(table) = table_opt {
-        if let Some(storage_location) = table.storage_location {
-            Ok(storage_location)
-        } else {
-            Err(
-                format!("Databricks table {table_reference} does not have a storage location")
-                    .into(),
-            )
-        }
-    } else {
-        Err(format!("Databricks table {table_reference} does not exist").into())
+        self.get_delta_table(table_reference).await
     }
 }

@@ -24,14 +24,13 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
     Error as DbConnectionPoolError,
 };
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -58,13 +57,24 @@ impl PostgresFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("connection_string").secret(),
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("host"),
+    ParameterSpec::connector("port"),
+    ParameterSpec::connector("db"),
+    ParameterSpec::connector("sslmode"),
+    ParameterSpec::connector("sslrootcert"),
+];
+
 impl DataConnectorFactory for PostgresFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match PostgresConnectionPool::new(params).await {
+            match PostgresConnectionPool::new(params.to_secret_map()).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
@@ -102,8 +112,8 @@ impl DataConnectorFactory for PostgresFactory {
         "pg"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["connection_string", "user", "pass"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
