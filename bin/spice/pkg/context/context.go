@@ -40,7 +40,7 @@ type RuntimeContext struct {
 
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
-		httpEndpoint: "http://127.0.0.1:3000",
+		httpEndpoint: "http://127.0.0.1:8090",
 	}
 	err := rtcontext.Init()
 	if err != nil {
@@ -173,7 +173,7 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd() (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	cmd := exec.Command(spiceCMD, "--metrics", "127.0.0.1:9000")
+	cmd := exec.Command(spiceCMD, "--metrics", "127.0.0.1:9090")
 
 	return cmd, nil
 }
