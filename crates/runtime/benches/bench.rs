@@ -23,9 +23,9 @@ use crate::results::Status;
 mod results;
 mod setup;
 
-mod bench_spicecloud;
 #[cfg(feature = "spark")]
 mod bench_spark;
+mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
