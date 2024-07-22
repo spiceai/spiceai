@@ -90,7 +90,7 @@ jobs:
       - name: Install missing tools (Linux x86_64)
         if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
         run: |
-          sudo apt-get install unixodbc -y
+          sudo apt-get install unixodbc unixodbc-dev -y
 
       - name: Install missing tools (Mac)
         if: matrix.target_os == 'darwin'
