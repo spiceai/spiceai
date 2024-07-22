@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::component::dataset::Dataset;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -22,17 +22,15 @@ use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactor
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
-use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::{future::Future, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: endpoint"))]
-    MissingEndpointParameter,
+    #[snafu(display("Missing required parameter: {parameter}"))]
+    MissingParameter { parameter: String },
 
     #[snafu(display("Unable to construct TLS flight client: {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
@@ -63,24 +61,32 @@ impl FlightSQLFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("endpoint"),
+];
+
 impl DataConnectorFactory for FlightSQLFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
                 .get("endpoint")
-                .map(ExposeSecret::expose_secret)
-                .cloned()
-                .context(MissingEndpointParameterSnafu)?;
+                .expose()
+                .ok_or_else(|p| Error::MissingParameter {
+                    parameter: p.to_string(),
+                })?
+                .to_string();
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
-            let username = params.get("username").map(|s| s.expose_secret().as_str());
-            let password = params.get("password").map(|s| s.expose_secret().as_str());
+            let username = params.get("username").expose().ok();
+            let password = params.get("password").expose().ok();
             if let (Some(username), Some(password)) = (username, password) {
                 client
                     .handshake(username, password)
@@ -96,8 +102,8 @@ impl DataConnectorFactory for FlightSQLFactory {
         "flightsql"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["username", "password"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

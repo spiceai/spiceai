@@ -25,15 +25,14 @@ use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::KafkaConsumer;
 use datafusion::datasource::TableProvider;
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -55,14 +54,10 @@ pub struct Debezium {
 
 impl Debezium {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(params: HashMap<String, SecretString>) -> Result<Self> {
-        let transport = params
-            .get("transport")
-            .map_or("kafka", |p| p.expose_secret().as_str());
+    pub fn new(params: Parameters) -> Result<Self> {
+        let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
-        let message_format = params
-            .get("message_format")
-            .map_or("json", |p| p.expose_secret().as_str());
+        let message_format = params.get("message_format").expose().ok().unwrap_or("json");
 
         if transport != "kafka" {
             return InvalidTransportSnafu.fail();
@@ -73,7 +68,8 @@ impl Debezium {
 
         let kakfa_brokers = params
             .get("kafka_bootstrap_servers")
-            .map(ExposeSecret::expose_secret)
+            .expose()
+            .ok()
             .context(MissingKafkaBootstrapServersSnafu)?;
 
         Ok(Self {
@@ -97,10 +93,26 @@ impl DebeziumFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("transport")
+        .required()
+        .default("kafka")
+        .description("The message broker transport to use. The default is kafka."),
+    ParameterSpec::connector("message_format")
+        .required()
+        .default("json")
+        .description("The message format to use. The default is json."),
+    ParameterSpec::runtime("kafka_bootstrap_servers")
+        .required()
+        .description(
+            "A list of host/port pairs for establishing the initial Kafka cluster connection.",
+        ),
+];
+
 impl DataConnectorFactory for DebeziumFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let debezium = Debezium::new(params)?;
@@ -112,8 +124,8 @@ impl DataConnectorFactory for DebeziumFactory {
         "debezium"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

@@ -95,7 +95,7 @@ jobs:
     - name: wait for Spice runtime healthy
       if: matrix.target_os != 'windows'
       run: |
-        bash -c 'while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done' || false
+        bash -c 'while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done' || false
       timeout-minutes: 1
 
     - name: wait for Spice runtime healthy
@@ -104,7 +104,7 @@ jobs:
         do {
           try {
             Start-Sleep -Seconds 1
-            $response = Invoke-WebRequest -Uri "http://127.0.0.1:3000/health" -UseBasicParsing
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:8090/health" -UseBasicParsing
             $res = $response.Content.Trim()
 
             Write-Host "Status: $($response.StatusCode)"

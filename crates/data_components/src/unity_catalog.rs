@@ -18,7 +18,6 @@ use datafusion::sql::TableReference;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
-use std::collections::HashMap;
 use url::Url;
 
 pub mod provider;
@@ -70,7 +69,10 @@ pub struct UnityCatalog {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone)]
 pub struct Endpoint(pub String);
+
+#[derive(Debug, Clone)]
 pub struct CatalogId(pub String);
 
 impl UnityCatalog {
@@ -87,19 +89,6 @@ impl UnityCatalog {
             token,
             client: reqwest::Client::new(),
         }
-    }
-
-    pub fn from_params(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
-        let endpoint = params
-            .get("endpoint")
-            .context(MissingParameterSnafu {
-                parameter: "endpoint".to_string(),
-            })?
-            .expose_secret();
-
-        let token = params.get("token").cloned();
-
-        Ok(Self::new(Endpoint(endpoint.to_string()), token))
     }
 
     /// Parses a catalog url into the endpoint and catalog id.

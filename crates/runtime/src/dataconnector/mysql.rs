@@ -24,14 +24,13 @@ use datafusion_table_providers::sql::db_connection_pool::{
     DbConnectionPool, Error as DbConnectionPoolError,
 };
 use mysql_async::prelude::ToValue;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -60,10 +59,21 @@ impl MySQLFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("connection_string").secret(),
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("host"),
+    ParameterSpec::connector("tcp_port"),
+    ParameterSpec::connector("db"),
+    ParameterSpec::connector("sslmode"),
+    ParameterSpec::connector("sslrootcert"),
+];
+
 impl DataConnectorFactory for MySQLFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
@@ -71,7 +81,7 @@ impl DataConnectorFactory for MySQLFactory {
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(params)
+                MySQLConnectionPool::new(params.to_secret_map())
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );
@@ -86,8 +96,8 @@ impl DataConnectorFactory for MySQLFactory {
         "mysql"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["connection_string", "user", "pass"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
