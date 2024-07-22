@@ -24,6 +24,8 @@ mod results;
 mod setup;
 
 mod bench_spicecloud;
+#[cfg(feature = "spark")]
+mod bench_spark;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -33,20 +35,38 @@ async fn main() -> Result<(), String> {
         upload_results_dataset = Some(env_var);
     }
 
-    let (mut benchmark_results, mut rt) = setup::setup_benchmark(&upload_results_dataset).await;
+    let connectors = vec![
+        "spice.ai",
+        #[cfg(feature = "spark")]
+        "spark",
+    ];
 
-    bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+    for connector in connectors {
+        let (mut benchmark_results, mut rt) =
+            setup::setup_benchmark(&upload_results_dataset, connector).await;
 
-    let data_update: DataUpdate = benchmark_results.into();
+        match connector {
+            "spice.ai" => {
+                bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "spark")]
+            "spark" => {
+                bench_spark::run(&mut rt, &mut benchmark_results).await?;
+            }
+            _ => {}
+        }
 
-    let display_records = data_update.data.clone();
+        let data_update: DataUpdate = benchmark_results.into();
 
-    if let Some(upload_results_dataset) = upload_results_dataset {
-        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
-        setup::write_benchmark_results(data_update, &rt).await?;
+        let display_records = data_update.data.clone();
+
+        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+            tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+            setup::write_benchmark_results(data_update, &rt).await?;
+        }
+
+        display_benchmark_records(display_records).await?;
     }
-
-    display_benchmark_records(display_records).await?;
 
     Ok(())
 }
@@ -61,10 +81,11 @@ fn get_current_unix_ms() -> i64 {
 async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
+    connector: &str,
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
-    tracing::info!("Running query `{query_name}`...");
+    tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
 
     let mut min_iter_duration_ms = i64::MAX;
@@ -97,7 +118,7 @@ async fn run_query_and_record_result(
     benchmark_results.record_result(
         start_time,
         end_time,
-        query_name,
+        &format!("{connector} {query_name}"),
         Status::Passed,
         min_iter_duration_ms,
         max_iter_duration_ms,
