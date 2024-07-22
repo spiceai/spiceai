@@ -420,6 +420,13 @@ impl Parameters {
                     return None;
                 }
 
+                if has_prefix && !spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {connector_name}."
+                );
+                    return None;
+                }
+
                 Some((unprefixed_key.to_string(), value))
             })
             .collect();
