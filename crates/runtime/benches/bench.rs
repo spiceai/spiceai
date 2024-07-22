@@ -7,7 +7,7 @@
 
 // spice.ai/spicehq/spice-tests/datasets/spicehq."spice-tests".oss_benchmarks
 // schema
-// run_id, started_at, finished_at, query_name, status, min_duration, max_duration, iterations, commit_sha
+// run_id, started_at, finished_at, connector_name, query_name, status, min_duration, max_duration, iterations, commit_sha
 
 use std::sync::Arc;
 
@@ -41,6 +41,8 @@ async fn main() -> Result<(), String> {
         "spark",
     ];
 
+    let mut display_records = vec![];
+
     for connector in connectors {
         let (mut benchmark_results, mut rt) =
             setup::setup_benchmark(&upload_results_dataset, connector).await;
@@ -55,18 +57,18 @@ async fn main() -> Result<(), String> {
             }
             _ => {}
         }
-
         let data_update: DataUpdate = benchmark_results.into();
 
-        let display_records = data_update.data.clone();
+        let mut records = data_update.data.clone();
+        display_records.append(&mut records);
 
         if let Some(upload_results_dataset) = upload_results_dataset.clone() {
             tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
             setup::write_benchmark_results(data_update, &rt).await?;
         }
-
-        display_benchmark_records(display_records).await?;
     }
+
+    display_benchmark_records(display_records).await?;
 
     Ok(())
 }
@@ -98,10 +100,10 @@ async fn run_query_and_record_result(
             .ctx
             .sql(query)
             .await
-            .map_err(|e| format!("query `{query_name}` to plan: {e}"))?
+            .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
             .collect()
             .await
-            .map_err(|e| format!("query `{query_name}` to results: {e}"))?;
+            .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
         let end_iter_time = get_current_unix_ms();
 
         let iter_duration_ms = end_iter_time - start_iter_time;
@@ -118,7 +120,8 @@ async fn run_query_and_record_result(
     benchmark_results.record_result(
         start_time,
         end_time,
-        &format!("{connector} {query_name}"),
+        connector,
+        query_name,
         Status::Passed,
         min_iter_duration_ms,
         max_iter_duration_ms,
