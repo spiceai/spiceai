@@ -137,76 +137,74 @@ jobs:
             spice
             spiced
 
-  # Re-enable after spiceai/quickstart is updated for https://github.com/spiceai/spiceai/issues/1701
+  test_quickstart_dremio:
+    name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    runs-on: ${{ matrix.target.runner }}
+    # run quickstart with external service dependency only on manual trigger
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    needs:
+      - build
+      - setup-matrix
 
-  # test_quickstart_dremio:
-  #   name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-  #   runs-on: ${{ matrix.target.runner }}
-  #   # run quickstart with external service dependency only on manual trigger
-  #   if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
-  #   needs:
-  #     - build
-  #     - setup-matrix
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
-  #   strategy:
-  #     matrix:
-  #       target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
 
-  #   steps:
-  #     - uses: actions/checkout@v4
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
 
-  #     - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-  #         path: ./build
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
 
-  #     - name: Install spice
-  #       uses: ./.github/actions/install-spice
-  #       with:
-  #         build-path: ./build
+      - name: Init spice app
+        run: |
+          spice init test_app
 
-  #     - name: Init spice app
-  #       run: |
-  #         spice init test_app
+      - name: Connect Dremio
+        working-directory: test_app
+        run: |
+          spice login dremio -u demo -p demo1234
 
-  #     - name: Connect Dremio
-  #       working-directory: test_app
-  #       run: |
-  #         spice login dremio -u demo -p demo1234
+      - name: Start spice runtime
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
 
-  #     - name: Start spice runtime
-  #       working-directory: test_app
-  #       run: |
-  #         spice run &> spice.log &
-  #         # time to initialize added dataset
-  #         sleep 10
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
-  #     - name: Wait for Spice runtime healthy
-  #       working-directory: test_app
-  #       timeout-minutes: 1
-  #       run: |
-  #         while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+      - name: Add spiceai/quickstart
+        working-directory: test_app
+        run: |
+          spice add spiceai/quickstart
+          cat spicepod.yaml
+          # time to initialize added dataset
+          sleep 10
 
-  #     - name: Add spiceai/quickstart
-  #       working-directory: test_app
-  #       run: |
-  #         spice add spiceai/quickstart
-  #         cat spicepod.yaml
-  #         # time to initialize added dataset
-  #         sleep 10
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: taxi_trips
 
-  #     - name: Verify dataset
-  #       uses: ./.github/actions/verify-dataset
-  #       with:
-  #         name: taxi_trips
-
-  #     - name: Stop spice and check logs
-  #       working-directory: test_app
-  #       if: always()
-  #       run: |
-  #         killall spice
-  #         cat spice.log
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
 
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
