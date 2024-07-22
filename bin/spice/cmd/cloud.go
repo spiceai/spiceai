@@ -86,7 +86,7 @@ spice chat --model <model> --cloud
 			if cloud {
 				httpEndpoint = "https://data.spiceai.io"
 			} else {
-				httpEndpoint = "http://localhost:3000"
+				httpEndpoint = "http://localhost:8090"
 			}
 		}
 
@@ -234,7 +234,7 @@ func callCloudChat(baseUrl string, apiKey string, client *http.Client, body *Cha
 func init() {
 	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
-	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:3000)")
+	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 
 	RootCmd.AddCommand(chatCmd)
 }

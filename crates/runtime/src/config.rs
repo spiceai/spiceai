@@ -22,7 +22,7 @@ pub struct Config {
     #[arg(
         long = "http",
         value_name = "BIND_ADDRESS",
-        default_value = "127.0.0.1:3000",
+        default_value = "127.0.0.1:8090",
         action
     )]
     pub http_bind_address: SocketAddr,
