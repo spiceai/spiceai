@@ -186,7 +186,7 @@ jobs:
   #       working-directory: test_app
   #       timeout-minutes: 1
   #       run: |
-  #         while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+  #         while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
   #     - name: Add spiceai/quickstart
   #       working-directory: test_app
@@ -258,7 +258,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -335,7 +335,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -432,7 +432,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -530,7 +530,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -612,7 +612,7 @@ jobs:
         working-directory: duckdb-app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -723,7 +723,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
       - name: Manually refresh dataset
         working-directory: test_app
@@ -810,13 +810,13 @@ jobs:
           working-directory: test_app
           timeout-minutes: 1
           run: |
-            while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+            while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
 
         - name: Run SQL query and check Miss cache header
           working-directory: test_app
           run: |
-            response=$(curl -i -XPOST "127.0.0.1:3000/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+            response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
             echo "$response"
             if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
               echo "Cache miss detected as expected"
@@ -828,7 +828,7 @@ jobs:
         - name: Run SQL query and check Hit cache header
           working-directory: test_app
           run: |
-            response=$(curl -i -XPOST "127.0.0.1:3000/v1/sql" --data "select c_name from (select * from customer)")
+            response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "select c_name from (select * from customer)")
             echo "$response"
             if echo "$response" | grep -q "x-cache: Hit from spiceai"; then
               echo "Cache hit detected as expected"
@@ -853,7 +853,7 @@ jobs:
         - name: Run SQL query and check Miss cache header
           working-directory: test_app
           run: |
-            response=$(curl -i -XPOST "127.0.0.1:3000/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+            response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
             echo "$response"
             if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
               echo "Cache miss detected as expected"

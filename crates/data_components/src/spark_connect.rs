@@ -40,15 +40,19 @@ use datafusion::{
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 use futures::Stream;
+use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
     client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
 };
 
 use std::error::Error;
 
+pub mod federation;
+
 #[derive(Clone)]
 pub struct SparkConnect {
     session: Arc<SparkSession>,
+    join_push_down_context: String,
 }
 
 impl SparkConnect {
@@ -61,7 +65,28 @@ impl SparkConnect {
 
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let session = Arc::new(SparkSessionBuilder::remote(connection)?.build().await?);
-        Ok(Self { session })
+
+        let (host, port, options) = ChannelBuilder::parse_connection_string(connection)?;
+        let options = options.unwrap_or_default();
+
+        // it's safe to use default value here for options as session is already established.
+        // ignore token and session_id
+        let join_push_down_context = format!(
+            "sc://{}:{}/;user_id={};x-databricks-cluster-id={};use_ssl={}",
+            host,
+            port,
+            options.get("user_id").cloned().unwrap_or_default(),
+            options
+                .get("x-databricks-cluster-id")
+                .cloned()
+                .unwrap_or_default(),
+            options.get("use_ssl").cloned().unwrap_or_default()
+        );
+
+        Ok(Self {
+            session,
+            join_push_down_context,
+        })
     }
 }
 
@@ -72,8 +97,18 @@ impl Read for SparkConnect {
         table_reference: TableReference,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        let provider =
-            get_table_provider(Arc::clone(&self.session), table_reference, schema).await?;
+        let provider = get_table_provider(
+            Arc::clone(&self.session),
+            table_reference,
+            schema,
+            self.join_push_down_context.clone(),
+        )
+        .await?;
+        let provider = Arc::new(
+            provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
         Ok(provider)
     }
 }
@@ -82,7 +117,8 @@ async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: TableReference,
     schema: Option<SchemaRef>,
-) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+    join_push_down_context: String,
+) -> Result<Arc<SparkConnectTableProvider>, Box<dyn Error + Send + Sync>> {
     let spark_table_reference = match table_reference {
         TableReference::Bare { ref table } => format!("`{table}`"),
         TableReference::Partial {
@@ -104,12 +140,16 @@ async fn get_table_provider(
     };
     Ok(Arc::new(SparkConnectTableProvider {
         dataframe,
+        table_reference: spark_table_reference.into(),
+        join_push_down_context,
         schema: arrow_schema,
     }))
 }
 
 struct SparkConnectTableProvider {
+    table_reference: TableReference,
     dataframe: DataFrame,
+    join_push_down_context: String,
     schema: SchemaRef,
 }
 
@@ -294,7 +334,14 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
 
 fn dataframe_to_stream(dataframe: DataFrame) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
-        let data = dataframe.collect().await.map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        yield(Ok(data))
+        let data = dataframe
+            .collect()
+            .await
+            .map_err(map_error_to_datafusion_err)?;
+        yield (Ok(data))
     }
+}
+
+fn map_error_to_datafusion_err(e: SparkError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
 }

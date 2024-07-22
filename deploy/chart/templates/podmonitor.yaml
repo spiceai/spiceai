@@ -8,7 +8,7 @@ spec:
   - interval: 10s
     path: /metrics
     scheme: http
-    targetPort: 9000
+    targetPort: 9090
   selector:
     matchLabels:
       app: {{ .Release.Name }}
