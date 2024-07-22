@@ -98,6 +98,7 @@ jobs:
           brew install protobuf
           brew install cmake
           brew install unixodbc
+          echo "RUSTFLAGS='-L /opt/homebrew/lib'" >> $GITHUB_ENV
 
       - name: Restore build cache (Windows)
         if: matrix.target_os == 'windows'
