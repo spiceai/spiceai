@@ -59,6 +59,7 @@ impl BenchmarkResultsBuilder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_result(
         &mut self,
         start_time: i64,
