@@ -420,7 +420,7 @@ impl Parameters {
                     return None;
                 }
 
-                Some((key[full_prefix.len()..].to_string(), value))
+                Some((unprefixed_key.to_string(), value))
             })
             .collect();
         let secret_guard = secrets.read().await;
