@@ -101,6 +101,8 @@ jobs:
           }
 
       - name: Build spiced
+        env:
+          SPICED_NON_DEFAULT_FEATURES: odbc
         run: make -C bin/spiced
 
       - name: Update build cache (macOS)
