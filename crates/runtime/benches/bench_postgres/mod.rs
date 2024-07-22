@@ -68,11 +68,11 @@ pub struct PostgresBenchAppBuilder {}
 
 impl PostgresBenchAppBuilder {
     fn get_postgres_params() -> Params {
-        let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").expect("pg_host not set");
-        let pg_user = std::env::var("PG_BENCHMARK_PG_USER").expect("pg_user not set");
-        let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").expect("pg_pass not set");
-        let pg_db = std::env::var("PG_BENCHMARK_PG_DB").expect("pg_db not set");
-        let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").expect("pg_sslmode not set");
+        let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap_or_default();
+        let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap_or_default();
+        let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap_or_default();
+        let pg_db = std::env::var("PG_BENCHMARK_PG_DB").unwrap_or_default();
+        let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap_or_default();
         // Get postgres params from github secret?
         Params::from_string_map(
             vec![
