@@ -23,6 +23,8 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+#[cfg(feature = "mysql")]
+mod bench_mysql;
 #[cfg(feature = "postgres")]
 mod bench_postgres;
 mod bench_spicecloud;
@@ -40,6 +42,8 @@ async fn main() -> Result<(), String> {
         setup::DataConnector::SpiceAI,
         #[cfg(feature = "postgres")]
         setup::DataConnector::Postgres,
+        #[cfg(feature = "mysql")]
+        setup::DataConnector::MySql,
     ];
 
     let mut display_records = vec![];
@@ -54,6 +58,10 @@ async fn main() -> Result<(), String> {
             #[cfg(feature = "postgres")]
             setup::DataConnector::Postgres => {
                 bench_postgres::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "mysql")]
+            setup::DataConnector::MySql => {
+                bench_mysql::run(&mut rt, &mut benchmark_results).await?;
             }
             _ => {}
         }

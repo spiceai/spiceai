@@ -1,5 +1,7 @@
 #[cfg(feature = "postgres")]
 use crate::bench_postgres::PostgresBenchAppBuilder;
+#[cfg(feature = "mysql")]
+use crate::bench_mysql::MySqlBenchAppBuilder;
 use crate::bench_spicecloud::SpiceAIBenchAppBuilder;
 use crate::results::BenchmarkResultsBuilder;
 use app::App;
@@ -15,6 +17,7 @@ const ITERATIONS: i32 = 5;
 pub enum DataConnector {
     Postgres,
     SpiceAI,
+    MySql
 }
 
 impl std::fmt::Display for DataConnector {
@@ -22,6 +25,7 @@ impl std::fmt::Display for DataConnector {
         match self {
             DataConnector::Postgres => write!(f, "postgres"),
             DataConnector::SpiceAI => write!(f, "spiceai"),
+            DataConnector::MySql => write!(f, "mysql"),
         }
     }
 }
@@ -40,6 +44,10 @@ pub(crate) async fn setup_benchmark(
         #[cfg(feature = "postgres")]
         DataConnector::Postgres => {
             PostgresBenchAppBuilder::build_app(&PostgresBenchAppBuilder {}, upload_results_dataset)
+        }
+        #[cfg(feature = "mysql")]
+        DataConnector::MySql => {
+            MySqlBenchAppBuilder::build_app(&MySqlBenchAppBuilder {}, upload_results_dataset)
         }
         _ => return Err("Not reachable".to_string()),
     };

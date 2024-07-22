@@ -49,7 +49,7 @@ test-integration-without-spiceai-dataset:
 
 .PHONY: test-bench
 test-bench:
-	@cargo bench -p runtime --features postgres
+	@cargo bench -p runtime --features postgres mysql
 
 .PHONY: lint lint-go lint-rust
 lint: lint-go lint-rust
