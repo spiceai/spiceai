@@ -28,7 +28,8 @@ use datafusion::{
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use futures::Stream;
-use spark_connect_rs::errors::SparkError;
+
+use crate::spark_connect::map_error_to_datafusion_err;
 
 use super::SparkConnectTableProvider;
 
@@ -132,6 +133,3 @@ fn spark_query_to_stream(
     }
 }
 
-fn map_error_to_datafusion_err(e: SparkError) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::External(Box::new(e))
-}

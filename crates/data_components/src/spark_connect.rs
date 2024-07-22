@@ -40,6 +40,7 @@ use datafusion::{
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 use futures::Stream;
+use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
     client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
 };
@@ -336,7 +337,11 @@ fn dataframe_to_stream(dataframe: DataFrame) -> impl Stream<Item = DataFusionRes
         let data = dataframe
             .collect()
             .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(map_error_to_datafusion_err)?;
         yield (Ok(data))
     }
+}
+
+fn map_error_to_datafusion_err(e: SparkError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
 }
