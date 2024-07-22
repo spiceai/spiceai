@@ -12,7 +12,8 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, query_name, query).await?;
+        super::run_query_and_record_result(rt, benchmark_results, "postgres", query_name, query)
+            .await?;
     }
 
     Ok(())
@@ -66,14 +67,14 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
 pub struct PostgresBenchAppBuilder {}
 
 impl PostgresBenchAppBuilder {
-    fn get_postgres_params() -> Option<Params> {
+    fn get_postgres_params() -> Params {
         let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap();
         let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap();
         let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap();
         let pg_db = std::env::var("PG_BENCHMARK_PG_DB").unwrap();
         let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap();
         // Get postgres params from github secret?
-        Some(Params::from_string_map(
+        Params::from_string_map(
             vec![
                 ("pg_host".to_string(), pg_host),
                 ("pg_user".to_string(), pg_user),
@@ -83,7 +84,7 @@ impl PostgresBenchAppBuilder {
             ]
             .into_iter()
             .collect(),
-        ))
+        )
     }
 }
 
@@ -100,11 +101,8 @@ impl BenchAppBuilder for PostgresBenchAppBuilder {
             .with_dataset(self.make_dataset("supplier", "supplier"));
 
         if let Some(upload_results_dataset) = upload_results_dataset {
-            app_builder = app_builder.with_dataset(self.make_rw_dataset(
-                upload_results_dataset,
-                "oss_benchmarks",
-                DataConnector::Postgres,
-            ));
+            app_builder = app_builder
+                .with_dataset(self.make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
         }
 
         app_builder.build()
@@ -112,7 +110,7 @@ impl BenchAppBuilder for PostgresBenchAppBuilder {
 
     fn make_dataset(&self, path: &str, name: &str) -> Dataset {
         let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
-        dataset.params = Self::get_postgres_params();
+        dataset.params = Some(Self::get_postgres_params());
         dataset
     }
 }

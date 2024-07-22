@@ -1,3 +1,4 @@
+#[cfg(feature = "postgres")]
 use crate::bench_postgres::PostgresBenchAppBuilder;
 use crate::bench_spicecloud::SpiceAIBenchAppBuilder;
 use crate::results::BenchmarkResultsBuilder;
@@ -28,16 +29,18 @@ impl std::fmt::Display for DataConnector {
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
     dataconnector: DataConnector,
-) -> (BenchmarkResultsBuilder, Runtime) {
+) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
     init_tracing();
 
     let app = match dataconnector {
-        DataConnector::Postgres => {
-            PostgresBenchAppBuilder::build_app(&PostgresBenchAppBuilder {}, upload_results_dataset)
-        }
         DataConnector::SpiceAI => {
             SpiceAIBenchAppBuilder::build_app(&SpiceAIBenchAppBuilder {}, upload_results_dataset)
         }
+        #[cfg(feature = "postgres")]
+        DataConnector::Postgres => {
+            PostgresBenchAppBuilder::build_app(&PostgresBenchAppBuilder {}, upload_results_dataset)
+        }
+        _ => return Err("Not reachable".to_string()),
     };
 
     let rt = Runtime::builder().with_app(app).build().await;
@@ -52,7 +55,7 @@ pub(crate) async fn setup_benchmark(
     let benchmark_results =
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
 
-    (benchmark_results, rt)
+    Ok((benchmark_results, rt))
 }
 
 pub(crate) async fn write_benchmark_results(
@@ -126,11 +129,8 @@ pub trait BenchAppBuilder {
     fn build_app(&self, upload_results_dataset: &Option<String>) -> App;
     fn make_dataset(&self, path: &str, name: &str) -> Dataset;
 
-    fn make_rw_dataset(&self, path: &str, name: &str, dataconnector: DataConnector) -> Dataset {
-        let mut ds = Dataset::new(
-            format!("spiceai:{}_{}", path, dataconnector),
-            name.to_string(),
-        );
+    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset {
+        let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
         ds.mode = Mode::ReadWrite;
         ds.replication = Some(Replication { enabled: true });
         ds

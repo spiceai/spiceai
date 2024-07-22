@@ -12,7 +12,8 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, query_name, query).await?;
+        super::run_query_and_record_result(rt, benchmark_results, "spice.ai", query_name, query)
+            .await?;
     }
 
     Ok(())
@@ -84,11 +85,8 @@ impl BenchAppBuilder for SpiceAIBenchAppBuilder {
             .with_dataset(self.make_dataset("tpch.supplier", "supplier"));
 
         if let Some(upload_results_dataset) = upload_results_dataset {
-            app_builder = app_builder.with_dataset(self.make_rw_dataset(
-                upload_results_dataset,
-                "oss_benchmarks",
-                DataConnector::SpiceAI,
-            ));
+            app_builder = app_builder
+                .with_dataset(self.make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
         }
 
         app_builder.build()

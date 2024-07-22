@@ -23,46 +23,52 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+#[cfg(feature = "postgres")]
 mod bench_postgres;
 mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    // let _ = run_benchmark_test(setup::DataConnector::SpiceAI).await;
-    let _ = run_benchmark_test(setup::DataConnector::Postgres).await;
-    Ok(())
-}
-
-async fn run_benchmark_test(dataconnector: setup::DataConnector) -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");
         upload_results_dataset = Some(env_var);
     }
 
-    let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(&upload_results_dataset, dataconnector).await;
+    let dataconnectors = vec![
+        setup::DataConnector::SpiceAI,
+        #[cfg(feature = "postgres")]
+        setup::DataConnector::Postgres,
+    ];
 
-    match dataconnector {
-        setup::DataConnector::SpiceAI => {
-            bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+    let mut display_records = vec![];
+
+    for dataconnector in dataconnectors {
+        let (mut benchmark_results, mut rt) =
+            setup::setup_benchmark(&upload_results_dataset, dataconnector).await?;
+        match dataconnector {
+            setup::DataConnector::SpiceAI => {
+                bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "postgres")]
+            setup::DataConnector::Postgres => {
+                bench_postgres::run(&mut rt, &mut benchmark_results).await?;
+            }
+            _ => {}
         }
-        setup::DataConnector::Postgres => {
-            bench_postgres::run(&mut rt, &mut benchmark_results).await?;
+        let data_update: DataUpdate = benchmark_results.into();
+        let mut records = data_update.data.clone();
+        display_records.append(&mut records);
+
+        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+            tracing::info!(
+                "Writing {dataconnector} benchmark results to dataset {upload_results_dataset}..."
+            );
+            setup::write_benchmark_results(data_update, &rt).await?;
         }
-    }
-
-    let data_update: DataUpdate = benchmark_results.into();
-
-    let display_records = data_update.data.clone();
-
-    if let Some(upload_results_dataset) = upload_results_dataset {
-        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
-        setup::write_benchmark_results(data_update, &rt).await?;
     }
 
     display_benchmark_records(display_records).await?;
-
     Ok(())
 }
 
@@ -76,10 +82,12 @@ fn get_current_unix_ms() -> i64 {
 async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
+    connector: &str,
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
     tracing::info!("Running query `{query_name}`...");
+    tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
 
     let mut min_iter_duration_ms = i64::MAX;
@@ -92,10 +100,10 @@ async fn run_query_and_record_result(
             .ctx
             .sql(query)
             .await
-            .map_err(|e| format!("query `{query_name}` to plan: {e}"))?
+            .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
             .collect()
             .await
-            .map_err(|e| format!("query `{query_name}` to results: {e}"))?;
+            .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
         let end_iter_time = get_current_unix_ms();
 
         let iter_duration_ms = end_iter_time - start_iter_time;
@@ -112,6 +120,7 @@ async fn run_query_and_record_result(
     benchmark_results.record_result(
         start_time,
         end_time,
+        connector,
         query_name,
         Status::Passed,
         min_iter_duration_ms,
