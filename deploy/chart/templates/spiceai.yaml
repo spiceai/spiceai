@@ -40,9 +40,9 @@ spec:
             [
               "/usr/local/bin/spiced",
               "--http",
-              "0.0.0.0:3000",
+              "0.0.0.0:8090",
               "--metrics",
-              "0.0.0.0:9000",
+              "0.0.0.0:9090",
               "--flight",
               "0.0.0.0:50051",
               "--open_telemetry",
@@ -53,9 +53,9 @@ spec:
             {{- .Values.additionalEnv | toYaml | nindent 12 }}
             {{- end }}
           ports:
-            - containerPort: 3000
+            - containerPort: 8090
               name: http
-            - containerPort: 9000
+            - containerPort: 9090
               name: metrics
             - containerPort: 50051
               name: flight
@@ -64,15 +64,15 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 3000
+              port: 8090
           readinessProbe:
             httpGet:
               path: /v1/ready
-              port: 3000
+              port: 8090
           startupProbe:
             httpGet:
               path: /health
-              port: 3000
+              port: 8090
           volumeMounts:
             {{- if .Values.volumeMounts }}
             {{- .Values.volumeMounts | toYaml | nindent 12 }}
@@ -99,9 +99,9 @@ metadata:
     app: {{ .Release.Name }}
 spec:
   ports:
-    - port: 3000
+    - port: 8090
       name: http
-    - port: 9000
+    - port: 9090
       name: metrics
     - port: 50051
       name: flight
