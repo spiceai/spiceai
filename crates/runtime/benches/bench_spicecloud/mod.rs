@@ -9,7 +9,8 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, "spice.ai", query_name, query).await?;
+        super::run_query_and_record_result(rt, benchmark_results, "spice.ai", query_name, query)
+            .await?;
     }
 
     Ok(())
@@ -45,10 +46,25 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q21", include_str!("../queries/tpch_q21.sql")),
         // Error: "query `tpch_q22` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.orders' not found
         // ("tpch_q22", include_str!("tpch_q22.sql")),
-        ("tpch_simple_q1", include_str!("../queries/tpch_simple_q1.sql")),
-        ("tpch_simple_q2", include_str!("../queries/tpch_simple_q2.sql")),
-        ("tpch_simple_q3", include_str!("../queries/tpch_simple_q3.sql")),
-        ("tpch_simple_q4", include_str!("../queries/tpch_simple_q4.sql")),
-        ("tpch_simple_q5", include_str!("../queries/tpch_simple_q5.sql")),
+        (
+            "tpch_simple_q1",
+            include_str!("../queries/tpch_simple_q1.sql"),
+        ),
+        (
+            "tpch_simple_q2",
+            include_str!("../queries/tpch_simple_q2.sql"),
+        ),
+        (
+            "tpch_simple_q3",
+            include_str!("../queries/tpch_simple_q3.sql"),
+        ),
+        (
+            "tpch_simple_q4",
+            include_str!("../queries/tpch_simple_q4.sql"),
+        ),
+        (
+            "tpch_simple_q5",
+            include_str!("../queries/tpch_simple_q5.sql"),
+        ),
     ]
 }

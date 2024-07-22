@@ -9,7 +9,8 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, "spark", query_name, query).await?;
+        super::run_query_and_record_result(rt, benchmark_results, "spark", query_name, query)
+            .await?;
     }
 
     Ok(())
@@ -32,7 +33,6 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q13", include_str!("../queries/tpch_q13.sql")),
         ("tpch_q14", include_str!("../queries/tpch_q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
-
         ("tpch_q16", include_str!("../queries/tpch_q16.sql")),
         ("tpch_q17", include_str!("../queries/tpch_q17.sql")),
         ("tpch_q18", include_str!("../queries/tpch_q18.sql")),
@@ -40,10 +40,25 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q20", include_str!("../queries/tpch_q20.sql")),
         ("tpch_q21", include_str!("../queries/tpch_q21.sql")),
         ("tpch_q22", include_str!("../queries/tpch_q22.sql")),
-        ("tpch_simple_q1", include_str!("../queries/tpch_simple_q1.sql")),
-        ("tpch_simple_q2", include_str!("../queries/tpch_simple_q2.sql")),
-        ("tpch_simple_q3", include_str!("../queries/tpch_simple_q3.sql")),
-        ("tpch_simple_q4", include_str!("../queries/tpch_simple_q4.sql")),
-        ("tpch_simple_q5", include_str!("../queries/tpch_simple_q5.sql")),
+        (
+            "tpch_simple_q1",
+            include_str!("../queries/tpch_simple_q1.sql"),
+        ),
+        (
+            "tpch_simple_q2",
+            include_str!("../queries/tpch_simple_q2.sql"),
+        ),
+        (
+            "tpch_simple_q3",
+            include_str!("../queries/tpch_simple_q3.sql"),
+        ),
+        (
+            "tpch_simple_q4",
+            include_str!("../queries/tpch_simple_q4.sql"),
+        ),
+        (
+            "tpch_simple_q5",
+            include_str!("../queries/tpch_simple_q5.sql"),
+        ),
     ]
 }
