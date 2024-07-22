@@ -1,7 +1,7 @@
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
-use crate::setup::{BenchAppBuilder, DataConnector};
+use crate::setup::BenchAppBuilder;
 use app::{App, AppBuilder};
 use spicepod::component::dataset::Dataset;
 

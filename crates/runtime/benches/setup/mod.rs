@@ -26,6 +26,7 @@ impl std::fmt::Display for DataConnector {
     }
 }
 
+#[allow(unreachable_patterns)]
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
     dataconnector: DataConnector,

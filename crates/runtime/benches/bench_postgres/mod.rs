@@ -1,7 +1,7 @@
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
-use crate::setup::{BenchAppBuilder, DataConnector};
+use crate::setup::BenchAppBuilder;
 use app::{App, AppBuilder};
 use spicepod::component::{dataset::Dataset, params::Params};
 
@@ -68,11 +68,11 @@ pub struct PostgresBenchAppBuilder {}
 
 impl PostgresBenchAppBuilder {
     fn get_postgres_params() -> Params {
-        let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap();
-        let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap();
-        let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap();
-        let pg_db = std::env::var("PG_BENCHMARK_PG_DB").unwrap();
-        let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap();
+        let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").expect("pg_host not set");
+        let pg_user = std::env::var("PG_BENCHMARK_PG_USER").expect("pg_user not set");
+        let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").expect("pg_pass not set");
+        let pg_db = std::env::var("PG_BENCHMARK_PG_DB").expect("pg_db not set");
+        let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").expect("pg_sslmode not set");
         // Get postgres params from github secret?
         Params::from_string_map(
             vec![

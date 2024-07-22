@@ -27,6 +27,7 @@ mod setup;
 mod bench_postgres;
 mod bench_spicecloud;
 
+#[allow(unreachable_patterns)]
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
