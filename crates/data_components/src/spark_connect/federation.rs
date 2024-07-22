@@ -132,4 +132,3 @@ fn spark_query_to_stream(
         yield (Ok(data))
     }
 }
-
