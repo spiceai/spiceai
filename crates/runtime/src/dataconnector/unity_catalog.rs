@@ -16,6 +16,8 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::ParameterSpec;
+use super::Parameters;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
@@ -60,7 +62,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct UnityCatalog {
-    params: HashMap<String, SecretString>,
+    params: Parameters,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -78,10 +80,55 @@ impl UnityCatalogFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("token")
+        .required()
+        .secret()
+        .description(
+            "The personal access token used to authenticate against the Unity Catalog API.",
+        ),
+    // S3 storage options
+    ParameterSpec::connector("aws_region")
+        .description("The AWS region to use for S3 storage.")
+        .secret(),
+    ParameterSpec::connector("aws_access_key_id")
+        .description("The AWS access key ID to use for S3 storage.")
+        .secret(),
+    ParameterSpec::connector("aws_secret_access_key")
+        .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::connector("aws_endpoint")
+        .description("The AWS endpoint to use for S3 storage.")
+        .secret(),
+    // Azure storage options
+    ParameterSpec::connector("azure_storage_account_name")
+        .description("The storage account to use for Azure storage.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_account_key")
+        .description("The storage account key to use for Azure storage.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_client_id")
+        .description("The service principal client id for accessing the storage account.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_client_secret")
+        .description("The service principal client secret for accessing the storage account.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_sas_key")
+        .description("The shared access signature key for accessing the storage account.")
+        .secret(),
+    ParameterSpec::connector("azure_storage_endpoint")
+        .description("The endpoint for the Azure Blob storage account.")
+        .secret(),
+    // GCS storage options
+    ParameterSpec::connector("google_service_account")
+        .description("Filesystem path to the Google service account JSON key file.")
+        .secret(),
+];
+
 impl DataConnectorFactory for UnityCatalogFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(UnityCatalog { params }) as Arc<dyn DataConnector>) })
     }
@@ -90,8 +137,8 @@ impl DataConnectorFactory for UnityCatalogFactory {
         "unity_catalog"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["token"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -139,7 +186,7 @@ impl DataConnector for UnityCatalog {
 
         let client = Arc::new(UnityCatalogClient::new(
             endpoint,
-            self.params.get("token").cloned(),
+            self.params.get("token").ok().cloned(),
         ));
 
         // Copy the catalog params into the dataset params, and allow user to override

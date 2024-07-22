@@ -24,14 +24,16 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use duckdb::AccessMode;
-use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{
+    AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec,
+    Parameters,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -89,18 +91,19 @@ impl DuckDBFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("open")];
+
 impl DataConnectorFactory for DuckDBFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let duckdb_factory =
-                if let Some(db_path) = params.get("open").map(ExposeSecret::expose_secret) {
-                    DuckDB::create_file(db_path)?
-                } else {
-                    DuckDB::create_in_memory()?
-                };
+            let duckdb_factory = if let Some(db_path) = params.get("open").expose().ok() {
+                DuckDB::create_file(db_path)?
+            } else {
+                DuckDB::create_in_memory()?
+            };
 
             Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
         })
@@ -110,8 +113,8 @@ impl DataConnectorFactory for DuckDBFactory {
         "duckdb"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

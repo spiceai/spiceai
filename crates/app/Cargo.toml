@@ -11,4 +11,3 @@ version.workspace = true
 [dependencies]
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-tracing.workspace = true

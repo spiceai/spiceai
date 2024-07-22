@@ -20,20 +20,18 @@ use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
-    CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect, MySqlDialect, PostgreSqlDialect,
-    SqliteDialect,
+    CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect, IntervalStyle, MySqlDialect,
+    PostgreSqlDialect, SqliteDialect,
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
-use secrecy::ExposeSecret;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,6 +76,7 @@ enum ODBCDriver {
 fn databricks_dialect() -> CustomDialect {
     CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
+        .with_interval_style(IntervalStyle::MySQL)
         .build()
 }
 
@@ -144,22 +143,29 @@ impl ODBCFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("connection_string").secret(),
+    ParameterSpec::connector("max_binary_size"),
+    ParameterSpec::connector("max_text_size"),
+    ParameterSpec::connector("max_bytes_per_batch"),
+    ParameterSpec::connector("max_num_rows_per_batch"),
+    ParameterSpec::runtime("sql_dialect"),
+];
+
 impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let dialect = if let Some(sql_dialect) = params.get("sql_dialect") {
-                let sql_dialect = SQLDialectParam::new(sql_dialect.expose_secret().as_str());
+            let dialect = if let Some(sql_dialect) = params.get("sql_dialect").expose().ok() {
+                let sql_dialect = SQLDialectParam::new(sql_dialect);
                 sql_dialect.try_into()
             } else {
                 let driver = params
                     .get("connection_string")
-                    .context(MissingParameterSnafu {
-                        param: "odbc_connection_string".to_string(),
-                    })?
-                    .expose_secret()
+                    .expose()
+                    .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
                     .to_lowercase();
 
                 let driver = driver
@@ -170,8 +176,10 @@ impl DataConnectorFactory for ODBCFactory {
                 Ok(ODBCDriver::from(driver).into())
             }?;
 
-            let pool: Arc<ODBCDbConnectionPool> =
-                Arc::new(ODBCPool::new(params).context(UnableToCreateODBCConnectionPoolSnafu)?);
+            let pool: Arc<ODBCDbConnectionPool> = Arc::new(
+                ODBCPool::new(params.to_secret_map())
+                    .context(UnableToCreateODBCConnectionPoolSnafu)?,
+            );
 
             let odbc_factory = ODBCTableFactory::new(pool, dialect);
 
@@ -183,8 +191,8 @@ impl DataConnectorFactory for ODBCFactory {
         "odbc"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &["connection_string"]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

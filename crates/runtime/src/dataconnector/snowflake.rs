@@ -16,11 +16,12 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::ParameterSpec;
+use super::Parameters;
 use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-use secrecy::SecretString;
 
 use crate::component::dataset::Dataset;
 use datafusion::datasource::TableProvider;
@@ -29,9 +30,9 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -62,16 +63,27 @@ impl SnowflakeFactory {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("private_key_path").secret(),
+    ParameterSpec::connector("private_key_passphrase").secret(),
+    ParameterSpec::connector("account").secret(),
+    ParameterSpec::connector("warehouse").secret(),
+    ParameterSpec::connector("role").secret(),
+    ParameterSpec::connector("auth_type"),
+];
+
 impl DataConnectorFactory for SnowflakeFactory {
     fn create(
         &self,
-        params: HashMap<String, SecretString>,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
             > = Arc::new(
-                SnowflakeConnectionPool::new(&params)
+                SnowflakeConnectionPool::new(&params.to_secret_map())
                     .await
                     .context(UnableToCreateSnowflakeConnectionPoolSnafu)?,
             );
@@ -86,17 +98,8 @@ impl DataConnectorFactory for SnowflakeFactory {
         "snowflake"
     }
 
-    fn autoload_secrets(&self) -> &'static [&'static str] {
-        &[
-            "username",
-            "account",
-            "warehouse",
-            "role",
-            "auth_type",
-            "password",
-            "private_key_path",
-            "private_key_passphrase",
-        ]
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
