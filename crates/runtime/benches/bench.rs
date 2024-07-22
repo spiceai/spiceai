@@ -39,9 +39,9 @@ async fn main() -> Result<(), String> {
     }
 
     let dataconnectors = vec![
-        setup::DataConnector::SpiceAI,
-        #[cfg(feature = "postgres")]
-        setup::DataConnector::Postgres,
+        // setup::DataConnector::SpiceAI,
+        // #[cfg(feature = "postgres")]
+        // setup::DataConnector::Postgres,
         #[cfg(feature = "mysql")]
         setup::DataConnector::MySql,
     ];
