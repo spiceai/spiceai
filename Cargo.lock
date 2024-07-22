@@ -220,7 +220,6 @@ version = "0.16.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
- "tracing",
 ]
 
 [[package]]
@@ -510,19 +509,12 @@ name = "arrow_sql_gen"
 version = "0.16.0-beta"
 dependencies = [
  "arrow",
- "bigdecimal 0.3.1",
  "bigdecimal 0.4.5",
- "byteorder",
  "chrono",
  "chrono-tz 0.8.6",
  "clickhouse-rs",
  "datafusion-table-providers",
- "fallible-iterator 0.3.0",
- "sea-query",
  "snafu 0.8.4",
- "time",
- "tokio",
- "tracing",
  "uuid 1.10.0",
 ]
 
@@ -1928,7 +1920,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
- "metrics 0.23.0",
+ "metrics",
  "moka",
  "snafu 0.8.4",
  "spicepod",
@@ -2722,13 +2714,9 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "arrow-flight",
- "arrow-odbc",
- "arrow_sql_gen",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
- "bb8",
- "bb8-postgres",
  "bytes",
  "chrono",
  "clickhouse-rs",
@@ -2742,12 +2730,7 @@ dependencies = [
  "flight_client",
  "futures",
  "globset",
- "itertools 0.12.1",
- "mysql_async",
  "object_store",
- "odbc-api",
- "postgres-native-tls",
- "r2d2",
  "rdkafka",
  "regex",
  "reqwest 0.11.27",
@@ -2760,7 +2743,6 @@ dependencies = [
  "spark-connect-rs",
  "tokio",
  "tokio-postgres",
- "tokio-rusqlite",
  "tonic 0.11.0",
  "tracing",
  "tracing-subscriber",
@@ -3133,34 +3115,21 @@ dependencies = [
  "arrow_sql_gen",
  "async-stream",
  "async-trait",
- "bb8",
- "bb8-postgres",
  "clickhouse-rs",
  "datafusion",
  "datafusion-table-providers",
- "duckdb",
  "dyn-clone",
  "futures",
  "lazy_static",
- "mysql_async",
- "native-tls",
- "ns_lookup",
  "odbc-api",
- "pem",
  "pkcs8",
- "postgres-native-tls",
- "r2d2",
- "rusqlite",
  "secrecy",
  "sha2",
  "snafu 0.8.4",
  "snowflake-api",
  "tokio",
- "tokio-postgres",
- "tokio-rusqlite",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -3768,7 +3737,6 @@ dependencies = [
  "rustls-pemfile 1.0.4",
  "snafu 0.8.4",
  "tonic 0.11.0",
- "tracing",
 ]
 
 [[package]]
@@ -3800,7 +3768,6 @@ dependencies = [
  "rustyline",
  "serde_json",
  "tonic 0.11.0",
- "tracing",
 ]
 
 [[package]]
@@ -5434,10 +5401,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "candle-core 0.5.1",
- "candle-core 0.6.0 (git+https://github.com/spiceai/candle.git?rev=41aaac4dd80e64af6b9b8e02197fa58feb5809b3)",
  "candle-examples",
  "candle-transformers 0.5.1",
- "dirs",
  "futures",
  "hf-hub",
  "mistralrs",
@@ -5449,7 +5414,6 @@ dependencies = [
  "tempfile",
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
- "text-embeddings-core",
  "tokenizers",
  "tokio",
  "tracing",
@@ -5684,17 +5648,6 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fde3af1a009ed76a778cb84fdef9e7dbbdf5775ae3e4cc1f434a6a307f6f76c5"
-dependencies = [
- "ahash 0.8.11",
- "metrics-macros",
- "portable-atomic",
-]
-
-[[package]]
-name = "metrics"
 version = "0.23.0"
 source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
@@ -5714,23 +5667,12 @@ dependencies = [
  "hyper-util",
  "indexmap 2.2.6",
  "ipnet",
- "metrics 0.23.0",
+ "metrics",
  "metrics-util",
  "quanta",
  "thiserror",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "metrics-macros"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38b4faf00617defe497754acde3024865bc143d44a86799b24e191ecff91354f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.71",
 ]
 
 [[package]]
@@ -5743,7 +5685,7 @@ dependencies = [
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "indexmap 2.2.6",
- "metrics 0.23.0",
+ "metrics",
  "num_cpus",
  "ordered-float 4.2.1",
  "quanta",
@@ -8080,8 +8022,6 @@ dependencies = [
  "axum 0.7.5",
  "axum-extra",
  "base64 0.22.1",
- "bb8",
- "bb8-postgres",
  "bollard",
  "bytes",
  "cache",
@@ -8095,8 +8035,6 @@ dependencies = [
  "datafusion-federation",
  "datafusion-table-providers",
  "db_connection_pool",
- "derive_builder",
- "dirs",
  "dotenvy",
  "duckdb",
  "flight_client",
@@ -8111,23 +8049,18 @@ dependencies = [
  "llms",
  "logos",
  "mediatype",
- "metrics 0.23.0",
- "metrics-exporter-prometheus",
+ "metrics",
  "metrics-util",
  "model_components",
  "mysql_async",
- "ndarray",
  "notify",
  "ns_lookup",
  "object_store",
- "odbc-api",
  "once_cell",
  "opentelemetry-proto",
  "pin-project",
- "postgres-native-tls",
  "prometheus-parse",
  "prost 0.12.6",
- "r2d2",
  "rand",
  "regex",
  "reqwest 0.11.27",
@@ -8142,15 +8075,12 @@ dependencies = [
  "suppaftp",
  "tokio",
  "tokio-rusqlite",
- "tokio-stream",
- "toml",
  "tonic 0.11.0",
  "tonic 0.9.2",
  "tonic-health",
  "tracing",
  "tracing-subscriber",
  "tract-core",
- "tract-onnx",
  "url",
  "util",
  "uuid 1.10.0",
@@ -9047,7 +8977,6 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu 0.8.4",
- "spicepod",
  "tokio",
  "tracing",
 ]
@@ -9059,15 +8988,12 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
- "futures",
- "metrics 0.23.0",
  "metrics-exporter-prometheus",
  "runtime",
  "rustls 0.23.11",
  "snafu 0.8.4",
  "snmalloc-rs",
  "spice-cloud",
- "spicepod",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -9439,16 +9365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "text-embeddings-backend"
-version = "1.2.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
-dependencies = [
- "text-embeddings-backend-core",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "text-embeddings-backend-candle"
 version = "1.2.3"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
@@ -9475,20 +9391,6 @@ source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde32
 dependencies = [
  "nohash-hasher",
  "thiserror",
-]
-
-[[package]]
-name = "text-embeddings-core"
-version = "1.2.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
-dependencies = [
- "hf-hub",
- "metrics 0.21.1",
- "text-embeddings-backend",
- "thiserror",
- "tokenizers",
- "tokio",
- "tracing",
 ]
 
 [[package]]
