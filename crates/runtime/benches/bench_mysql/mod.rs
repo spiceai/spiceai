@@ -64,12 +64,12 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
 pub struct MySqlBenchAppBuilder {}
 
 impl MySqlBenchAppBuilder {
-    fn get_postgres_params() -> Option<Params> {
+    fn get_postgres_params() -> Params {
         let host = std::env::var("MYSQL_BENCHMARK_MYSQL_HOST").unwrap_or_default();
         let user = std::env::var("MYSQL_BENCHMARK_MYSQL_USER").unwrap_or_default();
         let pass = std::env::var("MYSQL_BENCHMARK_MYSQL_PASS").unwrap_or_default();
         let db = std::env::var("MYSQL_BENCHMARK_MYSQL_DB").unwrap_or_default();
-        Some(Params::from_string_map(
+        Params::from_string_map(
             vec![
                 ("mysql_host".to_string(), host),
                 ("mysql_user".to_string(), user),
@@ -80,13 +80,13 @@ impl MySqlBenchAppBuilder {
             ]
             .into_iter()
             .collect(),
-        ))
+        )
     }
 }
 
 impl BenchAppBuilder for MySqlBenchAppBuilder {
-    fn build_app(&self, _upload_results_dataset: &Option<String>) -> App {
-        let app_builder = AppBuilder::new("runtime_benchmark_test")
+    fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
+        let mut app_builder = AppBuilder::new("runtime_benchmark_test")
             .with_dataset(self.make_dataset("customer", "customer"))
             .with_dataset(self.make_dataset("lineitem", "lineitem"))
             .with_dataset(self.make_dataset("part", "part"))
@@ -96,12 +96,17 @@ impl BenchAppBuilder for MySqlBenchAppBuilder {
             .with_dataset(self.make_dataset("region", "region"))
             .with_dataset(self.make_dataset("supplier", "supplier"));
 
+        if let Some(upload_results_dataset) = upload_results_dataset {
+            app_builder = app_builder
+                .with_dataset(self.make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
+        }
+
         app_builder.build()
     }
 
     fn make_dataset(&self, path: &str, name: &str) -> Dataset {
         let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
-        dataset.params = Self::get_postgres_params();
+        dataset.params = Some(Self::get_postgres_params());
         dataset
     }
 }

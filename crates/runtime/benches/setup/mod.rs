@@ -1,7 +1,7 @@
-#[cfg(feature = "postgres")]
-use crate::bench_postgres::PostgresBenchAppBuilder;
 #[cfg(feature = "mysql")]
 use crate::bench_mysql::MySqlBenchAppBuilder;
+#[cfg(feature = "postgres")]
+use crate::bench_postgres::PostgresBenchAppBuilder;
 use crate::bench_spicecloud::SpiceAIBenchAppBuilder;
 use crate::results::BenchmarkResultsBuilder;
 use app::App;
@@ -17,7 +17,7 @@ const ITERATIONS: i32 = 5;
 pub enum DataConnector {
     Postgres,
     SpiceAI,
-    MySql
+    MySql,
 }
 
 impl std::fmt::Display for DataConnector {
