@@ -113,7 +113,7 @@ spice dataset configure
 			}
 			endpoint = strings.TrimSuffix(endpoint, "\n")
 
-			params["endpoint"] = endpoint
+			params[datasetPrefix+"_endpoint"] = endpoint
 		}
 
 		if datasetPrefix == spec.DATA_SOURCE_S3 || datasetPrefix == spec.DATA_SOURCE_FTP || datasetPrefix == spec.DATA_SOURCE_SFTP {
