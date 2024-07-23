@@ -30,7 +30,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.78"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 
 [workspace.dependencies]
 arrow = "52.0.0"

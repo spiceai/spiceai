@@ -1,8 +1,21 @@
-#[cfg(feature = "postgres")]
-use crate::bench_postgres::PostgresBenchAppBuilder;
-use crate::bench_spicecloud::SpiceAIBenchAppBuilder;
-use crate::results::BenchmarkResultsBuilder;
-use app::App;
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use crate::{bench_s3, results::BenchmarkResultsBuilder};
+use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::{replication::Replication, Dataset, Mode};
 use std::process::Command;
@@ -29,20 +42,11 @@ impl std::fmt::Display for DataConnector {
 #[allow(unreachable_patterns)]
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
-    dataconnector: DataConnector,
-) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
+    connector: &str,
+) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = match dataconnector {
-        DataConnector::SpiceAI => {
-            SpiceAIBenchAppBuilder::build_app(&SpiceAIBenchAppBuilder {}, upload_results_dataset)
-        }
-        #[cfg(feature = "postgres")]
-        DataConnector::Postgres => {
-            PostgresBenchAppBuilder::build_app(&PostgresBenchAppBuilder {}, upload_results_dataset)
-        }
-        _ => return Err("Not reachable".to_string()),
-    };
+    let app = build_app(upload_results_dataset, connector);
 
     let rt = Runtime::builder().with_app(app).build().await;
 
@@ -69,6 +73,43 @@ pub(crate) async fn write_benchmark_results(
         .map_err(|e| e.to_string())
 }
 
+fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
+    let mut app_builder = AppBuilder::new("runtime_benchmark_test");
+
+    app_builder = match connector {
+        "spice.ai" => app_builder
+            .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
+            .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
+            .with_dataset(make_spiceai_dataset("tpch.part", "part"))
+            .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
+            .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
+            .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
+            .with_dataset(make_spiceai_dataset("tpch.region", "region"))
+            .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier")),
+        "spark" => app_builder
+            .with_dataset(make_spark_dataset("samples.tpch.customer", "customer"))
+            .with_dataset(make_spark_dataset("samples.tpch.lineitem", "lineitem"))
+            .with_dataset(make_spark_dataset("samples.tpch.part", "part"))
+            .with_dataset(make_spark_dataset("samples.tpch.partsupp", "partsupp"))
+            .with_dataset(make_spark_dataset("samples.tpch.orders", "orders"))
+            .with_dataset(make_spark_dataset("samples.tpch.nation", "nation"))
+            .with_dataset(make_spark_dataset("samples.tpch.region", "region"))
+            .with_dataset(make_spark_dataset("samples.tpch.supplier", "supplier")),
+        "s3" => bench_s3::build_app(app_builder),
+
+        _ => app_builder,
+    };
+
+    if let Some(upload_results_dataset) = upload_results_dataset {
+        app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
+            upload_results_dataset,
+            "oss_benchmarks",
+        ));
+    }
+
+    app_builder.build()
+}
+
 fn init_tracing() {
     let filter = match std::env::var("SPICED_LOG").ok() {
         Some(level) => EnvFilter::new(level),
@@ -82,6 +123,21 @@ fn init_tracing() {
         .with_ansi(true)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
+    Dataset::new(format!("spiceai:{path}"), name.to_string())
+}
+
+fn make_spark_dataset(path: &str, name: &str) -> Dataset {
+    Dataset::new(format!("spark:{path}"), name.to_string())
+}
+
+fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
+    let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
+    ds.mode = Mode::ReadWrite;
+    ds.replication = Some(Replication { enabled: true });
+    ds
 }
 
 // This should also append "-dirty" if there are uncommitted changes

@@ -85,7 +85,6 @@ impl Databricks {
                 params,
             })
         } else {
-            let user = params.get("user").expose().ok();
             let mut databricks_use_ssl = true;
             if let Some(databricks_use_ssl_value) = params.get("use_ssl").expose().ok() {
                 databricks_use_ssl = match databricks_use_ssl_value {
@@ -104,7 +103,6 @@ impl Databricks {
                 .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
             let databricks_spark = DatabricksSparkConnect::new(
                 endpoint.to_string(),
-                user.map(str::to_string),
                 cluster_id.expose_secret().to_string(),
                 token.expose_secret().to_string(),
                 databricks_use_ssl,
