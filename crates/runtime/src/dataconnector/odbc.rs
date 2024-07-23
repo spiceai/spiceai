@@ -20,8 +20,8 @@ use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
-    CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect, MySqlDialect, PostgreSqlDialect,
-    SqliteDialect,
+    CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect, IntervalStyle, MySqlDialect,
+    PostgreSqlDialect, SqliteDialect,
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
@@ -76,6 +76,7 @@ enum ODBCDriver {
 fn databricks_dialect() -> CustomDialect {
     CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
+        .with_interval_style(IntervalStyle::MySQL)
         .build()
 }
 
