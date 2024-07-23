@@ -520,7 +520,7 @@ impl Parameters {
     pub fn user_param(&self, name: &str) -> UserParam {
         let spec = self.describe(name);
 
-        if self.prefix.is_empty() {
+        if self.prefix.is_empty() || !spec.r#type.is_prefixed() {
             UserParam(spec.name.to_string())
         } else {
             UserParam(format!("{}_{}", self.prefix, spec.name))
