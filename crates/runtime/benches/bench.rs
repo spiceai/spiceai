@@ -39,9 +39,9 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
-mod bench_s3;
 mod bench_spicecloud;
 
 #[tokio::main]
