@@ -80,15 +80,12 @@
       ]
     },
     "secrets": {
-      "description": "Optional spicepod secrets configuration Default value is `store: file`",
-      "default": {
-        "store": "file"
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/Secrets"
-        }
-      ]
+      "description": "Optional spicepod secrets configuration Default value is: ```yaml secrets: - from: env name: env ```",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Secret"
+      }
     },
     "version": {
       "description": "The version of the Spicepod",
@@ -114,12 +111,6 @@
           "type": "boolean"
         },
         "engine": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "engine_secret": {
           "type": [
             "string",
             "null"
@@ -706,27 +697,31 @@
         }
       }
     },
-    "Secrets": {
-      "description": "The secrets configuration for a Spicepod.\n\nExample: ```yaml secrets: store: file ```",
+    "Secret": {
+      "description": "The secrets configuration for a Spicepod.\n\nExample: ```yaml secrets: - from: env name: env - from: kubernetes:my_secret_name name: k8s ```",
       "type": "object",
       "required": [
-        "store"
+        "from",
+        "name"
       ],
       "properties": {
-        "store": {
-          "$ref": "#/definitions/SpiceSecretStore"
+        "from": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
-    },
-    "SpiceSecretStore": {
-      "type": "string",
-      "enum": [
-        "file",
-        "env",
-        "kubernetes",
-        "keyring",
-        "aws_secrets_manager"
-      ]
     },
     "SpicepodKind": {
       "type": "string",
@@ -743,6 +738,8 @@
     "TimeFormat": {
       "type": "string",
       "enum": [
+        "timestamp",
+        "timestamptz",
         "unix_seconds",
         "unix_millis",
         "ISO8601"
