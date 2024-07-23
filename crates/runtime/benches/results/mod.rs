@@ -48,7 +48,6 @@ impl BenchmarkResultsBuilder {
             run_id: StringBuilder::new(),
             started_at: Int64Builder::new(),
             finished_at: Int64Builder::new(),
-            connector_name: StringBuilder::new(),
             query_name: StringBuilder::new(),
             status: StringBuilder::new(),
             min_duration_ms: Int64Builder::new(),
@@ -56,6 +55,7 @@ impl BenchmarkResultsBuilder {
             iterations: Int32Builder::new(),
             commit_sha: StringBuilder::new(),
             branch_name: StringBuilder::new(),
+            connector_name: StringBuilder::new(),
         }
     }
 
@@ -95,7 +95,6 @@ impl BenchmarkResultsBuilder {
                 Arc::new(self.run_id.finish()),
                 Arc::new(self.started_at.finish()),
                 Arc::new(self.finished_at.finish()),
-                Arc::new(self.connector_name.finish()),
                 Arc::new(self.query_name.finish()),
                 Arc::new(self.status.finish()),
                 Arc::new(self.min_duration_ms.finish()),
@@ -103,6 +102,7 @@ impl BenchmarkResultsBuilder {
                 Arc::new(self.iterations.finish()),
                 Arc::new(self.commit_sha.finish()),
                 Arc::new(self.branch_name.finish()),
+                Arc::new(self.connector_name.finish()),
             ],
         );
         match batch {
@@ -128,7 +128,6 @@ fn results_schema() -> SchemaRef {
         Field::new("run_id", DataType::Utf8, false),
         Field::new("started_at", DataType::Int64, false),
         Field::new("finished_at", DataType::Int64, false),
-        Field::new("connector_name", DataType::Utf8, false),
         Field::new("query_name", DataType::Utf8, false),
         Field::new("status", DataType::Utf8, false),
         Field::new("min_duration_ms", DataType::Int64, false),
@@ -136,6 +135,7 @@ fn results_schema() -> SchemaRef {
         Field::new("iterations", DataType::Int32, false),
         Field::new("commit_sha", DataType::Utf8, false),
         Field::new("branch_name", DataType::Utf8, false),
+        Field::new("connector_name", DataType::Utf8, false),
     ];
     Arc::new(Schema::new(fields))
 }
