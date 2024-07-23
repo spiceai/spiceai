@@ -53,7 +53,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            make test-integration
+            make OPT_LEVEL=ci-dev test-integration
           else
-            make test-integration-without-spiceai-dataset
+            make OPT_LEVEL=ci-dev test-integration-without-spiceai-dataset
           fi

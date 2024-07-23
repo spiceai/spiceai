@@ -28,40 +28,40 @@
         # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory 
         # this can re-use the existing build cache to go faster.
         - name: Build without default features
-          run: cargo check --no-default-features
+          run: cargo check --no-default-features --profile ci-dev
   
         - name: Build with only duckdb
-          run: cargo check --no-default-features --features duckdb
+          run: cargo check --no-default-features --features duckdb --profile ci-dev
   
         - name: Build with only postgres
-          run: cargo check --no-default-features --features postgres
+          run: cargo check --no-default-features --features postgres --profile ci-dev
   
         - name: Build with only sqlite
-          run: cargo check --no-default-features --features sqlite
+          run: cargo check --no-default-features --features sqlite --profile ci-dev
   
         - name: Build with only mysql
-          run: cargo check --no-default-features --features mysql
+          run: cargo check --no-default-features --features mysql --profile ci-dev
   
         - name: Build with only keyring-secret-store
-          run: cargo check --no-default-features --features keyring-secret-store
+          run: cargo check --no-default-features --features keyring-secret-store --profile ci-dev
   
         - name: Build with only flightsql
-          run: cargo check --no-default-features --features flightsql
+          run: cargo check --no-default-features --features flightsql --profile ci-dev
   
         - name: Build with only aws-secrets-manager
-          run: cargo check --no-default-features --features aws-secrets-manager
+          run: cargo check --no-default-features --features aws-secrets-manager --profile ci-dev
   
         - name: Build with only databricks
-          run: cargo check --no-default-features --features databricks
+          run: cargo check --no-default-features --features databricks --profile ci-dev
   
         - name: Build with only delta_lake
-          run: cargo check --no-default-features --features delta_lake
+          run: cargo check --no-default-features --features delta_lake --profile ci-dev
   
         - name: Build with only dremio
-          run: cargo check --no-default-features --features dremio
+          run: cargo check --no-default-features --features dremio --profile ci-dev
 
         - name: Build with only clickhouse
-          run: cargo check --no-default-features --features clickhouse
+          run: cargo check --no-default-features --features clickhouse --profile ci-dev
 
         - name: Build with only debezium
-          run: cargo check --no-default-features --features debezium
+          run: cargo check --no-default-features --features debezium --profile ci-dev
