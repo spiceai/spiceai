@@ -49,4 +49,4 @@ runs:
         wget https://github.com/rui314/mold/releases/download/v2.32.1/mold-2.32.1-x86_64-linux.tar.gz
         tar -xvf mold-2.32.1-x86_64-linux.tar.gz
         sudo mv mold-2.32.1-x86_64-linux/bin/mold /usr/local/bin/mold
-        sudo apt install clang stdc++-12 -y
+        sudo apt install clang libstdc++-12-dev -y
