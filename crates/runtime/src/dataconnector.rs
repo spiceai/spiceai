@@ -420,7 +420,14 @@ impl Parameters {
                     return None;
                 }
 
-                Some((key[full_prefix.len()..].to_string(), value))
+                if has_prefix && !spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {connector_name}."
+                );
+                    return None;
+                }
+
+                Some((unprefixed_key.to_string(), value))
             })
             .collect();
         let secret_guard = secrets.read().await;

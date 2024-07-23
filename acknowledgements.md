@@ -12,13 +12,13 @@ github.com/golang/protobuf/proto, https://github.com/golang/protobuf/blob/v1.5.3
 github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/v0.5.2/LICENSE, MPL-2.0
 github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/v0.7.7/LICENSE, MPL-2.0
 github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/v1.0.0/LICENSE, MPL-2.0
+github.com/joho/godotenv, https://github.com/joho/godotenv/blob/v1.5.1/LICENCE, MIT
 github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
 github.com/magiconair/properties, https://github.com/magiconair/properties/blob/v1.8.6/LICENSE.md, BSD-2-Clause
 github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.15/LICENSE, MIT
 github.com/matttproud/golang_protobuf_extensions/pbutil, https://github.com/matttproud/golang_protobuf_extensions/blob/v1.0.4/LICENSE, Apache-2.0
 github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/v1.5.0/LICENSE, MIT
 github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v0.0.5/LICENSE.md, MIT
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/v1.9.5/LICENSE, Apache-2.0
 github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.0.2/LICENSE, MIT
 github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
 github.com/prometheus/client_model/go, https://github.com/prometheus/client_model/blob/v0.6.0/LICENSE, Apache-2.0
@@ -114,12 +114,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - base64 0.22.1, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
 
-- bb8 0.8.5, MIT 
-  <br/>https://github.com/djc/bb8
-
-- bb8-postgres 0.8.1, MIT 
-  <br/>https://github.com/djc/bb8
-
 - bigdecimal 0.3.1, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
 
@@ -131,9 +125,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - byte-unit 5.1.4, MIT 
   <br/>https://github.com/magiclen/byte-unit
-
-- byteorder 1.5.0, MIT OR Unlicense 
-  <br/>https://github.com/BurntSushi/byteorder
 
 - bytes 1.6.1, MIT 
   <br/>https://github.com/tokio-rs/bytes
@@ -192,23 +183,17 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - delta_kernel 0.1.1, Apache-2.0 
   <br/>https://github.com/delta-incubator/delta-kernel-rs
 
-- derive_builder 0.20.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/colin-kiegel/rust-derive-builder
-
 - dirs 5.0.1, Apache-2.0 OR MIT 
   <br/>https://github.com/soc/dirs-rs
+
+- dotenvy 0.15.7, MIT 
+  <br/>https://github.com/allan2/dotenvy
 
 - duckdb 1.0.0, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
 - dyn-clone 1.0.17, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/dyn-clone
-
-- fallible-iterator 0.2.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/rust-fallible-iterator
-
-- fallible-iterator 0.3.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/rust-fallible-iterator
 
 - fundu 2.0.0, MIT 
   <br/>https://github.com/fundu-rs/fundu
@@ -252,11 +237,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - lazy_static 1.5.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang-nursery/lazy-static.rs
 
+- logos 0.14.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/maciejhirsz/logos
+
 - mediatype 0.19.18, MIT 
   <br/>https://github.com/picoHz/mediatype
-
-- metrics 0.21.1, MIT 
-  <br/>https://github.com/metrics-rs/metrics
 
 - metrics 0.23.0, MIT 
   <br/>https://github.com/metrics-rs/metrics
@@ -279,9 +264,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - mysql_async 0.34.1, Apache-2.0 OR MIT 
   <br/>https://github.com/blackbeam/mysql_async
 
-- native-tls 0.2.12, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/rust-native-tls
-
 - ndarray 0.15.6, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-ndarray/ndarray
 
@@ -303,17 +285,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - parquet 52.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- pem 3.0.4, MIT 
-  <br/>https://github.com/jcreekmore/pem-rs.git
-
 - pin-project 1.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/taiki-e/pin-project
 
 - pkcs8 0.10.2, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/formats/tree/master/pkcs8
-
-- postgres-native-tls 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/rust-postgres
 
 - prometheus-parse 0.2.5, Apache-2.0 
   <br/>https://github.com/ccakes/prometheus-parse-rs
@@ -323,9 +299,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - prost 0.12.6, Apache-2.0 
   <br/>https://github.com/tokio-rs/prost
-
-- r2d2 0.8.10, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/r2d2
 
 - rand 0.8.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
@@ -345,6 +318,15 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rusqlite 0.31.0, MIT 
   <br/>https://github.com/rusqlite/rusqlite
 
+- rustls 0.21.12, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/rustls/rustls
+
+- rustls 0.22.4, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/rustls/rustls
+
+- rustls 0.23.11, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/rustls/rustls
+
 - rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/ctz/rustls-native-certs
 
@@ -362,9 +344,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - schemars 0.8.21, MIT 
   <br/>https://github.com/GREsau/schemars
-
-- sea-query 0.30.7, Apache-2.0 OR MIT 
-  <br/>https://github.com/SeaQL/sea-query
 
 - secrecy 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
@@ -411,12 +390,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - text-embeddings-backend-core 1.2.3,  
   <br/>
 
-- text-embeddings-core 1.2.3,  
-  <br/>
-
-- time 0.3.36, Apache-2.0 OR MIT 
-  <br/>https://github.com/time-rs/time
-
 - tokenizers 0.19.1, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
 
@@ -428,12 +401,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - tokio-rusqlite 0.5.1, MIT 
   <br/>https://github.com/programatik29/tokio-rusqlite
-
-- tokio-stream 0.1.15, MIT 
-  <br/>https://github.com/tokio-rs/tokio
-
-- toml 0.8.14, Apache-2.0 OR MIT 
-  <br/>https://github.com/toml-rs/toml
 
 - tonic 0.9.2, MIT 
   <br/>https://github.com/hyperium/tonic
