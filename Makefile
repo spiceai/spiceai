@@ -57,7 +57,7 @@ test-bench:
 lint: lint-go lint-rust
 
 lint-rust:
-	cargo fmt --all --profile ${OPT_LEVEL} -- --check
+	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features --workspace --profile ${OPT_LEVEL} -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
