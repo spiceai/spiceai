@@ -91,7 +91,13 @@ impl Secrets {
         for secret in secrets {
             let store_type = spicepod_secret_store_type(secret)?;
 
-            let secret_store = load_secret_store(store_type).await?;
+            let secret_store = match load_secret_store(store_type).await {
+                Ok(secret_store) => secret_store,
+                Err(e) => {
+                    tracing::error!("Error loading secret store {}: {e}", secret.name);
+                    continue;
+                }
+            };
 
             self.stores.insert(secret.name.clone(), secret_store);
         }
