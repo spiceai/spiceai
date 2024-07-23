@@ -1,1 +1,0 @@
-SELECT l_linenumber FROM lineitem WHERE l_linenumber = (SELECT MAX(l_linenumber) FROM lineitem)
