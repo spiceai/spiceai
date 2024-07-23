@@ -10,9 +10,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## [v0.16-beta (July 2024)](https://github.com/spiceai/spiceai/milestone/31)
 
-- Catalog Providers
-  - Unity Catalog catalog provider (alpha)
-- Dataset management improvements
 - Bugfixes and performance improvements
 - Databricks data connector (Beta)
 - Spice AI data connector (Beta)
