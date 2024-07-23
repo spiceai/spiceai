@@ -137,7 +137,7 @@ spice dataset configure
 					os.Exit(1)
 				}
 
-				params[datasetPrefix+"_file_format"] = file_format
+				params["file_format"] = file_format
 			}
 		}
 
