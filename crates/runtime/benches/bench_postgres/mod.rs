@@ -31,8 +31,8 @@ pub(crate) async fn run(
     Ok(())
 }
 
-fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
-    let mut app_builder = AppBuilder::new("runtime_benchmark_test")
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
         .with_dataset(make_dataset("customer", "customer"))
         .with_dataset(make_dataset("lineitem", "lineitem"))
         .with_dataset(make_dataset("part", "part"))
@@ -40,14 +40,7 @@ fn build_app(&self, upload_results_dataset: &Option<String>) -> App {
         .with_dataset(make_dataset("orders", "orders"))
         .with_dataset(make_dataset("nation", "nation"))
         .with_dataset(make_dataset("region", "region"))
-        .with_dataset(make_dataset("supplier", "supplier"));
-
-    if let Some(upload_results_dataset) = upload_results_dataset {
-        app_builder =
-            app_builder.with_dataset(make_rw_dataset(upload_results_dataset, "oss_benchmarks"));
-    }
-
-    app_builder.build()
+        .with_dataset(make_dataset("supplier", "supplier"))
 }
 
 fn get_postgres_params() -> Params {

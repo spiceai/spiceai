@@ -60,6 +60,8 @@ async fn main() -> Result<(), String> {
         #[cfg(feature = "spark")]
         "spark",
         "s3",
+        #[cfg(feature = "postgres")]
+        "postgres",
     ];
 
     let mut display_records = vec![];
@@ -79,6 +81,7 @@ async fn main() -> Result<(), String> {
             "s3" => {
                 bench_s3::run(&mut rt, &mut benchmark_results).await?;
             }
+            "postgres" => bench_postgres::run(&mut rt, &mut benchmark_results).await?,
             _ => {}
         }
         let data_update: DataUpdate = benchmark_results.into();
