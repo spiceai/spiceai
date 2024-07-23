@@ -18,7 +18,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - ODBC Data Connector (Beta)
 - MySQL Data Connector (Beta)
 
-## [v0.17-rc (August 2024)](https://github.com/spiceai/spiceai/milestone/32)
+## [v0.18-rc (August 2024)](https://github.com/spiceai/spiceai/milestone/32)
 
 - Bugfixes and performance improvements
 - Databricks data connector (Release Candidate)
