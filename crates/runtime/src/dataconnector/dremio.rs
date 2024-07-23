@@ -25,6 +25,7 @@ use data_components::flight::FlightFactory;
 use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::sqlparser::ast::TimezoneInfo;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
@@ -70,6 +71,14 @@ impl Dialect for DremioDialect {
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
         DefaultDialect {}.identifier_quote_style(identifier)
+    }
+
+    fn timestamp_cast_dtype(
+        &self,
+        _time_unit: &arrow::datatypes::TimeUnit,
+        _tz: &Option<Arc<str>>,
+    ) -> datafusion::sql::sqlparser::ast::DataType {
+        datafusion::sql::sqlparser::ast::DataType::Timestamp(None, TimezoneInfo::None)
     }
 }
 
