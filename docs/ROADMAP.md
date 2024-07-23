@@ -8,7 +8,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.16-beta (July 2024)](https://github.com/spiceai/spiceai/milestone/31)
+## [v0.17-beta (July 2024)](https://github.com/spiceai/spiceai/milestone/37)
 
 - Bugfixes and performance improvements
 - Databricks data connector (Beta)
