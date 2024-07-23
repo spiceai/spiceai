@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
+use metrics_exporter_prometheus::PrometheusHandle;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
@@ -85,7 +86,7 @@ pub struct Args {
     pub repl_config: ReplConfig,
 }
 
-pub async fn run(args: Args) -> Result<()> {
+pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
     let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())

@@ -57,6 +57,7 @@ llms = { path = "../llms" }
 logos = "0.14.0"
 mediatype = "0.19.18"
 metrics.workspace = true
+metrics-exporter-prometheus = { workspace = true }
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
 notify = "6.1.1"

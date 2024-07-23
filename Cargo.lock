@@ -8050,6 +8050,7 @@ dependencies = [
  "logos",
  "mediatype",
  "metrics",
+ "metrics-exporter-prometheus",
  "metrics-util",
  "model_components",
  "mysql_async",
