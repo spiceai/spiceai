@@ -1,3 +1,5 @@
+OPT_LEVEL := release
+
 ################################################################################
 # Target: all                                                                 #
 ################################################################################
@@ -31,7 +33,7 @@ ci:
 
 .PHONY: test
 test:
-	@cargo test --all --lib
+	@cargo test --all --lib --profile ${OPT_LEVEL}
 
 .PHONY: nextest
 nextest:
@@ -41,11 +43,11 @@ nextest:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,spiceai-dataset-test -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql,spiceai-dataset-test --profile ${OPT_LEVEL} -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql --profile ${OPT_LEVEL} -- --nocapture
 
 .PHONY: test-bench
 test-bench:
@@ -55,8 +57,8 @@ test-bench:
 lint: lint-go lint-rust
 
 lint-rust:
-	cargo fmt --all -- --check
-	cargo clippy --all-targets --all-features --workspace -- \
+	cargo fmt --all --profile ${OPT_LEVEL} -- --check
+	cargo clippy --all-targets --all-features --workspace --profile ${OPT_LEVEL} -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \

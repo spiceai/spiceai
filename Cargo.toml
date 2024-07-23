@@ -95,3 +95,11 @@ uuid = "1.9.1"
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ffe792dfdff7a96327bcc536b55d8e9167d29e14" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
+
+[profile.ci-dev]
+debug = 0
+incremental = false
+inherits = "dev"
+strip = "debuginfo"
+[profile.ci-dev.package."*"] # external dependencies
+opt-level = 3

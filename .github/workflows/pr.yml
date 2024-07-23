@@ -73,7 +73,7 @@ jobs:
         with:
           os: 'linux'
 
-      - run: make ci test
+      - run: make OPT_LEVEL=ci-dev ci test
 
   build-docker:
     name: Build Docker Image
