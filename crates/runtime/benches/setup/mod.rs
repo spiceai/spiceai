@@ -10,10 +10,11 @@ const ITERATIONS: i32 = 5;
 
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
+    connector: &str,
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = build_app(upload_results_dataset);
+    let app = build_app(upload_results_dataset, connector);
 
     let rt = Runtime::builder().with_app(app).build().await;
 
@@ -40,16 +41,31 @@ pub(crate) async fn write_benchmark_results(
         .map_err(|e| e.to_string())
 }
 
-fn build_app(upload_results_dataset: &Option<String>) -> App {
-    let mut app_builder = AppBuilder::new("runtime_benchmark_test")
-        .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
-        .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
-        .with_dataset(make_spiceai_dataset("tpch.part", "part"))
-        .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
-        .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
-        .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
-        .with_dataset(make_spiceai_dataset("tpch.region", "region"))
-        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"));
+fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
+    let mut app_builder = AppBuilder::new("runtime_benchmark_test");
+
+    app_builder = match connector {
+        "spice.ai" => app_builder
+            .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
+            .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
+            .with_dataset(make_spiceai_dataset("tpch.part", "part"))
+            .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
+            .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
+            .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
+            .with_dataset(make_spiceai_dataset("tpch.region", "region"))
+            .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier")),
+        "spark" => app_builder
+            .with_dataset(make_spark_dataset("samples.tpch.customer", "customer"))
+            .with_dataset(make_spark_dataset("samples.tpch.lineitem", "lineitem"))
+            .with_dataset(make_spark_dataset("samples.tpch.part", "part"))
+            .with_dataset(make_spark_dataset("samples.tpch.partsupp", "partsupp"))
+            .with_dataset(make_spark_dataset("samples.tpch.orders", "orders"))
+            .with_dataset(make_spark_dataset("samples.tpch.nation", "nation"))
+            .with_dataset(make_spark_dataset("samples.tpch.region", "region"))
+            .with_dataset(make_spark_dataset("samples.tpch.supplier", "supplier")),
+
+        _ => app_builder,
+    };
 
     if let Some(upload_results_dataset) = upload_results_dataset {
         app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
@@ -78,6 +94,10 @@ fn init_tracing() {
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
     Dataset::new(format!("spiceai:{path}"), name.to_string())
+}
+
+fn make_spark_dataset(path: &str, name: &str) -> Dataset {
+    Dataset::new(format!("spark:{path}"), name.to_string())
 }
 
 fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
