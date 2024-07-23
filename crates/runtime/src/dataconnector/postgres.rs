@@ -74,6 +74,7 @@ impl DataConnectorFactory for PostgresFactory {
         params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            println!("CREATE POSTGRES CONNECTION FACTORY");
             match PostgresConnectionPool::new(params.to_secret_map()).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));

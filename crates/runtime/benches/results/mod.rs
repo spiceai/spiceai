@@ -64,7 +64,6 @@ impl BenchmarkResultsBuilder {
             run_id: StringBuilder::new(),
             started_at: Int64Builder::new(),
             finished_at: Int64Builder::new(),
-            connector_name: StringBuilder::new(),
             query_name: StringBuilder::new(),
             status: StringBuilder::new(),
             min_duration_ms: Int64Builder::new(),
@@ -90,7 +89,6 @@ impl BenchmarkResultsBuilder {
         self.run_id.append_value(&self.this_run_id);
         self.started_at.append_value(start_time);
         self.finished_at.append_value(end_time);
-        self.connector_name.append_value(connector_name);
         self.query_name.append_value(query_name);
         self.connector_name.append_value(connector_name);
         self.status.append_value(status.to_string());
@@ -113,7 +111,6 @@ impl BenchmarkResultsBuilder {
                 Arc::new(self.run_id.finish()),
                 Arc::new(self.started_at.finish()),
                 Arc::new(self.finished_at.finish()),
-                Arc::new(self.connector_name.finish()),
                 Arc::new(self.query_name.finish()),
                 Arc::new(self.status.finish()),
                 Arc::new(self.min_duration_ms.finish()),
@@ -147,7 +144,6 @@ fn results_schema() -> SchemaRef {
         Field::new("run_id", DataType::Utf8, false),
         Field::new("started_at", DataType::Int64, false),
         Field::new("finished_at", DataType::Int64, false),
-        Field::new("connector_name", DataType::Utf8, false),
         Field::new("query_name", DataType::Utf8, false),
         Field::new("status", DataType::Utf8, false),
         Field::new("min_duration_ms", DataType::Int64, false),

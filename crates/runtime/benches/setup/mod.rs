@@ -24,22 +24,6 @@ use tracing_subscriber::EnvFilter;
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
-#[derive(Clone, Copy)]
-pub enum DataConnector {
-    Postgres,
-    SpiceAI,
-}
-
-impl std::fmt::Display for DataConnector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DataConnector::Postgres => write!(f, "postgres"),
-            DataConnector::SpiceAI => write!(f, "spiceai"),
-        }
-    }
-}
-
-#[allow(unreachable_patterns)]
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
     connector: &str,
@@ -60,7 +44,7 @@ pub(crate) async fn setup_benchmark(
     let benchmark_results =
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
 
-    Ok((benchmark_results, rt))
+    (benchmark_results, rt)
 }
 
 pub(crate) async fn write_benchmark_results(
@@ -180,16 +164,4 @@ fn get_branch_name() -> String {
             |_| "unknown".to_string(),
             |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
         )
-}
-
-pub trait BenchAppBuilder {
-    fn build_app(&self, upload_results_dataset: &Option<String>) -> App;
-    fn make_dataset(&self, path: &str, name: &str) -> Dataset;
-
-    fn make_rw_dataset(&self, path: &str, name: &str) -> Dataset {
-        let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
-        ds.mode = Mode::ReadWrite;
-        ds.replication = Some(Replication { enabled: true });
-        ds
-    }
 }
