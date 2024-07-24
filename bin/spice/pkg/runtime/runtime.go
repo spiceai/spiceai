@@ -25,11 +25,9 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
-func Run() error {
-	fmt.Println("Spice.ai runtime starting...")
-
+// Ensures the runtime is installed. Returns true if the runtime was installed or upgraded, false if it was already installed.
+func EnsureInstalled() (bool, error) {
 	rtcontext := context.NewContext()
-
 	err := rtcontext.Init()
 	if err != nil {
 		fmt.Println(err.Error())
@@ -39,7 +37,6 @@ func Run() error {
 	shouldInstall := false
 	var upgradeVersion string
 	if installRequired := rtcontext.IsRuntimeInstallRequired(); installRequired {
-		fmt.Println("The Spice.ai runtime has not yet been installed.")
 		shouldInstall = true
 	} else {
 		upgradeVersion, err = rtcontext.IsRuntimeUpgradeAvailable()
@@ -53,8 +50,27 @@ func Run() error {
 	if shouldInstall {
 		err = rtcontext.InstallOrUpgradeRuntime()
 		if err != nil {
-			return err
+			return shouldInstall, err
 		}
+	}
+
+	return shouldInstall, nil
+}
+
+func Run() error {
+	fmt.Println("Spice.ai runtime starting...")
+
+	rtcontext := context.NewContext()
+
+	err := rtcontext.Init()
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
+
+	_, err = EnsureInstalled()
+	if err != nil {
+		return err
 	}
 
 	cmd, err := rtcontext.GetRunCmd()

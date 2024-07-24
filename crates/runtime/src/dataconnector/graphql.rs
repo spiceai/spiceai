@@ -98,8 +98,9 @@ struct PaginationParameters {
 impl PaginationParameters {
     fn parse(query: &str, pointer: &str) -> Option<Self> {
         let pagination_pattern = r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}";
-        let regex = Regex::new(pagination_pattern)
-            .unwrap_or_else(|_| panic!("Invalid regex pagination pattern"));
+        let regex = Regex::new(pagination_pattern).unwrap_or_else(|_| {
+            unreachable!("Invalid regex pagination pattern defined at compile time")
+        });
         match regex.captures(query) {
             Some(captures) => {
                 let resource_name = captures.get(1).map(|m| m.as_str().to_owned());
@@ -571,8 +572,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .required(),
     // Runtime parameters
     ParameterSpec::runtime("json_pointer")
-        .description("The JSON pointer to the data in the GraphQL response.")
-        .required(),
+        .description("The JSON pointer to the data in the GraphQL response."),
     ParameterSpec::runtime("unnest_depth").description(
         "Depth level to automatically unnest objects to. By default, disabled if unspecified or 0.",
     ),
@@ -638,17 +638,14 @@ impl GraphQL {
                 message: "Invalid URL in dataset `from` definition",
             },
         )?;
+
+        // If json_pointer isn't provided, default to the root of the response
         let json_pointer = self
             .params
             .get("json_pointer")
             .expose()
-            .ok_or_else(|p| {
-                super::InvalidConfigurationNoSourceSnafu {
-                    dataconnector: "graphql",
-                    message: format!("`{}` not found in params", p.0),
-                }
-                .build()
-            })?
+            .ok()
+            .unwrap_or_default()
             .to_owned();
 
         let pagination_parameters = PaginationParameters::parse(&query, &json_pointer);
