@@ -2,7 +2,12 @@
 name: benchmark tests
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - qianqian/docker-tpch-postgres
+  pull_request:
+    branches:
+      - qianqian/docker-tpch-postgres
 
 jobs:
   run-database-bench:
