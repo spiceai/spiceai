@@ -20,8 +20,8 @@ use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
-    CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect, IntervalStyle, MySqlDialect,
-    PostgreSqlDialect, SqliteDialect,
+    CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
+    IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
@@ -70,6 +70,7 @@ enum ODBCDriver {
     PostgreSql,
     Sqlite,
     Databricks,
+    Athena,
     Unknown,
 }
 
@@ -77,6 +78,13 @@ fn databricks_dialect() -> CustomDialect {
     CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
         .with_interval_style(IntervalStyle::MySQL)
+        .build()
+}
+
+fn athena_dialect() -> CustomDialect {
+    CustomDialectBuilder::new()
+        .with_interval_style(IntervalStyle::MySQL)
+        .with_date_field_extract_style(DateFieldExtractStyle::Extract)
         .build()
 }
 
@@ -90,6 +98,7 @@ impl From<&str> for ODBCDriver {
             _ if val.contains("sqlite") => ODBCDriver::Sqlite, // profile and library name
             _ if val.contains("libsparkodbc") => ODBCDriver::Databricks, // library filename
             _ if val.contains("databricks") => ODBCDriver::Databricks, // profile name
+            _ if val.contains("athena") => ODBCDriver::Athena, // profile and library name
             _ => {
                 tracing::debug!("Unknown ODBC driver detected: {}", val);
                 ODBCDriver::Unknown
@@ -105,6 +114,7 @@ impl From<ODBCDriver> for Option<Arc<dyn Dialect + Send + Sync>> {
             ODBCDriver::PostgreSql => Some(Arc::new(PostgreSqlDialect {})),
             ODBCDriver::Sqlite => Some(Arc::new(SqliteDialect {})),
             ODBCDriver::Databricks => Some(Arc::new(databricks_dialect())),
+            ODBCDriver::Athena => Some(Arc::new(athena_dialect())),
             ODBCDriver::Unknown => Some(Arc::new(DefaultDialect {})),
         }
     }
@@ -119,10 +129,12 @@ impl TryFrom<SQLDialectParam> for Option<Arc<dyn Dialect + Send + Sync>> {
             "postgresql" => Ok(Some(Arc::new(PostgreSqlDialect {}))),
             "sqlite" => Ok(Some(Arc::new(SqliteDialect {}))),
             "databricks" => Ok(Some(Arc::new(databricks_dialect()))),
+            "athena" => Ok(Some(Arc::new(athena_dialect()))),
             _ => Err(Error::InvalidParameter {
                 param: "odbc_sql_dialect".to_string(),
-                msg: "Only 'mysql', 'postgresql', 'sqlite', and 'databricks' are supported"
-                    .to_string(),
+                msg:
+                    "Only 'mysql', 'postgresql', 'sqlite', 'athena', or 'databricks' are supported"
+                        .to_string(),
             }),
         }
     }
