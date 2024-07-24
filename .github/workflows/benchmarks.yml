@@ -47,4 +47,4 @@ jobs:
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root
           MYSQL_BENCHMARK_MYSQL_PASS: root
-          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_05
+          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_01
