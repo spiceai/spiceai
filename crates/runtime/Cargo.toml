@@ -49,6 +49,10 @@ fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
 headers-accept = "0.1.3"
+http = "1.1.0"
+http-body-util = "0.1.2"
+hyper = "1.4.1"
+hyper-util = "0.1.6"
 indexmap = "2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }

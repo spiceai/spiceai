@@ -119,6 +119,7 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         )]))
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
+        .with_metrics_server_opt(args.metrics, metrics_handle)
         .build()
         .await;
 

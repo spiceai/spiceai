@@ -14,10 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use bytes::Bytes;
+use http::{HeaderValue, Request, Response};
+use http_body_util::Full;
+use hyper::{
+    body::{self, Incoming},
+    header::CONTENT_TYPE,
+    server::conn::http1::Builder,
+};
+use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusHandle;
 use snafu::prelude::*;
 use std::fmt::Debug;
-use std::net::{TcpListener, ToSocketAddrs};
+use std::net::ToSocketAddrs;
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -35,11 +45,10 @@ pub(crate) async fn start<A>(
     handle: Option<PrometheusHandle>,
 ) -> Result<()>
 where
-    A: ToSocketAddrs + Debug,
+    A: ToSocketAddrs + Debug + Clone + Copy,
 {
-    let (bind_address, handle) = match (bind_address, handle) {
-        (Some(bind_address), Some(handle)) => (bind_address, handle),
-        _ => return Ok(futures::pending!()),
+    let (Some(bind_address), Some(handle)) = (bind_address, handle) else {
+        return Ok(futures::pending!());
     };
 
     let listener = std::net::TcpListener::bind(bind_address)
@@ -47,13 +56,51 @@ where
             listener.set_nonblocking(true)?;
             Ok(listener)
         })
-        .map_err(|e| BuildError::FailedToCreateHTTPListener(e.to_string()))?;
-    let listener = TcpListener::from_std(listener).unwrap();
+        .context(UnableToBindServerToPortSnafu)?;
+    let listener = TcpListener::from_std(listener).context(UnableToBindServerToPortSnafu)?;
+    tracing::info!("Spice Runtime Metrics listening on {:?}", bind_address);
 
-    let exporter = HttpListeningExporter {
-        handle,
-        allowed_addresses,
-    };
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::warn!(
+                    "Error accepting connection to serve Prometheus metrics request: {e}"
+                );
+                continue;
+            }
+        };
 
-    Ok(Box::pin(async move { exporter.serve(listener).await }))
+        process_tcp_stream(stream, handle.clone());
+    }
+}
+
+fn process_tcp_stream(stream: TcpStream, handle: PrometheusHandle) {
+    let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
+        let handle = handle.clone();
+        async move { Ok::<_, hyper::Error>(handle_http_request(&handle, &req)) }
+    });
+
+    tokio::spawn(async move {
+        if let Err(err) = Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await
+        {
+            tracing::warn!(error = ?err, "Error serving Prometheus metrics connection.");
+        }
+    });
+}
+
+fn handle_http_request(
+    handle: &PrometheusHandle,
+    req: &Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let mut response = Response::new(match req.uri().path() {
+        "/health" => "OK".into(),
+        _ => handle.render().into(),
+    });
+    response
+        .headers_mut()
+        .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    response
 }
