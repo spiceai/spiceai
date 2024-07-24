@@ -2392,6 +2392,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector_odbc"
+version = "0.17.0-beta"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "db_connection_pool",
+ "runtime",
+ "snafu 0.8.4",
+ "snmalloc-rs",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "console"
 version = "0.15.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5236,9 +5251,9 @@ dependencies = [
 
 [[package]]
 name = "libloading"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e310b3a6b5907f99202fcdb4960ff45b93735d7c7d96b760fcff8db2dc0e103d"
+checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
  "windows-targets 0.52.6",
@@ -8988,6 +9003,7 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
+ "libloading",
  "metrics-exporter-prometheus",
  "runtime",
  "rustls 0.23.11",

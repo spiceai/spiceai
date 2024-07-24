@@ -12,11 +12,12 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
+libloading = "0.8.5"
 metrics-exporter-prometheus = { workspace = true }
 runtime = { path = "../../crates/runtime" }
 rustls.workspace = true
 snafu.workspace = true
-snmalloc-rs = "0.3.6"
+snmalloc-rs.workspace = true
 spice-cloud = { path = "../../crates/spice_cloud" }
 tokio.workspace = true
 tracing.workspace = true

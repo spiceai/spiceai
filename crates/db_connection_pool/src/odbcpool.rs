@@ -23,6 +23,7 @@ use secrecy::{ExposeSecret, Secret, SecretString};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Handle;
 
 use lazy_static::lazy_static;
 
@@ -55,6 +56,7 @@ pub enum Error {
 
 pub struct ODBCPool {
     pool: &'static Environment,
+    handle: Handle,
     params: Arc<HashMap<String, SecretString>>,
     connection_string: String,
     connection_id: String,
@@ -75,7 +77,7 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub fn new(params: HashMap<String, SecretString>) -> Result<Self, Error> {
+    pub fn new(params: HashMap<String, SecretString>, handle: Handle) -> Result<Self, Error> {
         let connection_string = params
             .get("connection_string")
             .map(Secret::expose_secret)
@@ -91,6 +93,7 @@ impl ODBCPool {
             connection_string,
             connection_id,
             pool: &ENV,
+            handle,
         })
     }
 
@@ -116,6 +119,7 @@ where
         let odbc_cxn = ODBCConnection {
             conn: Arc::new(cxn.into()),
             params: Arc::clone(&self.params),
+            handle: self.handle.clone(),
         };
 
         Ok(Box::new(odbc_cxn))

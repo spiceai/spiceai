@@ -87,6 +87,7 @@ pub enum Error {
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,
     pub params: Arc<HashMap<String, SecretString>>,
+    pub handle: Handle,
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
@@ -121,11 +122,8 @@ impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self {
-        ODBCConnection {
-            conn: Arc::new(conn.into()),
-            params: Arc::new(HashMap::new()),
-        }
+    fn new(_conn: Connection<'a>) -> Self {
+        todo!()
     }
 
     #[must_use]
@@ -170,7 +168,7 @@ where
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
         let secrets = Arc::clone(&self.params);
 
-        let join_handle = tokio::task::spawn_blocking(move || {
+        let join_handle = self.handle.spawn_blocking(move || {
             let handle = Handle::current();
             let cxn = handle.block_on(async { conn.lock().await });
 
@@ -312,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(HashMap::new()).expect("Must create ODBC pool");
+        let pool = ODBCPool::new(HashMap::new(), Handle::current()).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(

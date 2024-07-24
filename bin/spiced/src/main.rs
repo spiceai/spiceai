@@ -22,6 +22,8 @@ use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
+// Changes to the global allocator need to be kept in sync with any dynamic libraries we build:
+// - crates/connector_odbc/src/lib.rs
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 

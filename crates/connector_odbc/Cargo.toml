@@ -1,0 +1,23 @@
+[package]
+name = "connector_odbc"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+async-trait.workspace = true
+data_components = { path = "../data_components", features = ["odbc"] }
+datafusion.workspace = true
+db_connection_pool = { path = "../db_connection_pool", features = ["odbc"] }
+runtime = { path = "../runtime" }
+snafu.workspace = true
+snmalloc-rs.workspace = true
+tracing.workspace = true
+tokio.workspace = true

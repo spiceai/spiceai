@@ -50,6 +50,7 @@ odbc = [
   "dep:tokio",
   "dep:dyn-clone",
   "dep:sha2",
+  "dep:async-stream",
 ]
 postgres = [
   "dep:tokio",

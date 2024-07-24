@@ -223,7 +223,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
-type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
+pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
 lazy_static! {
     static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>> =
@@ -273,7 +273,9 @@ pub async fn create_new_connector(
     Some(result)
 }
 
-pub async fn register_all() {
+pub async fn register_all(
+    extension_connectors: Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
+) {
     register_connector_factory("localhost", localhost::LocalhostConnectorFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
@@ -315,6 +317,11 @@ pub async fn register_all() {
         unity_catalog::UnityCatalogFactory::new_arc(),
     )
     .await;
+
+    for (name, factory) in extension_connectors {
+        tracing::info!("Registering extension data connector: {name}");
+        register_connector_factory(name, factory).await;
+    }
 }
 
 #[derive(Clone)]
@@ -325,7 +332,7 @@ pub struct Parameters {
 }
 
 #[derive(Debug, Clone)]
-pub struct UserParam(String);
+pub struct UserParam(pub String);
 
 impl Display for UserParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

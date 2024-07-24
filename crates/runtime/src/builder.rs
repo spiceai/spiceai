@@ -20,7 +20,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    dataaccelerator, dataconnector,
+    dataaccelerator,
+    dataconnector::{self, DataConnectorFactory},
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
@@ -31,6 +32,7 @@ pub struct RuntimeBuilder {
     app: Option<app::App>,
     autoload_extensions: HashMap<String, Box<dyn ExtensionFactory>>,
     extensions: Vec<Box<dyn ExtensionFactory>>,
+    extension_connectors: Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
     pods_watcher: Option<podswatcher::PodsWatcher>,
     datasets_health_monitor_enabled: bool,
     metrics: Option<SocketAddr>,
@@ -42,6 +44,7 @@ impl RuntimeBuilder {
         RuntimeBuilder {
             app: None,
             extensions: vec![],
+            extension_connectors: vec![],
             pods_watcher: None,
             datasets_health_monitor_enabled: false,
             metrics: None,
@@ -74,6 +77,14 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_extension_connectors(
+        mut self,
+        extension_connectors: Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
+    ) -> Self {
+        self.extension_connectors = extension_connectors;
+        self
+    }
+
     pub fn with_pods_watcher(mut self, pods_watcher: podswatcher::PodsWatcher) -> Self {
         self.pods_watcher = Some(pods_watcher);
         self
@@ -100,7 +111,7 @@ impl RuntimeBuilder {
     }
 
     pub async fn build(self) -> Runtime {
-        dataconnector::register_all().await;
+        dataconnector::register_all(self.extension_connectors).await;
         dataaccelerator::register_all().await;
 
         let hash = Uuid::new_v4().to_string()[..8].to_string();

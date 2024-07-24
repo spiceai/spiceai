@@ -20,16 +20,19 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
+use runtime::dataconnector::DataConnectorFactory;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
+use tokio::runtime::Handle;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -98,6 +101,26 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
+    let mut extension_connectors: Vec<(&'static str, Arc<dyn DataConnectorFactory>)> = vec![];
+    unsafe {
+        let lib = libloading::Library::new(
+            "/Users/phillip/code/spiceai/spiceai/target/debug/libconnector_odbc.dylib",
+        )
+        .unwrap();
+        let func: libloading::Symbol<
+            unsafe extern "Rust" fn(
+                tokio::runtime::Handle,
+            )
+                -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
+        > = lib.get(b"connectors").unwrap();
+        let tokio_runtime = Handle::current();
+        let connectors = func(tokio_runtime);
+        for (name, factory) in &connectors {
+            tracing::info!("Loaded data connector: {name}");
+        }
+        extension_connectors.extend(connectors);
+    }
+
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(app) = &app {
@@ -116,6 +139,7 @@ pub async fn run(args: Args) -> Result<()> {
             "spice_cloud".to_string(),
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
         )]))
+        .with_extension_connectors(extension_connectors)
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
         .build()

@@ -8,6 +8,7 @@ members = [
   "crates/app",
   "crates/arrow_sql_gen",
   "crates/arrow_tools",
+  "crates/connector_odbc",
   "crates/flightrepl",
   "crates/llms",
   "crates/model_components",
@@ -16,7 +17,7 @@ members = [
   "crates/spice_cloud",
   "tools/flightpublisher/",
   "tools/flightsubscriber/",
-  "tools/spicepodschema/",
+  "tools/spicepodschema/", 
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -74,6 +75,7 @@ serde_json = "1.0.1"
 serde_yaml = "0.9.30"
 snafu = "0.8.0"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
+snmalloc-rs = "0.3.6"
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 tokio = { version = "1.35.1", features = [
