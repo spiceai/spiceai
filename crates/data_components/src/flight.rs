@@ -181,7 +181,6 @@ impl FlightTable {
         dialect: Arc<dyn Dialect>,
     ) -> Self {
         let table_reference = table_reference.into();
-        let primary_keys = Vec::<String>::new();
         Self {
             name,
             client: client.clone(),

@@ -186,6 +186,9 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
+
+    #[snafu(display("Acceleration mode {mode} not supported for dataset from source {from}"))]
+    UnsupportedAccelerationMode { mode: String, from: String },
 }
 
 pub enum Table {
@@ -630,6 +633,11 @@ impl DataFusion {
             let append_stream = source.append_stream(source_table_provider).await;
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);
+            } else {
+                return Err(Error::UnsupportedAccelerationMode {
+                    mode: "append".to_string(),
+                    from: dataset.from.clone(),
+                });
             }
         }
 

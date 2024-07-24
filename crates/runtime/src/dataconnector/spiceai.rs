@@ -173,8 +173,7 @@ impl DataConnector for SpiceAI {
             .downcast_ref::<FederatedTableProviderAdaptor>()?;
         let flight_table = federated_table_provider_adaptor
             .table_provider
-            .as_ref()
-            .unwrap()
+            .as_ref()?
             .as_any()
             .downcast_ref::<FlightTable>()?;
         let stream = flight_table.stream_changes();

@@ -156,6 +156,7 @@ pub(crate) async fn handle(
             let schema = batch.schema();
             let row_count = batch.num_rows();
 
+            // "r" stands for ChangeOperation::Read
             let op_data = vec!["r"; row_count];
             let op_array = StringArray::from(op_data);
 
@@ -167,15 +168,19 @@ pub(crate) async fn handle(
             let data_array = StructArray::from(batch.clone());
 
             let new_schema = Arc::new(changes_schema(schema.as_ref()));
-            let new_record_batch = RecordBatch::try_new(
-                new_schema.clone(),
+            let new_record_batch = match RecordBatch::try_new(
+                Arc::clone(&new_schema),
                 vec![
                     Arc::new(op_array),
                     Arc::new(primary_keys_array),
                     Arc::new(data_array),
                 ],
-            )
-            .expect("Failed to create new RecordBatch");
+            ) {
+                Ok(new_record_batch) => new_record_batch,
+                Err(e) => {
+                    panic!("Unable to convert record batch into change event")
+                }
+            };
 
             let data_update = DataUpdate {
                 data: vec![new_record_batch.clone()],
