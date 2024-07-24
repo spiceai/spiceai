@@ -24,10 +24,18 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusHandle;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, private_key};
 use snafu::prelude::*;
-use std::fmt::Debug;
-use std::net::ToSocketAddrs;
-use tokio::net::{TcpListener, TcpStream};
+use std::{
+    fmt::Debug,
+    fs::File,
+    io::{BufReader, ErrorKind},
+    path::Path,
+};
+use std::{io, net::ToSocketAddrs};
+use tokio::net::TcpListener;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -36,6 +44,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: std::io::Error },
+
+    #[snafu(display("Unable to load TLS certs: {source}"))]
+    UnableToLoadTlsCerts { source: std::io::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -60,6 +71,11 @@ where
     let listener = TcpListener::from_std(listener).context(UnableToBindServerToPortSnafu)?;
     tracing::info!("Spice Runtime Metrics listening on {:?}", bind_address);
 
+    let certs = load_certs(&Path::new("certs/server.pem")).context(UnableToLoadTlsCertsSnafu)?;
+    let key = load_key(&Path::new("certs/key")).context(UnableToLoadTlsCertsSnafu)?;
+
+    let config = ServerConfig::builder().with_single_cert(certs, key).build();
+
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -75,7 +91,10 @@ where
     }
 }
 
-fn process_tcp_stream(stream: TcpStream, handle: PrometheusHandle) {
+fn process_tcp_stream<S>(stream: S, handle: PrometheusHandle)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
         let handle = handle.clone();
         async move { Ok::<_, hyper::Error>(handle_http_request(&handle, &req)) }
@@ -103,4 +122,17 @@ fn handle_http_request(
         .headers_mut()
         .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     response
+}
+
+fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+    certs(&mut BufReader::new(File::open(path)?)).collect()
+}
+
+fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
+    Ok(private_key(&mut BufReader::new(File::open(path)?))
+        .unwrap()
+        .ok_or(io::Error::new(
+            ErrorKind::Other,
+            "no private key found".to_string(),
+        ))?)
 }
