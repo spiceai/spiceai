@@ -89,8 +89,8 @@ impl BenchmarkResultsBuilder {
         self.run_id.append_value(&self.this_run_id);
         self.started_at.append_value(start_time);
         self.finished_at.append_value(end_time);
-        self.connector_name.append_value(connector_name);
         self.query_name.append_value(query_name);
+        self.connector_name.append_value(connector_name);
         self.status.append_value(status.to_string());
         self.min_duration_ms.append_value(min_duration_ms);
         self.max_duration_ms.append_value(max_duration_ms);
