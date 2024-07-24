@@ -5,9 +5,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  run-database-bench:
     name: Benchmark Tests
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: ghcr.io/spiceai/spice-mysql-bench:latest
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -proot --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +44,7 @@ jobs:
           PG_BENCHMARK_PG_SSLMODE: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_SSLMODE }}
           PG_BENCHMARK_PG_DBNAME: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_DBNAME }}
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
-          MYSQL_BENCHMARK_MYSQL_HOST: ${{ secrets.MYSQL_BENCHMARK_MYSQL_HOST }}
-          MYSQL_BENCHMARK_MYSQL_USER: ${{ secrets.MYSQL_BENCHMARK_MYSQL_USER }}
-          MYSQL_BENCHMARK_MYSQL_PASS: ${{ secrets.MYSQL_BENCHMARK_MYSQL_PASS }}
-          MYSQL_BENCHMARK_MYSQL_DB: ${{ secrets.MYSQL_BENCHMARK_MYSQL_DB }}
+          MYSQL_BENCHMARK_MYSQL_HOST: localhost
+          MYSQL_BENCHMARK_MYSQL_USER: root
+          MYSQL_BENCHMARK_MYSQL_PASS: root
+          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_01
