@@ -23,6 +23,26 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start MySQL test server
+        timeout-minutes: 2
+        run: |
+          docker run --name spice-mysql-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d ghcr.io/spiceai/spice-mysql-bench:latest
+          while true; do
+            if docker exec spice-mysql-bench-temp mysqladmin ping -uroot -proot --silent; then
+              echo 'MySQL is ready!'
+              exit 0
+            fi
+            echo 'Waiting for MySQL to be ready...'
+            sleep 1
+          done
+
       - run: cargo bench -p runtime --features postgres,spark,mysql
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
@@ -32,7 +52,7 @@ jobs:
           PG_BENCHMARK_PG_SSLMODE: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_SSLMODE }}
           PG_BENCHMARK_PG_DBNAME: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_DBNAME }}
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
-          MYSQL_BENCHMARK_MYSQL_HOST: ${{ secrets.MYSQL_BENCHMARK_MYSQL_HOST }}
-          MYSQL_BENCHMARK_MYSQL_USER: ${{ secrets.MYSQL_BENCHMARK_MYSQL_USER }}
-          MYSQL_BENCHMARK_MYSQL_PASS: ${{ secrets.MYSQL_BENCHMARK_MYSQL_PASS }}
-          MYSQL_BENCHMARK_MYSQL_DB: ${{ secrets.MYSQL_BENCHMARK_MYSQL_DB }}
+          MYSQL_BENCHMARK_MYSQL_HOST: localhost
+          MYSQL_BENCHMARK_MYSQL_USER: root
+          MYSQL_BENCHMARK_MYSQL_PASS: root
+          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_01
