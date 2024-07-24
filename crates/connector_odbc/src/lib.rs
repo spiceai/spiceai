@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{sync::Arc, thread};
 
 use runtime::dataconnector::DataConnectorFactory;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, Runtime};
 
 mod odbc;
 
@@ -26,8 +26,13 @@ mod odbc;
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 #[no_mangle]
-pub extern "Rust" fn connectors(
-    handle: Handle,
-) -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)> {
-    vec![("odbc", odbc::ODBCFactory::new_arc(handle))]
+pub extern "Rust" fn connectors() -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)> {
+    let runtime = Runtime::new().unwrap();
+    let connectors = vec![("odbc", odbc::ODBCFactory::new_arc(runtime.handle().clone()))];
+    thread::spawn(move || init(runtime));
+    connectors
+}
+
+fn init(runtime: Runtime) {
+    runtime.block_on(std::future::pending::<()>());
 }

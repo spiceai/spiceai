@@ -108,13 +108,9 @@ pub async fn run(args: Args) -> Result<()> {
         )
         .unwrap();
         let func: libloading::Symbol<
-            unsafe extern "Rust" fn(
-                tokio::runtime::Handle,
-            )
-                -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
+            unsafe extern "Rust" fn() -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
         > = lib.get(b"connectors").unwrap();
-        let tokio_runtime = Handle::current();
-        let connectors = func(tokio_runtime);
+        let connectors = func();
         for (name, factory) in &connectors {
             tracing::info!("Loaded data connector: {name}");
         }
