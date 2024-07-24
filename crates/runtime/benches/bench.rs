@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 //! This is a benchmark test suite for the Spice runtime.
 //!
 //! It performs the following actions:
@@ -7,7 +23,7 @@
 
 // spice.ai/spicehq/spice-tests/datasets/spicehq."spice-tests".oss_benchmarks
 // schema
-// run_id, started_at, finished_at, query_name, status, min_duration, max_duration, iterations, commit_sha
+// run_id, started_at, finished_at, connector_name, query_name, status, min_duration, max_duration, iterations, commit_sha
 
 use std::sync::Arc;
 
@@ -23,6 +39,11 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+#[cfg(feature = "mysql")]
+mod bench_mysql;
+mod bench_s3;
+#[cfg(feature = "spark")]
+mod bench_spark;
 mod bench_spicecloud;
 
 #[tokio::main]
@@ -33,17 +54,47 @@ async fn main() -> Result<(), String> {
         upload_results_dataset = Some(env_var);
     }
 
-    let (mut benchmark_results, mut rt) = setup::setup_benchmark(&upload_results_dataset).await;
+    let connectors = vec![
+        "spice.ai",
+        #[cfg(feature = "spark")]
+        "spark",
+        "s3",
+        #[cfg(feature = "mysql")]
+        "mysql",
+    ];
 
-    bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+    let mut display_records = vec![];
 
-    let data_update: DataUpdate = benchmark_results.into();
+    for connector in connectors {
+        let (mut benchmark_results, mut rt) =
+            setup::setup_benchmark(&upload_results_dataset, connector).await;
 
-    let display_records = data_update.data.clone();
+        match connector {
+            "spice.ai" => {
+                bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "spark")]
+            "spark" => {
+                bench_spark::run(&mut rt, &mut benchmark_results).await?;
+            }
+            "s3" => {
+                bench_s3::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "mysql")]
+            "mysql" => {
+                bench_mysql::run(&mut rt, &mut benchmark_results).await?;
+            }
+            _ => {}
+        }
+        let data_update: DataUpdate = benchmark_results.into();
 
-    if let Some(upload_results_dataset) = upload_results_dataset {
-        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
-        setup::write_benchmark_results(data_update, &rt).await?;
+        let mut records = data_update.data.clone();
+        display_records.append(&mut records);
+
+        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+            tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+            setup::write_benchmark_results(data_update, &rt).await?;
+        }
     }
 
     display_benchmark_records(display_records).await?;
@@ -61,10 +112,11 @@ fn get_current_unix_ms() -> i64 {
 async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
+    connector: &str,
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
-    tracing::info!("Running query `{query_name}`...");
+    tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
 
     let mut min_iter_duration_ms = i64::MAX;
@@ -77,10 +129,10 @@ async fn run_query_and_record_result(
             .ctx
             .sql(query)
             .await
-            .map_err(|e| format!("query `{query_name}` to plan: {e}"))?
+            .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
             .collect()
             .await
-            .map_err(|e| format!("query `{query_name}` to results: {e}"))?;
+            .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
         let end_iter_time = get_current_unix_ms();
 
         let iter_duration_ms = end_iter_time - start_iter_time;
@@ -97,6 +149,7 @@ async fn run_query_and_record_result(
     benchmark_results.record_result(
         start_time,
         end_time,
+        connector,
         query_name,
         Status::Passed,
         min_iter_duration_ms,

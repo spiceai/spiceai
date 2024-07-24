@@ -42,6 +42,7 @@ assignees: ''
 - [ ] Update release notes
   - [ ] Ensure any external contributors have been acknowledged.
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
+  - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docs/acknowledgements/index.md)
 - [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the release branch.
 - [ ] QA DRI sign-off
@@ -51,6 +52,7 @@ assignees: ''
 - [ ] Trigger algolia search crawler [workflow](https://github.com/spiceai/docs/actions/workflows/trigger_search_reindex.yml), to reindex updated docs.
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) version (image.tag version & chart version). Ensure [docker build](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) for the tag from the release branch completed (~2 hours) and trigger the [Release Chart](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) workflow.
 - [ ] Final test pass on released binaries
+- [ ] Run [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
 - [ ] Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
