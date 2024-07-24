@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::AppBuilder;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
+use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -25,11 +27,48 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, "spark", query_name, query)
+        super::run_query_and_record_result(rt, benchmark_results, "mysql", query_name, query)
             .await?;
     }
 
     Ok(())
+}
+
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
+        .with_dataset(make_dataset("customer", "customer"))
+        .with_dataset(make_dataset("lineitem", "lineitem"))
+        .with_dataset(make_dataset("part", "part"))
+        .with_dataset(make_dataset("partsupp", "partsupp"))
+        .with_dataset(make_dataset("orders", "orders"))
+        .with_dataset(make_dataset("nation", "nation"))
+        .with_dataset(make_dataset("region", "region"))
+        .with_dataset(make_dataset("supplier", "supplier"))
+}
+
+fn make_dataset(path: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
+    dataset.params = Some(get_params());
+    dataset
+}
+
+fn get_params() -> Params {
+    let host = std::env::var("MYSQL_BENCHMARK_MYSQL_HOST").unwrap_or_default();
+    let user = std::env::var("MYSQL_BENCHMARK_MYSQL_USER").unwrap_or_default();
+    let pass = std::env::var("MYSQL_BENCHMARK_MYSQL_PASS").unwrap_or_default();
+    let db = std::env::var("MYSQL_BENCHMARK_MYSQL_DB").unwrap_or_default();
+    Params::from_string_map(
+        vec![
+            ("mysql_host".to_string(), host),
+            ("mysql_user".to_string(), user),
+            ("mysql_db".to_string(), db),
+            ("mysql_pass".to_string(), pass),
+            ("mysql_tcp_port".to_string(), "3306".to_string()),
+            ("mysql_sslmode".to_string(), "preferred".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    )
 }
 
 fn get_test_queries() -> Vec<(&'static str, &'static str)> {
