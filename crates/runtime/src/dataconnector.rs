@@ -463,9 +463,15 @@ impl Parameters {
             }
 
             if parameter.required && missing {
+                let param = if parameter.r#type.is_prefixed() {
+                    format!("{full_prefix}{}", parameter.name)
+                } else {
+                    parameter.name.to_string()
+                };
+
                 return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: connector_name.to_string(),
-                    message: format!("Missing required parameter: {}", parameter.name),
+                    message: format!("Missing required parameter: {param}"),
                 }));
             }
         }
@@ -520,7 +526,7 @@ impl Parameters {
     pub fn user_param(&self, name: &str) -> UserParam {
         let spec = self.describe(name);
 
-        if self.prefix.is_empty() {
+        if self.prefix.is_empty() || !spec.r#type.is_prefixed() {
             UserParam(spec.name.to_string())
         } else {
             UserParam(format!("{}_{}", self.prefix, spec.name))

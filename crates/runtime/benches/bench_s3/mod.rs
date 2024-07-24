@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::AppBuilder;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
+use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -25,11 +27,44 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, "spark", query_name, query)
-            .await?;
+        super::run_query_and_record_result(rt, benchmark_results, "s3", query_name, query).await?;
     }
 
     Ok(())
+}
+
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
+        .with_dataset(make_dataset(
+            "spiceai-demo-datasets/tpch/customer/",
+            "customer",
+        ))
+        .with_dataset(make_dataset(
+            "spiceai-demo-datasets/tpch/lineitem/",
+            "lineitem",
+        ))
+        .with_dataset(make_dataset("spiceai-demo-datasets/tpch/part/", "part"))
+        .with_dataset(make_dataset(
+            "spiceai-demo-datasets/tpch/partsupp/",
+            "partsupp",
+        ))
+        .with_dataset(make_dataset("spiceai-demo-datasets/tpch/orders/", "orders"))
+        .with_dataset(make_dataset("spiceai-demo-datasets/tpch/nation/", "nation"))
+        .with_dataset(make_dataset("spiceai-demo-datasets/tpch/region/", "region"))
+        .with_dataset(make_dataset(
+            "spiceai-demo-datasets/tpch/supplier/",
+            "supplier",
+        ))
+}
+
+fn make_dataset(path: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("s3://{path}"), name.to_string());
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "parquet".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset
 }
 
 fn get_test_queries() -> Vec<(&'static str, &'static str)> {
