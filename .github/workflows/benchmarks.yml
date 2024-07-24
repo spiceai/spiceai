@@ -5,9 +5,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  run-database-bench:
     name: Benchmark Tests
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: ghcr.io/spiceai/spice-mysql-bench:latest
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -proot --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
     steps:
       - uses: actions/checkout@v4
 
@@ -22,26 +34,6 @@ jobs:
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Start MySQL test server
-        timeout-minutes: 2
-        run: |
-          docker run --name spice-mysql-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d ghcr.io/spiceai/spice-mysql-bench:latest
-          while true; do
-            if docker exec spice-mysql-bench-temp mysqladmin ping -uroot -proot --silent; then
-              echo 'MySQL is ready!'
-              exit 0
-            fi
-            echo 'Waiting for MySQL to be ready...'
-            sleep 1
-          done
 
       - run: cargo bench -p runtime --features postgres,spark,mysql
         env:
