@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{bench_s3, results::BenchmarkResultsBuilder};
+use crate::{bench_mysql, bench_s3, results::BenchmarkResultsBuilder};
 use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::{replication::Replication, Dataset, Mode};
@@ -80,6 +80,7 @@ fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
             .with_dataset(make_spark_dataset("samples.tpch.region", "region"))
             .with_dataset(make_spark_dataset("samples.tpch.supplier", "supplier")),
         "s3" => bench_s3::build_app(app_builder),
+        "mysql" => bench_mysql::build_app(app_builder),
 
         _ => app_builder,
     };

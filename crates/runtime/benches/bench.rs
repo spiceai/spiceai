@@ -39,6 +39,8 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+#[cfg(feature = "mysql")]
+mod bench_mysql;
 mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
@@ -57,6 +59,8 @@ async fn main() -> Result<(), String> {
         #[cfg(feature = "spark")]
         "spark",
         "s3",
+        #[cfg(feature = "mysql")]
+        "mysql",
     ];
 
     let mut display_records = vec![];
@@ -75,6 +79,10 @@ async fn main() -> Result<(), String> {
             }
             "s3" => {
                 bench_s3::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "mysql")]
+            "mysql" => {
+                bench_mysql::run(&mut rt, &mut benchmark_results).await?;
             }
             _ => {}
         }
