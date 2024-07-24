@@ -54,7 +54,12 @@ impl<'a> Iterator for SecretReplacementMatcher<'a> {
     type Item = ReplacementMatch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(Ok(token)) = self.lexer.next() {
+        while let Some(token_result) = self.lexer.next() {
+            // If this couldn't be parsed as an expected token, skip it.
+            let Ok(token) = token_result else {
+                continue;
+            };
+
             let SecretReplacementToken::Start = token else {
                 continue;
             };
@@ -167,5 +172,21 @@ mod tests {
 
         let matches: Vec<ReplacementMatch> = lexer.collect();
         assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_mysql_connection_string() {
+        let input = "mysql://${env:USER}:${env:PASSWORD}@localhost:3306/mysql_db";
+        let lexer = SecretReplacementMatcher::new(input);
+
+        let matches: Vec<ReplacementMatch> = lexer.collect();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].store_name, "env");
+        assert_eq!(matches[0].key, "USER");
+        assert_eq!(matches[0].span, 8..19);
+
+        assert_eq!(matches[1].store_name, "env");
+        assert_eq!(matches[1].key, "PASSWORD");
+        assert_eq!(matches[1].span, 20..35);
     }
 }
