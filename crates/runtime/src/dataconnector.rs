@@ -463,9 +463,15 @@ impl Parameters {
             }
 
             if parameter.required && missing {
+                let param = if parameter.r#type.is_prefixed() {
+                    format!("{full_prefix}{}", parameter.name)
+                } else {
+                    parameter.name.to_string()
+                };
+
                 return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: connector_name.to_string(),
-                    message: format!("Missing required parameter: {}", parameter.name),
+                    message: format!("Missing required parameter: {param}"),
                 }));
             }
         }
