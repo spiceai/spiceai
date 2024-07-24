@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{bench_postgres, bench_mysql, bench_s3, results::BenchmarkResultsBuilder};
+use crate::{bench_mysql, bench_postgres, bench_s3, results::BenchmarkResultsBuilder};
 use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::{replication::Replication, Dataset, Mode};

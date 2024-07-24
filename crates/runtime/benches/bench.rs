@@ -39,16 +39,15 @@ use crate::results::Status;
 mod results;
 mod setup;
 
-#[cfg(feature = "postgres")]
-mod bench_postgres;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
+#[cfg(feature = "postgres")]
+mod bench_postgres;
 mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
 mod bench_spicecloud;
 
-#[allow(unreachable_patterns)]
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
