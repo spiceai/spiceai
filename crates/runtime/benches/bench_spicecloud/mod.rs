@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::Runtime;
-
 use crate::results::BenchmarkResultsBuilder;
+use runtime::Runtime;
 
 pub(crate) async fn run(
     rt: &mut Runtime,
