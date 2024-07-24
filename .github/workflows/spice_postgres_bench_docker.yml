@@ -1,7 +1,12 @@
 name: spice-postgres-bench docker
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - qianqian/docker-tpch-postgres
+  pull_request:
+    branches:
+      - qianqian/docker-tpch-postgres
 
 jobs:
   build:
