@@ -41,6 +41,8 @@ mod setup;
 
 #[cfg(feature = "mysql")]
 mod bench_mysql;
+#[cfg(feature = "postgres")]
+mod bench_postgres;
 mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
@@ -59,6 +61,8 @@ async fn main() -> Result<(), String> {
         #[cfg(feature = "spark")]
         "spark",
         "s3",
+        #[cfg(feature = "postgres")]
+        "postgres",
         #[cfg(feature = "mysql")]
         "mysql",
     ];
@@ -80,6 +84,8 @@ async fn main() -> Result<(), String> {
             "s3" => {
                 bench_s3::run(&mut rt, &mut benchmark_results).await?;
             }
+            #[cfg(feature = "postgres")]
+            "postgres" => bench_postgres::run(&mut rt, &mut benchmark_results).await?,
             #[cfg(feature = "mysql")]
             "mysql" => {
                 bench_mysql::run(&mut rt, &mut benchmark_results).await?;
@@ -98,7 +104,6 @@ async fn main() -> Result<(), String> {
     }
 
     display_benchmark_records(display_records).await?;
-
     Ok(())
 }
 
