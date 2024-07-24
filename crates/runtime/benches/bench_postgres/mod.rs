@@ -44,11 +44,11 @@ pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
 }
 
 fn get_postgres_params() -> Params {
-    let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap_or_default();
-    let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap_or_default();
-    let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap_or_default();
-    let pg_db = std::env::var("PG_BENCHMARK_PG_DB").unwrap_or_default();
-    let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap_or_default();
+    let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap();
+    let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap();
+    let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap();
+    let pg_db = std::env::var("PG_BENCHMARK_PG_DB").unwrap();
+    let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap();
     Params::from_string_map(
         vec![
             ("pg_host".to_string(), pg_host),

@@ -56,10 +56,10 @@ async fn main() -> Result<(), String> {
     }
 
     let connectors = vec![
-        "spice.ai",
-        #[cfg(feature = "spark")]
-        "spark",
-        "s3",
+        // "spice.ai",
+        // #[cfg(feature = "spark")]
+        // "spark",
+        // "s3",
         #[cfg(feature = "postgres")]
         "postgres",
     ];
