@@ -20,9 +20,12 @@ use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::secrets::Secret;
 use crate::Runtime;
+use arrow_flight::decode::DecodedPayload;
+use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
-use data_components::flight::stream::FlightTableStreamer;
+use data_components::cdc::{
+    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+};
 use data_components::flight::FlightFactory;
 use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
@@ -31,8 +34,9 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
-use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
+use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::FlightClient;
+use futures::{Stream, StreamExt};
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
@@ -176,7 +180,12 @@ impl DataConnector for SpiceAI {
             .as_ref()?
             .as_any()
             .downcast_ref::<FlightTable>()?;
-        let stream = flight_table.stream_changes();
+
+        let stream = Box::pin(subscribe_to_append_stream(
+            flight_table.get_flight_client(),
+            flight_table.get_table_reference(),
+        ));
+
         Some(stream)
     }
 
@@ -234,6 +243,48 @@ impl SpiceAI {
             [org, app, dataset_name] => format!("{org}.{app}.{dataset_name}"),
             _ => path.to_string(),
         }
+    }
+}
+
+pub fn subscribe_to_append_stream(
+    mut client: FlightClient,
+    table_reference: String,
+) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
+    stream! {
+        match client.subscribe(&table_reference).await {
+            Ok(mut stream) => {
+                while let Some(decoded_data) = stream.next().await {
+                    match decoded_data {
+                        Ok(decoded_data) => match decoded_data.payload {
+                          DecodedPayload::None | DecodedPayload::Schema(_)=> continue,
+                          DecodedPayload::RecordBatch(batch) => {
+                            match ChangeBatch::try_new(batch)
+                            .map(|rb| ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)) {
+                                Ok(change_batch) => yield Ok(change_batch),
+                                Err(e) => yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
+                            };
+                        },
+                        },
+                        Err(e) => {
+                            yield Err(cdc::StreamError::Flight(e.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                yield Err(cdc::StreamError::Flight(e.to_string()));
+            }
+        }
+    }
+}
+
+pub struct SpiceAIChangeCommiter {}
+
+impl CommitChange for SpiceAIChangeCommiter {
+    fn commit(&self) -> Result<(), CommitError> {
+        Err(CommitError::UnableToCommitChange {
+            source: "Change commit is not yet supported by Spice AI data connector".into(),
+        })
     }
 }
 

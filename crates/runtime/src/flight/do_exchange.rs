@@ -16,13 +16,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ListArray, StringArray, StructArray};
-use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::RecordBatch;
+use arrow::array::{ListArray, StringArray, StructArray};
+use arrow::datatypes::{DataType, Field};
 use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
 use data_components::cdc::changes_schema;
-use datafusion::{catalog::schema, sql::TableReference};
+use datafusion::sql::TableReference;
 use futures::{stream, StreamExt};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, Streaming};
@@ -177,7 +177,7 @@ pub(crate) async fn handle(
                 ],
             ) {
                 Ok(new_record_batch) => new_record_batch,
-                Err(e) => {
+                Err(_) => {
                     panic!("Unable to convert record batch into change event")
                 }
             };

@@ -14,12 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{
-    cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream},
-    Read, ReadWrite,
-};
+use crate::{Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use arrow_flight::decode::DecodedPayload;
 use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -236,11 +232,12 @@ impl FlightTable {
         )?))
     }
 
-    pub fn stream_changes(&self) -> ChangesStream {
-        let append_stream =
-            subscribe_to_append_stream(self.client.clone(), self.table_reference.to_string());
+    pub fn get_flight_client(&self) -> FlightClient {
+        self.client.clone()
+    }
 
-        Box::pin(append_stream)
+    pub fn get_table_reference(&self) -> String {
+        self.table_reference.to_string()
     }
 }
 
@@ -431,38 +428,6 @@ fn query_to_stream(
                 }
             }
             Err(error) => yield Err(to_execution_error(Error::Flight{ source: error}))
-        }
-    }
-}
-
-pub fn subscribe_to_append_stream(
-    mut client: FlightClient,
-    table_reference: String,
-) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
-    stream! {
-        match client.subscribe(&table_reference).await {
-            Ok(mut stream) => {
-                while let Some(decoded_data) = stream.next().await {
-                    match decoded_data {
-                        Ok(decoded_data) => match decoded_data.payload {
-                          DecodedPayload::None | DecodedPayload::Schema(_)=> continue,
-                          DecodedPayload::RecordBatch(batch) => {
-                            match ChangeBatch::try_new(batch)
-                            .map(|rb| ChangeEnvelope::new(None, rb)) {
-                                Ok(change_batch) => yield Ok(change_batch),
-                                Err(e) => yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
-                            };
-                        },
-                        },
-                        Err(e) => {
-                            yield Err(cdc::StreamError::Flight(e.to_string()));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                yield Err(cdc::StreamError::Flight(e.to_string()));
-            }
         }
     }
 }
