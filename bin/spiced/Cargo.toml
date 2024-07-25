@@ -15,6 +15,7 @@ flightrepl = { path = "../../crates/flightrepl" }
 metrics-exporter-prometheus = { workspace = true }
 runtime = { path = "../../crates/runtime" }
 rustls.workspace = true
+rustls-pemfile.workspace = true
 snafu.workspace = true
 snmalloc-rs = "0.3.6"
 spice-cloud = { path = "../../crates/spice_cloud" }
