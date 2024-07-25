@@ -61,7 +61,7 @@ itertools = "0.12"
 metrics = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
 metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
-object_store = { version = "0.10.1" }
+object_store = { version = "0.10.2" }
 odbc-api = { version = "8.1.2" }
 pem = "3.0.4"
 r2d2 = "0.8.10"

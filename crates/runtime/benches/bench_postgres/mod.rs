@@ -47,8 +47,8 @@ fn get_postgres_params() -> Params {
     let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap_or_default();
     let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap_or_default();
     let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap_or_default();
-    let pg_db = "tpch_001".to_string();
-    let pg_sslmode = "require".to_string();
+    let pg_db = std::env::var("PG_BENCHMARK_PG_DBNAME").unwrap_or_default();
+    let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap_or_default();
     Params::from_string_map(
         vec![
             ("pg_host".to_string(), pg_host),
