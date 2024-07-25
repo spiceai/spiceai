@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use metrics_exporter_prometheus::PrometheusHandle;
+use rustls::ServerConfig;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -37,6 +38,7 @@ pub struct RuntimeBuilder {
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
     datafusion: Option<Arc<DataFusion>>,
+    tls_config: Option<Arc<ServerConfig>>,
 }
 
 impl RuntimeBuilder {
@@ -50,6 +52,7 @@ impl RuntimeBuilder {
             metrics_handle: None,
             datafusion: None,
             autoload_extensions: HashMap::new(),
+            tls_config: None,
         }
     }
 
@@ -112,6 +115,16 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_tls_config(mut self, tls_config: Arc<ServerConfig>) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    pub fn with_tls_config_opt(mut self, tls_config: Option<Arc<ServerConfig>>) -> Self {
+        self.tls_config = tls_config;
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
@@ -150,6 +163,7 @@ impl RuntimeBuilder {
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             metrics_handle: self.metrics_handle,
+            tls_config: self.tls_config,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

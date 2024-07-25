@@ -196,9 +196,10 @@ async fn context_aware_chat(
 /// }
 /// ```
 ///  - `from` returns the primary key of the relevant rows from each `payload.datasources` if
-/// primary keys for the table can be determined. An attempt to determine the primary key will be
-/// from the underlying Datafusion [`TableProvider`]'s `constraints()`. It can be explicitly
-/// provided  within the spicepod configuration, under the `datasets[*].embeddings.column_pk` path.
+///     primary keys for the table can be determined. An attempt to determine the primary key will be
+///     from the underlying Datafusion [`TableProvider`]'s `constraints()`. It can be explicitly
+///     provided within the spicepod configuration, under the `datasets[*].embeddings.column_pk` path.
+///
 /// For example:
 ///
 /// ```yaml
