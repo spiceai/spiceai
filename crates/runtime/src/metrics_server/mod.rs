@@ -59,7 +59,7 @@ where
     A: ToSocketAddrs + Debug + Clone + Copy,
 {
     let (Some(bind_address), Some(handle)) = (bind_address, handle) else {
-        return Ok(futures::pending!());
+        return Ok(());
     };
 
     let listener = std::net::TcpListener::bind(bind_address)
