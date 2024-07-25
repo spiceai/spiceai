@@ -347,10 +347,13 @@ impl Runtime {
         );
 
         // Spawn the metrics server in the background
-        tokio::spawn(metrics_server::start(
-            self.metrics_endpoint,
-            self.metrics_handle.clone(),
-        ));
+        let metrics_endpoint = self.metrics_endpoint;
+        let metrics_handle = self.metrics_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::start(metrics_endpoint, metrics_handle, None).await {
+                tracing::error!("Prometheus metrics server error: {e}");
+            }
+        });
 
         let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
         let open_telemetry_server_future =

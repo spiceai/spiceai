@@ -24,19 +24,14 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusHandle;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
 use snafu::prelude::*;
-use std::{
-    fmt::Debug,
-    fs::File,
-    io::{BufReader, ErrorKind},
-    path::Path,
-};
-use std::{io, net::ToSocketAddrs};
-use tokio::net::TcpListener;
+use std::net::ToSocketAddrs;
+use std::{fmt::Debug, sync::Arc};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to bind to address: {source}"))]
@@ -47,6 +42,12 @@ pub enum Error {
 
     #[snafu(display("Unable to load TLS certs: {source}"))]
     UnableToLoadTlsCerts { source: std::io::Error },
+
+    #[snafu(display("Unable to validate TLS certs: {source}"))]
+    UnableToValidateTlsCerts { source: rustls::Error },
+
+    #[snafu(display("Unable to accept TLS connection: {source}"))]
+    UnableToAcceptTlsConnection { source: std::io::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -54,6 +55,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) async fn start<A>(
     bind_address: Option<A>,
     handle: Option<PrometheusHandle>,
+    tls_config: Option<Arc<ServerConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug + Clone + Copy,
@@ -71,27 +73,48 @@ where
     let listener = TcpListener::from_std(listener).context(UnableToBindServerToPortSnafu)?;
     tracing::info!("Spice Runtime Metrics listening on {:?}", bind_address);
 
-    let certs = load_certs(&Path::new("certs/server.pem")).context(UnableToLoadTlsCertsSnafu)?;
-    let key = load_key(&Path::new("certs/key")).context(UnableToLoadTlsCertsSnafu)?;
-
-    let config = ServerConfig::builder().with_single_cert(certs, key).build();
-
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     "Error accepting connection to serve Prometheus metrics request: {e}"
                 );
                 continue;
             }
         };
 
-        process_tcp_stream(stream, handle.clone());
+        match tls_config {
+            Some(ref config) => {
+                let acceptor = TlsAcceptor::from(Arc::clone(config));
+                process_tls_tcp_stream(stream, acceptor.clone(), handle.clone());
+            }
+            None => {
+                process_tcp_stream(stream, handle.clone());
+            }
+        }
     }
 }
 
-fn process_tcp_stream<S>(stream: S, handle: PrometheusHandle)
+fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, handle: PrometheusHandle) {
+    tokio::spawn(async move {
+        let stream = acceptor.accept(stream).await;
+        match stream {
+            Ok(stream) => {
+                serve_connection(stream, handle).await;
+            }
+            Err(e) => {
+                tracing::debug!("Error accepting TLS connection: {e}");
+            }
+        }
+    });
+}
+
+fn process_tcp_stream(stream: TcpStream, handle: PrometheusHandle) {
+    tokio::spawn(serve_connection(stream, handle));
+}
+
+async fn serve_connection<S>(stream: S, handle: PrometheusHandle)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -100,14 +123,12 @@ where
         async move { Ok::<_, hyper::Error>(handle_http_request(&handle, &req)) }
     });
 
-    tokio::spawn(async move {
-        if let Err(err) = Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
-            .await
-        {
-            tracing::warn!(error = ?err, "Error serving Prometheus metrics connection.");
-        }
-    });
+    if let Err(err) = Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        tracing::debug!(error = ?err, "Error serving Prometheus metrics connection.");
+    }
 }
 
 fn handle_http_request(
@@ -122,17 +143,4 @@ fn handle_http_request(
         .headers_mut()
         .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     response
-}
-
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    certs(&mut BufReader::new(File::open(path)?)).collect()
-}
-
-fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    Ok(private_key(&mut BufReader::new(File::open(path)?))
-        .unwrap()
-        .ok_or(io::Error::new(
-            ErrorKind::Other,
-            "no private key found".to_string(),
-        ))?)
 }

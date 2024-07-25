@@ -8200,6 +8200,7 @@ dependencies = [
  "suppaftp",
  "tokio",
  "tokio-rusqlite",
+ "tokio-rustls 0.26.0",
  "tonic 0.11.0",
  "tonic 0.9.2",
  "tonic-health",
