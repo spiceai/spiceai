@@ -22,7 +22,7 @@ When developing applications with Spice, developers will have different database
 1. All ports will be in the same 500XX range. For instance: 50051, 50052.
 2. Keep the default ports selected when Spice originally launched.
 3. Use the most common ports used in data applications: 8080 and 9000 for HTTP endpoints, 50051 and 50052 for GRPC endpoints.
-4. Only change the HTTP ports to 8090 and 9090 to avoid conflicts with HTTP applications, but keep the GRPC endpoints using 50051 and 50052 to avoid changing the Spice client SDKs.
+4. Only change the HTTP ports to 8090 and 9090 to avoid conflicts with HTTP applications, but keep the GRPC endpoints using 50051 and 50052.
 
 ## First-Principles
 
