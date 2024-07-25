@@ -49,6 +49,7 @@ use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
+use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
@@ -81,6 +82,7 @@ pub mod extension;
 mod flight;
 mod http;
 pub mod internal_table;
+mod metrics_server;
 pub mod model;
 pub mod object_store_registry;
 pub mod objectstore;
@@ -97,6 +99,9 @@ mod tracing_util;
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
+
+    #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
+    UnableToStartMetricsServer { source: metrics_server::Error },
 
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
@@ -267,7 +272,8 @@ pub struct Runtime {
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
-    metrics: Option<SocketAddr>,
+    metrics_endpoint: Option<SocketAddr>,
+    metrics_handle: Option<PrometheusHandle>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -326,7 +332,8 @@ impl Runtime {
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
     pub async fn start_servers(&self, config: Config) -> Result<()> {
-        self.start_metrics(self.metrics).await?;
+        self.register_metrics_table(self.metrics_handle.clone())
+            .await?;
 
         let http_server_future = http::start(
             config.http_bind_address,
@@ -336,8 +343,11 @@ impl Runtime {
             Arc::clone(&self.llms),
             Arc::clone(&self.embeds),
             config.clone().into(),
-            self.metrics,
+            self.metrics_endpoint,
         );
+
+        let metrics_server_future =
+            metrics_server::start(self.metrics_endpoint, self.metrics_handle.clone());
 
         let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
         let open_telemetry_server_future =
@@ -346,6 +356,7 @@ impl Runtime {
 
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
+            metrics_res = metrics_server_future => metrics_res.context(UnableToStartMetricsServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
             open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
             pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
@@ -1213,9 +1224,9 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    async fn start_metrics(&self, with_metrics: Option<SocketAddr>) -> Result<()> {
-        if let Some(metrics_socket) = with_metrics {
-            let mut recorder = MetricsRecorder::new(metrics_socket);
+    async fn register_metrics_table(&self, with_metrics: Option<PrometheusHandle>) -> Result<()> {
+        if let Some(handle) = with_metrics {
+            let mut recorder = MetricsRecorder::new(handle);
 
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;
