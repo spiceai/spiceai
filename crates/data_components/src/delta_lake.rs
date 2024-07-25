@@ -94,7 +94,8 @@ impl DeltaTable {
         table_location: String,
         storage_options: HashMap<String, SecretString>,
     ) -> Result<Self> {
-        let table = Table::try_from_uri(table_location).context(DeltaTableSnafu)?;
+        let table =
+            Table::try_from_uri(ensure_folder_location(table_location)).context(DeltaTableSnafu)?;
 
         let storage_options: HashMap<String, String> = storage_options
             .into_iter()
@@ -143,6 +144,14 @@ impl DeltaTable {
         }
 
         Schema::new(fields)
+    }
+}
+
+fn ensure_folder_location(table_location: String) -> String {
+    if table_location.ends_with('/') {
+        table_location
+    } else {
+        format!("{table_location}/")
     }
 }
 
@@ -528,6 +537,18 @@ mod tests {
         assert_eq!(
             row_group_access,
             RowGroupAccess::Selection(selectors.into())
+        );
+    }
+
+    #[test]
+    fn test_get_table_location() {
+        assert_eq!(
+            ensure_folder_location("s3://my_bucket/".to_string()),
+            "s3://my_bucket/"
+        );
+        assert_eq!(
+            ensure_folder_location("s3://my_bucket".to_string()),
+            "s3://my_bucket/"
         );
     }
 }
