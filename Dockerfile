@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.78
+ARG RUST_VERSION=1.79
 FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
@@ -29,6 +29,9 @@ RUN \
 FROM debian:bookworm-slim
 
 ARG CARGO_FEATURES
+
+# Allow DuckDB to load extensions
+RUN mkdir .duckdb/ && chown 777 .duckdb/
 
 RUN apt update \
     && apt install --yes ca-certificates libssl3 --no-install-recommends \
