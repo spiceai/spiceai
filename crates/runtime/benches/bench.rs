@@ -56,15 +56,16 @@ async fn main() -> Result<(), String> {
         upload_results_dataset = Some(env_var);
     }
 
+    // Temp Change
     let connectors = vec![
-        "spice.ai",
-        #[cfg(feature = "spark")]
-        "spark",
-        "s3",
+        // "spice.ai",
+        // #[cfg(feature = "spark")]
+        // "spark",
+        // "s3",
         #[cfg(feature = "postgres")]
         "postgres",
-        #[cfg(feature = "mysql")]
-        "mysql",
+        // #[cfg(feature = "mysql")]
+        // "mysql",
     ];
 
     let mut display_records = vec![];
