@@ -31,7 +31,7 @@ FROM debian:bookworm-slim
 ARG CARGO_FEATURES
 
 # Allow DuckDB to load extensions
-RUN mkdir .duckdb/ && chown 777 .duckdb/
+RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 RUN apt update \
     && apt install --yes ca-certificates libssl3 --no-install-recommends \
