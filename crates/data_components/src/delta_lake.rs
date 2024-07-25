@@ -94,6 +94,12 @@ impl DeltaTable {
         table_location: String,
         storage_options: HashMap<String, SecretString>,
     ) -> Result<Self> {
+        let table_location = if table_location.ends_with('/') {
+            table_location
+        } else {
+            format!("{table_location}/")
+        };
+
         let table = Table::try_from_uri(table_location).context(DeltaTableSnafu)?;
 
         let storage_options: HashMap<String, String> = storage_options
