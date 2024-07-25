@@ -103,18 +103,23 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut extension_connectors: Vec<(&'static str, Arc<dyn DataConnectorFactory>)> = vec![];
     unsafe {
-        let lib = libloading::Library::new(
-            "/Users/phillip/code/spiceai/spiceai/target/debug/libconnector_odbc.dylib",
-        )
-        .unwrap();
-        let func: libloading::Symbol<
-            unsafe extern "Rust" fn() -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
-        > = lib.get(b"connectors").unwrap();
-        let connectors = func();
-        for (name, factory) in &connectors {
-            tracing::info!("Loaded data connector: {name}");
+        // Check if extension file exists
+        if !PathBuf::from("/Users/phillip/code/spiceai/spiceai/libconnector_odbc.dylib").exists() {
+            tracing::info!("Extension file not found");
+        } else {
+            let lib = libloading::Library::new(
+                "/Users/phillip/code/spiceai/spiceai/libconnector_odbc.dylib",
+            )
+            .unwrap();
+            let func: libloading::Symbol<
+                unsafe extern "Rust" fn() -> Vec<(&'static str, Arc<dyn DataConnectorFactory>)>,
+            > = lib.get(b"connectors").unwrap();
+            let connectors = func();
+            for (name, factory) in &connectors {
+                tracing::info!("Loaded data connector: {name}");
+            }
+            extension_connectors.extend(connectors);
         }
-        extension_connectors.extend(connectors);
     }
 
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
