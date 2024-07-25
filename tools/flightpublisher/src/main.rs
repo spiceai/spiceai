@@ -27,11 +27,7 @@ use tonic::transport::Channel;
 #[clap(about = "Spice.ai Flight Publisher Utility")]
 pub struct Args {
     /// Load parquet file to send to Apache Arrow Flight endpoint
-    #[arg(
-        long,
-        value_name = "PARQUET_FILE",
-        default_value = "/Users/qianqian/spiceai/tools/flightpublisher/src/recent_blocks.parquet"
-    )]
+    #[arg(long, value_name = "PARQUET_FILE", default_value = "test.parquet")]
     pub parquet_file: String,
 
     #[arg(
@@ -41,7 +37,7 @@ pub struct Args {
     )]
     pub flight_endpoint: String,
 
-    #[arg(long, value_name = "DATASET_PATH", default_value = "recent_blocks")]
+    #[arg(long, value_name = "DATASET_PATH", default_value = "test")]
     pub path: String,
 }
 

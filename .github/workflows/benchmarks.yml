@@ -2,7 +2,13 @@
 name: benchmark tests
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - qianqian/postgres-local
+
+  pull_request:
+    branches:
+      - qianqian/postgres-local
 
 jobs:
   run-database-bench:
@@ -20,6 +26,17 @@ jobs:
           - 3306:3306
         env:
           MYSQL_ROOT_PASSWORD: root
+      postgres:
+        image: ghcr.io/spiceai/spice-postgres-bench:latest
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
 
@@ -35,14 +52,15 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
-      - run: cargo bench -p runtime --features postgres,spark,mysql
+      # Temp Change
+      - run: cargo bench -p runtime --features postgres
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
-          PG_BENCHMARK_PG_HOST: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_HOST }}
-          PG_BENCHMARK_PG_USER: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_USER }}
-          PG_BENCHMARK_PG_PASS: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_PASS }}
-          PG_BENCHMARK_PG_SSLMODE: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_SSLMODE }}
-          PG_BENCHMARK_PG_DBNAME: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_DBNAME }}
+          PG_BENCHMARK_PG_HOST: localhost
+          PG_BENCHMARK_PG_USER: postgres
+          PG_BENCHMARK_PG_PASS: postgres
+          PG_BENCHMARK_PG_SSLMODE: disable
+          PG_BENCHMARK_PG_DBNAME: tpch_sf0_01
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root
