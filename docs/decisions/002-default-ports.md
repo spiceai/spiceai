@@ -48,11 +48,12 @@ Spice will use these port numbers as defaults:
 
 **Why not**:
 
-- Changing the HTTP endpoints introduces a breaking change. The cost of the breaking change needs to be weighed against the benefit for local development.
-- Changing the default ports can reduce the probability of port conflict in local development, but there is no guarantee that a developers environment could use ports that would conflict with the Spice defaults.
+- Changing the HTTP endpoints introduces a breaking change in the Spice runtime. The cost of the breaking change needs to be weighed against the benefit for local development.
+- Changing the default HTTP ports can reduce the probability of port conflict in local development, but there is no guarantee that a developers environment could use ports that would conflict with the Spice defaults.
+- Port 50051 is commonly used as the default port in GRPC tutorials. Not changing the default GRPC ports has a higher probability of port conflicts with GRPC applications.
 
 ## Consequences
 
-- A breaking change will be introduced in the v0.16.0-alpha release.  Developers using prior releases of Spice will need to make changes to continue using the old ports, or use the new defaults.
+- A breaking change will be introduced in the v0.16.0-alpha release.  Developers using prior releases of Spice will need to override the default HTTP ports to continue using the old ports, or change their application to use the new defaults.
 - All documents, quickstarts, and samples will be updated to the latest defaults.  Developers that pulled from these repos before the breaking change will need to upgrade their port defaults.
-- Fewer databases, front-end frameworks, and services run alongside spice for development will have port conflicts during initial setup.
+- Fewer databases, front-end frameworks, and services run alongside spice for development will have HTTP port conflicts during initial setup.
