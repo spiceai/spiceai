@@ -104,15 +104,45 @@ pub(crate) async fn handle(
                     let mut flights = vec![];
 
                     for batch in &data_update.data {
-                        if !schema_sent {
-                            let schema = batch.schema();
+                        // Convert record batch to match change schema
+                        let schema = batch.schema();
+                        let row_count = batch.num_rows();
 
-                            flights
-                                .push(FlightData::from(SchemaAsIpc::new(&schema, &write_options)));
+                        // "r" stands for ChangeOperation::Read
+                        let op_data = vec!["r"; row_count];
+                        let op_array = StringArray::from(op_data);
+
+                        let primary_keys_array = ListArray::new_null(
+                            Arc::new(Field::new("item", DataType::Utf8, false)),
+                            row_count,
+                        );
+
+                        let data_array = StructArray::from(batch.clone());
+
+                        let new_schema = Arc::new(changes_schema(schema.as_ref()));
+                        let new_record_batch = match RecordBatch::try_new(
+                            Arc::clone(&new_schema),
+                            vec![
+                                Arc::new(op_array),
+                                Arc::new(primary_keys_array),
+                                Arc::new(data_array),
+                            ],
+                        ) {
+                            Ok(new_record_batch) => new_record_batch,
+                            Err(_) => {
+                                panic!("Unable to convert record batch into change event")
+                            }
+                        };
+
+                        if !schema_sent {
+                            flights.push(FlightData::from(SchemaAsIpc::new(
+                                &new_schema,
+                                &write_options,
+                            )));
                             schema_sent = true;
                         }
                         let Ok((flight_dictionaries, flight_batch)) =
-                            encoder.encoded_batch(batch, &mut tracker, &write_options)
+                            encoder.encoded_batch(&new_record_batch, &mut tracker, &write_options)
                         else {
                             panic!("Unable to encode batch")
                         };
@@ -154,38 +184,10 @@ pub(crate) async fn handle(
 
         for batch in &results {
             let schema = batch.schema();
-            let row_count = batch.num_rows();
-
-            // "r" stands for ChangeOperation::Read
-            let op_data = vec!["r"; row_count];
-            let op_array = StringArray::from(op_data);
-
-            let primary_keys_array = ListArray::new_null(
-                Arc::new(Field::new("item", DataType::Utf8, false)),
-                row_count,
-            );
-
-            let data_array = StructArray::from(batch.clone());
-
-            let new_schema = Arc::new(changes_schema(schema.as_ref()));
-            let new_record_batch = match RecordBatch::try_new(
-                Arc::clone(&new_schema),
-                vec![
-                    Arc::new(op_array),
-                    Arc::new(primary_keys_array),
-                    Arc::new(data_array),
-                ],
-            ) {
-                Ok(new_record_batch) => new_record_batch,
-                Err(_) => {
-                    panic!("Unable to convert record batch into change event")
-                }
-            };
-
             let data_update = DataUpdate {
-                data: vec![new_record_batch.clone()],
-                schema: new_schema,
-                update_type: UpdateType::Changes,
+                data: vec![batch.clone()],
+                schema,
+                update_type: UpdateType::Append,
             };
             let _ = tx.send(data_update);
         }
