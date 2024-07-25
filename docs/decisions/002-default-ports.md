@@ -43,7 +43,7 @@ Spice will use these port numbers as defaults:
 - Back-end and data applications more commonly use ports in the 8000-9000 range for local development.  Examples:
   - Clickhouse, an analytics database, uses port 9000 by default.  
   - Trino, an analytics query engine, uses port 8080 by default.
-- The HTTP SQL API endpoint default of 3000 is used by front-end and web applications that could be used to query spice during development. Examples:
+- The HTTP API endpoint default of 3000 is used by front-end and web applications that could be used to query spice during development. Examples:
   - Next.js and Express, both web application frameworks that could be used to query Spice, default to port 3000.
 - No Spice Data Connectors or Accelerators use the selected ports by default.
 
