@@ -80,6 +80,8 @@ prost = { version = "0.12.1", default-features = false, features = [
 ] }
 regex.workspace = true
 reqwest = { version = "0.11.24", features = ["json"] }
+rustls.workspace = true
+rustls-pemfile.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -89,6 +91,7 @@ spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
+tokio-rustls = "0.26.0"
 tokio.workspace = true
 tonic-health = "0.9.0"
 tonic.workspace = true

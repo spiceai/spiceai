@@ -18,8 +18,12 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
+use std::io;
+use std::io::BufReader;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use app::{App, AppBuilder};
 use clap::Parser;
@@ -29,6 +33,11 @@ use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::ServerConfig;
+use rustls_pemfile::certs;
+use rustls_pemfile::private_key;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 
@@ -57,6 +66,9 @@ pub enum Error {
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: runtime::NotifyError },
 
+    #[snafu(display("Unable to configure TLS: {source}"))]
+    UnableToInitializeTls { source: Box<dyn std::error::Error> },
+
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 }
@@ -65,6 +77,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Parser)]
 #[clap(about = "Spice.ai OSS Runtime")]
+#[clap(rename_all = "kebab-case")]
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
@@ -84,6 +97,26 @@ pub struct Args {
 
     #[clap(flatten)]
     pub repl_config: ReplConfig,
+
+    /// Enable TLS for all server endpoints. Requires a certificate and key.
+    #[arg(long)]
+    pub tls: bool,
+
+    /// The TLS PEM-encoded certificate.
+    #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
+    pub tls_certificate: Option<String>,
+
+    /// Path to the TLS PEM-encoded certificate file.
+    #[arg(long, value_name = "cert.pem")]
+    pub tls_certificate_file: Option<String>,
+
+    /// The TLS PEM-encoded private key.
+    #[arg(long, value_name = "-----BEGIN PRIVATE KEY-----...")]
+    pub tls_key: Option<String>,
+
+    /// Path to the TLS PEM-encoded private key file.
+    #[arg(long, value_name = "key.pem")]
+    pub tls_key_file: Option<String>,
 }
 
 pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result<()> {
@@ -108,6 +141,8 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         }
     }
 
+    let tls_config = load_tls_config(&args).context(UnableToInitializeTlsSnafu)?;
+
     let rt: Runtime = Runtime::builder()
         .with_app_opt(app)
         // User configured extensions
@@ -120,6 +155,7 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, metrics_handle)
+        .with_tls_config_opt(tls_config)
         .build()
         .await;
 
@@ -139,4 +175,47 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
             reason: "Unable to start spiced".into(),
         }),
     }
+}
+
+fn load_tls_config(
+    args: &Args,
+) -> std::result::Result<Option<Arc<ServerConfig>>, Box<dyn std::error::Error>> {
+    if !args.tls {
+        return Ok(None);
+    }
+
+    let cert_reader: &mut dyn io::BufRead =
+        match (&args.tls_certificate_file, &args.tls_certificate) {
+            (Some(cert_path), _) => &mut load_file(Path::new(cert_path))?,
+            (_, Some(cert)) => &mut cert.as_bytes(),
+            (None, None) => return Err("TLS certificate is required (--tls-certificate)".into()),
+        };
+    let key_reader: &mut dyn io::BufRead = match (&args.tls_key_file, &args.tls_key) {
+        (Some(key_path), _) => &mut load_file(Path::new(key_path))?,
+        (_, Some(key)) => &mut key.as_bytes(),
+        (None, None) => return Err("TLS key is required (--tls-key)".into()),
+    };
+
+    let certs = load_certs(cert_reader)?;
+    let key = load_key(key_reader)?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(Some(Arc::new(config)))
+}
+
+fn load_file(path: &Path) -> io::Result<BufReader<File>> {
+    Ok(BufReader::new(File::open(path)?))
+}
+
+fn load_certs(rd: &mut dyn io::BufRead) -> io::Result<Vec<CertificateDer<'static>>> {
+    certs(rd).collect()
+}
+
+fn load_key(
+    rd: &mut dyn io::BufRead,
+) -> std::result::Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+    private_key(rd)?.ok_or_else(|| "No private key found in provided TLS key".into())
 }

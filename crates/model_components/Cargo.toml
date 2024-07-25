@@ -30,3 +30,4 @@ tract-onnx = "0.21.0"
 
 [features]
 full = []
+dev = []

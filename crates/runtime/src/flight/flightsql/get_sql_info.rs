@@ -520,7 +520,7 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
     builder.append(SqlInfo::SqlNullPlusNullIsNull, true);
     builder.append(
         SqlInfo::SqlSupportsConvert,
-        &SQL_INFO_SUPPORTS_CONVERT.clone(),
+        SQL_INFO_SUPPORTS_CONVERT.clone(),
     );
     builder.append(SqlInfo::SqlSupportsTableCorrelationNames, false);
     builder.append(SqlInfo::SqlSupportsDifferentTableCorrelationNames, false);

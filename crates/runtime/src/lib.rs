@@ -53,6 +53,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
+use rustls::ServerConfig;
 use secrecy::SecretString;
 use secrets::ParamStr;
 use snafu::prelude::*;
@@ -274,6 +275,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
+    tls_config: Option<Arc<ServerConfig>>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -347,10 +349,16 @@ impl Runtime {
         );
 
         // Spawn the metrics server in the background
-        tokio::spawn(metrics_server::start(
-            self.metrics_endpoint,
-            self.metrics_handle.clone(),
-        ));
+        let metrics_endpoint = self.metrics_endpoint;
+        let metrics_handle = self.metrics_handle.clone();
+        let tls_config = self.tls_config.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                metrics_server::start(metrics_endpoint, metrics_handle, tls_config).await
+            {
+                tracing::error!("Prometheus metrics server error: {e}");
+            }
+        });
 
         let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
         let open_telemetry_server_future =
