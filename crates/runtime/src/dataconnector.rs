@@ -807,6 +807,7 @@ pub trait ListingTableConnector: DataConnector {
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
     ///  - csv
+    ///
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
     ///
     /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`

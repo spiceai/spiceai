@@ -20,9 +20,6 @@ use arrow::{
     datatypes::{ArrowPrimitiveType, DataType, Float64Type},
 };
 
-#[cfg(feature = "f16_and_f128")]
-use arrow::array::Float16Array;
-
 use datafusion::{
     common::{plan_err, DataFusionError, Result as DataFusionResult},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
@@ -51,9 +48,10 @@ impl Default for ArrayDistance {
 /// For two [`DataType::FixedSizeList`], the inputs must have the same length, and have compatible
 /// inner types. Compatible inner types are
 ///   - Both inputs are [`DataType::Float16`], [`DataType::Float32`], or [`DataType::Float64`].
+///
 /// The output will be the same type as both inputs.
 ///   - Two inputs of unequal type which are within: [`DataType::Float16`], [`DataType::Float32`],
-/// and [`DataType::Float64`]. The output will be the less precise of the two inputs.
+///     and [`DataType::Float64`]. The output will be the less precise of the two inputs.
 ///   
 /// Either [`DataType::FixedSizeList`] input may contain null elements (the resulting output for
 /// that index will be null), however, all elements in a [`DataType::FixedSizeList`] must be
@@ -68,12 +66,7 @@ impl ArrayDistance {
     pub fn new() -> Self {
         let valid_types = [true, false]
             .iter()
-            .cartesian_product([
-                #[cfg(feature = "f16_and_f128")]
-                DataType::Float16,
-                DataType::Float32,
-                DataType::Float64,
-            ])
+            .cartesian_product([DataType::Float32, DataType::Float64])
             .flat_map(|(nullable, type_)| {
                 vec![
                     DataType::new_fixed_size_list(
@@ -106,12 +99,7 @@ impl ArrayDistance {
 
     /// Returns the less precise Float16/32/64 of the two input types.
     fn least_precise_float_type(t1: &DataType, t2: &DataType) -> DataFusionResult<DataType> {
-        let float_types = [
-            #[cfg(feature = "f16_and_f128")]
-            DataType::Float16,
-            DataType::Float32,
-            DataType::Float64,
-        ];
+        let float_types = [DataType::Float32, DataType::Float64];
         let i1 = float_types
             .iter()
             .position(|t| t == t1)
@@ -276,13 +264,6 @@ impl ScalarUDFImpl for ArrayDistance {
             .collect();
 
         let arr: ArrayRef = match output_type {
-            #[cfg(feature = "f16_and_f128")]
-            DataType::Float16 => Arc::new(Float16Array::from(
-                result
-                    .iter()
-                    .flat_map(|opt| opt.map(f16::from_f64))
-                    .collect_vec(),
-            )),
             DataType::Float32 => Arc::new(Float32Array::from(
                 result
                     .iter()
