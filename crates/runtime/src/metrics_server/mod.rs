@@ -39,15 +39,6 @@ pub enum Error {
 
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: std::io::Error },
-
-    #[snafu(display("Unable to load TLS certs: {source}"))]
-    UnableToLoadTlsCerts { source: std::io::Error },
-
-    #[snafu(display("Unable to validate TLS certs: {source}"))]
-    UnableToValidateTlsCerts { source: rustls::Error },
-
-    #[snafu(display("Unable to accept TLS connection: {source}"))]
-    UnableToAcceptTlsConnection { source: std::io::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

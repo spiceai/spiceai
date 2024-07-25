@@ -98,7 +98,7 @@ pub struct Args {
     #[clap(flatten)]
     pub repl_config: ReplConfig,
 
-    /// Enable TLS for the HTTP server.
+    /// Enable TLS for all server endpoints. Requires a certificate and key.
     #[arg(long)]
     pub tls: bool,
 
