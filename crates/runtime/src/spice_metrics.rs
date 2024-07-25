@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +23,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{self, try_cast_to};
 use chrono::Utc;
 use datafusion::sql::TableReference;
+use metrics_exporter_prometheus::PrometheusHandle;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::RwLock;
@@ -63,15 +63,15 @@ pub enum Error {
 }
 
 pub struct MetricsRecorder {
-    socket_addr: Arc<SocketAddr>,
+    metrics_handle: PrometheusHandle,
     remote_schema: Arc<Option<Arc<Schema>>>,
 }
 
 impl MetricsRecorder {
     #[must_use]
-    pub fn new(socket_addr: SocketAddr) -> Self {
+    pub fn new(metrics_handle: PrometheusHandle) -> Self {
         Self {
-            socket_addr: Arc::new(socket_addr),
+            metrics_handle,
             remote_schema: Arc::new(None),
         }
     }
@@ -110,17 +110,12 @@ impl MetricsRecorder {
     }
 
     async fn tick(
-        socket_addr: &SocketAddr,
+        metrics_handle: &PrometheusHandle,
         instance_name: String,
         datafusion: &Arc<DataFusion>,
         remote_schema: &Arc<Option<Arc<Schema>>>,
     ) -> Result<(), Error> {
-        let body = reqwest::get(format!("http://{socket_addr}/metrics"))
-            .await
-            .context(FailedToQueryPrometheusMetricsSnafu)?
-            .text()
-            .await
-            .context(FailedToQueryPrometheusMetricsSnafu)?;
+        let body = metrics_handle.render();
 
         let lines = body.lines().map(|s| Ok(s.to_owned()));
         let scrape =
@@ -197,14 +192,14 @@ impl MetricsRecorder {
     }
 
     pub fn start(&self, instance_name: String, datafusion: &Arc<DataFusion>) {
-        let addr = Arc::clone(&self.socket_addr);
+        let handle = self.metrics_handle.clone();
         let df = Arc::clone(datafusion);
         let schema = Arc::clone(&self.remote_schema);
 
         spawn(async move {
             loop {
                 if let Err(err) =
-                    MetricsRecorder::tick(&addr, instance_name.clone(), &df, &schema).await
+                    MetricsRecorder::tick(&handle, instance_name.clone(), &df, &schema).await
                 {
                     tracing::error!("{err}");
                 }

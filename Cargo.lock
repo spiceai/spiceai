@@ -2486,6 +2486,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e6e4d7b33a94f0991c26729976b10ebde1d34c3ee82408fb536164fa10d636"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
+
+[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2610,6 +2625,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5efa2b3d7902f4b634a20cae3c9c4e6209dc4779feb6863329607560143efa70"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -3140,12 +3164,13 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1ddfe35af3696786ab5f23cd995df33a66f6cff272ac1f85e09c1a6316acd4c"
+checksum = "04f22db2e9d735475ffcb97bf00b80d693b3d6b87ea11786bc48a7785e503680"
 dependencies = [
  "arrow-arith",
  "arrow-array",
+ "arrow-cast",
  "arrow-json",
  "arrow-ord",
  "arrow-schema",
@@ -3156,6 +3181,7 @@ dependencies = [
  "either",
  "fix-hidden-lifetime-bug",
  "futures",
+ "hdfs-native-object-store",
  "indexmap 2.2.6",
  "itertools 0.13.0",
  "lazy_static",
@@ -3177,9 +3203,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4d2127a34b12919a6bce08225f0ca6fde8a19342a32675370edfc8795e7c38a"
+checksum = "05bdaeea7681865f265739cf1d071ed571a62deaf5b77a5eb6604bf303116164"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4061,6 +4087,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "g2gen"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc2c7625b2fc250dd90b63f7887a6bb0f7ec1d714c8278415bea2669ef20820e"
+dependencies = [
+ "g2poly",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "g2p"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc36d9bdc3d2da057775a9f4fa7d7b09edab3e0eda7a92cc353358fa63b8519e"
+dependencies = [
+ "g2gen",
+ "g2poly",
+]
+
+[[package]]
+name = "g2poly"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af6a86e750338603ea2c14b1c0bfe58cd61f87ca67a0021d9334996024608e12"
+
+[[package]]
 name = "galil-seiferas"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4359,6 +4413,61 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hdfs-native"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ea02e367508e4e096e07d73216ce03ec817db26dea67781c08fa855c4dd76a3"
+dependencies = [
+ "aes",
+ "base64 0.21.7",
+ "bitflags 2.6.0",
+ "bytes",
+ "cbc",
+ "chrono",
+ "cipher",
+ "crc",
+ "ctr",
+ "des",
+ "futures",
+ "g2p",
+ "hex",
+ "hmac",
+ "libc",
+ "libloading",
+ "log",
+ "md-5",
+ "num-traits",
+ "once_cell",
+ "prost 0.12.6",
+ "prost-types",
+ "rand",
+ "regex",
+ "roxmltree",
+ "socket2 0.5.7",
+ "thiserror",
+ "tokio",
+ "url",
+ "uuid 1.10.0",
+ "whoami",
+]
+
+[[package]]
+name = "hdfs-native-object-store"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54730badbcfe7e9bdef975fd86563c0d98d4f9e0c924e335066a6c51a8a1af2b"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hdfs-native",
+ "object_store",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -6537,9 +6646,9 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbebfd32c213ba1907fa7a9c9138015a8de2b43e30c5aa45b18f7deb46786ad6"
+checksum = "e6da452820c715ce78221e8202ccc599b4a52f3e1eb3eedb487b680c81a8e3f3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6548,7 +6657,7 @@ dependencies = [
  "futures",
  "humantime",
  "hyper 1.4.1",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "md-5",
  "parking_lot 0.12.3",
  "percent-encoding",
@@ -7418,9 +7527,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.31.0"
+version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
+checksum = "96a05e2e8efddfa51a84ca47cec303fac86c8541b686d37cac5efc0e094417bc"
 dependencies = [
  "memchr",
  "serde",
@@ -7980,6 +8089,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "862340e351ce1b271a378ec53f304a5558f7db87f3769dc655a8f6ecbb68b302"
+dependencies = [
+ "xmlparser",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8042,6 +8160,10 @@ dependencies = [
  "futures",
  "globset",
  "headers-accept",
+ "http 1.1.0",
+ "http-body-util",
+ "hyper 1.4.1",
+ "hyper-util",
  "indexmap 2.2.6",
  "itertools 0.12.1",
  "keyring",
@@ -8050,6 +8172,7 @@ dependencies = [
  "logos",
  "mediatype",
  "metrics",
+ "metrics-exporter-prometheus",
  "metrics-util",
  "model_components",
  "mysql_async",
