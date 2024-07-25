@@ -36,7 +36,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState};
+use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
@@ -363,6 +363,7 @@ fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
     size: i64,
+    _stats: Option<Stats>,
     dv_info: DvInfo,
     _partition_values: HashMap<String, String>,
 ) {

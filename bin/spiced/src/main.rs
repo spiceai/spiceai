@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::net::SocketAddr;
-
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rustls::crypto::{self, CryptoProvider};
@@ -79,11 +77,12 @@ fn main() {
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(metrics_socket) = args.metrics {
-        init_metrics(metrics_socket)?;
-    }
+    let metrics_handle = match args.metrics {
+        Some(_) => Some(PrometheusBuilder::new().install_recorder()?),
+        None => None,
+    };
 
-    spiced::run(args).await?;
+    spiced::run(args, metrics_handle).await?;
     Ok(())
 }
 
@@ -99,16 +98,6 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(true)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
-
-    Ok(())
-}
-
-fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let builder = PrometheusBuilder::new().with_http_listener(socket_addr);
-
-    // This needs to run inside a Tokio runtime.
-    builder.install()?;
-    tracing::info!("Metrics listening on {socket_addr}");
 
     Ok(())
 }
