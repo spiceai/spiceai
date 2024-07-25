@@ -2,13 +2,7 @@
 name: benchmark tests
 
 on:
-  push:
-    branches:
-      - qianqian/postgres-local
-
-  pull_request:
-    branches:
-      - qianqian/postgres-local
+  workflow_dispatch:
 
 jobs:
   run-database-bench:
@@ -52,8 +46,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
-      # Temp Change
-      - run: cargo bench -p runtime --features postgres
+      - run: cargo bench -p runtime --features postgres,spark,mysql
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
