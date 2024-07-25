@@ -346,8 +346,11 @@ impl Runtime {
             self.metrics_endpoint,
         );
 
-        let metrics_server_future =
-            metrics_server::start(self.metrics_endpoint, self.metrics_handle.clone());
+        // Spawn the metrics server in the background
+        tokio::spawn(metrics_server::start(
+            self.metrics_endpoint,
+            self.metrics_handle.clone(),
+        ));
 
         let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
         let open_telemetry_server_future =
@@ -356,7 +359,6 @@ impl Runtime {
 
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
-            metrics_res = metrics_server_future => metrics_res.context(UnableToStartMetricsServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
             open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
             pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
