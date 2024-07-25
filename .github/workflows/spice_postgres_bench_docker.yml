@@ -40,7 +40,7 @@ jobs:
             DBGEN_SCALE=$sf make tpch-gen
             DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
             DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-load
-            echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >postgres-bench/backup_$DB_NAME.sql
+            echo "CREATE DATABASE $DB_NAME;" >postgres-bench/backup_$DB_NAME.sql
             echo "USE $DB_NAME;" >> postgres-bench/backup_$DB_NAME.sql
             docker exec spice-postgres-bench-temp sh -c "exec pg_dump -U postgres ${DB_NAME}" >> postgres-bench/backup_$DB_NAME.sql
           done
