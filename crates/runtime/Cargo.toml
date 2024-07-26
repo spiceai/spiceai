@@ -101,6 +101,7 @@ tract-core = "0.21.0"
 url = "2.5.0"
 util = { path = "../util" }
 uuid.workspace = true
+x509-certificate.workspace = true
 
 [dev-dependencies]
 anyhow = "1.0.86"

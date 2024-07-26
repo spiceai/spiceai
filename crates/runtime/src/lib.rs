@@ -377,8 +377,17 @@ impl Runtime {
         );
         let pods_watcher_future = self.start_pods_watcher();
 
-        if tls_config.is_some() {
-            tracing::info!("All endpoints secured with TLS");
+        if let Some(tls_config) = tls_config {
+            match tls_config.subject_name() {
+                Some(subject_name) => {
+                    tracing::info!(
+                        "All endpoints secured with TLS using certificate: {subject_name}"
+                    );
+                }
+                None => {
+                    tracing::info!("All endpoints secured with TLS");
+                }
+            }
         }
 
         tokio::select! {
