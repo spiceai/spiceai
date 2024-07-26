@@ -34,6 +34,13 @@ jobs:
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+      
+      - name: Install Databricks ODBC driver
+        run: |
+          sudo apt-get install unixodbc unixodbc-dev unzip -y
+          wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
+          unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
+          sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
 
       - run: cargo bench -p runtime --features postgres,spark,mysql,odbc
         env:
