@@ -285,7 +285,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("google_service_account")
         .description("Filesystem path to the Google service account JSON key file.")
         .secret(),
-
 ];
 
 impl DataConnectorFactory for DatabricksFactory {
