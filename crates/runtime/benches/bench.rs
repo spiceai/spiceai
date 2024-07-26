@@ -39,15 +39,19 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+#[cfg(feature = "delta_lake")]
+mod bench_delta;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
 #[cfg(feature = "odbc")]
 mod bench_odbc_databricks;
 #[cfg(feature = "postgres")]
 mod bench_postgres;
+#[cfg(feature = "s3-bench")]
 mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
+#[cfg(feature = "spiceai-bench")]
 mod bench_spicecloud;
 
 #[tokio::main]
@@ -59,7 +63,9 @@ async fn main() -> Result<(), String> {
     }
 
     let connectors = vec![
+        #[cfg(feature = "spiceai-bench")]
         "spice.ai",
+        #[cfg(feature = "s3-bench")]
         "s3",
         #[cfg(feature = "spark")]
         "spark",
@@ -69,6 +75,8 @@ async fn main() -> Result<(), String> {
         "mysql",
         #[cfg(feature = "odbc")]
         "odbc",
+        #[cfg(feature = "delta_lake")]
+        "delta_lake",
     ];
 
     let mut display_records = vec![];
@@ -78,9 +86,11 @@ async fn main() -> Result<(), String> {
             setup::setup_benchmark(&upload_results_dataset, connector).await;
 
         match connector {
+            #[cfg(feature = "spiceai-bench")]
             "spice.ai" => {
                 bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
             }
+            #[cfg(feature = "s3-bench")]
             "s3" => {
                 bench_s3::run(&mut rt, &mut benchmark_results).await?;
             }
@@ -99,6 +109,10 @@ async fn main() -> Result<(), String> {
             #[cfg(feature = "odbc")]
             "odbc" => {
                 bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "delta_lake")]
+            "delta_lake" => {
+                bench_delta::run(&mut rt, &mut benchmark_results).await?;
             }
             _ => {}
         }
@@ -176,6 +190,10 @@ async fn run_query_and_record_result(
 
 /// Display the benchmark results record batches to the console.
 async fn display_benchmark_records(records: Vec<RecordBatch>) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
     let schema = records[0].schema();
 
     let ctx = SessionContext::new();
