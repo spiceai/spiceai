@@ -367,8 +367,11 @@ impl Runtime {
             Arc::clone(&self.df),
             self.tls_config.clone(),
         );
-        let open_telemetry_server_future =
-            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
+        let open_telemetry_server_future = opentelemetry::start(
+            config.open_telemetry_bind_address,
+            Arc::clone(&self.df),
+            self.tls_config.clone(),
+        );
         let pods_watcher_future = self.start_pods_watcher();
 
         tokio::select! {
