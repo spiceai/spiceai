@@ -50,8 +50,8 @@ use tonic_0_9_0::transport::{Identity, Server, ServerTlsConfig};
 use tonic_0_9_0::Request;
 use tonic_0_9_0::Response;
 use tonic_0_9_0::Status;
-use tonic_health::pb::health_server::Health;
-use tonic_health::pb::health_server::HealthServer;
+use tonic_health_0_9_0::pb::health_server::Health;
+use tonic_health_0_9_0::pb::health_server::HealthServer;
 
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -206,7 +206,7 @@ impl MetricsService for Service {
 }
 
 async fn create_health_service() -> HealthServer<impl Health> {
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (mut health_reporter, health_service) = tonic_health_0_9_0::server::health_reporter();
     health_reporter
         .set_serving::<MetricsServiceServer<Service>>()
         .await;

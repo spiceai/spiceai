@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Config {
@@ -44,4 +44,42 @@ pub struct Config {
         action
     )]
     pub open_telemetry_bind_address: SocketAddr,
+}
+
+impl Config {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8090),
+            flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50051),
+            open_telemetry_bind_address: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                50052,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn with_http_bind_address(mut self, bind_addr: SocketAddr) -> Self {
+        self.http_bind_address = bind_addr;
+        self
+    }
+
+    #[must_use]
+    pub fn with_flight_bind_address(mut self, bind_addr: SocketAddr) -> Self {
+        self.flight_bind_address = bind_addr;
+        self
+    }
+
+    #[must_use]
+    pub fn with_open_telemetry_bind_address(mut self, bind_addr: SocketAddr) -> Self {
+        self.open_telemetry_bind_address = bind_addr;
+        self
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
 }
