@@ -35,7 +35,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
-      - run: cargo bench -p runtime --features postgres,spark,mysql
+      - run: cargo bench -p runtime --features postgres,spark,mysql,odbc
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: ${{ secrets.SPICE_SECRET_PG_BENCHMARK_PG_HOST }}
@@ -48,3 +48,6 @@ jobs:
           MYSQL_BENCHMARK_MYSQL_USER: root
           MYSQL_BENCHMARK_MYSQL_PASS: root
           MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_01
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
