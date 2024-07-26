@@ -50,9 +50,12 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
     // these env vars don't get auto-loaded because they're part of the connection string
     // so we need to pull them out ourselves
+    #[allow(clippy::expect_used)]
     let host_env = std::env::var("DATABRICKS_HOST").expect("DATABRICKS_HOST to be set");
+    #[allow(clippy::expect_used)]
     let http_path_env =
         std::env::var("DATABRICKS_ODBC_PATH").expect("DATABRICKS_ODBC_PATH to be set");
+    #[allow(clippy::expect_used)]
     let token_env = std::env::var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN to be set");
 
     let connection_string = format!("Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so;Host={host_env};Port=443;HTTPPath={http_path_env};SSL=1;ThriftTransport=2;AuthMech=3;UID=token;PWD={token_env}");
