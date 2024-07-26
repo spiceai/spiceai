@@ -346,6 +346,7 @@ impl Runtime {
             Arc::clone(&self.embeds),
             config.clone().into(),
             self.metrics_endpoint,
+            self.tls_config.clone(),
         );
 
         // Spawn the metrics server in the background

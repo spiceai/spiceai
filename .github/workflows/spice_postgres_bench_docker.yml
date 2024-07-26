@@ -1,0 +1,57 @@
+name: spice-postgres-bench docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull Postgres Docker image
+        run: docker pull postgres:latest
+
+      - name: Start temporary Postgres server
+        run: |
+          docker run --name spice-postgres-bench-temp -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:latest
+          sleep 10
+
+      - name: Install necessary tools
+        run: sudo apt-get update && sudo apt-get install -y git make gcc
+
+      - name: Initialize TPCH data
+        working-directory: ./test/tpch
+        run: |
+          make tpch-init
+          export PGPASSWORD='postgres'
+          for sf in 0.01 0.05 1; do
+            DB_NAME=tpch_sf${sf//./_}
+            DBGEN_SCALE=$sf make tpch-gen
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-load
+            docker exec spice-postgres-bench-temp sh -c "exec pg_dump -U postgres ${DB_NAME}" >> postgres-bench/backup_$DB_NAME.sql
+          done
+
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./test/tpch/postgres-bench
+          file: ./test/tpch/postgres-bench/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/spiceai/spice-postgres-bench:latest
+            ghcr.io/spiceai/spice-postgres-bench:${{ github.sha }}
