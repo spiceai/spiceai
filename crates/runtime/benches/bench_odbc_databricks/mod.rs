@@ -27,8 +27,14 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, "odbc", query_name, query)
-            .await?;
+        super::run_query_and_record_result(
+            rt,
+            benchmark_results,
+            "odbc-databricks",
+            query_name,
+            query,
+        )
+        .await?;
     }
 
     Ok(())
@@ -48,17 +54,7 @@ pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
-    // these env vars don't get auto-loaded because they're part of the connection string
-    // so we need to pull them out ourselves
-    #[allow(clippy::expect_used)]
-    let host_env = std::env::var("DATABRICKS_HOST").expect("DATABRICKS_HOST to be set");
-    #[allow(clippy::expect_used)]
-    let http_path_env =
-        std::env::var("DATABRICKS_ODBC_PATH").expect("DATABRICKS_ODBC_PATH to be set");
-    #[allow(clippy::expect_used)]
-    let token_env = std::env::var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN to be set");
-
-    let connection_string = format!("Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so;Host={host_env};Port=443;HTTPPath={http_path_env};SSL=1;ThriftTransport=2;AuthMech=3;UID=token;PWD={token_env}");
+    let connection_string = "Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so;Host=${ env:DATABRICKS_HOST };Port=443;HTTPPath=${ env:DATABRICKS_ODBC_PATH };SSL=1;ThriftTransport=2;AuthMech=3;UID=token;PWD=${ env:DATABRICKS_TOKEN }".to_string();
 
     dataset.params = Some(Params::from_string_map(
         vec![("odbc_connection_string".to_string(), connection_string)]
