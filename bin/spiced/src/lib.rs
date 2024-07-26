@@ -19,8 +19,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io;
-use std::io::BufReader;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,12 +31,8 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
+use runtime::tls::TlsConfig;
 use runtime::{extension::ExtensionFactory, Runtime};
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::PrivateKeyDer;
-use rustls::ServerConfig;
-use rustls_pemfile::certs;
-use rustls_pemfile::private_key;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 
@@ -179,43 +174,30 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
 
 fn load_tls_config(
     args: &Args,
-) -> std::result::Result<Option<Arc<ServerConfig>>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Option<Arc<TlsConfig>>, Box<dyn std::error::Error>> {
     if !args.tls {
         return Ok(None);
     }
 
-    let cert_reader: &mut dyn io::BufRead =
-        match (&args.tls_certificate_file, &args.tls_certificate) {
-            (Some(cert_path), _) => &mut load_file(Path::new(cert_path))?,
-            (_, Some(cert)) => &mut cert.as_bytes(),
-            (None, None) => return Err("TLS certificate is required (--tls-certificate)".into()),
-        };
-    let key_reader: &mut dyn io::BufRead = match (&args.tls_key_file, &args.tls_key) {
-        (Some(key_path), _) => &mut load_file(Path::new(key_path))?,
-        (_, Some(key)) => &mut key.as_bytes(),
+    let cert_bytes: Vec<u8> = match (&args.tls_certificate_file, &args.tls_certificate) {
+        (Some(cert_path), _) => load_file(Path::new(cert_path))?,
+        (_, Some(cert)) => cert.as_bytes().to_vec(),
+        (None, None) => return Err("TLS certificate is required (--tls-certificate)".into()),
+    };
+    let key_bytes: Vec<u8> = match (&args.tls_key_file, &args.tls_key) {
+        (Some(key_path), _) => load_file(Path::new(key_path))?,
+        (_, Some(key)) => key.as_bytes().to_vec(),
         (None, None) => return Err("TLS key is required (--tls-key)".into()),
     };
 
-    let certs = load_certs(cert_reader)?;
-    let key = load_key(key_reader)?;
+    let tls_config = TlsConfig::try_new(cert_bytes, key_bytes)?;
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    Ok(Some(Arc::new(config)))
+    Ok(Some(Arc::new(tls_config)))
 }
 
-fn load_file(path: &Path) -> io::Result<BufReader<File>> {
-    Ok(BufReader::new(File::open(path)?))
-}
-
-fn load_certs(rd: &mut dyn io::BufRead) -> io::Result<Vec<CertificateDer<'static>>> {
-    certs(rd).collect()
-}
-
-fn load_key(
-    rd: &mut dyn io::BufRead,
-) -> std::result::Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
-    private_key(rd)?.ok_or_else(|| "No private key found in provided TLS key".into())
+fn load_file(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
 }

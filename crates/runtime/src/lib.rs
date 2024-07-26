@@ -53,13 +53,13 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use rustls::ServerConfig;
 use secrecy::SecretString;
 use secrets::ParamStr;
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tracing_util::dataset_registered_trace;
@@ -93,6 +93,7 @@ pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
 pub mod timing;
+pub mod tls;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -275,7 +276,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
-    tls_config: Option<Arc<ServerConfig>>,
+    tls_config: Option<Arc<TlsConfig>>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -361,7 +362,11 @@ impl Runtime {
             }
         });
 
-        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
+        let flight_server_future = flight::start(
+            config.flight_bind_address,
+            Arc::clone(&self.df),
+            self.tls_config.clone(),
+        );
         let open_telemetry_server_future =
             opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
         let pods_watcher_future = self.start_pods_watcher();

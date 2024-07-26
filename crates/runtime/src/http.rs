@@ -24,7 +24,6 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use model_components::model::Model;
-use rustls::ServerConfig;
 use snafu::prelude::*;
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -37,6 +36,7 @@ use crate::{
     datafusion::DataFusion,
     embeddings::vector_search::{self, compute_primary_keys},
     model::LLMModelStore,
+    tls::TlsConfig,
     EmbeddingModelStore,
 };
 
@@ -64,7 +64,7 @@ pub(crate) async fn start<A>(
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
-    tls_config: Option<Arc<ServerConfig>>,
+    tls_config: Option<Arc<TlsConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
@@ -103,7 +103,7 @@ where
 
         match tls_config {
             Some(ref config) => {
-                let acceptor = TlsAcceptor::from(Arc::clone(config));
+                let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
                 process_tls_tcp_stream(stream, acceptor, routes.clone());
             }
             None => {
