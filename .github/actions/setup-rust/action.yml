@@ -42,11 +42,55 @@ runs:
       run: |
         rustup toolchain install stable
     
-    - uses: rui314/setup-mold@v1
-
-    - name: Install clang
+    - name: Install lld (Linux)
       if: inputs.os == 'linux'
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang libstdc++-12-dev
+        sudo apt-get install -y lld
+    
+    - name: Install lld (macOS)
+      if: inputs.os == 'darwin'
+      shell: bash
+      run: |
+        brew install lld
+    
+    - name: Install sccache (Linux X64)
+      if: inputs.os == 'linux' && runner.arch == 'X64'
+      shell: bash
+      run: |
+        wget https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-i686-unknown-linux-musl.tar.gz
+        tar -xvf sccache-v0.8.1-i686-unknown-linux-musl.tar.gz
+        sudo mv sccache-v0.8.1-i686-unknown-linux-musl/sccache /usr/bin/sccache
+    
+    - name: Install sccache (Linux ARM)
+      if: inputs.os == 'linux' && runner.arch == 'X64'
+      shell: bash
+      run: |
+        wget https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-aarch64-unknown-linux-musl.tar.gz
+        tar -xvf sccache-v0.8.1-aarch64-unknown-linux-musl.tar.gz
+        sudo mv sccache-v0.8.1-aarch64-unknown-linux-musl/sccache /usr/bin/sccache
+
+    - name: Install sccache (macOS)
+      if: inputs.os == 'darwin'
+      shell: bash
+      run: |
+        brew install sccache
+    
+    - name: Configure sccache
+      if: inputs.os == 'linux' || inputs.os == 'darwin'
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: todo
+        AWS_SECRET_ACCESS_KEY: todo
+      run: |
+        mkdir -p $HOME/.config/sccache
+        cp .config/sccache/config $HOME/.config/sccache/config
+        sccache --start-server
+    
+    - name: Configure Cargo
+      if: inputs.os == 'linux' || inputs.os == 'darwin'
+      shell: bash
+      run: |
+        mkdir -p $HOME/.cargo
+        cp .cargo/config $HOME/.cargo/config

@@ -1,0 +1,5 @@
+[cache.s3]
+bucket = 'spiceai-sandpit-sccache'
+region = 'us-east-2'
+use_ssl = true
+no_credentials = false
