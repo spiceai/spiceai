@@ -76,8 +76,6 @@ pub(crate) async fn load_tls_config(
 
     let tls_config = TlsConfig::try_new(cert_bytes, key_bytes)?;
 
-    tracing::info!("All endpoints secured with TLS");
-
     Ok(Some(Arc::new(tls_config)))
 }
 

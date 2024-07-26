@@ -377,6 +377,10 @@ impl Runtime {
         );
         let pods_watcher_future = self.start_pods_watcher();
 
+        if tls_config.is_some() {
+            tracing::info!("All endpoints secured with TLS");
+        }
+
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
