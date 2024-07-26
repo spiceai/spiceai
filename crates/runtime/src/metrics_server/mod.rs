@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::tls::TlsConfig;
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response};
 use http_body_util::Full;
@@ -24,7 +25,6 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusHandle;
-use rustls::ServerConfig;
 use snafu::prelude::*;
 use std::net::ToSocketAddrs;
 use std::{fmt::Debug, sync::Arc};
@@ -46,7 +46,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) async fn start<A>(
     bind_address: Option<A>,
     handle: Option<PrometheusHandle>,
-    tls_config: Option<Arc<ServerConfig>>,
+    tls_config: Option<Arc<TlsConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug + Clone + Copy,
@@ -77,7 +77,7 @@ where
 
         match tls_config {
             Some(ref config) => {
-                let acceptor = TlsAcceptor::from(Arc::clone(config));
+                let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
                 process_tls_tcp_stream(stream, acceptor.clone(), handle.clone());
             }
             None => {

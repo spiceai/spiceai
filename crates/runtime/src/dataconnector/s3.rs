@@ -68,7 +68,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("endpoint").secret(),
     ParameterSpec::connector("key").secret(),
     ParameterSpec::connector("secret").secret(),
-    ParameterSpec::runtime("client_timeout"),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for S3 client."),
 
     // Common listing table parameters
     ParameterSpec::runtime("file_format"),

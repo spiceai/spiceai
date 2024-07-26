@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use metrics_exporter_prometheus::PrometheusHandle;
-use rustls::ServerConfig;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -26,7 +25,9 @@ use crate::{
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
-    podswatcher, secrets, tracers, Runtime,
+    podswatcher, secrets,
+    tls::TlsConfig,
+    tracers, Runtime,
 };
 
 pub struct RuntimeBuilder {
@@ -38,7 +39,7 @@ pub struct RuntimeBuilder {
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
     datafusion: Option<Arc<DataFusion>>,
-    tls_config: Option<Arc<ServerConfig>>,
+    tls_config: Option<Arc<TlsConfig>>,
 }
 
 impl RuntimeBuilder {
@@ -115,12 +116,12 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_tls_config(mut self, tls_config: Arc<ServerConfig>) -> Self {
+    pub fn with_tls_config(mut self, tls_config: Arc<TlsConfig>) -> Self {
         self.tls_config = Some(tls_config);
         self
     }
 
-    pub fn with_tls_config_opt(mut self, tls_config: Option<Arc<ServerConfig>>) -> Self {
+    pub fn with_tls_config_opt(mut self, tls_config: Option<Arc<TlsConfig>>) -> Self {
         self.tls_config = tls_config;
         self
     }

@@ -41,6 +41,8 @@ mod setup;
 
 #[cfg(feature = "mysql")]
 mod bench_mysql;
+#[cfg(feature = "odbc")]
+mod bench_odbc_databricks;
 #[cfg(feature = "postgres")]
 mod bench_postgres;
 mod bench_s3;
@@ -58,13 +60,15 @@ async fn main() -> Result<(), String> {
 
     let connectors = vec![
         "spice.ai",
+        "s3",
         #[cfg(feature = "spark")]
         "spark",
-        "s3",
         #[cfg(feature = "postgres")]
         "postgres",
         #[cfg(feature = "mysql")]
         "mysql",
+        #[cfg(feature = "odbc")]
+        "odbc",
     ];
 
     let mut display_records = vec![];
@@ -77,18 +81,24 @@ async fn main() -> Result<(), String> {
             "spice.ai" => {
                 bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
             }
+            "s3" => {
+                bench_s3::run(&mut rt, &mut benchmark_results).await?;
+            }
             #[cfg(feature = "spark")]
             "spark" => {
                 bench_spark::run(&mut rt, &mut benchmark_results).await?;
             }
-            "s3" => {
-                bench_s3::run(&mut rt, &mut benchmark_results).await?;
-            }
             #[cfg(feature = "postgres")]
-            "postgres" => bench_postgres::run(&mut rt, &mut benchmark_results).await?,
+            "postgres" => {
+                bench_postgres::run(&mut rt, &mut benchmark_results).await?;
+            }
             #[cfg(feature = "mysql")]
             "mysql" => {
                 bench_mysql::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "odbc")]
+            "odbc" => {
+                bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
             }
             _ => {}
         }

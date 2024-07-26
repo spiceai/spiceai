@@ -19,6 +19,7 @@ use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
+use crate::tls::TlsConfig;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -32,12 +33,13 @@ use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
@@ -290,11 +292,18 @@ pub enum Error {
 
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: tonic::transport::Error },
+
+    #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
+    UnableToConfigureTls { source: tonic::transport::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
+pub async fn start(
+    bind_address: std::net::SocketAddr,
+    df: Arc<DataFusion>,
+    tls_config: Option<Arc<TlsConfig>>,
+) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
@@ -304,7 +313,19 @@ pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> R
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     metrics::counter!("spiced_runtime_flight_server_start").increment(1);
 
-    Server::builder()
+    let mut server = Server::builder();
+
+    if let Some(ref tls_config) = tls_config {
+        let server_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+            tls_config.cert.expose_secret(),
+            tls_config.key.expose_secret(),
+        ));
+        server = server
+            .tls_config(server_tls_config)
+            .context(UnableToConfigureTlsSnafu)?;
+    }
+
+    server
         .add_service(svc)
         .serve(bind_address)
         .await

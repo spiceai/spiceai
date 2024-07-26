@@ -42,10 +42,11 @@ use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use tonic_0_9_0::async_trait;
 use tonic_0_9_0::codec::CompressionEncoding;
-use tonic_0_9_0::transport::Server;
+use tonic_0_9_0::transport::{Identity, Server, ServerTlsConfig};
 use tonic_0_9_0::Request;
 use tonic_0_9_0::Response;
 use tonic_0_9_0::Status;
@@ -55,6 +56,7 @@ use tonic_health::pb::health_server::HealthServer;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::dataupdate::UpdateType;
+use crate::tls::TlsConfig;
 use crate::{tracers::OnceTracer, warn_once};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -91,6 +93,11 @@ pub enum Error {
         "First data point for metric {metric} has no value and therefore is not valid for establishing schema"
     ))]
     FirstMetricDataPointHasNoValue { metric: String },
+
+    #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
+    UnableToConfigureTls {
+        source: tonic_0_9_0::transport::Error,
+    },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -583,7 +590,11 @@ fn append_null(
     }
 }
 
-pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Result<()> {
+pub async fn start(
+    bind_address: SocketAddr,
+    data_fusion: Arc<DataFusion>,
+    tls_config: Option<Arc<TlsConfig>>,
+) -> Result<()> {
     let service = Service {
         data_fusion,
         once_tracer: OnceTracer::new(),
@@ -592,7 +603,19 @@ pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Re
 
     tracing::info!("Spice Runtime OpenTelemetry listening on {bind_address}");
 
-    Server::builder()
+    let mut server = Server::builder();
+
+    if let Some(ref tls_config) = tls_config {
+        let server_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+            tls_config.cert.expose_secret(),
+            tls_config.key.expose_secret(),
+        ));
+        server = server
+            .tls_config(server_tls_config)
+            .context(UnableToConfigureTlsSnafu)?;
+    }
+
+    server
         .add_service(create_health_service().await)
         .add_service(svc)
         .serve(bind_address)

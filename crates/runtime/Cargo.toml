@@ -95,7 +95,7 @@ tokio-rustls = "0.26.0"
 tokio.workspace = true
 tonic-health = "0.9.0"
 tonic.workspace = true
-tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
+tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip", "tls"] }
 tracing.workspace = true
 tract-core = "0.21.0"
 url = "2.5.0"
