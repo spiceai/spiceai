@@ -18,11 +18,8 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
-use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use app::{App, AppBuilder};
 use clap::Parser;
@@ -31,10 +28,11 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
-use runtime::tls::TlsConfig;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
+
+mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -136,7 +134,7 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         }
     }
 
-    let tls_config = load_tls_config(&args).context(UnableToInitializeTlsSnafu)?;
+    let spicepod_tls_config = app.as_ref().and_then(|app| app.runtime.tls.clone());
 
     let rt: Runtime = Runtime::builder()
         .with_app_opt(app)
@@ -150,12 +148,16 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, metrics_handle)
-        .with_tls_config_opt(tls_config)
         .build()
         .await;
 
+    let tls_config = tls::load_tls_config(&args, spicepod_tls_config, rt.secrets())
+        .await
+        .context(UnableToInitializeTlsSnafu)?;
+
     let cloned_rt = rt.clone();
-    let server_thread = tokio::spawn(async move { cloned_rt.start_servers(args.runtime).await });
+    let server_thread =
+        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, tls_config).await });
 
     tokio::select! {
         () = rt.load_components() => {},
@@ -170,34 +172,4 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
             reason: "Unable to start spiced".into(),
         }),
     }
-}
-
-fn load_tls_config(
-    args: &Args,
-) -> std::result::Result<Option<Arc<TlsConfig>>, Box<dyn std::error::Error>> {
-    if !args.tls {
-        return Ok(None);
-    }
-
-    let cert_bytes: Vec<u8> = match (&args.tls_certificate_file, &args.tls_certificate) {
-        (Some(cert_path), _) => load_file(Path::new(cert_path))?,
-        (_, Some(cert)) => cert.as_bytes().to_vec(),
-        (None, None) => return Err("TLS certificate is required (--tls-certificate)".into()),
-    };
-    let key_bytes: Vec<u8> = match (&args.tls_key_file, &args.tls_key) {
-        (Some(key_path), _) => load_file(Path::new(key_path))?,
-        (_, Some(key)) => key.as_bytes().to_vec(),
-        (None, None) => return Err("TLS key is required (--tls-key)".into()),
-    };
-
-    let tls_config = TlsConfig::try_new(cert_bytes, key_bytes)?;
-
-    Ok(Some(Arc::new(tls_config)))
-}
-
-fn load_file(path: &Path) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(buf)
 }
