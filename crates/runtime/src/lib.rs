@@ -276,7 +276,6 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
-    tls_config: Option<Arc<TlsConfig>>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -334,7 +333,11 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    pub async fn start_servers(&self, config: Config) -> Result<()> {
+    pub async fn start_servers(
+        &self,
+        config: Config,
+        tls_config: Option<Arc<TlsConfig>>,
+    ) -> Result<()> {
         self.register_metrics_table(self.metrics_handle.clone())
             .await?;
 
@@ -347,16 +350,16 @@ impl Runtime {
             Arc::clone(&self.embeds),
             config.clone().into(),
             self.metrics_endpoint,
-            self.tls_config.clone(),
+            tls_config.clone(),
         );
 
         // Spawn the metrics server in the background
         let metrics_endpoint = self.metrics_endpoint;
         let metrics_handle = self.metrics_handle.clone();
-        let tls_config = self.tls_config.clone();
+        let cloned_tls_config = tls_config.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                metrics_server::start(metrics_endpoint, metrics_handle, tls_config).await
+                metrics_server::start(metrics_endpoint, metrics_handle, cloned_tls_config).await
             {
                 tracing::error!("Prometheus metrics server error: {e}");
             }
@@ -365,12 +368,12 @@ impl Runtime {
         let flight_server_future = flight::start(
             config.flight_bind_address,
             Arc::clone(&self.df),
-            self.tls_config.clone(),
+            tls_config.clone(),
         );
         let open_telemetry_server_future = opentelemetry::start(
             config.open_telemetry_bind_address,
             Arc::clone(&self.df),
-            self.tls_config.clone(),
+            tls_config.clone(),
         );
         let pods_watcher_future = self.start_pods_watcher();
 
@@ -390,7 +393,6 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded.
     pub async fn load_components(&self) {
-        self.load_secrets().await;
         self.start_extensions().await;
 
         #[cfg(feature = "models")]
@@ -441,18 +443,6 @@ impl Runtime {
             if let Err(err) = extension.on_start(self).await {
                 tracing::warn!("Failed to start extension {name}: {err}");
             }
-        }
-    }
-
-    async fn load_secrets(&self) {
-        measure_scope_ms!("load_secret_stores");
-        let mut secrets = self.secrets.write().await;
-
-        let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            if let Err(e) = secrets.load_from(&app.secrets).await {
-                tracing::error!("Error loading secret stores: {e}");
-            };
         }
     }
 

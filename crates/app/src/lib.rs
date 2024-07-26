@@ -19,6 +19,7 @@ limitations under the License.
 use std::{collections::HashMap, path::PathBuf};
 
 use snafu::prelude::*;
+pub use spicepod;
 use spicepod::{
     component::{
         catalog::Catalog,
