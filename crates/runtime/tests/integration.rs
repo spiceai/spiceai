@@ -37,6 +37,7 @@ mod postgres;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
+mod tls;
 
 #[cfg(feature = "odbc")]
 mod odbc;
