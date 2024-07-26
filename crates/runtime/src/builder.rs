@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
+use app::App;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -25,8 +26,8 @@ use crate::{
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
-    podswatcher, secrets,
-    tls::TlsConfig,
+    measure_scope_ms, podswatcher,
+    secrets::{self, Secrets},
     tracers, Runtime,
 };
 
@@ -39,7 +40,6 @@ pub struct RuntimeBuilder {
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
     datafusion: Option<Arc<DataFusion>>,
-    tls_config: Option<Arc<TlsConfig>>,
 }
 
 impl RuntimeBuilder {
@@ -53,7 +53,6 @@ impl RuntimeBuilder {
             metrics_handle: None,
             datafusion: None,
             autoload_extensions: HashMap::new(),
-            tls_config: None,
         }
     }
 
@@ -116,16 +115,6 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_tls_config(mut self, tls_config: Arc<TlsConfig>) -> Self {
-        self.tls_config = Some(tls_config);
-        self
-    }
-
-    pub fn with_tls_config_opt(mut self, tls_config: Option<Arc<TlsConfig>>) -> Self {
-        self.tls_config = tls_config;
-        self
-    }
-
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
@@ -149,6 +138,8 @@ impl RuntimeBuilder {
             None
         };
 
+        let secrets = Self::load_secrets(self.app.as_ref()).await;
+
         let mut rt = Runtime {
             instance_name: format!("{name}-{hash}").to_string(),
             app: Arc::new(RwLock::new(self.app)),
@@ -157,14 +148,13 @@ impl RuntimeBuilder {
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
-            secrets: Arc::new(RwLock::new(secrets::Secrets::new())),
+            secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             metrics_handle: self.metrics_handle,
-            tls_config: self.tls_config,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -180,6 +170,19 @@ impl RuntimeBuilder {
         rt.extensions = Arc::new(RwLock::new(extensions));
 
         rt
+    }
+
+    async fn load_secrets(app: Option<&App>) -> Secrets {
+        measure_scope_ms!("load_secret_stores");
+        let mut secrets = secrets::Secrets::new();
+
+        if let Some(app) = app {
+            if let Err(e) = secrets.load_from(&app.secrets).await {
+                tracing::error!("Error loading secret stores: {e}");
+            };
+        }
+
+        secrets
     }
 }
 
