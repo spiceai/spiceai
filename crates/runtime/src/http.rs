@@ -104,7 +104,7 @@ where
         match tls_config {
             Some(ref config) => {
                 let acceptor = TlsAcceptor::from(Arc::clone(config));
-                process_tls_tcp_stream(stream, acceptor.clone(), routes.clone());
+                process_tls_tcp_stream(stream, acceptor, routes.clone());
             }
             None => {
                 process_tcp_stream(stream, routes.clone());
