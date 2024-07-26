@@ -19,11 +19,12 @@ use rustls::{
     ServerConfig,
 };
 use rustls_pemfile::{certs, private_key};
-use secrecy::Secret;
+use secrecy::{ExposeSecret, Secret};
 use std::{
     io::{self, Cursor},
     sync::Arc,
 };
+use x509_certificate::X509Certificate;
 
 pub struct TlsConfig {
     pub cert: Secret<Vec<u8>>,
@@ -48,6 +49,12 @@ impl TlsConfig {
             key: Secret::new(key_bytes),
             server_config: Arc::new(config),
         })
+    }
+
+    #[must_use]
+    pub fn subject_name(&self) -> Option<String> {
+        let x509_cert = X509Certificate::from_pem(self.cert.expose_secret()).ok()?;
+        x509_cert.subject_name().user_friendly_str().ok()
     }
 }
 

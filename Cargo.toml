@@ -91,6 +91,7 @@ tonic = { version = "0.11.0", features = ["tls"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
+x509-certificate = "0.23.1"
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ffe792dfdff7a96327bcc536b55d8e9167d29e14" }
