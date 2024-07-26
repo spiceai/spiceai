@@ -87,7 +87,7 @@ tokio-postgres = { version = "0.7.10", features = [
   "with-uuid-1",
 ] }
 tokio-rusqlite = "0.5.1"
-tonic = "0.11.0"
+tonic = { version = "0.11.0", features = ["tls"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
