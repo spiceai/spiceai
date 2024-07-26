@@ -283,6 +283,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("google_service_account")
         .description("Filesystem path to the Google service account JSON key file.")
         .secret(),
+
+    // Common options - client
+    ParameterSpec::connector("timeout")
+        .description("The request timeout setting for fetching remote objects")
+        .secret(),
 ];
 
 impl DataConnectorFactory for DatabricksFactory {
