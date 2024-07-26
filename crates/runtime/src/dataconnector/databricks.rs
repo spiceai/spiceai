@@ -242,6 +242,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("mode")
         .description("The execution mode for querying against Databricks.")
         .default("spark_connect"),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for object store client."),
     ParameterSpec::connector("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::connector("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
 
@@ -284,10 +286,6 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Filesystem path to the Google service account JSON key file.")
         .secret(),
 
-    // Common options - client
-    ParameterSpec::connector("timeout")
-        .description("The request timeout setting for fetching remote objects")
-        .secret(),
 ];
 
 impl DataConnectorFactory for DatabricksFactory {
