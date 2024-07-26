@@ -54,10 +54,17 @@ impl DatabricksDelta {
 
         let mut storage_options = HashMap::new();
         for (key, value) in &self.storage_options {
-            if key == "token" || key == "endpoint" {
-                continue;
+            match key.as_ref() {
+                "token" | "endpoint" => {
+                    continue;
+                }
+                "client_timeout" => {
+                    storage_options.insert("timeout".into(), value.clone());
+                }
+                _ => {
+                    storage_options.insert(key.to_string(), value.clone());
+                }
             }
-            storage_options.insert(key.to_string(), value.clone());
         }
 
         let delta_table = DeltaTable::from(table_uri, storage_options)?;
