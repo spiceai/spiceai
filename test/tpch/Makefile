@@ -44,34 +44,34 @@ tpch-gen: tpch-init
 
 	@echo "Test data and queries generated successfully."
 
-# Example: PGPORT=5432 PGUSER=postgres make pg-init
+# Default value for DB_NAME
+DB_NAME ?= tpch
+
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-init
 pg-init:
-	@psql -tAc "SELECT 1 FROM pg_database WHERE datname='tpch'" | grep -q 1 && \
-	(echo "Database 'tpch' already exists, skipping creation." ) || \
-	(createdb tpch && echo "Database 'tpch' created successfully.")
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -tAc "SELECT 1 FROM pg_database WHERE datname='$(DB_NAME)'" | grep -q 1 && \
+	(echo "Database $(DB_NAME) already exists, skipping creation." ) || \
+	(createdb -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) && echo "Database $(DB_NAME) created successfully.")
 	
-	@psql tpch -c "DROP TABLE IF EXISTS nation, region, part, supplier, partsupp, customer, orders, lineitem;"
-	@psql tpch -f ./tpch-kit/dbgen/dss.ddl
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP TABLE IF EXISTS nation, region, part, supplier, partsupp, customer, orders, lineitem;"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -f ./tpch-kit/dbgen/dss.ddl
 
-	@echo "Database 'tpch' has been successfuly created or updated."
+	@echo "Database $(DB_NAME) has been successfuly created or updated."
 
-# Example: PGPORT=5432 PGUSER=postgres make pg-load
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-load
 pg-load:
 	@for i in tpch-kit/dbgen/*.tbl; do \
 		table=$$(basename $$i .tbl); \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' $$i > ./tmp/$$table.tbl; \
-		psql tpch -q -c "TRUNCATE $$table"; \
-		psql tpch -c "\\copy $$table FROM './tmp/$$table.tbl' CSV DELIMITER '|';"; \
+		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -q -c "TRUNCATE $$table"; \
+		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.tbl' CSV DELIMITER '|';"; \
 	done
-	@echo "Benchmark dataset has been successfully loaded to 'tpch' database"
+	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
 
-# Example: PGPORT=5432 PGUSER=postgres make tpch-run-pq
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
-	psql tpch < ./tpch_queries.sql
-
-# Default value for DB_NAME
-DB_NAME ?= tpch
+	psql $(DB_NAME) < ./tpch_queries.sql
 
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-init
 mysql-init:

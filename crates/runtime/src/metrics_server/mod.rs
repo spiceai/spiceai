@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::tls::TlsConfig;
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response};
 use http_body_util::Full;
@@ -25,10 +26,12 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusHandle;
 use snafu::prelude::*;
-use std::fmt::Debug;
 use std::net::ToSocketAddrs;
+use std::{fmt::Debug, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to bind to address: {source}"))]
@@ -43,12 +46,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) async fn start<A>(
     bind_address: Option<A>,
     handle: Option<PrometheusHandle>,
+    tls_config: Option<Arc<TlsConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug + Clone + Copy,
 {
     let (Some(bind_address), Some(handle)) = (bind_address, handle) else {
-        return Ok(futures::pending!());
+        return Ok(());
     };
 
     let listener = std::net::TcpListener::bind(bind_address)
@@ -64,31 +68,58 @@ where
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     "Error accepting connection to serve Prometheus metrics request: {e}"
                 );
                 continue;
             }
         };
 
-        process_tcp_stream(stream, handle.clone());
+        match tls_config {
+            Some(ref config) => {
+                let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
+                process_tls_tcp_stream(stream, acceptor.clone(), handle.clone());
+            }
+            None => {
+                process_tcp_stream(stream, handle.clone());
+            }
+        }
     }
 }
 
+fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, handle: PrometheusHandle) {
+    tokio::spawn(async move {
+        let stream = acceptor.accept(stream).await;
+        match stream {
+            Ok(stream) => {
+                serve_connection(stream, handle).await;
+            }
+            Err(e) => {
+                tracing::debug!("Error accepting TLS connection: {e}");
+            }
+        }
+    });
+}
+
 fn process_tcp_stream(stream: TcpStream, handle: PrometheusHandle) {
+    tokio::spawn(serve_connection(stream, handle));
+}
+
+async fn serve_connection<S>(stream: S, handle: PrometheusHandle)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
         let handle = handle.clone();
         async move { Ok::<_, hyper::Error>(handle_http_request(&handle, &req)) }
     });
 
-    tokio::spawn(async move {
-        if let Err(err) = Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
-            .await
-        {
-            tracing::warn!(error = ?err, "Error serving Prometheus metrics connection.");
-        }
-    });
+    if let Err(err) = Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        tracing::debug!(error = ?err, "Error serving Prometheus metrics connection.");
+    }
 }
 
 fn handle_http_request(

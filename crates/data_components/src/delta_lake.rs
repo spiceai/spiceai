@@ -36,7 +36,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState};
+use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
@@ -94,7 +94,8 @@ impl DeltaTable {
         table_location: String,
         storage_options: HashMap<String, SecretString>,
     ) -> Result<Self> {
-        let table = Table::try_from_uri(table_location).context(DeltaTableSnafu)?;
+        let table =
+            Table::try_from_uri(ensure_folder_location(table_location)).context(DeltaTableSnafu)?;
 
         let storage_options: HashMap<String, String> = storage_options
             .into_iter()
@@ -143,6 +144,14 @@ impl DeltaTable {
         }
 
         Schema::new(fields)
+    }
+}
+
+fn ensure_folder_location(table_location: String) -> String {
+    if table_location.ends_with('/') {
+        table_location
+    } else {
+        format!("{table_location}/")
     }
 }
 
@@ -363,6 +372,7 @@ fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
     size: i64,
+    _stats: Option<Stats>,
     dv_info: DvInfo,
     _partition_values: HashMap<String, String>,
 ) {
@@ -527,6 +537,18 @@ mod tests {
         assert_eq!(
             row_group_access,
             RowGroupAccess::Selection(selectors.into())
+        );
+    }
+
+    #[test]
+    fn test_get_table_location() {
+        assert_eq!(
+            ensure_folder_location("s3://my_bucket/".to_string()),
+            "s3://my_bucket/"
+        );
+        assert_eq!(
+            ensure_folder_location("s3://my_bucket".to_string()),
+            "s3://my_bucket/"
         );
     }
 }

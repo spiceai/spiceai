@@ -59,6 +59,7 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tracing_util::dataset_registered_trace;
@@ -92,6 +93,7 @@ pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
 pub mod timing;
+pub mod tls;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -274,6 +276,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     metrics_handle: Option<PrometheusHandle>,
+    tls_config: Option<Arc<TlsConfig>>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -344,19 +347,32 @@ impl Runtime {
             Arc::clone(&self.embeds),
             config.clone().into(),
             self.metrics_endpoint,
+            self.tls_config.clone(),
         );
 
-        let metrics_server_future =
-            metrics_server::start(self.metrics_endpoint, self.metrics_handle.clone());
+        // Spawn the metrics server in the background
+        let metrics_endpoint = self.metrics_endpoint;
+        let metrics_handle = self.metrics_handle.clone();
+        let tls_config = self.tls_config.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                metrics_server::start(metrics_endpoint, metrics_handle, tls_config).await
+            {
+                tracing::error!("Prometheus metrics server error: {e}");
+            }
+        });
 
-        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
+        let flight_server_future = flight::start(
+            config.flight_bind_address,
+            Arc::clone(&self.df),
+            self.tls_config.clone(),
+        );
         let open_telemetry_server_future =
             opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
         let pods_watcher_future = self.start_pods_watcher();
 
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
-            metrics_res = metrics_server_future => metrics_res.context(UnableToStartMetricsServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
             open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
             pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),

@@ -233,7 +233,7 @@ fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
     for (name, file) in files {
-        symlink(file, &temp_dir.path().join(name))
+        symlink(file, temp_dir.path().join(name))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
     }
