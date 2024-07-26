@@ -55,6 +55,7 @@ impl Default for ResultsCache {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct TlsConfig {
     /// A filesystem path to a file containing the PEM encoded certificate
