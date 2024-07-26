@@ -46,6 +46,7 @@ duckdb = ["datafusion-table-providers/duckdb"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = [
   "dep:odbc-api",
+  "dep:async-stream",
   "dep:arrow-odbc",
   "dep:tokio",
   "dep:dyn-clone",
