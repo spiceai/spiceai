@@ -338,17 +338,6 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
-    fn supports_append_stream(&self) -> bool {
-        false
-    }
-
-    async fn append_stream(
-        &self,
-        _table_provider: Arc<dyn TableProvider>,
-    ) -> Option<ChangesStream> {
-        None
-    }
-
     async fn metadata_provider(
         &self,
         _dataset: &Dataset,

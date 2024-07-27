@@ -167,11 +167,11 @@ impl DataConnector for SpiceAI {
         Some(read_write_result)
     }
 
-    fn supports_append_stream(&self) -> bool {
+    fn supports_changes_stream(&self) -> bool {
         true
     }
 
-    async fn append_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
+    fn changes_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         let federated_table_provider_adaptor = table_provider
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()?;

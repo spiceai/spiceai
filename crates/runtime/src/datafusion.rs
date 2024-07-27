@@ -630,7 +630,7 @@ impl DataFusion {
 
         if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
             let source = Box::leak(Box::new(source));
-            let append_stream = source.append_stream(source_table_provider).await;
+            let append_stream = source.changes_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);
             } else {
