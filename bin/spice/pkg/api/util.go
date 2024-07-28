@@ -38,24 +38,24 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 
 	switch method {
 	case GET:
-		resp, err = http.Get(url)
+		resp, err = rtcontext.Client().Get(url)
 	case POST:
-		resp, err = http.Post(url, "application/json", nil)
+		resp, err = rtcontext.Client().Post(url, "application/json", nil)
 	default:
-		return *new(T), fmt.Errorf("Unsupported method: %s", method)
+		return *new(T), fmt.Errorf("unsupported method: %s", method)
 	}
 
 	if err != nil {
 		if strings.HasSuffix(err.Error(), "connection refused") {
 			return *new(T), rtcontext.RuntimeUnavailableError()
 		}
-		return *new(T), fmt.Errorf("Error performing request to %s: %w", url, err)
+		return *new(T), fmt.Errorf("error performing request to %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	var result T
 	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return *new(T), fmt.Errorf("Error decoding response: %w", err)
+		return *new(T), fmt.Errorf("error decoding response: %w", err)
 	}
 	return result, nil
 }
@@ -77,7 +77,7 @@ func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path strin
 	items, err := doRuntimeApiRequest[[]T](rtcontext, GET, path)
 
 	if err != nil {
-		return fmt.Errorf("Error fetching runtime information: %w", err)
+		return fmt.Errorf("error fetching runtime information: %w", err)
 	}
 
 	var table []interface{}
