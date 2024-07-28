@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -27,11 +26,11 @@ use datafusion_table_providers::sql::db_connection_pool::{
 use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -45,37 +44,60 @@ pub struct MySQL {
     mysql_factory: MySQLTableFactory,
 }
 
-impl DataConnectorFactory for MySQL {
-    fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
-        if let Some(secret) = secret {
-            secret.insert_to_params(
-                &mut params,
-                "mysql_connection_string_key",
-                "mysql_connection_string",
-            );
-            secret.insert_to_params(&mut params, "mysql_pass_key", "mysql_pass");
-            secret.insert_to_params(&mut params, "mysql_user_key", "mysql_user");
-        }
+#[derive(Default, Copy, Clone)]
+pub struct MySQLFactory {}
 
+impl MySQLFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("connection_string").secret(),
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("host"),
+    ParameterSpec::connector("tcp_port"),
+    ParameterSpec::connector("db"),
+    ParameterSpec::connector("sslmode"),
+    ParameterSpec::connector("sslrootcert"),
+];
+
+impl DataConnectorFactory for MySQLFactory {
+    fn create(
+        &self,
+        params: Parameters,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
             > = Arc::new(
-                MySQLConnectionPool::new(Arc::new(params.into_map()))
+                MySQLConnectionPool::new(params.to_secret_map())
                     .await
                     .context(UnableToCreateMySQLConnectionPoolSnafu)?,
             );
 
             let mysql_factory = MySQLTableFactory::new(pool);
 
-            Ok(Arc::new(Self { mysql_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(MySQL { mysql_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "mysql"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

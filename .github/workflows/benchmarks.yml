@@ -1,28 +1,71 @@
 ---
-    name: benchmark tests
-    
-    on:
-      workflow_dispatch:
-    
-    jobs:
-      build:
-        name: Benchmark Tests
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
-    
-          - name: Set up Rust
-            uses: ./.github/actions/setup-rust
-            with:
-              os: 'linux'
-    
-          - name: Set up Spice.ai API Key
-            run: |
-              mkdir -p ~/.spice
-              echo "[spiceai]" > ~/.spice/auth
-              echo "  [spiceai.params]" >> ~/.spice/auth
-              echo '    key = "${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' >> ~/.spice/auth
-    
-          - run: cargo bench -p runtime
-            env:
-                UPLOAD_RESULTS_DATASET: "spiceai.tests.oss_benchmarks"
+name: benchmark tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-database-bench:
+    name: Benchmark Tests
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: ghcr.io/spiceai/spice-mysql-bench:latest
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -proot --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
+      postgres:
+        image: ghcr.io/spiceai/spice-postgres-bench:latest
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up Spice.ai API Key
+        run: |
+          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+      
+      - name: Install Databricks ODBC driver
+        run: |
+          sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
+          wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
+          unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
+          sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
+
+      - run: cargo bench -p runtime --features postgres,spark,mysql,odbc
+        env:
+          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          PG_BENCHMARK_PG_HOST: localhost
+          PG_BENCHMARK_PG_USER: postgres
+          PG_BENCHMARK_PG_PASS: postgres
+          PG_BENCHMARK_PG_SSLMODE: disable
+          PG_BENCHMARK_PG_DBNAME: tpch_sf0_01
+          SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
+          MYSQL_BENCHMARK_MYSQL_HOST: localhost
+          MYSQL_BENCHMARK_MYSQL_USER: root
+          MYSQL_BENCHMARK_MYSQL_PASS: root
+          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_01
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}

@@ -17,7 +17,6 @@ limitations under the License.
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::metadata::AcceleratedMetadata;
-use crate::secrets::Secret;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -29,11 +28,11 @@ use datafusion::datasource::TableProvider;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,7 +42,7 @@ pub enum Error {
     #[snafu(display("Invalid value for debezium_message_format: Valid values: 'json'"))]
     InvalidMessageFormat,
 
-    #[snafu(display("Missing required parameter: kafka_bootstrap_servers"))]
+    #[snafu(display("Missing required parameter: debezium_kafka_bootstrap_servers"))]
     MissingKafkaBootstrapServers,
 }
 
@@ -54,14 +53,11 @@ pub struct Debezium {
 }
 
 impl Debezium {
-    pub fn new(params: &Arc<HashMap<String, String>>) -> Result<Self> {
-        let transport = params
-            .get("debezium_transport")
-            .map_or("kafka", String::as_str);
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(params: Parameters) -> Result<Self> {
+        let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
-        let message_format = params
-            .get("debezium_message_format")
-            .map_or("json", String::as_str);
+        let message_format = params.get("message_format").expose().ok().unwrap_or("json");
 
         if transport != "kafka" {
             return InvalidTransportSnafu.fail();
@@ -72,6 +68,8 @@ impl Debezium {
 
         let kakfa_brokers = params
             .get("kafka_bootstrap_servers")
+            .expose()
+            .ok()
             .context(MissingKafkaBootstrapServersSnafu)?;
 
         Ok(Self {
@@ -80,15 +78,54 @@ impl Debezium {
     }
 }
 
-impl DataConnectorFactory for Debezium {
+#[derive(Default, Copy, Clone)]
+pub struct DebeziumFactory {}
+
+impl DebeziumFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("transport")
+        .required()
+        .default("kafka")
+        .description("The message broker transport to use. The default is kafka."),
+    ParameterSpec::connector("message_format")
+        .required()
+        .default("json")
+        .description("The message format to use. The default is json."),
+    ParameterSpec::runtime("kafka_bootstrap_servers")
+        .required()
+        .description(
+            "A list of host/port pairs for establishing the initial Kafka cluster connection.",
+        ),
+];
+
+impl DataConnectorFactory for DebeziumFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let debezium = Debezium::new(&params)?;
+            let debezium = Debezium::new(params)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "debezium"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

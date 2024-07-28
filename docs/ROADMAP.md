@@ -8,19 +8,17 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.16-beta (July 2024)](https://github.com/spiceai/spiceai/milestone/31)
+## [v0.17-beta (July 2024)](https://github.com/spiceai/spiceai/milestone/37)
 
-- Catalog Providers
-  - Unity Catalog catalog provider (alpha)
-- Dataset management improvements
 - Bugfixes and performance improvements
 - Databricks data connector (Beta)
 - Spice AI data connector (Beta)
 - PostgreSQL data connector (Beta)
 - S3 data connector (Beta)
 - ODBC Data Connector (Beta)
+- MySQL Data Connector (Beta)
 
-## [v0.17-rc (August 2024)](https://github.com/spiceai/spiceai/milestone/32)
+## [v0.18-rc (August 2024)](https://github.com/spiceai/spiceai/milestone/32)
 
 - Bugfixes and performance improvements
 - Databricks data connector (Release Candidate)
@@ -35,10 +33,10 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Databricks data connector (Stable)
 - Spice AI data connector (Stable)
 - S3 data connector (Stable)
-- DuckDB data connector (Beta)
 - ODBC Data Connector (Stable)
-- FTP/SFTP Data Connector (Beta)
 - PostgreSQL Data Connector (Stable)
+- DuckDB data connector (Beta)
+- FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
 
@@ -51,13 +49,13 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `spiceai`     | Stable |
 | `s3`          | Stable |
 | `odbc`        | Stable |
+| `mysql`       | Stable |
 | `duckdb`      | Beta   |
 | `spark`       | Beta   |
 | `snowflake`   | Beta   |
 | `ftp`, `sftp` | Beta   |
 | `clickhouse`  | Alpha  |
 | `dremio`      | Alpha  |
-| `mysql`       | Alpha  |
 | `flightsql`   | Alpha  |
 | `graphql`     | Alpha  |
 | `debezium`    | Alpha  |

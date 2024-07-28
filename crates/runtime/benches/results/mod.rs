@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::sync::Arc;
 
 use arrow::{
@@ -28,6 +44,7 @@ pub(crate) struct BenchmarkResultsBuilder {
     run_id: StringBuilder,
     started_at: Int64Builder,
     finished_at: Int64Builder,
+    connector_name: StringBuilder,
     query_name: StringBuilder,
     status: StringBuilder,
     min_duration_ms: Int64Builder,
@@ -54,13 +71,16 @@ impl BenchmarkResultsBuilder {
             iterations: Int32Builder::new(),
             commit_sha: StringBuilder::new(),
             branch_name: StringBuilder::new(),
+            connector_name: StringBuilder::new(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_result(
         &mut self,
         start_time: i64,
         end_time: i64,
+        connector_name: &str,
         query_name: &str,
         status: Status,
         min_duration_ms: i64,
@@ -70,6 +90,7 @@ impl BenchmarkResultsBuilder {
         self.started_at.append_value(start_time);
         self.finished_at.append_value(end_time);
         self.query_name.append_value(query_name);
+        self.connector_name.append_value(connector_name);
         self.status.append_value(status.to_string());
         self.min_duration_ms.append_value(min_duration_ms);
         self.max_duration_ms.append_value(max_duration_ms);
@@ -97,6 +118,7 @@ impl BenchmarkResultsBuilder {
                 Arc::new(self.iterations.finish()),
                 Arc::new(self.commit_sha.finish()),
                 Arc::new(self.branch_name.finish()),
+                Arc::new(self.connector_name.finish()),
             ],
         );
         match batch {
@@ -129,6 +151,7 @@ fn results_schema() -> SchemaRef {
         Field::new("iterations", DataType::Int32, false),
         Field::new("commit_sha", DataType::Utf8, false),
         Field::new("branch_name", DataType::Utf8, false),
+        Field::new("connector_name", DataType::Utf8, false),
     ];
     Arc::new(Schema::new(fields))
 }

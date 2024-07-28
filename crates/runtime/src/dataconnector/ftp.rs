@@ -15,36 +15,80 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
+    Parameters,
+};
 
 pub struct FTP {
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: Parameters,
 }
 
 impl std::fmt::Display for FTP {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FTP")
+        write!(f, "ftp")
     }
 }
 
-impl DataConnectorFactory for FTP {
+#[derive(Default, Copy, Clone)]
+pub struct FTPFactory {}
+
+impl FTPFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("port").description("The port to connect to."),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
+impl DataConnectorFactory for FTPFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let ftp = Self { secret, params };
+            let ftp = FTP { params };
             Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "ftp"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -53,7 +97,7 @@ impl ListingTableConnector for FTP {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 
@@ -61,16 +105,14 @@ impl ListingTableConnector for FTP {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(ftp_port) = self.params.get("ftp_port") {
+        if let Some(ftp_port) = self.params.get("port").expose().ok() {
             fragment_builder.append_pair("port", ftp_port);
         }
-        if let Some(ftp_user) = self.params.get("ftp_user") {
+        if let Some(ftp_user) = self.params.get("user").expose().ok() {
             fragment_builder.append_pair("user", ftp_user);
         }
-        if let Some(ftp_password) =
-            get_secret_or_param(&self.params, &self.secret, "ftp_pass_key", "ftp_pass")
-        {
-            fragment_builder.append_pair("password", &ftp_password);
+        if let Some(ftp_password) = self.params.get("pass").expose().ok() {
+            fragment_builder.append_pair("password", ftp_password);
         }
         fragments.push(fragment_builder.finish());
 
@@ -81,10 +123,6 @@ impl ListingTableConnector for FTP {
                     dataconnector: format!("{self}"),
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
-
-        if dataset.from.ends_with('/') {
-            fragments.push("dfiscollectionbugworkaround=hack/".into());
-        }
 
         ftp_url.set_fragment(Some(&fragments.join("&")));
 

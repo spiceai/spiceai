@@ -17,10 +17,9 @@ limitations under the License.
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{any::Any, pin::Pin, sync::Arc};
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
@@ -37,12 +36,12 @@ use datafusion::{
 use futures::Future;
 use snafu::prelude::*;
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(r#"Missing required parameter "schema": The localhost connector requires specifying the schema up-front as a SQL CREATE TABLE statement."#))]
-    MissingSchemaParameter,
+    #[snafu(display(r#"Missing required parameter "{parameter}": The localhost connector requires specifying the schema up-front as a SQL CREATE TABLE statement."#))]
+    MissingSchemaParameter { parameter: String },
 
     #[snafu(display(
         "Unable to parse schema as a valid SQL statement: {source}\nSchema:\n{schema}"
@@ -79,17 +78,38 @@ impl LocalhostConnector {
     }
 }
 
-impl DataConnectorFactory for LocalhostConnector {
+#[derive(Default, Copy, Clone)]
+pub struct LocalhostConnectorFactory {}
+
+impl LocalhostConnectorFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("schema")
+    .description("The schema of the table as a CREATE TABLE statement.")];
+
+impl DataConnectorFactory for LocalhostConnectorFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let schema = params.get("schema").ok_or(Error::MissingSchemaParameter)?;
+            let schema = params
+                .get("schema")
+                .expose()
+                .ok_or_else(|p| Error::MissingSchemaParameter { parameter: p.0 })?;
 
             let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
                 UnableToParseSchemaSnafu {
-                    schema: schema.clone(),
+                    schema: schema.to_string(),
                 },
             )?;
             ensure!(statements.len() == 1, OneStatementExpectedSnafu);
@@ -105,10 +125,16 @@ impl DataConnectorFactory for LocalhostConnector {
                 .build_schema(columns)
                 .context(UnableToParseSchemaFromColumnDefinitionsSnafu)?;
 
-            Ok(Arc::new(LocalhostConnector {
-                schema: Arc::new(schema),
-            }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(LocalhostConnector::new(Arc::new(schema))) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "localhost"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

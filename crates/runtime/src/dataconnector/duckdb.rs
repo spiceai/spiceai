@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -27,11 +26,14 @@ use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPo
 use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{
+    AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec,
+    Parameters,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -74,20 +76,45 @@ impl DuckDB {
     }
 }
 
-impl DataConnectorFactory for DuckDB {
+#[derive(Default, Copy, Clone)]
+pub struct DuckDBFactory {}
+
+impl DuckDBFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("open")];
+
+impl DataConnectorFactory for DuckDBFactory {
     fn create(
-        _secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let duckdb_factory = if let Some(db_path) = params.get("open") {
-                Self::create_file(db_path)?
+            let duckdb_factory = if let Some(db_path) = params.get("open").expose().ok() {
+                DuckDB::create_file(db_path)?
             } else {
-                Self::create_in_memory()?
+                DuckDB::create_in_memory()?
             };
 
-            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -103,7 +130,7 @@ impl DataConnector for DuckDB {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path: TableReference = dataset.path().into();
 
-        if !(is_table_function(&path) || dataset.params.contains_key("open")) {
+        if !(is_table_function(&path) || dataset.params.contains_key("duckdb_open")) {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "duckdb".to_string(),
                 source: Box::new(Error::MissingDuckDBFile {}),

@@ -16,13 +16,16 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::ParameterSpec;
+use super::Parameters;
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
+use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
 use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::sqlparser::ast::TimezoneInfo;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
@@ -30,17 +33,14 @@ use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: endpoint"))]
-    MissingEndpointParameter,
-
-    #[snafu(display("Missing required secrets"))]
-    MissingSecrets,
+    #[snafu(display("Missing required parameter: {parameter}"))]
+    MissingParameter { parameter: String },
 
     #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
     UnableToVerifyEndpointConnection {
@@ -72,20 +72,50 @@ impl Dialect for DremioDialect {
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
         DefaultDialect {}.identifier_quote_style(identifier)
     }
+
+    fn timestamp_cast_dtype(
+        &self,
+        _time_unit: &arrow::datatypes::TimeUnit,
+        _tz: &Option<Arc<str>>,
+    ) -> datafusion::sql::sqlparser::ast::DataType {
+        datafusion::sql::sqlparser::ast::DataType::Timestamp(None, TimezoneInfo::None)
+    }
 }
 
-impl DataConnectorFactory for Dremio {
+#[derive(Default, Copy, Clone)]
+pub struct DremioFactory {}
+
+impl DremioFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("endpoint"),
+];
+
+impl DataConnectorFactory for DremioFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let secret = secret.context(MissingSecretsSnafu)?;
-
             let endpoint: String = params
                 .get("endpoint")
-                .context(MissingEndpointParameterSnafu)?
-                .clone();
+                .expose()
+                .ok_or_else(|p| Error::MissingParameter {
+                    parameter: p.to_string(),
+                })?
+                .to_string();
 
             verify_endpoint_connection(&endpoint)
                 .await
@@ -95,15 +125,23 @@ impl DataConnectorFactory for Dremio {
 
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                secret.get("username").unwrap_or_default(),
-                secret.get("password").unwrap_or_default(),
+                params.get("username").expose().ok().unwrap_or_default(),
+                params.get("password").expose().ok().unwrap_or_default(),
             )
             .await
             .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
                 FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
-            Ok(Arc::new(Self { flight_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "dremio"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -117,15 +155,34 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(
+        match Read::table_provider(
             &self.flight_factory,
             dataset.path().into(),
             dataset.schema(),
         )
         .await
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "dremio",
-        })?)
+        {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(data_components::flight::Error::UnableToGetSchema {
+                    source: _,
+                    table,
+                }) = e.downcast_ref::<data_components::flight::Error>()
+                {
+                    tracing::debug!("{e}");
+                    return Err(DataConnectorError::UnableToGetSchema {
+                        dataconnector: "dremio".to_string(),
+                        dataset_name: dataset.name.to_string(),
+                        table_name: table.clone(),
+                    });
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "dremio".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 
     async fn read_write_provider(

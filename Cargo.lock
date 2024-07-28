@@ -216,11 +216,10 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
- "tracing",
 ]
 
 [[package]]
@@ -507,28 +506,21 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
- "bigdecimal 0.3.1",
  "bigdecimal 0.4.5",
- "byteorder",
  "chrono",
  "chrono-tz 0.8.6",
  "clickhouse-rs",
  "datafusion-table-providers",
- "fallible-iterator 0.3.0",
- "sea-query",
  "snafu 0.8.4",
- "time",
- "tokio",
- "tracing",
  "uuid 1.10.0",
 ]
 
 [[package]]
 name = "arrow_tools"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "snafu 0.8.4",
@@ -1524,6 +1516,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcder"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c627747a6774aab38beb35990d88309481378558875a41da1a4b2e373c906ef0"
+dependencies = [
+ "bytes",
+ "smallvec",
+]
+
+[[package]]
+name = "beef"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
+
+[[package]]
 name = "bigdecimal"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1922,7 +1930,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
- "metrics 0.23.0",
+ "metrics",
  "moka",
  "snafu 0.8.4",
  "spicepod",
@@ -2488,6 +2496,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e6e4d7b33a94f0991c26729976b10ebde1d34c3ee82408fb536164fa10d636"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
+
+[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2615,6 +2638,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2711,18 +2743,14 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
  "arrow-flight",
- "arrow-odbc",
- "arrow_sql_gen",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
- "bb8",
- "bb8-postgres",
  "bytes",
  "chrono",
  "clickhouse-rs",
@@ -2736,12 +2764,7 @@ dependencies = [
  "flight_client",
  "futures",
  "globset",
- "itertools 0.12.1",
- "mysql_async",
  "object_store",
- "odbc-api",
- "postgres-native-tls",
- "r2d2",
  "rdkafka",
  "regex",
  "reqwest 0.11.27",
@@ -2754,7 +2777,6 @@ dependencies = [
  "spark-connect-rs",
  "tokio",
  "tokio-postgres",
- "tokio-rusqlite",
  "tonic 0.11.0",
  "tracing",
  "tracing-subscriber",
@@ -2765,7 +2787,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2818,7 +2840,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2839,7 +2861,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "tokio",
 ]
@@ -2847,7 +2869,7 @@ dependencies = [
 [[package]]
 name = "datafusion-execution"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "arrow",
  "chrono",
@@ -2867,7 +2889,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2909,7 +2931,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -2934,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2951,7 +2973,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-array"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2971,7 +2993,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2990,7 +3012,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -3019,7 +3041,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -3032,7 +3054,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -3065,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "40.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=1d5fe15ecc6ffcc899a3f8afff977372fbf4645e#1d5fe15ecc6ffcc899a3f8afff977372fbf4645e"
+source = "git+https://github.com/spiceai/datafusion.git?rev=ffe792dfdff7a96327bcc536b55d8e9167d29e14#ffe792dfdff7a96327bcc536b55d8e9167d29e14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3081,7 +3103,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=02081887de7b64dfd816ef86716f8b0853ae3196#02081887de7b64dfd816ef86716f8b0853ae3196"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=16d871e159be2360aab67a6f07faeb5e9b9bdaf7#16d871e159be2360aab67a6f07faeb5e9b9bdaf7"
 dependencies = [
  "arrow",
  "async-stream",
@@ -3120,41 +3142,28 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "arrow-odbc",
  "arrow_sql_gen",
  "async-stream",
  "async-trait",
- "bb8",
- "bb8-postgres",
  "clickhouse-rs",
  "datafusion",
  "datafusion-table-providers",
- "duckdb",
  "dyn-clone",
  "futures",
  "lazy_static",
- "mysql_async",
- "native-tls",
- "ns_lookup",
  "odbc-api",
- "pem",
  "pkcs8",
- "postgres-native-tls",
- "r2d2",
- "rusqlite",
  "secrecy",
  "sha2",
  "snafu 0.8.4",
  "snowflake-api",
  "tokio",
- "tokio-postgres",
- "tokio-rusqlite",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -3165,12 +3174,13 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1ddfe35af3696786ab5f23cd995df33a66f6cff272ac1f85e09c1a6316acd4c"
+checksum = "04f22db2e9d735475ffcb97bf00b80d693b3d6b87ea11786bc48a7785e503680"
 dependencies = [
  "arrow-arith",
  "arrow-array",
+ "arrow-cast",
  "arrow-json",
  "arrow-ord",
  "arrow-schema",
@@ -3181,6 +3191,7 @@ dependencies = [
  "either",
  "fix-hidden-lifetime-bug",
  "futures",
+ "hdfs-native-object-store",
  "indexmap 2.2.6",
  "itertools 0.13.0",
  "lazy_static",
@@ -3202,9 +3213,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4d2127a34b12919a6bce08225f0ca6fde8a19342a32675370edfc8795e7c38a"
+checksum = "05bdaeea7681865f265739cf1d071ed571a62deaf5b77a5eb6604bf303116164"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3391,6 +3402,12 @@ name = "doc-comment"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "downcast-rs"
@@ -3745,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3756,12 +3773,11 @@ dependencies = [
  "rustls-pemfile 1.0.4",
  "snafu 0.8.4",
  "tonic 0.11.0",
- "tracing",
 ]
 
 [[package]]
 name = "flightpublisher"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3774,7 +3790,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3788,12 +3804,11 @@ dependencies = [
  "rustyline",
  "serde_json",
  "tonic 0.11.0",
- "tracing",
 ]
 
 [[package]]
 name = "flightsubscriber"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -4080,6 +4095,34 @@ dependencies = [
  "pin-utils",
  "slab",
 ]
+
+[[package]]
+name = "g2gen"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc2c7625b2fc250dd90b63f7887a6bb0f7ec1d714c8278415bea2669ef20820e"
+dependencies = [
+ "g2poly",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "g2p"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc36d9bdc3d2da057775a9f4fa7d7b09edab3e0eda7a92cc353358fa63b8519e"
+dependencies = [
+ "g2gen",
+ "g2poly",
+]
+
+[[package]]
+name = "g2poly"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af6a86e750338603ea2c14b1c0bfe58cd61f87ca67a0021d9334996024608e12"
 
 [[package]]
 name = "galil-seiferas"
@@ -4383,6 +4426,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdfs-native"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ea02e367508e4e096e07d73216ce03ec817db26dea67781c08fa855c4dd76a3"
+dependencies = [
+ "aes",
+ "base64 0.21.7",
+ "bitflags 2.6.0",
+ "bytes",
+ "cbc",
+ "chrono",
+ "cipher",
+ "crc",
+ "ctr",
+ "des",
+ "futures",
+ "g2p",
+ "hex",
+ "hmac",
+ "libc",
+ "libloading",
+ "log",
+ "md-5",
+ "num-traits",
+ "once_cell",
+ "prost 0.12.6",
+ "prost-types",
+ "rand",
+ "regex",
+ "roxmltree",
+ "socket2 0.5.7",
+ "thiserror",
+ "tokio",
+ "url",
+ "uuid 1.10.0",
+ "whoami",
+]
+
+[[package]]
+name = "hdfs-native-object-store"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54730badbcfe7e9bdef975fd86563c0d98d4f9e0c924e335066a6c51a8a1af2b"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hdfs-native",
+ "object_store",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "headers"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4673,7 +4771,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.0",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 0.26.3",
 ]
 
 [[package]]
@@ -5416,16 +5514,14 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
  "candle-core 0.5.1",
- "candle-core 0.6.0 (git+https://github.com/spiceai/candle.git?rev=41aaac4dd80e64af6b9b8e02197fa58feb5809b3)",
  "candle-examples",
  "candle-transformers 0.5.1",
- "dirs",
  "futures",
  "hf-hub",
  "mistralrs",
@@ -5437,7 +5533,6 @@ dependencies = [
  "tempfile",
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
- "text-embeddings-core",
  "tokenizers",
  "tokio",
  "tracing",
@@ -5461,6 +5556,39 @@ checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 dependencies = [
  "serde",
  "value-bag",
+]
+
+[[package]]
+name = "logos"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "161971eb88a0da7ae0c333e1063467c5b5727e7fb6b710b8db4814eade3a42e8"
+dependencies = [
+ "logos-derive",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e31badd9de5131fdf4921f6473d457e3dd85b11b7f091ceb50e4df7c3eeb12a"
+dependencies = [
+ "beef",
+ "fnv",
+ "lazy_static",
+ "proc-macro2",
+ "quote",
+ "regex-syntax 0.8.4",
+ "syn 2.0.71",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c2a69b3eb68d5bd595107c9ee58d7e07fe2bb5e360cc85b0f084dedac80de0a"
+dependencies = [
+ "logos-codegen",
 ]
 
 [[package]]
@@ -5639,17 +5767,6 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fde3af1a009ed76a778cb84fdef9e7dbbdf5775ae3e4cc1f434a6a307f6f76c5"
-dependencies = [
- "ahash 0.8.11",
- "metrics-macros",
- "portable-atomic",
-]
-
-[[package]]
-name = "metrics"
 version = "0.23.0"
 source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
 dependencies = [
@@ -5669,23 +5786,12 @@ dependencies = [
  "hyper-util",
  "indexmap 2.2.6",
  "ipnet",
- "metrics 0.23.0",
+ "metrics",
  "metrics-util",
  "quanta",
  "thiserror",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "metrics-macros"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38b4faf00617defe497754acde3024865bc143d44a86799b24e191ecff91354f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.71",
 ]
 
 [[package]]
@@ -5698,7 +5804,7 @@ dependencies = [
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "indexmap 2.2.6",
- "metrics 0.23.0",
+ "metrics",
  "num_cpus",
  "ordered-float 4.2.1",
  "quanta",
@@ -5855,7 +5961,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6162,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "tracing",
@@ -6550,9 +6656,9 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbebfd32c213ba1907fa7a9c9138015a8de2b43e30c5aa45b18f7deb46786ad6"
+checksum = "e6da452820c715ce78221e8202ccc599b4a52f3e1eb3eedb487b680c81a8e3f3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6561,7 +6667,7 @@ dependencies = [
  "futures",
  "humantime",
  "hyper 1.4.1",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "md-5",
  "parking_lot 0.12.3",
  "percent-encoding",
@@ -6629,9 +6735,9 @@ dependencies = [
 
 [[package]]
 name = "openssl"
-version = "0.10.64"
+version = "0.10.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a0481286a310808298130d22dd1fef0fa571e05a8f44ec801801e84b216b1f"
+checksum = "9529f4786b70a3e8c61e11179af17ab6188ad8d0ded78c5529441ed39d4bd9c1"
 dependencies = [
  "bitflags 2.6.0",
  "cfg-if",
@@ -6661,9 +6767,9 @@ checksum = "ff011a302c396a5197692431fc1948019154afc178baf7d8e37367442a4601cf"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.102"
+version = "0.9.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c597637d56fbc83893a35eb0dd04b2b8e7a50c91e64e9493e398b5df4fb45fa2"
+checksum = "7f9e8deee91df40a943c71b917e5874b951d32a802526c85721ce3b776c929d6"
 dependencies = [
  "cc",
  "libc",
@@ -7431,9 +7537,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.31.0"
+version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
+checksum = "96a05e2e8efddfa51a84ca47cec303fac86c8541b686d37cac5efc0e094417bc"
 dependencies = [
  "memchr",
  "serde",
@@ -7786,6 +7892,7 @@ dependencies = [
  "http 0.2.12",
  "http-body 0.4.6",
  "hyper 0.14.30",
+ "hyper-rustls 0.24.2",
  "hyper-tls 0.5.0",
  "ipnet",
  "js-sys",
@@ -7795,6 +7902,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
+ "rustls 0.21.12",
  "rustls-pemfile 1.0.4",
  "serde",
  "serde_json",
@@ -7803,11 +7911,13 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls 0.24.1",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 0.25.4",
  "winreg 0.50.0",
 ]
 
@@ -7860,7 +7970,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 0.26.3",
  "winreg 0.52.0",
 ]
 
@@ -7993,6 +8103,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "862340e351ce1b271a378ec53f304a5558f7db87f3769dc655a8f6ecbb68b302"
+dependencies = [
+ "xmlparser",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8014,7 +8133,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "anyhow",
  "app",
@@ -8035,8 +8154,6 @@ dependencies = [
  "axum 0.7.5",
  "axum-extra",
  "base64 0.22.1",
- "bb8",
- "bb8-postgres",
  "bollard",
  "bytes",
  "cache",
@@ -8050,40 +8167,42 @@ dependencies = [
  "datafusion-federation",
  "datafusion-table-providers",
  "db_connection_pool",
- "derive_builder",
- "dirs",
+ "dotenvy",
  "duckdb",
  "flight_client",
  "fundu",
  "futures",
  "globset",
  "headers-accept",
+ "http 1.1.0",
+ "http-body-util",
+ "hyper 1.4.1",
+ "hyper-util",
  "indexmap 2.2.6",
  "itertools 0.12.1",
  "keyring",
  "lazy_static",
  "llms",
+ "logos",
  "mediatype",
- "metrics 0.23.0",
+ "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
  "model_components",
  "mysql_async",
- "ndarray",
  "notify",
  "ns_lookup",
  "object_store",
- "odbc-api",
  "once_cell",
  "opentelemetry-proto",
  "pin-project",
- "postgres-native-tls",
  "prometheus-parse",
  "prost 0.12.6",
- "r2d2",
  "rand",
  "regex",
  "reqwest 0.11.27",
+ "rustls 0.23.11",
+ "rustls-pemfile 2.1.2",
  "secrecy",
  "serde",
  "serde_json",
@@ -8095,18 +8214,17 @@ dependencies = [
  "suppaftp",
  "tokio",
  "tokio-rusqlite",
- "tokio-stream",
- "toml",
+ "tokio-rustls 0.26.0",
  "tonic 0.11.0",
  "tonic 0.9.2",
  "tonic-health",
  "tracing",
  "tracing-subscriber",
  "tract-core",
- "tract-onnx",
  "url",
  "util",
  "uuid 1.10.0",
+ "x509-certificate",
 ]
 
 [[package]]
@@ -8989,7 +9107,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -9000,27 +9118,24 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu 0.8.4",
- "spicepod",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "spiced"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "app",
  "clap",
  "flightrepl",
- "futures",
- "metrics 0.23.0",
  "metrics-exporter-prometheus",
  "runtime",
  "rustls 0.23.11",
+ "rustls-pemfile 2.1.2",
  "snafu 0.8.4",
  "snmalloc-rs",
  "spice-cloud",
- "spicepod",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -9028,7 +9143,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "schemars",
  "serde",
@@ -9040,7 +9155,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "schemars",
  "serde_json",
@@ -9392,16 +9507,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "text-embeddings-backend"
-version = "1.2.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
-dependencies = [
- "text-embeddings-backend-core",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "text-embeddings-backend-candle"
 version = "1.2.3"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
@@ -9428,20 +9533,6 @@ source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde32
 dependencies = [
  "nohash-hasher",
  "thiserror",
-]
-
-[[package]]
-name = "text-embeddings-core"
-version = "1.2.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
-dependencies = [
- "hf-hub",
- "metrics 0.21.1",
- "text-embeddings-backend",
- "thiserror",
- "tokenizers",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -9811,6 +9902,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3082666a3a6433f7f511c7192923fa1fe07c69332d3c6a2e6bb040b569199d5a"
 dependencies = [
+ "async-stream",
  "async-trait",
  "axum 0.6.20",
  "base64 0.21.7",
@@ -9826,7 +9918,9 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.11.9",
+ "rustls-pemfile 1.0.4",
  "tokio",
+ "tokio-rustls 0.24.1",
  "tokio-stream",
  "tower",
  "tower-layer",
@@ -10365,7 +10459,7 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
- "webpki-roots",
+ "webpki-roots 0.26.3",
 ]
 
 [[package]]
@@ -10405,7 +10499,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "0.16.0-beta"
+version = "0.17.0-beta"
 dependencies = [
  "backoff",
  "humantime",
@@ -10648,6 +10742,12 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "webpki-roots"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "webpki-roots"
@@ -11023,6 +11123,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "x509-certificate"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66534846dec7a11d7c50a74b7cdb208b9a581cad890b7866430d438455847c85"
+dependencies = [
+ "bcder",
+ "bytes",
+ "chrono",
+ "der",
+ "hex",
+ "pem",
+ "ring",
+ "signature",
+ "spki",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]

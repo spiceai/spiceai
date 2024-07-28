@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.78
+ARG RUST_VERSION=1.79
 FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
@@ -30,6 +30,9 @@ FROM debian:bookworm-slim
 
 ARG CARGO_FEATURES
 
+# Allow DuckDB to load extensions
+RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
+
 RUN apt update \
     && apt install --yes ca-certificates libssl3 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
@@ -42,7 +45,7 @@ fi
 
 COPY --from=build /root/spiced /usr/local/bin/spiced
 
-EXPOSE 3000 50051
+EXPOSE 8090 50051
 
 WORKDIR /app
 

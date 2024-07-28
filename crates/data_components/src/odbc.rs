@@ -16,7 +16,10 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{
+    datasource::TableProvider,
+    sql::{unparser::dialect::Dialect, TableReference},
+};
 use datafusion_table_providers::sql::{
     db_connection_pool as db_connection_pool_datafusion,
     sql_provider_datafusion::{
@@ -57,6 +60,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct ODBCTableFactory<'a> {
     pool: Arc<ODBCDbConnectionPool<'a>>,
+    dialect: Option<Arc<dyn Dialect + Send + Sync>>,
 }
 
 impl<'a> ODBCTableFactory<'a>
@@ -64,8 +68,11 @@ where
     'a: 'static,
 {
     #[must_use]
-    pub fn new(pool: Arc<ODBCDbConnectionPool<'a>>) -> Self {
-        Self { pool }
+    pub fn new(
+        pool: Arc<ODBCDbConnectionPool<'a>>,
+        dialect: Option<Arc<dyn Dialect + Send + Sync>>,
+    ) -> Self {
+        Self { pool, dialect }
     }
 }
 
@@ -81,11 +88,18 @@ where
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
-        let table_provider = Arc::new(
-            SqlTable::new("odbc", &dyn_pool, table_reference, Some(Engine::ODBC))
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+
+        let table = SqlTable::new("odbc", &dyn_pool, table_reference, Some(Engine::ODBC))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let table = if let Some(dialect) = &self.dialect {
+            table.with_dialect(Arc::clone(dialect))
+        } else {
+            table
+        };
+
+        let table_provider = Arc::new(table);
 
         let table_provider = Arc::new(
             table_provider

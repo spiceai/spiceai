@@ -17,18 +17,26 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
+use axum::Router;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
 use model_components::model::Model;
 use snafu::prelude::*;
 use tokio::{
-    net::{TcpListener, ToSocketAddrs},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::RwLock,
 };
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     config,
     datafusion::DataFusion,
     embeddings::vector_search::{self, compute_primary_keys},
     model::LLMModelStore,
+    tls::TlsConfig,
     EmbeddingModelStore,
 };
 
@@ -56,6 +64,7 @@ pub(crate) async fn start<A>(
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
+    tls_config: Option<Arc<TlsConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
@@ -83,8 +92,54 @@ where
 
     metrics::counter!("spiced_runtime_http_server_start").increment(1);
 
-    axum::serve(listener, routes)
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::debug!("Error accepting connection to serve HTTP request: {e}");
+                continue;
+            }
+        };
+
+        match tls_config {
+            Some(ref config) => {
+                let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
+                process_tls_tcp_stream(stream, acceptor, routes.clone());
+            }
+            None => {
+                process_tcp_stream(stream, routes.clone());
+            }
+        };
+    }
+}
+
+fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, routes: Router) {
+    tokio::spawn(async move {
+        let stream = acceptor.accept(stream).await;
+        match stream {
+            Ok(stream) => {
+                serve_connection(stream, routes).await;
+            }
+            Err(e) => {
+                tracing::debug!("Error accepting TLS connection: {e}");
+            }
+        }
+    });
+}
+
+fn process_tcp_stream(stream: TcpStream, routes: Router) {
+    tokio::spawn(serve_connection(stream, routes));
+}
+
+async fn serve_connection<S>(stream: S, service: Router)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let hyper_service = TowerToHyperService::new(service);
+    if let Err(err) = Builder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(stream), hyper_service)
         .await
-        .context(UnableToStartHttpServerSnafu)?;
-    Ok(())
+    {
+        tracing::debug!(error = ?err, "Error serving HTTP connection.");
+    }
 }

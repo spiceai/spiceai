@@ -14,63 +14,96 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
-use data_components::flightsql::FlightSQLFactory;
+use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::{future::Future, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: endpoint"))]
-    MissingEndpointParameter,
+    #[snafu(display("Missing required parameter: {parameter}"))]
+    MissingParameter { parameter: String },
 
     #[snafu(display("Unable to construct TLS flight client: {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
+
+    #[snafu(display("Unable to perform FlightSQL handshake: {source}"))]
+    UnableToPerformHandshake { source: arrow::error::ArrowError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
-    pub flightsql_factory: FlightSQLFactory,
+    pub flightsql_factory: DataComponentFlightSQLFactory,
 }
 
-impl DataConnectorFactory for FlightSQL {
+#[derive(Default, Copy, Clone)]
+pub struct FlightSQLFactory {}
+
+impl FlightSQLFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("endpoint"),
+];
+
+impl DataConnectorFactory for FlightSQLFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
                 .get("endpoint")
-                .cloned()
-                .context(MissingEndpointParameterSnafu)?;
+                .expose()
+                .ok_or_else(|p| Error::MissingParameter {
+                    parameter: p.to_string(),
+                })?
+                .to_string();
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
-            if let Some(s) = secret {
-                let _ = client
-                    .handshake(
-                        s.get("username").unwrap_or_default(),
-                        s.get("password").unwrap_or_default(),
-                    )
-                    .await;
+            let username = params.get("username").expose().ok();
+            let password = params.get("password").expose().ok();
+            if let (Some(username), Some(password)) = (username, password) {
+                client
+                    .handshake(username, password)
+                    .await
+                    .context(UnableToPerformHandshakeSnafu)?;
             };
-            let flightsql_factory = FlightSQLFactory::new(client, endpoint);
-            Ok(Arc::new(Self { flightsql_factory }) as Arc<dyn DataConnector>)
+            let flightsql_factory = DataComponentFlightSQLFactory::new(client, endpoint);
+            Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "flightsql"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

@@ -36,13 +36,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState};
+use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::ops::Deref;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -60,12 +59,12 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DeltaTableFactory {
-    params: Arc<HashMap<String, SecretString>>,
+    params: HashMap<String, SecretString>,
 }
 
 impl DeltaTableFactory {
     #[must_use]
-    pub fn new(params: Arc<HashMap<String, SecretString>>) -> Self {
+    pub fn new(params: HashMap<String, SecretString>) -> Self {
         Self { params }
     }
 }
@@ -78,8 +77,7 @@ impl Read for DeltaTableFactory {
         _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.deref().clone()).boxed()?;
+        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone()).boxed()?;
         Ok(Arc::new(delta))
     }
 }
@@ -96,7 +94,8 @@ impl DeltaTable {
         table_location: String,
         storage_options: HashMap<String, SecretString>,
     ) -> Result<Self> {
-        let table = Table::try_from_uri(table_location).context(DeltaTableSnafu)?;
+        let table =
+            Table::try_from_uri(ensure_folder_location(table_location)).context(DeltaTableSnafu)?;
 
         let storage_options: HashMap<String, String> = storage_options
             .into_iter()
@@ -145,6 +144,14 @@ impl DeltaTable {
         }
 
         Schema::new(fields)
+    }
+}
+
+fn ensure_folder_location(table_location: String) -> String {
+    if table_location.ends_with('/') {
+        table_location
+    } else {
+        format!("{table_location}/")
     }
 }
 
@@ -365,6 +372,7 @@ fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
     size: i64,
+    _stats: Option<Stats>,
     dv_info: DvInfo,
     _partition_values: HashMap<String, String>,
 ) {
@@ -529,6 +537,18 @@ mod tests {
         assert_eq!(
             row_group_access,
             RowGroupAccess::Selection(selectors.into())
+        );
+    }
+
+    #[test]
+    fn test_get_table_location() {
+        assert_eq!(
+            ensure_folder_location("s3://my_bucket/".to_string()),
+            "s3://my_bucket/"
+        );
+        assert_eq!(
+            ensure_folder_location("s3://my_bucket".to_string()),
+            "s3://my_bucket/"
         );
     }
 }

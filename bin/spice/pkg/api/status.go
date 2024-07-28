@@ -26,6 +26,7 @@ import (
 	"github.com/matttproud/golang_protobuf_extensions/pbutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
 type ComponentStatus int
@@ -61,13 +62,13 @@ func (cs ComponentStatus) String() string {
 const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
 
 // Get the status of all models and datasets (respectively).
-func GetComponentStatuses(spiced_addr string) (map[string]ComponentStatus, map[string]ComponentStatus, error) {
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/metrics", spiced_addr), nil)
+func GetComponentStatuses(rtContext *context.RuntimeContext) (map[string]ComponentStatus, map[string]ComponentStatus, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/metrics", rtContext.MetricsEndpoint()), nil)
 	if err != nil {
 		return nil, nil, err
 	}
 	req.Header.Add("Accept", acceptHeader)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := rtContext.Client().Do(req)
 	if err != nil {
 		if strings.HasSuffix(err.Error(), "connection refused") {
 			return nil, nil, nil

@@ -15,10 +15,12 @@ limitations under the License.
 */
 
 use super::DataConnector;
+use super::DataConnectorError;
 use super::DataConnectorFactory;
+use super::ParameterSpec;
+use super::Parameters;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use crate::Runtime;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
@@ -41,9 +43,9 @@ use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -53,8 +55,8 @@ pub enum Error {
     #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
     UnableToPublishData { source: flight_client::Error },
 
-    #[snafu(display("Missing required secrets"))]
-    MissingRequiredSecrets,
+    #[snafu(display("Missing required parameter: {parameter}"))]
+    MissingRequiredParameter { parameter: String },
 
     #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
     UnableToVerifyEndpointConnection {
@@ -89,10 +91,31 @@ impl Dialect for SpiceCloudPlatformDialect {
     }
 }
 
-impl DataConnectorFactory for SpiceAI {
+#[derive(Default, Copy, Clone)]
+pub struct SpiceAIFactory {}
+
+impl SpiceAIFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("api_key").secret(),
+    ParameterSpec::connector("token").secret(),
+    ParameterSpec::connector("endpoint"),
+];
+
+impl DataConnectorFactory for SpiceAIFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
@@ -100,12 +123,11 @@ impl DataConnectorFactory for SpiceAI {
             "https://flight.spiceai.io".to_string()
         };
         Box::pin(async move {
-            let secret = secret.context(MissingRequiredSecretsSnafu)?;
-
             let url: String = params
                 .get("endpoint")
-                .cloned()
-                .unwrap_or(default_flight_url);
+                .expose()
+                .ok()
+                .map_or(default_flight_url, str::to_string);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
             verify_endpoint_connection(&url).await.with_context(|_| {
@@ -114,7 +136,10 @@ impl DataConnectorFactory for SpiceAI {
                 }
             })?;
 
-            let api_key = secret.get("key").unwrap_or_default();
+            let api_key = params
+                .get("api_key")
+                .expose()
+                .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
@@ -123,9 +148,17 @@ impl DataConnectorFactory for SpiceAI {
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
             );
-            let spiceai = Self { flight_factory };
+            let spiceai = SpiceAI { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spiceai"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -139,15 +172,34 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(
+        match Read::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
             dataset.schema(),
         )
         .await
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "spiceai",
-        })?)
+        {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(data_components::flight::Error::UnableToGetSchema {
+                    source: _,
+                    table,
+                }) = e.downcast_ref::<data_components::flight::Error>()
+                {
+                    tracing::debug!("{e}");
+                    return Err(DataConnectorError::UnableToGetSchema {
+                        dataconnector: "spiceai".to_string(),
+                        dataset_name: dataset.name.to_string(),
+                        table_name: table.clone(),
+                    });
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "spiceai".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 
     async fn read_write_provider(

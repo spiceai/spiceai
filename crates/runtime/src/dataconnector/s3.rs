@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
+    Parameters,
+};
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
+use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
 
 #[derive(Debug, Snafu)]
@@ -43,25 +45,70 @@ pub enum Error {
 }
 
 pub struct S3 {
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: Parameters,
 }
 
-impl DataConnectorFactory for S3 {
+#[derive(Default, Copy, Clone)]
+pub struct S3Factory {}
+
+impl S3Factory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("region").secret(),
+    ParameterSpec::connector("endpoint").secret(),
+    ParameterSpec::connector("key").secret(),
+    ParameterSpec::connector("secret").secret(),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for S3 client."),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
+impl DataConnectorFactory for S3Factory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let s3 = Self { secret, params };
+            let s3 = S3 { params };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "s3"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
 impl std::fmt::Display for S3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "S3")
+        write!(f, "s3")
     }
 }
 
@@ -70,7 +117,7 @@ impl ListingTableConnector for S3 {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 
@@ -78,21 +125,19 @@ impl ListingTableConnector for S3 {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(region) = self.params.get("region") {
+        if let Some(region) = self.params.get("region").expose().ok() {
             fragment_builder.append_pair("region", region);
         }
-        if let Some(endpoint) = self.params.get("endpoint") {
+        if let Some(endpoint) = self.params.get("endpoint").expose().ok() {
             fragment_builder.append_pair("endpoint", endpoint);
         }
-        if let Some(secret) = &self.secret {
-            if let Some(key) = secret.get("key") {
-                fragment_builder.append_pair("key", key);
-            };
-            if let Some(secret) = secret.get("secret") {
-                fragment_builder.append_pair("secret", secret);
-            };
-        }
-        if let Some(timeout) = self.params.get("timeout") {
+        if let Some(key) = self.params.get("key").expose().ok() {
+            fragment_builder.append_pair("key", key);
+        };
+        if let Some(secret) = self.params.get("secret").expose().ok() {
+            fragment_builder.append_pair("secret", secret);
+        };
+        if let Some(timeout) = self.params.get("client_timeout").expose().ok() {
             fragment_builder.append_pair("timeout", timeout);
         }
         fragments.push(fragment_builder.finish());
@@ -104,15 +149,6 @@ impl ListingTableConnector for S3 {
                     dataconnector: format!("{self}"),
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
-
-        // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
-        // using a fragment with / suffix to trick df to think this is still a collection
-        // will need to raise an issue with DF to use url without query and fragment to decide if
-        // is_collection
-        // PR: https://github.com/apache/datafusion/pull/10419/files
-        if dataset.from.ends_with('/') {
-            fragments.push("dfiscollectionbugworkaround=hack/".into());
-        }
 
         s3_url.set_fragment(Some(&fragments.join("&")));
 

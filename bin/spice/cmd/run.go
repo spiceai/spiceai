@@ -32,14 +32,14 @@ spice run
 
 # See more at: https://docs.spiceai.org/
 `,
+	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
-
 		err := checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
 		}
 
-		err = runtime.Run()
+		err = runtime.Run(args)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			os.Exit(1)

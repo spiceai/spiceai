@@ -30,6 +30,9 @@ spice status
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
+		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
+			rtcontext = context.NewHttpsContext(rootCertPath)
+		}
 		err := api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
 		if err != nil {
 			cmd.PrintErrln(err.Error())
@@ -38,5 +41,6 @@ spice status
 }
 
 func init() {
+	statusCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	RootCmd.AddCommand(statusCmd)
 }

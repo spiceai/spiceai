@@ -17,18 +17,17 @@ limitations under the License.
 use async_trait::async_trait;
 
 use crate::component::dataset::Dataset;
-use crate::secrets::Secret;
 use data_components::spark_connect::SparkConnect;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -36,9 +35,6 @@ pub enum Error {
         "Missing required Spark Remote, not available as secret or plaintext parameter"
     ))]
     MissingSparkRemote,
-
-    #[snafu(display("Spark Remote configured twice, both as secret or plaintext parameter"))]
-    DuplicatedSparkRemote,
 
     #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
     InvalidEndpoint {
@@ -59,18 +55,11 @@ pub struct Spark {
 }
 
 impl Spark {
-    async fn new(
-        secret: Arc<Option<Secret>>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Result<Self> {
-        let plain_text_connection = params.get("spark_remote");
-        let secret_connection = secret.as_ref().as_ref().and_then(|s| s.get("spark_remote"));
-        let conn = match (plain_text_connection, secret_connection) {
-            (Some(_), Some(_)) => DuplicatedSparkRemoteSnafu.fail(),
-            (_, Some(conn)) => Ok(conn),
-            (Some(conn), _) => Ok(conn.as_str()),
-            _ => MissingSparkRemoteSnafu.fail(),
-        }?;
+    async fn new(params: Parameters) -> Result<Self> {
+        let conn = params.get("remote").expose().ok();
+        let Some(conn) = conn else {
+            return MissingSparkRemoteSnafu.fail();
+        };
         SparkConnect::validate_connection_string(conn)
             .context(InvalidEndpointSnafu { endpoint: conn })?;
         let spark = SparkConnect::from_connection(conn)
@@ -82,17 +71,33 @@ impl Spark {
     }
 }
 
-impl DataConnectorFactory for Spark {
+#[derive(Default, Copy, Clone)]
+pub struct SparkFactory {}
+
+impl SparkFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("remote").secret().required()];
+
+impl DataConnectorFactory for SparkFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match Spark::new(Arc::new(secret), params).await {
+            match Spark::new(params).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
                 Err(e) => match e {
-                    Error::DuplicatedSparkRemote
-                    | Error::MissingSparkRemote
+                    Error::MissingSparkRemote
                     | Error::InvalidEndpoint {
                         endpoint: _,
                         source: _,
@@ -112,6 +117,14 @@ impl DataConnectorFactory for Spark {
                 },
             }
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spark"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

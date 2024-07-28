@@ -15,22 +15,20 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 use url::Url;
 
 use super::{
     DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,
-    ListingTableConnector,
+    ListingTableConnector, ParameterSpec, Parameters,
 };
 
 pub struct Https {
-    params: Arc<HashMap<String, String>>,
-    secret: Option<Secret>,
+    params: Parameters,
 }
 
 impl std::fmt::Display for Https {
@@ -39,12 +37,55 @@ impl std::fmt::Display for Https {
     }
 }
 
-impl DataConnectorFactory for Https {
+#[derive(Default, Copy, Clone)]
+pub struct HttpsFactory {}
+
+impl HttpsFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("port").description("The port to connect to."),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
+
+impl DataConnectorFactory for HttpsFactory {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Self { params, secret }) as Arc<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(Https { params }) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "http"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -53,7 +94,7 @@ impl ListingTableConnector for Https {
         self
     }
 
-    fn get_params(&self) -> &HashMap<String, String> {
+    fn get_params(&self) -> &Parameters {
         &self.params
     }
 
@@ -66,13 +107,16 @@ impl ListingTableConnector for Https {
             }
         })?;
 
-        if let Some(p) = self.params.get("http_port") {
+        if let Some(p) = self.params.get("port").expose().ok() {
             let n = match p.parse::<u16>() {
                 Ok(n) => n,
                 Err(e) => {
                     return Err(DataConnectorError::InvalidConfiguration {
                         dataconnector: "https".to_string(),
-                        message: format!("Invalid port parameter: {e}"),
+                        message: format!(
+                            "Invalid `{}` parameter: {e}",
+                            self.params.user_param("port")
+                        ),
                         source: Box::new(e),
                     });
                 }
@@ -80,13 +124,8 @@ impl ListingTableConnector for Https {
             let _ = u.set_port(Some(n));
         };
 
-        if let Some(p) = get_secret_or_param(
-            &self.params,
-            &self.secret,
-            "http_password_key",
-            "http_password",
-        ) {
-            if u.set_password(Some(&p)).is_err() {
+        if let Some(p) = self.params.get("password").expose().ok() {
+            if u.set_password(Some(p)).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                         dataconnector: "https".to_string(),
@@ -95,7 +134,7 @@ impl ListingTableConnector for Https {
             };
         }
 
-        if let Some(p) = self.params.get("http_username") {
+        if let Some(p) = self.params.get("username").expose().ok() {
             if u.set_username(p).is_err() {
                 return Err(
                     DataConnectorError::UnableToConnectInvalidUsernameOrPassword {

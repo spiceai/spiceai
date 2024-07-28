@@ -211,7 +211,7 @@ fn make_graphql_dataset(path: &str, name: &str, query: &str, json_pointer: &str)
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
     let params = HashMap::from([
         ("json_pointer".to_string(), json_pointer.to_string()),
-        ("query".to_string(), query.to_string()),
+        ("graphql_query".to_string(), query.to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset

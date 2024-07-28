@@ -86,7 +86,7 @@ spice chat --model <model> --cloud
 			if cloud {
 				httpEndpoint = "https://data.spiceai.io"
 			} else {
-				httpEndpoint = "http://localhost:3000"
+				httpEndpoint = "http://localhost:8090"
 			}
 		}
 
@@ -99,7 +99,7 @@ spice chat --model <model> --cloud
 		var messages []Message = []Message{}
 
 		for {
-			cmd.Print(">>> ")
+			cmd.Print("chat> ")
 
 			message, err := reader.ReadString('\n')
 			if err != nil {
@@ -136,10 +136,10 @@ spice chat --model <model> --cloud
 				}
 			}
 
-			done <- true
-
 			scanner := bufio.NewScanner(response.Body)
 			var responseMessage = ""
+
+			doneLoading := false
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
@@ -153,6 +153,11 @@ spice chat --model <model> --cloud
 				if err != nil {
 					cmd.Println(err)
 					continue
+				}
+
+				if !doneLoading {
+					done <- true
+					doneLoading = true
 				}
 
 				token := chatResponse.Choices[0].Delta.Content
@@ -229,7 +234,7 @@ func callCloudChat(baseUrl string, apiKey string, client *http.Client, body *Cha
 func init() {
 	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
-	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:3000)")
+	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 
 	RootCmd.AddCommand(chatCmd)
 }

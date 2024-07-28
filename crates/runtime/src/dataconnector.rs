@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::secrets::Secrets;
 use crate::Runtime;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -41,6 +42,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -48,10 +50,9 @@ use std::fmt::Display;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
-use crate::secrets::Secret;
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;
@@ -193,6 +194,15 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
+    #[snafu(display(
+        "Failed to get schema for {dataconnector} dataset {dataset_name}. Ensure the table '{table_name}' exists in the data source."
+    ))]
+    UnableToGetSchema {
+        dataconnector: String,
+        dataset_name: String,
+        table_name: String,
+    },
+
     #[snafu(display("{dataconnector} Data Connector Error: {source}"))]
     InternalWithSource {
         dataconnector: String,
@@ -215,29 +225,18 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-type NewDataConnectorFn = dyn Fn(
-        Option<Secret>,
-        Arc<HashMap<String, String>>,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
-    + Send;
-
 lazy_static! {
-    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Box<NewDataConnectorFn>>> =
+    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>> =
         Mutex::new(HashMap::new());
 }
 
 pub async fn register_connector_factory(
     name: &str,
-    connector_factory: impl Fn(
-            Option<Secret>,
-            Arc<HashMap<String, String>>,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
-        + Send
-        + 'static,
+    connector_factory: Arc<dyn DataConnectorFactory>,
 ) {
     let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
-    registry.insert(name.to_string(), Box::new(connector_factory));
+    registry.insert(name.to_string(), connector_factory);
 }
 
 /// Create a new `DataConnector` by name.
@@ -248,64 +247,424 @@ pub async fn register_connector_factory(
 #[allow(clippy::implicit_hasher)]
 pub async fn create_new_connector(
     name: &str,
-    secret: Option<Secret>,
-    params: Arc<HashMap<String, String>>,
+    params: HashMap<String, SecretString>,
+    secrets: Arc<RwLock<Secrets>>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
     let connector_factory = guard.get(name);
 
-    match connector_factory {
-        Some(factory) => Some(factory(secret, params).await),
-        None => None,
-    }
+    let factory = connector_factory?;
+
+    let params = match Parameters::try_new(
+        name,
+        params.into_iter().collect(),
+        factory.prefix(),
+        secrets,
+        factory.parameters(),
+    )
+    .await
+    {
+        Ok(params) => params,
+        Err(e) => return Some(Err(e)),
+    };
+
+    let result = factory.create(params).await;
+    Some(result)
 }
 
 pub async fn register_all() {
-    register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
+    register_connector_factory("localhost", localhost::LocalhostConnectorFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
-    register_connector_factory("databricks", databricks::Databricks::create).await;
+    register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
     #[cfg(feature = "delta_lake")]
-    register_connector_factory("delta_lake", delta_lake::DeltaLake::create).await;
+    register_connector_factory("delta_lake", delta_lake::DeltaLakeFactory::new_arc()).await;
     #[cfg(feature = "dremio")]
-    register_connector_factory("dremio", dremio::Dremio::create).await;
-    register_connector_factory("file", file::File::create).await;
+    register_connector_factory("dremio", dremio::DremioFactory::new_arc()).await;
+    register_connector_factory("file", file::FileFactory::new_arc()).await;
     #[cfg(feature = "flightsql")]
-    register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
-    register_connector_factory("s3", s3::S3::create).await;
+    register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
+    register_connector_factory("s3", s3::S3Factory::new_arc()).await;
     #[cfg(feature = "ftp")]
-    register_connector_factory("ftp", ftp::FTP::create).await;
-    register_connector_factory("http", https::Https::create).await;
-    register_connector_factory("https", https::Https::create).await;
+    register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
+    register_connector_factory("http", https::HttpsFactory::new_arc()).await;
+    register_connector_factory("https", https::HttpsFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
-    register_connector_factory("sftp", sftp::SFTP::create).await;
-    register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
+    register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
+    register_connector_factory("spiceai", spiceai::SpiceAIFactory::new_arc()).await;
     #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQL::create).await;
+    register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
     #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::Postgres::create).await;
+    register_connector_factory("postgres", postgres::PostgresFactory::new_arc()).await;
     #[cfg(feature = "duckdb")]
-    register_connector_factory("duckdb", duckdb::DuckDB::create).await;
+    register_connector_factory("duckdb", duckdb::DuckDBFactory::new_arc()).await;
     #[cfg(feature = "clickhouse")]
-    register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
-    register_connector_factory("graphql", graphql::GraphQL::create).await;
+    register_connector_factory("clickhouse", clickhouse::ClickhouseFactory::new_arc()).await;
+    register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
     #[cfg(feature = "odbc")]
-    register_connector_factory("odbc", odbc::ODBC::create).await;
+    register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
     #[cfg(feature = "spark")]
-    register_connector_factory("spark", spark::Spark::create).await;
+    register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
     #[cfg(feature = "snowflake")]
-    register_connector_factory("snowflake", snowflake::Snowflake::create).await;
+    register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
     #[cfg(feature = "debezium")]
-    register_connector_factory("debezium", debezium::Debezium::create).await;
+    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
     #[cfg(feature = "delta_lake")]
-    register_connector_factory("unity_catalog", unity_catalog::UnityCatalog::create).await;
+    register_connector_factory(
+        "unity_catalog",
+        unity_catalog::UnityCatalogFactory::new_arc(),
+    )
+    .await;
 }
 
-pub trait DataConnectorFactory {
+#[derive(Clone)]
+pub struct Parameters {
+    params: Vec<(String, SecretString)>,
+    prefix: &'static str,
+    all_params: &'static [ParameterSpec],
+}
+
+#[derive(Debug, Clone)]
+pub struct UserParam(String);
+
+impl Display for UserParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub enum ParamLookup<'a> {
+    Present(&'a SecretString),
+    Absent(UserParam),
+}
+
+impl<'a> ParamLookup<'a> {
+    #[must_use]
+    pub fn ok(&self) -> Option<&'a SecretString> {
+        match self {
+            ParamLookup::Present(s) => Some(*s),
+            ParamLookup::Absent(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn expose(self) -> ExposedParamLookup<'a> {
+        match self {
+            ParamLookup::Present(s) => ExposedParamLookup::Present(s.expose_secret()),
+            ParamLookup::Absent(s) => ExposedParamLookup::Absent(s),
+        }
+    }
+
+    pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a SecretString, E> {
+        match self {
+            ParamLookup::Present(s) => Ok(s),
+            ParamLookup::Absent(s) => Err(f(s)),
+        }
+    }
+}
+
+pub enum ExposedParamLookup<'a> {
+    Present(&'a str),
+    Absent(UserParam),
+}
+
+impl<'a> ExposedParamLookup<'a> {
+    #[must_use]
+    pub fn ok(self) -> Option<&'a str> {
+        match self {
+            ExposedParamLookup::Present(s) => Some(s),
+            ExposedParamLookup::Absent(_) => None,
+        }
+    }
+
+    pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a str, E> {
+        match self {
+            ExposedParamLookup::Present(s) => Ok(s),
+            ExposedParamLookup::Absent(s) => Err(f(s)),
+        }
+    }
+}
+
+impl Parameters {
+    pub async fn try_new(
+        connector_name: &str,
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        secrets: Arc<RwLock<Secrets>>,
+        all_params: &'static [ParameterSpec],
+    ) -> AnyErrorResult<Self> {
+        let full_prefix = format!("{prefix}_");
+
+        // Convert the user-provided parameters into the format expected by the data connector
+        let mut params: Vec<(String, SecretString)> = params
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let mut unprefixed_key = key.as_str();
+                let mut has_prefix = false;
+                if key.starts_with(&full_prefix) {
+                    has_prefix = true;
+                    unprefixed_key = &key[full_prefix.len()..];
+                }
+
+                let spec = all_params.iter().find(|p| p.name == unprefixed_key);
+
+                let Some(spec) = spec else {
+                    tracing::warn!("Ignoring parameter {key}: not supported for {connector_name}.");
+                    return None;
+                };
+
+                if !has_prefix && spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {connector_name}."
+                );
+                    return None;
+                }
+
+                if has_prefix && !spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {connector_name}."
+                );
+                    return None;
+                }
+
+                Some((unprefixed_key.to_string(), value))
+            })
+            .collect();
+        let secret_guard = secrets.read().await;
+
+        // Try to autoload secrets that might be missing from params.
+        for secret_key in all_params.iter().filter(|p| p.secret) {
+            let secret_key_with_prefix = format!("{prefix}_{}", secret_key.name);
+            tracing::debug!(
+                "Attempting to autoload secret for {connector_name}: {secret_key_with_prefix}",
+            );
+            if params.iter().any(|p| p.0 == secret_key.name) {
+                continue;
+            }
+            let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+            if let Ok(Some(secret)) = secret {
+                tracing::debug!(
+                    "Autoloading secret for {connector_name}: {secret_key_with_prefix}",
+                );
+                // Insert without the prefix into the params
+                params.push((secret_key.name.to_string(), secret));
+            }
+        }
+
+        // Check if all required parameters are present
+        for parameter in all_params {
+            // If the parameter is missing and has a default value, add it to the params
+            let missing = !params.iter().any(|p| p.0 == parameter.name);
+            if missing {
+                if let Some(default_value) = parameter.default {
+                    params.push((parameter.name.to_string(), default_value.to_string().into()));
+                    continue;
+                }
+            }
+
+            if parameter.required && missing {
+                let param = if parameter.r#type.is_prefixed() {
+                    format!("{full_prefix}{}", parameter.name)
+                } else {
+                    parameter.name.to_string()
+                };
+
+                return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: connector_name.to_string(),
+                    message: format!("Missing required parameter: {param}"),
+                }));
+            }
+        }
+
+        Ok(Parameters::new(params, prefix, all_params))
+    }
+
+    #[must_use]
+    pub fn new(
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        all_params: &'static [ParameterSpec],
+    ) -> Self {
+        Self {
+            params,
+            prefix,
+            all_params,
+        }
+    }
+
+    #[must_use]
+    pub fn to_secret_map(&self) -> HashMap<String, SecretString> {
+        self.params.iter().cloned().collect()
+    }
+
+    /// Returns the `SecretString` for the given parameter, or the user-facing parameter name of the missing parameter.
+    #[must_use]
+    pub fn get<'a>(&'a self, name: &str) -> ParamLookup<'a> {
+        if let Some(param_value) = self.params.iter().find(|p| p.0 == name) {
+            ParamLookup::Present(&param_value.1)
+        } else {
+            ParamLookup::Absent(self.user_param(name))
+        }
+    }
+
+    /// Gets the `ParameterSpec` for the given parameter name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
+    #[must_use]
+    pub fn describe(&self, name: &str) -> &ParameterSpec {
+        if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
+            spec
+        } else {
+            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory.");
+        }
+    }
+
+    /// Retrieves the user-facing parameter name for the given parameter.
+    #[must_use]
+    pub fn user_param(&self, name: &str) -> UserParam {
+        let spec = self.describe(name);
+
+        if self.prefix.is_empty() || !spec.r#type.is_prefixed() {
+            UserParam(spec.name.to_string())
+        } else {
+            UserParam(format!("{}_{}", self.prefix, spec.name))
+        }
+    }
+}
+
+pub struct ParameterSpec {
+    pub name: &'static str,
+    pub required: bool,
+    pub default: Option<&'static str>,
+    pub secret: bool,
+    pub description: &'static str,
+    pub help_link: &'static str,
+    pub examples: &'static [&'static str],
+    pub r#type: ParameterType,
+}
+
+impl ParameterSpec {
+    #[must_use]
+    pub const fn connector(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            default: None,
+            secret: false,
+            description: "",
+            help_link: "",
+            examples: &[],
+            r#type: ParameterType::Connector,
+        }
+    }
+
+    #[must_use]
+    pub const fn runtime(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            default: None,
+            secret: false,
+            description: "",
+            help_link: "",
+            examples: &[],
+            r#type: ParameterType::Runtime,
+        }
+    }
+
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn default(mut self, default: &'static str) -> Self {
+        self.default = Some(default);
+        self
+    }
+
+    #[must_use]
+    pub const fn secret(mut self) -> Self {
+        self.secret = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    #[must_use]
+    pub const fn help_link(mut self, help_link: &'static str) -> Self {
+        self.help_link = help_link;
+        self
+    }
+
+    #[must_use]
+    pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
+        self.examples = examples;
+        self
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum ParameterType {
+    /// A parameter which tells Spice how to connect to the underlying data source.
+    ///
+    /// These parameters are automatically prefixed with the data connector's prefix.
+    ///
+    /// # Examples
+    ///
+    /// In Postgres, the `host` is a Connector parameter and would be auto-prefixed with `pg_`.
+    #[default]
+    Connector,
+    /// Other parameters which control how the runtime interacts with the data source, but does
+    /// not affect the actual connection.
+    ///
+    /// These parameters are not prefixed with the data connector's prefix.
+    ///
+    /// # Examples
+    ///
+    /// In Databricks, the `mode` parameter is used to select which connection to use, and thus is
+    /// not a Connector parameter.
+    Runtime,
+}
+
+impl ParameterType {
+    #[must_use]
+    pub const fn is_prefixed(&self) -> bool {
+        matches!(self, Self::Connector)
+    }
+}
+
+pub trait DataConnectorFactory: Send + Sync {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
+        &self,
+        params: Parameters,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
+
+    /// The prefix to use for parameters and secrets for this `DataConnector`.
+    ///
+    /// This prefix is applied to any `ParameterType::Connector` parameters.
+    ///
+    /// ## Example
+    ///
+    /// If the prefix is `pg` then the following parameters are accepted:
+    ///
+    /// - `pg_host` -> `host`
+    /// - `pg_port` -> `port`
+    ///
+    /// The prefix will be stripped from the parameter name before being passed to the data connector.
+    fn prefix(&self) -> &'static str;
+
+    /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
+    ///
+    /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
+    fn parameters(&self) -> &'static [ParameterSpec];
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -387,7 +746,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
-    fn get_params(&self) -> &HashMap<String, String>;
+    fn get_params(&self) -> &Parameters;
 
     #[must_use]
     fn get_session_context() -> SessionContext {
@@ -448,6 +807,7 @@ pub trait ListingTableConnector: DataConnector {
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
     ///  - csv
+    ///
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
     ///
     /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
@@ -460,9 +820,13 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let params = self.get_params();
-        let extension = params.get("file_extension").cloned();
+        let extension = params
+            .get("file_extension")
+            .expose()
+            .ok()
+            .map(str::to_string);
 
-        match params.get("file_format").map(String::as_str) {
+        match params.get("file_format").expose().ok() {
             Some("csv") => Ok((
                 Some(self.get_csv_format(params)?),
                 extension.unwrap_or(".csv".to_string()),
@@ -497,27 +861,40 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
-    fn get_csv_format(
-        &self,
-        params: &HashMap<String, String>,
-    ) -> DataConnectorResult<Arc<CsvFormat>>
+    fn get_csv_format(&self, params: &Parameters) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
     {
-        let has_header = params.get("has_header").map_or(true, |f| f == "true");
+        let has_header = params
+            .get("csv_has_header")
+            .expose()
+            .ok()
+            .map_or(true, |f| f.eq_ignore_ascii_case("true"));
         let quote = params
-            .get("quote")
+            .get("csv_quote")
+            .expose()
+            .ok()
             .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
         let escape = params
-            .get("escape")
+            .get("csv_escape")
+            .expose()
+            .ok()
             .and_then(|f| f.as_bytes().first().copied());
         let schema_infer_max_rec = params
-            .get("schema_infer_max_records")
+            .get("csv_schema_infer_max_records")
+            .expose()
+            .ok()
             .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
         let delimiter = params
-            .get("delimiter")
+            .get("csv_delimiter")
+            .expose()
+            .ok()
             .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
-        let compression_type = params.get("compression_type").map_or("", |f| f);
+        let compression_type = params
+            .get("file_compression_type")
+            .expose()
+            .ok()
+            .unwrap_or_default();
 
         Ok(Arc::new(
             CsvFormat::default()
@@ -621,10 +998,12 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_table_providers::util::secrets::to_secret_map;
+
     use super::*;
 
     struct TestConnector {
-        params: Arc<HashMap<String, String>>,
+        params: Parameters,
     }
 
     impl std::fmt::Display for TestConnector {
@@ -635,13 +1014,21 @@ mod tests {
 
     impl DataConnectorFactory for TestConnector {
         fn create(
-            _secret: Option<Secret>,
-            params: Arc<HashMap<String, String>>,
+            &self,
+            params: Parameters,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };
                 Ok(Arc::new(connector) as Arc<dyn DataConnector>)
             })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "test"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
         }
     }
 
@@ -650,7 +1037,7 @@ mod tests {
             self
         }
 
-        fn get_params(&self) -> &HashMap<String, String> {
+        fn get_params(&self) -> &Parameters {
             &self.params
         }
 
@@ -664,9 +1051,24 @@ mod tests {
         }
     }
 
+    const TEST_PARAMETERS: &[ParameterSpec] = &[
+        ParameterSpec::runtime("file_extension"),
+        ParameterSpec::runtime("file_format"),
+        ParameterSpec::runtime("csv_has_header"),
+        ParameterSpec::runtime("csv_quote"),
+        ParameterSpec::runtime("csv_escape"),
+        ParameterSpec::runtime("csv_schema_infer_max_records"),
+        ParameterSpec::runtime("csv_delimiter"),
+        ParameterSpec::runtime("file_compression_type"),
+    ];
+
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
-            params: params.into(),
+            params: Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                "test",
+                TEST_PARAMETERS,
+            ),
         };
         let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
 

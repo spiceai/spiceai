@@ -49,14 +49,17 @@ use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
+use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use secrets::{spicepod_secret_store_type, Secret, SecretMap};
+use secrecy::SecretString;
+use secrets::ParamStr;
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
 use tracing_util::dataset_registered_trace;
@@ -80,6 +83,7 @@ pub mod extension;
 mod flight;
 mod http;
 pub mod internal_table;
+mod metrics_server;
 pub mod model;
 pub mod object_store_registry;
 pub mod objectstore;
@@ -89,6 +93,7 @@ pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
 pub mod timing;
+pub mod tls;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -96,6 +101,12 @@ mod tracing_util;
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
+
+    #[snafu(display("{source}"))]
+    UnableToJoinTask { source: tokio::task::JoinError },
+
+    #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
+    UnableToStartMetricsServer { source: metrics_server::Error },
 
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
@@ -264,9 +275,10 @@ pub struct Runtime {
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
-    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
-    metrics: Option<SocketAddr>,
+    metrics_endpoint: Option<SocketAddr>,
+    metrics_handle: Option<PrometheusHandle>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -285,8 +297,8 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
-        Arc::clone(&self.secrets_provider)
+    pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
+        Arc::clone(&self.secrets)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -324,10 +336,15 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    pub async fn start_servers(&self, config: Config) -> Result<()> {
-        self.start_metrics(self.metrics).await?;
+    pub async fn start_servers(
+        &self,
+        config: Config,
+        tls_config: Option<Arc<TlsConfig>>,
+    ) -> Result<()> {
+        self.register_metrics_table(self.metrics_handle.clone())
+            .await?;
 
-        let http_server_future = http::start(
+        let http_server_future = tokio::spawn(http::start(
             config.http_bind_address,
             Arc::clone(&self.app),
             Arc::clone(&self.df),
@@ -335,18 +352,72 @@ impl Runtime {
             Arc::clone(&self.llms),
             Arc::clone(&self.embeds),
             config.clone().into(),
-            self.metrics,
-        );
+            self.metrics_endpoint,
+            tls_config.clone(),
+        ));
 
-        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
-        let open_telemetry_server_future =
-            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
+        // Spawn the metrics server in the background
+        let metrics_endpoint = self.metrics_endpoint;
+        let metrics_handle = self.metrics_handle.clone();
+        let cloned_tls_config = tls_config.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                metrics_server::start(metrics_endpoint, metrics_handle, cloned_tls_config).await
+            {
+                tracing::error!("Prometheus metrics server error: {e}");
+            }
+        });
+
+        let flight_server_future = tokio::spawn(flight::start(
+            config.flight_bind_address,
+            Arc::clone(&self.df),
+            tls_config.clone(),
+        ));
+        let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
+            config.open_telemetry_bind_address,
+            Arc::clone(&self.df),
+            tls_config.clone(),
+        ));
         let pods_watcher_future = self.start_pods_watcher();
 
+        if let Some(tls_config) = tls_config {
+            match tls_config.subject_name() {
+                Some(subject_name) => {
+                    tracing::info!(
+                        "All endpoints secured with TLS using certificate: {subject_name}"
+                    );
+                }
+                None => {
+                    tracing::info!("All endpoints secured with TLS");
+                }
+            }
+        }
+
         tokio::select! {
-            http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
-            flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
-            open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
+            http_res = http_server_future => {
+                match http_res {
+                    Ok(http_res) => http_res.context(UnableToStartHttpServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToJoinTask { source })
+                    }
+                }
+             },
+            flight_res = flight_server_future => {
+                match flight_res {
+                    Ok(flight_res) => flight_res.context(UnableToStartFlightServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToJoinTask { source })
+                    }
+                }
+            },
+            open_telemetry_res = open_telemetry_server_future => {
+                match open_telemetry_res {
+                    Ok(open_telemetry_res) => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToJoinTask { source })
+                    }
+                }
+            },
             pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
             () = shutdown_signal() => {
                 tracing::info!("Goodbye!");
@@ -355,11 +426,10 @@ impl Runtime {
         }
     }
 
-    /// Will load all of the components of the Runtime, including datasets, models, and embeddings.
+    /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded.
     pub async fn load_components(&self) {
-        self.load_secrets().await;
         self.start_extensions().await;
 
         #[cfg(feature = "models")]
@@ -385,30 +455,31 @@ impl Runtime {
         self.df.mark_initial_load_complete();
     }
 
+    pub async fn get_params_with_secrets(
+        &self,
+        params: &HashMap<String, String>,
+    ) -> HashMap<String, SecretString> {
+        let shared_secrets = Arc::clone(&self.secrets);
+        let secrets = shared_secrets.read().await;
+
+        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+        // Inject secrets from the user-supplied params.
+        // This will replace any instances of `${ store:key }` with the actual secret value.
+        for (k, v) in params {
+            let secret = secrets.inject_secrets(k, ParamStr(v)).await;
+            params_with_secrets.insert(k.clone(), secret);
+        }
+
+        params_with_secrets
+    }
+
     async fn start_extensions(&self) {
         let mut extensions = self.extensions.write().await;
         for (name, extension) in extensions.iter_mut() {
             if let Err(err) = extension.on_start(self).await {
                 tracing::warn!("Failed to start extension {name}: {err}");
             }
-        }
-    }
-
-    async fn load_secrets(&self) {
-        measure_scope_ms!("load_secrets");
-        let mut secret_store = self.secrets_provider.write().await;
-
-        let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
-                return;
-            };
-
-            secret_store.store = secret_store_type;
-        }
-
-        if let Err(e) = secret_store.load_secrets().await {
-            tracing::warn!("Unable to load secrets: {}", e);
         }
     }
 
@@ -632,68 +703,48 @@ impl Runtime {
 
     async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
-            Arc::clone(&self.secrets_provider);
-
         let catalog = catalog.clone();
 
-        let secrets_provider = shared_secrets_provider.read().await;
-
         let source = catalog.provider;
-        let params = Arc::new(catalog.params.clone());
-        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
-            &source,
-            &secrets_provider,
-            Arc::clone(&params),
-        )
-        .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let catalog_name = &catalog.name;
-                status::update_catalog(catalog_name, status::ComponentStatus::Error);
-                metrics::counter!("catalogs_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: catalog_name.clone(),
+        let params = catalog.params.clone();
+        let data_connector: Arc<dyn DataConnector> =
+            match self.get_dataconnector_from_source(&source, params).await {
+                Ok(data_connector) => data_connector,
+                Err(err) => {
+                    let catalog_name = &catalog.name;
+                    status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                    metrics::counter!("catalogs_load_error").increment(1);
+                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: catalog_name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-        };
+            };
 
         Ok(data_connector)
     }
 
     async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
-            Arc::clone(&self.secrets_provider);
-
         let ds = ds.clone();
 
-        let secrets_provider = shared_secrets_provider.read().await;
-
         let source = ds.source();
-        let params = Arc::new(ds.params.clone());
-        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
-            &source,
-            &secrets_provider,
-            Arc::clone(&params),
-        )
-        .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let ds_name = &ds.name;
-                status::update_dataset(ds_name, status::ComponentStatus::Error);
-                metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: ds.name.clone(),
+        let params = ds.params.clone();
+        let data_connector: Arc<dyn DataConnector> =
+            match self.get_dataconnector_from_source(&source, params).await {
+                Ok(data_connector) => data_connector,
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    status::update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::counter!("datasets_load_error").increment(1);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: ds.name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-        };
+            };
 
         Ok(data_connector)
     }
@@ -758,13 +809,9 @@ impl Runtime {
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
-        let df = Arc::clone(&self.df);
         let ds = ds.clone();
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
-            Arc::clone(&self.secrets_provider);
-
         if let Some(acceleration) = &ds.acceleration {
             if data_connector.resolve_refresh_mode(acceleration.refresh_mode)
                 == RefreshMode::Changes
@@ -793,19 +840,17 @@ impl Runtime {
             }
         };
 
-        match Runtime::register_dataset(
-            &ds,
-            RegisterDatasetContext {
-                data_connector: Arc::clone(&data_connector),
-                federated_read_table: read_provider,
-                df: Arc::clone(&df),
-                source,
-                secrets_provider: Arc::clone(&shared_secrets_provider),
-                accelerated_table,
-                embedding: Arc::clone(&self.embeds),
-            },
-        )
-        .await
+        match self
+            .register_dataset(
+                &ds,
+                RegisterDatasetContext {
+                    data_connector: Arc::clone(&data_connector),
+                    federated_read_table: read_provider,
+                    source,
+                    accelerated_table,
+                },
+            )
+            .await
         {
             Ok(()) => {
                 tracing::info!(
@@ -949,9 +994,6 @@ impl Runtime {
         ds: &Dataset,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let acceleration_secret =
-            Runtime::get_acceleration_secret(ds, Arc::clone(&self.secrets_provider)).await?;
-
         let read_table = connector.read_provider(ds).await.map_err(|_| {
             UnableToLoadDatasetConnectorSnafu {
                 dataset: ds.name.clone(),
@@ -962,7 +1004,7 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), read_table, acceleration_secret)
+            .create_accelerated_table(ds, Arc::clone(&connector), read_table, self.secrets())
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -982,17 +1024,13 @@ impl Runtime {
     }
 
     async fn get_dataconnector_from_source(
+        &self,
         source: &str,
-        secrets_provider: &secrets::SecretsProvider,
-        params: Arc<HashMap<String, String>>,
+        params: HashMap<String, String>,
     ) -> Result<Arc<dyn DataConnector>> {
-        let secret = secrets_provider.get_secret(source).await.context(
-            UnableToGetSecretForDataConnectorSnafu {
-                data_connector: source,
-            },
-        )?;
+        let secret_map = self.get_params_with_secrets(&params).await;
 
-        match dataconnector::create_new_connector(source, secret, params).await {
+        match dataconnector::create_new_connector(source, secret_map, self.secrets()).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,
@@ -1001,55 +1039,16 @@ impl Runtime {
         }
     }
 
-    async fn get_acceleration_secret(
-        ds: &Dataset,
-        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-    ) -> Result<Option<Secret>> {
-        let source = ds.source();
-        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
-
-        let acceleration_settings =
-            ds.acceleration
-                .as_ref()
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: ds.name.to_string(),
-                })?;
-
-        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
-            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
-        }
-
-        let accelerator_engine = acceleration_settings.engine;
-        let secret_key = acceleration_settings
-            .engine_secret
-            .clone()
-            .unwrap_or(format!("{accelerator_engine}_engine").to_lowercase());
-
-        let secrets_provider_read_guard = secrets_provider.read().await;
-        let acceleration_secret = secrets_provider_read_guard
-            .get_secret(&secret_key)
-            .await
-            .context(UnableToGetSecretForDataConnectorSnafu {
-                data_connector: source,
-            })?;
-
-        drop(secrets_provider_read_guard);
-
-        Ok(acceleration_secret)
-    }
-
     async fn register_dataset(
+        &self,
         ds: impl Borrow<Dataset>,
         register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
         let RegisterDatasetContext {
             data_connector,
             federated_read_table,
-            df,
             source,
-            secrets_provider,
             accelerated_table,
-            embedding,
         } = register_dataset_ctx;
 
         let ds = ds.borrow();
@@ -1062,7 +1061,7 @@ impl Runtime {
         } else {
             Arc::new(EmbeddingConnector::new(
                 data_connector,
-                Arc::clone(&embedding),
+                Arc::clone(&self.embeds),
             )) as Arc<dyn DataConnector>
         };
 
@@ -1073,7 +1072,8 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            return df
+            return self
+                .df
                 .register_table(
                     ds,
                     datafusion::Table::Federated {
@@ -1095,7 +1095,11 @@ impl Runtime {
                     name: ds.name.to_string(),
                 })?;
         let accelerator_engine = acceleration_settings.engine;
-        let acceleration_secret = Runtime::get_acceleration_secret(ds, secrets_provider).await?;
+        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
+
+        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
+            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
+        }
 
         dataaccelerator::get_accelerator_engine(accelerator_engine)
             .await
@@ -1103,45 +1107,29 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        df.register_table(
-            ds,
-            datafusion::Table::Accelerated {
-                source: connector,
-                federated_read_table,
-                acceleration_secret,
-                accelerated_table,
-            },
-        )
-        .await
-        .context(UnableToAttachDataConnectorSnafu {
-            data_connector: source,
-        })
-    }
-
-    async fn get_params_with_secrets(&self, params: &HashMap<String, String>) -> Result<SecretMap> {
-        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
-        let secrets_provider = shared_secrets_provider.read().await;
-
-        let mut params_with_secrets: SecretMap = params.clone().into();
-
-        if let (Some(secret_name), Some(secret_key)) =
-            (params.get("secret_name"), params.get("secret_key"))
-        {
-            if let Some(secret) = secrets_provider
-                .get_secret(secret_name)
-                .await
-                .context(UnableToGetSecretForLLMSnafu)?
-            {
-                secret.insert_to_params(&mut params_with_secrets, secret_key, secret_key);
-            }
-        }
-
-        Ok(params_with_secrets)
+        self.df
+            .register_table(
+                ds,
+                datafusion::Table::Accelerated {
+                    source: connector,
+                    federated_read_table,
+                    accelerated_table,
+                    secrets: self.secrets(),
+                },
+            )
+            .await
+            .context(UnableToAttachDataConnectorSnafu {
+                data_connector: source,
+            })
     }
 
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
-    async fn load_llm(&self, m: SpicepodModel, params: SecretMap) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params.into_map())
+    async fn load_llm(
+        &self,
+        m: SpicepodModel,
+        params: HashMap<String, SecretString>,
+    ) -> Result<Box<dyn Chat>> {
+        let mut l = try_to_chat_model(&m, &params)
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1154,9 +1142,9 @@ impl Runtime {
 
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
-        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await?;
+        let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
 
-        let mut l = try_to_embedding(in_embed, &params_with_secrets.into_map())
+        let mut l = try_to_embedding(in_embed, &params_with_secrets)
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()
@@ -1211,19 +1199,7 @@ impl Runtime {
         measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
-        let params = match self.get_params_with_secrets(&m.params).await {
-            Ok(s) => s,
-            Err(e) => {
-                metrics::counter!("models_load_error").increment(1);
-                status::update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!(
-                    "Unable to load model '{}' from spicepod, error: {}",
-                    m.name,
-                    e,
-                );
-                return;
-            }
-        };
+        let params = self.get_params_with_secrets(&m.params).await;
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
@@ -1239,7 +1215,7 @@ impl Runtime {
                     m.name, e,
                 )),
             },
-            Some(ModelType::Ml) => match Model::load(m.clone(), params.into_map()).await {
+            Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
                 Ok(in_m) => {
                     let mut model_map = self.models.write().await;
                     model_map.insert(m.name.clone(), in_m);
@@ -1294,9 +1270,9 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    async fn start_metrics(&self, with_metrics: Option<SocketAddr>) -> Result<()> {
-        if let Some(metrics_socket) = with_metrics {
-            let mut recorder = MetricsRecorder::new(metrics_socket);
+    async fn register_metrics_table(&self, with_metrics: Option<PrometheusHandle>) -> Result<()> {
+        if let Some(handle) = with_metrics {
+            let mut recorder = MetricsRecorder::new(handle);
 
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;
@@ -1565,9 +1541,6 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
 pub struct RegisterDatasetContext {
     data_connector: Arc<dyn DataConnector>,
     federated_read_table: Arc<dyn TableProvider>,
-    df: Arc<DataFusion>,
     source: String,
-    secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     accelerated_table: Option<AcceleratedTable>,
-    embedding: Arc<RwLock<EmbeddingModelStore>>,
 }

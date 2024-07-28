@@ -10,10 +10,10 @@ version.workspace = true
 
 [dependencies]
 app = { path = "../app" }
-arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc = "52.0.0"
 arrow-json = "52.0.0"
+arrow.workspace = true
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
@@ -25,8 +25,6 @@ aws-sdk-sts = { version = "1.19.0", optional = true }
 axum = { version = "0.7.4", features = ["macros"] }
 axum-extra = { version = "0.9.3", features = ["typed-header"] }
 base64.workspace = true
-bb8 = { workspace = true, optional = true }
-bb8-postgres = { workspace = true, optional = true }
 bytes = { version = "1", default-features = false }
 cache = { path = "../cache" }
 chrono = { version = "0.4.38" }
@@ -35,12 +33,11 @@ clickhouse-rs = { workspace = true, optional = true }
 csv = "1.3.0"
 dashmap = "5.5.3"
 data_components = { path = "../data_components" }
-datafusion.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
+datafusion.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
-derive_builder = "0.20.0"
-dirs = "5.0.1"
+dotenvy = "0.15"
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
@@ -52,21 +49,24 @@ fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
 headers-accept = "0.1.3"
-indexmap = "2.2.2"
+http = "1.1.0"
+http-body-util = "0.1.2"
+hyper = "1.4.1"
+hyper-util = "0.1.6"
+indexmap = "2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }
 lazy_static = "1.4.0"
 llms = { path = "../llms" }
+logos = "0.14.0"
 mediatype = "0.19.18"
 metrics.workspace = true
-metrics-exporter-prometheus.workspace = true
+metrics-exporter-prometheus = { workspace = true }
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
-ndarray = "0.15.3"
 notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http"] }
-odbc-api = { workspace = true, optional = true }
 once_cell = "1.19.0"
 opentelemetry-proto = { version = "0.4.0", features = [
   "gen-tonic-messages",
@@ -74,14 +74,14 @@ opentelemetry-proto = { version = "0.4.0", features = [
   "metrics",
 ] }
 pin-project = "1.0"
-postgres-native-tls = { version = "0.5.0", optional = true }
 prometheus-parse = "0.2.5"
 prost = { version = "0.12.1", default-features = false, features = [
   "prost-derive",
 ] }
-r2d2 = { workspace = true, optional = true }
 regex.workspace = true
-reqwest = { version = "0.11.24", features = ["json"] }
+reqwest = { version = "0.11.24", features = ["json", "rustls-tls"] }
+rustls.workspace = true
+rustls-pemfile.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -90,19 +90,18 @@ snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
-tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
-tokio-stream = "0.1"
-toml = "0.8.8"
+tokio-rustls = "0.26.0"
+tokio.workspace = true
+tonic_health_0_9_0 = { version = "0.9.0", package = "tonic-health" }
 tonic.workspace = true
-tonic-health = "0.9.0"
-tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
+tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip", "tls"] }
 tracing.workspace = true
 tract-core = "0.21.0"
-tract-onnx = "0.21.0"
 url = "2.5.0"
 util = { path = "../util" }
 uuid.workspace = true
+x509-certificate.workspace = true
 
 [dev-dependencies]
 anyhow = "1.0.86"
@@ -132,22 +131,14 @@ default = ["keyring-secret-store", "aws-secrets-manager"]
 delta_lake = ["data_components/delta_lake"]
 dev = []
 dremio = []
-duckdb = [
-  "dep:duckdb",
-  "r2d2",
-  "db_connection_pool/duckdb",
-  "data_components/duckdb",
-]
+duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
 models = ["model_components/full", "llms/mistralrs", "llms/candle"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
-odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
+odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 postgres = [
-  "dep:bb8",
-  "dep:bb8-postgres",
-  "dep:postgres-native-tls",
   "db_connection_pool/postgres",
   "data_components/postgres",
   "datafusion-table-providers/postgres",

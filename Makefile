@@ -39,6 +39,8 @@ nextest:
 
 .PHONY: test-integration
 test-integration:
+	# Test if .env file exists, and login to Spice if not
+	@test -f .env || (`spice login`)
 	@cargo test -p runtime --test integration --features postgres,mysql,spiceai-dataset-test -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
@@ -47,7 +49,7 @@ test-integration-without-spiceai-dataset:
 
 .PHONY: test-bench
 test-bench:
-	@cargo bench -p runtime
+	@cargo bench -p runtime --features postgres,spark,mysql
 
 .PHONY: lint lint-go lint-rust
 lint: lint-go lint-rust
@@ -81,7 +83,7 @@ docker:
 .PHONY: docker-run
 docker-run:
 	docker stop spiceai && docker rm spiceai || true
-	docker run --name spiceai -p 3000:3000 -p 50051:50051 spiceai-rust:local-dev
+	docker run --name spiceai -p 8090:8090 -p 50051:50051 spiceai-rust:local-dev
 
 .PHONY: deps-licenses
 dep-licenses:

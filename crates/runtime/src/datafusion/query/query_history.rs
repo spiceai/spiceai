@@ -19,8 +19,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::component::dataset::TimeFormat;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
+use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::{
     array::{
         BooleanArray, Float32Array, Int8Array, RecordBatch, StringArray, TimestampNanosecondArray,
@@ -31,6 +31,7 @@ use arrow::{
 use datafusion::sql::TableReference;
 
 use snafu::{ResultExt, Snafu};
+use tokio::sync::RwLock;
 
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
@@ -61,6 +62,7 @@ pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, 
         Acceleration::default(),
         Refresh::default(),
         retention,
+        Arc::new(RwLock::new(Secrets::default())),
     )
     .await
     .boxed()

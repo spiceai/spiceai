@@ -24,6 +24,9 @@ pub struct Runtime {
     #[serde(default)]
     pub results_cache: ResultsCache,
     pub num_of_parallel_loading_at_start_up: Option<usize>,
+
+    /// If set, the runtime will configure all endpoints to use TLS
+    pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,4 +52,21 @@ impl Default for ResultsCache {
             eviction_policy: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TlsConfig {
+    /// A filesystem path to a file containing the PEM encoded certificate
+    pub certificate_file: Option<String>,
+
+    /// A PEM encoded certificate
+    pub certificate: Option<String>,
+
+    /// A filesystem path to a file containing the PEM encoded private key
+    pub key_file: Option<String>,
+
+    /// A PEM encoded private key
+    pub key: Option<String>,
 }

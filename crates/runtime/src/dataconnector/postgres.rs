@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::secrets::{Secret, SecretMap};
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -27,11 +26,11 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,26 +42,42 @@ pub struct Postgres {
     postgres_factory: PostgresTableFactory,
 }
 
-impl DataConnectorFactory for Postgres {
-    fn create(
-        secret: Option<Secret>,
-        params: Arc<HashMap<String, String>>,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let mut params: SecretMap = params.as_ref().into();
-        if let Some(secret) = secret {
-            secret.insert_to_params(
-                &mut params,
-                "pg_connection_string_key",
-                "pg_connection_string",
-            );
-            secret.insert_to_params(&mut params, "pg_pass_key", "pg_pass");
-        }
+#[derive(Default, Copy, Clone)]
+pub struct PostgresFactory {}
 
+impl PostgresFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("connection_string").secret(),
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("host"),
+    ParameterSpec::connector("port"),
+    ParameterSpec::connector("db"),
+    ParameterSpec::connector("sslmode"),
+    ParameterSpec::connector("sslrootcert"),
+];
+
+impl DataConnectorFactory for PostgresFactory {
+    fn create(
+        &self,
+        params: Parameters,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match PostgresConnectionPool::new(Arc::new(params.into_map())).await {
+            match PostgresConnectionPool::new(params.to_secret_map()).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
-                    Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                    Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
                     postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
@@ -91,6 +106,14 @@ impl DataConnectorFactory for Postgres {
                 },
             }
         })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "pg"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

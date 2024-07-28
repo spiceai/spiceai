@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
+use app::App;
+use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -24,7 +26,9 @@ use crate::{
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
-    podswatcher, secrets, tracers, Runtime,
+    measure_scope_ms, podswatcher,
+    secrets::{self, Secrets},
+    tracers, Runtime,
 };
 
 pub struct RuntimeBuilder {
@@ -33,7 +37,8 @@ pub struct RuntimeBuilder {
     extensions: Vec<Box<dyn ExtensionFactory>>,
     pods_watcher: Option<podswatcher::PodsWatcher>,
     datasets_health_monitor_enabled: bool,
-    metrics: Option<SocketAddr>,
+    metrics_endpoint: Option<SocketAddr>,
+    metrics_handle: Option<PrometheusHandle>,
     datafusion: Option<Arc<DataFusion>>,
 }
 
@@ -44,7 +49,8 @@ impl RuntimeBuilder {
             extensions: vec![],
             pods_watcher: None,
             datasets_health_monitor_enabled: false,
-            metrics: None,
+            metrics_endpoint: None,
+            metrics_handle: None,
             datafusion: None,
             autoload_extensions: HashMap::new(),
         }
@@ -84,13 +90,23 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_metrics_server(mut self, metrics: SocketAddr) -> Self {
-        self.metrics = Some(metrics);
+    pub fn with_metrics_server(
+        mut self,
+        metrics_endpoint: SocketAddr,
+        metrics_handle: PrometheusHandle,
+    ) -> Self {
+        self.metrics_endpoint = Some(metrics_endpoint);
+        self.metrics_handle = Some(metrics_handle);
         self
     }
 
-    pub fn with_metrics_server_opt(mut self, metrics: Option<SocketAddr>) -> Self {
-        self.metrics = metrics;
+    pub fn with_metrics_server_opt(
+        mut self,
+        metrics_endpoint: Option<SocketAddr>,
+        metrics_handle: Option<PrometheusHandle>,
+    ) -> Self {
+        self.metrics_endpoint = metrics_endpoint;
+        self.metrics_handle = metrics_handle;
         self
     }
 
@@ -122,6 +138,8 @@ impl RuntimeBuilder {
             None
         };
 
+        let secrets = Self::load_secrets(self.app.as_ref()).await;
+
         let mut rt = Runtime {
             instance_name: format!("{name}-{hash}").to_string(),
             app: Arc::new(RwLock::new(self.app)),
@@ -130,12 +148,13 @@ impl RuntimeBuilder {
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
-            secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
+            secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
-            metrics: self.metrics,
+            metrics_endpoint: self.metrics_endpoint,
+            metrics_handle: self.metrics_handle,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -151,6 +170,19 @@ impl RuntimeBuilder {
         rt.extensions = Arc::new(RwLock::new(extensions));
 
         rt
+    }
+
+    async fn load_secrets(app: Option<&App>) -> Secrets {
+        measure_scope_ms!("load_secret_stores");
+        let mut secrets = secrets::Secrets::new();
+
+        if let Some(app) = app {
+            if let Err(e) = secrets.load_from(&app.secrets).await {
+                tracing::error!("Error loading secret stores: {e}");
+            };
+        }
+
+        secrets
     }
 }
 
