@@ -63,7 +63,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q1", include_str!("../queries/tpch_q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch_q2.sql")),
         ("tpch_q3", include_str!("../queries/tpch_q3.sql")),
-        // ("tpch_q4", include_str!("../queries/tpch_q4.sql")),
+        // ("tpch_q4", include_str!("../queries/tpch_q4.sql")), https://github.com/spiceai/spiceai/issues/2077
         ("tpch_q5", include_str!("../queries/tpch_q5.sql")),
         ("tpch_q6", include_str!("../queries/tpch_q6.sql")),
         ("tpch_q7", include_str!("../queries/tpch_q7.sql")),
@@ -79,7 +79,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q17", include_str!("../queries/tpch_q17.sql")),
         ("tpch_q18", include_str!("../queries/tpch_q18.sql")),
         ("tpch_q19", include_str!("../queries/tpch_q19.sql")),
-        // ("tpch_q20", include_str!("../queries/tpch_q20.sql")),
+        // ("tpch_q20", include_str!("../queries/tpch_q20.sql")), https://github.com/spiceai/spiceai/issues/2078
         ("tpch_q21", include_str!("../queries/tpch_q21.sql")),
         ("tpch_q22", include_str!("../queries/tpch_q22.sql")),
         (
