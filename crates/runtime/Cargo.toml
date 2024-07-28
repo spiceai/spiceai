@@ -79,7 +79,7 @@ prost = { version = "0.12.1", default-features = false, features = [
   "prost-derive",
 ] }
 regex.workspace = true
-reqwest = { version = "0.11.24", features = ["json"] }
+reqwest = { version = "0.11.24", features = ["json", "rustls-tls"] }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 secrecy.workspace = true
@@ -93,7 +93,7 @@ suppaftp = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio.workspace = true
-tonic-health = "0.9.0"
+tonic_health_0_9_0 = { version = "0.9.0", package = "tonic-health" }
 tonic.workspace = true
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip", "tls"] }
 tracing.workspace = true

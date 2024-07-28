@@ -57,7 +57,7 @@ func EnsureInstalled() (bool, error) {
 	return shouldInstall, nil
 }
 
-func Run() error {
+func Run(args []string) error {
 	fmt.Println("Spice.ai runtime starting...")
 
 	rtcontext := context.NewContext()
@@ -73,7 +73,7 @@ func Run() error {
 		return err
 	}
 
-	cmd, err := rtcontext.GetRunCmd()
+	cmd, err := rtcontext.GetRunCmd(args)
 	if err != nil {
 		return err
 	}

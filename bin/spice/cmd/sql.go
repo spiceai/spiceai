@@ -43,15 +43,18 @@ sql> show tables
 | datafusion    | information_schema | df_settings   | VIEW       |
 +---------------+--------------------+---------------+------------+
 `,
+	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		execCmd, err := rtcontext.GetRunCmd()
+
+		spiceArgs := []string{"--repl"}
+		args = append(spiceArgs, args...)
+
+		execCmd, err := rtcontext.GetRunCmd(args)
 		if err != nil {
 			cmd.Println(err)
 			os.Exit(1)
 		}
-
-		execCmd.Args = append(execCmd.Args, "--repl")
 
 		execCmd.Stderr = os.Stderr
 		execCmd.Stdout = os.Stdout

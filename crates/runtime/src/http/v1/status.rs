@@ -18,7 +18,7 @@ use flight_client::FlightClient;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 use tonic_0_9_0::transport::Channel;
-use tonic_health::{pb::health_client::HealthClient, ServingStatus};
+use tonic_health_0_9_0::{pb::health_client::HealthClient, ServingStatus};
 
 use axum::{
     extract::Query,
@@ -162,7 +162,7 @@ async fn get_opentelemetry_status(
     let mut client = HealthClient::new(channel);
 
     let resp = client
-        .check(tonic_health::pb::HealthCheckRequest {
+        .check(tonic_health_0_9_0::pb::HealthCheckRequest {
             service: String::new(),
         })
         .await?;

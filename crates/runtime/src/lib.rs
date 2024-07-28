@@ -102,6 +102,9 @@ pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
 
+    #[snafu(display("{source}"))]
+    UnableToJoinTask { source: tokio::task::JoinError },
+
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
     UnableToStartMetricsServer { source: metrics_server::Error },
 
@@ -341,7 +344,7 @@ impl Runtime {
         self.register_metrics_table(self.metrics_handle.clone())
             .await?;
 
-        let http_server_future = http::start(
+        let http_server_future = tokio::spawn(http::start(
             config.http_bind_address,
             Arc::clone(&self.app),
             Arc::clone(&self.df),
@@ -351,7 +354,7 @@ impl Runtime {
             config.clone().into(),
             self.metrics_endpoint,
             tls_config.clone(),
-        );
+        ));
 
         // Spawn the metrics server in the background
         let metrics_endpoint = self.metrics_endpoint;
@@ -365,16 +368,16 @@ impl Runtime {
             }
         });
 
-        let flight_server_future = flight::start(
+        let flight_server_future = tokio::spawn(flight::start(
             config.flight_bind_address,
             Arc::clone(&self.df),
             tls_config.clone(),
-        );
-        let open_telemetry_server_future = opentelemetry::start(
+        ));
+        let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
             config.open_telemetry_bind_address,
             Arc::clone(&self.df),
             tls_config.clone(),
-        );
+        ));
         let pods_watcher_future = self.start_pods_watcher();
 
         if let Some(tls_config) = tls_config {
@@ -391,9 +394,30 @@ impl Runtime {
         }
 
         tokio::select! {
-            http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
-            flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
-            open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
+            http_res = http_server_future => {
+                match http_res {
+                    Ok(http_res) => http_res.context(UnableToStartHttpServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToJoinTask { source })
+                    }
+                }
+             },
+            flight_res = flight_server_future => {
+                match flight_res {
+                    Ok(flight_res) => flight_res.context(UnableToStartFlightServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToJoinTask { source })
+                    }
+                }
+            },
+            open_telemetry_res = open_telemetry_server_future => {
+                match open_telemetry_res {
+                    Ok(open_telemetry_res) => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToJoinTask { source })
+                    }
+                }
+            },
             pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
             () = shutdown_signal() => {
                 tracing::info!("Goodbye!");
