@@ -38,7 +38,7 @@ use reqwest::Client;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::json;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
 #[derive(Parser)]
@@ -59,6 +59,14 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub http_endpoint: String,
+
+    /// The path to the CA certificate file used to verify the Spice.ai runtime server certificate
+    #[arg(
+        long,
+        value_name = "TLS_CA_CERTIFICATE_PATH",
+        help_heading = "SQL REPL"
+    )]
+    pub tls_ca_certificate_path: Option<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -85,16 +93,29 @@ async fn send_nsql_request(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
+    let channel = if let Some(tls_ca_certificate_path) = repl_config.tls_ca_certificate_path {
+        let tls_ca_certificate = std::fs::read(tls_ca_certificate_path)?;
+        let tls_ca_certificate = tonic::transport::Certificate::from_pem(tls_ca_certificate);
+        let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_ca_certificate);
+        if repl_flight_endpoint == "http://localhost:50051" {
+            repl_flight_endpoint = "https://localhost:50051".to_string();
+        }
+        Channel::from_shared(repl_flight_endpoint)?
+            .tls_config(client_tls_config)?
+            .connect()
+            .await
+    } else {
+        Channel::from_shared(repl_flight_endpoint)?.connect().await
+    };
+
     // Set up the Flight client
     let spice_endpoint = repl_config.http_endpoint.clone();
-    let channel = Channel::from_shared(repl_config.repl_flight_endpoint)?
-        .connect()
-        .await
-        .map_err(|_err| {
-            Box::<dyn Error>::from(format!(
-                "Unable to connect to spiced at {spice_endpoint}. Is it running?"
-            ))
-        })?;
+    let channel = channel.map_err(|_err| {
+        Box::<dyn Error>::from(format!(
+            "Unable to connect to spiced at {spice_endpoint}. Is it running?"
+        ))
+    })?;
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
