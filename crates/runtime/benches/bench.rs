@@ -42,6 +42,8 @@ mod setup;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
 #[cfg(feature = "odbc")]
+mod bench_odbc_athena;
+#[cfg(feature = "odbc")]
 mod bench_odbc_databricks;
 #[cfg(feature = "postgres")]
 mod bench_postgres;
@@ -68,7 +70,9 @@ async fn main() -> Result<(), String> {
         #[cfg(feature = "mysql")]
         "mysql",
         #[cfg(feature = "odbc")]
-        "odbc",
+        "odbc-databricks",
+        #[cfg(feature = "odbc")]
+        "odbc-athena",
     ];
 
     let mut display_records = vec![];
@@ -97,8 +101,12 @@ async fn main() -> Result<(), String> {
                 bench_mysql::run(&mut rt, &mut benchmark_results).await?;
             }
             #[cfg(feature = "odbc")]
-            "odbc" => {
+            "odbc-databricks" => {
                 bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "odbc")]
+            "odbc-athena" => {
+                bench_odbc_athena::run(&mut rt, &mut benchmark_results).await?;
             }
             _ => {}
         }

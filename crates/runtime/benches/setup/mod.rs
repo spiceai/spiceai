@@ -24,6 +24,8 @@ use tracing_subscriber::EnvFilter;
 #[cfg(feature = "mysql")]
 use crate::bench_mysql;
 #[cfg(feature = "odbc")]
+use crate::bench_odbc_athena;
+#[cfg(feature = "odbc")]
 use crate::bench_odbc_databricks;
 #[cfg(feature = "postgres")]
 use crate::bench_postgres;
@@ -92,7 +94,9 @@ fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
         #[cfg(feature = "mysql")]
         "mysql" => bench_mysql::build_app(app_builder),
         #[cfg(feature = "odbc")]
-        "odbc" => bench_odbc_databricks::build_app(app_builder),
+        "odbc-databricks" => bench_odbc_databricks::build_app(app_builder),
+        #[cfg(feature = "odbc")]
+        "odbc-athena" => bench_odbc_athena::build_app(app_builder),
         _ => app_builder,
     };
 
