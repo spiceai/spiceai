@@ -31,6 +31,9 @@ spice pods
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
+		if rootCertPath, err := cmd.Flags().GetString("tls-ca-certificate-path"); err == nil && rootCertPath != "" {
+			rtcontext = context.NewHttpsContext(rootCertPath)
+		}
 
 		spicepods, err := api.GetData[api.Spicepod](rtcontext, "/v1/spicepods")
 		if err != nil {
@@ -52,5 +55,6 @@ spice pods
 }
 
 func init() {
+	podsCmd.Flags().String("tls-ca-certificate-path", "", "The path to the CA certificate file used to verify the Spice.ai runtime server certificate")
 	RootCmd.AddCommand(podsCmd)
 }

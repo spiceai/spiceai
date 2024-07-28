@@ -31,7 +31,10 @@ spice datasets
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		_, dataset_statuses, err := api.GetComponentStatuses(PROM_ENDPOINT)
+		if rootCertPath, err := cmd.Flags().GetString("tls-ca-certificate-path"); err == nil && rootCertPath != "" {
+			rtcontext = context.NewHttpsContext(rootCertPath)
+		}
+		_, dataset_statuses, err := api.GetComponentStatuses(rtcontext)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 		}
@@ -53,5 +56,6 @@ spice datasets
 }
 
 func init() {
+	datasetsCmd.Flags().String("tls-ca-certificate-path", "", "The path to the CA certificate file used to verify the Spice.ai runtime server certificate")
 	RootCmd.AddCommand(datasetsCmd)
 }

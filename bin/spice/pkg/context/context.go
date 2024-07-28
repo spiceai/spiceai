@@ -17,8 +17,11 @@ limitations under the License.
 package context
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,17 +39,62 @@ type RuntimeContext struct {
 	appDir          string
 	podsDir         string
 	httpEndpoint    string
+	metricsEndpoint string
+
+	httpClient *http.Client
 }
 
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
-		httpEndpoint: "http://127.0.0.1:8090",
+		httpEndpoint:    "http://127.0.0.1:8090",
+		metricsEndpoint: "http://127.0.0.1:9090",
+		httpClient:      &http.Client{},
 	}
 	err := rtcontext.Init()
 	if err != nil {
 		panic(err)
 	}
 	return rtcontext
+}
+
+func NewHttpsContext(rootCertPath string) *RuntimeContext {
+	rootCert, err := os.ReadFile(rootCertPath)
+	if err != nil {
+		panic(err)
+	}
+
+	roots := x509.NewCertPool()
+	if ok := roots.AppendCertsFromPEM(rootCert); !ok {
+		panic("Failed to append root certificate")
+	}
+
+	tlsConfig := &tls.Config{
+		RootCAs: roots,
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+	}
+
+	rtcontext := &RuntimeContext{
+		httpEndpoint:    "https://127.0.0.1:8090",
+		metricsEndpoint: "https://127.0.0.1:9090",
+		httpClient:      client,
+	}
+
+	err = rtcontext.Init()
+	if err != nil {
+		panic(err)
+	}
+	return rtcontext
+}
+
+func (c *RuntimeContext) Client() *http.Client {
+	return c.httpClient
 }
 
 func (c *RuntimeContext) SpiceRuntimeDir() string {
@@ -63,6 +111,10 @@ func (c *RuntimeContext) PodsDir() string {
 
 func (c *RuntimeContext) HttpEndpoint() string {
 	return c.httpEndpoint
+}
+
+func (c *RuntimeContext) MetricsEndpoint() string {
+	return c.metricsEndpoint
 }
 
 func (c *RuntimeContext) Init() error {
@@ -96,7 +148,7 @@ func (c *RuntimeContext) Version() (string, error) {
 }
 
 func (c *RuntimeContext) RuntimeUnavailableError() error {
-	return fmt.Errorf("The Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
+	return fmt.Errorf("the Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
 }
 
 func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
