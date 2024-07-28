@@ -39,6 +39,9 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+mod bench_s3;
+mod bench_spicecloud;
+
 #[cfg(feature = "delta_lake")]
 mod bench_delta;
 #[cfg(feature = "mysql")]
@@ -47,12 +50,8 @@ mod bench_mysql;
 mod bench_odbc_databricks;
 #[cfg(feature = "postgres")]
 mod bench_postgres;
-#[cfg(feature = "s3-bench")]
-mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
-#[cfg(feature = "spiceai-bench")]
-mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -63,9 +62,7 @@ async fn main() -> Result<(), String> {
     }
 
     let connectors = vec![
-        #[cfg(feature = "spiceai-bench")]
         "spice.ai",
-        #[cfg(feature = "s3-bench")]
         "s3",
         #[cfg(feature = "spark")]
         "spark",
@@ -86,11 +83,9 @@ async fn main() -> Result<(), String> {
             setup::setup_benchmark(&upload_results_dataset, connector).await;
 
         match connector {
-            #[cfg(feature = "spiceai-bench")]
             "spice.ai" => {
                 bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
             }
-            #[cfg(feature = "s3-bench")]
             "s3" => {
                 bench_s3::run(&mut rt, &mut benchmark_results).await?;
             }

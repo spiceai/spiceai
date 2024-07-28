@@ -155,8 +155,6 @@ sqlite = [
   "db_connection_pool/sqlite",
   "data_components/sqlite",
 ]
-spiceai-bench = []
-s3-bench = []
 
 [[bench]]
 harness = false
