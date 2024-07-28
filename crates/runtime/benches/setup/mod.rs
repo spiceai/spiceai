@@ -79,7 +79,6 @@ fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
             .with_dataset(make_spark_dataset("samples.tpch.nation", "nation"))
             .with_dataset(make_spark_dataset("samples.tpch.region", "region"))
             .with_dataset(make_spark_dataset("samples.tpch.supplier", "supplier")),
-        #[cfg(feature = "s3-bench")]
         "s3" => crate::bench_s3::build_app(app_builder),
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder),
