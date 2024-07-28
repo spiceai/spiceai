@@ -7,7 +7,7 @@ on:
       features:
         description: 'included features for bench'
         required: true
-        default: "spiceai-bench,s3-bench,postgres,spark,mysql,odbc"
+        default: "postgres,spark,mysql,odbc"
 
 jobs:
   run-database-bench:
