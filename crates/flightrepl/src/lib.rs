@@ -60,13 +60,13 @@ pub struct ReplConfig {
     )]
     pub http_endpoint: String,
 
-    /// The path to the CA certificate file used to verify the Spice.ai runtime server certificate
+    /// The path to the root certificate file used to verify the Spice.ai runtime server certificate
     #[arg(
         long,
-        value_name = "TLS_CA_CERTIFICATE_PATH",
+        value_name = "TLS_ROOT_CERTIFICATE_FILE",
         help_heading = "SQL REPL"
     )]
-    pub tls_ca_certificate_path: Option<String>,
+    pub tls_root_certificate_file: Option<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -94,10 +94,10 @@ async fn send_nsql_request(
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
-    let channel = if let Some(tls_ca_certificate_path) = repl_config.tls_ca_certificate_path {
-        let tls_ca_certificate = std::fs::read(tls_ca_certificate_path)?;
-        let tls_ca_certificate = tonic::transport::Certificate::from_pem(tls_ca_certificate);
-        let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_ca_certificate);
+    let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
+        let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
+        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
+        let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
         if repl_flight_endpoint == "http://localhost:50051" {
             repl_flight_endpoint = "https://localhost:50051".to_string();
         }
