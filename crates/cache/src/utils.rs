@@ -19,7 +19,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::array::RecordBatch;
 use datafusion::{
     execution::SendableRecordBatchStream, logical_expr::LogicalPlan,
-    physical_plan::stream::RecordBatchStreamAdapter,
+    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 
 use crate::{CachedQueryResult, QueryResultsCacheProvider};
@@ -33,8 +33,8 @@ use futures::StreamExt;
 pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
-    plan: LogicalPlan,
-    input_tables: Arc<HashSet<String>>,
+    plan_key: u64,
+    input_tables: Arc<HashSet<TableReference>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let schema_copy = Arc::clone(&schema);
@@ -62,7 +62,7 @@ pub fn to_cached_record_batch_stream(
                 input_tables,
             };
 
-            if let Err(e) = cache_provider.put(&plan, cached_result).await {
+            if let Err(e) = cache_provider.put_key(plan_key, cached_result).await {
                 tracing::error!("Failed to cache query results: {e}");
             }
         }
@@ -75,13 +75,14 @@ pub fn to_cached_record_batch_stream(
 }
 
 #[must_use]
-pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<String> {
-    let mut table_names: HashSet<String> = HashSet::new();
+pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<TableReference> {
+    let mut table_names: HashSet<TableReference> = HashSet::new();
     let mut plan_stack = vec![plan];
 
     while let Some(current_plan) = plan_stack.pop() {
         if let LogicalPlan::TableScan(source, ..) = current_plan {
-            table_names.insert(source.table_name.to_string().to_lowercase());
+            // Clones of TableReferences are cheap - all fields are Arcs
+            table_names.insert(source.table_name.clone());
         }
 
         plan_stack.extend(current_plan.inputs());
@@ -90,35 +91,8 @@ pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<String> {
     table_names
 }
 
-#[must_use]
-pub fn cache_is_enabled_for_plan(plan: &LogicalPlan) -> bool {
-    let mut plan_stack = vec![plan];
-
-    while let Some(current_plan) = plan_stack.pop() {
-        match current_plan {
-            LogicalPlan::TableScan(source, ..) => {
-                let table_name = source.table_name.to_string();
-                if table_name.starts_with("information_schema.")
-                    || table_name.starts_with("runtime.")
-                {
-                    return false;
-                }
-            }
-            LogicalPlan::Explain { .. }
-            | LogicalPlan::Analyze { .. }
-            | LogicalPlan::DescribeTable { .. }
-            | LogicalPlan::Statement(..) => return false,
-            _ => {}
-        }
-
-        plan_stack.extend(current_plan.inputs());
-    }
-
-    true
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -126,7 +100,7 @@ mod tests {
     use datafusion::execution::context::SessionContext;
     use std::collections::HashSet;
 
-    async fn parse_sql_to_logical_plan(sql: &str) -> LogicalPlan {
+    pub(crate) async fn parse_sql_to_logical_plan(sql: &str) -> LogicalPlan {
         let ctx = create_session_context();
 
         let plan = &ctx
@@ -145,7 +119,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec![].into_iter().collect();
+        let expected: HashSet<TableReference> = HashSet::new();
         assert_eq!(table_names, expected);
     }
 
@@ -156,9 +130,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["information_schema.tables".to_string()]
-            .into_iter()
-            .collect();
+        let expected: HashSet<TableReference> = HashSet::from(["information_schema.tables".into()]);
         assert_eq!(table_names, expected);
     }
 
@@ -169,7 +141,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["customer".to_string()].into_iter().collect();
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into()]);
         assert_eq!(table_names, expected);
     }
 
@@ -181,9 +153,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["customer".to_string(), "orders".to_string()]
-            .into_iter()
-            .collect();
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
         assert_eq!(table_names, expected);
     }
 
@@ -194,7 +164,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["state".to_string()].into_iter().collect();
+        let expected: HashSet<TableReference> = HashSet::from(["state".into()]);
         assert_eq!(table_names, expected);
     }
 
@@ -212,9 +182,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["customer".to_string(), "orders".to_string()]
-            .into_iter()
-            .collect();
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
         assert_eq!(table_names, expected);
     }
 
@@ -233,9 +201,7 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["customer".to_string(), "orders".to_string()]
-            .into_iter()
-            .collect();
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
         assert_eq!(table_names, expected);
     }
 
@@ -253,34 +219,8 @@ mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<String> = vec!["orders".to_string(), "customer".to_string()]
-            .into_iter()
-            .collect();
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
         assert_eq!(table_names, expected);
-    }
-
-    #[tokio::test]
-    async fn test_cache_is_enabled_for_system_query_describe() {
-        let sql = "describe customer";
-        let logical_plan = parse_sql_to_logical_plan(sql).await;
-
-        assert!(!cache_is_enabled_for_plan(&logical_plan));
-    }
-
-    #[tokio::test]
-    async fn test_cache_is_enabled_for_show_tables() {
-        let sql = "show tables";
-        let logical_plan = parse_sql_to_logical_plan(sql).await;
-
-        assert!(!cache_is_enabled_for_plan(&logical_plan));
-    }
-
-    #[tokio::test]
-    async fn test_cache_is_enabled_for_simple_select() {
-        let sql = "SELECT * FROM customer";
-        let logical_plan = parse_sql_to_logical_plan(sql).await;
-
-        assert!(cache_is_enabled_for_plan(&logical_plan));
     }
 
     fn create_session_context() -> SessionContext {
