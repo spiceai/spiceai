@@ -288,13 +288,7 @@ After creating an account, you will need to create an app in order to create to 
 
 You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the `spice.ai/eth.recent_blocks` dataset.
 
-**Step 1.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
-
-```bash
-spice login
-```
-
-**Step 2.** Initialize a new project and start the runtime:
+**Step 1.** Initialize a new project.
 
 ```bash
 # Initialize a new Spice app
@@ -302,7 +296,17 @@ spice init spice_app
 
 # Change to app directory
 cd spice_app
+```
 
+**Step 2.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
+
+```bash
+spice login
+```
+
+**Step 3.** Start the runtime:
+
+```bash
 # Start the runtime
 spice run
 ```
