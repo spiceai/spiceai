@@ -53,6 +53,7 @@ datafusion = "40.0.0"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "16d871e159be2360aab67a6f07faeb5e9b9bdaf7" }
+dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.0"
 futures = "0.3.30"
@@ -97,3 +98,4 @@ x509-certificate = "0.23.1"
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ffe792dfdff7a96327bcc536b55d8e9167d29e14" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
+dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
