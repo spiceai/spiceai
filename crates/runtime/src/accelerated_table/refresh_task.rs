@@ -122,7 +122,7 @@ impl RefreshTask {
 
                         if let Some(cache_provider) = &cache_provider {
                             if let Err(e) = cache_provider
-                                .invalidate_for_table(&dataset_name.to_string())
+                                .invalidate_for_table(dataset_name.clone())
                                 .await
                             {
                                 tracing::error!(
