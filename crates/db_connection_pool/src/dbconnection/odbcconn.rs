@@ -36,6 +36,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use dyn_clone::DynClone;
 use futures::lock::Mutex;
+use odbc_api::handles::SqlResult;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
@@ -76,6 +77,8 @@ pub enum Error {
     ArrowODBCError { source: arrow_odbc::Error },
     #[snafu(display("odbc_api Error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
+    #[snafu(display("odbc_api Error: {message}"))]
+    ODBCAPIErrorNoSource { message: String },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     TryFromError { source: std::num::TryFromIntError },
     #[snafu(display("Unable to bind integer parameter: {source}"))]
@@ -184,9 +187,15 @@ where
 
             // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
             let cursor = unsafe {
-                statement.execute().unwrap();
-                CursorImpl::new(statement.as_stmt_ref())
-            };
+                if let SqlResult::Error { function } = statement.execute() {
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: function.to_string(),
+                    }
+                    .into());
+                }
+
+                Ok::<_, GenericError>(CursorImpl::new(statement.as_stmt_ref()))
+            }?;
 
             let reader = build_odbc_reader(cursor, &schema, &secrets)?;
             for batch in reader {
