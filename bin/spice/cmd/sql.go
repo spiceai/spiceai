@@ -48,6 +48,11 @@ sql> show tables
 		rtcontext := context.NewContext()
 
 		spiceArgs := []string{"--repl"}
+
+		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
+			args = append(args, "--tls-root-certificate-file", rootCertPath)
+		}
+
 		args = append(spiceArgs, args...)
 
 		execCmd, err := rtcontext.GetRunCmd(args)
@@ -69,6 +74,7 @@ sql> show tables
 }
 
 func init() {
+	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	sqlCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(sqlCmd)
 }
