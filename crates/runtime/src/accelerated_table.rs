@@ -217,17 +217,6 @@ impl Builder {
         self
     }
 
-    /// Set the append stream for the accelerated table
-    ///
-    /// # Panics
-    ///
-    /// Panics if the refresh mode isn't `RefreshMode::Append`.
-    pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
-        assert!(self.refresh.mode == RefreshMode::Append);
-        self.changes_stream = Some(append_stream);
-        self
-    }
-
     /// Build the accelerated table
     ///
     /// # Panics

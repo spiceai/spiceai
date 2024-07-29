@@ -308,14 +308,17 @@ pub fn subscribe_to_append_stream(
                 while let Some(decoded_data) = stream.next().await {
                     match decoded_data {
                         Ok(decoded_data) => match decoded_data.payload {
-                          DecodedPayload::None | DecodedPayload::Schema(_)=> continue,
-                          DecodedPayload::RecordBatch(batch) => {
-                            match ChangeBatch::try_new(batch)
-                            .map(|rb| ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)) {
-                                Ok(change_batch) => yield Ok(change_batch),
-                                Err(e) => yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
-                            };
-                        },
+                            DecodedPayload::None | DecodedPayload::Schema(_) => continue,
+                            DecodedPayload::RecordBatch(batch) => {
+                                match ChangeBatch::try_new(batch).map(|rb| {
+                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
+                                }) {
+                                    Ok(change_batch) => yield Ok(change_batch),
+                                    Err(e) => {
+                                        yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
+                                    }
+                                };
+                            }
                         },
                         Err(e) => {
                             yield Err(cdc::StreamError::Flight(e.to_string()));
