@@ -1401,7 +1401,10 @@ impl Runtime {
             return;
         }
 
-        match QueryResultsCacheProvider::new(cache_config) {
+        match QueryResultsCacheProvider::try_new(
+            cache_config,
+            Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
+        ) {
             Ok(cache_provider) => {
                 tracing::info!("Initialized results cache; {cache_provider}");
                 self.datafusion().set_cache_provider(cache_provider);
