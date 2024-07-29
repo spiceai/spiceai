@@ -97,14 +97,12 @@ pub(crate) async fn post(
             table_create_schemas=table_create_stms.join("\n")
         );
 
-    let nsql_query_copy = nsql_query.clone();
-
     tracing::trace!("Running prompt: {nsql_query}");
 
     let model_id = payload.model.clone();
     let response = match llms.read().await.get(&model_id) {
         Some(nql_model) => {
-            let Ok(req) = create_chat_request(model_id, nsql_query) else {
+            let Ok(req) = create_chat_request(model_id, &nsql_query) else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error preparing data for NQL model".to_string(),
@@ -134,7 +132,7 @@ pub(crate) async fn post(
             let cleaned_query = clean_model_based_sql(&model_sql_query);
             tracing::trace!("Running query:\n{cleaned_query}");
 
-            sql_to_http_response(Arc::clone(&df), &cleaned_query, Some(nsql_query_copy)).await
+            sql_to_http_response(Arc::clone(&df), &cleaned_query, Some(&nsql_query)).await
         }
         Ok(None) => {
             tracing::trace!("No query produced from NSQL model");
@@ -163,7 +161,7 @@ pub fn convert_json_object_to_sql(raw_json: &str) -> ChatResult<Option<String>> 
 
 pub fn create_chat_request(
     model_id: String,
-    prompt: String,
+    prompt: &str,
 ) -> Result<CreateChatCompletionRequest, OpenAIError> {
     let messages: Vec<ChatCompletionRequestMessage> = vec![
         ChatCompletionRequestSystemMessageArgs::default()

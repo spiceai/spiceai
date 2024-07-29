@@ -76,7 +76,7 @@ async fn execute_query_and_check_cache_status(
     query: &str,
     expected_cache_status: Option<bool>,
 ) -> Result<Vec<RecordBatch>, String> {
-    let query = QueryBuilder::new(query.to_string(), rt.datafusion(), Protocol::Http).build();
+    let query = QueryBuilder::new(query, rt.datafusion(), Protocol::Http).build();
 
     let query_result = query
         .run()

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, collections::HashSet, string, sync::Arc, time::SystemTime};
+use std::{cell::LazyCell, sync::Arc};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow_tools::schema::verify_schema;
 use cache::{
     cache_is_enabled_for_plan, get_logical_plan_input_tables, to_cached_record_batch_stream,
@@ -29,14 +29,13 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::Snafu;
-use tokio::time::Instant;
-use uuid::Uuid;
+use tracker::QueryTracker;
 
 pub mod builder;
 pub mod query_history;
 pub use builder::QueryBuilder;
-
 pub mod error_code;
+mod tracker;
 
 use async_stream::stream;
 use futures::StreamExt;
@@ -61,7 +60,7 @@ pub enum Error {
     SchemaMismatch { source: arrow_tools::schema::Error },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum Protocol {
     Http,
     Flight,
@@ -88,21 +87,9 @@ thread_local! {
 
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
-    sql: String,
-    query_id: Uuid,
-    schema: Option<Arc<Schema>>,
-    nsql: Option<String>,
-    start_time: SystemTime,
-    end_time: Option<SystemTime>,
-    execution_time: Option<f32>,
-    rows_produced: u64,
-    results_cache_hit: Option<bool>,
+    sql: Arc<str>,
     restricted_sql_options: bool,
-    error_message: Option<String>,
-    error_code: Option<ErrorCode>,
-    timer: Instant,
-    datasets: Arc<HashSet<String>>,
-    protocol: Protocol,
+    tracker: QueryTracker,
 }
 
 macro_rules! handle_error {
@@ -119,13 +106,14 @@ impl Query {
     pub async fn run(self) -> Result<QueryResult> {
         let session = self.df.ctx.state();
 
-        let mut ctx = self;
+        let ctx = self;
+        let mut tracker = ctx.tracker;
 
         let plan = match session.create_logical_plan(&ctx.sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 let error_code = ErrorCode::from(&e);
-                handle_error!(ctx, error_code, e, UnableToExecuteQuery)
+                handle_error!(tracker, error_code, e, UnableToExecuteQuery)
             }
         };
 
@@ -133,9 +121,9 @@ impl Query {
             if let Some(cached_result) = match cache_provider.get(&plan).await {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => None,
-                Err(e) => handle_error!(ctx, ErrorCode::InternalError, e, FailedToAccessCache),
+                Err(e) => handle_error!(tracker, ErrorCode::InternalError, e, FailedToAccessCache),
             } {
-                ctx = ctx
+                tracker = tracker
                     .datasets(cached_result.input_tables)
                     .results_cache_hit(true);
 
@@ -146,28 +134,38 @@ impl Query {
                 ) {
                     Ok(stream) => stream,
                     Err(e) => {
-                        handle_error!(ctx, ErrorCode::InternalError, e, UnableToCreateMemoryStream)
+                        handle_error!(
+                            tracker,
+                            ErrorCode::InternalError,
+                            e,
+                            UnableToCreateMemoryStream
+                        )
                     }
                 };
 
                 return Ok(QueryResult::new(
-                    attach_query_context_to_stream(ctx, Box::pin(record_batch_stream)),
+                    attach_query_tracker_to_stream(tracker, Box::pin(record_batch_stream)),
                     Some(true),
                 ));
             }
 
-            ctx = ctx.results_cache_hit(false);
+            tracker = tracker.results_cache_hit(false);
         }
 
         if ctx.restricted_sql_options {
             if let Err(e) =
                 RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
             {
-                handle_error!(ctx, ErrorCode::QueryPlanningError, e, UnableToExecuteQuery)
+                handle_error!(
+                    tracker,
+                    ErrorCode::QueryPlanningError,
+                    e,
+                    UnableToExecuteQuery
+                )
             }
         }
 
-        ctx = ctx.datasets(Arc::new(get_logical_plan_input_tables(&plan)));
+        tracker = tracker.datasets(Arc::new(get_logical_plan_input_tables(&plan)));
 
         let plan_copy = plan.clone();
 
@@ -175,24 +173,24 @@ impl Query {
             Ok(df) => df,
             Err(e) => {
                 let error_code = ErrorCode::from(&e);
-                handle_error!(ctx, error_code, e, UnableToExecuteQuery)
+                handle_error!(tracker, error_code, e, UnableToExecuteQuery)
             }
         };
 
-        let df_schema: Arc<Schema> = df.schema().clone().into();
+        let df_schema: SchemaRef = Arc::clone(df.schema().inner());
 
         let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
             Ok(stream) => stream,
             Err(e) => {
                 let error_code = ErrorCode::from(&e);
-                handle_error!(ctx, error_code, e, UnableToExecuteQuery)
+                handle_error!(tracker, error_code, e, UnableToExecuteQuery)
             }
         };
 
         let res_schema = res_stream.schema();
 
         if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-            handle_error!(ctx, ErrorCode::InternalError, e, SchemaMismatch)
+            handle_error!(tracker, ErrorCode::InternalError, e, SchemaMismatch)
         };
 
         if cache_is_enabled_for_plan(&plan_copy) {
@@ -201,123 +199,44 @@ impl Query {
                     Arc::clone(cache_provider),
                     res_stream,
                     plan_copy,
-                    Arc::clone(&ctx.datasets),
+                    Arc::clone(&tracker.datasets),
                 );
 
                 return Ok(QueryResult::new(
-                    attach_query_context_to_stream(ctx, record_batch_stream),
+                    attach_query_tracker_to_stream(tracker, record_batch_stream),
                     Some(false),
                 ));
             }
         }
 
         Ok(QueryResult::new(
-            attach_query_context_to_stream(ctx, res_stream),
+            attach_query_tracker_to_stream(tracker, res_stream),
             None,
         ))
+    }
+
+    pub async fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
+        self.tracker
+            .finish_with_error(error_message, error_code)
+            .await;
     }
 
     pub async fn get_schema(&self) -> Result<Schema, DataFusionError> {
         let df = self.df.ctx.sql(&self.sql).await?;
         Ok(df.schema().into())
     }
-
-    pub async fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
-        tracing::debug!(
-            "Query '{}' finished with error: {error_message}; code: {error_code}",
-            self.sql
-        );
-        self.error_message = Some(error_message);
-        self.error_code = Some(error_code);
-        self.finish().await;
-    }
-
-    pub async fn finish(mut self) {
-        if self.end_time.is_none() {
-            self.end_time = Some(SystemTime::now());
-        }
-
-        let duration = self.timer.elapsed();
-
-        if self.execution_time.is_none() {
-            self.execution_time = Some(duration.as_secs_f32());
-        }
-
-        let mut tags = vec![];
-        match self.results_cache_hit {
-            Some(true) => {
-                tags.push("cache-hit");
-            }
-            Some(false) => {
-                tags.push("cache-miss");
-            }
-            None => {}
-        }
-
-        if self.error_message.is_some() {
-            tags.push("error");
-        }
-
-        let mut labels = vec![
-            ("tags", tags.join(",")),
-            (
-                "datasets",
-                self.datasets
-                    .iter()
-                    .map(string::ToString::to_string)
-                    .collect::<Vec<String>>()
-                    .join(","),
-            ),
-            ("protocol", self.protocol.to_string()),
-        ];
-
-        metrics::histogram!("query_duration_seconds", &labels).record(duration.as_secs_f32());
-
-        if let Some(err) = &self.error_code {
-            labels.push(("err_code", err.to_string()));
-            metrics::counter!("query_failures", &labels).increment(1);
-        }
-
-        if let Err(err) = self.write_query_history().await {
-            tracing::error!("Error writing query history: {err}");
-        };
-    }
-
-    #[must_use]
-    fn schema(mut self, schema: Arc<Schema>) -> Self {
-        self.schema = Some(schema);
-        self
-    }
-
-    #[must_use]
-    fn rows_produced(mut self, rows_produced: u64) -> Self {
-        self.rows_produced = rows_produced;
-        self
-    }
-
-    #[must_use]
-    fn results_cache_hit(mut self, cache_hit: bool) -> Self {
-        self.results_cache_hit = Some(cache_hit);
-        self
-    }
-
-    #[must_use]
-    fn datasets(mut self, datasets: Arc<HashSet<String>>) -> Self {
-        self.datasets = datasets;
-        self
-    }
 }
 
 #[must_use]
-/// Attaches a query context to a stream of record batches.
+/// Attaches a query tracker to a stream of record batches.
 ///
-/// Processes a stream of record batches, updating the query context
+/// Processes a stream of record batches, updating the query tracker
 /// with the number of records returned and saving query details at the end.
 ///
-/// Note: If an error occurs during stream processing, the query context
+/// Note: If an error occurs during stream processing, the query tracker
 /// is finalized with error details, and further streaming is terminated.
-fn attach_query_context_to_stream(
-    ctx: Query,
+fn attach_query_tracker_to_stream(
+    ctx: QueryTracker,
     mut stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();

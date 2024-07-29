@@ -71,12 +71,8 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 }
 
 // Runs query and converts query results to HTTP response (as JSON).
-pub async fn sql_to_http_response(
-    df: Arc<DataFusion>,
-    sql: &str,
-    nsql: Option<String>,
-) -> Response {
-    let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df), Protocol::Http)
+pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, nsql: Option<&str>) -> Response {
+    let query = QueryBuilder::new(sql, Arc::clone(&df), Protocol::Http)
         .use_restricted_sql_options()
         .nsql(nsql)
         .protocol(Protocol::Http)

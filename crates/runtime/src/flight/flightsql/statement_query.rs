@@ -39,10 +39,9 @@ pub(crate) async fn get_flight_info(
 
     let sql = query.query.as_str();
 
-    let arrow_schema =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql.to_string())
-            .await
-            .map_err(to_tonic_err)?;
+    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+        .await
+        .map_err(to_tonic_err)?;
 
     let fd = request.into_inner();
 
@@ -67,7 +66,7 @@ pub(crate) async fn do_get(
     tracing::trace!("do_get_statement: {cmd:?}");
     let start = TimeMeasurement::new("flight_do_get_statement_query_duration_ms", vec![]);
     let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, cmd.query)).await?;
+        Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query)).await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =

@@ -155,7 +155,7 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: &str) -> Result<Schema, Status> {
         let query = QueryBuilder::new(sql, datafusion, Protocol::Flight).build();
 
         let schema = match query.get_schema().await {
@@ -181,7 +181,7 @@ impl Service {
 
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
-        sql: String,
+        sql: &str,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion), Protocol::Flight)
             .use_restricted_sql_options()
