@@ -39,7 +39,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use csv::Writer;
-use datafusion::execution::context::SQLOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
@@ -72,14 +71,9 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 }
 
 // Runs query and converts query results to HTTP response (as JSON).
-pub async fn sql_to_http_response(
-    df: Arc<DataFusion>,
-    sql: &str,
-    restricted_sql_options: Option<SQLOptions>,
-    nsql: Option<String>,
-) -> Response {
-    let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df), Protocol::Http)
-        .restricted_sql_options(restricted_sql_options)
+pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, nsql: Option<&str>) -> Response {
+    let query = QueryBuilder::new(sql, Arc::clone(&df), Protocol::Http)
+        .use_restricted_sql_options()
         .nsql(nsql)
         .protocol(Protocol::Http)
         .build();

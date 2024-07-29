@@ -54,7 +54,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
     let mut result = rt
         .datafusion()
         .query_builder(
-            "SELECT * FROM spiceai.eth.recent_blocks LIMIT 10".to_string(),
+            "SELECT * FROM spiceai.eth.recent_blocks LIMIT 10",
             Protocol::Flight,
         )
         .build()
@@ -110,8 +110,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
              FROM information_schema.tables 
              WHERE table_schema != 'information_schema' 
                AND table_catalog = 'spiceai' 
-             ORDER BY table_name"
-                .to_string(),
+             ORDER BY table_name",
             Protocol::Flight,
         )
         .build()

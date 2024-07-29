@@ -40,7 +40,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
-use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
@@ -49,7 +48,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
@@ -225,10 +224,9 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-lazy_static! {
-    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>> =
-        Mutex::new(HashMap::new());
-}
+static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
+    Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn register_connector_factory(
     name: &str,

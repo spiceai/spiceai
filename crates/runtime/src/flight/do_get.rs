@@ -25,7 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::flight_utils::attach_cache_metadata,
+    flight::util::attach_cache_metadata,
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -79,7 +79,7 @@ async fn do_get_simple(
         Ok(sql) => {
             let start = TimeMeasurement::new("flight_do_get_simple_duration_ms", vec![]);
             let (output, from_cache) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql.to_owned())).await?;
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
 
             let timed_output = TimedStream::new(output, move || start);
 
