@@ -26,7 +26,6 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use datafusion::execution::context::SQLOptions;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
 use llms::{
     chat::{Error as ChatError, Result as ChatResult},
@@ -129,24 +128,13 @@ pub(crate) async fn post(
         }
     };
 
-    let restricted_sql_options = SQLOptions::new()
-        .with_allow_ddl(false)
-        .with_allow_dml(false)
-        .with_allow_statements(false);
-
     // Run the SQL from the NSQL model through datafusion.
     match process_response(response) {
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
             tracing::trace!("Running query:\n{cleaned_query}");
 
-            sql_to_http_response(
-                Arc::clone(&df),
-                &cleaned_query,
-                Some(restricted_sql_options),
-                Some(nsql_query_copy),
-            )
-            .await
+            sql_to_http_response(Arc::clone(&df), &cleaned_query, Some(nsql_query_copy)).await
         }
         Ok(None) => {
             tracing::trace!("No query produced from NSQL model");
