@@ -3,6 +3,11 @@ name: benchmark tests
 
 on:
   workflow_dispatch:
+    inputs:
+      features:
+        description: 'included features for bench'
+        required: true
+        default: "postgres,spark,mysql,odbc"
 
 jobs:
   run-database-bench:
@@ -10,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: ghcr.io/spiceai/spice-mysql-bench:latest
+        image: ${{ contains(inputs.features, 'mysql') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
           --health-cmd="mysqladmin ping -uroot -proot --silent"
           --health-interval 10s
@@ -21,7 +26,7 @@ jobs:
         env:
           MYSQL_ROOT_PASSWORD: root
       postgres:
-        image: ghcr.io/spiceai/spice-postgres-bench:latest
+        image: ${{ contains(inputs.features, 'postgres') && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --health-cmd="pg_isready -U postgres"
           --health-interval 10s
@@ -44,9 +49,11 @@ jobs:
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
       - name: Install Protoc
+        if: contains(inputs.features, 'spark')
         uses: arduino/setup-protoc@v3
       
       - name: Install Databricks ODBC driver
+        if: contains(inputs.features, 'odbc')
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
@@ -59,7 +66,7 @@ jobs:
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
-      - run: cargo bench -p runtime --features postgres,spark,mysql,odbc
+      - run: cargo bench -p runtime --features ${{ inputs.features }}
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
