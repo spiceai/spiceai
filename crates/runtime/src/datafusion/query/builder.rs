@@ -16,37 +16,36 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
-use datafusion::execution::context::SQLOptions;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::datafusion::DataFusion;
 
-use super::{Protocol, Query};
+use super::{tracker::QueryTracker, Protocol, Query};
 
-pub struct QueryBuilder {
+pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
-    sql: String,
+    sql: &'a str,
     query_id: Uuid,
-    nsql: Option<String>,
-    restricted_sql_options: Option<SQLOptions>,
+    nsql: Option<&'a str>,
+    restricted_sql_options: bool,
     protocol: Protocol,
 }
 
-impl QueryBuilder {
-    pub fn new(sql: String, df: Arc<DataFusion>, protocol: Protocol) -> Self {
+impl<'a> QueryBuilder<'a> {
+    pub fn new(sql: &'a str, df: Arc<DataFusion>, protocol: Protocol) -> Self {
         Self {
             df,
             sql,
             query_id: Uuid::new_v4(),
             nsql: None,
-            restricted_sql_options: None,
+            restricted_sql_options: false,
             protocol,
         }
     }
 
     #[must_use]
-    pub fn nsql(mut self, nsql: Option<String>) -> Self {
+    pub fn nsql(mut self, nsql: Option<&'a str>) -> Self {
         self.nsql = nsql;
         self
     }
@@ -58,8 +57,8 @@ impl QueryBuilder {
     }
 
     #[must_use]
-    pub fn restricted_sql_options(mut self, restricted_sql_options: Option<SQLOptions>) -> Self {
-        self.restricted_sql_options = restricted_sql_options;
+    pub fn use_restricted_sql_options(mut self) -> Self {
+        self.restricted_sql_options = true;
         self
     }
 
@@ -71,23 +70,28 @@ impl QueryBuilder {
 
     #[must_use]
     pub fn build(self) -> Query {
+        let sql: Arc<str> = self.sql.into();
         Query {
-            df: self.df,
-            sql: self.sql,
-            query_id: self.query_id,
-            schema: None,
-            nsql: self.nsql,
-            start_time: SystemTime::now(),
-            end_time: None,
-            execution_time: None,
-            rows_produced: 0,
-            results_cache_hit: None,
+            df: Arc::clone(&self.df),
+            sql: Arc::clone(&sql),
             restricted_sql_options: self.restricted_sql_options,
-            error_message: None,
-            error_code: None,
-            datasets: Arc::new(HashSet::default()),
-            timer: Instant::now(),
-            protocol: self.protocol,
+            tracker: QueryTracker {
+                df: self.df,
+                schema: None,
+                sql,
+                nsql: self.nsql.map(Into::into),
+                query_id: self.query_id,
+                start_time: SystemTime::now(),
+                end_time: None,
+                execution_time: None,
+                rows_produced: 0,
+                results_cache_hit: None,
+                error_message: None,
+                error_code: None,
+                timer: Instant::now(),
+                datasets: Arc::new(HashSet::default()),
+                protocol: self.protocol,
+            },
         }
     }
 }

@@ -28,7 +28,6 @@ use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaRes
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SQLOptions;
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -46,10 +45,10 @@ mod actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
-mod flight_utils;
 mod flightsql;
 mod get_flight_info;
 mod handshake;
+mod util;
 
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
@@ -156,7 +155,7 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: &str) -> Result<Schema, Status> {
         let query = QueryBuilder::new(sql, datafusion, Protocol::Flight).build();
 
         let schema = match query.get_schema().await {
@@ -182,15 +181,10 @@ impl Service {
 
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
-        sql: String,
+        sql: &str,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
-        let restricted_sql_options = SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
-
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion), Protocol::Flight)
-            .restricted_sql_options(Some(restricted_sql_options))
+            .use_restricted_sql_options()
             .protocol(Protocol::Flight)
             .build();
 

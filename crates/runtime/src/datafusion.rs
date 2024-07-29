@@ -876,7 +876,7 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder(self: &Arc<Self>, sql: String, protocol: Protocol) -> QueryBuilder {
+    pub fn query_builder(self: &Arc<Self>, sql: &str, protocol: Protocol) -> QueryBuilder {
         QueryBuilder::new(sql, Arc::clone(self), protocol)
     }
 }

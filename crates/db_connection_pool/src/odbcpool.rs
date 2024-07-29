@@ -22,27 +22,26 @@ use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Enviro
 use secrecy::{ExposeSecret, Secret, SecretString};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
-use lazy_static::lazy_static;
-
-lazy_static! {
-  static ref ENV: Environment = unsafe {
-      // Enable connection pooling. Let driver decide wether the attributes of two connection
-      // are similar enough to change the attributes of a pooled one, to fit the requested
-      // connection, or if it is cheaper to create a new Connection from scratch.
-      // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
-      if let Err(e) = Environment::set_connection_pooling(AttrConnectionPooling::DriverAware) {
-          tracing::error!("Failed to set ODBC connection pooling: {e}");
-      };
-      match Environment::new() {
-          Ok(env) => env,
-          Err(e) => {
+static ENV: LazyLock<Environment> = LazyLock::new(|| unsafe {
+    // Enable connection pooling. Let driver decide wether the attributes of two connection
+    // are similar enough to change the attributes of a pooled one, to fit the requested
+    // connection, or if it is cheaper to create a new Connection from scratch.
+    // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
+    if let Err(e) = Environment::set_connection_pooling(AttrConnectionPooling::DriverAware) {
+        tracing::error!("Failed to set ODBC connection pooling: {e}");
+    };
+    match Environment::new() {
+        Ok(env) => env,
+        Err(e) => {
             panic!("Failed to create ODBC environment: {e}");
-          }
-      }
-  };
-}
+        }
+    }
+});
 
 #[derive(Debug, Snafu)]
 pub enum Error {

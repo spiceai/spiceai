@@ -37,7 +37,7 @@ datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 datafusion.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
-dotenvy = "0.15"
+dotenvy.workspace = true
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
@@ -56,7 +56,6 @@ hyper-util = "0.1.6"
 indexmap = "2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }
-lazy_static = "1.4.0"
 llms = { path = "../llms" }
 logos = "0.14.0"
 mediatype = "0.19.18"

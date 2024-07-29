@@ -39,7 +39,7 @@ use crate::{
     internal_table::create_internal_accelerated_table,
 };
 
-use super::Query;
+use super::tracker::QueryTracker;
 
 pub const DEFAULT_QUERY_HISTORY_TABLE: &str = "query_history";
 
@@ -131,7 +131,7 @@ macro_rules! check_required_field {
     };
 }
 
-impl Query {
+impl QueryTracker {
     pub async fn write_query_history(&self) -> Result<(), Error> {
         self.validate()?;
 
@@ -190,8 +190,8 @@ impl Query {
                     .schema
                     .as_ref()
                     .map(ToString::to_string)])),
-                Arc::new(StringArray::from(vec![self.sql.clone()])),
-                Arc::new(StringArray::from(vec![self.nsql.clone()])),
+                Arc::new(StringArray::from(vec![self.sql.as_ref()])),
+                Arc::new(StringArray::from(vec![self.nsql.as_ref().map(Arc::as_ref)])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
                 Arc::new(Float32Array::from(vec![self.execution_time])),

@@ -25,7 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{flight_utils::attach_cache_metadata, to_tonic_err, Service},
+    flight::{to_tonic_err, util::attach_cache_metadata, Service},
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -36,7 +36,7 @@ pub(crate) async fn do_action_create_prepared_statement(
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
     let arrow_schema =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), statement.query.clone())
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &statement.query)
             .await
             .map_err(to_tonic_err)?;
 
@@ -57,7 +57,7 @@ pub(crate) async fn get_flight_info(
     tracing::trace!("get_flight_info: {handle:?}");
 
     let sql = match std::str::from_utf8(&handle.prepared_statement_handle) {
-        Ok(sql) => sql.to_string(),
+        Ok(sql) => sql,
         Err(e) => {
             return Err(Status::invalid_argument(format!(
                 "Invalid prepared statement handle: {e}"
@@ -97,7 +97,7 @@ pub(crate) async fn do_get(
             let start =
                 TimeMeasurement::new("flight_do_get_prepared_statement_query_duration_ms", vec![]);
             let (output, from_cache) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql.to_owned())).await?;
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
             let timed_output = TimedStream::new(output, move || start);
 
             let mut response =

@@ -27,14 +27,8 @@ pub(crate) async fn run(
     let test_queries = get_test_queries();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(
-            rt,
-            benchmark_results,
-            "databricks_delta",
-            query_name,
-            query,
-        )
-        .await?;
+        super::run_query_and_record_result(rt, benchmark_results, "odbc-athena", query_name, query)
+            .await?;
     }
 
     Ok(())
@@ -42,47 +36,26 @@ pub(crate) async fn run(
 
 pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
     app_builder
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.customer", "customer"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.lineitem", "lineitem"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.part", "part"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.partsupp", "partsupp"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.orders", "orders"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.nation", "nation"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.region", "region"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.supplier", "supplier"))
+        .with_dataset(make_dataset("tpch.customer", "customer"))
+        .with_dataset(make_dataset("tpch.lineitem", "lineitem"))
+        .with_dataset(make_dataset("tpch.part", "part"))
+        .with_dataset(make_dataset("tpch.partsupp", "partsupp"))
+        .with_dataset(make_dataset("tpch.orders", "orders"))
+        .with_dataset(make_dataset("tpch.nation", "nation"))
+        .with_dataset(make_dataset("tpch.region", "region"))
+        .with_dataset(make_dataset("tpch.supplier", "supplier"))
 }
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
-    let mut dataset = Dataset::new(format!("databricks:{path}"), name.to_string());
-    dataset.params = Some(get_params());
-    dataset
-}
+    let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
+    let connection_string = "Driver=/opt/athena/odbc/lib/libathena-odbc.so;Catalog=AwsDataCatalog;AwsRegion=us-east-2;Schema=tpch;Workgroup=primary;S3OutputLocation=s3://aws-athena-query-results-211125479522-us-east-2/;AuthenticationType=IAM Credentials;UID=${ env:AWS_ACCESS_KEY_ID };PWD=${ env:AWS_SECRET_ACCESS_KEY };".to_string();
 
-fn get_params() -> Params {
-    Params::from_string_map(
-        vec![
-            (
-                "databricks_endpoint".to_string(),
-                "${ env:DATABRICKS_HOST }".to_string(),
-            ),
-            (
-                "databricks_token".to_string(),
-                "${ env:DATABRICKS_TOKEN }".to_string(),
-            ),
-            (
-                "databricks_aws_secret_access_key".to_string(),
-                "${ env:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }".to_string(),
-            ),
-            (
-                "databricks_aws_access_key_id".to_string(),
-                "${ env:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }".to_string(),
-            ),
-            ("client_timeout".to_string(), "120s".to_string()),
-            ("mode".to_string(), "delta_lake".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    )
+    dataset.params = Some(Params::from_string_map(
+        vec![("odbc_connection_string".to_string(), connection_string)]
+            .into_iter()
+            .collect(),
+    ));
+    dataset
 }
 
 fn get_test_queries() -> Vec<(&'static str, &'static str)> {
@@ -90,7 +63,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q1", include_str!("../queries/tpch_q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch_q2.sql")),
         ("tpch_q3", include_str!("../queries/tpch_q3.sql")),
-        ("tpch_q4", include_str!("../queries/tpch_q4.sql")),
+        // ("tpch_q4", include_str!("../queries/tpch_q4.sql")), https://github.com/spiceai/spiceai/issues/2077
         ("tpch_q5", include_str!("../queries/tpch_q5.sql")),
         ("tpch_q6", include_str!("../queries/tpch_q6.sql")),
         ("tpch_q7", include_str!("../queries/tpch_q7.sql")),
@@ -101,12 +74,12 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q12", include_str!("../queries/tpch_q12.sql")),
         ("tpch_q13", include_str!("../queries/tpch_q13.sql")),
         ("tpch_q14", include_str!("../queries/tpch_q14.sql")),
-        // tpch_q15 has a view creation which we don't support by design
+        // // tpch_q15 has a view creation which we don't support by design
         ("tpch_q16", include_str!("../queries/tpch_q16.sql")),
         ("tpch_q17", include_str!("../queries/tpch_q17.sql")),
         ("tpch_q18", include_str!("../queries/tpch_q18.sql")),
         ("tpch_q19", include_str!("../queries/tpch_q19.sql")),
-        ("tpch_q20", include_str!("../queries/tpch_q20.sql")),
+        // ("tpch_q20", include_str!("../queries/tpch_q20.sql")), https://github.com/spiceai/spiceai/issues/2078
         ("tpch_q21", include_str!("../queries/tpch_q21.sql")),
         ("tpch_q22", include_str!("../queries/tpch_q22.sql")),
         (

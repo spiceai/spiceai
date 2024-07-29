@@ -7,7 +7,7 @@ on:
       features:
         description: 'included features for bench'
         required: true
-        default: "postgres,spark,mysql,odbc"
+        default: "postgres,spark,mysql,odbc,delta_lake,databricks"
 
 jobs:
   run-database-bench:
@@ -59,6 +59,13 @@ jobs:
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
+        
+      - name: Install Athena ODBC driver
+        if: contains(inputs.features, 'odbc')
+        run: |
+          sudo apt-get install alien -y
+          wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
+          sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
       - run: cargo bench -p runtime --features ${{ inputs.features }}
         env:
@@ -76,3 +83,7 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
