@@ -21,7 +21,6 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use datafusion::execution::context::SQLOptions;
 
 use crate::datafusion::DataFusion;
 
@@ -36,10 +35,5 @@ pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes)
         }
     };
 
-    let restricted_sql_options = SQLOptions::new()
-        .with_allow_ddl(false)
-        .with_allow_dml(false)
-        .with_allow_statements(false);
-
-    sql_to_http_response(df, &query, Some(restricted_sql_options), None).await
+    sql_to_http_response(df, &query, None).await
 }

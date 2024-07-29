@@ -27,9 +27,9 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use lazy_static::lazy_static;
 use secrecy::SecretString;
 use snafu::prelude::*;
+use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
@@ -68,10 +68,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-lazy_static! {
-    static ref DATA_ACCELERATOR_ENGINES: Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>> =
-        Mutex::new(HashMap::new());
-}
+static DATA_ACCELERATOR_ENGINES: LazyLock<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn register_accelerator_engine(
     name: Engine,

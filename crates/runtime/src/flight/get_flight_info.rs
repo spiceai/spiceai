@@ -69,7 +69,8 @@ async fn get_flight_info_simple(
     tracing::trace!("get_flight_info_simple: {request:?}");
 
     let fd = request.into_inner();
-    let sql = String::from_utf8(fd.cmd.clone().to_vec()).map_err(to_tonic_err)?;
+
+    let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
     let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
         .await
         .map_err(to_tonic_err)?;
