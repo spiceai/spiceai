@@ -14,19 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{bench_s3, results::BenchmarkResultsBuilder};
+use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::{replication::Replication, Dataset, Mode};
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-
-#[cfg(feature = "mysql")]
-use crate::bench_mysql;
-#[cfg(feature = "odbc")]
-use crate::bench_odbc_databricks;
-#[cfg(feature = "postgres")]
-use crate::bench_postgres;
 
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
@@ -86,13 +79,15 @@ fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
             .with_dataset(make_spark_dataset("samples.tpch.nation", "nation"))
             .with_dataset(make_spark_dataset("samples.tpch.region", "region"))
             .with_dataset(make_spark_dataset("samples.tpch.supplier", "supplier")),
-        "s3" => bench_s3::build_app(app_builder),
+        "s3" => crate::bench_s3::build_app(app_builder),
         #[cfg(feature = "postgres")]
-        "postgres" => bench_postgres::build_app(app_builder),
+        "postgres" => crate::bench_postgres::build_app(app_builder),
         #[cfg(feature = "mysql")]
-        "mysql" => bench_mysql::build_app(app_builder),
+        "mysql" => crate::bench_mysql::build_app(app_builder),
         #[cfg(feature = "odbc")]
-        "odbc" => bench_odbc_databricks::build_app(app_builder),
+        "odbc" => crate::bench_odbc_databricks::build_app(app_builder),
+        #[cfg(feature = "delta_lake")]
+        "delta_lake" => crate::bench_delta::build_app(app_builder),
         _ => app_builder,
     };
 

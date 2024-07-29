@@ -149,7 +149,6 @@ snowflake = [
   "data_components/snowflake",
 ]
 spark = ["data_components/spark_connect"]
-spiceai-dataset-test = []
 sqlite = [
   "dep:tokio-rusqlite",
   "db_connection_pool/sqlite",
