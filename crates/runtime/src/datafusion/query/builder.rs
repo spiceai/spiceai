@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
-use datafusion::execution::context::SQLOptions;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -29,7 +28,7 @@ pub struct QueryBuilder {
     sql: String,
     query_id: Uuid,
     nsql: Option<String>,
-    restricted_sql_options: Option<SQLOptions>,
+    restricted_sql_options: bool,
     protocol: Protocol,
 }
 
@@ -40,7 +39,7 @@ impl QueryBuilder {
             sql,
             query_id: Uuid::new_v4(),
             nsql: None,
-            restricted_sql_options: None,
+            restricted_sql_options: false,
             protocol,
         }
     }
@@ -58,8 +57,8 @@ impl QueryBuilder {
     }
 
     #[must_use]
-    pub fn restricted_sql_options(mut self, restricted_sql_options: Option<SQLOptions>) -> Self {
-        self.restricted_sql_options = restricted_sql_options;
+    pub fn use_restricted_sql_options(mut self) -> Self {
+        self.restricted_sql_options = true;
         self
     }
 

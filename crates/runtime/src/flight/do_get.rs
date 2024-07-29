@@ -25,7 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::flight_utils::attach_cache_metadata,
+    flight::util::attach_cache_metadata,
     timing::{TimeMeasurement, TimedStream},
 };
 

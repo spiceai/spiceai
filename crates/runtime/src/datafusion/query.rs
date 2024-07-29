@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, string, sync::Arc, time::SystemTime};
+use std::{cell::LazyCell, collections::HashSet, string, sync::Arc, time::SystemTime};
 
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
@@ -76,6 +76,16 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+// There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
+thread_local! {
+    static RESTRICTED_SQL_OPTIONS: LazyCell<SQLOptions> = LazyCell::new(|| {
+        SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false)
+    });
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: String,
@@ -87,7 +97,7 @@ pub struct Query {
     execution_time: Option<f32>,
     rows_produced: u64,
     results_cache_hit: Option<bool>,
-    restricted_sql_options: Option<SQLOptions>,
+    restricted_sql_options: bool,
     error_message: Option<String>,
     error_code: Option<ErrorCode>,
     timer: Instant,
@@ -149,8 +159,10 @@ impl Query {
             ctx = ctx.results_cache_hit(false);
         }
 
-        if let Some(restricted_sql_options) = ctx.restricted_sql_options {
-            if let Err(e) = restricted_sql_options.verify_plan(&plan) {
+        if ctx.restricted_sql_options {
+            if let Err(e) =
+                RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
+            {
                 handle_error!(ctx, ErrorCode::QueryPlanningError, e, UnableToExecuteQuery)
             }
         }
