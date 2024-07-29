@@ -22,12 +22,26 @@ use super::Parameters;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
+use arrow::array::GenericListArray;
+use arrow::array::GenericStringBuilder;
+use arrow::array::ListArray;
+use arrow::array::ListBuilder;
+use arrow::array::RecordBatch;
+use arrow::array::StringArray;
+use arrow::array::StringBuilder;
+use arrow::array::StructArray;
+use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
+use arrow::datatypes::Int32Type;
+use arrow::datatypes::Utf8Type;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
+use data_components::cdc::changes_schema;
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
+use data_components::debezium::change_event::Op;
 use data_components::flight::FlightFactory;
 use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
@@ -310,6 +324,22 @@ pub fn subscribe_to_append_stream(
                         Ok(decoded_data) => match decoded_data.payload {
                             DecodedPayload::None | DecodedPayload::Schema(_) => continue,
                             DecodedPayload::RecordBatch(batch) => {
+                                // WIP
+                                // let schema = changes_schema(batch.schema().as_ref());
+
+                                // let op = StringArray::from(vec![Op::Create.to_string()]);
+                                // let mut builder = ListBuilder::new(StringBuilder::new())
+                                //     .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+                                // builder.append(true);
+                                // let primary_keys = builder.finish();
+
+                                // let data = StructArray::from(batch.clone());
+
+                                // let batch = RecordBatch::try_new(
+                                //     Arc::new(schema),
+                                //     vec![Arc::new(op), Arc::new(primary_keys), Arc::new(data)],
+                                // ).unwrap();
+
                                 match ChangeBatch::try_new(batch).map(|rb| {
                                     ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
                                 }) {
@@ -337,9 +367,8 @@ pub struct SpiceAIChangeCommiter {}
 
 impl CommitChange for SpiceAIChangeCommiter {
     fn commit(&self) -> Result<(), CommitError> {
-        Err(CommitError::UnableToCommitChange {
-            source: "Change commit is not yet supported by Spice AI data connector".into(),
-        })
+        // Noop
+        Ok(())
     }
 }
 

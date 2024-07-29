@@ -212,7 +212,10 @@ impl Builder {
     ///
     /// Panics if the refresh mode isn't `RefreshMode::Changes`.
     pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
-        assert!(self.refresh.mode == RefreshMode::Changes);
+        assert!(
+            self.refresh.mode == RefreshMode::Changes
+                || self.refresh.mode == RefreshMode::Append && self.refresh.time_column.is_none()
+        );
         self.changes_stream = Some(changes_stream);
         self
     }
