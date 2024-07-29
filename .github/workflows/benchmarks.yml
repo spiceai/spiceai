@@ -61,6 +61,7 @@ jobs:
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
         
       - name: Install Athena ODBC driver
+        if: contains(inputs.features, 'odbc')
         run: |
           sudo apt-get install alien -y
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
