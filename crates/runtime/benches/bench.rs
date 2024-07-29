@@ -39,16 +39,19 @@ use crate::results::Status;
 mod results;
 mod setup;
 
+mod bench_s3;
+mod bench_spicecloud;
+
+#[cfg(feature = "delta_lake")]
+mod bench_delta;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
 #[cfg(feature = "odbc")]
 mod bench_odbc_databricks;
 #[cfg(feature = "postgres")]
 mod bench_postgres;
-mod bench_s3;
 #[cfg(feature = "spark")]
 mod bench_spark;
-mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -69,6 +72,8 @@ async fn main() -> Result<(), String> {
         "mysql",
         #[cfg(feature = "odbc")]
         "odbc",
+        #[cfg(feature = "delta_lake")]
+        "delta_lake",
     ];
 
     let mut display_records = vec![];
@@ -99,6 +104,10 @@ async fn main() -> Result<(), String> {
             #[cfg(feature = "odbc")]
             "odbc" => {
                 bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
+            }
+            #[cfg(feature = "delta_lake")]
+            "delta_lake" => {
+                bench_delta::run(&mut rt, &mut benchmark_results).await?;
             }
             _ => {}
         }
@@ -176,6 +185,10 @@ async fn run_query_and_record_result(
 
 /// Display the benchmark results record batches to the console.
 async fn display_benchmark_records(records: Vec<RecordBatch>) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
     let schema = records[0].schema();
 
     let ctx = SessionContext::new();

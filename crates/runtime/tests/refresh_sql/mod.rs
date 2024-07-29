@@ -33,9 +33,8 @@ fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset 
 }
 
 #[tokio::test]
-#[cfg(feature = "spiceai-dataset-test")]
 #[allow(clippy::too_many_lines)]
-async fn refresh_sql_pushdown() -> Result<(), String> {
+async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
     use runtime::accelerated_table::refresh_task::RefreshTask;
 
     let _tracing = init_tracing(None);
