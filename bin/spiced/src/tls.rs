@@ -31,7 +31,12 @@ pub(crate) async fn load_tls_config(
     spicepod_tls_config: Option<SpicepodTlsConfig>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> std::result::Result<Option<Arc<TlsConfig>>, Box<dyn std::error::Error>> {
-    if !args.tls && spicepod_tls_config.is_none() {
+    let tls_enabled = args.tls_certificate.is_some()
+        || args.tls_certificate_file.is_some()
+        || args.tls_key.is_some()
+        || args.tls_key_file.is_some()
+        || spicepod_tls_config.is_some();
+    if !tls_enabled {
         return Ok(None);
     }
 

@@ -91,10 +91,6 @@ pub struct Args {
     #[clap(flatten)]
     pub repl_config: ReplConfig,
 
-    /// Enable TLS for all server endpoints. Requires a certificate and key.
-    #[arg(long)]
-    pub tls: bool,
-
     /// The TLS PEM-encoded certificate.
     #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
     pub tls_certificate: Option<String>,
