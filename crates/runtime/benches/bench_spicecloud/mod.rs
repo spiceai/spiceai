@@ -81,5 +81,13 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
             "tpch_simple_q5",
             include_str!("../queries/tpch_simple_q5.sql"),
         ),
+        (
+            "tpch_simple_q6",
+            include_str!("../queries/tpch_simple_q6.sql"),
+        ),
+        (
+            "tpch_simple_q7",
+            include_str!("../queries/tpch_simple_q7.sql"),
+        ),
     ]
 }

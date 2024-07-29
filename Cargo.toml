@@ -94,6 +94,6 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c1f813567d661a304e089ea382ac2dce59837d38" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4986265c3b6ce43e34e98ea45b7e4f438c5d2fa3" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
