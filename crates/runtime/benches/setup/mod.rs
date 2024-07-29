@@ -85,7 +85,9 @@ fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
         #[cfg(feature = "mysql")]
         "mysql" => crate::bench_mysql::build_app(app_builder),
         #[cfg(feature = "odbc")]
-        "odbc" => crate::bench_odbc_databricks::build_app(app_builder),
+        "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder),
+        #[cfg(feature = "odbc")]
+        "odbc-athena" => crate::bench_odbc_athena::build_app(app_builder),
         #[cfg(feature = "delta_lake")]
         "delta_lake" => crate::bench_delta::build_app(app_builder),
         _ => app_builder,
