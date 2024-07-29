@@ -26,8 +26,7 @@ use spicepod::component::catalog::Catalog;
 use std::collections::HashMap;
 
 #[tokio::test]
-#[cfg(feature = "spiceai-dataset-test")]
-async fn spiceai_catalog_test() -> Result<(), anyhow::Error> {
+async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("spiceai_catalog_test")
         .with_catalog(Catalog::new("spiceai".to_string(), "spiceai".to_string()))
@@ -74,8 +73,7 @@ async fn spiceai_catalog_test() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[cfg(feature = "spiceai-dataset-test")]
-async fn spiceai_catalog_test_include() -> Result<(), anyhow::Error> {
+async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     let mut catalog = Catalog::new("spiceai".to_string(), "spiceai".to_string());
     catalog.include = vec![
