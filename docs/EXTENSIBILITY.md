@@ -4,9 +4,15 @@ This document is an overview of all the interfaces and extension points in Spice
 
 | Component       | Description                                                                                                                                | Definition Link                                            |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------       | ------------------------------------------------------     |
-| DataConnector   | Represents the source of data to the Spice.ai runtime. Specifies how to retrieve data, stream data updates, and write data back.           | [dataconnector.rs](../crates/runtime/src/dataconnector.rs) |
-| DataBackend     | Used by the runtime to store accelerated data locally. Specifies which data backend to use via `engine` & `mode` fields.                   | [databackend.rs](../crates/runtime/src/databackend.rs)     |
-| DataPublisher   | An interface that specifies how to publish data updates. All DataBackends implement it, and DataConnectors that support writing data back. | [datapublisher.rs](../crates/runtime/src/datapublisher.rs) |
-| ModelFormat     | Specifies the format of model artifacts.                                                                                                   | [modelformat.rs](../crates/runtime/src/modelformat.rs)     |
-| ModelRuntime    | Provides the runtime-specific information needed to run a model. Specifies the runtime and its configuration.                              | [modelruntime.rs](../crates/runtime/src/modelruntime.rs)   |
-| ModelSource     | Specifies the source of the model.                                                                                                         | [modelsource.rs](../crates/runtime/src/modelsource.rs)     |
+| [Data Connector]   | Represents the source of data to the Spice.ai runtime. Specifies how to retrieve data, stream data updates, and write data back.           | [dataconnector.rs](../crates/runtime/src/dataconnector.rs) |
+| [Data Accelerator]     | Used by the runtime to store accelerated data locally. Specify which data accelerator to use via `engine` & `mode` fields.                   | [dataaccelerator.rs](../crates/runtime/src/databackend.rs)     |
+| [Catalog Connector]     | Catalog Connectors connect to external catalog providers and make their tables available for federated SQL query in Spice. Implemented as an optional function on the `DataConnector` trait.                                                                                                  | [dataconnector.rs](../crates/runtime/src/dataconnector.rs)     |
+| [Secret Stores]    | A Secret Store is a location where secrets are stored and can be used to store sensitive data, like passwords, tokens, and secret keys.                               | [secrets.rs](../crates/runtime/src/secrets.rs)   |
+| [Models]     | A machine-learning (ML) or language model (LLM) to load for inferencing.          | [modelsource.rs](../crates/model_components/src/model.rs)     |
+| Embeddings    | Embeddings map high-dimensional data to a lower-dimensional vector space.         | [embeddings.rs](../crates/llms/src/embeddings/mod.rs)     |
+
+[Data Connector]: https://docs.spiceai.org/components/data-connectors
+[Data Accelerator]: https://docs.spiceai.org/components/data-accelerators
+[Catalog Connector]: https://docs.spiceai.org/components/catalogs
+[Secret Stores]: https://docs.spiceai.org/components/secret-stores
+[Models]: https://docs.spiceai.org/components/models
