@@ -56,7 +56,9 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to query: {source}"))]
-    UnableToQuery { source: tonic::Status },
+    UnableToQuery {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to publish: {source}"))]
     UnableToPublish { source: tonic::Status },
@@ -147,7 +149,9 @@ impl FlightClient {
             .clone()
             .get_flight_info(req)
             .await
-            .context(UnableToQuerySnafu)?
+            .map_err(|e| Error::UnableToQuery {
+                source: e.message().into(),
+            })?
             .into_inner();
 
         let ep = info.endpoint[0].clone();
@@ -168,7 +172,9 @@ impl FlightClient {
                 .clone()
                 .do_get(req)
                 .await
-                .context(UnableToQuerySnafu)?
+                .map_err(|e| Error::UnableToQuery {
+                    source: e.message().into(),
+                })?
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
@@ -213,7 +219,9 @@ impl FlightClient {
             .clone()
             .do_exchange(req)
             .await
-            .context(UnableToQuerySnafu)?
+            .map_err(|e| Error::UnableToQuery {
+                source: e.message().into(),
+            })?
             .into_parts();
 
         Ok(FlightDataDecoder::new(
