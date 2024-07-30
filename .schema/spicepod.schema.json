@@ -71,7 +71,8 @@
           "enabled": true,
           "eviction_policy": null,
           "item_ttl": null
-        }
+        },
+        "tls": null
       },
       "allOf": [
         {
@@ -694,6 +695,17 @@
               "$ref": "#/definitions/ResultsCache"
             }
           ]
+        },
+        "tls": {
+          "description": "If set, the runtime will configure all endpoints to use TLS",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -744,6 +756,40 @@
         "unix_millis",
         "ISO8601"
       ]
+    },
+    "TlsConfig": {
+      "type": "object",
+      "properties": {
+        "certificate": {
+          "description": "A PEM encoded certificate",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "certificate_file": {
+          "description": "A filesystem path to a file containing the PEM encoded certificate",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "description": "A PEM encoded private key",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_file": {
+          "description": "A filesystem path to a file containing the PEM encoded private key",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "View": {
       "type": "object",

@@ -288,13 +288,7 @@ After creating an account, you will need to create an app in order to create to 
 
 You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the `spice.ai/eth.recent_blocks` dataset.
 
-**Step 1.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
-
-```bash
-spice login
-```
-
-**Step 2.** Initialize a new project and start the runtime:
+**Step 1.** Initialize a new project.
 
 ```bash
 # Initialize a new Spice app
@@ -302,12 +296,22 @@ spice init spice_app
 
 # Change to app directory
 cd spice_app
+```
 
+**Step 2.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
+
+```bash
+spice login
+```
+
+**Step 3.** Start the runtime:
+
+```bash
 # Start the runtime
 spice run
 ```
 
-**Step 3.** Configure the dataset:
+**Step 4.** Configure the dataset:
 
 In a new terminal window, configure a new dataset using the `spice dataset configure` command:
 
@@ -347,7 +351,7 @@ You should see the following output from your runtime terminal:
 2024-06-03T23:26:00.758813Z  INFO runtime::accelerated_table::refresh: Loaded 143 rows (6.22 MiB) for dataset eth_recent_blocks in 1s 244ms.
 ```
 
-**Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
+**Step 5.** In a new terminal window, use the Spice SQL REPL to query the dataset
 
 ```bash
 spice sql
