@@ -167,6 +167,7 @@ pub struct Builder {
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
+    append_stream: Option<ChangesStream>,
 }
 
 impl Builder {
@@ -185,6 +186,7 @@ impl Builder {
             zero_results_action: ZeroResultsAction::default(),
             cache_provider: None,
             changes_stream: None,
+            append_stream: None,
         }
     }
 
@@ -212,11 +214,19 @@ impl Builder {
     ///
     /// Panics if the refresh mode isn't `RefreshMode::Changes`.
     pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
-        assert!(
-            self.refresh.mode == RefreshMode::Changes
-                || self.refresh.mode == RefreshMode::Append && self.refresh.time_column.is_none()
-        );
+        assert!(self.refresh.mode == RefreshMode::Changes);
         self.changes_stream = Some(changes_stream);
+        self
+    }
+
+    /// Set the append stream for the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode isn't `RefreshMode::Append`.
+    pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
+        assert!(self.refresh.mode == RefreshMode::Append);
+        self.append_stream = Some(append_stream);
         self
     }
 
@@ -232,7 +242,7 @@ impl Builder {
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
                     // Get the append stream
-                    let Some(append_stream) = self.changes_stream else {
+                    let Some(append_stream) = self.append_stream else {
                         panic!("Append stream is required for `RefreshMode::Append` without time_column");
                     };
                     (

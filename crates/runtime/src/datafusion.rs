@@ -616,16 +616,21 @@ impl DataFusion {
 
         accelerated_table_builder.cache_provider(self.cache_provider());
 
-        if refresh_mode == RefreshMode::Changes
-            // A change stream only supports append: e.g. Flight
-            || (refresh_mode == RefreshMode::Append && dataset.time_column.is_none())
-        {
+        if refresh_mode == RefreshMode::Changes {
             let source = Box::leak(Box::new(Arc::clone(&source)));
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
-            } else if refresh_mode == RefreshMode::Append {
+            }
+        }
+
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+            let source = Box::leak(Box::new(source));
+            let append_stream = source.append_stream(source_table_provider);
+            if let Some(append_stream) = append_stream {
+                accelerated_table_builder.append_stream(append_stream);
+            } else {
                 return Err(Error::UnsupportedAccelerationMode {
                     mode: "append".to_string(),
                     from: dataset.from.clone(),

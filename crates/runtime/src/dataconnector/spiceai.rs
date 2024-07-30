@@ -233,11 +233,11 @@ impl DataConnector for SpiceAI {
         Some(read_write_result)
     }
 
-    fn supports_changes_stream(&self) -> bool {
+    fn supports_append_stream(&self) -> bool {
         true
     }
 
-    fn changes_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
+    fn append_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
         let federated_table_provider_adaptor = table_provider
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()?;
@@ -324,22 +324,6 @@ pub fn subscribe_to_append_stream(
                         Ok(decoded_data) => match decoded_data.payload {
                             DecodedPayload::None | DecodedPayload::Schema(_) => continue,
                             DecodedPayload::RecordBatch(batch) => {
-                                // WIP
-                                // let schema = changes_schema(batch.schema().as_ref());
-
-                                // let op = StringArray::from(vec![Op::Create.to_string()]);
-                                // let mut builder = ListBuilder::new(StringBuilder::new())
-                                //     .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
-                                // builder.append(true);
-                                // let primary_keys = builder.finish();
-
-                                // let data = StructArray::from(batch.clone());
-
-                                // let batch = RecordBatch::try_new(
-                                //     Arc::new(schema),
-                                //     vec![Arc::new(op), Arc::new(primary_keys), Arc::new(data)],
-                                // ).unwrap();
-
                                 match ChangeBatch::try_new(batch).map(|rb| {
                                     ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
                                 }) {
