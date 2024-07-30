@@ -383,12 +383,10 @@ impl Runtime {
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
                 Some(subject_name) => {
-                    tracing::info!(
-                        "All endpoints secured with TLS using certificate: {subject_name}"
-                    );
+                    tracing::info!("Endpoints secured with TLS using certificate: {subject_name}");
                 }
                 None => {
-                    tracing::info!("All endpoints secured with TLS");
+                    tracing::info!("Endpoints secured with TLS");
                 }
             }
         }
