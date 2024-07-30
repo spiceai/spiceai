@@ -149,9 +149,7 @@ impl FlightClient {
             .clone()
             .get_flight_info(req)
             .await
-            .map_err(|e| Error::UnableToQuery {
-                source: e.message().into(),
-            })?
+            .map_err(map_tonic_error_to_user_friendly_error)?
             .into_inner();
 
         let ep = info.endpoint[0].clone();
@@ -172,9 +170,7 @@ impl FlightClient {
                 .clone()
                 .do_get(req)
                 .await
-                .map_err(|e| Error::UnableToQuery {
-                    source: e.message().into(),
-                })?
+                .map_err(map_tonic_error_to_user_friendly_error)?
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
@@ -219,9 +215,7 @@ impl FlightClient {
             .clone()
             .do_exchange(req)
             .await
-            .map_err(|e| Error::UnableToQuery {
-                source: e.message().into(),
-            })?
+            .map_err(map_tonic_error_to_user_friendly_error)?
             .into_parts();
 
         Ok(FlightDataDecoder::new(
@@ -320,5 +314,17 @@ impl FlightClient {
 
     pub fn username(&self) -> &str {
         &self.username
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn map_tonic_error_to_user_friendly_error(e: tonic::Status) -> Error {
+    if let Some(message) = e.message().split('\n').next() {
+        return Error::UnableToQuery {
+            source: message.to_string().into(),
+        };
+    }
+    Error::UnableToQuery {
+        source: e.message().into(),
     }
 }
