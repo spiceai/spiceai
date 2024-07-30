@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use app::{App, AppBuilder};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
 use metrics_exporter_prometheus::PrometheusHandle;
 use runtime::config::Config as RuntimeConfig;
@@ -90,6 +90,10 @@ pub struct Args {
 
     #[clap(flatten)]
     pub repl_config: ReplConfig,
+
+    /// Enable TLS for the runtime.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub tls_enabled: bool,
 
     /// The TLS PEM-encoded certificate.
     #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
