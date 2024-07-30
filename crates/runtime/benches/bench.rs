@@ -33,6 +33,7 @@ use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
 use results::BenchmarkResultsBuilder;
 use runtime::{dataupdate::DataUpdate, Runtime};
+use spicepod::component::dataset::acceleration::{self, Acceleration};
 
 use crate::results::Status;
 
@@ -84,14 +85,14 @@ async fn main() -> Result<(), String> {
 
     for connector in connectors {
         let (mut benchmark_results, mut rt) =
-            setup::setup_benchmark(&upload_results_dataset, connector).await;
+            setup::setup_benchmark(&upload_results_dataset, connector, None).await;
 
         match connector {
             "spice.ai" => {
                 bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
             }
             "s3" => {
-                bench_s3::run(&mut rt, &mut benchmark_results).await?;
+                bench_s3::run(&mut rt, &mut benchmark_results, None).await?;
             }
             #[cfg(feature = "spark")]
             "spark" => {
@@ -130,8 +131,40 @@ async fn main() -> Result<(), String> {
         }
     }
 
+    let accelerators: Vec<Acceleration> = vec![
+        #[cfg(feature = "duckdb")]
+        create_acceleration("duckdb", acceleration::Mode::Memory),
+        #[cfg(feature = "duckdb")]
+        create_acceleration("duckdb", acceleration::Mode::File),
+    ];
+
+    for accelerator in accelerators {
+        let (mut benchmark_results, mut rt) =
+            setup::setup_benchmark(&upload_results_dataset, "s3", Some(&accelerator)).await;
+
+        bench_s3::run(&mut rt, &mut benchmark_results, Some(accelerator)).await?;
+
+        let data_update: DataUpdate = benchmark_results.into();
+
+        let mut records = data_update.data.clone();
+        display_records.append(&mut records);
+
+        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+            tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+            setup::write_benchmark_results(data_update, &rt).await?;
+        }
+    }
+
     display_benchmark_records(display_records).await?;
     Ok(())
+}
+
+fn create_acceleration(engine: &str, mode: acceleration::Mode) -> Acceleration {
+    Acceleration {
+        engine: Some(engine.to_string()),
+        mode,
+        ..Default::default()
+    }
 }
 
 fn get_current_unix_ms() -> i64 {
