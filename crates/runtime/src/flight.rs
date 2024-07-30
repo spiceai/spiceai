@@ -214,7 +214,7 @@ impl Service {
                             flights.push(flight_batch.into());
                             Ok(flights)
                         }
-                        Err(e) => Err(Status::internal(e.to_string())),
+                        Err(e) => Err(Status::invalid_argument(e.to_string())),
                     }
                 }
             })
