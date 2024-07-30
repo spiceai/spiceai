@@ -152,9 +152,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
-                    Some(ref err) => {
-                        let err_message = err.message();
-                        println!("{err_message}")},
+                    Some(ref err) => println!("{err:?}"),
                     None => println!("No error to display"),
                 }
                 continue;
@@ -358,7 +356,9 @@ fn display_grpc_error(err: &Status) {
         Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
             ("Error", "An internal error occurred. Execute '.error' to show details.")
         },
-        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message()),
+        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => {
+            let message = err.message().split('\n').next().unwrap_or(err.message());
+            ("Query Error", message)},
         Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
         Code::Aborted => ("Error", "The query was aborted before it could complete."),
         Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded."),
