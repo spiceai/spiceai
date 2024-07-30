@@ -152,7 +152,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
-                    Some(ref err) => println!("{err:?}"),
+                    Some(ref err) => {
+                        let err_message = err.message();
+                        println!("{err_message}")},
                     None => println!("No error to display"),
                 }
                 continue;
