@@ -311,7 +311,7 @@ spice login
 spice run
 ```
 
-**Step 3.** Configure the dataset:
+**Step 4.** Configure the dataset:
 
 In a new terminal window, configure a new dataset using the `spice dataset configure` command:
 
@@ -351,7 +351,7 @@ You should see the following output from your runtime terminal:
 2024-06-03T23:26:00.758813Z  INFO runtime::accelerated_table::refresh: Loaded 143 rows (6.22 MiB) for dataset eth_recent_blocks in 1s 244ms.
 ```
 
-**Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
+**Step 5.** In a new terminal window, use the Spice SQL REPL to query the dataset
 
 ```bash
 spice sql
