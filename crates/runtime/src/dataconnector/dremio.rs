@@ -123,7 +123,7 @@ impl DataConnectorFactory for DremioFactory {
                     endpoint: endpoint.clone(),
                 })?;
 
-            let flight_client = FlightClient::new(
+            let flight_client = FlightClient::try_new(
                 endpoint.as_str(),
                 params.get("username").expose().ok().unwrap_or_default(),
                 params.get("password").expose().ok().unwrap_or_default(),
