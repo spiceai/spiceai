@@ -13,7 +13,7 @@
     jobs:
       make_install:
         name: make install*
-        runs-on: ubuntu-latest-32-cores
+        runs-on: ubuntu-latest-64-cores
         env:
           GOVER: 1.22.0
     
