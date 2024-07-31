@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
+use app::App;
 use axum::{
     extract::Query,
     http::status,
@@ -22,7 +23,6 @@ use axum::{
     Extension,
 };
 use csv::Writer;
-use model_components::model::Model;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -43,26 +43,35 @@ pub(crate) struct ModelResponse {
 }
 
 pub(crate) async fn get(
-    Extension(model): Extension<Arc<RwLock<HashMap<String, Model>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
-    let resp = model
-        .read()
-        .await
-        .values()
-        .map(|m| {
-            let datasets = if m.model.datasets.is_empty() {
-                None
-            } else {
-                Some(m.model.datasets.clone())
-            };
-            ModelResponse {
-                name: m.model.name.clone(),
-                from: m.model.from.clone(),
-                datasets,
-            }
-        })
-        .collect::<Vec<ModelResponse>>();
+    let resp = match app.read().await.as_ref() {
+        Some(a) => a
+            .models
+            .iter()
+            .map(|m| {
+                let d = if m.datasets.is_empty() {
+                    None
+                } else {
+                    Some(m.datasets.clone())
+                };
+
+                ModelResponse {
+                    name: m.name.clone(),
+                    from: m.from.clone(),
+                    datasets: d,
+                }
+            })
+            .collect::<Vec<ModelResponse>>(),
+        None => {
+            return (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                "App not initialized",
+            )
+                .into_response();
+        }
+    };
 
     match params.format {
         Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
