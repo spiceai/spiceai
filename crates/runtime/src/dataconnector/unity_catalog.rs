@@ -81,12 +81,9 @@ impl UnityCatalogFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("token")
-        .required()
-        .secret()
-        .description(
-            "The personal access token used to authenticate against the Unity Catalog API.",
-        ),
+    ParameterSpec::connector("token").secret().description(
+        "The personal access token used to authenticate against the Unity Catalog API.",
+    ),
     // S3 storage options
     ParameterSpec::connector("aws_region")
         .description("The AWS region to use for S3 storage.")
