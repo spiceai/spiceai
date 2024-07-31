@@ -56,7 +56,9 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to query: {source}"))]
-    UnableToQuery { source: tonic::Status },
+    UnableToQuery {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to publish: {source}"))]
     UnableToPublish { source: tonic::Status },
@@ -147,7 +149,7 @@ impl FlightClient {
             .clone()
             .get_flight_info(req)
             .await
-            .context(UnableToQuerySnafu)?
+            .map_err(map_tonic_error_to_message)?
             .into_inner();
 
         let ep = info.endpoint[0].clone();
@@ -168,7 +170,7 @@ impl FlightClient {
                 .clone()
                 .do_get(req)
                 .await
-                .context(UnableToQuerySnafu)?
+                .map_err(map_tonic_error_to_message)?
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
@@ -213,7 +215,7 @@ impl FlightClient {
             .clone()
             .do_exchange(req)
             .await
-            .context(UnableToQuerySnafu)?
+            .map_err(map_tonic_error_to_message)?
             .into_parts();
 
         Ok(FlightDataDecoder::new(
@@ -312,5 +314,12 @@ impl FlightClient {
 
     pub fn username(&self) -> &str {
         &self.username
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn map_tonic_error_to_message(e: tonic::Status) -> Error {
+    Error::UnableToQuery {
+        source: e.message().into(),
     }
 }
