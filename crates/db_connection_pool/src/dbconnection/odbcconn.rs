@@ -48,6 +48,7 @@ use snafu::Snafu;
 use tokio::runtime::Handle;
 
 use odbc_api::Connection;
+use tokio::signal;
 use tokio::sync::mpsc::Sender;
 
 type Result<T, E = GenericError> = std::result::Result<T, E>;
@@ -173,6 +174,24 @@ where
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
         let secrets = Arc::clone(&self.params);
 
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let cloned_token = cancellation_token.clone();
+
+        tokio::spawn(async move {
+            let ctrl_c = async {
+                let signal_result = signal::ctrl_c().await;
+                if let Err(err) = signal_result {
+                    tracing::error!("Failed to listen to shutdown signal in ODBC data fetching: {err}");
+                } else {
+                    cancellation_token.clone().cancel();
+                }
+            };
+            tokio::select! {
+                () = cancellation_token.cancelled() => {},
+                () = ctrl_c => {},
+            }
+        });
+
         let join_handle = tokio::task::spawn_blocking(move || {
             let handle = Handle::current();
             let cxn = handle.block_on(async { conn.lock().await });
@@ -199,8 +218,17 @@ where
 
             let reader = build_odbc_reader(cursor, &schema, &secrets)?;
             for batch in reader {
+                if cloned_token.is_cancelled() {
+                    return Err(Error::ChannelError {
+                        message: "process is terminated".to_string(),
+                    }
+                    .into());
+                };
                 blocking_channel_send(&batch_tx, batch.context(ArrowSnafu)?)?;
             }
+            if !cloned_token.is_cancelled() {
+                cloned_token.cancel();
+            };
 
             Ok::<_, GenericError>(())
         });

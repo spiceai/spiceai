@@ -30,6 +30,7 @@ sha2 = { version = "0.10.8", optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
+tokio-util = "0.7.11"
 tracing.workspace = true
 
 [dev-dependencies]
