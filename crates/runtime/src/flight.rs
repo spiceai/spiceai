@@ -216,10 +216,6 @@ impl Service {
                         }
                         Err(e) => match e {
                             DataFusionError::External(e) => {
-                                // Failed to downcast to datafusion execution error using the following method
-                                // if let Some(df_error) = e.downcast_ref::<DataFusionError>() {
-                                // }
-                                // Match Datafusion Error pattern with string
                                 if let Some(execution_error) =
                                     e.to_string().strip_prefix("Execution error: ")
                                 {
