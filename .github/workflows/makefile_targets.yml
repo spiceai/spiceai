@@ -1,0 +1,58 @@
+---
+    name: Makefile Targets
+    
+    on:
+      pull_request:
+        branches:
+          - trunk
+          - release-*
+          - feature-*
+    
+      workflow_dispatch:
+    
+    jobs:
+      make_install:
+        name: make install*
+        runs-on: ubuntu-latest-16-cores
+        env:
+          GOVER: 1.22.0
+    
+        steps:
+          - uses: actions/checkout@v4
+    
+          - name: Set up Go
+            uses: actions/setup-go@v5
+            with:
+              go-version: ${{ env.GOVER }}
+              cache: false
+    
+          - name: Set up Rust
+            uses: ./.github/actions/setup-rust
+            with:
+              os: 'linux'
+          
+          - name: Install Protoc
+            uses: arduino/setup-protoc@v3
+            with:
+              repo-token: ${{ secrets.GITHUB_TOKEN }}
+    
+          - name: make install
+            run: |
+              make install
+    
+          - name: make install-with-models
+            run: |
+              make install-with-models
+    
+          - name: make install-with-odbc
+            run: |
+              make install-with-odbc
+    
+          - name: make install-cli
+            run: |
+              make install-cli
+    
+          - name: make install-runtime
+            run: |
+              make install-runtime
+    
