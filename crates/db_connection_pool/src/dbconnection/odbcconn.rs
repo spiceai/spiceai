@@ -48,8 +48,8 @@ use snafu::Snafu;
 use tokio::runtime::Handle;
 
 use odbc_api::Connection;
-use tokio::signal;
 use tokio::sync::mpsc::Sender;
+use util::shutdown_signal;
 
 type Result<T, E = GenericError> = std::result::Result<T, E>;
 
@@ -178,18 +178,14 @@ where
         let cloned_token = cancellation_token.clone();
 
         tokio::spawn(async move {
-            let ctrl_c = async {
-                let signal_result = signal::ctrl_c().await;
-                if let Err(err) = signal_result {
-                    tracing::error!(
-                        "Failed to listen to shutdown signal in ODBC data fetching: {err}"
-                    );
-                }
+            let shutdown = async {
+                shutdown_signal().await;
                 cancellation_token.clone().cancel();
             };
+
             tokio::select! {
                 () = cancellation_token.cancelled() => {},
-                () = ctrl_c => {},
+                () = shutdown => {},
             }
         });
 
