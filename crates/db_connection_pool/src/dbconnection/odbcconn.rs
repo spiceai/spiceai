@@ -184,9 +184,8 @@ where
                     tracing::error!(
                         "Failed to listen to shutdown signal in ODBC data fetching: {err}"
                     );
-                } else {
-                    cancellation_token.clone().cancel();
                 }
+                cancellation_token.clone().cancel();
             };
             tokio::select! {
                 () = cancellation_token.cancelled() => {},
