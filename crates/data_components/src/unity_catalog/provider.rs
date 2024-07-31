@@ -136,12 +136,16 @@ impl UnityCatalogSchemaProvider {
                 }
             }
 
-            let table_provider = table_creator
+            let table_provider = match table_creator
                 .table_provider(table_reference.clone(), None)
                 .await
-                .context(super::UnableToGetTableProviderSnafu {
-                    table_reference: table_reference.to_string(),
-                })?;
+            {
+                Ok(provider) => provider,
+                Err(source) => {
+                    tracing::warn!("Couldn't get table provider for {table_reference}: {source}");
+                    continue;
+                }
+            };
             tables_map.insert(table_name, table_provider);
         }
 
