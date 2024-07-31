@@ -181,7 +181,9 @@ where
             let ctrl_c = async {
                 let signal_result = signal::ctrl_c().await;
                 if let Err(err) = signal_result {
-                    tracing::error!("Failed to listen to shutdown signal in ODBC data fetching: {err}");
+                    tracing::error!(
+                        "Failed to listen to shutdown signal in ODBC data fetching: {err}"
+                    );
                 } else {
                     cancellation_token.clone().cancel();
                 }
