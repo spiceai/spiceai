@@ -58,6 +58,9 @@ impl Default for ResultsCache {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct TlsConfig {
+    /// If set, the runtime will configure all endpoints to use TLS
+    pub enabled: bool,
+
     /// A filesystem path to a file containing the PEM encoded certificate
     pub certificate_file: Option<String>,
 
