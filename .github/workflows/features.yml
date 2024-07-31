@@ -1,67 +1,71 @@
----
-  name: check all features
-  
-  on:
-    push:
-      branches:
-        - trunk
-      paths:
-        - "**/Cargo.toml"
-    pull_request:
-      paths:
-        - "**/Cargo.toml"
-    workflow_dispatch:
-  
-  jobs:
-    build:
-      name: Features Check
-      runs-on: rust
-  
-      steps:
-        - uses: actions/checkout@v4
-  
-        - name: Set up Rust
-          uses: ./.github/actions/setup-rust
-          with:
-            os: 'linux'
-  
-        # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory 
-        # this can re-use the existing build cache to go faster.
-        - name: Build without default features
-          run: cargo check --no-default-features
-  
-        - name: Build with only duckdb
-          run: cargo check --no-default-features --features duckdb
-  
-        - name: Build with only postgres
-          run: cargo check --no-default-features --features postgres
-  
-        - name: Build with only sqlite
-          run: cargo check --no-default-features --features sqlite
-  
-        - name: Build with only mysql
-          run: cargo check --no-default-features --features mysql
-  
-        - name: Build with only keyring-secret-store
-          run: cargo check --no-default-features --features keyring-secret-store
-  
-        - name: Build with only flightsql
-          run: cargo check --no-default-features --features flightsql
-  
-        - name: Build with only aws-secrets-manager
-          run: cargo check --no-default-features --features aws-secrets-manager
-  
-        - name: Build with only databricks
-          run: cargo check --no-default-features --features databricks
-  
-        - name: Build with only delta_lake
-          run: cargo check --no-default-features --features delta_lake
-  
-        - name: Build with only dremio
-          run: cargo check --no-default-features --features dremio
+name: check all features
 
-        - name: Build with only clickhouse
-          run: cargo check --no-default-features --features clickhouse
+on:
+  push:
+    branches:
+      - trunk
+    paths:
+      - "**/Cargo.toml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+  workflow_dispatch:
 
-        - name: Build with only debezium
-          run: cargo check --no-default-features --features debezium
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Features Check
+    runs-on: rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory 
+      # this can re-use the existing build cache to go faster.
+      - name: Build without default features
+        run: cargo check --no-default-features
+
+      - name: Build with only duckdb
+        run: cargo check --no-default-features --features duckdb
+
+      - name: Build with only postgres
+        run: cargo check --no-default-features --features postgres
+
+      - name: Build with only sqlite
+        run: cargo check --no-default-features --features sqlite
+
+      - name: Build with only mysql
+        run: cargo check --no-default-features --features mysql
+
+      - name: Build with only keyring-secret-store
+        run: cargo check --no-default-features --features keyring-secret-store
+
+      - name: Build with only flightsql
+        run: cargo check --no-default-features --features flightsql
+
+      - name: Build with only aws-secrets-manager
+        run: cargo check --no-default-features --features aws-secrets-manager
+
+      - name: Build with only databricks
+        run: cargo check --no-default-features --features databricks
+
+      - name: Build with only delta_lake
+        run: cargo check --no-default-features --features delta_lake
+
+      - name: Build with only dremio
+        run: cargo check --no-default-features --features dremio
+
+      - name: Build with only clickhouse
+        run: cargo check --no-default-features --features clickhouse
+
+      - name: Build with only debezium
+        run: cargo check --no-default-features --features debezium
