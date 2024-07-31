@@ -133,7 +133,7 @@ fn convert_details_to_csv(
 
 async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
     tracing::trace!("Checking flight status at {flight_addr}");
-    match FlightClient::new(&format!("http://{flight_addr}"), "", "").await {
+    match FlightClient::try_new(&format!("http://{flight_addr}"), "", "").await {
         Ok(_) => ComponentStatus::Ready,
         Err(e) => {
             tracing::error!("Error connecting to flight when checking status: {e}");

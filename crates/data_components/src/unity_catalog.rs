@@ -50,12 +50,6 @@ pub enum Error {
 
     #[snafu(display("The schema {schema} doesn't exist in {catalog_id}."))]
     SchemaDoesntExist { schema: String, catalog_id: String },
-
-    #[snafu(display("Couldn't get table provider for {table_reference}: {source}"))]
-    UnableToGetTableProvider {
-        table_reference: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -105,7 +99,7 @@ impl UnityCatalog {
         })?;
 
         // Extract the endpoint
-        let endpoint = format!(
+        let mut endpoint = format!(
             "{}://{}",
             parsed_url.scheme(),
             parsed_url
@@ -115,6 +109,10 @@ impl UnityCatalog {
                     url: url.to_string()
                 })?
         );
+
+        if let Some(port) = parsed_url.port() {
+            endpoint.push_str(&format!(":{port}"));
+        }
 
         tracing::debug!("parse_catalog_url: endpoint: {}", endpoint);
 
