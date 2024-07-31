@@ -187,17 +187,16 @@ async fn run_query_and_record_result(
     let mut min_iter_duration_ms = i64::MAX;
     let mut max_iter_duration_ms = i64::MIN;
 
+    let mut query_err: Option<String> = None;
+
+    let mut completed_iterations = 0;
+
     for _ in 0..benchmark_results.iterations() {
+        completed_iterations += 1;
+
         let start_iter_time = get_current_unix_ms();
-        let _ = rt
-            .datafusion()
-            .ctx
-            .sql(query)
-            .await
-            .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
-            .collect()
-            .await
-            .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
+
+        let res = run_query(rt, connector, query_name, query).await;
         let end_iter_time = get_current_unix_ms();
 
         let iter_duration_ms = end_iter_time - start_iter_time;
@@ -206,6 +205,11 @@ async fn run_query_and_record_result(
         }
         if iter_duration_ms > max_iter_duration_ms {
             max_iter_duration_ms = iter_duration_ms;
+        }
+
+        if let Err(e) = res {
+            query_err = Some(e);
+            break;
         }
     }
 
@@ -216,10 +220,38 @@ async fn run_query_and_record_result(
         end_time,
         connector,
         query_name,
-        Status::Passed,
+        if query_err.is_some() {
+            Status::Failed
+        } else {
+            Status::Passed
+        },
         min_iter_duration_ms,
         max_iter_duration_ms,
+        completed_iterations,
     );
+
+    if let Some(e) = query_err {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+async fn run_query(
+    rt: &mut Runtime,
+    connector: &str,
+    query_name: &str,
+    query: &str,
+) -> Result<(), String> {
+    let _ = rt
+        .datafusion()
+        .ctx
+        .sql(query)
+        .await
+        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
     Ok(())
 }
