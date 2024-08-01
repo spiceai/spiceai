@@ -23,6 +23,7 @@ use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
+use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
@@ -31,7 +32,7 @@ use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
 use crate::{embeddings, get_dependent_table_names};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use cache::QueryResultsCacheProvider;
@@ -202,10 +203,17 @@ pub enum Table {
     View(String),
 }
 
+struct PendingSinkRegistration {
+    dataset: Arc<Dataset>,
+    secrets: Arc<TokioRwLock<Secrets>>,
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: RwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+
+    pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
 
     /// Has the initial load of the data been completed? It is the responsibility of the caller to call `mark_initial_load_complete` when the initial load is complete.
     initial_load_complete: Mutex<bool>,
@@ -277,6 +285,7 @@ impl DataFusion {
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
             initial_load_complete: Mutex::new(false),
+            pending_sink_tables: TokioRwLock::new(Vec::new()),
         }
     }
 
@@ -372,11 +381,19 @@ impl DataFusion {
                     self.ctx
                         .register_table(dataset_table_ref.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
-
-                    return Ok(());
+                } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
+                    // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
+                    self.pending_sink_tables
+                        .write()
+                        .await
+                        .push(PendingSinkRegistration {
+                            dataset: Arc::clone(&dataset),
+                            secrets: Arc::clone(&secrets),
+                        });
+                } else {
+                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
+                        .await?;
                 }
-                self.register_accelerated_table(dataset, source, federated_read_table, secrets)
-                    .await?;
             }
             Table::Federated {
                 data_connector,
@@ -442,6 +459,55 @@ impl DataFusion {
         Ok(table_provider)
     }
 
+    async fn ensure_sink_dataset(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<()> {
+        let pending_sink_registrations = self.pending_sink_tables.read().await;
+
+        let mut pending_registration = None;
+        let mut pending_registration_idx = 0;
+        for (pending_sink_registration_idx, pending_sink_registration) in
+            pending_sink_registrations.iter().enumerate()
+        {
+            if pending_sink_registration.dataset.name == table_reference {
+                pending_registration = Some(pending_sink_registration);
+                pending_registration_idx = pending_sink_registration_idx;
+                break;
+            }
+        }
+
+        let Some(pending_registration) = pending_registration else {
+            return Ok(());
+        };
+
+        let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
+        let read_provider = sink_connector
+            .read_provider(&pending_registration.dataset)
+            .await
+            .context(UnableToResolveTableProviderSnafu)?;
+
+        tracing::info!(
+            "Loading data for dataset {}",
+            pending_registration.dataset.name
+        );
+        self.register_accelerated_table(
+            Arc::clone(&pending_registration.dataset),
+            sink_connector,
+            read_provider,
+            Arc::clone(&pending_registration.secrets),
+        )
+        .await?;
+
+        drop(pending_sink_registrations);
+
+        let mut pending_sink_registrations = self.pending_sink_tables.write().await;
+        pending_sink_registrations.remove(pending_registration_idx);
+
+        Ok(())
+    }
+
     pub async fn write_data(
         &self,
         table_reference: TableReference,
@@ -453,6 +519,9 @@ impl DataFusion {
             }
             .fail()?;
         }
+
+        self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
+            .await?;
 
         let table_provider = self.get_table_provider(&table_reference).await?;
 

@@ -19,7 +19,7 @@ use async_trait::async_trait;
 
 use std::{any::Any, pin::Pin, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
@@ -90,6 +90,10 @@ impl DataConnector for SinkConnector {
         self
     }
 
+    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
+        refresh_mode.unwrap_or(RefreshMode::Disabled)
+    }
+
     async fn read_provider(
         &self,
         _dataset: &Dataset,
@@ -120,7 +124,7 @@ impl SinkContextProvider {
 impl ContextProvider for SinkContextProvider {
     fn get_table_source(&self, _name: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
         Err(DataFusionError::NotImplemented(
-            "LocalhostContextProvider::get_table_source".to_string(),
+            "SinkContextProvider::get_table_source".to_string(),
         ))
     }
 
