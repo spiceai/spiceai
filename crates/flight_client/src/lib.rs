@@ -140,13 +140,6 @@ impl FlightClient {
         req.metadata_mut()
             .insert("authorization", auth_header_value);
 
-        if let Some(token) = &token {
-            let val = format!("Bearer {token}")
-                .parse()
-                .context(InvalidMetadataSnafu)?;
-            req.metadata_mut().insert("authorization", val);
-        }
-
         let info = self
             .flight_client
             .clone()

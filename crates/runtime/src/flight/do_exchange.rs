@@ -120,18 +120,15 @@ pub(crate) async fn handle(
                         let data_array = StructArray::from(batch.clone());
 
                         let new_schema = Arc::new(changes_schema(schema.as_ref()));
-                        let new_record_batch = match RecordBatch::try_new(
+                        let Ok(new_record_batch) = RecordBatch::try_new(
                             Arc::clone(&new_schema),
                             vec![
                                 Arc::new(op_array),
                                 Arc::new(primary_keys_array),
                                 Arc::new(data_array),
                             ],
-                        ) {
-                            Ok(new_record_batch) => new_record_batch,
-                            Err(_) => {
-                                panic!("Unable to convert record batch into change event")
-                            }
+                        ) else {
+                            panic!("Unable to convert record batch into change event")
                         };
 
                         if !schema_sent {

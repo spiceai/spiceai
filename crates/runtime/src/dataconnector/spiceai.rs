@@ -22,26 +22,12 @@ use super::Parameters;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
-use arrow::array::GenericListArray;
-use arrow::array::GenericStringBuilder;
-use arrow::array::ListArray;
-use arrow::array::ListBuilder;
-use arrow::array::RecordBatch;
-use arrow::array::StringArray;
-use arrow::array::StringBuilder;
-use arrow::array::StructArray;
-use arrow::datatypes::DataType;
-use arrow::datatypes::Field;
-use arrow::datatypes::Int32Type;
-use arrow::datatypes::Utf8Type;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::changes_schema;
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
-use data_components::debezium::change_event::Op;
 use data_components::flight::FlightFactory;
 use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
