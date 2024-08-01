@@ -56,6 +56,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("username").secret(),
     ParameterSpec::connector("password").secret(),
     ParameterSpec::connector("port").description("The port to connect to."),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for HTTP(S) client."),
 
     // Common listing table parameters
     ParameterSpec::runtime("file_format"),
@@ -143,6 +145,12 @@ impl ListingTableConnector for Https {
                 );
             };
         }
+
+        u.set_fragment(Some(&super::build_fragments(
+            &self.params,
+            vec!["client_timeout"],
+        )));
+
         Ok(u)
     }
 }
