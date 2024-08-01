@@ -1062,7 +1062,7 @@ impl Runtime {
         } else {
             let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
             federated_read_table = connector
-                .wrap_table(federated_read_table, ds)
+                .wrap_table(federated_read_table, &ds)
                 .await
                 .boxed()
                 .context(UnableToInitializeDataConnectorSnafu)?;
