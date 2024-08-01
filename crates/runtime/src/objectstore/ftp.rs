@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::ops::Range;
+use std::time::Duration;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -35,6 +37,7 @@ pub struct FTPObjectStore {
     password: String,
     host: String,
     port: String,
+    timeout: Option<Duration>,
 }
 
 impl std::fmt::Display for FTPObjectStore {
@@ -45,22 +48,42 @@ impl std::fmt::Display for FTPObjectStore {
 
 impl FTPObjectStore {
     #[must_use]
-    pub fn new(user: String, password: String, host: String, port: String) -> Self {
+    pub fn new(
+        user: String,
+        password: String,
+        host: String,
+        port: String,
+        timeout: Option<Duration>,
+    ) -> Self {
         Self {
             user,
             password,
             host,
             port,
+            timeout,
         }
     }
 
     async fn get_async_client(&self) -> object_store::Result<AsyncFtpStream> {
-        let mut client = AsyncFtpStream::connect(format!("{}:{}", self.host, self.port))
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "FTP",
-                source: e.into(),
-            })?;
+        let mut client = match self.timeout {
+            Some(timeout) => {
+                AsyncFtpStream::connect_timeout(
+                    format!("{}:{}", self.host, self.port).parse().map_err(
+                        |e: std::net::AddrParseError| object_store::Error::Generic {
+                            store: "FTP",
+                            source: e.into(),
+                        },
+                    )?,
+                    timeout,
+                )
+                .await
+            }
+            None => AsyncFtpStream::connect(format!("{}:{}", self.host, self.port)).await,
+        }
+        .map_err(|e| object_store::Error::Generic {
+            store: "FTP",
+            source: e.into(),
+        })?;
         client
             .login(&self.user, &self.password)
             .await
