@@ -46,7 +46,7 @@ impl EmbeddingConnector {
 
     /// Wrap an existing [`TableProvider`] with a [`EmbeddingTable`] provider. If no embeddings
     /// are needed for the [`Dataset`], it is not unnecessarily nested.
-    async fn wrap(
+    pub(crate) async fn wrap(
         &self,
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &Dataset,
