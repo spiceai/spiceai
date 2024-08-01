@@ -46,7 +46,7 @@ impl EmbeddingConnector {
 
     /// Wrap an existing [`TableProvider`] with a [`EmbeddingTable`] provider. If no embeddings
     /// are needed for the [`Dataset`], it is not unnecessarily nested.
-    pub(crate) async fn wrap(
+    pub(crate) async fn wrap_table(
         &self,
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &Dataset,
@@ -82,7 +82,7 @@ impl DataConnector for EmbeddingConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.wrap(self.inner_connector.read_provider(dataset).await?, dataset)
+        self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
             .await
     }
 
@@ -91,7 +91,7 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap(inner, dataset).await),
+            Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }
