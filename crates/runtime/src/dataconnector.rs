@@ -50,7 +50,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};
-use url::Url;
+use url::{form_urlencoded, Url};
 
 use std::future::Future;
 
@@ -994,6 +994,19 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 }
 
+fn build_fragments(params: &Parameters, keys: Vec<&str>) -> String {
+    let mut fragments = vec![];
+    let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
+
+    for key in keys {
+        if let Some(value) = params.get(key).expose().ok() {
+            fragment_builder.append_pair(key, value);
+        }
+    }
+    fragments.push(fragment_builder.finish());
+    fragments.join("&")
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -1140,5 +1153,22 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
+    }
+
+    #[test]
+    fn test_build_fragments() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        params.insert("csv_has_header".to_string(), "true".to_string());
+        let params = Parameters::new(
+            to_secret_map(params).into_iter().collect(),
+            "test",
+            TEST_PARAMETERS,
+        );
+
+        assert_eq!(
+            build_fragments(&params, vec!["file_format", "csv_has_header"]),
+            "file_format=csv&csv_has_header=true"
+        );
     }
 }

@@ -64,7 +64,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(endpoint) = params.get("endpoint") {
             s3_builder = s3_builder.with_endpoint(endpoint);
         }
-        if let Some(timeout) = params.get("timeout") {
+        if let Some(timeout) = params.get("client_timeout") {
             client_options =
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
                     DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
@@ -88,12 +88,22 @@ impl SpiceObjectStoreRegistry {
             format!("http://{}/", url.authority())
         };
 
-        Ok(Arc::new(
-            HttpBuilder::new()
-                .with_url(base_url)
-                .with_client_options(ClientOptions::new().with_allow_http(true))
-                .build()?,
-        ))
+        let mut client_options = ClientOptions::new().with_allow_http(true);
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+        if let Some(timeout) = params.get("client_timeout") {
+            client_options =
+                client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
+                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
+                })?);
+        }
+
+        let builder = HttpBuilder::new()
+            .with_url(base_url)
+            .with_client_options(client_options);
+
+        Ok(Arc::new(builder.build()?))
     }
 
     #[cfg(feature = "ftp")]
@@ -113,17 +123,28 @@ impl SpiceObjectStoreRegistry {
         let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
             DataFusionError::Configuration("No user provided for FTP".to_string())
         })?;
-        let password = params
-            .get("password")
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                DataFusionError::Configuration("No password provided for FTP".to_string())
+        let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No password provided for FTP".to_string())
+        })?;
+
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
             })?;
 
-        Ok(
-            Arc::new(FTPObjectStore::new(user, password, host.to_string(), port))
-                as Arc<dyn ObjectStore>,
-        )
+        Ok(Arc::new(FTPObjectStore::new(
+            user,
+            password,
+            host.to_string(),
+            port,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
     }
 
     #[cfg(feature = "ftp")]
@@ -143,17 +164,27 @@ impl SpiceObjectStoreRegistry {
         let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
             DataFusionError::Configuration("No user provided for SFTP".to_string())
         })?;
-        let password = params
-            .get("password")
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                DataFusionError::Configuration("No password provided for SFTP".to_string())
+        let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No password provided for SFTP".to_string())
+        })?;
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
             })?;
 
-        Ok(
-            Arc::new(SFTPObjectStore::new(user, password, host.to_string(), port))
-                as Arc<dyn ObjectStore>,
-        )
+        Ok(Arc::new(SFTPObjectStore::new(
+            user,
+            password,
+            host.to_string(),
+            port,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
     }
 
     fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {

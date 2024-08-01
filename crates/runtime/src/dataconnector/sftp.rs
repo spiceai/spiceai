@@ -20,7 +20,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use url::{form_urlencoded, Url};
+use url::Url;
 
 use super::{
     DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
@@ -65,6 +65,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("user").secret(),
     ParameterSpec::connector("pass").secret(),
     ParameterSpec::connector("port").description("The port to connect to."),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for SFTP client."),
 
     // Common listing table parameters
     ParameterSpec::runtime("file_format"),
@@ -111,20 +113,6 @@ impl ListingTableConnector for SFTP {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let mut fragments = vec![];
-        let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
-
-        if let Some(sftp_port) = self.params.get("port").expose().ok() {
-            fragment_builder.append_pair("port", sftp_port);
-        }
-        if let Some(sftp_user) = self.params.get("user").expose().ok() {
-            fragment_builder.append_pair("user", sftp_user);
-        }
-        if let Some(sftp_password) = self.params.get("pass").expose().ok() {
-            fragment_builder.append_pair("password", sftp_password);
-        }
-        fragments.push(fragment_builder.finish());
-
         let mut ftp_url =
             Url::parse(&dataset.from)
                 .boxed()
@@ -133,7 +121,10 @@ impl ListingTableConnector for SFTP {
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
-        ftp_url.set_fragment(Some(&fragments.join("&")));
+        ftp_url.set_fragment(Some(&super::build_fragments(
+            &self.params,
+            vec!["port", "user", "pass", "client_timeout"],
+        )));
 
         Ok(ftp_url)
     }
