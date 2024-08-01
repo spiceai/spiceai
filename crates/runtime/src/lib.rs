@@ -1057,11 +1057,12 @@ impl Runtime {
         let connector = if ds.embeddings.is_empty() {
             data_connector
         } else {
-            let connector = EmbeddingConnector::new(
-                data_connector,
-                Arc::clone(&self.embeds),
-            );
-            federated_read_table = connector.wrap(federated_read_table, ds).await.boxed().context(UnableToInitializeDataConnectorSnafu)?;
+            let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
+            federated_read_table = connector
+                .wrap(federated_read_table, ds)
+                .await
+                .boxed()
+                .context(UnableToInitializeDataConnectorSnafu)?;
             Arc::new(connector) as Arc<dyn DataConnector>
         };
 
