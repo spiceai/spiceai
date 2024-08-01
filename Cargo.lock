@@ -3161,8 +3161,10 @@ dependencies = [
  "snafu 0.8.4",
  "snowflake-api",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "util",
 ]
 
 [[package]]

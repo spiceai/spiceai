@@ -25,12 +25,14 @@ use runtime::dataupdate::{DataUpdate, UpdateType};
 #[derive(Copy, Clone)]
 pub(crate) enum Status {
     Passed,
+    Failed,
 }
 
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Status::Passed => write!(f, "passed"),
+            Status::Failed => write!(f, "failed"),
         }
     }
 }
@@ -85,6 +87,7 @@ impl BenchmarkResultsBuilder {
         status: Status,
         min_duration_ms: i64,
         max_duration_ms: i64,
+        iterations: i32,
     ) {
         self.run_id.append_value(&self.this_run_id);
         self.started_at.append_value(start_time);
@@ -94,7 +97,7 @@ impl BenchmarkResultsBuilder {
         self.status.append_value(status.to_string());
         self.min_duration_ms.append_value(min_duration_ms);
         self.max_duration_ms.append_value(max_duration_ms);
-        self.iterations.append_value(self.this_iterations);
+        self.iterations.append_value(iterations);
         self.commit_sha.append_value(&self.this_commit_sha);
         self.branch_name.append_value(&self.this_branch_name);
     }
