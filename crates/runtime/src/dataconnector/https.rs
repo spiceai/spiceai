@@ -20,7 +20,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use url::{form_urlencoded, Url};
+use url::Url;
 
 use super::{
     DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,

@@ -127,12 +127,16 @@ impl SpiceObjectStoreRegistry {
             DataFusionError::Configuration("No password provided for FTP".to_string())
         })?;
 
-        let mut client_timeout = None;
-        if let Some(timeout) = params.get("client_timeout") {
-            client_timeout = Some(fundu::parse_duration(timeout).map_err(|_| {
-                DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
-            })?);
-        }
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
 
         Ok(Arc::new(FTPObjectStore::new(
             user,
@@ -163,12 +167,16 @@ impl SpiceObjectStoreRegistry {
         let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
             DataFusionError::Configuration("No password provided for SFTP".to_string())
         })?;
-        let mut client_timeout = None;
-        if let Some(timeout) = params.get("client_timeout") {
-            client_timeout = Some(fundu::parse_duration(timeout).map_err(|_| {
-                DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
-            })?);
-        }
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
 
         Ok(Arc::new(SFTPObjectStore::new(
             user,
