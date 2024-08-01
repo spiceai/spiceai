@@ -185,34 +185,18 @@ impl FlightTable {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
     async fn get_schema(
         client: FlightClient,
         table_reference: &TableReference,
     ) -> Result<SchemaRef> {
-        let mut stream = client
-            .clone()
-            .query(
-                format!(
-                    "SELECT * FROM {} limit 1",
-                    table_reference.to_quoted_string()
-                )
-                .as_str(),
-            )
+        let schema = client
+            .get_schema(vec![table_reference.to_quoted_string()])
             .await
             .context(UnableToGetSchemaSnafu {
                 table: table_reference.to_quoted_string(),
             })?;
 
-        if stream.next().await.is_some() {
-            if let Some(schema) = stream.schema() {
-                Ok(Arc::clone(schema))
-            } else {
-                UnableToRetrieveSchemaSnafu.fail()?
-            }
-        } else {
-            UnableToRetrieveSchemaSnafu.fail()?
-        }
+        Ok(Arc::new(schema))
     }
 
     fn create_physical_plan(
