@@ -47,6 +47,7 @@ mod do_get;
 mod do_put;
 mod flightsql;
 mod get_flight_info;
+mod get_schema;
 mod handshake;
 mod util;
 
@@ -106,11 +107,10 @@ impl FlightService for Service {
 
     async fn get_schema(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         metrics::counter!("flight_get_schema_requests").increment(1);
-        tracing::trace!("get_schema - unimplemented");
-        Err(Status::unimplemented("Not yet implemented"))
+        get_schema::handle(self, request).await
     }
 
     async fn do_get(
