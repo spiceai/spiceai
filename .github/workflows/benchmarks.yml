@@ -35,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: setup-matrix
     strategy:
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     services:
@@ -73,7 +74,7 @@ jobs:
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
       - name: Install Protoc
-        if: contains(matrix.target.feature, 'spark')
+        if: contains(matrix.target.feature, 'spark') || contains(matrix.target.feature, 'databricks')
         uses: arduino/setup-protoc@v3
       
       - name: Install Databricks ODBC driver
