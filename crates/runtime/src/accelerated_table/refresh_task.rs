@@ -190,7 +190,7 @@ impl RefreshTask {
         let _timer = TimeMeasurement::new(
             match mode {
                 RefreshMode::Disabled => {
-                    unreachable!("refresh is not be called for disabled acceleration")
+                    unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
