@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
 use std::{any::Any, pin::Pin, sync::Arc};
@@ -27,51 +27,21 @@ use datafusion::{
     execution::context::SessionState,
     logical_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF},
     physical_plan::{empty::EmptyExec, ExecutionPlan},
-    sql::{
-        planner::{ContextProvider, SqlToRel},
-        sqlparser::{self, ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
-        TableReference,
-    },
+    sql::{planner::ContextProvider, TableReference},
 };
 use futures::Future;
-use snafu::prelude::*;
 
 use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(r#"Missing required parameter "{parameter}": The localhost connector requires specifying the schema up-front as a SQL CREATE TABLE statement."#))]
-    MissingSchemaParameter { parameter: String },
-
-    #[snafu(display(
-        "Unable to parse schema as a valid SQL statement: {source}\nSchema:\n{schema}"
-    ))]
-    UnableToParseSchema {
-        schema: String,
-        source: sqlparser::parser::ParserError,
-    },
-
-    #[snafu(display("Schema must be a single SQL statement"))]
-    OneStatementExpected,
-
-    #[snafu(display("Schema must be specified as a CREATE TABLE statement"))]
-    CreateTableStatementExpected,
-
-    #[snafu(display("Unable to parse schema from column definitions: {source}"))]
-    UnableToParseSchemaFromColumnDefinitions { source: DataFusionError },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
-/// Configure an accelerator to store data - the localhost connector itself does nothing.
+/// Configure an accelerator to store data - the sink connector itself does nothing.
 #[derive(Debug, Clone)]
-pub struct LocalhostConnector {
+pub struct SinkConnector {
     schema: SchemaRef,
 }
 
-impl LocalhostConnector {
+impl SinkConnector {
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
         Self { schema }
@@ -79,9 +49,9 @@ impl LocalhostConnector {
 }
 
 #[derive(Default, Copy, Clone)]
-pub struct LocalhostConnectorFactory {}
+pub struct SinkConnectorFactory {}
 
-impl LocalhostConnectorFactory {
+impl SinkConnectorFactory {
     #[must_use]
     pub fn new() -> Self {
         Self {}
@@ -93,53 +63,29 @@ impl LocalhostConnectorFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("schema")
-    .description("The schema of the table as a CREATE TABLE statement.")];
-
-impl DataConnectorFactory for LocalhostConnectorFactory {
+impl DataConnectorFactory for SinkConnectorFactory {
     fn create(
         &self,
-        params: Parameters,
+        _params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let schema = params
-                .get("schema")
-                .expose()
-                .ok_or_else(|p| Error::MissingSchemaParameter { parameter: p.0 })?;
+            let schema = Schema::new(vec![Field::new("placeholder", DataType::Utf8, false)]);
 
-            let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
-                UnableToParseSchemaSnafu {
-                    schema: schema.to_string(),
-                },
-            )?;
-            ensure!(statements.len() == 1, OneStatementExpectedSnafu);
-
-            let statement = statements[0].clone();
-
-            let columns = match statement {
-                Statement::CreateTable { columns, .. } => columns,
-                _ => CreateTableStatementExpectedSnafu.fail()?,
-            };
-
-            let schema = SqlToRel::new(&LocalhostContextProvider::new())
-                .build_schema(columns)
-                .context(UnableToParseSchemaFromColumnDefinitionsSnafu)?;
-
-            Ok(Arc::new(LocalhostConnector::new(Arc::new(schema))) as Arc<dyn DataConnector>)
+            Ok(Arc::new(SinkConnector::new(Arc::new(schema))) as Arc<dyn DataConnector>)
         })
     }
 
     fn prefix(&self) -> &'static str {
-        "localhost"
+        "sink"
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        &[]
     }
 }
 
 #[async_trait]
-impl DataConnector for LocalhostConnector {
+impl DataConnector for SinkConnector {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -159,11 +105,11 @@ impl DataConnector for LocalhostConnector {
     }
 }
 
-struct LocalhostContextProvider {
+struct SinkContextProvider {
     options: ConfigOptions,
 }
 
-impl LocalhostContextProvider {
+impl SinkContextProvider {
     pub fn new() -> Self {
         Self {
             options: ConfigOptions::default(),
@@ -171,7 +117,7 @@ impl LocalhostContextProvider {
     }
 }
 
-impl ContextProvider for LocalhostContextProvider {
+impl ContextProvider for SinkContextProvider {
     fn get_table_source(&self, _name: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
         Err(DataFusionError::NotImplemented(
             "LocalhostContextProvider::get_table_source".to_string(),
@@ -212,7 +158,7 @@ impl ContextProvider for LocalhostContextProvider {
 }
 
 #[async_trait]
-impl TableProvider for LocalhostConnector {
+impl TableProvider for SinkConnector {
     fn as_any(&self) -> &dyn Any {
         self
     }

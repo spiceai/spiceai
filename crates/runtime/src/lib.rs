@@ -490,11 +490,11 @@ impl Runtime {
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Dataset> {
+    fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
         Self::datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
-                Ok(ds) => Some(ds),
+                Ok(ds) => Some(Arc::new(ds)),
                 Err(e) => {
                     if log_errors.0 {
                         status::update_dataset(
@@ -596,7 +596,7 @@ impl Runtime {
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds));
+            futures.push(self.load_dataset(Arc::clone(ds)));
         }
 
         if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
@@ -611,7 +611,7 @@ impl Runtime {
         self.load_views(app, &valid_datasets);
     }
 
-    fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
+    fn load_views(&self, app: &App, valid_datasets: &[Arc<Dataset>]) {
         let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
 
         for view in &views {
@@ -651,13 +651,13 @@ impl Runtime {
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
-    async fn load_dataset(&self, ds: &Dataset) {
+    async fn load_dataset(&self, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let _ = retry(retry_strategy, || async {
-            let connector = match self.load_dataset_connector(ds).await {
+            let connector = match self.load_dataset_connector(Arc::clone(&ds)).await {
                 Ok(connector) => connector,
                 Err(err) => {
                     let ds_name = &ds.name;
@@ -668,7 +668,10 @@ impl Runtime {
                 }
             };
 
-            if let Err(err) = self.register_loaded_dataset(ds, connector, None).await {
+            if let Err(err) = self
+                .register_loaded_dataset(Arc::clone(&ds), connector, None)
+                .await
+            {
                 return Err(RetryError::transient(err));
             };
 
@@ -679,7 +682,7 @@ impl Runtime {
         .await;
     }
 
-    fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
+    fn load_view(&self, view: &View, all_datasets: &[Arc<Dataset>]) -> Result<()> {
         let existing_tables = all_datasets
             .iter()
             .map(|d| d.name.clone())
@@ -723,9 +726,8 @@ impl Runtime {
         Ok(data_connector)
     }
 
-    async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
+    async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let ds = ds.clone();
 
         let source = ds.source();
         let params = ds.params.clone();
@@ -803,11 +805,10 @@ impl Runtime {
 
     async fn register_loaded_dataset(
         &self,
-        ds: &Dataset,
+        ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
-        let ds = ds.clone();
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration {
@@ -840,7 +841,7 @@ impl Runtime {
 
         match self
             .register_dataset(
-                &ds,
+                Arc::clone(&ds),
                 RegisterDatasetContext {
                     data_connector: Arc::clone(&data_connector),
                     federated_read_table: read_provider,
@@ -867,7 +868,7 @@ impl Runtime {
                         );
                     };
                 }
-                let engine = ds.acceleration.map_or_else(
+                let engine = ds.acceleration.as_ref().map_or_else(
                     || "None".to_string(),
                     |acc| {
                         if acc.enabled {
@@ -927,15 +928,15 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    async fn update_dataset(&self, ds: &Dataset) {
+    async fn update_dataset(&self, ds: Arc<Dataset>) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        match self.load_dataset_connector(ds).await {
+        match self.load_dataset_connector(Arc::clone(&ds)).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
-                if Self::accelerated_dataset_supports_hot_reload(ds, &*connector) {
+                if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Updating accelerated dataset {}...", &ds.name);
                     if let Ok(()) = &self
-                        .reload_accelerated_dataset(ds, Arc::clone(&connector))
+                        .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
                         .await
                     {
                         status::update_dataset(&ds.name, status::ComponentStatus::Ready);
@@ -944,10 +945,10 @@ impl Runtime {
                     tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
                 }
 
-                self.remove_dataset(ds).await;
+                self.remove_dataset(&ds).await;
 
                 if let Ok(()) = self
-                    .register_loaded_dataset(ds, Arc::clone(&connector), None)
+                    .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
                     .await
                 {
                     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
@@ -993,10 +994,10 @@ impl Runtime {
 
     async fn reload_accelerated_dataset(
         &self,
-        ds: &Dataset,
+        ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(ds).await.map_err(|_| {
+        let read_table = connector.read_provider(&ds).await.map_err(|_| {
             UnableToLoadDatasetConnectorSnafu {
                 dataset: ds.name.clone(),
             }
@@ -1006,7 +1007,7 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), read_table, self.secrets())
+            .create_accelerated_table(&ds, Arc::clone(&connector), read_table, self.secrets())
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -1043,7 +1044,7 @@ impl Runtime {
 
     async fn register_dataset(
         &self,
-        ds: impl Borrow<Dataset>,
+        ds: Arc<Dataset>,
         register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
         let RegisterDatasetContext {
@@ -1052,8 +1053,6 @@ impl Runtime {
             source,
             accelerated_table,
         } = register_dataset_ctx;
-
-        let ds = ds.borrow();
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
@@ -1336,9 +1335,9 @@ impl Runtime {
                 let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
                 let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
-                for ds in &valid_datasets {
+                for ds in valid_datasets {
                     if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
-                        if ds != current_ds {
+                        if ds != *current_ds {
                             self.update_dataset(ds).await;
                         }
                     } else {

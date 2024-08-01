@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -352,10 +351,11 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn register_table(&self, dataset: impl Borrow<Dataset>, table: Table) -> Result<()> {
-        let dataset = dataset.borrow();
-
+    pub async fn register_table(&self, dataset: Arc<Dataset>, table: Table) -> Result<()> {
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+
+        let dataset_mode = dataset.mode();
+        let dataset_table_ref = dataset.name.clone();
 
         match table {
             Table::Accelerated {
@@ -370,7 +370,7 @@ impl DataFusion {
                     );
 
                     self.ctx
-                        .register_table(dataset.name.clone(), Arc::new(accelerated_table))
+                        .register_table(dataset_table_ref.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
 
                     return Ok(());
@@ -382,17 +382,17 @@ impl DataFusion {
                 data_connector,
                 federated_read_table,
             } => {
-                self.register_federated_table(dataset, data_connector, federated_read_table)
+                self.register_federated_table(&dataset, data_connector, federated_read_table)
                     .await?;
             }
-            Table::View(sql) => self.register_view(dataset.name.clone(), sql)?,
+            Table::View(sql) => self.register_view(dataset_table_ref.clone(), sql)?,
         }
 
-        if matches!(dataset.mode(), Mode::ReadWrite) {
+        if matches!(dataset_mode, Mode::ReadWrite) {
             self.data_writers
                 .write()
                 .map_err(|_| Error::UnableToLockDataWriters {})?
-                .insert(dataset.name.clone());
+                .insert(dataset_table_ref.clone());
         }
 
         Ok(())
@@ -634,20 +634,20 @@ impl DataFusion {
 
     async fn register_accelerated_table(
         &self,
-        dataset: &Dataset,
+        dataset: Arc<Dataset>,
         source: Arc<dyn DataConnector>,
         federated_read_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, Arc::clone(&source), federated_read_table, secrets)
+            .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
 
         self.ctx
             .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
-        self.register_metadata_table(dataset, Arc::clone(&source))
+        self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
 
         Ok(())
