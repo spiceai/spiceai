@@ -970,6 +970,10 @@ impl Runtime {
             return false;
         };
 
+        if !acceleration.enabled {
+            return false;
+        }
+
         // Datasets that configure changes and are file-accelerated automatically keep track of changes that survive restarts.
         // Thus we don't need to "hot reload" them to try to keep their data intact.
         if connector.supports_changes_stream()

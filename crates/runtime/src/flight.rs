@@ -214,7 +214,19 @@ impl Service {
                             flights.push(flight_batch.into());
                             Ok(flights)
                         }
-                        Err(e) => Err(Status::internal(e.to_string())),
+                        Err(e) => match e {
+                            DataFusionError::External(e) => {
+                                if let Some(execution_error) =
+                                    e.to_string().strip_prefix("Execution error: ")
+                                {
+                                    return Err(Status::invalid_argument(
+                                        execution_error.to_string(),
+                                    ));
+                                }
+                                Err(Status::invalid_argument(e.to_string()))
+                            }
+                            _ => Err(Status::invalid_argument(e.to_string())),
+                        },
                     }
                 }
             })
