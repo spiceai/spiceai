@@ -17,7 +17,9 @@ limitations under the License.
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
-use spicepod::component::dataset::{replication::Replication, Dataset, Mode};
+use spicepod::component::dataset::{
+    acceleration::Acceleration, replication::Replication, Dataset, Mode,
+};
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
@@ -27,18 +29,24 @@ const ITERATIONS: i32 = 5;
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
     connector: &str,
+    acceleration: Option<&Acceleration>,
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = build_app(upload_results_dataset, connector);
+    let app = build_app(upload_results_dataset, connector, acceleration);
 
     let rt = Runtime::builder().with_app(app).build().await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60*15)) => { // Databricks can take awhile to start up
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
         () = rt.load_components() => {}
+    }
+
+    if acceleration.is_some() {
+        // allow accelerated data to load
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
 
     let benchmark_results =
@@ -57,7 +65,11 @@ pub(crate) async fn write_benchmark_results(
         .map_err(|e| e.to_string())
 }
 
-fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
+fn build_app(
+    upload_results_dataset: &Option<String>,
+    connector: &str,
+    acceleration: Option<&Acceleration>,
+) -> App {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test");
 
     app_builder = match connector {
@@ -100,7 +112,17 @@ fn build_app(upload_results_dataset: &Option<String>, connector: &str) -> App {
         ));
     }
 
-    app_builder.build()
+    let mut app = app_builder.build();
+
+    if let Some(accel) = acceleration {
+        app.datasets.iter_mut().for_each(|ds| {
+            if ds.name != "oss_benchmarks" {
+                ds.acceleration = Some(accel.clone());
+            }
+        });
+    }
+
+    app
 }
 
 fn init_tracing() {

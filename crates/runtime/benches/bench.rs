@@ -33,6 +33,7 @@ use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
 use results::BenchmarkResultsBuilder;
 use runtime::{dataupdate::DataUpdate, Runtime};
+use spicepod::component::dataset::acceleration::{self, Acceleration};
 
 use crate::results::Status;
 
@@ -84,14 +85,14 @@ async fn main() -> Result<(), String> {
 
     for connector in connectors {
         let (mut benchmark_results, mut rt) =
-            setup::setup_benchmark(&upload_results_dataset, connector).await;
+            setup::setup_benchmark(&upload_results_dataset, connector, None).await;
 
         match connector {
             "spice.ai" => {
                 bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
             }
             "s3" => {
-                bench_s3::run(&mut rt, &mut benchmark_results).await?;
+                bench_s3::run(&mut rt, &mut benchmark_results, None).await?;
             }
             #[cfg(feature = "spark")]
             "spark" => {
@@ -130,8 +131,40 @@ async fn main() -> Result<(), String> {
         }
     }
 
+    let accelerators: Vec<Acceleration> = vec![
+        #[cfg(feature = "duckdb")]
+        create_acceleration("duckdb", acceleration::Mode::Memory),
+        #[cfg(feature = "duckdb")]
+        create_acceleration("duckdb", acceleration::Mode::File),
+    ];
+
+    for accelerator in accelerators {
+        let (mut benchmark_results, mut rt) =
+            setup::setup_benchmark(&upload_results_dataset, "s3", Some(&accelerator)).await;
+
+        bench_s3::run(&mut rt, &mut benchmark_results, Some(accelerator)).await?;
+
+        let data_update: DataUpdate = benchmark_results.into();
+
+        let mut records = data_update.data.clone();
+        display_records.append(&mut records);
+
+        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+            tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+            setup::write_benchmark_results(data_update, &rt).await?;
+        }
+    }
+
     display_benchmark_records(display_records).await?;
     Ok(())
+}
+
+fn create_acceleration(engine: &str, mode: acceleration::Mode) -> Acceleration {
+    Acceleration {
+        engine: Some(engine.to_string()),
+        mode,
+        ..Default::default()
+    }
 }
 
 fn get_current_unix_ms() -> i64 {
@@ -154,17 +187,16 @@ async fn run_query_and_record_result(
     let mut min_iter_duration_ms = i64::MAX;
     let mut max_iter_duration_ms = i64::MIN;
 
+    let mut query_err: Option<String> = None;
+
+    let mut completed_iterations = 0;
+
     for _ in 0..benchmark_results.iterations() {
+        completed_iterations += 1;
+
         let start_iter_time = get_current_unix_ms();
-        let _ = rt
-            .datafusion()
-            .ctx
-            .sql(query)
-            .await
-            .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
-            .collect()
-            .await
-            .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
+
+        let res = run_query(rt, connector, query_name, query).await;
         let end_iter_time = get_current_unix_ms();
 
         let iter_duration_ms = end_iter_time - start_iter_time;
@@ -173,6 +205,11 @@ async fn run_query_and_record_result(
         }
         if iter_duration_ms > max_iter_duration_ms {
             max_iter_duration_ms = iter_duration_ms;
+        }
+
+        if let Err(e) = res {
+            query_err = Some(e);
+            break;
         }
     }
 
@@ -183,10 +220,38 @@ async fn run_query_and_record_result(
         end_time,
         connector,
         query_name,
-        Status::Passed,
+        if query_err.is_some() {
+            Status::Failed
+        } else {
+            Status::Passed
+        },
         min_iter_duration_ms,
         max_iter_duration_ms,
+        completed_iterations,
     );
+
+    if let Some(e) = query_err {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+async fn run_query(
+    rt: &mut Runtime,
+    connector: &str,
+    query_name: &str,
+    query: &str,
+) -> Result<(), String> {
+    let _ = rt
+        .datafusion()
+        .ctx
+        .sql(query)
+        .await
+        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
     Ok(())
 }

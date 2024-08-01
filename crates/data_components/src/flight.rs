@@ -419,7 +419,7 @@ impl ExecutionPlan for FlightExec {
 
 #[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
-    mut client: FlightClient,
+    client: FlightClient,
     sql: &str,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     let sql = sql.to_string();
@@ -442,5 +442,13 @@ fn query_to_stream(
 
 #[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: Error) -> DataFusionError {
-    DataFusionError::Execution(format!("{e}"))
+    match e {
+        Error::Flight { source } => match source {
+            flight_client::Error::UnableToQuery { source } => {
+                DataFusionError::Execution(format!("{source}"))
+            }
+            _ => DataFusionError::Execution(format!("{source}")),
+        },
+        _ => DataFusionError::Execution(format!("{e}")),
+    }
 }

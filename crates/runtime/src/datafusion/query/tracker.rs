@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use arrow::datatypes::SchemaRef;
+use datafusion::sql::TableReference;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -36,7 +37,7 @@ pub(crate) struct QueryTracker {
     pub(crate) error_message: Option<String>,
     pub(crate) error_code: Option<ErrorCode>,
     pub(crate) timer: Instant,
-    pub(crate) datasets: Arc<HashSet<String>>,
+    pub(crate) datasets: Arc<HashSet<TableReference>>,
     pub(crate) protocol: Protocol,
 }
 
@@ -118,7 +119,7 @@ impl QueryTracker {
     }
 
     #[must_use]
-    pub(crate) fn datasets(mut self, datasets: Arc<HashSet<String>>) -> Self {
+    pub(crate) fn datasets(mut self, datasets: Arc<HashSet<TableReference>>) -> Self {
         self.datasets = datasets;
         self
     }

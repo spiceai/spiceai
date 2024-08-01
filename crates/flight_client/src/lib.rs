@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
 use std::task::Poll;
 
 use arrow::record_batch::RecordBatch;
@@ -56,7 +57,9 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to query: {source}"))]
-    UnableToQuery { source: tonic::Status },
+    UnableToQuery {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to publish: {source}"))]
     UnableToPublish { source: tonic::Status },
@@ -73,13 +76,16 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Apache Arrow Flight client for interacting with Apache Arrow Flight services.
+///
+/// This client is cheap to clone. Most fields are wrapped in `Arc`, and the `FlightServiceClient` is
+/// also designed to be cheap to clone.
 #[derive(Debug, Clone)]
 pub struct FlightClient {
-    token: Option<String>,
     flight_client: FlightServiceClient<Channel>,
-    username: String,
-    password: String,
-    url: String,
+    username: Arc<str>,
+    password: Arc<str>,
+    url: Arc<str>,
 }
 
 impl FlightClient {
@@ -88,12 +94,12 @@ impl FlightClient {
     /// # Arguments
     ///
     /// * `username` - The username to use.
-    /// * `password` - The password to use, if using an API key with Spice then provide it as `password` with an empty username.
+    /// * `password` - The password to use.
     ///
     /// # Errors
     ///
     /// Returns an error if unable to create the `FlightClient`.
-    pub async fn new(url: &str, username: &str, password: &str) -> Result<Self> {
+    pub async fn try_new(url: &str, username: &str, password: &str) -> Result<Self> {
         let flight_channel = tls::new_tls_flight_channel(url)
             .await
             .context(UnableToConnectToServerSnafu)?;
@@ -102,10 +108,9 @@ impl FlightClient {
             flight_client: FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(100 * 1024 * 1024)
                 .max_decoding_message_size(100 * 1024 * 1024),
-            token: None,
-            username: username.to_string(),
-            password: password.to_string(),
-            url: url.to_string(),
+            username: username.into(),
+            password: password.into(),
+            url: url.into(),
         })
     }
 
@@ -118,13 +123,13 @@ impl FlightClient {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn query(&mut self, query: &str) -> Result<FlightRecordBatchStream> {
-        self.authenticate_basic_token().await?;
+    pub async fn query(&self, query: &str) -> Result<FlightRecordBatchStream> {
+        let token = self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let mut req = descriptor.into_request();
 
-        let auth_header_value = match self.token.clone() {
+        let auth_header_value = match &token {
             Some(token) => format!("Bearer {token}")
                 .parse()
                 .context(InvalidMetadataSnafu)?,
@@ -135,7 +140,7 @@ impl FlightClient {
         req.metadata_mut()
             .insert("authorization", auth_header_value);
 
-        if let Some(token) = &self.token {
+        if let Some(token) = &token {
             let val = format!("Bearer {token}")
                 .parse()
                 .context(InvalidMetadataSnafu)?;
@@ -147,13 +152,13 @@ impl FlightClient {
             .clone()
             .get_flight_info(req)
             .await
-            .context(UnableToQuerySnafu)?
+            .map_err(map_tonic_error_to_message)?
             .into_inner();
 
         let ep = info.endpoint[0].clone();
         if let Some(ticket) = ep.ticket {
             let mut req = ticket.into_request();
-            let auth_header_value = match self.token.clone() {
+            let auth_header_value = match token {
                 Some(token) => format!("Bearer {token}")
                     .parse()
                     .context(InvalidMetadataSnafu)?,
@@ -168,7 +173,7 @@ impl FlightClient {
                 .clone()
                 .do_get(req)
                 .await
-                .context(UnableToQuerySnafu)?
+                .map_err(map_tonic_error_to_message)?
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
@@ -190,14 +195,14 @@ impl FlightClient {
     ///
     /// Returns an error if the dataset is not available for subscription.
     pub async fn subscribe(&mut self, dataset_path: &str) -> Result<FlightDataDecoder> {
-        self.authenticate_basic_token().await?;
+        let token = self.authenticate_basic_token().await?;
 
         let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
         let subscription_request =
             stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)].into_iter());
 
         let mut req = subscription_request.into_streaming_request();
-        let auth_header_value = match self.token.clone() {
+        let auth_header_value = match token {
             Some(token) => format!("Bearer {token}")
                 .parse()
                 .context(InvalidMetadataSnafu)?,
@@ -213,7 +218,7 @@ impl FlightClient {
             .clone()
             .do_exchange(req)
             .await
-            .context(UnableToQuerySnafu)?
+            .map_err(map_tonic_error_to_message)?
             .into_parts();
 
         Ok(FlightDataDecoder::new(
@@ -232,7 +237,7 @@ impl FlightClient {
     ///
     /// Returns an error if the data cannot be published to the flight source via `DoPut`.
     pub async fn publish(&mut self, dataset_path: &str, data: Vec<RecordBatch>) -> Result<()> {
-        self.authenticate_basic_token().await?;
+        let token = self.authenticate_basic_token().await?;
 
         let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
 
@@ -251,7 +256,7 @@ impl FlightClient {
         });
 
         let mut publish_request = request_stream.into_streaming_request();
-        let auth_header_value = match self.token.clone() {
+        let auth_header_value = match token {
             Some(token) => format!("Bearer {token}")
                 .parse()
                 .context(InvalidMetadataSnafu)?,
@@ -280,7 +285,7 @@ impl FlightClient {
         Ok(())
     }
 
-    async fn authenticate_basic_token(&mut self) -> Result<()> {
+    async fn authenticate_basic_token(&self) -> Result<Option<String>> {
         let cmd = HandshakeRequest {
             protocol_version: 0,
             payload: Bytes::default(),
@@ -297,13 +302,14 @@ impl FlightClient {
             .handshake(req)
             .await
             .context(UnableToPerformHandshakeSnafu)?;
+        let mut token: Option<String> = None;
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
-            self.token = Some(auth["Bearer ".len()..].to_string());
+            token = Some(auth["Bearer ".len()..].to_string());
         }
-        Ok(())
+        Ok(token)
     }
 
     pub fn url(&self) -> &str {
@@ -312,5 +318,12 @@ impl FlightClient {
 
     pub fn username(&self) -> &str {
         &self.username
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn map_tonic_error_to_message(e: tonic::Status) -> Error {
+    Error::UnableToQuery {
+        source: e.message().into(),
     }
 }

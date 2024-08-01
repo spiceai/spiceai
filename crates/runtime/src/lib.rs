@@ -383,12 +383,10 @@ impl Runtime {
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
                 Some(subject_name) => {
-                    tracing::info!(
-                        "All endpoints secured with TLS using certificate: {subject_name}"
-                    );
+                    tracing::info!("Endpoints secured with TLS using certificate: {subject_name}");
                 }
                 None => {
-                    tracing::info!("All endpoints secured with TLS");
+                    tracing::info!("Endpoints secured with TLS");
                 }
             }
         }
@@ -972,6 +970,10 @@ impl Runtime {
             return false;
         };
 
+        if !acceleration.enabled {
+            return false;
+        }
+
         // Datasets that configure changes and are file-accelerated automatically keep track of changes that survive restarts.
         // Thus we don't need to "hot reload" them to try to keep their data intact.
         if connector.supports_changes_stream()
@@ -1046,7 +1048,7 @@ impl Runtime {
     ) -> Result<()> {
         let RegisterDatasetContext {
             data_connector,
-            federated_read_table,
+            mut federated_read_table,
             source,
             accelerated_table,
         } = register_dataset_ctx;
@@ -1059,10 +1061,13 @@ impl Runtime {
         let connector = if ds.embeddings.is_empty() {
             data_connector
         } else {
-            Arc::new(EmbeddingConnector::new(
-                data_connector,
-                Arc::clone(&self.embeds),
-            )) as Arc<dyn DataConnector>
+            let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
+            federated_read_table = connector
+                .wrap_table(federated_read_table, ds)
+                .await
+                .boxed()
+                .context(UnableToInitializeDataConnectorSnafu)?;
+            Arc::new(connector) as Arc<dyn DataConnector>
         };
 
         // FEDERATED TABLE
@@ -1401,7 +1406,10 @@ impl Runtime {
             return;
         }
 
-        match QueryResultsCacheProvider::new(cache_config) {
+        match QueryResultsCacheProvider::try_new(
+            cache_config,
+            Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
+        ) {
             Ok(cache_provider) => {
                 tracing::info!("Initialized results cache; {cache_provider}");
                 self.datafusion().set_cache_provider(cache_provider);

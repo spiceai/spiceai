@@ -18,16 +18,47 @@ use app::AppBuilder;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
-use spicepod::component::{dataset::Dataset, params::Params};
+use spicepod::component::{
+    dataset::{acceleration::Acceleration, Dataset},
+    params::Params,
+};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
+    acceleration: Option<Acceleration>,
 ) -> Result<(), String> {
-    let test_queries = get_test_queries();
+    let test_queries = get_test_queries(&acceleration);
+
+    let bench_name = match acceleration {
+        Some(acceleration) => format!(
+            "s3_{}_{}",
+            acceleration.engine.unwrap_or_default(),
+            acceleration.mode
+        )
+        .to_lowercase(),
+        None => "s3".to_string(),
+    };
+
+    let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(rt, benchmark_results, "s3", query_name, query).await?;
+        if let Err(e) = super::run_query_and_record_result(
+            rt,
+            benchmark_results,
+            bench_name.as_str(),
+            query_name,
+            query,
+        )
+        .await
+        {
+            errors.push(format!("Query {query_name} failed with error: {e}"));
+        }
+    }
+
+    if !errors.is_empty() {
+        tracing::error!("There are failed queries:\n{}", errors.join("\n"));
+        return Err(errors.join("\n"));
     }
 
     Ok(())
@@ -67,7 +98,11 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-fn get_test_queries() -> Vec<(&'static str, &'static str)> {
+fn get_test_queries(acceleration: &Option<Acceleration>) -> Vec<(&'static str, &'static str)> {
+    let is_duckdb = acceleration
+        .as_ref()
+        .map_or(false, |a| a.engine == Some("duckdb".to_string()));
+
     vec![
         ("tpch_q1", include_str!("../queries/tpch_q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch_q2.sql")),
@@ -112,4 +147,16 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
             include_str!("../queries/tpch_simple_q5.sql"),
         ),
     ]
+    .into_iter()
+    .filter(|(q_name, _)| {
+        if is_duckdb && (*q_name == "tpch_q16" || *q_name == "tpch_q19" || *q_name == "tpch_q22") {
+            // "tpch_q16" Unable to generate SQL: Expression not supported p_size IN ([Int32(49), Int32(14), Int32(23), Int32(45), Int32(19), Int32(3), Int32(36), Int32(9)])"
+            // "tpch_q19" Unable to generate SQL: Expression not supported p_container IN ([Utf8(\"SM CASE\"), Utf8(\"SM BOX\"), Utf8(\"SM PACK\"), Utf8(\"SM PKG\")])"
+            // "tpch_q22" Expression not supported substr(c_phone, Int64(1), Int64(2)) IN ([Utf8(\"13\"), Utf8(\"31\"), Utf8(\"23\"), Utf8(\"29\"), Utf8(\"30\"), Utf8(\"18\"), Utf8(\"17\")])"
+            false
+        } else {
+            true
+        }
+    })
+    .collect()
 }

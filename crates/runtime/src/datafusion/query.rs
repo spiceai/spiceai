@@ -18,10 +18,7 @@ use std::{cell::LazyCell, sync::Arc};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow_tools::schema::verify_schema;
-use cache::{
-    cache_is_enabled_for_plan, get_logical_plan_input_tables, to_cached_record_batch_stream,
-    QueryResult,
-};
+use cache::{get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult};
 use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
@@ -117,6 +114,9 @@ impl Query {
             }
         };
 
+        let mut plan_is_cache_enabled = false;
+        let plan_cache_key = cache::key_for_logical_plan(&plan);
+
         if let Some(cache_provider) = &ctx.df.cache_provider() {
             if let Some(cached_result) = match cache_provider.get(&plan).await {
                 Ok(Some(v)) => Some(v),
@@ -149,6 +149,7 @@ impl Query {
                 ));
             }
 
+            plan_is_cache_enabled = cache_provider.cache_is_enabled_for_plan(&plan);
             tracker = tracker.results_cache_hit(false);
         }
 
@@ -166,8 +167,6 @@ impl Query {
         }
 
         tracker = tracker.datasets(Arc::new(get_logical_plan_input_tables(&plan)));
-
-        let plan_copy = plan.clone();
 
         let df = match ctx.df.ctx.execute_logical_plan(plan).await {
             Ok(df) => df,
@@ -193,12 +192,12 @@ impl Query {
             handle_error!(tracker, ErrorCode::InternalError, e, SchemaMismatch)
         };
 
-        if cache_is_enabled_for_plan(&plan_copy) {
+        if plan_is_cache_enabled {
             if let Some(cache_provider) = &ctx.df.cache_provider() {
                 let record_batch_stream = to_cached_record_batch_stream(
                     Arc::clone(cache_provider),
                     res_stream,
-                    plan_copy,
+                    plan_cache_key,
                     Arc::clone(&tracker.datasets),
                 );
 

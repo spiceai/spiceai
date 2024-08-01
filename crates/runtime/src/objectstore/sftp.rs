@@ -18,6 +18,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     net::TcpStream,
     ops::Range,
+    time::Duration,
 };
 
 use async_stream::stream;
@@ -37,6 +38,7 @@ pub struct SFTPObjectStore {
     password: String,
     host: String,
     port: String,
+    timeout: Option<Duration>,
 }
 
 impl std::fmt::Display for SFTPObjectStore {
@@ -47,18 +49,38 @@ impl std::fmt::Display for SFTPObjectStore {
 
 impl SFTPObjectStore {
     #[must_use]
-    pub fn new(user: String, password: String, host: String, port: String) -> Self {
+    pub fn new(
+        user: String,
+        password: String,
+        host: String,
+        port: String,
+        timeout: Option<Duration>,
+    ) -> Self {
         Self {
             user,
             password,
             host,
             port,
+            timeout,
         }
     }
 
     fn get_client(&self) -> object_store::Result<Session> {
-        let stream =
-            TcpStream::connect(format!("{}:{}", self.host, self.port)).map_err(handle_error)?;
+        let stream = match self.timeout {
+            Some(timeout) => TcpStream::connect_timeout(
+                &format!("{}:{}", self.host, self.port).parse().map_err(
+                    |e: std::net::AddrParseError| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: e.into(),
+                    },
+                )?,
+                timeout,
+            )
+            .map_err(handle_error)?,
+            None => {
+                TcpStream::connect(format!("{}:{}", self.host, self.port)).map_err(handle_error)?
+            }
+        };
         let mut session = Session::new().map_err(handle_error)?;
         session.set_tcp_stream(stream);
         session.handshake().map_err(handle_error)?;

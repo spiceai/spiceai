@@ -1,3 +1,4 @@
+use crate::key_for_logical_plan;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -19,11 +20,10 @@ use crate::QueryResultCache;
 use crate::Result;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
-use std::hash::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct LruCache {
@@ -79,10 +79,20 @@ impl QueryResultCache for LruCache {
         Ok(())
     }
 
-    async fn invalidate_for_table(&self, table_name: &str) -> Result<()> {
-        let name = table_name.to_string().to_lowercase();
+    async fn put_key(&self, plan_key: u64, result: CachedQueryResult) -> Result<()> {
+        self.cache.insert(plan_key, result).await;
+        Ok(())
+    }
+
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let table_name = match &table_ref {
+            TableReference::Bare { table }
+            | TableReference::Partial { table, .. }
+            | TableReference::Full { table, .. } => table,
+        };
+        let table_name = Arc::clone(table_name);
         self.cache
-            .invalidate_entries_if(move |_key, value| value.input_tables.contains(&name))
+            .invalidate_entries_if(move |_key, value| value.input_tables.contains(&table_ref))
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())
@@ -95,10 +105,4 @@ impl QueryResultCache for LruCache {
     fn item_count(&self) -> u64 {
         self.cache.entry_count()
     }
-}
-
-pub fn key_for_logical_plan(plan: &LogicalPlan) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    plan.hash(&mut hasher);
-    hasher.finish()
 }

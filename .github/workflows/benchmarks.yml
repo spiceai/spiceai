@@ -7,7 +7,7 @@ on:
       features:
         description: 'included features for bench'
         required: true
-        default: "postgres,spark,mysql,odbc,delta_lake,databricks"
+        default: "postgres,spark,mysql,odbc,delta_lake,databricks,duckdb"
 
 jobs:
   run-database-bench:

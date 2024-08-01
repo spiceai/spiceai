@@ -30,7 +30,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.80"
-version = "0.17.0-beta"
+version = "0.17.1-beta"
 
 [workspace.dependencies]
 arrow = "52.0.0"
@@ -52,7 +52,7 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
 datafusion = "40.0.0"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "16d871e159be2360aab67a6f07faeb5e9b9bdaf7" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b0ee4d0c06cb7d4d9a23344cbc64cafb97c7f0fa" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.0"
@@ -100,4 +100,6 @@ datafusion-federation = { git = "https://github.com/spiceai/datafusion-federatio
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
+
+# Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }

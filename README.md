@@ -82,16 +82,16 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name          | Description                                                                                    | Status | Protocol/Format                                                                                    |
 | ------------- | ---------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- |
-| `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
+| `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Beta   | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
+| `postgres`    | PostgreSQL                                                                                     | Beta   |                                                                                                    |
+| `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Beta   | Arrow Flight                                                                                       |
+| `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Beta   | Parquet, CSV                                                                                       |
+| `mysql`       | MySQL                                                                                          | Beta   |                                                                                                    |
+| `odbc`        | ODBC                                                                                           | Beta   | ODBC                                                                                               |
 | `delta_lake`  | [Delta Lake](https://delta.io/)                                                                | Alpha  | [Delta Lake](https://delta.io/)                                                                    |
-| `postgres`    | PostgreSQL                                                                                     | Alpha  |                                                                                                    |
-| `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha  | Arrow Flight                                                                                       |
-| `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha  | Parquet, CSV                                                                                       |
 | `dremio`      | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha  | Arrow Flight                                                                                       |
-| `mysql`       | MySQL                                                                                          | Alpha  |                                                                                                    |
 | `duckdb`      | DuckDB                                                                                         | Alpha  |                                                                                                    |
 | `clickhouse`  | Clickhouse                                                                                     | Alpha  |                                                                                                    |
-| `odbc`        | ODBC                                                                                           | Alpha  | ODBC                                                                                               |
 | `spark`       | Spark                                                                                          | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  |
 | `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
@@ -110,7 +110,7 @@ Currently supported data stores for local materialization/acceleration. More com
 | `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Alpha  | `file`           |
 
-⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
+⚠️ **DEVELOPER PREVIEW** Spice is under active **beta** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
 
 ## ⚡️ Quickstart (Local Machine)
 
@@ -200,7 +200,7 @@ spice sql
 
 The SQL REPL inferface will be shown:
 
-```
+```bash
 Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
 show tables; -- list available tables
@@ -209,7 +209,7 @@ sql>
 
 Enter `show tables;` to display the available tables for query:
 
-```
+```bash
 sql> show tables
 +---------------+--------------+---------------+------------+
 | table_catalog | table_schema | table_name    | table_type |
@@ -224,13 +224,13 @@ Time: 0.007505084 seconds. 3 rows.
 
 Enter a query to display the longest taxi trips:
 
-```
+```bash
 sql> SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
 ```
 
 Output:
 
-```
+```bash
 +---------------+--------------+
 | trip_distance | total_amount |
 +---------------+--------------+
@@ -288,13 +288,7 @@ After creating an account, you will need to create an app in order to create to 
 
 You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the `spice.ai/eth.recent_blocks` dataset.
 
-**Step 1.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
-
-```bash
-spice login
-```
-
-**Step 2.** Initialize a new project and start the runtime:
+**Step 1.** Initialize a new project.
 
 ```bash
 # Initialize a new Spice app
@@ -302,12 +296,22 @@ spice init spice_app
 
 # Change to app directory
 cd spice_app
+```
 
+**Step 2.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
+
+```bash
+spice login
+```
+
+**Step 3.** Start the runtime:
+
+```bash
 # Start the runtime
 spice run
 ```
 
-**Step 3.** Configure the dataset:
+**Step 4.** Configure the dataset:
 
 In a new terminal window, configure a new dataset using the `spice dataset configure` command:
 
@@ -323,7 +327,7 @@ dataset name: (spice_app) eth_recent_blocks
 
 Enter the description of the dataset:
 
-```
+```bash
 description: eth recent blocks
 ```
 
@@ -347,7 +351,7 @@ You should see the following output from your runtime terminal:
 2024-06-03T23:26:00.758813Z  INFO runtime::accelerated_table::refresh: Loaded 143 rows (6.22 MiB) for dataset eth_recent_blocks in 1s 244ms.
 ```
 
-**Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
+**Step 5.** In a new terminal window, use the Spice SQL REPL to query the dataset
 
 ```bash
 spice sql
@@ -383,6 +387,10 @@ You can experiment with the time it takes to generate queries when using non-acc
 ### 📄 Documentation
 
 Comprehensive documentation is available at [docs.spiceai.org](https://docs.spiceai.org/).
+
+### 🔌 Extensibility
+
+Spice.ai is designed to be extensible with extension points documented at [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md). Build custom [Data Connectors](https://docs.spiceai.org/components/data-connectors), [Data Accelerators](https://docs.spiceai.org/components/data-accelerators), [Catalog Connectors](https://docs.spiceai.org/components/catalogs), [Secret Stores](https://docs.spiceai.org/components/secret-stores), [Models](https://docs.spiceai.org/components/models), or [Embeddings](https://docs.spiceai.org/components/embeddings).
 
 ### 🔨 Upcoming Features
 

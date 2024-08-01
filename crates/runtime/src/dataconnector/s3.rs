@@ -27,7 +27,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
 use std::sync::Arc;
-use url::{form_urlencoded, Url};
+use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -122,26 +122,6 @@ impl ListingTableConnector for S3 {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let mut fragments = vec![];
-        let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
-
-        if let Some(region) = self.params.get("region").expose().ok() {
-            fragment_builder.append_pair("region", region);
-        }
-        if let Some(endpoint) = self.params.get("endpoint").expose().ok() {
-            fragment_builder.append_pair("endpoint", endpoint);
-        }
-        if let Some(key) = self.params.get("key").expose().ok() {
-            fragment_builder.append_pair("key", key);
-        };
-        if let Some(secret) = self.params.get("secret").expose().ok() {
-            fragment_builder.append_pair("secret", secret);
-        };
-        if let Some(timeout) = self.params.get("client_timeout").expose().ok() {
-            fragment_builder.append_pair("timeout", timeout);
-        }
-        fragments.push(fragment_builder.finish());
-
         let mut s3_url =
             Url::parse(&dataset.from)
                 .boxed()
@@ -150,7 +130,10 @@ impl ListingTableConnector for S3 {
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
-        s3_url.set_fragment(Some(&fragments.join("&")));
+        s3_url.set_fragment(Some(&super::build_fragments(
+            &self.params,
+            vec!["region", "endpoint", "key", "secret", "client_timeout"],
+        )));
 
         Ok(s3_url)
     }

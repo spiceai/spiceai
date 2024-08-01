@@ -17,6 +17,9 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -28,6 +31,7 @@ use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::TableReference;
 use fundu::ParseError;
 use lru_cache::LruCache;
 use metrics::atomics::AtomicU64;
@@ -37,7 +41,6 @@ use spicepod::component::runtime::ResultsCache;
 mod lru_cache;
 mod utils;
 
-pub use utils::cache_is_enabled_for_plan;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -52,7 +55,7 @@ pub enum Error {
     #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
     FailedToInvalidateCache {
         source: moka::PredicateError,
-        table_name: String,
+        table_name: Arc<str>,
     },
 }
 
@@ -74,14 +77,15 @@ impl QueryResult {
 pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
-    pub input_tables: Arc<HashSet<String>>,
+    pub input_tables: Arc<HashSet<TableReference>>,
 }
 
 #[async_trait]
 pub trait QueryResultCache {
     async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
     async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
-    async fn invalidate_for_table(&self, table_name: &str) -> Result<()>;
+    async fn put_key(&self, key: u64, result: CachedQueryResult) -> Result<()>;
+    async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()>;
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
 }
@@ -91,13 +95,15 @@ pub struct QueryResultsCacheProvider {
     cache_max_size: u64,
     ttl: std::time::Duration,
     metrics_reported_last_time: AtomicU64,
+
+    ignore_schemas: Box<[Box<str>]>,
 }
 
 impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
-    pub fn new(config: &ResultsCache) -> Result<Self> {
+    pub fn try_new(config: &ResultsCache, ignore_schemas: Box<[Box<str>]>) -> Result<Self> {
         let cache_max_size: u64 = match &config.cache_max_size {
             Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
                 .context(FailedToParseCacheMaxSizeSnafu)?
@@ -115,6 +121,7 @@ impl QueryResultsCacheProvider {
             cache_max_size,
             ttl,
             metrics_reported_last_time: AtomicU64::new(0),
+            ignore_schemas,
         };
 
         #[allow(clippy::cast_precision_loss)]
@@ -147,6 +154,15 @@ impl QueryResultsCacheProvider {
         res
     }
 
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn put_key(&self, plan_key: u64, result: CachedQueryResult) -> Result<()> {
+        let res = self.cache.put_key(plan_key, result).await;
+        self.report_size_metrics();
+        res
+    }
+
     fn report_size_metrics(&self) {
         let now_seconds = current_time_secs();
 
@@ -163,7 +179,7 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
-    pub async fn invalidate_for_table(&self, table_name: &str) -> Result<()> {
+    pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
         self.cache.invalidate_for_table(table_name).await
     }
 
@@ -180,6 +196,36 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub fn item_count(&self) -> u64 {
         self.cache.item_count()
+    }
+
+    #[must_use]
+    pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
+        let mut plan_stack = vec![plan];
+
+        while let Some(current_plan) = plan_stack.pop() {
+            match current_plan {
+                LogicalPlan::TableScan(source, ..) => {
+                    let schema_name = source.table_name.schema();
+                    let Some(schema) = schema_name else {
+                        continue;
+                    };
+                    for ignore_schema in &self.ignore_schemas {
+                        if *schema == **ignore_schema {
+                            return false;
+                        }
+                    }
+                }
+                LogicalPlan::Explain { .. }
+                | LogicalPlan::Analyze { .. }
+                | LogicalPlan::DescribeTable { .. }
+                | LogicalPlan::Statement(..) => return false,
+                _ => {}
+            }
+
+            plan_stack.extend(current_plan.inputs());
+        }
+
+        true
     }
 }
 
@@ -199,4 +245,56 @@ fn current_time_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[must_use]
+pub fn key_for_logical_plan(plan: &LogicalPlan) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    plan.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use utils::tests::parse_sql_to_logical_plan;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_system_query_describe() {
+        let sql = "describe customer";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&ResultsCache::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_show_tables() {
+        let sql = "show tables";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider = QueryResultsCacheProvider::try_new(
+            &ResultsCache::default(),
+            Box::new(["information_schema".into()]),
+        )
+        .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_simple_select() {
+        let sql = "SELECT * FROM customer";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&ResultsCache::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
 }
