@@ -206,6 +206,7 @@ impl Default for Refresh {
 }
 
 pub(crate) enum AccelerationRefreshMode {
+    Disabled,
     Full(Receiver<()>),
     Append(Option<Receiver<()>>),
     Changes(ChangesStream),
@@ -256,20 +257,21 @@ impl Refresher {
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
         ready_sender: oneshot::Sender<()>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let time_column = self.refresh.read().await.time_column.clone();
 
         let mut on_start_refresh_external = match acceleration_refresh_mode {
+            AccelerationRefreshMode::Disabled => return None,
             AccelerationRefreshMode::Append(receiver) => {
                 if let (Some(receiver), Some(_)) = (receiver, time_column) {
                     receiver
                 } else {
-                    return self.start_streaming_append(ready_sender);
+                    return Some(self.start_streaming_append(ready_sender));
                 }
             }
             AccelerationRefreshMode::Full(receiver) => receiver,
             AccelerationRefreshMode::Changes(stream) => {
-                return self.start_changes_stream(stream, ready_sender);
+                return Some(self.start_changes_stream(stream, ready_sender));
             }
         };
 
@@ -283,7 +285,7 @@ impl Refresher {
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
 
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             // first refresh is on start, thus duration is 0
             let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
 
@@ -330,7 +332,7 @@ impl Refresher {
                     }
                 }
             }
-        })
+        }))
     }
 
     fn start_streaming_append(

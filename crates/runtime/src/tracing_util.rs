@@ -59,7 +59,7 @@ fn dataset_acceleration_info(
     }
 
     match data_connector.resolve_refresh_mode(acceleration.refresh_mode) {
-        RefreshMode::Full => {}
+        RefreshMode::Full | RefreshMode::Disabled => {}
         RefreshMode::Append => {
             info.push_str(", append");
         }

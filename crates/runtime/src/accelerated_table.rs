@@ -226,6 +226,7 @@ impl Builder {
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
+            RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
                     (refresh::AccelerationRefreshMode::Append(None), None)
@@ -271,7 +272,9 @@ impl Builder {
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
-        handlers.push(refresh_handle);
+        if let Some(refresh_handle) = refresh_handle {
+            handlers.push(refresh_handle);
+        }
 
         if let Some(retention) = self.retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
