@@ -493,7 +493,7 @@ impl RefreshTask {
                 refresh.sql.clone(),
                 match refresh.mode {
                     RefreshMode::Disabled => {
-                        unreachable!("refresh is not be called for disabled acceleration")
+                        unreachable!("Refresh cannot be called when acceleration is disabled")
                     }
                     RefreshMode::Full => UpdateType::Overwrite,
                     RefreshMode::Append => UpdateType::Append,
