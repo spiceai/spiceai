@@ -114,10 +114,13 @@ pub trait DataAccelerator: Send + Sync {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
+    // The name of the accelerator
     fn name(&self) -> &'static str;
 
+    // The prefix of the table name
     fn prefix(&self) -> &'static str;
 
+    // The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 }
 
@@ -274,7 +277,6 @@ pub async fn create_accelerator_table(
     };
 
     let cloned_secrets = Arc::clone(&secrets);
-
     let secret_guard = cloned_secrets.read().await;
     let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
 
