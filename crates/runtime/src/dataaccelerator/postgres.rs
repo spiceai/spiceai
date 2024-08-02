@@ -27,6 +27,8 @@ use datafusion_table_providers::postgres::{
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::dataconnector::ParameterSpec;
+
 use super::DataAccelerator;
 
 #[derive(Debug, Snafu)]
@@ -58,10 +60,24 @@ impl Default for PostgresAccelerator {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("host"),
+    ParameterSpec::connector("port"),
+    ParameterSpec::connector("db"),
+    ParameterSpec::connector("user").secret(),
+    ParameterSpec::connector("pass").secret(),
+    ParameterSpec::connector("sslmode"),
+    ParameterSpec::connector("sslrootcert"),
+];
+
 #[async_trait]
 impl DataAccelerator for PostgresAccelerator {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self) -> &'static str {
+        "postgres"
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -87,5 +103,13 @@ impl DataAccelerator for PostgresAccelerator {
 
         let deletion_adapter = DeletionTableProviderAdapter::new(postgres_writer);
         Ok(Arc::new(deletion_adapter))
+    }
+
+    fn prefix(&self) -> &'static str {
+        "pg"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }

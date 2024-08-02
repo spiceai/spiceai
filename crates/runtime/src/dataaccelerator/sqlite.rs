@@ -25,7 +25,7 @@ use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTablePr
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, dataconnector::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -72,10 +72,16 @@ impl Default for SqliteAccelerator {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("file")];
+
 #[async_trait]
 impl DataAccelerator for SqliteAccelerator {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self) -> &'static str {
+        "sqlite"
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -98,6 +104,16 @@ impl DataAccelerator for SqliteAccelerator {
 
         let deletion_adapter = DeletionTableProviderAdapter::new(sqlite_writer);
         Ok(Arc::new(deletion_adapter))
+    }
+
+    /// .
+    fn prefix(&self) -> &'static str {
+        "sqlite"
+    }
+
+    /// .
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 

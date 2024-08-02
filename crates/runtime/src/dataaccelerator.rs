@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::dataconnector::ParameterSpec;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -41,6 +42,8 @@ use self::duckdb::DuckDBAccelerator;
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
 use self::sqlite::SqliteAccelerator;
+
+pub type Parameters = crate::dataconnector::Parameters;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -111,6 +114,12 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn name(&self) -> &'static str;
+
+    fn prefix(&self) -> &'static str;
+
+    fn parameters(&self) -> &'static [ParameterSpec];
 }
 
 pub struct AcceleratorExternalTableBuilder {
@@ -118,7 +127,7 @@ pub struct AcceleratorExternalTableBuilder {
     schema: SchemaRef,
     engine: Engine,
     mode: Mode,
-    options: Option<HashMap<String, SecretString>>,
+    options: Option<Parameters>,
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
@@ -158,7 +167,7 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn options(mut self, options: HashMap<String, SecretString>) -> Self {
+    pub fn options(mut self, options: Parameters) -> Self {
         self.options = Some(options);
         self
     }
@@ -191,10 +200,13 @@ impl AcceleratorExternalTableBuilder {
 
         let mut options: HashMap<String, String> = self
             .options
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
-            .collect();
+            .map(|x| x.to_secret_map())
+            .map(|x| {
+                x.into_iter()
+                    .map(|(k, v)| (k, v.expose_secret().to_string()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
@@ -262,7 +274,9 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
-    let secret_guard = secrets.read().await;
+    let cloned_secrets = Arc::clone(&secrets);
+
+    let secret_guard = cloned_secrets.read().await;
     let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
 
     // Inject secrets from the user-supplied params.
@@ -272,10 +286,20 @@ pub async fn create_accelerator_table(
         params_with_secrets.insert(k.clone(), secret);
     }
 
+    let params = Parameters::try_new(
+        accelerator.name(),
+        params_with_secrets.into_iter().collect::<Vec<_>>(),
+        accelerator.prefix(),
+        secrets,
+        accelerator.parameters(),
+    )
+    .await
+    .context(AccelerationCreationFailedSnafu)?;
+
     let mut external_table_builder =
         AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
-            .options(params_with_secrets)
+            .options(params)
             .indexes(acceleration_settings.indexes.clone());
 
     // If there are constraints from the federated table, then add them to the accelerated table
