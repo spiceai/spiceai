@@ -132,10 +132,15 @@ async fn main() -> Result<(), String> {
     }
 
     let accelerators: Vec<Acceleration> = vec![
+        create_acceleration("arrow", acceleration::Mode::Memory),
         #[cfg(feature = "duckdb")]
         create_acceleration("duckdb", acceleration::Mode::Memory),
         #[cfg(feature = "duckdb")]
         create_acceleration("duckdb", acceleration::Mode::File),
+        #[cfg(feature = "sqlite")]
+        create_acceleration("sqlite", acceleration::Mode::Memory),
+        #[cfg(feature = "sqlite")]
+        create_acceleration("sqlite", acceleration::Mode::File),
     ];
 
     for accelerator in accelerators {

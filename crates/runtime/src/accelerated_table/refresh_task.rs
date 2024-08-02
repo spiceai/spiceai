@@ -189,6 +189,9 @@ impl RefreshTask {
 
         let _timer = TimeMeasurement::new(
             match mode {
+                RefreshMode::Disabled => {
+                    unreachable!("Refresh cannot be called when acceleration is disabled")
+                }
                 RefreshMode::Full => "load_dataset_duration_ms",
                 RefreshMode::Append => "append_dataset_duration_ms",
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
@@ -199,6 +202,9 @@ impl RefreshTask {
         let start_time = SystemTime::now();
 
         let get_data_update_result = match mode {
+            RefreshMode::Disabled => {
+                unreachable!("Refresh cannot be called when acceleration is disabled")
+            }
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
@@ -450,7 +456,7 @@ impl RefreshTask {
     }
 
     fn trace_dataset_loaded(&self, start_time: SystemTime, num_rows: usize, memory_size: usize) {
-        if let Ok(elapse) = util::humantime_elapsed(start_time) {
+        if let Ok(elapsed) = util::humantime_elapsed(start_time) {
             let dataset_name = &self.dataset_name;
             let num_rows = util::pretty_print_number(num_rows);
             let memory_size = if memory_size > 0 {
@@ -461,11 +467,11 @@ impl RefreshTask {
 
             if self.dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
                 tracing::debug!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}.",
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}.",
                 );
             } else {
                 tracing::info!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}."
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}."
                 );
             }
         }
@@ -486,6 +492,9 @@ impl RefreshTask {
             (
                 refresh.sql.clone(),
                 match refresh.mode {
+                    RefreshMode::Disabled => {
+                        unreachable!("Refresh cannot be called when acceleration is disabled")
+                    }
                     RefreshMode::Full => UpdateType::Overwrite,
                     RefreshMode::Append => UpdateType::Append,
                     RefreshMode::Changes => unreachable!("changes are handled upstream"),

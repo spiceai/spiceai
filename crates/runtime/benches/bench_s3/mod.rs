@@ -98,11 +98,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-fn get_test_queries(acceleration: &Option<Acceleration>) -> Vec<(&'static str, &'static str)> {
-    let is_duckdb = acceleration
-        .as_ref()
-        .map_or(false, |a| a.engine == Some("duckdb".to_string()));
-
+fn get_test_queries(_acceleration: &Option<Acceleration>) -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch_q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch_q2.sql")),
@@ -146,17 +142,13 @@ fn get_test_queries(acceleration: &Option<Acceleration>) -> Vec<(&'static str, &
             "tpch_simple_q5",
             include_str!("../queries/tpch_simple_q5.sql"),
         ),
+        (
+            "tpch_simple_q6",
+            include_str!("../queries/tpch_simple_q6.sql"),
+        ),
+        (
+            "tpch_simple_q7",
+            include_str!("../queries/tpch_simple_q7.sql"),
+        ),
     ]
-    .into_iter()
-    .filter(|(q_name, _)| {
-        if is_duckdb && (*q_name == "tpch_q16" || *q_name == "tpch_q19" || *q_name == "tpch_q22") {
-            // "tpch_q16" Unable to generate SQL: Expression not supported p_size IN ([Int32(49), Int32(14), Int32(23), Int32(45), Int32(19), Int32(3), Int32(36), Int32(9)])"
-            // "tpch_q19" Unable to generate SQL: Expression not supported p_container IN ([Utf8(\"SM CASE\"), Utf8(\"SM BOX\"), Utf8(\"SM PACK\"), Utf8(\"SM PKG\")])"
-            // "tpch_q22" Expression not supported substr(c_phone, Int64(1), Int64(2)) IN ([Utf8(\"13\"), Utf8(\"31\"), Utf8(\"23\"), Utf8(\"29\"), Utf8(\"30\"), Utf8(\"18\"), Utf8(\"17\")])"
-            false
-        } else {
-            true
-        }
-    })
-    .collect()
 }

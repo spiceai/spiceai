@@ -77,7 +77,6 @@ pub mod flightsql;
 pub mod ftp;
 pub mod graphql;
 pub mod https;
-pub mod localhost;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
@@ -87,6 +86,7 @@ pub mod postgres;
 pub mod s3;
 #[cfg(feature = "ftp")]
 pub mod sftp;
+pub mod sink;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 #[cfg(feature = "spark")]
@@ -274,7 +274,7 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    register_connector_factory("localhost", localhost::LocalhostConnectorFactory::new_arc()).await;
+    register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
     #[cfg(feature = "delta_lake")]
