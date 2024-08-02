@@ -71,13 +71,6 @@ fn build_app(
     connector: &str,
     acceleration: Option<&Acceleration>,
 ) -> App {
-    // Disable result caching in benchmark test
-    let results_cache = ResultsCache {
-        enabled: false,
-        cache_max_size: None,
-        item_ttl: None,
-        eviction_policy: None,
-    };
     let mut app_builder =
         AppBuilder::new("runtime_benchmark_test").with_results_cache(results_cache);
 
