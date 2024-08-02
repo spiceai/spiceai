@@ -115,8 +115,9 @@ impl VectorSearch {
 
         for (tbl, search_vectors) in per_table_embeddings {
             tracing::debug!("Running vector search for table {:#?}", tbl.clone());
+            let primary_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
 
-            // Only support one embedding column per table.
+             // Only support one embedding column per table.
             let table_provider =
                 self.df
                     .get_table(tbl.clone())
@@ -140,7 +141,7 @@ impl VectorSearch {
             match search_vectors.first() {
                 None => unreachable!(),
                 Some(embedding) => {
-                    let mut select_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
+                    let mut select_keys = primary_keys.clone();
                     select_keys.push(embedding_column.clone());
 
                     let result = self
@@ -174,9 +175,30 @@ impl VectorSearch {
 
                     let outtt: Vec<String> =
                         outt.iter().flat_map(std::clone::Clone::clone).collect();
+                    /// Retrieve the column data for just the primary keys
+                    /// This could be empty or also include the embedding column.
+                    let public_key_data = batch
+                        .iter()
+                        .map(|b| {
+                            let proj = b
+                                .schema()
+                                .fields()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, f)| {
+                                    if primary_keys.contains(&f.name()) {
+                                        Some(i)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<usize>>();
+                            b.project(&proj)
+                        })
+                        .collect::<std::result::Result<Vec<RecordBatch>, ArrowError>>()?;
 
                     response.retrieved_entries.insert(tbl.clone(), outtt);
-                    response.retrieved_public_keys.insert(tbl, batch);
+                    response.retrieved_public_keys.insert(tbl, public_key_data);
                 }
             };
         }
