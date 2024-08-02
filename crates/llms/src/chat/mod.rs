@@ -38,6 +38,7 @@ pub mod candle;
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
+use mistralrs::RequestMessage;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -131,6 +132,72 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             ..
         }) => content.clone().unwrap_or_default(),
     }
+}
+
+/// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequesstMessage`] type.
+#[cfg(feature = "mistralrs")]
+pub fn messages_to_mistral(messages: Vec<ChatCompletionRequestMessage>) -> RequestMessage {
+    use either::Either;
+    use indexmap::IndexMap;
+    use mistralrs::MessageContent;
+
+    let output = messages.iter().map(|message| {
+        match message {
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content, ..
+            }) => {
+                let body: MessageContent = match content {
+                    ChatCompletionRequestUserMessageContent::Text(text) => either::Either::Left(text.clone()),
+                    ChatCompletionRequestUserMessageContent::Array(array) => {
+
+                        let v = array.iter().map(|p| {
+                            match p {
+                                async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
+                                    ("text".to_string(), t.text.clone())
+                                }
+                                async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(i) => {
+                                    ("image_url".to_string(), i.image_url.url.clone())
+                                }
+                            }
+
+                        }).collect::<Vec<_>>();
+                        let index_map: IndexMap<String, String> = v.into_iter().collect();
+                        either::Either::Right(vec![index_map])
+                    }
+                };
+                (String::from("user"), body)
+            },
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content,
+                ..
+            }) => ("system".to_string(), Either::Left(content.clone())),
+            | ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+                content, tool_call_id
+            }) => ("tool".to_string(), Either::Right(vec![IndexMap::from([
+                ("content".to_string(), content.clone()),
+                ("tool_call_id".to_string(), tool_call_id.clone())
+            ])])),
+            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                content,
+                name,
+                tool_calls,
+                ..
+            }) => ("assistant".to_string(), Either::Right(vec![IndexMap::from([
+                ("content".to_string(), content.clone().unwrap_or_default()),
+                ("name".to_string(), name.clone().unwrap_or_default()),
+                ("tool_calls".to_string(), tool_calls.clone().map(|m| serde_json::to_string(&m).unwrap_or_default()).unwrap_or_default())
+            ])])),
+            | ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
+                content,
+                name
+            }) => ("function".to_string(), Either::Right(vec![IndexMap::from([
+                ("content".to_string(), content.clone().unwrap_or_default().clone()),
+                ("name".to_string(), name.clone())
+            ])])),
+        }
+    }).collect::<IndexMap<_, _>>();
+
+    RequestMessage::Chat(vec![output])
 }
 
 #[async_trait]
