@@ -132,7 +132,7 @@ async fn main() -> Result<(), String> {
     }
 
     let accelerators: Vec<Acceleration> = vec![
-        create_acceleration("arrrow", acceleration::Mode::Memory),
+        create_acceleration("arrow", acceleration::Mode::Memory),
         #[cfg(feature = "duckdb")]
         create_acceleration("duckdb", acceleration::Mode::Memory),
         #[cfg(feature = "duckdb")]
