@@ -98,9 +98,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-fn get_test_queries(acceleration: &Option<Acceleration>) -> Vec<(&'static str, &'static str)> {
-    let is_accelerated = acceleration.is_some();
-
+fn get_test_queries(_acceleration: &Option<Acceleration>) -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch_q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch_q2.sql")),
@@ -144,15 +142,13 @@ fn get_test_queries(acceleration: &Option<Acceleration>) -> Vec<(&'static str, &
             "tpch_simple_q5",
             include_str!("../queries/tpch_simple_q5.sql"),
         ),
+        (
+            "tpch_simple_q6",
+            include_str!("../queries/tpch_simple_q6.sql"),
+        ),
+        (
+            "tpch_simple_q7",
+            include_str!("../queries/tpch_simple_q7.sql"),
+        ),
     ]
-    .into_iter()
-    .filter(|(q_name, _)| {
-        if is_accelerated && *q_name == "tpch_q22" {
-            // "tpch_q22" Expression not supported c_acctbal > Decimal128(Some(0),38,2)
-            false
-        } else {
-            true
-        }
-    })
-    .collect()
 }
