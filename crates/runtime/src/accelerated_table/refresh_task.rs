@@ -203,7 +203,7 @@ impl RefreshTask {
 
         let get_data_update_result = match mode {
             RefreshMode::Disabled => {
-                unreachable!("refresh is not be called for disabled acceleration")
+                unreachable!("Refresh cannot be called when acceleration is disabled")
             }
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
