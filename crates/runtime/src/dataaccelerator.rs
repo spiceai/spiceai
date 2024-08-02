@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
-use crate::dataconnector::ParameterSpec;
+use crate::parameters::ParameterSpec;
+use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -42,8 +43,6 @@ use self::duckdb::DuckDBAccelerator;
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
 use self::sqlite::SqliteAccelerator;
-
-pub type Parameters = crate::dataconnector::Parameters;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -287,7 +286,7 @@ pub async fn create_accelerator_table(
     }
 
     let params = Parameters::try_new(
-        accelerator.name(),
+        &format!("accelerator {}", accelerator.name()),
         params_with_secrets.into_iter().collect::<Vec<_>>(),
         accelerator.prefix(),
         secrets,

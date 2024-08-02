@@ -24,7 +24,7 @@ use datafusion::{
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::dataconnector::ParameterSpec;
+use crate::parameters::ParameterSpec;
 
 use super::DataAccelerator;
 

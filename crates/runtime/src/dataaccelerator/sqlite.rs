@@ -25,7 +25,7 @@ use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTablePr
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::{component::dataset::Dataset, dataconnector::ParameterSpec};
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -72,7 +72,7 @@ impl Default for SqliteAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("file")];
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::accelerator("file")];
 
 #[async_trait]
 impl DataAccelerator for SqliteAccelerator {

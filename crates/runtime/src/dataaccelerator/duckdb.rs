@@ -26,7 +26,7 @@ use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::{component::dataset::Dataset, dataconnector::ParameterSpec};
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -78,7 +78,7 @@ impl Default for DuckDBAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("file")];
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::accelerator("file")];
 
 #[async_trait]
 impl DataAccelerator for DuckDBAccelerator {

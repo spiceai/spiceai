@@ -27,7 +27,7 @@ use datafusion_table_providers::postgres::{
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::dataconnector::ParameterSpec;
+use crate::parameters::ParameterSpec;
 
 use super::DataAccelerator;
 
@@ -61,13 +61,13 @@ impl Default for PostgresAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("host"),
-    ParameterSpec::connector("port"),
-    ParameterSpec::connector("db"),
-    ParameterSpec::connector("user").secret(),
-    ParameterSpec::connector("pass").secret(),
-    ParameterSpec::connector("sslmode"),
-    ParameterSpec::connector("sslrootcert"),
+    ParameterSpec::accelerator("host"),
+    ParameterSpec::accelerator("port"),
+    ParameterSpec::accelerator("db"),
+    ParameterSpec::accelerator("user").secret(),
+    ParameterSpec::accelerator("pass").secret(),
+    ParameterSpec::accelerator("sslmode"),
+    ParameterSpec::accelerator("sslrootcert"),
 ];
 
 #[async_trait]
