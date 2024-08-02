@@ -106,12 +106,10 @@ impl DataAccelerator for SqliteAccelerator {
         Ok(Arc::new(deletion_adapter))
     }
 
-    /// .
     fn prefix(&self) -> &'static str {
         "sqlite"
     }
 
-    /// .
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }

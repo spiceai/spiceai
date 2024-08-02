@@ -22,7 +22,7 @@ impl Parameters {
     ) -> AnyErrorResult<Self> {
         let full_prefix = format!("{prefix}_");
 
-        // Convert the user-provided parameters into the format expected by the data connector
+        // Convert the user-provided parameters into the format expected by the component
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
             .filter_map(|(key, value)| {
