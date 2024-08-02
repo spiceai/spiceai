@@ -83,14 +83,14 @@ fn build_app(
             .with_dataset(make_spiceai_dataset("tpch.region", "region"))
             .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier")),
         "spark" => app_builder
-            .with_dataset(make_spark_dataset("samples.tpch.customer", "customer"))
-            .with_dataset(make_spark_dataset("samples.tpch.lineitem", "lineitem"))
-            .with_dataset(make_spark_dataset("samples.tpch.part", "part"))
-            .with_dataset(make_spark_dataset("samples.tpch.partsupp", "partsupp"))
-            .with_dataset(make_spark_dataset("samples.tpch.orders", "orders"))
-            .with_dataset(make_spark_dataset("samples.tpch.nation", "nation"))
-            .with_dataset(make_spark_dataset("samples.tpch.region", "region"))
-            .with_dataset(make_spark_dataset("samples.tpch.supplier", "supplier")),
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.customer", "customer"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.lineitem", "lineitem"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.part", "part"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.partsupp", "partsupp"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.orders", "orders"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.nation", "nation"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.region", "region"))
+            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.supplier", "supplier")),
         "s3" => crate::bench_s3::build_app(app_builder),
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder),
