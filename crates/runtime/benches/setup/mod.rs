@@ -17,8 +17,9 @@ limitations under the License.
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
 use runtime::{dataupdate::DataUpdate, Runtime};
-use spicepod::component::dataset::{
-    acceleration::Acceleration, replication::Replication, Dataset, Mode,
+use spicepod::component::{
+    dataset::{acceleration::Acceleration, replication::Replication, Dataset, Mode},
+    runtime::ResultsCache,
 };
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
@@ -70,7 +71,15 @@ fn build_app(
     connector: &str,
     acceleration: Option<&Acceleration>,
 ) -> App {
-    let mut app_builder = AppBuilder::new("runtime_benchmark_test");
+    // Disable result caching in benchmark test
+    let results_cache = ResultsCache {
+        enabled: false,
+        cache_max_size: None,
+        item_ttl: None,
+        eviction_policy: None,
+    };
+    let mut app_builder =
+        AppBuilder::new("runtime_benchmark_test").with_results_cache(results_cache);
 
     app_builder = match connector {
         "spice.ai" => app_builder
