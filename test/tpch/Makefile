@@ -69,6 +69,14 @@ pg-load:
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
 
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-create-index
+pg-create-index:
+	@echo "Creating indexes in $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_partsupp_ps_partkey ON partsupp (ps_partkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_part_p_partkey ON part (p_partkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_lineitem_l_partkey ON lineitem (l_partkey);";
+	@echo "Indexes have been successfully created to $(DB_NAME) database"
+
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
 	psql $(DB_NAME) < ./tpch_queries.sql
