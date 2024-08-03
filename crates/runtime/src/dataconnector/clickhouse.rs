@@ -34,9 +34,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, ParamLookup, ParameterSpec, Parameters,
-};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
+use crate::parameters::{ParamLookup, ParameterSpec};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
