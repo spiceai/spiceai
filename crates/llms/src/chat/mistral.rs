@@ -30,10 +30,10 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use mistralrs::{
-    Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, MistralRs, MistralRsBuilder, ModelDType, NormalLoaderBuilder, NormalRequest,
-    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
-    TokenSource, Tool, ToolChoice, ToolType, Usage,
+    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, MistralRs, MistralRsBuilder, ModelDType,
+    NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage,
+    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType, Usage,
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -52,6 +52,11 @@ use tokio::sync::mpsc::{channel, Sender};
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
+}
+
+#[allow(deprecated)]
+fn to_openai_response(resp: ChatCompletionResponse) -> CreateChatCompletionResponse {
+    serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap()
 }
 
 impl MistralLlama {
@@ -107,31 +112,29 @@ impl MistralLlama {
         _tokenizer: Option<&Path>,
         model_id: &str,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
-        GGUFLoaderBuilder::new(
-            paths
-                .get_template_filename()
-                .clone()
-                .map(|f| f.to_string_lossy().to_string()),
-            None,
-            model_id.to_string(),
-            // An empty `get_weight_filenames` will return an error below in `load_model_from_path`.
-            paths
-                .get_weight_filenames()
-                .first()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
-        )
-        .build()
-        .load_model_from_path(
-            &paths,
-            &ModelDType::Auto,
-            device,
-            false,
-            DeviceMapMetadata::dummy(),
-            None,
-            None,
-        )
-        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        let chat_template = paths
+            .get_template_filename()
+            .clone()
+            .map(|f| f.to_string_lossy().to_string());
+
+        let gguf_file = paths
+            .get_weight_filenames()
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        GGUFLoaderBuilder::new(chat_template, None, model_id.to_string(), gguf_file)
+            .build()
+            .load_model_from_path(
+                &paths,
+                &ModelDType::Auto,
+                device,
+                false,
+                DeviceMapMetadata::dummy(),
+                None,
+                None,
+            )
+            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_ggml_pipeline(
@@ -287,7 +290,7 @@ impl MistralLlama {
         message: RequestMessage,
         tools: Option<Vec<Tool>>,
         tool_choice: Option<ToolChoice>,
-    ) -> Result<Option<(String, Usage)>> {
+    ) -> Result<Option<ChatCompletionResponse>> {
         let (snd, mut rcv) = channel::<MistralResponse>(10_000);
 
         tracing::trace!("Sending request to pipeline");
@@ -303,16 +306,16 @@ impl MistralLlama {
 
         match rcv.recv().await {
             Some(response) => match response {
-                MistralResponse::CompletionDone(cr) => {
-                    let payload = cr.choices[0].text.clone();
-                    let usage = cr.usage;
-                    Ok(Some((payload, usage)))
+                MistralResponse::Done(resp) => Ok(Some(resp)),
+                MistralResponse::ModelError(e, _) => {
+                    Err(ChatError::FailedToRunModel { source: e.into() })
                 }
-                MistralResponse::CompletionModelError(err_msg, _cr) => {
-                    Err(ChatError::FailedToRunModel {
-                        source: err_msg.into(),
-                    })
+                MistralResponse::InternalError(e) | MistralResponse::ValidationError(e) => {
+                    println!("Error: {e}");
+                    Err(ChatError::FailedToRunModel { source: e })
                 }
+
+                // Don't expect MistralResponse::Chunk, should be streaming only.
                 _ => Err(ChatError::FailedToRunModel {
                     source: "Unexpected error occurred".into(),
                 }),
@@ -418,7 +421,10 @@ impl Chat for MistralLlama {
             )
             .await?
         {
-            Some((response, _usage)) => Ok(Some(response)),
+            Some(response) => Ok(response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.clone())),
             None => Ok(None),
         }
     }
@@ -463,7 +469,7 @@ impl Chat for MistralLlama {
             }
         });
 
-        let (choices, usage): (Vec<ChatChoice>, Option<Usage>) = match self
+        let resp = self
             .run_internal(messages, tools, tool_choice)
             .await
             .map_err(|e| {
@@ -473,45 +479,17 @@ impl Chat for MistralLlama {
                     param: None,
                     code: None,
                 })
-            })? {
-            Some((resp, usage)) => {
-                let choice = vec![ChatChoice {
-                    message: ChatCompletionResponseMessage {
-                        content: Some(resp),
-                        tool_calls: None,
-                        role: Role::System,
-                        function_call: None,
-                    },
-                    index: 0,
-                    finish_reason: None,
-                    logprobs: None,
-                }];
-                (choice, Some(usage))
-            }
-            None => (vec![], None),
-        };
+            })?
+            .ok_or_else(|| {
+                OpenAIError::ApiError(ApiError {
+                    message: "No response from model".to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                })
+            })?;
 
-        Ok(CreateChatCompletionResponse {
-            id: format!(
-                "{}-{}",
-                model_id.clone(),
-                thread_rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect::<String>()
-            ),
-            choices,
-            model: model_id,
-            created: 0,
-            system_fingerprint: None,
-            object: "list".to_string(),
-            usage: usage.map(|u| CompletionUsage {
-                prompt_tokens: u.prompt_tokens as u32,
-                completion_tokens: u.completion_tokens as u32,
-                total_tokens: u.total_tokens as u32,
-            }),
-        })
+        Ok(to_openai_response(resp))
     }
 
     #[allow(deprecated)]
