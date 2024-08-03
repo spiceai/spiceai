@@ -228,8 +228,8 @@ impl Dataset {
         if parts.len() > 1 {
             parts[0].to_string()
         } else {
-            if self.from == "localhost" || self.from.is_empty() {
-                return "localhost".to_string();
+            if self.from == "sink" || self.from.is_empty() {
+                return "sink".to_string();
             }
             "spiceai".to_string()
         }
