@@ -26,7 +26,7 @@ use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -78,10 +78,16 @@ impl Default for DuckDBAccelerator {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::accelerator("file")];
+
 #[async_trait]
 impl DataAccelerator for DuckDBAccelerator {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self) -> &'static str {
+        "duckdb"
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -104,6 +110,14 @@ impl DataAccelerator for DuckDBAccelerator {
 
         let deletion_adapter = DeletionTableProviderAdapter::new(duckdb_writer);
         Ok(Arc::new(deletion_adapter))
+    }
+
+    fn prefix(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
