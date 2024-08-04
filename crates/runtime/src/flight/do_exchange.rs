@@ -16,8 +16,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow::array::{make_builder, ArrayBuilder, ListBuilder, RecordBatch, StringBuilder};
+use arrow::array::{ListArray, StringArray, StructArray};
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
+use data_components::cdc::changes_schema;
+use datafusion::common::{Constraint, Constraints};
 use datafusion::sql::TableReference;
 use futures::{stream, StreamExt};
 use tokio::sync::broadcast;
@@ -64,16 +69,11 @@ pub(crate) async fn handle(
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    if flight_svc
-        .datafusion
-        .get_table(data_path.clone())
-        .await
-        .is_none()
-    {
+    let Some(table_provider) = flight_svc.datafusion.get_table(data_path.clone()).await else {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
-    }
+    };
 
     let channel_map = Arc::clone(&flight_svc.channel_map);
     let channel_map_read = channel_map.read().await;
@@ -92,6 +92,7 @@ pub(crate) async fn handle(
         let encoder = IpcDataGenerator::default();
         let mut tracker = DictionaryTracker::new(false);
         let write_options = writer::IpcWriteOptions::default();
+        let table_provider = Arc::clone(&table_provider);
         async move {
             match rx.recv().await {
                 Ok(data_update) => {
@@ -100,14 +101,51 @@ pub(crate) async fn handle(
                     let mut flights = vec![];
 
                     for batch in &data_update.data {
+                        // Convert record batch to match change schema
+                        let schema = batch.schema();
+                        let row_count = batch.num_rows();
+
+                        // "r" stands for ChangeOperation::Read
+                        let op_data = vec!["r"; row_count];
+                        let op_array = StringArray::from(op_data);
+
+                        let primary_keys_opt =
+                            get_primary_keys_from_constraints(table_provider.constraints());
+
+                        let primary_keys_array = match primary_keys_opt {
+                            Some(pk) => {
+                                let primary_keys = get_primary_keys(&schema, pk[0]);
+                                get_primary_keys_array(&primary_keys, row_count)
+                            }
+                            None => ListArray::new_null(
+                                Arc::new(Field::new("item", DataType::Utf8, false)),
+                                row_count,
+                            ),
+                        };
+
+                        let data_array = StructArray::from(batch.clone());
+
+                        let new_schema = Arc::new(changes_schema(schema.as_ref()));
+                        let Ok(new_record_batch) = RecordBatch::try_new(
+                            Arc::clone(&new_schema),
+                            vec![
+                                Arc::new(op_array),
+                                Arc::new(primary_keys_array),
+                                Arc::new(data_array),
+                            ],
+                        ) else {
+                            panic!("Unable to convert record batch into change event")
+                        };
+
                         if !schema_sent {
-                            let schema = batch.schema();
-                            flights
-                                .push(FlightData::from(SchemaAsIpc::new(&schema, &write_options)));
+                            flights.push(FlightData::from(SchemaAsIpc::new(
+                                &new_schema,
+                                &write_options,
+                            )));
                             schema_sent = true;
                         }
                         let Ok((flight_dictionaries, flight_batch)) =
-                            encoder.encoded_batch(batch, &mut tracker, &write_options)
+                            encoder.encoded_batch(&new_record_batch, &mut tracker, &write_options)
                         else {
                             panic!("Unable to encode batch")
                         };
@@ -159,4 +197,47 @@ pub(crate) async fn handle(
     });
 
     Ok(Response::new(response_stream.boxed()))
+}
+
+fn get_primary_keys_from_constraints(
+    constraints: Option<&Constraints>,
+) -> Option<Vec<&Vec<usize>>> {
+    constraints.map(|c| {
+        c.iter()
+            .filter_map(|c| match c {
+                Constraint::PrimaryKey(pk) => Some(pk),
+                Constraint::Unique(_) => None,
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn get_primary_keys<'a>(schema: &'a SchemaRef, primary_key_idx: &[usize]) -> Vec<&'a str> {
+    primary_key_idx
+        .iter()
+        .map(|idx| schema.field(*idx).name().as_str())
+        .collect()
+}
+
+fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray {
+    let mut list_builder_generic = make_builder(
+        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        row_count,
+    );
+    let list_builder = list_builder_generic
+        .as_any_mut()
+        .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+        .unwrap_or_else(|| unreachable!("created above as a list builder"));
+    for _ in 0..row_count {
+        let str_builder = list_builder
+            .values()
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap_or_else(|| unreachable!("created above as a string builder"));
+        for key in primary_keys {
+            str_builder.append_value(key);
+        }
+        list_builder.append(true);
+    }
+    list_builder.finish()
 }

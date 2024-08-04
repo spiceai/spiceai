@@ -51,6 +51,7 @@ pub(crate) async fn handle(
         x if x == DescriptorType::Path as i32 => {
             let path = fd.path.join(".");
             let table_reference = TableReference::from(path);
+            tracing::debug!("get_schema: table_reference: {:?}", table_reference);
             let Some(table) = flight_svc.datafusion.get_table(table_reference).await else {
                 return Err(Status::not_found("Table not found"));
             };

@@ -158,10 +158,14 @@ impl RefreshTask {
                     let ctx = SessionContext::new();
                     let session_state = ctx.state();
 
-                    tracing::info!(
-                        "Upserting data row for {dataset_name} with {}",
-                        Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
-                    );
+                    if primary_keys.is_empty() {
+                        tracing::debug!("Inserting data row for {dataset_name}",);
+                    } else {
+                        tracing::debug!(
+                            "Upserting data row for {dataset_name} with {}",
+                            Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
+                        );
+                    }
 
                     let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
                         inner_data.schema(),

@@ -63,6 +63,14 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve schema"))]
     UnableToRetrieveSchema,
+
+    #[snafu(display("{source}"))]
+    UnableToDecodeFlightData {
+        source: arrow_flight::error::FlightError,
+    },
+
+    #[snafu(display("Unable to subscribe to data from the Arrow Flight endpoint: {source}"))]
+    UnableToSubscribeToFlightData { source: flight_client::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -82,6 +90,11 @@ impl FlightFactory {
             client,
             dialect,
         }
+    }
+
+    #[must_use]
+    pub fn client(&self) -> FlightClient {
+        self.client.clone()
     }
 }
 
@@ -241,6 +254,14 @@ impl FlightTable {
             filters,
             limit,
         )?))
+    }
+
+    pub fn get_flight_client(&self) -> FlightClient {
+        self.client.clone()
+    }
+
+    pub fn get_table_reference(&self) -> String {
+        self.table_reference.to_string()
     }
 }
 
