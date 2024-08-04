@@ -156,7 +156,11 @@ impl FlightTable {
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(client.clone(), &table_reference).await?;
+        let schema = Self::get_query_schema(
+            client.clone(),
+            &format!("SELECT * FROM {}", table_reference.to_quoted_string()),
+        )
+        .await?;
         Ok(Self {
             name,
             client: client.clone(),
@@ -209,6 +213,15 @@ impl FlightTable {
             .context(UnableToGetSchemaSnafu {
                 table: table_reference.to_quoted_string(),
             })?;
+
+        Ok(Arc::new(schema))
+    }
+
+    async fn get_query_schema(client: FlightClient, sql: &str) -> Result<SchemaRef> {
+        let schema = client
+            .get_query_schema(sql.into())
+            .await
+            .context(FlightSnafu)?;
 
         Ok(Arc::new(schema))
     }

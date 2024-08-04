@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -131,6 +132,43 @@ impl FlightClient {
         let token = self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_path(path);
+        let mut req = descriptor.into_request();
+
+        let auth_header_value = match &token {
+            Some(token) => format!("Bearer {token}")
+                .parse()
+                .context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+        req.metadata_mut()
+            .insert("authorization", auth_header_value);
+
+        let schema_result = self
+            .flight_client
+            .clone()
+            .get_schema(req)
+            .await
+            .map_err(map_tonic_error_to_message)?
+            .into_inner();
+
+        Schema::try_from(&schema_result).context(UnableToConvertSchemaSnafu)
+    }
+
+    /// Queries the flight service for the schema of the query.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL query to inspect the schema for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema inference fails.
+    pub async fn get_query_schema<'a>(&self, sql: Cow<'a, str>) -> Result<Schema> {
+        let token = self.authenticate_basic_token().await?;
+
+        let descriptor = FlightDescriptor::new_cmd(sql.into_owned());
         let mut req = descriptor.into_request();
 
         let auth_header_value = match &token {
