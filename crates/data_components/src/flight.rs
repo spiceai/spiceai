@@ -156,7 +156,11 @@ impl FlightTable {
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(client.clone(), &table_reference).await?;
+        let schema = Self::get_query_schema(
+            client.clone(),
+            &format!("SELECT * FROM {}", table_reference.to_quoted_string()),
+        )
+        .await?;
         Ok(Self {
             name,
             client: client.clone(),
@@ -185,34 +189,41 @@ impl FlightTable {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
     async fn get_schema(
         client: FlightClient,
         table_reference: &TableReference,
     ) -> Result<SchemaRef> {
-        let mut stream = client
-            .clone()
-            .query(
-                format!(
-                    "SELECT * FROM {} limit 1",
-                    table_reference.to_quoted_string()
-                )
-                .as_str(),
-            )
+        let table_paths = match table_reference {
+            TableReference::Bare { table } => vec![table.to_string()],
+            TableReference::Partial { schema, table } => {
+                vec![schema.to_string(), table.to_string()]
+            }
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+            }
+        };
+
+        let schema = client
+            .get_schema(table_paths)
             .await
             .context(UnableToGetSchemaSnafu {
                 table: table_reference.to_quoted_string(),
             })?;
 
-        if stream.next().await.is_some() {
-            if let Some(schema) = stream.schema() {
-                Ok(Arc::clone(schema))
-            } else {
-                UnableToRetrieveSchemaSnafu.fail()?
-            }
-        } else {
-            UnableToRetrieveSchemaSnafu.fail()?
-        }
+        Ok(Arc::new(schema))
+    }
+
+    async fn get_query_schema(client: FlightClient, sql: &str) -> Result<SchemaRef> {
+        let schema = client
+            .get_query_schema(sql.into())
+            .await
+            .context(FlightSnafu)?;
+
+        Ok(Arc::new(schema))
     }
 
     fn create_physical_plan(
