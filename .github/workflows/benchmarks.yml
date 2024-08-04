@@ -79,7 +79,7 @@ jobs:
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root
           MYSQL_BENCHMARK_MYSQL_PASS: root
-          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf0_01
+          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf1
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
