@@ -189,8 +189,22 @@ impl FlightTable {
         client: FlightClient,
         table_reference: &TableReference,
     ) -> Result<SchemaRef> {
+        let table_paths = match table_reference {
+            TableReference::Bare { table } => vec![table.to_string()],
+            TableReference::Partial { schema, table } => {
+                vec![schema.to_string(), table.to_string()]
+            }
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+            }
+        };
+
         let schema = client
-            .get_schema(vec![table_reference.to_quoted_string()])
+            .get_schema(table_paths)
             .await
             .context(UnableToGetSchemaSnafu {
                 table: table_reference.to_quoted_string(),
