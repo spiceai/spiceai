@@ -88,6 +88,7 @@ pub mod model;
 pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
+mod parameters;
 pub mod podswatcher;
 pub mod secrets;
 pub mod spice_metrics;
