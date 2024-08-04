@@ -335,7 +335,25 @@ impl DataFusion {
         &self,
         table_reference: TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
-        self.ctx.table_provider(table_reference).await.ok()
+        let catalog_provider = match &table_reference {
+            TableReference::Bare { .. } | TableReference::Partial { .. } => {
+                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
+            }
+            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
+        }?;
+
+        let schema_provider = match &table_reference {
+            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
+            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
+                catalog_provider.schema(schema)
+            }
+        }?;
+
+        schema_provider
+            .table(table_reference.table())
+            .await
+            .ok()
+            .flatten()
     }
 
     pub fn register_runtime_table(
