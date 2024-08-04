@@ -159,9 +159,9 @@ impl RefreshTask {
                     let session_state = ctx.state();
 
                     if primary_keys.is_empty() {
-                        tracing::info!("Inserting data row for {dataset_name}",);
+                        tracing::debug!("Inserting data row for {dataset_name}",);
                     } else {
-                        tracing::info!(
+                        tracing::debug!(
                             "Upserting data row for {dataset_name} with {}",
                             Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
                         );
