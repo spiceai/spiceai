@@ -488,13 +488,9 @@ impl DataFusion {
         let pending_sink_registrations = self.pending_sink_tables.read().await;
 
         let mut pending_registration = None;
-        let mut pending_registration_idx = 0;
-        for (pending_sink_registration_idx, pending_sink_registration) in
-            pending_sink_registrations.iter().enumerate()
-        {
+        for pending_sink_registration in pending_sink_registrations.iter() {
             if pending_sink_registration.dataset.name == table_reference {
                 pending_registration = Some(pending_sink_registration);
-                pending_registration_idx = pending_sink_registration_idx;
                 break;
             }
         }
@@ -524,7 +520,18 @@ impl DataFusion {
         drop(pending_sink_registrations);
 
         let mut pending_sink_registrations = self.pending_sink_tables.write().await;
-        pending_sink_registrations.remove(pending_registration_idx);
+        let mut pending_registration_idx = Some(0);
+        for (pending_sink_registration_idx, pending_sink_registration) in
+            pending_sink_registrations.iter().enumerate()
+        {
+            if pending_sink_registration.dataset.name == table_reference {
+                pending_registration_idx = Some(pending_sink_registration_idx);
+                break;
+            }
+        }
+        if let Some(pending_registration_idx) = pending_registration_idx {
+            pending_sink_registrations.remove(pending_registration_idx);
+        }
 
         Ok(())
     }
