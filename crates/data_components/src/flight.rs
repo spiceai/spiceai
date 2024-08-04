@@ -91,6 +91,11 @@ impl FlightFactory {
             dialect,
         }
     }
+
+    #[must_use]
+    pub fn client(&self) -> FlightClient {
+        self.client.clone()
+    }
 }
 
 #[async_trait]

@@ -19,9 +19,12 @@ use super::DataConnectorError;
 use super::DataConnectorFactory;
 use super::ParameterSpec;
 use super::Parameters;
+use super::UnableToGetReadProviderSnafu;
 use crate::component::catalog::Catalog;
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::Runtime;
+use arrow::datatypes::Schema;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -36,6 +39,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
+use datafusion::sql::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -66,6 +70,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create flight client: {source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
+
+    #[snafu(display("Unable to get append stream schema: {source}"))]
+    UnableToGetAppendSchema { source: flight_client::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -172,10 +179,26 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let mut dataset_schema = dataset.schema();
+        if let Some(acceleration) = &dataset.acceleration {
+            if acceleration.refresh_mode == Some(RefreshMode::Append)
+                && dataset.time_column.is_none()
+            {
+                dataset_schema = Some(Arc::new(
+                    append_stream_schema(self.flight_factory.client(), dataset.name.clone())
+                        .await
+                        .boxed()
+                        .context(UnableToGetReadProviderSnafu {
+                            dataconnector: "spiceai",
+                        })?,
+                ));
+            }
+        }
+
         match Read::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
-            dataset.schema(),
+            dataset_schema,
         )
         .await
         {
@@ -296,6 +319,31 @@ impl SpiceAI {
             _ => path.to_string(),
         }
     }
+}
+
+async fn append_stream_schema(
+    client: FlightClient,
+    table_reference: TableReference,
+) -> Result<Schema> {
+    let table_paths = match table_reference {
+        TableReference::Bare { table } => vec![table.to_string()],
+        TableReference::Partial { schema, table } => {
+            vec![schema.to_string(), table.to_string()]
+        }
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => {
+            vec![catalog.to_string(), schema.to_string(), table.to_string()]
+        }
+    };
+    let schema = client
+        .get_schema(table_paths)
+        .await
+        .context(UnableToGetAppendSchemaSnafu)?;
+
+    Ok(schema)
 }
 
 pub fn subscribe_to_append_stream(
