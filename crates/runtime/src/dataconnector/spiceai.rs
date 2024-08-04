@@ -185,12 +185,15 @@ impl DataConnector for SpiceAI {
                 && dataset.time_column.is_none()
             {
                 dataset_schema = Some(Arc::new(
-                    append_stream_schema(self.flight_factory.client(), dataset.name.clone())
-                        .await
-                        .boxed()
-                        .context(UnableToGetReadProviderSnafu {
-                            dataconnector: "spiceai",
-                        })?,
+                    append_stream_schema(
+                        self.flight_factory.client(),
+                        SpiceAI::spice_dataset_path(dataset).into(),
+                    )
+                    .await
+                    .boxed()
+                    .context(UnableToGetReadProviderSnafu {
+                        dataconnector: "spiceai",
+                    })?,
                 ));
             }
         }
