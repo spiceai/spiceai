@@ -56,34 +56,55 @@ pub fn pretty_print_number(num: usize) -> String {
 }
 
 pub async fn shutdown_signal() {
-    let ctrl_c = async {
-        let signal_result = tokio::signal::ctrl_c().await;
-        if let Err(err) = signal_result {
-            tracing::error!("Failed to listen to ctrl-c signal: {err}");
-        }
+    wait_for_signal_impl().await;
+}
+
+#[cfg(unix)]
+async fn wait_for_signal_impl() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let Ok(mut signal_terminate) = signal(SignalKind::terminate()) else {
+        tracing::error!("Failed to listen to terminate signal");
+        return;
     };
-    #[cfg(unix)]
-    let sigterm = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                sigterm.recv().await;
-            }
-            Err(err) => {
-                tracing::error!("Failed to listen to terminate signal: {err}");
-            }
-        }
+    let Ok(mut signal_interrupt) = signal(SignalKind::interrupt()) else {
+        tracing::error!("Failed to listen to interrupt signal");
+        return;
     };
 
-    #[cfg(unix)]
     tokio::select! {
-        () = ctrl_c => {},
-        () = sigterm => {},
-    }
+        _ = signal_terminate.recv() => tracing::debug!("Received SIGTERM."),
+        _ = signal_interrupt.recv() => tracing::debug!("Received SIGINT."),
+    };
+}
 
-    #[cfg(not(unix))]
+#[cfg(windows)]
+async fn wait_for_signal_impl() {
+    use tokio::signal::windows;
+
+    let Ok(mut signal_c) = windows::ctrl_c() else {
+        tracing::error!("Failed to listen to ctrl_c signal");
+        return;
+    };
+    let Ok(mut signal_break) = windows::ctrl_break() else {
+        tracing::error!("Failed to listen to ctrl_break signal");
+        return;
+    };
+    let Ok(mut signal_close) = windows::ctrl_close() else {
+        tracing::error!("Failed to listen to ctrl_close signal");
+        return;
+    };
+    let Ok(mut signal_shutdown) = windows::ctrl_shutdown() else {
+        tracing::error!("Failed to listen to ctrl_shutdown signal");
+        return;
+    };
+
     tokio::select! {
-        () = ctrl_c => {},
-    }
+        _ = signal_c.recv() => tracing::debug!("Received CTRL_C."),
+        _ = signal_break.recv() => tracing::debug!("Received CTRL_BREAK."),
+        _ = signal_close.recv() => tracing::debug!("Received CTRL_CLOSE."),
+        _ = signal_shutdown.recv() => tracing::debug!("Received CTRL_SHUTDOWN."),
+    };
 }
 
 /**
