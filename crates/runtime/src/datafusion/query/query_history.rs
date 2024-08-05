@@ -196,6 +196,7 @@ impl QueryTracker {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
+        // Whilst both the query history and task history tables exist, don't need a `TaskTracker` for recording queries.
         Into::<TaskTracker>::into(self)
             .write()
             .await

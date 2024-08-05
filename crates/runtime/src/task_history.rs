@@ -40,15 +40,6 @@ use crate::accelerated_table::{AcceleratedTable, Retention};
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 
-/// Checks if a required field is missing in a [`QueryHistory`] struct. Adds field name to missing fields vector if field is None.
-macro_rules! check_required_field {
-    ($field:expr, $field_name:expr, $missing_fields:expr) => {
-        if $field.is_none() {
-            $missing_fields.push($field_name.into());
-        }
-    };
-}
-
 pub enum TaskType {
     Query,
     Chat,
@@ -221,7 +212,7 @@ impl TaskTracker {
                 "start_time",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 false,
-            ), // Used for time column of Retention
+            ), // Note: Used for time column of Retention
             Field::new(
                 "end_time",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -266,7 +257,11 @@ impl TaskTracker {
     }
 
     pub async fn write(&self) -> Result<(), Error> {
-        self.validate()?;
+        if self.end_time.is_none() {
+            return Err(Error::MissingColumnsInRow {
+                columns: "end_time".to_string(),
+            });
+        }
 
         let data = self
             .to_record_batch()
@@ -331,20 +326,6 @@ impl TaskTracker {
         )
         .boxed()
         .context(UnableToCreateRowSnafu)
-    }
-
-    fn validate(&self) -> Result<(), Error> {
-        let mut missing_fields: Vec<&str> = Vec::new();
-
-        check_required_field!(self.end_time, "end_time", missing_fields);
-
-        if missing_fields.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::MissingColumnsInRow {
-                columns: missing_fields.join(", "),
-            })
-        }
     }
 }
 
