@@ -46,17 +46,18 @@ pub(crate) async fn post(
                 task_history::TaskType::Embed,
                 input_text.as_str().into(),
                 None,
-                Some(labels_from_request(&req)),
             );
+
+            task_span = task_span.labels(labels_from_request(&req));
 
             let resp: Response = match model.embed_request(req).await {
                 Ok(response) => {
-                    task_span.set_outputs_produced(response.data.len() as u64);
+                    task_span = task_span.outputs_produced(response.data.len() as u64);
                     Json(response).into_response()
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    task_span.set_error_message(err_msg.clone());
+                    task_span = task_span.with_error_message(err_msg.clone());
                     (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
                 }
             };

@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(dead_code)]
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::dataupdate::DataUpdate;
@@ -26,6 +25,7 @@ use arrow::array::{
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::error::ArrowError;
 use datafusion::sql::TableReference;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ impl Display for TaskType {
     }
 }
 
-fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> MapArray {
+fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapArray, ArrowError> {
     let keys_field = Arc::new(Field::new("keys", DataType::Utf8, false));
     let values_field = Arc::new(Field::new("values", DataType::Utf8, false));
 
@@ -98,10 +98,9 @@ fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> MapArray {
         .len(1)
         .add_buffer(entry_offsets)
         .add_child_data(entry_struct.to_data())
-        .build()
-        .unwrap();
+        .build()?;
 
-    MapArray::from(map_data)
+    Ok(MapArray::from(map_data))
 }
 
 pub(crate) struct TaskTracker {
@@ -131,7 +130,6 @@ impl TaskTracker {
         task_type: TaskType,
         input_text: Arc<str>,
         id: Option<Uuid>,
-        labels: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
             df,
@@ -146,33 +144,24 @@ impl TaskTracker {
             outputs_produced: 0,
             cache_hit: None,
             error_message: None,
-            labels: labels.unwrap_or_default(),
+            labels: HashMap::default(),
             timer: Instant::now(),
         }
     }
 
-    pub fn set_outputs_produced(&mut self, outputs_produced: u64) {
+    pub fn outputs_produced(mut self, outputs_produced: u64) -> Self {
         self.outputs_produced = outputs_produced;
+        self
     }
 
-    pub fn set_parent_id(&mut self, parent_id: Uuid) {
-        self.parent_id = Some(parent_id);
-    }
-
-    pub fn cache_hit(&mut self, cache_hit: bool) {
-        self.cache_hit = Some(cache_hit);
-    }
-
-    pub fn set_error_message(&mut self, error_message: String) {
+    pub fn with_error_message(mut self, error_message: String) -> Self {
         self.error_message = Some(error_message);
+        self
     }
 
-    pub fn add_label(&mut self, key: String, value: String) {
-        self.labels.insert(key, value);
-    }
-
-    pub fn add_labels<I: IntoIterator<Item = (String, String)>>(&mut self, labels: I) {
+    pub fn labels<I: IntoIterator<Item = (String, String)>>(mut self, labels: I) -> Self {
         self.labels.extend(labels);
+        self
     }
 
     pub async fn instantiate_table() -> Result<Arc<AcceleratedTable>, Error> {
@@ -186,10 +175,11 @@ impl TaskTracker {
             Some(Duration::from_secs(300)),
             true,
         );
-        let query_history_table_reference =
+        let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
+
         create_internal_accelerated_table(
-            query_history_table_reference,
+            tbl_reference,
             Arc::new(TaskTracker::table_schema()),
             Acceleration::default(),
             Refresh::default(),
@@ -305,6 +295,10 @@ impl TaskTracker {
             .boxed()
             .context(UnableToCreateRowSnafu)?;
 
+        let labels = convert_hashmap_to_maparray(&self.labels)
+            .boxed()
+            .context(UnableToCreateRowSnafu)?;
+
         RecordBatch::try_new(
             Arc::new(Self::table_schema()),
             vec![
@@ -321,7 +315,7 @@ impl TaskTracker {
                 Arc::new(UInt64Array::from(vec![self.outputs_produced])),
                 Arc::new(BooleanArray::from(vec![self.cache_hit.unwrap_or(false)])),
                 Arc::new(StringArray::from(vec![self.error_message.clone()])),
-                Arc::new(convert_hashmap_to_maparray(&self.labels)),
+                Arc::new(labels),
             ],
         )
         .boxed()
