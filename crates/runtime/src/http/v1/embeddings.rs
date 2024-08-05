@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use crate::EmbeddingModelStore;
-use async_openai::types::CreateEmbeddingRequest;
+use crate::{datafusion::DataFusion, task_history, EmbeddingModelStore};
+use async_openai::types::{CreateEmbeddingRequest, EncodingFormat};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -26,18 +26,69 @@ use axum::{
 use tokio::sync::RwLock;
 
 pub(crate) async fn post(
+    Extension(df): Extension<Arc<DataFusion>>,
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Json(req): Json<CreateEmbeddingRequest>,
 ) -> Response {
+    let context_id = uuid::Uuid::new_v4();
+
+    let Ok(input_text) = serde_json::to_string(&req.input) else {
+        return (StatusCode::BAD_REQUEST, "invalid input").into_response();
+    };
+
     let model_id = req.model.clone().to_string();
     match embeddings.read().await.get(&model_id) {
         Some(model_lock) => {
             let mut model = model_lock.write().await;
-            match model.embed_request(req).await {
-                Ok(response) => Json(response).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            }
+            let mut task_span = task_history::TaskTracker::new(
+                df,
+                context_id,
+                task_history::TaskType::Embed,
+                input_text.as_str().into(),
+                None,
+                Some(labels_from_request(&req)),
+            );
+
+            let resp: Response = match model.embed_request(req).await {
+                Ok(response) => {
+                    task_span.set_outputs_produced(response.data.len() as u64);
+                    Json(response).into_response()
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    task_span.set_error_message(err_msg.clone());
+                    (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
+                }
+            };
+
+            // Shouldn't need to wait on DF write before returning response.
+            task_span.finish().await;
+            resp
         }
         None => (StatusCode::NOT_FOUND, "model not found").into_response(),
     }
+}
+
+fn labels_from_request(req: &CreateEmbeddingRequest) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    labels.insert("model".to_string(), req.model.clone());
+
+    if let Some(encoding_format) = &req.encoding_format {
+        labels.insert(
+            "encoding_format".to_string(),
+            match encoding_format {
+                EncodingFormat::Base64 => "base64".to_string(),
+                EncodingFormat::Float => "float".to_string(),
+            },
+        );
+    }
+    if let Some(user) = &req.user {
+        labels.insert("user".to_string(), user.clone());
+    }
+
+    if let Some(dims) = req.dimensions {
+        labels.insert("dimensions".to_string(), dims.to_string());
+    }
+
+    labels
 }

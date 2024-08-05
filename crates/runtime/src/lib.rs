@@ -93,6 +93,7 @@ pub mod podswatcher;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
+pub mod task_history;
 pub mod timing;
 pub mod tls;
 pub(crate) mod tracers;
@@ -238,6 +239,9 @@ pub enum Error {
 
     #[snafu(display("Unable to track query history: {source}"))]
     UnableToTrackQueryHistory { source: query_history::Error },
+
+    #[snafu(display("Unable to track task history: {source}"))]
+    UnableToTrackTaskHistory { source: task_history::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
@@ -1425,12 +1429,29 @@ impl Runtime {
             SPICE_RUNTIME_SCHEMA,
             query_history::DEFAULT_QUERY_HISTORY_TABLE,
         );
+
         match query_history::instantiate_query_history_table().await {
+            Ok(table) => {
+                let _ = self
+                    .df
+                    .register_runtime_table(query_history_table_reference, table)
+                    .context(UnableToCreateBackendSnafu);
+            }
+            Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
+        };
+
+        match task_history::TaskTracker::instantiate_table().await {
             Ok(table) => self
                 .df
-                .register_runtime_table(query_history_table_reference, table)
+                .register_runtime_table(
+                    TableReference::partial(
+                        SPICE_RUNTIME_SCHEMA,
+                        task_history::DEFAULT_TASK_HISTORY_TABLE,
+                    ),
+                    table,
+                )
                 .context(UnableToCreateBackendSnafu),
-            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+            Err(source) => Err(Error::UnableToTrackTaskHistory { source }),
         }
     }
 }
