@@ -15,15 +15,13 @@ limitations under the License.
 */
 
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use crate::{
-    component::dataset::acceleration::Acceleration,
-    datafusion::SPICE_RUNTIME_SCHEMA,
-    task_history::{TaskTracker, TaskType},
+    component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA,
+    task_history::TaskTracker,
 };
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::{
@@ -72,37 +70,6 @@ pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, 
     .await
     .boxed()
     .context(UnableToRegisterTableSnafu)
-}
-
-impl From<&QueryTracker> for TaskTracker {
-    fn from(qt: &QueryTracker) -> Self {
-        let mut labels = HashMap::new();
-        if let Some(schema) = &qt.schema {
-            labels.insert("schema".to_string(), format!("{:?}", schema));
-        }
-        if let Some(error_code) = &qt.error_code {
-            labels.insert("error_code".to_string(), format!("{}", error_code));
-        }
-        labels.insert("protocol".to_string(), format!("{:?}", qt.protocol));
-        labels.insert("datasets".to_string(), format!("{:?}", qt.datasets));
-
-        TaskTracker {
-            df: Arc::clone(&qt.df),
-            id: qt.query_id,
-            context_id: qt.query_id, // assuming context_id and id are the same; adjust as needed
-            parent_id: None,
-            task_type: TaskType::Query,
-            input_text: Arc::clone(&qt.sql),
-            start_time: qt.start_time,
-            end_time: qt.end_time,
-            execution_time: qt.execution_time,
-            outputs_produced: qt.rows_produced,
-            cache_hit: qt.results_cache_hit,
-            error_message: qt.error_message.clone(),
-            labels,
-            timer: qt.timer,
-        }
-    }
 }
 
 #[must_use]

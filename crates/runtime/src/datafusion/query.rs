@@ -26,7 +26,7 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::Snafu;
-use tracker::QueryTracker;
+pub(crate) use tracker::QueryTracker;
 
 pub mod builder;
 pub mod query_history;

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
+use crate::datafusion::query::QueryTracker;
 use crate::dataupdate::DataUpdate;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
@@ -60,6 +61,37 @@ impl Display for TaskType {
     }
 }
 
+impl From<&QueryTracker> for TaskTracker {
+    fn from(qt: &QueryTracker) -> Self {
+        let mut labels = HashMap::new();
+        if let Some(schema) = &qt.schema {
+            labels.insert("schema".to_string(), format!("{schema:?}"));
+        }
+        if let Some(error_code) = &qt.error_code {
+            labels.insert("error_code".to_string(), format!("{error_code}"));
+        }
+        labels.insert("protocol".to_string(), format!("{:?}", qt.protocol));
+        labels.insert("datasets".to_string(), format!("{:?}", qt.datasets));
+
+        TaskTracker {
+            df: Arc::clone(&qt.df),
+            id: qt.query_id,
+            context_id: qt.query_id, // assuming context_id and id are the same; adjust as needed
+            parent_id: None,
+            task_type: TaskType::Query,
+            input_text: Arc::clone(&qt.sql),
+            start_time: qt.start_time,
+            end_time: qt.end_time,
+            execution_time: qt.execution_time,
+            outputs_produced: qt.rows_produced,
+            cache_hit: qt.results_cache_hit,
+            error_message: qt.error_message.clone(),
+            labels,
+            timer: qt.timer,
+        }
+    }
+}
+
 fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapArray, ArrowError> {
     let keys_field = Arc::new(Field::new("keys", DataType::Utf8, false));
     let values_field = Arc::new(Field::new("values", DataType::Utf8, false));
@@ -72,16 +104,16 @@ fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapAr
 
     let entry_struct = StructArray::from(vec![
         (
-            keys_field.clone(),
+            Arc::clone(&keys_field),
             Arc::new(keys_array) as Arc<dyn arrow::array::Array>,
         ),
         (
-            values_field.clone(),
+            Arc::clone(&values_field),
             Arc::new(values_array) as Arc<dyn arrow::array::Array>,
         ),
     ]);
 
-    let entry_offsets = Buffer::from_vec(vec![0, labels.len() as i32]);
+    let entry_offsets = Buffer::from_vec(vec![0, labels.len() as u64]);
     let map_data_type = DataType::Map(
         Arc::new(Field::new_struct(
             "entries",
