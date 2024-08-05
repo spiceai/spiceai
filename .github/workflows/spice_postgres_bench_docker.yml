@@ -1,7 +1,13 @@
 name: spice-postgres-bench docker
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - qianqian/pg-image-index
+
+  pull_request:
+    branches:
+      - qianqian/pg-image-index
 
 jobs:
   build:

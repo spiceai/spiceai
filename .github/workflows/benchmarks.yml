@@ -2,14 +2,6 @@
 name: benchmark tests
 
 on:
-  push:
-    branches:
-      - qianqian/pg-image-index
-
-  pull_request:
-    branches:
-      - qianqian/pg-image-index
-
   workflow_dispatch:
     inputs:
       features:
