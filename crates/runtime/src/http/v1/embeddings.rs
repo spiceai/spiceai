@@ -62,8 +62,7 @@ pub(crate) async fn post(
                 }
             };
 
-            // TODO: Shouldn't need to wait on DF write before returning response.
-            task_span.finish().await;
+            task_span.finish();
             resp
         }
         None => (StatusCode::NOT_FOUND, "model not found").into_response(),

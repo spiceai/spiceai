@@ -230,7 +230,7 @@ impl TaskTracker {
         ])
     }
 
-    pub async fn finish(mut self) {
+    pub fn finish(mut self) {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -241,9 +241,11 @@ impl TaskTracker {
             self.execution_time = Some(duration.as_secs_f32());
         }
 
-        if let Err(err) = self.write().await {
-            tracing::error!("Error writing task history: {err}");
-        };
+        tokio::task::spawn(async move {
+            if let Err(err) = self.write().await {
+                tracing::error!("Error writing task history: {err}");
+            }
+        });
     }
 
     pub async fn write(&self) -> Result<(), Error> {
