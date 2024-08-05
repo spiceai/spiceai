@@ -19,8 +19,6 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
-use tokio::signal::unix::{signal, SignalKind};
-
 pub mod fibonacci_backoff;
 pub use backoff::future::retry;
 pub use backoff::Error as RetryError;
@@ -58,31 +56,55 @@ pub fn pretty_print_number(num: usize) -> String {
 }
 
 pub async fn shutdown_signal() {
-    let sigint = async {
-        match signal(SignalKind::interrupt()) {
-            Ok(mut sigint) => {
-                sigint.recv().await;
-            }
-            Err(err) => {
-                tracing::error!("Failed to listen to interrupt signal: {err}");
-            }
-        }
+    shutdown_signal_impl().await;
+}
+
+#[cfg(unix)]
+async fn shutdown_signal_impl() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let Ok(mut signal_terminate) = signal(SignalKind::terminate()) else {
+        tracing::error!("Failed to listen to terminate signal");
+        return;
     };
-    let sigterm = async {
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                sigterm.recv().await;
-            }
-            Err(err) => {
-                tracing::error!("Failed to listen to terminate signal: {err}");
-            }
-        }
+    let Ok(mut signal_interrupt) = signal(SignalKind::interrupt()) else {
+        tracing::error!("Failed to listen to interrupt signal");
+        return;
     };
 
     tokio::select! {
-        () = sigint => {},
-        () = sigterm => {},
-    }
+        _ = signal_terminate.recv() => tracing::debug!("Received SIGTERM."),
+        _ = signal_interrupt.recv() => tracing::debug!("Received SIGINT."),
+    };
+}
+
+#[cfg(windows)]
+async fn shutdown_signal_impl() {
+    use tokio::signal::windows;
+
+    let Ok(mut signal_c) = windows::ctrl_c() else {
+        tracing::error!("Failed to listen to ctrl_c signal");
+        return;
+    };
+    let Ok(mut signal_break) = windows::ctrl_break() else {
+        tracing::error!("Failed to listen to ctrl_break signal");
+        return;
+    };
+    let Ok(mut signal_close) = windows::ctrl_close() else {
+        tracing::error!("Failed to listen to ctrl_close signal");
+        return;
+    };
+    let Ok(mut signal_shutdown) = windows::ctrl_shutdown() else {
+        tracing::error!("Failed to listen to ctrl_shutdown signal");
+        return;
+    };
+
+    tokio::select! {
+        _ = signal_c.recv() => tracing::debug!("Received CTRL_C."),
+        _ = signal_break.recv() => tracing::debug!("Received CTRL_BREAK."),
+        _ = signal_close.recv() => tracing::debug!("Received CTRL_CLOSE."),
+        _ = signal_shutdown.recv() => tracing::debug!("Received CTRL_SHUTDOWN."),
+    };
 }
 
 /**
