@@ -30,10 +30,10 @@ jobs:
       working-directory: ./test/tpch
       run: |
         make tpch-init
-        for sf in 0.01 0.05 1; do
+        for sf in 0.01 1; do
           DB_NAME=tpch_sf${sf//./_}
           DBGEN_SCALE=$sf make tpch-gen
-          DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-init
+          DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME ADD_INDEXES=true make mysql-init
           DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-load
           echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-bench/backup_$DB_NAME.sql
           echo "USE $DB_NAME;" >> mysql-bench/backup_$DB_NAME.sql

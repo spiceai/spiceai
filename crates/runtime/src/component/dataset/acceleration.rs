@@ -23,6 +23,7 @@ pub mod on_conflict;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RefreshMode {
+    Disabled,
     Full,
     Append,
     Changes,

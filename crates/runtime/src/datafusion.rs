@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -24,6 +23,7 @@ use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
+use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
@@ -32,7 +32,7 @@ use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
 use crate::{embeddings, get_dependent_table_names};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use cache::QueryResultsCacheProvider;
@@ -187,6 +187,9 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
+
+    #[snafu(display("Acceleration mode {mode} not supported for dataset from source {from}"))]
+    UnsupportedAccelerationMode { mode: String, from: String },
 }
 
 pub enum Table {
@@ -203,10 +206,17 @@ pub enum Table {
     View(String),
 }
 
+struct PendingSinkRegistration {
+    dataset: Arc<Dataset>,
+    secrets: Arc<TokioRwLock<Secrets>>,
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: RwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+
+    pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
 
     /// Has the initial load of the data been completed? It is the responsibility of the caller to call `mark_initial_load_complete` when the initial load is complete.
     initial_load_complete: Mutex<bool>,
@@ -278,6 +288,7 @@ impl DataFusion {
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
             initial_load_complete: Mutex::new(false),
+            pending_sink_tables: TokioRwLock::new(Vec::new()),
         }
     }
 
@@ -324,7 +335,25 @@ impl DataFusion {
         &self,
         table_reference: TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
-        self.ctx.table_provider(table_reference).await.ok()
+        let catalog_provider = match &table_reference {
+            TableReference::Bare { .. } | TableReference::Partial { .. } => {
+                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
+            }
+            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
+        }?;
+
+        let schema_provider = match &table_reference {
+            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
+            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
+                catalog_provider.schema(schema)
+            }
+        }?;
+
+        schema_provider
+            .table(table_reference.table())
+            .await
+            .ok()
+            .flatten()
     }
 
     pub fn register_runtime_table(
@@ -352,10 +381,11 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn register_table(&self, dataset: impl Borrow<Dataset>, table: Table) -> Result<()> {
-        let dataset = dataset.borrow();
-
+    pub async fn register_table(&self, dataset: Arc<Dataset>, table: Table) -> Result<()> {
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+
+        let dataset_mode = dataset.mode();
+        let dataset_table_ref = dataset.name.clone();
 
         match table {
             Table::Accelerated {
@@ -370,29 +400,37 @@ impl DataFusion {
                     );
 
                     self.ctx
-                        .register_table(dataset.name.clone(), Arc::new(accelerated_table))
+                        .register_table(dataset_table_ref.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
-
-                    return Ok(());
+                } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
+                    // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
+                    self.pending_sink_tables
+                        .write()
+                        .await
+                        .push(PendingSinkRegistration {
+                            dataset: Arc::clone(&dataset),
+                            secrets: Arc::clone(&secrets),
+                        });
+                } else {
+                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
+                        .await?;
                 }
-                self.register_accelerated_table(dataset, source, federated_read_table, secrets)
-                    .await?;
             }
             Table::Federated {
                 data_connector,
                 federated_read_table,
             } => {
-                self.register_federated_table(dataset, data_connector, federated_read_table)
+                self.register_federated_table(&dataset, data_connector, federated_read_table)
                     .await?;
             }
-            Table::View(sql) => self.register_view(dataset.name.clone(), sql)?,
+            Table::View(sql) => self.register_view(dataset_table_ref.clone(), sql)?,
         }
 
-        if matches!(dataset.mode(), Mode::ReadWrite) {
+        if matches!(dataset_mode, Mode::ReadWrite) {
             self.data_writers
                 .write()
                 .map_err(|_| Error::UnableToLockDataWriters {})?
-                .insert(dataset.name.clone());
+                .insert(dataset_table_ref.clone());
         }
 
         Ok(())
@@ -442,6 +480,62 @@ impl DataFusion {
         Ok(table_provider)
     }
 
+    async fn ensure_sink_dataset(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<()> {
+        let pending_sink_registrations = self.pending_sink_tables.read().await;
+
+        let mut pending_registration = None;
+        for pending_sink_registration in pending_sink_registrations.iter() {
+            if pending_sink_registration.dataset.name == table_reference {
+                pending_registration = Some(pending_sink_registration);
+                break;
+            }
+        }
+
+        let Some(pending_registration) = pending_registration else {
+            return Ok(());
+        };
+
+        let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
+        let read_provider = sink_connector
+            .read_provider(&pending_registration.dataset)
+            .await
+            .context(UnableToResolveTableProviderSnafu)?;
+
+        tracing::info!(
+            "Loading data for dataset {}",
+            pending_registration.dataset.name
+        );
+        self.register_accelerated_table(
+            Arc::clone(&pending_registration.dataset),
+            sink_connector,
+            read_provider,
+            Arc::clone(&pending_registration.secrets),
+        )
+        .await?;
+
+        drop(pending_sink_registrations);
+
+        let mut pending_sink_registrations = self.pending_sink_tables.write().await;
+        let mut pending_registration_idx = Some(0);
+        for (pending_sink_registration_idx, pending_sink_registration) in
+            pending_sink_registrations.iter().enumerate()
+        {
+            if pending_sink_registration.dataset.name == table_reference {
+                pending_registration_idx = Some(pending_sink_registration_idx);
+                break;
+            }
+        }
+        if let Some(pending_registration_idx) = pending_registration_idx {
+            pending_sink_registrations.remove(pending_registration_idx);
+        }
+
+        Ok(())
+    }
+
     pub async fn write_data(
         &self,
         table_reference: TableReference,
@@ -453,6 +547,9 @@ impl DataFusion {
             }
             .fail()?;
         }
+
+        self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
+            .await?;
 
         let table_provider = self.get_table_provider(&table_reference).await?;
 
@@ -614,11 +711,25 @@ impl DataFusion {
         accelerated_table_builder.cache_provider(self.cache_provider());
 
         if refresh_mode == RefreshMode::Changes {
-            let source = Box::leak(Box::new(source));
-            let changes_stream = source.changes_stream(source_table_provider);
+            let source = Box::leak(Box::new(Arc::clone(&source)));
+            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
+
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
             }
+        }
+
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+            let source = Box::leak(Box::new(source));
+            let append_stream = source.append_stream(source_table_provider);
+            if let Some(append_stream) = append_stream {
+                accelerated_table_builder.append_stream(append_stream);
+            } else {
+                return Err(Error::UnsupportedAccelerationMode {
+                    mode: "append".to_string(),
+                    from: dataset.from.clone(),
+                });
+            };
         }
 
         Ok(accelerated_table_builder.build().await)
@@ -634,20 +745,20 @@ impl DataFusion {
 
     async fn register_accelerated_table(
         &self,
-        dataset: &Dataset,
+        dataset: Arc<Dataset>,
         source: Arc<dyn DataConnector>,
         federated_read_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, Arc::clone(&source), federated_read_table, secrets)
+            .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
 
         self.ctx
             .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
-        self.register_metadata_table(dataset, Arc::clone(&source))
+        self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
 
         Ok(())

@@ -75,7 +75,7 @@ pub(crate) async fn get(
     };
 
     let valid_datasets = Runtime::get_valid_datasets(readable_app, LogErrors(false));
-    let datasets: Vec<Dataset> = match filter.source {
+    let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()
             .filter(|d| d.source() == source)

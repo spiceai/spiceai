@@ -159,7 +159,7 @@ impl Databricks {
         let factory = DatabricksFactory::new();
 
         let params = Parameters::try_new(
-            "databricks",
+            "connector databricks",
             dataset_params.into_iter().collect(),
             factory.prefix(),
             runtime.secrets(),

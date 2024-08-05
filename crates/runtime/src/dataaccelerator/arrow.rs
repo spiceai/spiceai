@@ -24,6 +24,8 @@ use datafusion::{
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::parameters::ParameterSpec;
+
 use super::DataAccelerator;
 
 pub struct ArrowAccelerator {
@@ -51,6 +53,10 @@ impl DataAccelerator for ArrowAccelerator {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "arrow"
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
@@ -60,5 +66,13 @@ impl DataAccelerator for ArrowAccelerator {
         TableProviderFactory::create(&self.arrow_factory, &ctx.state(), cmd)
             .await
             .boxed()
+    }
+
+    fn prefix(&self) -> &'static str {
+        "arrow"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &[]
     }
 }
