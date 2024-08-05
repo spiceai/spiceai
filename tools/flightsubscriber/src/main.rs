@@ -22,7 +22,7 @@ use arrow_flight::{
 };
 use clap::Parser;
 use futures::{stream, StreamExt};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tracing_subscriber::filter::Directive;
 
 #[derive(Parser)]
@@ -37,6 +37,10 @@ pub struct Args {
 
     #[arg(long, value_name = "DATASET_PATH", default_value = "test")]
     pub path: String,
+
+    /// Path to the root certificate file to use to verify server's TLS certificate
+    #[arg(long, value_name = "TLS_ROOT_CERTIFICATE_FILE")]
+    pub tls_root_certificate_file: Option<String>,
 }
 
 /// Reads a Parquet file and sends it via DoPut to an Apache Arrow Flight endpoint.
@@ -46,9 +50,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Set up the Flight client
-    let channel = Channel::from_shared(args.flight_endpoint)?
-        .connect()
-        .await?;
+    let mut flight_endpoint = args.flight_endpoint;
+    let channel = if let Some(tls_root_certificate_file) = args.tls_root_certificate_file {
+        let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
+        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
+        let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
+        if flight_endpoint == "http://localhost:50051" {
+            flight_endpoint = "https://localhost:50051".to_string();
+        }
+        Channel::from_shared(flight_endpoint)?
+            .tls_config(client_tls_config)?
+            .connect()
+            .await
+    } else {
+        Channel::from_shared(flight_endpoint)?.connect().await
+    }?;
     let mut client = FlightServiceClient::new(channel);
 
     let flight_descriptor = FlightDescriptor::new_path(vec![args.path]);
