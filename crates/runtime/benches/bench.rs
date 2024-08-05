@@ -186,6 +186,10 @@ async fn run_query_and_record_result(
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
+    // Additional round of query run before recording results.
+    // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
+    let _ = run_query(rt, connector, query_name, query).await;
+
     tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
 

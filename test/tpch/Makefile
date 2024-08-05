@@ -60,11 +60,9 @@ pg-init:
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-load
 pg-load:
-	@for i in tpch-kit/dbgen/*.tbl; do \
-		table=$$(basename $$i .tbl); \
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' $$i > ./tmp/$$table.tbl; \
-		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -q -c "TRUNCATE $$table"; \
+		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
 		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.tbl' CSV DELIMITER '|';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
@@ -81,7 +79,7 @@ pg-create-index:
 tpch-run-pq:
 	psql $(DB_NAME) < ./tpch_queries.sql
 
-# Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-init
+# Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch ADD_INDEXES=true make mysql-init
 mysql-init:
 	@echo "Checking if database '$(DB_NAME)' exists..."
 	@if mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -e "USE $(DB_NAME);" 2>/dev/null; then \
@@ -99,16 +97,20 @@ mysql-init:
 	@echo "Creating tables from dss.ddl..."
 	@mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) < ./tpch-kit/dbgen/dss.ddl
 
+	@if [ "$(ADD_INDEXES)" = "true" ] || [ "$(ADD_INDEXES)" = "1" ]; then \
+		echo "Applying indexes from tpch_index.sql..."; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) < tpch_index.sql; \
+		echo "Indexes applied successfully."; \
+	fi
+
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
 mysql-load:
 	@mkdir -p ./tmp
-	@for i in tpch-kit/dbgen/*.tbl; do \
-		table=$$(basename $$i .tbl); \
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' $$i > ./tmp/$$table.tbl; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) -e "TRUNCATE TABLE $$table;"; \
+		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."

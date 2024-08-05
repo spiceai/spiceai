@@ -187,6 +187,9 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
+
+    #[snafu(display("Acceleration mode {mode} not supported for dataset from source {from}"))]
+    UnsupportedAccelerationMode { mode: String, from: String },
 }
 
 pub enum Table {
@@ -332,7 +335,25 @@ impl DataFusion {
         &self,
         table_reference: TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
-        self.ctx.table_provider(table_reference).await.ok()
+        let catalog_provider = match &table_reference {
+            TableReference::Bare { .. } | TableReference::Partial { .. } => {
+                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
+            }
+            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
+        }?;
+
+        let schema_provider = match &table_reference {
+            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
+            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
+                catalog_provider.schema(schema)
+            }
+        }?;
+
+        schema_provider
+            .table(table_reference.table())
+            .await
+            .ok()
+            .flatten()
     }
 
     pub fn register_runtime_table(
@@ -467,13 +488,9 @@ impl DataFusion {
         let pending_sink_registrations = self.pending_sink_tables.read().await;
 
         let mut pending_registration = None;
-        let mut pending_registration_idx = 0;
-        for (pending_sink_registration_idx, pending_sink_registration) in
-            pending_sink_registrations.iter().enumerate()
-        {
+        for pending_sink_registration in pending_sink_registrations.iter() {
             if pending_sink_registration.dataset.name == table_reference {
                 pending_registration = Some(pending_sink_registration);
-                pending_registration_idx = pending_sink_registration_idx;
                 break;
             }
         }
@@ -503,7 +520,18 @@ impl DataFusion {
         drop(pending_sink_registrations);
 
         let mut pending_sink_registrations = self.pending_sink_tables.write().await;
-        pending_sink_registrations.remove(pending_registration_idx);
+        let mut pending_registration_idx = Some(0);
+        for (pending_sink_registration_idx, pending_sink_registration) in
+            pending_sink_registrations.iter().enumerate()
+        {
+            if pending_sink_registration.dataset.name == table_reference {
+                pending_registration_idx = Some(pending_sink_registration_idx);
+                break;
+            }
+        }
+        if let Some(pending_registration_idx) = pending_registration_idx {
+            pending_sink_registrations.remove(pending_registration_idx);
+        }
 
         Ok(())
     }
@@ -683,11 +711,25 @@ impl DataFusion {
         accelerated_table_builder.cache_provider(self.cache_provider());
 
         if refresh_mode == RefreshMode::Changes {
-            let source = Box::leak(Box::new(source));
-            let changes_stream = source.changes_stream(source_table_provider);
+            let source = Box::leak(Box::new(Arc::clone(&source)));
+            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
+
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
             }
+        }
+
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+            let source = Box::leak(Box::new(source));
+            let append_stream = source.append_stream(source_table_provider);
+            if let Some(append_stream) = append_stream {
+                accelerated_table_builder.append_stream(append_stream);
+            } else {
+                return Err(Error::UnsupportedAccelerationMode {
+                    mode: "append".to_string(),
+                    from: dataset.from.clone(),
+                });
+            };
         }
 
         Ok(accelerated_table_builder.build().await)
