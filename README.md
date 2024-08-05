@@ -158,12 +158,11 @@ Example output will be shown as follows:
 
 ```bash
 Spice.ai runtime starting...
-Using latest 'local' runtime version.
-2024-06-03T23:21:26.819978Z  INFO spiced: Metrics listening on 127.0.0.1:9090
-2024-06-03T23:21:26.821863Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
-2024-06-03T23:21:26.821898Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2024-06-03T23:21:26.821958Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
-2024-06-03T23:21:26.822128Z  INFO runtime: Initialized results cache; max size: 128.00 MiB, item ttl: 1s
+2024-08-05T13:02:40.247484Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-08-05T13:02:40.247490Z  INFO runtime::metrics_server: Spice Runtime Metrics listening on 127.0.0.1:9090
+2024-08-05T13:02:40.247949Z  INFO runtime: Initialized results cache; max size: 128.00 MiB, item ttl: 1s
+2024-08-05T13:02:40.248611Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
+2024-08-05T13:02:40.252356Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
 The runtime is now started and ready for queries.
@@ -179,17 +178,17 @@ The `spicepod.yaml` file will be updated with the `spiceai/quickstart` dependenc
 ```yaml
 version: v1beta1
 kind: Spicepod
-name: PROJECT_NAME
+name: spice_qs
 dependencies:
-  - spiceai/quickstart
+    - spiceai/quickstart
 ```
 
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-06-03T23:21:29.721705Z  INFO runtime: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow, 10s refresh), results cache enabled.
-2024-06-03T23:21:29.722839Z  INFO runtime::accelerated_table::refresh: Loading data for dataset taxi_trips
-2024-06-03T23:21:50.813510Z  INFO runtime::accelerated_table::refresh: Loaded 2,964,624 rows (421.71 MiB) for dataset taxi_trips in 21s 90ms.
+2024-08-05T13:04:56.742779Z  INFO runtime: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow, 10s refresh), results cache enabled.
+2024-08-05T13:04:56.744062Z  INFO runtime::accelerated_table::refresh_task: Loading data for dataset taxi_trips
+2024-08-05T13:05:03.556169Z  INFO runtime::accelerated_table::refresh_task: Loaded 2,964,624 rows (421.71 MiB) for dataset taxi_trips in 6s 812ms.
 ```
 
 **Step 5.** Start the Spice SQL REPL:
@@ -210,16 +209,16 @@ sql>
 Enter `show tables;` to display the available tables for query:
 
 ```bash
-sql> show tables
+sql> show tables;
 +---------------+--------------+---------------+------------+
 | table_catalog | table_schema | table_name    | table_type |
 +---------------+--------------+---------------+------------+
 | spice         | public       | taxi_trips    | BASE TABLE |
-| spice         | runtime      | metrics       | BASE TABLE |
 | spice         | runtime      | query_history | BASE TABLE |
+| spice         | runtime      | metrics       | BASE TABLE |
 +---------------+--------------+---------------+------------+
 
-Time: 0.007505084 seconds. 3 rows.
+Time: 0.022671708 seconds. 3 rows.
 ```
 
 Enter a query to display the longest taxi trips:
@@ -246,7 +245,7 @@ Output:
 | 44018.64      | 52.43        |
 +---------------+--------------+
 
-Time: 0.015596458 seconds. 10 rows.
+Time: 0.045150667 seconds. 10 rows.
 ```
 
 ## ⚙️ Runtime Container Deployment
@@ -346,9 +345,9 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-06-03T23:25:59.514395Z  INFO runtime: Dataset eth_recent_blocks registered (spice.ai/eth.recent_blocks), acceleration (arrow, 10s refresh), results cache enabled.
-2024-06-03T23:25:59.514624Z  INFO runtime::accelerated_table::refresh: Loading data for dataset eth_recent_blocks
-2024-06-03T23:26:00.758813Z  INFO runtime::accelerated_table::refresh: Loaded 143 rows (6.22 MiB) for dataset eth_recent_blocks in 1s 244ms.
+2024-08-05T13:09:08.342450Z  INFO runtime: Dataset eth_recent_blocks registered (spice.ai/eth.recent_blocks), acceleration (arrow, 10s refresh), results cache enabled.
+2024-08-05T13:09:08.343641Z  INFO runtime::accelerated_table::refresh_task: Loading data for dataset eth_recent_blocks
+2024-08-05T13:09:09.575822Z  INFO runtime::accelerated_table::refresh_task: Loaded 146 rows (6.36 MiB) for dataset eth_recent_blocks in 1s 232ms.
 ```
 
 **Step 5.** In a new terminal window, use the Spice SQL REPL to query the dataset
@@ -367,19 +366,19 @@ The output displays the results of the query along with the query execution time
 +----------+--------+----------+
 | number   | size   | gas_used |
 +----------+--------+----------+
-| 19281345 | 400378 | 16150051 |
-| 19281344 | 200501 | 16480224 |
-| 19281343 | 97758  | 12605531 |
-| 19281342 | 89629  | 12035385 |
-| 19281341 | 133649 | 13335719 |
-| 19281340 | 307584 | 18389159 |
-| 19281339 | 89233  | 13391332 |
-| 19281338 | 75250  | 12806684 |
-| 19281337 | 100721 | 11823522 |
-| 19281336 | 150137 | 13418403 |
+| 20462425 | 32466  | 6705045  |
+| 20462435 | 262114 | 29985196 |
+| 20462427 | 138376 | 29989452 |
+| 20462444 | 40541  | 9480363  |
+| 20462431 | 78505  | 16994166 |
+| 20462461 | 110372 | 21987571 |
+| 20462441 | 51089  | 11136440 |
+| 20462428 | 327660 | 29998593 |
+| 20462429 | 133518 | 20159194 |
+| 20462422 | 61461  | 13389415 |
 +----------+--------+----------+
 
-Time: 0.004057791 seconds. 10 rows.
+Time: 0.008562625 seconds. 10 rows.
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
