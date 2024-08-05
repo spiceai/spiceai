@@ -56,11 +56,11 @@ pub fn pretty_print_number(num: usize) -> String {
 }
 
 pub async fn shutdown_signal() {
-    wait_for_signal_impl().await;
+    shutdown_signal_impl().await;
 }
 
 #[cfg(unix)]
-async fn wait_for_signal_impl() {
+async fn shutdown_signal_impl() {
     use tokio::signal::unix::{signal, SignalKind};
 
     let Ok(mut signal_terminate) = signal(SignalKind::terminate()) else {
@@ -79,7 +79,7 @@ async fn wait_for_signal_impl() {
 }
 
 #[cfg(windows)]
-async fn wait_for_signal_impl() {
+async fn shutdown_signal_impl() {
     use tokio::signal::windows;
 
     let Ok(mut signal_c) = windows::ctrl_c() else {
