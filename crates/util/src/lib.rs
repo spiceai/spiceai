@@ -19,8 +19,6 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
-use tokio::signal::unix::{signal, SignalKind};
-
 pub mod fibonacci_backoff;
 pub use backoff::future::retry;
 pub use backoff::Error as RetryError;
@@ -58,18 +56,15 @@ pub fn pretty_print_number(num: usize) -> String {
 }
 
 pub async fn shutdown_signal() {
-    let sigint = async {
-        match signal(SignalKind::interrupt()) {
-            Ok(mut sigint) => {
-                sigint.recv().await;
-            }
-            Err(err) => {
-                tracing::error!("Failed to listen to interrupt signal: {err}");
-            }
+    let ctrl_c = async {
+        let signal_result = tokio::signal::ctrl_c().await;
+        if let Err(err) = signal_result {
+            tracing::error!("Failed to listen to ctrl-c signal: {err}");
         }
     };
+    #[cfg(unix)]
     let sigterm = async {
-        match signal(SignalKind::terminate()) {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut sigterm) => {
                 sigterm.recv().await;
             }
@@ -79,9 +74,15 @@ pub async fn shutdown_signal() {
         }
     };
 
+    #[cfg(unix)]
     tokio::select! {
-        () = sigint => {},
+        () = ctrl_c => {},
         () = sigterm => {},
+    }
+
+    #[cfg(not(unix))]
+    tokio::select! {
+        () = ctrl_c => {},
     }
 }
 
