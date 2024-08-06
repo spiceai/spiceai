@@ -18,7 +18,7 @@ use crate::datafusion::query::error_code::ErrorCode;
 use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
-use crate::measure_scope_ms;
+use crate::metrics as runtime_metrics;
 use crate::tls::TlsConfig;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -317,7 +317,7 @@ pub async fn start(
     let svc = FlightServiceServer::new(service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    metrics::counter!("spiced_runtime_flight_server_start").increment(1);
+    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     let mut server = Server::builder();
 

@@ -27,6 +27,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
+use opentelemetry::Key;
 use snafu::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
@@ -34,6 +35,7 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
+use super::metrics;
 use super::refresh_task_runner::RefreshTaskRunner;
 
 #[derive(Debug, Snafu)]
@@ -408,12 +410,12 @@ async fn notify_refresh_done(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let mut labels = vec![("dataset", dataset_name.to_string())];
+    let mut labels = vec![Key::from_static_str("dataset").string(dataset_name.to_string())];
     if let Some(sql) = &refresh.read().await.sql {
-        labels.push(("sql", sql.to_string()));
+        labels.push(Key::from_static_str("sql").string(sql.to_string()));
     };
 
-    metrics::gauge!("datasets_acceleration_last_refresh_time", &labels).set(now.as_secs_f64());
+    metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
 }
 
 #[cfg(test)]

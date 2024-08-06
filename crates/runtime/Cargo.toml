@@ -59,14 +59,13 @@ keyring = { version = "2.3.2", optional = true }
 llms = { path = "../llms" }
 logos = "0.14.0"
 mediatype = "0.19.18"
-metrics.workspace = true
-metrics-exporter-prometheus = { workspace = true }
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
 notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http"] }
 once_cell = "1.19.0"
+opentelemetry.workspace = true
 opentelemetry-proto = { version = "0.6.0", features = [
   "gen-tonic-messages",
   "gen-tonic",

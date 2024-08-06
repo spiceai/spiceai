@@ -12,7 +12,6 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
-metrics-exporter-prometheus = { workspace = true }
 runtime = { path = "../../crates/runtime" }
 rustls.workspace = true
 rustls-pemfile.workspace = true

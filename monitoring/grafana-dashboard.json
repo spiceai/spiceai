@@ -1654,7 +1654,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_dataset_duration_ms{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
+          "expr": "datasets_acceleration_load_duration_ms{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
           "instant": false,
           "legendFormat": "{{dataset}} (P{{quantile}})",
           "range": true,
@@ -1748,7 +1748,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "1000*load_model{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_model == 0",
+          "expr": "1000*models_load_duration{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless models_load_duration == 0",
           "instant": false,
           "legendFormat": "{{model}} (P{{quantile}})",
           "range": true,

@@ -4763,7 +4763,6 @@ dependencies = [
  "http 1.1.0",
  "hyper 1.4.1",
  "hyper-util",
- "log",
  "rustls 0.23.11",
  "rustls-native-certs 0.7.1",
  "rustls-pki-types",
@@ -5771,26 +5770,6 @@ source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a
 dependencies = [
  "ahash 0.8.11",
  "portable-atomic",
-]
-
-[[package]]
-name = "metrics-exporter-prometheus"
-version = "0.15.1"
-source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
-dependencies = [
- "base64 0.22.1",
- "http-body-util",
- "hyper 1.4.1",
- "hyper-rustls 0.27.2",
- "hyper-util",
- "indexmap 2.2.6",
- "ipnet",
- "metrics",
- "metrics-util",
- "quanta",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -8194,8 +8173,6 @@ dependencies = [
  "llms",
  "logos",
  "mediatype",
- "metrics",
- "metrics-exporter-prometheus",
  "metrics-util",
  "model_components",
  "mysql_async",
@@ -8203,6 +8180,7 @@ dependencies = [
  "ns_lookup",
  "object_store",
  "once_cell",
+ "opentelemetry 0.24.0",
  "opentelemetry-proto",
  "pin-project",
  "prometheus-parse",
@@ -9137,7 +9115,6 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
- "metrics-exporter-prometheus",
  "runtime",
  "rustls 0.23.11",
  "rustls-pemfile 2.1.2",
