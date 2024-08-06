@@ -235,7 +235,9 @@ impl VectorSearch {
                         )
                         .await?;
                     response.retrieved_entries.insert(tbl.clone(), outtt);
-                    response.retrieved_primary_keys.insert(tbl, primary_key_data);
+                    response
+                        .retrieved_primary_keys
+                        .insert(tbl, primary_key_data);
                 }
             };
         }
