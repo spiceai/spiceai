@@ -191,13 +191,15 @@ jobs:
         if: matrix.target_os == 'windows'
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@v4
+      # Verify https://github.com/actions/upload-artifact/issues/591 is fixed before upgrading.
+      - uses: actions/upload-artifact@v4.3.4
         if: matrix.target_os != 'windows'
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      # Verify https://github.com/actions/upload-artifact/issues/591 is fixed before upgrading.
+      - uses: actions/upload-artifact@v4.3.4
         if: matrix.target_os == 'windows'
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
