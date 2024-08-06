@@ -95,6 +95,7 @@ pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub mod tls;
+mod tool_use;
 pub(crate) mod tracers;
 mod tracing_util;
 

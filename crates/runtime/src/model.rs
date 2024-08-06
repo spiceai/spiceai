@@ -26,7 +26,9 @@ use std::path::Path;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tract_core::model;
 
+use crate::tool_use::ToolUsingChat;
 use crate::DataFusion;
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
 
@@ -144,6 +146,22 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         .into(),
     })?;
 
+    let model = construct_model(prefix, model_id, component, params)?;
+
+    let tool_use_str = params.get("tool_use").map(Secret::expose_secret).cloned();
+    if tool_use_str.is_some_and(|x| x == "true") {
+        Ok(Box::new(ToolUsingChat::new(model)))
+    } else {
+        Ok(model)
+    }
+}
+
+pub fn construct_model<S: ::std::hash::BuildHasher>(
+    prefix: ModelSource,
+    model_id: Option<String>,
+    component: &spicepod::component::model::Model,
+    params: &HashMap<String, SecretString, S>,
+) -> Result<Box<dyn Chat>, LlmError> {
     match prefix {
         ModelSource::HuggingFace => {
             let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
