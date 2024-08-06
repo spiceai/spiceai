@@ -80,9 +80,9 @@ impl From<&QueryTracker> for TaskSpan {
         };
 
         let input_text = if let Some(nsql) = &qt.nsql {
-            Arc::clone(nsql)
+            Arc::new(nsql.to_string())
         } else {
-            Arc::clone(&qt.sql)
+            Arc::new(qt.sql.to_string())
         };
 
         TaskSpan {
@@ -159,7 +159,7 @@ pub(crate) struct TaskSpan {
     pub(crate) parent_id: Option<Uuid>,
 
     pub(crate) task_type: TaskType,
-    pub(crate) input_text: Arc<str>,
+    pub(crate) input_text: Arc<String>,
 
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: Option<SystemTime>,
@@ -177,7 +177,7 @@ impl TaskSpan {
         df: Arc<crate::datafusion::DataFusion>,
         context_id: Uuid,
         task_type: TaskType,
-        input_text: Arc<str>,
+        input_text: Arc<String>,
         id: Option<Uuid>,
     ) -> Self {
         Self {
@@ -205,6 +205,11 @@ impl TaskSpan {
 
     pub fn with_error_message(mut self, error_message: String) -> Self {
         self.error_message = Some(error_message);
+        self
+    }
+
+    pub fn label(mut self, key: String, value: String) -> Self {
+        self.labels.insert(key, value);
         self
     }
 
@@ -359,7 +364,7 @@ impl TaskSpan {
                     .parent_id
                     .map(|s| s.to_string())])),
                 Arc::new(StringArray::from(vec![self.task_type.to_string()])),
-                Arc::new(StringArray::from(vec![self.input_text.as_ref()])),
+                Arc::new(StringArray::from(vec![self.input_text.to_string()])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
                 Arc::new(Float32Array::from(vec![self.execution_time])),

@@ -43,6 +43,7 @@ use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
+use embeddings::task::TaskEmbed;
 use extension::ExtensionFactory;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
@@ -1169,7 +1170,10 @@ impl Runtime {
                 match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
-                        embeds_map.insert(in_embed.name.clone(), e.into());
+
+                        let m = Box::new(TaskEmbed::new(e, Arc::clone(&self.df))) as Box<dyn Embed>;
+                        embeds_map.insert(in_embed.name.clone(), m.into());
+
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
                         metrics::gauge!("embeddings_count", "embeddings" => in_embed.name.clone(), "source" => in_embed.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
                         status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);

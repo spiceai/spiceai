@@ -13,7 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::embeddings::vector_search::{RetrievalLimit, VectorSearch, VectorSearchResult};
+use crate::{
+    embeddings::vector_search::{RetrievalLimit, VectorSearch, VectorSearchResult},
+    task_history::{TaskSpan, TaskType},
+};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -79,6 +82,15 @@ pub(crate) async fn post(
         .map(TableReference::from)
         .collect();
 
+    let span = TaskSpan::new(
+        Arc::clone(&vs.df),
+        uuid::Uuid::new_v4(),
+        TaskType::VectorSearch,
+        Arc::new(payload.text.clone()),
+        None,
+    )
+    .label("tables".to_string(), format!("{input_tables:?}"));
+
     match vs
         .search(
             payload.text.clone(),
@@ -88,9 +100,18 @@ pub(crate) async fn post(
         .await
     {
         Ok(resp) => match SearchResponse::from_vector_search(resp) {
-            Ok(r) => (StatusCode::OK, Json(r)).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Ok(r) => {
+                span.outputs_produced(r.entries.len() as u64).finish();
+                (StatusCode::OK, Json(r)).into_response()
+            }
+            Err(e) => {
+                span.with_error_message(e.to_string()).finish();
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            span.with_error_message(e.to_string()).finish();
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }

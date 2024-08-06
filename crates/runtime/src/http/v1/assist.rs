@@ -38,6 +38,7 @@ use futures::StreamExt;
 use crate::{
     embeddings::vector_search::{RetrievalLimit, VectorSearch, VectorSearchResult},
     model::LLMModelStore,
+    task_history::{TaskSpan, TaskType},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,12 +231,29 @@ pub(crate) async fn post(
         .map(TableReference::from)
         .collect();
 
+    let mut span = TaskSpan::new(
+        Arc::clone(&vs.df),
+        uuid::Uuid::new_v4(),
+        TaskType::VectorSearch,
+        Arc::new(payload.text.clone()),
+        None,
+    )
+    .label("tables".to_string(), format!("{input_tables:?}"));
+
     let relevant_data = match vs
         .search(payload.text.clone(), input_tables, RetrievalLimit::TopN(3))
         .await
     {
-        Ok(relevant_data) => relevant_data,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(relevant_data) => {
+            span = span.outputs_produced(relevant_data.retrieved_entries.len() as u64);
+            span.finish();
+            relevant_data
+        }
+        Err(e) => {
+            span = span.with_error_message(e.to_string());
+            span.finish();
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     };
 
     tracing::debug!(

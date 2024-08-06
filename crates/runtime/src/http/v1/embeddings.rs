@@ -44,7 +44,7 @@ pub(crate) async fn post(
                 df,
                 context_id,
                 task_history::TaskType::TextEmbed,
-                input_text.as_str().into(),
+                Arc::new(input_text),
                 None,
             );
 
