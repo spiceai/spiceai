@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA,
-    task_history::TaskTracker,
+    task_history::TaskSpan,
 };
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::{
@@ -164,7 +164,7 @@ impl QueryTracker {
             .context(UnableToWriteToTableSnafu)?;
 
         // Whilst both the query history and task history tables exist, don't need a `TaskTracker` for recording queries.
-        Into::<TaskTracker>::into(self)
+        Into::<TaskSpan>::into(self)
             .write()
             .await
             .boxed()

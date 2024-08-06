@@ -42,26 +42,26 @@ use crate::accelerated_table::{AcceleratedTable, Retention};
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 
 pub enum TaskType {
-    Query,
-    Chat,
-    Embed,
-    Search,
-    FunctionCall,
+    SqlQuery,
+    NsqlQuery,
+    AiCompletion,
+    TextEmbed,
+    VectorSearch,
 }
 
 impl Display for TaskType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TaskType::Query => write!(f, "query"),
-            TaskType::Chat => write!(f, "chat"),
-            TaskType::Embed => write!(f, "embed"),
-            TaskType::Search => write!(f, "search"),
-            TaskType::FunctionCall => write!(f, "function_call"),
+            TaskType::SqlQuery => write!(f, "sql_query"),
+            TaskType::NsqlQuery => write!(f, "nsql_query"),
+            TaskType::AiCompletion => write!(f, "ai_completion"),
+            TaskType::TextEmbed => write!(f, "text_embed"),
+            TaskType::VectorSearch => write!(f, "vector_search"),
         }
     }
 }
 
-impl From<&QueryTracker> for TaskTracker {
+impl From<&QueryTracker> for TaskSpan {
     fn from(qt: &QueryTracker) -> Self {
         let mut labels = HashMap::new();
         if let Some(schema) = &qt.schema {
@@ -73,13 +73,25 @@ impl From<&QueryTracker> for TaskTracker {
         labels.insert("protocol".to_string(), format!("{:?}", qt.protocol));
         labels.insert("datasets".to_string(), format!("{:?}", qt.datasets));
 
-        TaskTracker {
+        let task_type = if qt.nsql.is_some() {
+            TaskType::NsqlQuery
+        } else {
+            TaskType::SqlQuery
+        };
+
+        let input_text = if let Some(nsql) = &qt.nsql {
+            Arc::clone(nsql)
+        } else {
+            Arc::clone(&qt.sql)
+        };
+
+        TaskSpan {
             df: Arc::clone(&qt.df),
             id: qt.query_id,
             context_id: qt.query_id, // assuming context_id and id are the same; adjust as needed
             parent_id: None,
-            task_type: TaskType::Query,
-            input_text: Arc::clone(&qt.sql),
+            task_type,
+            input_text,
             start_time: qt.start_time,
             end_time: qt.end_time,
             execution_time: qt.execution_time,
@@ -135,10 +147,15 @@ fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapAr
     Ok(MapArray::from(map_data))
 }
 
-pub(crate) struct TaskTracker {
+/// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
+pub(crate) struct TaskSpan {
     pub(crate) df: Arc<crate::datafusion::DataFusion>,
     pub(crate) id: Uuid,
+
+    /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
     pub(crate) context_id: Uuid,
+
+    /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
     pub(crate) parent_id: Option<Uuid>,
 
     pub(crate) task_type: TaskType,
@@ -155,7 +172,7 @@ pub(crate) struct TaskTracker {
     pub(crate) timer: Instant,
 }
 
-impl TaskTracker {
+impl TaskSpan {
     pub fn new(
         df: Arc<crate::datafusion::DataFusion>,
         context_id: Uuid,
@@ -212,7 +229,7 @@ impl TaskTracker {
 
         create_internal_accelerated_table(
             tbl_reference,
-            Arc::new(TaskTracker::table_schema()),
+            Arc::new(TaskSpan::table_schema()),
             Acceleration::default(),
             Refresh::default(),
             retention,

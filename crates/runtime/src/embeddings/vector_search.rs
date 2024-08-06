@@ -23,7 +23,9 @@ use datafusion::{common::Constraint, datasource::TableProvider, sql::TableRefere
 
 use tokio::sync::RwLock;
 
-use crate::{accelerated_table::AcceleratedTable, datafusion::DataFusion, EmbeddingModelStore};
+use crate::{
+    accelerated_table::AcceleratedTable, datafusion::DataFusion, model::EmbeddingModelStore,
+};
 
 use super::table::EmbeddingTable;
 use snafu::prelude::*;

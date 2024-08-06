@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{datafusion::DataFusion, task_history, EmbeddingModelStore};
+use crate::{datafusion::DataFusion, model::EmbeddingModelStore, task_history};
 use async_openai::types::{CreateEmbeddingRequest, EncodingFormat};
 use axum::{
     http::StatusCode,
@@ -40,10 +40,10 @@ pub(crate) async fn post(
     match embeddings.read().await.get(&model_id) {
         Some(model_lock) => {
             let mut model = model_lock.write().await;
-            let mut task_span = task_history::TaskTracker::new(
+            let mut task_span = task_history::TaskSpan::new(
                 df,
                 context_id,
-                task_history::TaskType::Embed,
+                task_history::TaskType::TextEmbed,
                 input_text.as_str().into(),
                 None,
             );

@@ -34,7 +34,7 @@ use std::{any::Any, sync::Arc};
 use std::fmt;
 use tokio::sync::RwLock;
 
-use crate::EmbeddingModelStore;
+use crate::model::EmbeddingModelStore;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,

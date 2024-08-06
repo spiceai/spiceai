@@ -50,7 +50,7 @@ use llms::chat::Chat;
 use llms::embeddings::Embed;
 use metrics::SetRecorderError;
 use metrics_exporter_prometheus::PrometheusHandle;
-use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
+use model::{try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -265,8 +265,6 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 #[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
@@ -1440,7 +1438,7 @@ impl Runtime {
             Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
         };
 
-        match task_history::TaskTracker::instantiate_table().await {
+        match task_history::TaskSpan::instantiate_table().await {
             Ok(table) => self
                 .df
                 .register_runtime_table(
