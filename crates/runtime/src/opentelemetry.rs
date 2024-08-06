@@ -44,14 +44,14 @@ use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
-use tonic_0_9_0::async_trait;
-use tonic_0_9_0::codec::CompressionEncoding;
-use tonic_0_9_0::transport::{Identity, Server, ServerTlsConfig};
-use tonic_0_9_0::Request;
-use tonic_0_9_0::Response;
-use tonic_0_9_0::Status;
-use tonic_health_0_9_0::pb::health_server::Health;
-use tonic_health_0_9_0::pb::health_server::HealthServer;
+use tonic::async_trait;
+use tonic::codec::CompressionEncoding;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::Request;
+use tonic::Response;
+use tonic::Status;
+use tonic_health::pb::health_server::Health;
+use tonic_health::pb::health_server::HealthServer;
 
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -64,9 +64,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to serve: {source}"))]
-    UnableToServe {
-        source: tonic_0_9_0::transport::Error,
-    },
+    UnableToServe { source: tonic::transport::Error },
 
     #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
@@ -95,9 +93,7 @@ pub enum Error {
     FirstMetricDataPointHasNoValue { metric: String },
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
-    UnableToConfigureTls {
-        source: tonic_0_9_0::transport::Error,
-    },
+    UnableToConfigureTls { source: tonic::transport::Error },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -206,7 +202,7 @@ impl MetricsService for Service {
 }
 
 async fn create_health_service() -> HealthServer<impl Health> {
-    let (mut health_reporter, health_service) = tonic_health_0_9_0::server::health_reporter();
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<MetricsServiceServer<Service>>()
         .await;

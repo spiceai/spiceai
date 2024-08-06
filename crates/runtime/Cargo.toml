@@ -11,8 +11,8 @@ version.workspace = true
 [dependencies]
 app = { path = "../app" }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-arrow-ipc = "52.0.0"
-arrow-json = "52.0.0"
+arrow-ipc.workspace = true
+arrow-json.workspace = true
 arrow.workspace = true
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
@@ -67,7 +67,7 @@ notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http"] }
 once_cell = "1.19.0"
-opentelemetry-proto = { version = "0.4.0", features = [
+opentelemetry-proto = { version = "0.6.0", features = [
   "gen-tonic-messages",
   "gen-tonic",
   "metrics",
@@ -92,9 +92,8 @@ suppaftp = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio.workspace = true
-tonic_health_0_9_0 = { version = "0.9.0", package = "tonic-health" }
+tonic-health.workspace = true
 tonic.workspace = true
-tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip", "tls"] }
 tracing.workspace = true
 tract-core = "0.21.0"
 url = "2.5.0"
