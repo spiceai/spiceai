@@ -16,8 +16,8 @@ byte-unit = "5.1.4"
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
-metrics.workspace = true
 moka = { version = "0.12.7", features = ["future"] }
+opentelemetry.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true

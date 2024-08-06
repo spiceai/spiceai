@@ -67,6 +67,7 @@ metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", 
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.2" }
 odbc-api = { version = "8.1.2" }
+opentelemetry = { version = "0.24.0", default-features = false, features = ["metrics"] }
 pem = "3.0.4"
 r2d2 = "0.8.10"
 regex = "1.10.3"

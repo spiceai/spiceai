@@ -1929,8 +1929,8 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
- "metrics",
  "moka",
+ "opentelemetry 0.24.0",
  "snafu 0.8.4",
  "spicepod",
  "tokio",
@@ -6790,12 +6790,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c365a63eec4f55b7efeceb724f1336f26a9cf3427b70e59e2cd2a5b947fba96"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "once_cell",
+ "thiserror",
+]
+
+[[package]]
 name = "opentelemetry-proto"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "984806e6cf27f2b49282e2a05e288f30594f3dbc74eb7a6e99422bc48ed78162"
 dependencies = [
- "opentelemetry",
+ "opentelemetry 0.23.0",
  "opentelemetry_sdk",
  "prost 0.12.6",
  "tonic",
@@ -6814,7 +6827,7 @@ dependencies = [
  "glob",
  "lazy_static",
  "once_cell",
- "opentelemetry",
+ "opentelemetry 0.23.0",
  "ordered-float 4.2.1",
  "thiserror",
 ]
