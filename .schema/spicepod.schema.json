@@ -759,6 +759,9 @@
     },
     "TlsConfig": {
       "type": "object",
+      "required": [
+        "enabled"
+      ],
       "properties": {
         "certificate": {
           "description": "A PEM encoded certificate",
@@ -773,6 +776,10 @@
             "string",
             "null"
           ]
+        },
+        "enabled": {
+          "description": "If set, the runtime will configure all endpoints to use TLS",
+          "type": "boolean"
         },
         "key": {
           "description": "A PEM encoded private key",
