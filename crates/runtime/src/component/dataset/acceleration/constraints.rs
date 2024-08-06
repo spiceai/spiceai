@@ -39,7 +39,7 @@ impl Acceleration {
 
     fn valid_columns(schema: &SchemaRef) -> String {
         schema
-            .all_fields()
+            .flattened_fields()
             .into_iter()
             .map(|f| f.name().to_string())
             .collect::<Vec<_>>()

@@ -33,9 +33,12 @@ rust-version = "1.80"
 version = "0.17.2-beta"
 
 [workspace.dependencies]
-arrow = "52.0.0"
-arrow-buffer = "52.0.0"
-arrow-flight = "52.0.0"
+arrow = "52.2.0"
+arrow-buffer = "52.2.0"
+arrow-flight = "52.2.0"
+arrow-json = "52.2.0"
+arrow-ipc = "52.2.0"
+parquet = "52.2.0"
 arrow-odbc = "11.2.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
 async-stream = "0.3.5"
@@ -88,7 +91,8 @@ tokio-postgres = { version = "0.7.10", features = [
   "with-uuid-1",
 ] }
 tokio-rusqlite = "0.5.1"
-tonic = { version = "0.11.0", features = ["tls"] }
+tonic = { version = "0.11", features = ["gzip", "tls"] }
+tonic-health = { version = "0.11" }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
