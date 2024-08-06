@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# Start the original entrypoint script in the background
-docker-entrypoint.sh postgres &
+# Start the original entrypoint script with custom configuration
+docker-entrypoint.sh postgres  -c shared_buffers=1GB -c work_mem=256MB -c max_wal_size=6GB&
 
 # Wait for PostgreSQL to start
 until pg_isready -h localhost -U postgres; do

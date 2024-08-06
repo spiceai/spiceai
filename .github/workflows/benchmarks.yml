@@ -7,7 +7,7 @@ on:
       features:
         description: 'included features for bench'
         required: true
-        default: "postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite"
+        default: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 jobs:
   run-database-bench:
@@ -28,6 +28,7 @@ jobs:
       postgres:
         image: ${{ contains(inputs.features, 'postgres') && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
+          --shm-size=2gb
           --health-cmd="pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
@@ -51,7 +52,7 @@ jobs:
       - name: Install Protoc
         if: contains(inputs.features, 'spark')
         uses: arduino/setup-protoc@v3
-      
+
       - name: Install Databricks ODBC driver
         if: contains(inputs.features, 'odbc')
         run: |
@@ -59,7 +60,7 @@ jobs:
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
-        
+
       - name: Install Athena ODBC driver
         if: contains(inputs.features, 'odbc')
         run: |
@@ -74,7 +75,7 @@ jobs:
           PG_BENCHMARK_PG_USER: postgres
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
-          PG_BENCHMARK_PG_DBNAME: tpch_sf0_01
+          PG_BENCHMARK_PG_DBNAME: tpch_sf1
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root
