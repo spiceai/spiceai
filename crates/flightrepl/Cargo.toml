@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 ansi_term = "0.12.1"
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-arrow-json = "52.0.0"
+arrow-json.workspace = true
 clap.workspace = true
 datafusion.workspace = true
 futures.workspace = true
