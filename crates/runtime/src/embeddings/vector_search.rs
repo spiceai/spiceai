@@ -74,7 +74,7 @@ pub type ModelKey = String;
 
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
-    pub retrieved_public_keys: HashMap<TableReference, Vec<RecordBatch>>,
+    pub retrieved_primary_keys: HashMap<TableReference, Vec<RecordBatch>>,
 }
 
 impl VectorSearch {
@@ -194,7 +194,7 @@ impl VectorSearch {
 
         let mut response = VectorSearchResult {
             retrieved_entries: HashMap::new(),
-            retrieved_public_keys: HashMap::new(),
+            retrieved_primary_keys: HashMap::new(),
         };
 
         for (tbl, search_vectors) in per_table_embeddings {
@@ -235,7 +235,7 @@ impl VectorSearch {
                         )
                         .await?;
                     response.retrieved_entries.insert(tbl.clone(), outtt);
-                    response.retrieved_public_keys.insert(tbl, primary_key_data);
+                    response.retrieved_primary_keys.insert(tbl, primary_key_data);
                 }
             };
         }
