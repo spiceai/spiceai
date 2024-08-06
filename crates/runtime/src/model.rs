@@ -26,7 +26,6 @@ use std::path::Path;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tract_core::model;
 
 use crate::tool_use::ToolUsingChat;
 use crate::DataFusion;

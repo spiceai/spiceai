@@ -61,11 +61,12 @@ impl Chat for ToolUsingChat {
         self.inner_chat.stream(prompt).await
     }
 
+    /// TODO: If response messages has ChatCompletionMessageToolCall that are spiced runtime tools, call locally, and pass back.
     async fn chat_stream(
         &mut self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        // Don't use spice runtime tools if users has explicitly chosen to not use use tools.
+        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
             .as_ref()
@@ -93,7 +94,7 @@ impl Chat for ToolUsingChat {
         &mut self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        // Don't use spice runtime tools if users has explicitly chosen to not use use tools.
+        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
             .as_ref()
