@@ -366,3 +366,44 @@ fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaR
         .flatten()
         .collect()
 }
+
+#[cfg(test)]
+mod test {
+    use ::arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_file_mode_db_creation() {
+        use std::{fs, path::Path};
+
+        let tmp_dir = std::env::temp_dir();
+        let path = format!("{}/abc.db", tmp_dir.display());
+
+        let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
+
+        register_all().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let acceleration_settings = Acceleration {
+            params,
+            enabled: true,
+            mode: Mode::File,
+            engine: Engine::DuckDB,
+            ..Acceleration::default()
+        };
+        let _ = create_accelerator_table(
+            "abc".into(),
+            schema,
+            None,
+            &acceleration_settings,
+            Arc::new(RwLock::new(Secrets::new())),
+        )
+        .await
+        .expect("accelerator table created");
+
+        let path = Path::new(&path);
+        assert!(path.is_file());
+        fs::remove_file(path).expect("file removed");
+    }
+}
