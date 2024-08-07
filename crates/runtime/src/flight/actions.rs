@@ -16,11 +16,12 @@ limitations under the License.
 
 use std::fmt::{self, Display, Formatter};
 
+use opentelemetry::Key;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{flightsql::prepared_statement_query, to_tonic_err, Service},
+    flight::{flightsql::prepared_statement_query, metrics, to_tonic_err, Service},
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -82,7 +83,7 @@ pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> 
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || {
-        TimeMeasurement::new("flight_list_actions_duration_ms", vec![])
+        TimeMeasurement::new(&metrics::LIST_ACTIONS_DURATION_MS, vec![])
     });
 
     Response::new(Box::pin(output) as <Service as FlightService>::ListActionsStream)
@@ -96,8 +97,8 @@ pub(crate) async fn do_action(
 
     let action_type_str = action_type.as_str().to_string();
     let start = TimeMeasurement::new(
-        "flight_do_action_duration_ms",
-        vec![("action_type", action_type_str)],
+        &metrics::DO_ACTION_DURATION_MS,
+        vec![Key::from_static_str("action_type").string(action_type_str)],
     );
 
     let stream = match action_type {

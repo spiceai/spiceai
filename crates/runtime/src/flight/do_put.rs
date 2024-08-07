@@ -20,6 +20,7 @@ use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use datafusion::sql::TableReference;
 use futures::stream;
+use opentelemetry::Key;
 use tokio::sync::{broadcast::Sender, RwLock};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -28,7 +29,7 @@ use crate::{
     timing::{TimeMeasurement, TimedStream},
 };
 
-use super::Service;
+use super::{metrics, Service};
 
 async fn get_sender_channel(
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
@@ -47,7 +48,7 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-    let mut duration_metric = TimeMeasurement::new("flight_do_put_duration_ms", vec![]);
+    let mut duration_metric = TimeMeasurement::new(&metrics::DO_PUT_DURATION_MS, vec![]);
     let mut streaming_flight = request.into_inner();
 
     let Ok(Some(message)) = streaming_flight.message().await else {
@@ -62,7 +63,7 @@ pub(crate) async fn handle(
 
     let path = TableReference::parse_str(&fd.path.join("."));
 
-    duration_metric.with_labels(vec![("path", path.to_string())]);
+    duration_metric.with_labels(vec![Key::from_static_str("path").string(path.to_string())]);
 
     if !flight_svc.datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(

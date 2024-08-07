@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 
 use opentelemetry::{
     global,
-    metrics::{Counter, Gauge, Meter, UpDownCounter},
+    metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter},
 };
 
 pub(crate) mod spiced_runtime {
@@ -38,6 +38,20 @@ pub(crate) mod spiced_runtime {
         RUNTIME_METER
             .u64_counter("http_server_start")
             .with_description("Indicates the runtime HTTP server has started.")
+            .init()
+    });
+}
+
+pub(crate) mod secrets {
+    use super::*;
+
+    pub(crate) static SECRETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("secrets"));
+
+    pub(crate) static STORES_LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+        SECRETS_METER
+            .f64_histogram("stores_load_duration_ms")
+            .with_description("Duration in milliseconds to load the secret stores.")
+            .with_unit("ms")
             .init()
     });
 }

@@ -26,7 +26,9 @@ use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{flightsql::get_tables, record_batches_to_flight_stream, to_tonic_err, Service},
+    flight::{
+        flightsql::get_tables, metrics, record_batches_to_flight_stream, to_tonic_err, Service,
+    },
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -49,7 +51,7 @@ pub(crate) fn get_flight_info(
 pub(crate) fn do_get(
     query: &sql::CommandGetTableTypes,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = TimeMeasurement::new("flight_do_get_table_types_duration_ms", vec![]);
+    let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_TABLE_TYPES_DURATION_MS, vec![]);
     tracing::trace!("do_get_table_types: {query:?}");
 
     let schema = Schema::new(vec![Field::new("table_type", DataType::Utf8, false)]);

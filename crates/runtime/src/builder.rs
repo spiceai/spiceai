@@ -26,7 +26,7 @@ use crate::{
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
-    podswatcher,
+    metrics, podswatcher,
     secrets::{self, Secrets},
     timing::TimeMeasurement,
     tracers, Runtime,
@@ -175,7 +175,7 @@ impl RuntimeBuilder {
 
     async fn load_secrets(app: Option<&App>) -> Secrets {
         // load_secret_stores
-        let _guard = TimeMeasurement::new(todo!(), &[]);
+        let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
         if let Some(app) = app {
