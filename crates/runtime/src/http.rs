@@ -41,6 +41,7 @@ use crate::{
     EmbeddingModelStore,
 };
 
+mod metrics;
 mod routes;
 mod v1;
 

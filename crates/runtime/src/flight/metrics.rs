@@ -44,6 +44,9 @@ pub(crate) static DO_PUT_REQUESTS: LazyLock<Counter<u64>> =
 pub(crate) static DO_EXCHANGE_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("do_exchange_requests").init());
 
+pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> =
+    LazyLock::new(|| METER.u64_counter("do_exchange_data_updates_sent").init());
+
 pub(crate) static DO_ACTION_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("do_action_requests").init());
 

@@ -21,6 +21,7 @@ use crate::{config, datafusion::DataFusion};
 use app::App;
 use axum::routing::patch;
 use model_components::model::Model;
+use opentelemetry::Key;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
@@ -35,7 +36,7 @@ use axum::{
 };
 use tokio::{sync::RwLock, time::Instant};
 
-use super::v1;
+use super::{metrics, v1};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routes(
@@ -105,13 +106,13 @@ async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
     let status = response.status().as_u16().to_string();
 
     let labels = [
-        ("method", method.to_string()),
-        ("path", path),
-        ("status", status),
+        Key::from_static_str("method").string(method.to_string()),
+        Key::from_static_str("path").string(path),
+        Key::from_static_str("status").string(status),
     ];
 
-    metrics::counter!("http_requests_total", &labels).increment(1);
-    metrics::histogram!("http_requests_duration_seconds", &labels).record(latency);
+    metrics::REQUESTS_TOTAL.add(1, &labels);
+    metrics::REQUESTS_DURATION_SECONDS.record(latency, &labels);
 
     response
 }
