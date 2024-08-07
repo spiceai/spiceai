@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::tool_use::ToolUsingChat;
-use crate::DataFusion;
+use crate::{DataFusion, Runtime};
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
@@ -135,6 +135,7 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
 pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString, S>,
+    rt: Arc<Runtime>,
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -147,9 +148,12 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
 
     let model = construct_model(prefix, model_id, component, params)?;
 
-    let tool_use_str = params.get("tool_use").map(Secret::expose_secret).cloned();
-    if tool_use_str.is_some_and(|x| x == "true") {
-        Ok(Box::new(ToolUsingChat::new(model)))
+    let use_spiced_tools = params
+        .get("use_spiced_tools")
+        .map(Secret::expose_secret)
+        .cloned();
+    if use_spiced_tools.is_some_and(|x| x == "true") {
+        Ok(Box::new(ToolUsingChat::new(model, rt)))
     } else {
         Ok(model)
     }

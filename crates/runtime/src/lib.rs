@@ -1135,7 +1135,7 @@ impl Runtime {
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params)
+        let mut l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
