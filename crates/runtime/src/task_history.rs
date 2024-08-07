@@ -21,8 +21,8 @@ use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::array::{
-    Array, ArrayData, BooleanArray, Float32Array, MapArray, RecordBatch, StringArray, StructArray,
-    TimestampNanosecondArray, UInt64Array,
+    Array, ArrayData, BooleanArray, Float64Array, MapArray, RecordBatch, StringArray,
+    StructArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -94,7 +94,7 @@ impl From<&QueryTracker> for TaskSpan {
             input_text,
             start_time: qt.start_time,
             end_time: qt.end_time,
-            execution_time: qt.execution_time,
+            execution_duration_ms: qt.execution_time.map(|t| f64::from(1000.0 * t)), // convert s to ms.
             outputs_produced: qt.rows_produced,
             cache_hit: qt.results_cache_hit,
             error_message: qt.error_message.clone(),
@@ -163,7 +163,7 @@ pub(crate) struct TaskSpan {
 
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: Option<SystemTime>,
-    pub(crate) execution_time: Option<f32>,
+    pub(crate) execution_duration_ms: Option<f64>,
     pub(crate) outputs_produced: u64,
     pub(crate) cache_hit: Option<bool>,
     pub(crate) error_message: Option<String>,
@@ -189,7 +189,7 @@ impl TaskSpan {
             input_text,
             start_time: SystemTime::now(),
             end_time: None,
-            execution_time: None,
+            execution_duration_ms: None,
             outputs_produced: 0,
             cache_hit: None,
             error_message: None,
@@ -262,7 +262,7 @@ impl TaskSpan {
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 false,
             ),
-            Field::new("execution_time", DataType::Float32, false),
+            Field::new("execution_duration_ms", DataType::Float64, false),
             Field::new("outputs_produced", DataType::UInt64, false),
             Field::new("cache_hit", DataType::Boolean, false),
             Field::new("error_message", DataType::Utf8, true),
@@ -291,8 +291,8 @@ impl TaskSpan {
 
         let duration = self.timer.elapsed();
 
-        if self.execution_time.is_none() {
-            self.execution_time = Some(duration.as_secs_f32());
+        if self.execution_duration_ms.is_none() {
+            self.execution_duration_ms = Some(1000.0 * duration.as_secs_f64());
         }
 
         tokio::task::spawn(async move {
@@ -367,7 +367,7 @@ impl TaskSpan {
                 Arc::new(StringArray::from(vec![self.input_text.to_string()])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-                Arc::new(Float32Array::from(vec![self.execution_time])),
+                Arc::new(Float64Array::from(vec![self.execution_duration_ms])),
                 Arc::new(UInt64Array::from(vec![self.outputs_produced])),
                 Arc::new(BooleanArray::from(vec![self.cache_hit.unwrap_or(false)])),
                 Arc::new(StringArray::from(vec![self.error_message.clone()])),
