@@ -30,7 +30,7 @@ use async_openai::types::{
 
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_trait::async_trait;
-use futures::{Stream, TryFutureExt};
+use futures::Stream;
 use serde_json::Value;
 use snafu::ResultExt;
 
@@ -90,7 +90,15 @@ impl SpicedTool for SqlTool {
 
     fn parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
-            "query": "The SQL query to run"
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The SQL query to run.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": false,
         }))
     }
 
@@ -158,7 +166,7 @@ impl ToolUsingChat {
     async fn call_tool(&self, req: &ChatCompletionMessageToolCall) -> Value {
         match self.tools.iter().find(|t| t.name() == req.function.name) {
             Some(t) => t
-                .call(&req.function.arguments, self.rt.clone())
+                .call(&req.function.arguments, Arc::<Runtime>::clone(&self.rt))
                 .await
                 .unwrap_or(Value::String(format!("Error calling tool {}", t.name()))),
             None => Value::Null,
@@ -270,14 +278,13 @@ impl Chat for ToolUsingChat {
         let tool_messages: Vec<ChatCompletionRequestMessage> = tool_and_response_content
             .iter()
             .map(|(tool_call, response_content)| {
-                ChatCompletionRequestToolMessageArgs::default()
+                Ok(ChatCompletionRequestToolMessageArgs::default()
                     .content(response_content.to_string())
                     .tool_call_id(tool_call.id.clone())
-                    .build()
-                    .unwrap()
-                    .into()
+                    .build()?
+                    .into())
             })
-            .collect();
+            .collect::<Result<_, OpenAIError>>()?;
 
         let mut messages = req.messages.clone();
         messages.push(assistant_message);

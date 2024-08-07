@@ -146,7 +146,7 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         .into(),
     })?;
 
-    let model = construct_model(prefix, model_id, component, params)?;
+    let model = construct_model(&prefix, model_id, component, params)?;
 
     let use_spiced_tools = params
         .get("use_spiced_tools")
@@ -160,7 +160,7 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
 }
 
 pub fn construct_model<S: ::std::hash::BuildHasher>(
-    prefix: ModelSource,
+    prefix: &ModelSource,
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString, S>,
