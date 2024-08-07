@@ -129,7 +129,7 @@ async fn context_aware_stream(
         Ok(model_stream) => model_stream,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let vector_data = match create_primary_key_payload(&vector_search_data.retrieved_public_keys) {
+    let vector_data = match create_primary_key_payload(&vector_search_data.retrieved_primary_keys) {
         Ok(vector_data) => vector_data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -163,7 +163,7 @@ async fn context_aware_chat(
 ) -> Response {
     match model.write().await.run(model_input).await {
         Ok(Some(text)) => {
-            match create_primary_key_payload(&vector_search_data.retrieved_public_keys) {
+            match create_primary_key_payload(&vector_search_data.retrieved_primary_keys) {
                 Ok(from) => (StatusCode::OK, Json(AssistResponse { text, from })).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }

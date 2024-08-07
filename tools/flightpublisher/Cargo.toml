@@ -13,6 +13,6 @@ arrow.workspace = true
 arrow-flight.workspace = true
 clap = { workspace = true, features = ["derive"] }
 futures.workspace = true
-parquet = "52.0.0"
+parquet.workspace = true
 tokio.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }

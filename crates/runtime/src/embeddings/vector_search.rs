@@ -18,6 +18,7 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
+use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 
@@ -84,7 +85,7 @@ pub type ModelKey = String;
 
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
-    pub retrieved_public_keys: HashMap<TableReference, Vec<RecordBatch>>,
+    pub retrieved_primary_keys: HashMap<TableReference, Vec<RecordBatch>>,
 }
 
 impl VectorSearch {
@@ -98,6 +99,89 @@ impl VectorSearch {
             embeddings,
             explicit_primary_keys,
         }
+    }
+
+    /// Perform a single SQL query vector search.
+    async fn individual_search(
+        &self,
+        tbl: &TableReference,
+        primary_keys: &[String],
+        embedding: Vec<f32>,
+        embedding_column: String,
+        n: usize,
+    ) -> Result<(Vec<std::string::String>, Vec<arrow::array::RecordBatch>)> {
+        let query = format!(
+            "SELECT {} FROM {} ORDER BY array_distance({}_embedding, {:?}) LIMIT {}",
+            [primary_keys.join(", "), embedding_column.clone()].join(", "),
+            tbl,
+            embedding_column,
+            embedding,
+            n
+        );
+
+        let batches = self
+            .df
+            .ctx
+            .sql(&query)
+            .await
+            .boxed()
+            .context(DataFusionSnafu)?
+            .collect()
+            .await
+            .boxed()
+            .context(DataFusionSnafu)?;
+
+        // Extract the embedding column data
+        let embedding_column_data: Vec<String> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(batch.num_columns() - 1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| string_to_boxed_err(
+                        format!(
+                            "Expected '{embedding_column}' to be the last column of the SQL query and return a String type"
+                        ),
+                    ))
+                    .context(DataFusionSnafu)
+                    .map(|array| {
+                        array
+                            .iter()
+                            .map(|value| value.unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        // Retrieve the primary key data
+        let primary_key_data: Vec<RecordBatch> = batches
+            .iter()
+            .map(|batch| {
+                let indices: Vec<usize> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, field)| {
+                        if primary_keys.contains(field.name()) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                batch.project(&indices)
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()
+            .boxed()
+            .context(DataFusionSnafu)?;
+
+        Ok((embedding_column_data, primary_key_data))
     }
 
     pub async fn search(
@@ -121,11 +205,12 @@ impl VectorSearch {
 
         let mut response = VectorSearchResult {
             retrieved_entries: HashMap::new(),
-            retrieved_public_keys: HashMap::new(),
+            retrieved_primary_keys: HashMap::new(),
         };
 
         for (tbl, search_vectors) in per_table_embeddings {
             tracing::debug!("Running vector search for table {:#?}", tbl.clone());
+            let primary_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
 
             // Only support one embedding column per table.
             let table_provider =
@@ -151,43 +236,19 @@ impl VectorSearch {
             match search_vectors.first() {
                 None => unreachable!(),
                 Some(embedding) => {
-                    let mut select_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
-                    select_keys.push(embedding_column.clone());
-
-                    let result = self
-                        .df
-                        .ctx
-                        .sql(&format!(
-                            "SELECT {} FROM {tbl} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {}", select_keys.join(", "), n
-                        ))
-                        .await
-                        .boxed()
-                        .context(DataFusionSnafu)?;
-                    let batch = result.collect().await.boxed().context(DataFusionSnafu)?;
-
-                    let outt: Vec<_> = batch
-                        .iter()
-                        .map(|b| {
-                            let z =
-                                b.column(b.num_columns() -1).as_any().downcast_ref::<StringArray>().ok_or(
-                                    string_to_boxed_err(
-                                        format!("Expected '{embedding_column}' to be last column of SQL query and return a String type"),
-                                    ),
-                                ).context(DataFusionSnafu);
-                            let zz = z.map(|s| {
-                                s.iter()
-                                    .map(|ss| ss.unwrap_or_default().to_string())
-                                    .collect::<Vec<String>>()
-                            });
-                            zz
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    let outtt: Vec<String> =
-                        outt.iter().flat_map(std::clone::Clone::clone).collect();
-
+                    let (outtt, primary_key_data) = self
+                        .individual_search(
+                            &tbl,
+                            &primary_keys,
+                            embedding.clone(),
+                            embedding_column,
+                            n,
+                        )
+                        .await?;
                     response.retrieved_entries.insert(tbl.clone(), outtt);
-                    response.retrieved_public_keys.insert(tbl, batch);
+                    response
+                        .retrieved_primary_keys
+                        .insert(tbl, primary_key_data);
                 }
             };
         }

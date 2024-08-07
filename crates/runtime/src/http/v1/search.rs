@@ -49,21 +49,21 @@ fn default_limit() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub entries: HashMap<String, Vec<String>>,
-    pub retrieved_public_keys: HashMap<String, Value>,
+    pub retrieved_primary_keys: HashMap<String, Value>,
 }
 
 impl SearchResponse {
     pub fn from_vector_search(
         result: VectorSearchResult,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let keys = create_primary_key_payload(&result.retrieved_public_keys)?;
+        let keys = create_primary_key_payload(&result.retrieved_primary_keys)?;
         Ok(Self {
             entries: result
                 .retrieved_entries
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
-            retrieved_public_keys: keys,
+            retrieved_primary_keys: keys,
         })
     }
 }
