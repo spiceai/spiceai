@@ -32,6 +32,7 @@ pub mod builder;
 pub mod query_history;
 pub use builder::QueryBuilder;
 pub mod error_code;
+mod metrics;
 mod tracker;
 
 use async_stream::stream;
