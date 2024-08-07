@@ -31,7 +31,7 @@ use rand::Rng;
 use runtime::{config::Config, tls::TlsConfig, Runtime};
 use rustls::crypto::{self, CryptoProvider};
 use tonic::transport::Channel;
-use tonic_health_0_9_0::pb::health_client::HealthClient;
+use tonic_health::pb::health_client::HealthClient;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
@@ -137,20 +137,17 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     tracing::info!("Flight (GRPC) health check passed");
 
     // OpenTelemetry (GRPC)
-    let root_cert_tonic_0_9_0 = tonic_0_9_0::transport::Certificate::from_pem(&root_cert_bytes);
+    let root_cert_tonic = tonic::transport::Certificate::from_pem(&root_cert_bytes);
     let otel_channel =
-        tonic_0_9_0::transport::Channel::from_shared(format!("https://127.0.0.1:{otel_port}"))?
-            .tls_config(
-                tonic_0_9_0::transport::ClientTlsConfig::new()
-                    .ca_certificate(root_cert_tonic_0_9_0),
-            )
+        tonic::transport::Channel::from_shared(format!("https://127.0.0.1:{otel_port}"))?
+            .tls_config(tonic::transport::ClientTlsConfig::new().ca_certificate(root_cert_tonic))
             .expect("valid tls config")
             .connect()
             .await
             .expect("to connect to otel port");
     let mut health_client = HealthClient::new(otel_channel);
     health_client
-        .check(tonic_health_0_9_0::pb::HealthCheckRequest {
+        .check(tonic_health::pb::HealthCheckRequest {
             service: String::new(),
         })
         .await

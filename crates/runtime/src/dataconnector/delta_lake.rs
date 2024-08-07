@@ -57,6 +57,8 @@ impl DeltaLakeFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for object store client."),
     // S3 storage options
     ParameterSpec::connector("aws_region")
         .description("The AWS region to use for S3 storage.")

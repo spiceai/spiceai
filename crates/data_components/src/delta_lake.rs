@@ -90,22 +90,24 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(
-        table_location: String,
-        storage_options: HashMap<String, SecretString>,
-    ) -> Result<Self> {
+    pub fn from(table_location: String, options: HashMap<String, SecretString>) -> Result<Self> {
         let table =
             Table::try_from_uri(ensure_folder_location(table_location)).context(DeltaTableSnafu)?;
 
-        let storage_options: HashMap<String, String> = storage_options
-            .into_iter()
-            .filter_map(|(k, v)| {
-                if k == "token" || k == "endpoint" {
-                    return None;
+        let mut storage_options: HashMap<String, String> = HashMap::new();
+        for (key, value) in options {
+            match key.as_ref() {
+                "token" | "endpoint" => {
+                    continue;
                 }
-                Some((k, v.expose_secret().clone()))
-            })
-            .collect();
+                "client_timeout" => {
+                    storage_options.insert("timeout".into(), value.expose_secret().clone());
+                }
+                _ => {
+                    storage_options.insert(key.to_string(), value.expose_secret().clone());
+                }
+            }
+        }
 
         let engine = Arc::new(
             DefaultEngine::try_new(
