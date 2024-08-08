@@ -453,7 +453,7 @@ mod test {
         use std::{fs, path::Path};
 
         let spice_data_dir = crate::spice_data_base_path();
-        let path = format!("{}/abc_sqlite.db", spice_data_dir);
+        let path = format!("{spice_data_dir}/abc_sqlite.db");
 
         register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
