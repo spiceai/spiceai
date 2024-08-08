@@ -17,6 +17,10 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
+use arrow::{
+    array::*,
+    datatypes::{DataType, Field, Schema, TimeUnit},
+};
 use datafusion::{
     assert_batches_eq, execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
@@ -155,3 +159,109 @@ fn container_registry() -> String {
     std::env::var("CONTAINER_REGISTRY")
         .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
 }
+
+// Helper functions to create arrow record batches of different types
+fn get_arrow_binary_record_batch() -> RecordBatch {
+    // Binary/LargeBinary/FixedSizeBinary Array
+    let values: Vec<&[u8]> = vec![b"one", b"two", b""];
+    let binary_array = BinaryArray::from_vec(values.clone());
+    let large_binary_array = LargeBinaryArray::from_vec(values);
+    let input_arg = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+    let fixed_size_binary_array =
+        FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap();
+
+    let schema = Schema::new(vec![
+        Field::new("binary", DataType::Binary, false),
+        Field::new("large_binary", DataType::LargeBinary, false),
+        Field::new("fixed_size_binary", DataType::FixedSizeBinary(2), false),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(binary_array),
+            Arc::new(large_binary_array),
+            Arc::new(fixed_size_binary_array),
+        ],
+    )
+    .expect("Failed to created arrow binary record batch")
+}
+
+// WIP: Add all arrow types covered in acceleration beta hardening criteria
+// fn get_arrow_int_recordbatch() {
+//     // Arrow Integer Types
+//     let int8_arr = Int8Array::from(vec![1, 2, 3]);
+//     let int16_arr = Int16Array::from(vec![1, 2, 3]);
+//     let int32_arr = Int32Array::from(vec![1, 2, 3]);
+//     let int64_arr = Int64Array::from(vec![1, 2, 3]);
+//     let uint8_arr = UInt8Array::from(vec![1, 2, 3]);
+//     let uint16_arr = UInt16Array::from(vec![1, 2, 3]);
+//     let uint32_arr = UInt32Array::from(vec![1, 2, 3]);
+//     let uint64_arr = UInt64Array::from(vec![1, 2, 3]);
+// }
+
+// fn get_arrow_float_record_batch() {
+//     // Arrow Float Types
+//     let float32_arr = Float32Array::from(vec![1.0, 2.0, 3.0]);
+//     let float64_arr = Float64Array::from(vec![1.0, 2.0, 3.0]);
+// }
+
+// fn get_arrow_utf8_record_batch() {
+//     // Utf8, LargeUtf8 Types
+//     let string_arr = StringArray::from(vec!["foo", "bar", "baz"]);
+//     let large_string_arr = LargeStringArray::from(vec!["foo", "bar", "baz"]);
+//     let bool_arr: BooleanArray = vec![true, true, false].into();
+// }
+
+// fn get_arrow_time_record_batch() {
+//     // Time32, Time64 Types
+//     let time32_milli_array: Time32MillisecondArray = vec![
+//         (10 * 3600 + 30 * 60) * 1_000,
+//         (10 * 3600 + 45 * 60 + 15) * 1_000,
+//         (11 * 3600 + 0 * 60 + 15) * 1_000,
+//     ]
+//     .into();
+//     let time32_sec_array: Time32SecondArray = vec![
+//         (10 * 3600 + 30 * 60),
+//         (10 * 3600 + 45 * 60 + 15),
+//         (11 * 3600 + 00 * 60 + 15),
+//     ]
+//     .into();
+//     let time64_micro_array: Time64MicrosecondArray = vec![
+//         (10 * 3600 + 30 * 60) * 1_000_000,
+//         (10 * 3600 + 45 * 60 + 15) * 1_000_000,
+//         (11 * 3600 + 0 * 60 + 15) * 1_000_000,
+//     ]
+//     .into();
+//     let time64_nano_array: Time64NanosecondArray = vec![
+//         (10 * 3600 + 30 * 60) * 1_000_000_000,
+//         (10 * 3600 + 45 * 60 + 15) * 1_000_000_000,
+//         (11 * 3600 + 00 * 60 + 15) * 1_000_000_000,
+//     ]
+//     .into();
+// }
+
+// fn get_arrow_timestamp_record_batch() {
+//     // Timestamp Types
+//     let timestamp_second_array =
+//         TimestampSecondArray::from(vec![1_680_000_000, 1_680_040_000, 1_680_080_000])
+//             .with_timezone("+10:00".to_string());
+//     let timestamp_milli_array = TimestampMillisecondArray::from(vec![
+//         1_680_000_000_000,
+//         1_680_040_000_000,
+//         1_680_080_000_000,
+//     ])
+//     .with_timezone("+10:00".to_string());
+//     let timestamp_micro_array = TimestampMicrosecondArray::from(vec![
+//         1_680_000_000_000_000,
+//         1_680_040_000_000_000,
+//         1_680_080_000_000_000,
+//     ])
+//     .with_timezone("+10:00".to_string());
+//     let timestamp_nano_array = TimestampMicrosecondArray::from(vec![
+//         1_680_000_000_000_000_000,
+//         1_680_040_000_000_000_000,
+//         1_680_080_000_000_000_000,
+//     ])
+//     .with_timezone("+10:00".to_string());
+// }
