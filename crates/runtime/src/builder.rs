@@ -90,8 +90,13 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_metrics_server(mut self, metrics_endpoint: SocketAddr) -> Self {
+    pub fn with_metrics_server(
+        mut self,
+        metrics_endpoint: SocketAddr,
+        prometheus_registry: prometheus::Registry,
+    ) -> Self {
         self.metrics_endpoint = Some(metrics_endpoint);
+        self.prometheus_registry = Some(prometheus_registry);
         self
     }
 

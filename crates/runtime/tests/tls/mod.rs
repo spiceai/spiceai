@@ -57,17 +57,16 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     let cert_bytes = include_bytes!("../../../../test/tls/spiced_cert.pem").to_vec();
     let key_bytes = include_bytes!("../../../../test/tls/spiced_key.pem").to_vec();
 
-    let metrics_recorder = PrometheusBuilder::new().build_recorder();
-    let metrics_handle = metrics_recorder.handle();
-
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
         .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
     let tls_config = TlsConfig::try_new(cert_bytes.clone(), key_bytes).expect("valid TlsConfig");
 
+    let registry = prometheus::Registry::new();
+
     let rt = Runtime::builder()
-        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), metrics_handle)
+        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
         .build()
         .await;
 
