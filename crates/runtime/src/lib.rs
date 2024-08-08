@@ -1582,11 +1582,11 @@ pub struct RegisterDatasetContext {
 
 pub(crate) fn spice_data_base_path() -> String {
     let Some(home_dir) = dirs::home_dir() else {
-        return "./".to_string();
+        return ".".to_string();
     };
 
     let base_folder = home_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or("./").to_string()
+    base_folder.to_str().unwrap_or(".").to_string()
 }
 
 pub(crate) fn make_spice_data_directory() -> Result<()> {
