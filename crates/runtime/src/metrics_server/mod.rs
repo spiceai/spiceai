@@ -138,7 +138,7 @@ fn handle_http_request(
         let metric_families = prometheus_registry.gather();
         let mut result = Vec::new();
         match encoder.encode(&metric_families, &mut result) {
-            Ok(_) => result.into(),
+            Ok(()) => result.into(),
             Err(e) => {
                 tracing::error!("Error encoding Prometheus metrics: {e}");
                 "Error encoding Prometheus metrics".into()
