@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
@@ -24,7 +24,9 @@ use datafusion::{common::Constraint, datasource::TableProvider, sql::TableRefere
 
 use tokio::sync::RwLock;
 
-use crate::{accelerated_table::AcceleratedTable, datafusion::DataFusion, EmbeddingModelStore};
+use crate::{
+    accelerated_table::AcceleratedTable, datafusion::DataFusion, model::EmbeddingModelStore,
+};
 
 use super::table::EmbeddingTable;
 use snafu::prelude::*;
@@ -61,7 +63,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A Component that can perform vector search operations.
 pub struct VectorSearch {
-    df: Arc<DataFusion>,
+    pub df: Arc<DataFusion>,
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
     explicit_primary_keys: HashMap<TableReference, Vec<String>>,
 }
@@ -70,6 +72,15 @@ pub enum RetrievalLimit {
     TopN(usize),
     Threshold(f64),
 }
+impl Display for RetrievalLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetrievalLimit::TopN(n) => write!(f, "TopN({n})"),
+            RetrievalLimit::Threshold(t) => write!(f, "Threshold({t})"),
+        }
+    }
+}
+
 pub type ModelKey = String;
 
 pub struct VectorSearchResult {

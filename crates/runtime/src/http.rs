@@ -35,9 +35,8 @@ use crate::{
     config,
     datafusion::DataFusion,
     embeddings::vector_search::{self, compute_primary_keys},
-    model::LLMModelStore,
+    model::{EmbeddingModelStore, LLMModelStore},
     tls::TlsConfig,
-    EmbeddingModelStore,
 };
 
 mod routes;

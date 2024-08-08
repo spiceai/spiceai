@@ -46,10 +46,10 @@ impl QueryTracker {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish().await;
+        self.finish(Arc::from("")).await;
     }
 
-    pub async fn finish(mut self) {
+    pub async fn finish(mut self, truncated_output: Arc<str>) {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -95,7 +95,7 @@ impl QueryTracker {
             metrics::counter!("query_failures", &labels).increment(1);
         }
 
-        if let Err(err) = self.write_query_history().await {
+        if let Err(err) = self.write_query_history(truncated_output).await {
             tracing::error!("Error writing query history: {err}");
         };
     }
