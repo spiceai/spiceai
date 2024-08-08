@@ -100,4 +100,18 @@ pub(crate) mod flightsql {
 
     pub(crate) static DO_GET_GET_TABLES_DURATION_MS: LazyLock<Histogram<f64>> =
         LazyLock::new(|| METER.f64_histogram("do_get_get_tables_duration_ms").init());
+
+    pub(crate) static DO_GET_PREPARED_STATEMENT_QUERY_DURATION_MS: LazyLock<Histogram<f64>> =
+        LazyLock::new(|| {
+            METER
+                .f64_histogram("do_get_prepared_statement_query_duration_ms")
+                .init()
+        });
+
+    pub(crate) static DO_GET_STATEMENT_QUERY_DURATION_MS: LazyLock<Histogram<f64>> =
+        LazyLock::new(|| {
+            METER
+                .f64_histogram("do_get_statement_query_duration_ms")
+                .init()
+        });
 }

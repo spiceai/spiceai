@@ -45,8 +45,7 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetTables,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let metric = &metrics::flightsql::DO_GET_GET_TABLES_DURATION_MS;
-    let start = TimeMeasurement::new(metric, vec![]);
+    let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_GET_TABLES_DURATION_MS, vec![]);
     let catalog = &query.catalog;
     tracing::trace!("do_get_tables: {query:?}");
     let filtered_catalogs = match catalog {
