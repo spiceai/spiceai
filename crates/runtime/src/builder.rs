@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
-use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -39,7 +38,7 @@ pub struct RuntimeBuilder {
     pods_watcher: Option<podswatcher::PodsWatcher>,
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
-    metrics_handle: Option<PrometheusHandle>,
+    prometheus_registry: Option<prometheus::Registry>,
     datafusion: Option<Arc<DataFusion>>,
 }
 
@@ -51,7 +50,7 @@ impl RuntimeBuilder {
             pods_watcher: None,
             datasets_health_monitor_enabled: false,
             metrics_endpoint: None,
-            metrics_handle: None,
+            prometheus_registry: None,
             datafusion: None,
             autoload_extensions: HashMap::new(),
         }
@@ -91,23 +90,18 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_metrics_server(
-        mut self,
-        metrics_endpoint: SocketAddr,
-        metrics_handle: PrometheusHandle,
-    ) -> Self {
+    pub fn with_metrics_server(mut self, metrics_endpoint: SocketAddr) -> Self {
         self.metrics_endpoint = Some(metrics_endpoint);
-        self.metrics_handle = Some(metrics_handle);
         self
     }
 
     pub fn with_metrics_server_opt(
         mut self,
         metrics_endpoint: Option<SocketAddr>,
-        metrics_handle: Option<PrometheusHandle>,
+        prometheus_registry: Option<prometheus::Registry>,
     ) -> Self {
         self.metrics_endpoint = metrics_endpoint;
-        self.metrics_handle = metrics_handle;
+        self.prometheus_registry = prometheus_registry;
         self
     }
 
@@ -155,7 +149,7 @@ impl RuntimeBuilder {
             extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
-            metrics_handle: self.metrics_handle,
+            prometheus_registry: self.prometheus_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -174,7 +168,6 @@ impl RuntimeBuilder {
     }
 
     async fn load_secrets(app: Option<&App>) -> Secrets {
-        // load_secret_stores
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 

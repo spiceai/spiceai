@@ -22,7 +22,7 @@ use opentelemetry::{
 };
 
 pub(crate) mod spiced_runtime {
-    use super::*;
+    use super::{global, Counter, LazyLock, Meter};
 
     pub(crate) static RUNTIME_METER: LazyLock<Meter> =
         LazyLock::new(|| global::meter("spiced_runtime"));
@@ -43,7 +43,7 @@ pub(crate) mod spiced_runtime {
 }
 
 pub(crate) mod secrets {
-    use super::*;
+    use super::{global, Histogram, LazyLock, Meter};
 
     pub(crate) static SECRETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("secrets"));
 
@@ -57,7 +57,7 @@ pub(crate) mod secrets {
 }
 
 pub(crate) mod datasets {
-    use super::*;
+    use super::{global, Counter, Gauge, LazyLock, Meter, UpDownCounter};
 
     pub(crate) static DATASETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("datasets"));
 
@@ -92,7 +92,7 @@ pub(crate) mod datasets {
 }
 
 pub(crate) mod catalogs {
-    use super::*;
+    use super::{global, Counter, Gauge, LazyLock, Meter};
 
     pub(crate) static CATALOGS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("catalogs"));
 
@@ -112,7 +112,7 @@ pub(crate) mod catalogs {
 }
 
 pub(crate) mod views {
-    use super::*;
+    use super::{global, Counter, LazyLock, Meter};
 
     pub(crate) static VIEWS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("views"));
 
@@ -125,7 +125,7 @@ pub(crate) mod views {
 }
 
 pub(crate) mod embeddings {
-    use super::*;
+    use super::{global, Counter, Gauge, LazyLock, Meter, UpDownCounter};
 
     pub(crate) static EMBEDDINGS_METER: LazyLock<Meter> =
         LazyLock::new(|| global::meter("embeddings"));
@@ -153,7 +153,7 @@ pub(crate) mod embeddings {
 }
 
 pub(crate) mod models {
-    use super::*;
+    use super::{global, Counter, Gauge, Histogram, LazyLock, Meter, UpDownCounter};
 
     pub(crate) static MODELS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("models"));
 
@@ -190,7 +190,7 @@ pub(crate) mod models {
 }
 
 pub(crate) mod llms {
-    use super::*;
+    use super::{global, Gauge, LazyLock, Meter};
 
     pub(crate) static LLMS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llms"));
 

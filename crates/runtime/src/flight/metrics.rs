@@ -76,7 +76,7 @@ pub(crate) static DO_ACTION_DURATION_MS: LazyLock<Histogram<f64>> =
     LazyLock::new(|| METER.f64_histogram("do_action_duration_ms").init());
 
 pub(crate) mod flightsql {
-    use super::*;
+    use super::{Histogram, LazyLock, METER};
 
     pub(crate) static DO_GET_GET_CATALOGS_DURATION_MS: LazyLock<Histogram<f64>> =
         LazyLock::new(|| {

@@ -49,7 +49,6 @@ use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
@@ -276,7 +275,7 @@ pub struct Runtime {
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
-    metrics_handle: Option<PrometheusHandle>,
+    prometheus_registry: Option<prometheus::Registry>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -339,7 +338,7 @@ impl Runtime {
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
     ) -> Result<()> {
-        self.register_metrics_table(self.metrics_handle.clone())
+        self.register_metrics_table(self.prometheus_registry.clone())
             .await?;
 
         let http_server_future = tokio::spawn(http::start(
@@ -356,11 +355,12 @@ impl Runtime {
 
         // Spawn the metrics server in the background
         let metrics_endpoint = self.metrics_endpoint;
-        let metrics_handle = self.metrics_handle.clone();
+        let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                metrics_server::start(metrics_endpoint, metrics_handle, cloned_tls_config).await
+                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
+                    .await
             {
                 tracing::error!("Prometheus metrics server error: {e}");
             }
@@ -1300,9 +1300,12 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    async fn register_metrics_table(&self, with_metrics: Option<PrometheusHandle>) -> Result<()> {
-        if let Some(handle) = with_metrics {
-            let mut recorder = MetricsRecorder::new(handle);
+    async fn register_metrics_table(
+        &self,
+        with_metrics: Option<prometheus::Registry>,
+    ) -> Result<()> {
+        if let Some(registry) = with_metrics {
+            let mut recorder = MetricsRecorder::new(registry);
 
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;
