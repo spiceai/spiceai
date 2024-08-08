@@ -428,7 +428,9 @@ mod tests {
     };
     use data_components::arrow::write::MemTable;
     use datafusion::{physical_plan::collect, prelude::SessionContext};
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+    use opentelemetry::global;
+    use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
+    use prometheus::proto::MetricType;
     use tokio::{sync::mpsc, time::timeout};
 
     use crate::status;
@@ -543,15 +545,17 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_status_change_to_ready() {
         fn wait_until_ready_status(
-            snapshotter: &Snapshotter,
+            registry: &prometheus::Registry,
             desired: status::ComponentStatus,
         ) -> bool {
             for _i in 1..20 {
-                let hashmap = snapshotter.snapshot().into_vec();
-                let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
-                match value {
-                    DebugValue::Gauge(i) => {
-                        let value = i.into_inner();
+                let hashmap = registry.gather();
+                dbg!(&hashmap);
+                let metric = hashmap.first().expect("at least one metric exists");
+                dbg!(&metric);
+                match metric.get_field_type() {
+                    MetricType::GAUGE => {
+                        let value = metric.get_metric()[0].get_gauge().get_value();
 
                         if value.is_eq(f64::from(desired as i32)) {
                             return true;
@@ -566,15 +570,33 @@ mod tests {
             false
         }
 
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let registry = prometheus::Registry::new();
 
-        metrics::set_global_recorder(recorder).expect("recorder is set globally");
+        let resource = Resource::default();
+
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()
+            .expect("to build prometheus exporter");
+
+        let provider = SdkMeterProvider::builder()
+            .with_resource(resource)
+            .with_reader(prometheus_exporter)
+            .build();
+        global::set_meter_provider(provider);
+
+        dbg!("here 1");
 
         status::update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
+
+        dbg!("here 2");
 
         setup_and_test(
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
@@ -583,20 +605,28 @@ mod tests {
         )
         .await;
 
+        dbg!("here 3");
+
         assert!(wait_until_ready_status(
-            &snapshotter,
+            &registry,
             status::ComponentStatus::Ready
         ));
+
+        dbg!("here 4");
 
         status::update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
+        dbg!("here 5");
+
         setup_and_test(vec![], vec![], 0).await;
 
+        dbg!("here 6");
+
         assert!(wait_until_ready_status(
-            &snapshotter,
+            &registry,
             status::ComponentStatus::Ready
         ));
     }
