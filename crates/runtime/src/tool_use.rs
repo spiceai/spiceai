@@ -33,12 +33,13 @@ use async_openai::types::{
 
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, TryStreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 
+use crate::datafusion::query::Protocol;
 use crate::Runtime;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -170,15 +171,19 @@ impl SpiceModelTool for SqlTool {
         let arg_v = Value::from_str(arg).boxed()?;
         let q = arg_v["query"].as_str().unwrap_or_default();
 
-        let batches = rt
+        let query_result = rt
             .datafusion()
-            .ctx
-            .sql(q)
-            .await
-            .boxed()?
-            .collect()
+            .query_builder(q, Protocol::Flight)
+            .build()
+            .run()
             .await
             .boxed()?;
+        let batches = query_result
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .boxed()?;
+
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
         writer.write_batches(batches.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
