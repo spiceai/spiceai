@@ -67,7 +67,11 @@ pub(crate) async fn post(
             } else {
                 match model.write().await.chat_request(req).await {
                     Ok(response) => {
-                        let preview = response.choices.first().map(|s| serde_json::to_string(s).unwrap_or_default()).unwrap_or_default();
+                        let preview = response
+                            .choices
+                            .first()
+                            .map(|s| serde_json::to_string(s).unwrap_or_default())
+                            .unwrap_or_default();
                         span.truncated_output_text(Arc::from(preview)).finish();
                         Json(response).into_response()
                     }
