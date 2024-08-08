@@ -25,7 +25,6 @@ use arrow_flight::{
     sql::{CommandStatementQuery, ProstMessageExt},
     FlightDescriptor,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
 use prost::Message;
 use rand::Rng;
 use runtime::{config::Config, tls::TlsConfig, Runtime};
