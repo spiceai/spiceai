@@ -1146,6 +1146,7 @@ impl Runtime {
         Ok(l)
     }
 
+    #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
@@ -1160,6 +1161,7 @@ impl Runtime {
         Ok(l)
     }
 
+    #[allow(dead_code)]
     async fn load_embeddings(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {

@@ -124,6 +124,7 @@ pub(crate) mod views {
     });
 }
 
+#[allow(dead_code)]
 pub(crate) mod embeddings {
     use super::{global, Counter, Gauge, LazyLock, Meter, UpDownCounter};
 
