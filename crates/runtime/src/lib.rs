@@ -49,7 +49,6 @@ use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use metrics::SetRecorderError;
 use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
 use model_components::model::Model;
@@ -60,6 +59,7 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -229,11 +229,6 @@ pub enum Error {
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
-
-    #[snafu(display("Unable to install metrics recorder: {source}"))]
-    UnableToInstallMetricsServer {
-        source: SetRecorderError<MetricsRecorder>,
-    },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
@@ -1214,8 +1209,13 @@ impl Runtime {
         let source = m.get_source();
         let source_str = source.clone().map(|s| s.to_string()).unwrap_or_default();
         let model = m.clone();
-        // models_load_duration
-        measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
+        let _guard = TimeMeasurement::new(
+            &metrics::models::LOAD_DURATION_MS,
+            &[
+                Key::from_static_str("model").string(m.name.clone()),
+                Key::from_static_str("source").string(source_str.clone()),
+            ],
+        );
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
         let params = self.get_params_with_secrets(&m.params).await;

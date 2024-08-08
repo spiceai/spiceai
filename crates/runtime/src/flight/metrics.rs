@@ -35,6 +35,13 @@ pub(crate) static LIST_FLIGHTS_REQUESTS: LazyLock<Counter<u64>> =
 pub(crate) static GET_FLIGHT_INFO_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("get_flight_info_requests").init());
 
+pub(crate) static GET_FLIGHT_INFO_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| {
+        METER
+            .f64_histogram("get_flight_info_request_duration_ms")
+            .init()
+    });
+
 pub(crate) static GET_SCHEMA_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("get_schema_requests").init());
 

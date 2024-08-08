@@ -19,6 +19,7 @@ use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
+use crate::timing::TimeMeasurement;
 use crate::tls::TlsConfig;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -94,7 +95,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        measure_scope_ms!("flight_get_flight_info_request_duration_ms");
+        let _guard = TimeMeasurement::new(&metrics::GET_FLIGHT_INFO_REQUEST_DURATION_MS, vec![]);
         metrics::GET_FLIGHT_INFO_REQUESTS.add(1, &[]);
         Box::pin(get_flight_info::handle(self, request)).await
     }

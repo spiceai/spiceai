@@ -164,6 +164,14 @@ pub(crate) mod models {
             .init()
     });
 
+    pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+        MODELS_METER
+            .f64_histogram("load_duration_ms")
+            .with_description("Duration in milliseconds to load the model.")
+            .with_unit("ms")
+            .init()
+    });
+
     pub(crate) static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
         MODELS_METER
             .i64_up_down_counter("count")
