@@ -95,6 +95,7 @@ pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub mod tls;
+mod tool_use;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -1134,7 +1135,7 @@ impl Runtime {
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params)
+        let mut l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
