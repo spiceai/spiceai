@@ -30,6 +30,7 @@ use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
 use ::datafusion::sql::TableReference;
+use ::opentelemetry::Key;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
@@ -49,8 +50,6 @@ use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use metrics::SetRecorderError;
-use metrics_exporter_prometheus::PrometheusHandle;
 use model::{try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
@@ -60,6 +59,7 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -84,6 +84,7 @@ pub mod extension;
 mod flight;
 mod http;
 pub mod internal_table;
+mod metrics;
 mod metrics_server;
 pub mod model;
 pub mod object_store_registry;
@@ -231,11 +232,6 @@ pub enum Error {
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
 
-    #[snafu(display("Unable to install metrics recorder: {source}"))]
-    UnableToInstallMetricsServer {
-        source: SetRecorderError<MetricsRecorder>,
-    },
-
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
@@ -286,7 +282,7 @@ pub struct Runtime {
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
-    metrics_handle: Option<PrometheusHandle>,
+    prometheus_registry: Option<prometheus::Registry>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -349,7 +345,7 @@ impl Runtime {
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
     ) -> Result<()> {
-        self.register_metrics_table(self.metrics_handle.clone())
+        self.register_metrics_table(self.prometheus_registry.clone())
             .await?;
 
         let http_server_future = tokio::spawn(http::start(
@@ -366,11 +362,12 @@ impl Runtime {
 
         // Spawn the metrics server in the background
         let metrics_endpoint = self.metrics_endpoint;
-        let metrics_handle = self.metrics_handle.clone();
+        let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                metrics_server::start(metrics_endpoint, metrics_handle, cloned_tls_config).await
+                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
+                    .await
             {
                 tracing::error!("Prometheus metrics server error: {e}");
             }
@@ -509,7 +506,7 @@ impl Runtime {
                             &TableReference::parse_str(&spicepod_ds.name),
                             status::ComponentStatus::Error,
                         );
-                        metrics::counter!("datasets_load_error").increment(1);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
                         tracing::error!(dataset = &spicepod_ds.name, "{e}");
                     }
                     None
@@ -530,7 +527,7 @@ impl Runtime {
                             &spicepod_catalog.name,
                             status::ComponentStatus::Error,
                         );
-                        metrics::counter!("catalogs_load_error").increment(1);
+                        metrics::catalogs::LOAD_ERROR.add(1, &[]);
                         tracing::error!(catalog = &spicepod_catalog.name, "{e}");
                     }
                     None
@@ -556,7 +553,7 @@ impl Runtime {
                     // only load this view if the name isn't used by an existing dataset
                     if datasets.contains(&view.name) {
                         if log_errors.0 {
-                            metrics::counter!("views_load_error").increment(1);
+                            metrics::views::LOAD_ERROR.add(1, &[]);
                             tracing::error!(
                                 view = &spicepod_view.name,
                                 "View name is already in use by a dataset."
@@ -569,7 +566,7 @@ impl Runtime {
                 }
                 Err(e) => {
                     if log_errors.0 {
-                        metrics::counter!("views_load_error").increment(1);
+                        metrics::views::LOAD_ERROR.add(1, &[]);
                         tracing::error!(view = &spicepod_view.name, "{e}");
                     }
                     None
@@ -640,7 +637,7 @@ impl Runtime {
                 Err(err) => {
                     let catalog_name = &catalog.name;
                     status::update_catalog(catalog_name, status::ComponentStatus::Error);
-                    metrics::counter!("catalogs_load_error").increment(1);
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
                 }
@@ -670,7 +667,7 @@ impl Runtime {
                 Err(err) => {
                     let ds_name = &ds.name;
                     status::update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
                 }
@@ -722,7 +719,7 @@ impl Runtime {
                 Err(err) => {
                     let catalog_name = &catalog.name;
                     status::update_catalog(catalog_name, status::ComponentStatus::Error);
-                    metrics::counter!("catalogs_load_error").increment(1);
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: catalog_name.clone(),
@@ -745,7 +742,7 @@ impl Runtime {
                 Err(err) => {
                     let ds_name = &ds.name;
                     status::update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
@@ -838,7 +835,7 @@ impl Runtime {
             Ok(provider) => provider,
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                metrics::counter!("datasets_load_error").increment(1);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
@@ -886,14 +883,14 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
+                metrics::datasets::COUNT.add(1, &[Key::from_static_str("engine").string(engine)]);
                 status::update_dataset(&ds.name, status::ComponentStatus::Ready);
 
                 Ok(())
             }
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                metrics::counter!("datasets_load_error").increment(1);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: datafusion::Error::RefreshSql { source },
                     data_connector: _,
@@ -933,7 +930,7 @@ impl Runtime {
                 }
             },
         );
-        metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
+        metrics::datasets::COUNT.add(-1, &[Key::from_static_str("engine").string(engine)]);
     }
 
     async fn update_dataset(&self, ds: Arc<Dataset>) {
@@ -1152,6 +1149,7 @@ impl Runtime {
         Ok(l)
     }
 
+    #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
@@ -1166,6 +1164,7 @@ impl Runtime {
         Ok(l)
     }
 
+    #[allow(dead_code)]
     async fn load_embeddings(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -1179,11 +1178,22 @@ impl Runtime {
                         embeds_map.insert(in_embed.name.clone(), m.into());
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
-                        metrics::gauge!("embeddings_count", "embeddings" => in_embed.name.clone(), "source" => in_embed.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        metrics::embeddings::COUNT.add(
+                            1,
+                            &[
+                                Key::from_static_str("embeddings").string(in_embed.name.clone()),
+                                Key::from_static_str("source").string(
+                                    in_embed
+                                        .get_prefix()
+                                        .map(|x| x.to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            ],
+                        );
                         status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);
                     }
                     Err(e) => {
-                        metrics::counter!("embeddings_load_error").increment(1);
+                        metrics::embeddings::LOAD_ERROR.add(1, &[]);
                         status::update_embedding(&in_embed.name, status::ComponentStatus::Error);
                         tracing::warn!(
                             "Unable to load embedding from spicepod {}, error: {}",
@@ -1211,7 +1221,13 @@ impl Runtime {
         let source = m.get_source();
         let source_str = source.clone().map(|s| s.to_string()).unwrap_or_default();
         let model = m.clone();
-        measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
+        let _guard = TimeMeasurement::new(
+            &metrics::models::LOAD_DURATION_MS,
+            &[
+                Key::from_static_str("model").string(m.name.clone()),
+                Key::from_static_str("source").string(source_str.clone()),
+            ],
+        );
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
         let params = self.get_params_with_secrets(&m.params).await;
@@ -1249,12 +1265,17 @@ impl Runtime {
         match result {
             Ok(()) => {
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => source_str)
-                    .increment(1.0);
+                metrics::models::COUNT.add(
+                    1,
+                    &[
+                        Key::from_static_str("model").string(m.name.clone()),
+                        Key::from_static_str("source").string(source_str),
+                    ],
+                );
                 status::update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
-                metrics::counter!("models_load_error").increment(1);
+                metrics::models::LOAD_ERROR.add(1, &[]);
                 status::update_model(&model.name, status::ComponentStatus::Error);
                 tracing::warn!(e);
             }
@@ -1275,8 +1296,14 @@ impl Runtime {
         };
 
         tracing::info!("Model [{}] has been unloaded", m.name);
-        metrics::gauge!("models_count", "llm" => m.name.clone(), "source" => m.get_source().map(|s| s.to_string()).unwrap_or_default())
-            .decrement(1.0);
+        let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
+        metrics::models::COUNT.add(
+            -1,
+            &[
+                Key::from_static_str("model").string(m.name.clone()),
+                Key::from_static_str("source").string(source_str),
+            ],
+        );
     }
 
     async fn update_model(&self, m: &SpicepodModel) {
@@ -1285,9 +1312,12 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    async fn register_metrics_table(&self, with_metrics: Option<PrometheusHandle>) -> Result<()> {
-        if let Some(handle) = with_metrics {
-            let mut recorder = MetricsRecorder::new(handle);
+    async fn register_metrics_table(
+        &self,
+        with_metrics: Option<prometheus::Registry>,
+    ) -> Result<()> {
+        if let Some(registry) = with_metrics {
+            let mut recorder = MetricsRecorder::new(registry);
 
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;

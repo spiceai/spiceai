@@ -1929,8 +1929,8 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
- "metrics",
  "moka",
+ "opentelemetry 0.24.0",
  "snafu 0.8.4",
  "spicepod",
  "tokio",
@@ -4763,7 +4763,6 @@ dependencies = [
  "http 1.1.0",
  "hyper 1.4.1",
  "hyper-util",
- "log",
  "rustls 0.23.11",
  "rustls-native-certs 0.7.1",
  "rustls-pki-types",
@@ -5765,53 +5764,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metrics"
-version = "0.23.0"
-source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
-dependencies = [
- "ahash 0.8.11",
- "portable-atomic",
-]
-
-[[package]]
-name = "metrics-exporter-prometheus"
-version = "0.15.1"
-source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
-dependencies = [
- "base64 0.22.1",
- "http-body-util",
- "hyper 1.4.1",
- "hyper-rustls 0.27.2",
- "hyper-util",
- "indexmap 2.2.6",
- "ipnet",
- "metrics",
- "metrics-util",
- "quanta",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "metrics-util"
-version = "0.17.0"
-source = "git+https://github.com/spiceai/metrics.git?rev=b7aa6388e08f395fc6e361a5ff13174ebd4562fe#b7aa6388e08f395fc6e361a5ff13174ebd4562fe"
-dependencies = [
- "aho-corasick",
- "crossbeam-epoch",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "indexmap 2.2.6",
- "metrics",
- "num_cpus",
- "ordered-float 4.2.1",
- "quanta",
- "radix_trie",
- "sketches-ddsketch",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6790,13 +6742,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c365a63eec4f55b7efeceb724f1336f26a9cf3427b70e59e2cd2a5b947fba96"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "once_cell",
+ "pin-project-lite",
+ "thiserror",
+]
+
+[[package]]
+name = "opentelemetry-prometheus"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4191ce34aa274621861a7a9d68dbcf618d5b6c66b10081631b61fd81fbc015"
+dependencies = [
+ "once_cell",
+ "opentelemetry 0.24.0",
+ "opentelemetry_sdk 0.24.1",
+ "prometheus",
+ "protobuf",
+]
+
+[[package]]
 name = "opentelemetry-proto"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "984806e6cf27f2b49282e2a05e288f30594f3dbc74eb7a6e99422bc48ed78162"
 dependencies = [
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.23.0",
+ "opentelemetry_sdk 0.23.0",
  "prost 0.12.6",
  "tonic",
 ]
@@ -6814,8 +6793,24 @@ dependencies = [
  "glob",
  "lazy_static",
  "once_cell",
- "opentelemetry",
+ "opentelemetry 0.23.0",
  "ordered-float 4.2.1",
+ "thiserror",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "692eac490ec80f24a17828d49b40b60f5aeaccdfe6a503f939713afd22bc28df"
+dependencies = [
+ "async-trait",
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "glob",
+ "once_cell",
+ "opentelemetry 0.24.0",
  "thiserror",
 ]
 
@@ -7383,6 +7378,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot 0.12.3",
+ "protobuf",
+ "thiserror",
+]
+
+[[package]]
 name = "prometheus-parse"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7469,6 +7479,12 @@ checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
 dependencies = [
  "prost 0.12.6",
 ]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "ptr_meta"
@@ -8182,17 +8198,18 @@ dependencies = [
  "llms",
  "logos",
  "mediatype",
- "metrics",
- "metrics-exporter-prometheus",
- "metrics-util",
  "model_components",
  "mysql_async",
  "notify",
  "ns_lookup",
  "object_store",
  "once_cell",
+ "opentelemetry 0.24.0",
+ "opentelemetry-prometheus",
  "opentelemetry-proto",
+ "opentelemetry_sdk 0.24.1",
  "pin-project",
+ "prometheus",
  "prometheus-parse",
  "prost 0.12.6",
  "rand",
@@ -8903,12 +8920,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
 
 [[package]]
-name = "sketches-ddsketch"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85636c14b73d81f541e525f585c0a2109e6744e1565b5c1668e31c70c10ed65c"
-
-[[package]]
 name = "slab"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9125,7 +9136,10 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
- "metrics-exporter-prometheus",
+ "opentelemetry 0.24.0",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk 0.24.1",
+ "prometheus",
  "runtime",
  "rustls 0.23.11",
  "rustls-pemfile 2.1.2",
