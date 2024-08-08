@@ -1,9 +1,12 @@
 /*
 Copyright 2024 The Spice.ai OSS Authors
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-https://www.apache.org/licenses/LICENSE-2.0
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -31,6 +34,7 @@ use async_openai::types::{
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_trait::async_trait;
 use futures::Stream;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
@@ -56,7 +60,10 @@ impl SpiceToolsOptions {
     }
 
     /// Filter out a list of tools permitted by the  [`SpiceToolsOptions`].
-    pub fn filter_tools(&self, tools: Vec<Box<dyn SpicedTool>>) -> Vec<Box<dyn SpicedTool>> {
+    pub fn filter_tools(
+        &self,
+        tools: Vec<Box<dyn SpiceModelTool>>,
+    ) -> Vec<Box<dyn SpiceModelTool>> {
         match self {
             SpiceToolsOptions::Auto => tools,
             SpiceToolsOptions::Disabled => vec![],
@@ -87,7 +94,7 @@ impl FromStr for SpiceToolsOptions {
 
 /// Tools that implement this trait can be automatically used by LLMs in the runtime.
 #[async_trait]
-pub trait SpicedTool: Sync + Send {
+pub trait SpiceModelTool: Sync + Send {
     fn name(&self) -> String;
     fn description(&self) -> Option<String>;
     fn parameters(&self) -> Option<Value>;
@@ -102,7 +109,7 @@ pub struct SqlTool {}
 pub struct ListTablesTool {}
 
 #[async_trait]
-impl SpicedTool for ListTablesTool {
+impl SpiceModelTool for ListTablesTool {
     fn name(&self) -> String {
         "list_tables".to_string()
     }
@@ -127,8 +134,22 @@ impl SpicedTool for ListTablesTool {
     }
 }
 
+static PARAMETERS: Lazy<Value> = Lazy::new(|| {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The SQL query to run.",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": false,
+    })
+});
+
 #[async_trait]
-impl SpicedTool for SqlTool {
+impl SpiceModelTool for SqlTool {
     fn name(&self) -> String {
         "sql".to_string()
     }
@@ -138,17 +159,7 @@ impl SpicedTool for SqlTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The SQL query to run.",
-                },
-            },
-            "required": ["query"],
-            "additionalProperties": false,
-        }))
+        Some(PARAMETERS.clone())
     }
 
     async fn call(
@@ -178,7 +189,7 @@ impl SpicedTool for SqlTool {
 pub struct ToolUsingChat {
     inner_chat: Box<dyn Chat>,
     rt: Arc<Runtime>,
-    tools: Vec<Box<dyn SpicedTool>>,
+    tools: Vec<Box<dyn SpiceModelTool>>,
 }
 
 impl ToolUsingChat {
