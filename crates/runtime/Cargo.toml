@@ -36,6 +36,7 @@ data_components = { path = "../data_components" }
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 datafusion.workspace = true
+dirs.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
 dotenvy.workspace = true
 duckdb = { workspace = true, features = [

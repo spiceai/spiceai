@@ -47,7 +47,9 @@ impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sqlite_factory: SqliteTableProviderFactory::new().db_path_param("file"),
+            sqlite_factory: SqliteTableProviderFactory::new()
+                .db_path_param("file")
+                .db_base_folder_param("data_directory"),
         }
     }
 

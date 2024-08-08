@@ -18,6 +18,7 @@ use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexT
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
+use crate::{make_spice_data_directory, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -210,6 +211,8 @@ impl AcceleratorExternalTableBuilder {
             })
             .unwrap_or_default();
 
+        options.insert("data_directory".to_string(), spice_data_base_path());
+
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
         let mode = self.mode;
@@ -260,6 +263,9 @@ pub async fn create_accelerator_table(
     acceleration_settings: &acceleration::Acceleration,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn TableProvider>> {
+    make_spice_data_directory()
+        .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+
     let engine = acceleration_settings.engine;
 
     let accelerator =
