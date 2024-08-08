@@ -550,9 +550,10 @@ mod tests {
         ) -> bool {
             for _i in 1..20 {
                 let hashmap = registry.gather();
-                dbg!(&hashmap);
-                let metric = hashmap.first().expect("at least one metric exists");
-                dbg!(&metric);
+                let metric = hashmap
+                    .iter()
+                    .find(|m| m.get_name() == "datasets_status")
+                    .expect("datasets_status metric exists");
                 match metric.get_field_type() {
                     MetricType::GAUGE => {
                         let value = metric.get_metric()[0].get_gauge().get_value();
@@ -561,7 +562,7 @@ mod tests {
                             return true;
                         }
                     }
-                    _ => panic!("not testing this"),
+                    _ => panic!("datasets_status is a gauge"),
                 }
 
                 sleep(Duration::from_millis(100));
@@ -589,14 +590,10 @@ mod tests {
             .build();
         global::set_meter_provider(provider);
 
-        dbg!("here 1");
-
         status::update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
-
-        dbg!("here 2");
 
         setup_and_test(
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
@@ -605,25 +602,17 @@ mod tests {
         )
         .await;
 
-        dbg!("here 3");
-
         assert!(wait_until_ready_status(
             &registry,
             status::ComponentStatus::Ready
         ));
-
-        dbg!("here 4");
 
         status::update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
-        dbg!("here 5");
-
         setup_and_test(vec![], vec![], 0).await;
-
-        dbg!("here 6");
 
         assert!(wait_until_ready_status(
             &registry,
