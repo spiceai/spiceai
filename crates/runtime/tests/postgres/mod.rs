@@ -191,11 +191,17 @@ CREATE TABLE test (
 }
 
 async fn arrow_postgres_round_trip(
-    ctx: SessionContext,
-    pool: PostgresConnectionPool,
+    port: usize,
     arrow_record: RecordBatch,
     table_name: &str,
 ) -> Result<(), String> {
+    tracing::debug!("Running tests on {table_name}");
+    let ctx = SessionContext::new();
+
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .map_err(|e| format!("Failed to create postgres connection pool: {e}"))?;
+
     let db_conn = pool
         .connect_direct()
         .await
@@ -263,15 +269,62 @@ async fn test_arrow_postgres_types_conversion() -> Result<(), String> {
 
     tracing::debug!("Container started");
 
-    let ctx = SessionContext::new();
-    let pool = common::get_postgres_connection_pool(port)
-        .await
-        .map_err(|e| format!("Failed to create postgres connection pool: {e}"))?;
-
     let binary_record_batch = get_arrow_binary_record_batch();
-    let _ = arrow_postgres_round_trip(ctx, pool, binary_record_batch, "binary_table").await;
+    match arrow_postgres_round_trip(port, binary_record_batch, "binary_types").await {
+        Ok(_) => (),
+        Err(e) => panic!("{}", e),
+    };
 
     let int_record_batch = get_arrow_int_recordbatch();
+    match arrow_postgres_round_trip(port, int_record_batch, "int_types").await {
+        Ok(_) => (),
+        Err(e) => panic!("{}", e),
+    };
+
+    let float_record_batch = get_arrow_float_record_batch();
+    match arrow_postgres_round_trip(port, float_record_batch, "float_types").await {
+        Ok(_) => (),
+        Err(e) => panic!("{}", e),
+    };
+
+    let utf8_record_batch = get_arrow_utf8_record_batch();
+    match arrow_postgres_round_trip(port, utf8_record_batch, "utf8_types").await {
+        Ok(_) => (),
+        Err(e) => panic!("{}", e),
+    };
+
+    // // Pending on datafusion-table-providers merge
+    // let time_record_batch = get_arrow_time_record_batch();
+    // match arrow_postgres_round_trip(port, time_record_batch, "time_types").await {
+    //     Ok(_) => (),
+    //     Err(e) => panic!("{}", e),
+    // };
+
+    let timestamp_record_batch = get_arrow_timestamp_record_batch();
+    match arrow_postgres_round_trip(port, timestamp_record_batch, "timestamp_types").await {
+        Ok(_) => (),
+        Err(e) => panic!("{}", e),
+    };
+
+    // // Pending on datafusion-table-providers merge
+    // let date_record_batch = get_arrow_date_record_batch();
+    // match arrow_postgres_round_trip(port, date_record_batch, "date_types").await {
+    //     Ok(_) => (),
+    //     Err(e) => panic!("{}", e),
+    // };
+
+    let struct_record_batch = get_arrow_struct_record_batch();
+    match arrow_postgres_round_trip(port, struct_record_batch, "struct_types").await {
+        Ok(_) => (),
+        Err(e) => panic!("{}", e),
+    };
+
+    // // Pending on datafusion-table-providers fix
+    // let decimal_record_batch = get_arrow_decimal_record_batch();
+    // match arrow_postgres_round_trip(port, decimal_record_batch, "decimal_types").await {
+    //     Ok(_) => (),
+    //     Err(e) => panic!("{}", e),
+    // };
 
     Ok(())
 }
