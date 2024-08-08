@@ -19,7 +19,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
+use crate::{
+    component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA,
+    task_history::TaskSpan,
+};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::{
     array::{
@@ -106,6 +109,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Error writing to task_history table: {source}"))]
+    UnableToWriteToTaskTable {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Error creating query_history row: {source}"))]
     UnableToCreateRow {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -132,7 +140,7 @@ macro_rules! check_required_field {
 }
 
 impl QueryTracker {
-    pub async fn write_query_history(&self) -> Result<(), Error> {
+    pub async fn write_query_history(&self, truncated_output: Arc<str>) -> Result<(), Error> {
         self.validate()?;
 
         let data = self
@@ -155,7 +163,13 @@ impl QueryTracker {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        Ok(())
+        // Whilst both the query history and task history tables exist, don't need a `TaskTracker` for recording queries.
+        Into::<TaskSpan>::into(self)
+            .truncated_output_text(truncated_output)
+            .write()
+            .await
+            .boxed()
+            .context(UnableToWriteToTaskTableSnafu)
     }
 
     fn to_record_batch(&self) -> Result<RecordBatch, Error> {

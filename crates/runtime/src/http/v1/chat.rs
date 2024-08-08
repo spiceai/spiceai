@@ -30,27 +30,53 @@ use axum::{
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use crate::model::LLMModelStore;
+use crate::{
+    datafusion::DataFusion,
+    model::LLMModelStore,
+    task_history::{TaskSpan, TaskType},
+};
 
 pub(crate) async fn post(
+    Extension(df): Extension<Arc<DataFusion>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
+    let span = TaskSpan::new(
+        Arc::clone(&df),
+        uuid::Uuid::new_v4(),
+        TaskType::AiCompletion,
+        Arc::from(serde_json::to_string(&req).unwrap_or_default()),
+        None,
+    )
+    .label("model".to_string(), req.model.clone());
+
     let model_id = req.model.clone();
     match llms.read().await.get(&model_id) {
         Some(model) => {
             if req.stream.unwrap_or_default() {
                 match model.write().await.chat_stream(req).await {
-                    Ok(strm) => create_sse_response(strm, time::Duration::from_secs(30)),
+                    Ok(strm) => {
+                        create_sse_response(strm, time::Duration::from_secs(30), Some(span))
+                    }
                     Err(e) => {
+                        span.with_error_message(e.to_string()).finish();
                         tracing::debug!("Error from v1/chat: {e}");
                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
                     }
                 }
             } else {
                 match model.write().await.chat_request(req).await {
-                    Ok(response) => Json(response).into_response(),
+                    Ok(response) => {
+                        let preview = response
+                            .choices
+                            .first()
+                            .map(|s| serde_json::to_string(s).unwrap_or_default())
+                            .unwrap_or_default();
+                        span.truncated_output_text(Arc::from(preview)).finish();
+                        Json(response).into_response()
+                    }
                     Err(e) => {
+                        span.with_error_message(e.to_string()).finish();
                         tracing::debug!("Error from v1/chat: {e}");
                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
                     }
@@ -65,6 +91,7 @@ pub(crate) async fn post(
 fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
+    finish_span: Option<TaskSpan>,
 ) -> Response {
     Sse::new(Box::pin(stream! {
         while let Some(msg) = strm.next().await {
@@ -82,6 +109,10 @@ fn create_sse_response(
                 }
             }
         };
+        if let Some(span) = finish_span {
+            span.finish();
+        }
+
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))
     .into_response()

@@ -44,12 +44,13 @@ use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
+use embeddings::task::TaskEmbed;
 use extension::ExtensionFactory;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
+use model::{try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -94,8 +95,10 @@ pub mod podswatcher;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
+pub mod task_history;
 pub mod timing;
 pub mod tls;
+mod tool_use;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -235,6 +238,9 @@ pub enum Error {
     #[snafu(display("Unable to track query history: {source}"))]
     UnableToTrackQueryHistory { source: query_history::Error },
 
+    #[snafu(display("Unable to track task history: {source}"))]
+    UnableToTrackTaskHistory { source: task_history::Error },
+
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
@@ -257,8 +263,6 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 #[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
@@ -1131,7 +1135,7 @@ impl Runtime {
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params)
+        let mut l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1164,7 +1168,10 @@ impl Runtime {
                 match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
-                        embeds_map.insert(in_embed.name.clone(), e.into());
+
+                        let m = Box::new(TaskEmbed::new(e, Arc::clone(&self.df))) as Box<dyn Embed>;
+                        embeds_map.insert(in_embed.name.clone(), m.into());
+
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
                         metrics::embeddings::COUNT.add(
                             1,
@@ -1453,12 +1460,29 @@ impl Runtime {
             SPICE_RUNTIME_SCHEMA,
             query_history::DEFAULT_QUERY_HISTORY_TABLE,
         );
+
         match query_history::instantiate_query_history_table().await {
+            Ok(table) => {
+                let _ = self
+                    .df
+                    .register_runtime_table(query_history_table_reference, table)
+                    .context(UnableToCreateBackendSnafu);
+            }
+            Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
+        };
+
+        match task_history::TaskSpan::instantiate_table().await {
             Ok(table) => self
                 .df
-                .register_runtime_table(query_history_table_reference, table)
+                .register_runtime_table(
+                    TableReference::partial(
+                        SPICE_RUNTIME_SCHEMA,
+                        task_history::DEFAULT_TASK_HISTORY_TABLE,
+                    ),
+                    table,
+                )
                 .context(UnableToCreateBackendSnafu),
-            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+            Err(source) => Err(Error::UnableToTrackTaskHistory { source }),
         }
     }
 }

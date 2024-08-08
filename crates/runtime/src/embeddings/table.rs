@@ -34,7 +34,7 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::embeddings::execution_plan::EmbeddingTableExec;
-use crate::EmbeddingModelStore;
+use crate::model::EmbeddingModelStore;
 
 #[derive(Debug, Snafu)]
 pub enum Error {}

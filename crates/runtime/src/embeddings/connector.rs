@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::component::dataset::Dataset;
-use crate::EmbeddingModelStore;
+use crate::model::EmbeddingModelStore;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use std::any::Any;

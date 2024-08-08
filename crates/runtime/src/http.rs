@@ -36,9 +36,8 @@ use crate::{
     datafusion::DataFusion,
     embeddings::vector_search::{self, compute_primary_keys},
     metrics as runtime_metrics,
-    model::LLMModelStore,
+    model::{EmbeddingModelStore, LLMModelStore},
     tls::TlsConfig,
-    EmbeddingModelStore,
 };
 
 mod metrics;
