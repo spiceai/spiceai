@@ -13,11 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use arrow::record_batch::RecordBatch;
 use model_components::model::{Error as ModelError, Model};
 use std::result::Result;
 use std::sync::Arc;
-
 mod chat;
 mod embed;
 
@@ -31,7 +31,7 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
         .ctx
         .sql(
             &(format!(
-                "select * from datafusion.public.{} order by ts asc",
+                "select * from {SPICE_DEFAULT_CATALOG}.{SPICE_DEFAULT_SCHEMA}.{} order by ts asc",
                 m.model.datasets[0]
             )),
         )
