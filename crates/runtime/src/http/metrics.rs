@@ -24,7 +24,11 @@ use opentelemetry::{
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http"));
 
 pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> =
-    LazyLock::new(|| METER.u64_counter("requests_total").init());
+    LazyLock::new(|| METER.u64_counter("http_requests_total").init());
 
-pub(crate) static REQUESTS_DURATION_SECONDS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| METER.f64_histogram("requests_duration_seconds").init());
+pub(crate) static REQUESTS_DURATION_SECONDS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("http_requests_duration_seconds")
+        .with_unit("s")
+        .init()
+});

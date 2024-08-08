@@ -25,7 +25,7 @@ static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("results_cache"))
 
 pub(crate) static SIZE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("size")
+        .u64_gauge("results_cache_size")
         .with_description("Size of the cache in bytes.")
         .with_unit("b")
         .init()
@@ -33,7 +33,7 @@ pub(crate) static SIZE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub(crate) static MAX_SIZE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("max_size")
+        .u64_gauge("results_cache_max_size")
         .with_description("Maximum allowed size of the cache in bytes.")
         .with_unit("b")
         .init()
@@ -41,21 +41,21 @@ pub(crate) static MAX_SIZE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub(crate) static REQUEST_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("request_count")
+        .u64_counter("results_cache_request_count")
         .with_description("Number of requests to get a key from the cache.")
         .init()
 });
 
 pub(crate) static HIT_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("hit_count")
+        .u64_counter("results_cache_hit_count")
         .with_description("Cache hit count")
         .init()
 });
 
 pub(crate) static ITEM_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("item_count")
+        .u64_counter("results_cache_item_count")
         .with_description("Number of items currently in the cache.")
         .init()
 });

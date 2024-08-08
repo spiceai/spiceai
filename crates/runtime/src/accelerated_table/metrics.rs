@@ -25,14 +25,14 @@ static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("datasets_acceler
 
 pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("refresh_errors")
+        .u64_counter("datasets_acceleration_refresh_errors")
         .with_description("Number of errors refreshing the dataset.")
         .init()
 });
 
 pub(crate) static LAST_REFRESH_TIME: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
-        .f64_gauge("last_refresh_time")
+        .f64_gauge("datasets_acceleration_last_refresh_time")
         .with_description("Seconds elapsed since the last successful refresh.")
         .with_unit("s")
         .init()
@@ -40,7 +40,7 @@ pub(crate) static LAST_REFRESH_TIME: LazyLock<Gauge<f64>> = LazyLock::new(|| {
 
 pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("load_duration_ms")
+        .f64_histogram("datasets_acceleration_load_duration_ms")
         .with_description("Duration in milliseconds to load a full refresh acceleration.")
         .with_unit("ms")
         .init()
@@ -48,7 +48,7 @@ pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
 
 pub(crate) static APPEND_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("append_duration_ms")
+        .f64_histogram("datasets_acceleration_append_duration_ms")
         .with_description("Duration in milliseconds to append to an acceleration.")
         .with_unit("ms")
         .init()

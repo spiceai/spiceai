@@ -25,14 +25,15 @@ static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("query"));
 
 pub(crate) static DURATION_SECONDS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("duration_seconds")
+        .f64_histogram("query_duration_seconds")
         .with_description("Duration in seconds to execute a query.")
+        .with_unit("s")
         .init()
 });
 
 pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("failures")
+        .u64_counter("query_failures")
         .with_description("Number of query failures.")
         .init()
 });

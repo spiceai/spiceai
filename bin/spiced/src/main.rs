@@ -16,7 +16,10 @@ limitations under the License.
 
 use clap::Parser;
 use opentelemetry::global;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
+use opentelemetry_sdk::{
+    metrics::{Instrument, SdkMeterProvider, Stream},
+    Resource,
+};
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
@@ -118,6 +121,7 @@ fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>> {
     let provider = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(prometheus_exporter)
+        .with_view(view_percentiles)
         .build();
     global::set_meter_provider(provider);
 

@@ -247,7 +247,7 @@ mod metrics {
 
     pub(super) static FEDERATED_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|| {
         METER
-            .u64_counter("federated_fallback")
+            .u64_counter("accelerated_zero_results_federated_fallback")
             .with_description("Number of times the federated table was queried due to the accelerated table returning zero results.")
             .init()
     });
