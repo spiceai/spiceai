@@ -24,7 +24,7 @@ use hyper::{
     server::conn::http1::Builder,
 };
 use hyper_util::rt::TokioIo;
-use metrics_exporter_prometheus::PrometheusHandle;
+use prometheus::{Encoder, TextEncoder};
 use snafu::prelude::*;
 use std::net::ToSocketAddrs;
 use std::{fmt::Debug, sync::Arc};
@@ -45,13 +45,14 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) async fn start<A>(
     bind_address: Option<A>,
-    handle: Option<PrometheusHandle>,
+    prometheus_registry: Option<prometheus::Registry>,
     tls_config: Option<Arc<TlsConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug + Clone + Copy,
 {
-    let (Some(bind_address), Some(handle)) = (bind_address, handle) else {
+    let (Some(bind_address), Some(prometheus_registry)) = (bind_address, prometheus_registry)
+    else {
         return Ok(());
     };
 
@@ -78,21 +79,25 @@ where
         match tls_config {
             Some(ref config) => {
                 let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
-                process_tls_tcp_stream(stream, acceptor.clone(), handle.clone());
+                process_tls_tcp_stream(stream, acceptor.clone(), prometheus_registry.clone());
             }
             None => {
-                process_tcp_stream(stream, handle.clone());
+                process_tcp_stream(stream, prometheus_registry.clone());
             }
         }
     }
 }
 
-fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, handle: PrometheusHandle) {
+fn process_tls_tcp_stream(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    prometheus_registry: prometheus::Registry,
+) {
     tokio::spawn(async move {
         let stream = acceptor.accept(stream).await;
         match stream {
             Ok(stream) => {
-                serve_connection(stream, handle).await;
+                serve_connection(stream, prometheus_registry).await;
             }
             Err(e) => {
                 tracing::debug!("Error accepting TLS connection: {e}");
@@ -101,17 +106,17 @@ fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, handle: Prom
     });
 }
 
-fn process_tcp_stream(stream: TcpStream, handle: PrometheusHandle) {
-    tokio::spawn(serve_connection(stream, handle));
+fn process_tcp_stream(stream: TcpStream, prometheus_registry: prometheus::Registry) {
+    tokio::spawn(serve_connection(stream, prometheus_registry));
 }
 
-async fn serve_connection<S>(stream: S, handle: PrometheusHandle)
+async fn serve_connection<S>(stream: S, prometheus_registry: prometheus::Registry)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
-        let handle = handle.clone();
-        async move { Ok::<_, hyper::Error>(handle_http_request(&handle, &req)) }
+        let prometheus_registry = prometheus_registry.clone();
+        async move { Ok::<_, hyper::Error>(handle_http_request(&prometheus_registry, &req)) }
     });
 
     if let Err(err) = Builder::new()
@@ -123,12 +128,22 @@ where
 }
 
 fn handle_http_request(
-    handle: &PrometheusHandle,
+    prometheus_registry: &prometheus::Registry,
     req: &Request<Incoming>,
 ) -> Response<Full<Bytes>> {
-    let mut response = Response::new(match req.uri().path() {
-        "/health" => "OK".into(),
-        _ => handle.render().into(),
+    let mut response = Response::new(if req.uri().path() == "/health" {
+        "OK".into()
+    } else {
+        let encoder = TextEncoder::new();
+        let metric_families = prometheus_registry.gather();
+        let mut result = Vec::new();
+        match encoder.encode(&metric_families, &mut result) {
+            Ok(()) => result.into(),
+            Err(e) => {
+                tracing::error!("Error encoding Prometheus metrics: {e}");
+                "Error encoding Prometheus metrics".into()
+            }
+        }
     });
     response
         .headers_mut()

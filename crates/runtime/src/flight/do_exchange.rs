@@ -30,7 +30,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::dataupdate::{DataUpdate, UpdateType};
 
-use super::Service;
+use super::{metrics, Service};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn handle(
@@ -154,8 +154,7 @@ pub(crate) async fn handle(
                         flights.push(flight_batch.into());
                     }
 
-                    metrics::counter!("flight_do_exchange_data_updates_sent")
-                        .increment(flights.len() as u64);
+                    metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
                     let output = futures::stream::iter(flights.into_iter().map(Ok));
 
                     Some((output, rx))

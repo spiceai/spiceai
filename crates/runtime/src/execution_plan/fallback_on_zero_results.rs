@@ -27,6 +27,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::TableReference;
 use futures::{stream, StreamExt};
+use opentelemetry::Key;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
@@ -191,7 +192,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 tracing::info!("{fallback_msg}");
-                metrics::counter!("accelerated_zero_results_federated_fallback", "dataset_name" => table_name.to_string()).increment(1);
+                metrics::FEDERATED_FALLBACK.add(1, &[Key::from_static_str("dataset_name").string(table_name.to_string())]);
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,
@@ -232,6 +233,24 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
         Ok(Box::pin(stream_adapter))
     }
+}
+
+mod metrics {
+    use std::sync::LazyLock;
+
+    use opentelemetry::{
+        global,
+        metrics::{Counter, Meter},
+    };
+
+    static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("accelerated_zero_results"));
+
+    pub(super) static FEDERATED_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        METER
+            .u64_counter("accelerated_zero_results_federated_fallback")
+            .with_description("Number of times the federated table was queried due to the accelerated table returning zero results.")
+            .init()
+    });
 }
 
 #[cfg(test)]

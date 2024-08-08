@@ -18,7 +18,8 @@ use crate::datafusion::query::error_code::ErrorCode;
 use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
-use crate::measure_scope_ms;
+use crate::metrics as runtime_metrics;
+use crate::timing::TimeMeasurement;
 use crate::tls::TlsConfig;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -49,6 +50,7 @@ mod flightsql;
 mod get_flight_info;
 mod get_schema;
 mod handshake;
+mod metrics;
 mod util;
 
 use arrow_flight::{
@@ -76,7 +78,7 @@ impl FlightService for Service {
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        metrics::counter!("flight_handshake_requests").increment(1);
+        metrics::HANDSHAKE_REQUESTS.add(1, &[]);
         handshake::handle()
     }
 
@@ -84,7 +86,7 @@ impl FlightService for Service {
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        metrics::counter!("flight_list_flights_requests").increment(1);
+        metrics::LIST_FLIGHTS_REQUESTS.add(1, &[]);
         tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
@@ -93,8 +95,8 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        measure_scope_ms!("flight_get_flight_info_request_duration_ms");
-        metrics::counter!("flight_get_flight_info_requests").increment(1);
+        let _guard = TimeMeasurement::new(&metrics::GET_FLIGHT_INFO_REQUEST_DURATION_MS, vec![]);
+        metrics::GET_FLIGHT_INFO_REQUESTS.add(1, &[]);
         Box::pin(get_flight_info::handle(self, request)).await
     }
 
@@ -109,7 +111,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        metrics::counter!("flight_get_schema_requests").increment(1);
+        metrics::GET_SCHEMA_REQUESTS.add(1, &[]);
         get_schema::handle(self, request).await
     }
 
@@ -117,7 +119,7 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        metrics::counter!("flight_do_get_requests").increment(1);
+        metrics::DO_GET_REQUESTS.add(1, &[]);
         Box::pin(do_get::handle(self, request)).await
     }
 
@@ -125,7 +127,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        metrics::counter!("flight_do_put_requests").increment(1);
+        metrics::DO_PUT_REQUESTS.add(1, &[]);
         do_put::handle(self, request).await
     }
 
@@ -133,7 +135,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        metrics::counter!("flight_do_exchange_requests").increment(1);
+        metrics::DO_EXCHANGE_REQUESTS.add(1, &[]);
         do_exchange::handle(self, request).await
     }
 
@@ -141,7 +143,7 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        metrics::counter!("flight_do_action_requests").increment(1);
+        metrics::DO_ACTION_REQUESTS.add(1, &[]);
         Box::pin(actions::do_action(self, request)).await
     }
 
@@ -149,7 +151,7 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        metrics::counter!("flight_list_actions_requests").increment(1);
+        metrics::LIST_ACTIONS_REQUESTS.add(1, &[]);
         Ok(actions::list())
     }
 }
@@ -317,7 +319,7 @@ pub async fn start(
     let svc = FlightServiceServer::new(service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    metrics::counter!("spiced_runtime_flight_server_start").increment(1);
+    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     let mut server = Server::builder();
 

@@ -23,7 +23,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{record_batches_to_flight_stream, to_tonic_err, Service},
+    flight::{metrics, record_batches_to_flight_stream, to_tonic_err, Service},
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -50,7 +50,7 @@ pub(crate) fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetCatalogs,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = TimeMeasurement::new("flight_do_get_get_catalogs_duration_ms", vec![]);
+    let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_GET_CATALOGS_DURATION_MS, vec![]);
     tracing::trace!("do_get_catalogs: {query:?}");
     let mut builder = query.into_builder();
 
