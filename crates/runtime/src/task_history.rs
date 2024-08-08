@@ -21,8 +21,8 @@ use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::array::{
-    Array, ArrayData, BooleanArray, Float64Array, MapArray, RecordBatch, StringArray,
-    StructArray, TimestampNanosecondArray, UInt64Array,
+    Array, ArrayData, BooleanArray, Float64Array, MapArray, RecordBatch, StringArray, StructArray,
+    TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -80,9 +80,9 @@ impl From<&QueryTracker> for TaskSpan {
         };
 
         let input_text = if let Some(nsql) = &qt.nsql {
-            Arc::new(nsql.to_string())
+            Arc::clone(nsql)
         } else {
-            Arc::new(qt.sql.to_string())
+            Arc::<str>::clone(&qt.sql)
         };
 
         TaskSpan {
@@ -159,7 +159,7 @@ pub(crate) struct TaskSpan {
     pub(crate) parent_id: Option<Uuid>,
 
     pub(crate) task_type: TaskType,
-    pub(crate) input_text: Arc<String>,
+    pub(crate) input_text: Arc<str>,
 
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: Option<SystemTime>,
@@ -177,7 +177,7 @@ impl TaskSpan {
         df: Arc<crate::datafusion::DataFusion>,
         context_id: Uuid,
         task_type: TaskType,
-        input_text: Arc<String>,
+        input_text: Arc<str>,
         id: Option<Uuid>,
     ) -> Self {
         Self {

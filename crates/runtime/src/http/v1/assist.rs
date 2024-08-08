@@ -235,7 +235,7 @@ pub(crate) async fn post(
         Arc::clone(&vs.df),
         uuid::Uuid::new_v4(),
         TaskType::VectorSearch,
-        Arc::new(payload.text.clone()),
+        Arc::from(payload.text.clone()),
         None,
     )
     .label("tables".to_string(), format!("{input_tables:?}"));

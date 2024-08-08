@@ -44,7 +44,7 @@ pub(crate) async fn post(
                 df,
                 context_id,
                 task_history::TaskType::TextEmbed,
-                Arc::new(input_text),
+                Arc::from(input_text.clone()),
                 None,
             );
 

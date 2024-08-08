@@ -42,7 +42,7 @@ impl Embed for TaskEmbed {
             Arc::clone(&self.df),
             uuid::Uuid::new_v4(),
             task_history::TaskType::TextEmbed,
-            Arc::new(serde_json::to_string(&input).unwrap_or_default()),
+            Arc::from(serde_json::to_string(&input).unwrap_or_default()),
             None,
         );
 
@@ -75,7 +75,7 @@ impl Embed for TaskEmbed {
             Arc::clone(&self.df),
             uuid::Uuid::new_v4(),
             task_history::TaskType::TextEmbed,
-            Arc::new(serde_json::to_string(&req.input).unwrap_or_default()),
+            Arc::from(serde_json::to_string(&req.input).unwrap_or_default()),
             None,
         )
         .label("model".to_string(), req.model.clone());

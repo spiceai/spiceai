@@ -45,7 +45,7 @@ pub(crate) async fn post(
         Arc::clone(&df),
         uuid::Uuid::new_v4(),
         TaskType::AiCompletion,
-        Arc::new(serde_json::to_string(&req).unwrap_or_default()),
+        Arc::from(serde_json::to_string(&req).unwrap_or_default()),
         None,
     )
     .label("model".to_string(), req.model.clone());
