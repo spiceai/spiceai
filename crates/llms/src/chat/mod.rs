@@ -87,6 +87,9 @@ pub enum Error {
 
     #[snafu(display("No model from {from} currently supports {task}"))]
     UnsupportedTaskForModel { from: String, task: String },
+
+    #[snafu(display("Invalid value for 'params.spice_tools'"))]
+    UnsupportedSpiceToolUseParameterError {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

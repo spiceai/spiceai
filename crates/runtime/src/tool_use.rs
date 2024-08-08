@@ -31,10 +31,59 @@ use async_openai::types::{
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_trait::async_trait;
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 
 use crate::Runtime;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpiceToolsOptions {
+    Auto,
+    Disabled,
+    Specific(Vec<String>),
+}
+
+impl SpiceToolsOptions {
+    // Check if spice tools can be used.
+    pub fn can_use_tools(&self) -> bool {
+        match self {
+            SpiceToolsOptions::Auto => true,
+            SpiceToolsOptions::Disabled => false,
+            SpiceToolsOptions::Specific(t) => !t.is_empty(),
+        }
+    }
+
+    /// Filter out a list of tools permitted by the  [`SpiceToolsOptions`].
+    pub fn filter_tools(&self, tools: Vec<Box<dyn SpicedTool>>) -> Vec<Box<dyn SpicedTool>> {
+        match self {
+            SpiceToolsOptions::Auto => tools,
+            SpiceToolsOptions::Disabled => vec![],
+            SpiceToolsOptions::Specific(t) => tools
+                .into_iter()
+                .filter(|tool| t.contains(&tool.name()))
+                .collect(),
+        }
+    }
+}
+
+impl FromStr for SpiceToolsOptions {
+    type Err = Box<dyn std::error::Error + Send + Sync>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" => Ok(SpiceToolsOptions::Auto),
+            "disabled" => Ok(SpiceToolsOptions::Disabled),
+            _ => Ok(SpiceToolsOptions::Specific(
+                s.split(',')
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+            )),
+        }
+    }
+}
 
 /// Tools that implement this trait can be automatically used by LLMs in the runtime.
 #[async_trait]
@@ -133,11 +182,11 @@ pub struct ToolUsingChat {
 }
 
 impl ToolUsingChat {
-    pub fn new(inner_chat: Box<dyn Chat>, rt: Arc<Runtime>) -> Self {
+    pub fn new(inner_chat: Box<dyn Chat>, rt: Arc<Runtime>, tools_opt: &SpiceToolsOptions) -> Self {
         Self {
             inner_chat,
             rt,
-            tools: vec![Box::new(SqlTool {}), Box::new(ListTablesTool {})],
+            tools: tools_opt.filter_tools(vec![Box::new(SqlTool {}), Box::new(ListTablesTool {})]),
         }
     }
 

@@ -27,7 +27,7 @@ use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::tool_use::ToolUsingChat;
+use crate::tool_use::{SpiceToolsOptions, ToolUsingChat};
 use crate::{DataFusion, Runtime};
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
 
@@ -148,14 +148,16 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
 
     let model = construct_model(&prefix, model_id, component, params)?;
 
-    let use_spiced_tools = params
-        .get("use_spiced_tools")
+    let spice_tool_opt: Option<SpiceToolsOptions> = params
+        .get("spice_tools")
         .map(Secret::expose_secret)
-        .cloned();
-    if use_spiced_tools.is_some_and(|x| x == "true") {
-        Ok(Box::new(ToolUsingChat::new(model, rt)))
-    } else {
-        Ok(model)
+        .map(|x| x.parse())
+        .transpose()
+        .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
+
+    match spice_tool_opt {
+        Some(tools) if tools.can_use_tools() => Ok(Box::new(ToolUsingChat::new(model, rt, &tools))),
+        Some(_) | None => Ok(model),
     }
 }
 
