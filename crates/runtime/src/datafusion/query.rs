@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::{cell::LazyCell, sync::Arc};
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Schema, SchemaRef},
+};
 use arrow_tools::schema::verify_schema;
 use cache::{get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult};
 use datafusion::{
@@ -25,7 +28,7 @@ use datafusion::{
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
 };
 use error_code::ErrorCode;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 pub(crate) use tracker::QueryTracker;
 
 pub mod builder;
@@ -243,11 +246,18 @@ fn attach_query_tracker_to_stream(
 
     let mut num_records = 0u64;
 
+    let mut truncated_output = "[]".to_string(); // default to empty preview
+
     let updated_stream = stream! {
         while let Some(batch_result) = stream.next().await {
 
             match &batch_result {
                 Ok(batch) => {
+                    // Create a truncated output for the query history table on first batch.
+                    if num_records == 0 {
+                        truncated_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
+                    }
+
                     num_records += batch.num_rows() as u64;
                     yield batch_result
                 }
@@ -265,7 +275,7 @@ fn attach_query_tracker_to_stream(
         ctx
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish()
+            .finish(Arc::from(truncated_output))
             .await;
     };
 
@@ -273,4 +283,16 @@ fn attach_query_tracker_to_stream(
         schema,
         Box::pin(updated_stream),
     ))
+}
+
+pub fn write_to_json_string(
+    data: &[RecordBatch],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(buf);
+
+    writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
+    writer.finish()?;
+
+    String::from_utf8(writer.into_inner()).boxed()
 }

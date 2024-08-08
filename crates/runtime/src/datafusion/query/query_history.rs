@@ -140,7 +140,7 @@ macro_rules! check_required_field {
 }
 
 impl QueryTracker {
-    pub async fn write_query_history(&self) -> Result<(), Error> {
+    pub async fn write_query_history(&self, truncated_output: Arc<str>) -> Result<(), Error> {
         self.validate()?;
 
         let data = self
@@ -165,6 +165,7 @@ impl QueryTracker {
 
         // Whilst both the query history and task history tables exist, don't need a `TaskTracker` for recording queries.
         Into::<TaskSpan>::into(self)
+            .truncated_output_text(truncated_output)
             .write()
             .await
             .boxed()

@@ -100,6 +100,7 @@ impl From<&QueryTracker> for TaskSpan {
             error_message: qt.error_message.clone(),
             labels,
             timer: qt.timer,
+            truncated_output_text: None,
         }
     }
 }
@@ -160,6 +161,7 @@ pub(crate) struct TaskSpan {
 
     pub(crate) task_type: TaskType,
     pub(crate) input_text: Arc<str>,
+    pub(crate) truncated_output_text: Option<Arc<str>>,
 
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: Option<SystemTime>,
@@ -195,7 +197,13 @@ impl TaskSpan {
             error_message: None,
             labels: HashMap::default(),
             timer: Instant::now(),
+            truncated_output_text: None,
         }
+    }
+
+    pub fn truncated_output_text(mut self, truncated_output_text: Arc<str>) -> Self {
+        self.truncated_output_text = Some(truncated_output_text);
+        self
     }
 
     pub fn outputs_produced(mut self, outputs_produced: u64) -> Self {
@@ -252,6 +260,7 @@ impl TaskSpan {
             Field::new("parent_id", DataType::Utf8, true),
             Field::new("task_type", DataType::Utf8, false),
             Field::new("input_text", DataType::Utf8, false),
+            Field::new("truncated_output_text", DataType::Utf8, true),
             Field::new(
                 "start_time",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -365,6 +374,10 @@ impl TaskSpan {
                     .map(|s| s.to_string())])),
                 Arc::new(StringArray::from(vec![self.task_type.to_string()])),
                 Arc::new(StringArray::from(vec![self.input_text.to_string()])),
+                Arc::new(StringArray::from(vec![self
+                    .truncated_output_text
+                    .clone()
+                    .map(|s| s.to_string())])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
                 Arc::new(Float64Array::from(vec![self.execution_duration_ms])),
