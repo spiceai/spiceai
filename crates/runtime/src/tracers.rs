@@ -57,12 +57,6 @@ pub struct SpacedTracer {
     pub interval: Duration,
 }
 
-impl Default for SpacedTracer {
-    fn default() -> Self {
-        SpacedTracer::new(Duration::from_secs(60))
-    }
-}
-
 impl SpacedTracer {
     pub fn new(interval: Duration) -> Self {
         SpacedTracer {
