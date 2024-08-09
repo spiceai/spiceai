@@ -72,7 +72,7 @@ impl SpiceToolsOptions {
             SpiceToolsOptions::Disabled => vec![],
             SpiceToolsOptions::Specific(t) => tools
                 .into_iter()
-                .filter(|tool| t.contains(&tool.name()))
+                .filter(|tool| t.iter().any(|s| s == tool.name()))
                 .collect(),
         }
     }
@@ -98,8 +98,8 @@ impl FromStr for SpiceToolsOptions {
 /// Tools that implement this trait can be automatically used by LLMs in the runtime.
 #[async_trait]
 pub trait SpiceModelTool: Sync + Send {
-    fn name(&self) -> String;
-    fn description(&self) -> Option<String>;
+    fn name(&self) -> &'static str;
+    fn description(&self) -> Option<&'static str>;
     fn parameters(&self) -> Option<Value>;
     async fn call(
         &self,
@@ -119,12 +119,12 @@ struct DocumentSimilarityToolArgs {
 
 #[async_trait]
 impl SpiceModelTool for DocumentSimilarityTool {
-    fn name(&self) -> String {
-        "document_similarity".to_string()
+    fn name(&self) -> &'static str {
+        "document_similarity"
     }
 
-    fn description(&self) -> Option<String> {
-        Some("Search and retrieve documents from available datasets".to_string())
+    fn description(&self) -> Option<&'static str> {
+        Some("Search and retrieve documents from available datasets")
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -206,12 +206,12 @@ pub struct ListTablesTool {}
 
 #[async_trait]
 impl SpiceModelTool for ListTablesTool {
-    fn name(&self) -> String {
-        "list_tables".to_string()
+    fn name(&self) -> &'static str {
+        "list_tables"
     }
 
-    fn description(&self) -> Option<String> {
-        Some("List all SQL tables available".to_string())
+    fn description(&self) -> Option<&'static str> {
+        Some("List all SQL tables available")
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -234,12 +234,12 @@ pub struct ListDatasetsTool {}
 
 #[async_trait]
 impl SpiceModelTool for ListDatasetsTool {
-    fn name(&self) -> String {
-        "list_datasets".to_string()
+    fn name(&self) -> &'static str {
+        "list_datasets"
     }
 
-    fn description(&self) -> Option<String> {
-        Some("List all datasets that contain searchable documents".to_string())
+    fn description(&self) -> Option<&'static str> {
+        Some("List all datasets that contain searchable documents")
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -268,12 +268,12 @@ impl SpiceModelTool for ListDatasetsTool {
 pub struct TableSchemaTool {}
 #[async_trait]
 impl SpiceModelTool for TableSchemaTool {
-    fn name(&self) -> String {
-        "table_schema".to_string()
+    fn name(&self) -> &'static str {
+        "table_schema"
     }
 
-    fn description(&self) -> Option<String> {
-        Some("Retrieve the schema of all available SQL tables".to_string())
+    fn description(&self) -> Option<&'static str> {
+        Some("Retrieve the schema of all available SQL tables")
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -337,12 +337,12 @@ pub struct SqlTool {}
 
 #[async_trait]
 impl SpiceModelTool for SqlTool {
-    fn name(&self) -> String {
-        "sql".to_string()
+    fn name(&self) -> &'static str {
+        "sql"
     }
 
-    fn description(&self) -> Option<String> {
-        Some("Run an SQL query on the data source".to_string())
+    fn description(&self) -> Option<&'static str> {
+        Some("Run an SQL query on the data source")
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -404,8 +404,8 @@ impl ToolUsingChat {
             .map(|t| ChatCompletionTool {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
-                    name: t.name(),
-                    description: t.description(),
+                    name: t.name().to_string(),
+                    description: t.description().map(ToString::to_string),
                     parameters: t.parameters(),
                 },
             })
@@ -438,7 +438,6 @@ impl ToolUsingChat {
         }
     }
 
-    ///
     /// For `requested_tools` requested from processing `original_messages` through a model, check
     /// if any are spiced runtime tools, and if so, run them locally and create new messages to be
     ///  reprocessed by the model.
@@ -461,7 +460,7 @@ impl ToolUsingChat {
 
         tracing::debug!(
             "spiced_tools available: {:?}. Used {:?}",
-            self.tools.iter().map(|t| t.name().clone()).collect_vec(),
+            self.tools.iter().map(|t| t.name()).collect_vec(),
             spiced_tools
         );
 
