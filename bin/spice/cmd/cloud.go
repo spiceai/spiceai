@@ -160,6 +160,10 @@ spice chat --model <model> --cloud
 					doneLoading = true
 				}
 
+				if len(chatResponse.Choices) == 0 {
+					continue
+				}
+
 				token := chatResponse.Choices[0].Delta.Content
 				cmd.Printf("%s", token)
 				responseMessage = responseMessage + token
