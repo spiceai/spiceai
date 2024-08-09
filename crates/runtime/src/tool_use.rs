@@ -110,6 +110,33 @@ pub trait SpiceModelTool: Sync + Send {
 
 pub struct DocumentSimilarityTool {}
 
+static DOCUMENT_SIMILARITY_PARAMETERS: Lazy<Value> = Lazy::new(|| {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "The text to search documents for similarity",
+            },
+            "from": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "The datasets to search for similarity. For available datasets, use the 'list_datasets' tool",
+                "default": []
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Number of documents to return for each dataset",
+                "default": 3
+            }
+        },
+        "required": ["text", "from"],
+        "additionalProperties": false
+    })
+});
+
 #[derive(Deserialize)]
 struct DocumentSimilarityToolArgs {
     text: String,
@@ -128,30 +155,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "The text to search documents for similarity",
-                },
-                "from": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "description": "The datasets to search for similarity. For available datasets, use the 'list_datasets' tool",
-                    "default": []
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of documents to return for each dataset",
-                    "default": 3
-                }
-            },
-            "required": ["text", "from"],
-            "additionalProperties": false
-        }))
+        Some(DOCUMENT_SIMILARITY_PARAMETERS.clone())
     }
 
     async fn call(
@@ -266,6 +270,23 @@ impl SpiceModelTool for ListDatasetsTool {
 }
 
 pub struct TableSchemaTool {}
+static TABLE_SCHEMA_PARAMETERS: Lazy<Value> = Lazy::new(|| {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tables": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "description": "Which subset of tables to return results for. Default to all tables.",
+        },
+        },
+        "required": [],
+        "additionalProperties": false,
+    })
+});
+
 #[async_trait]
 impl SpiceModelTool for TableSchemaTool {
     fn name(&self) -> &'static str {
@@ -277,20 +298,7 @@ impl SpiceModelTool for TableSchemaTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "tables": {
-                "type": "array",
-                "items": {
-                    "type": "string"
-                },
-                "description": "Which subset of tables to return results for. Default to all tables.",
-            },
-            },
-            "required": [],
-            "additionalProperties": false,
-        }))
+        Some(TABLE_SCHEMA_PARAMETERS.clone())
     }
 
     async fn call(
@@ -319,7 +327,8 @@ impl SpiceModelTool for TableSchemaTool {
     }
 }
 
-static PARAMETERS: Lazy<Value> = Lazy::new(|| {
+pub struct SqlTool {}
+static SQL_PARAMETERS: Lazy<Value> = Lazy::new(|| {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -333,8 +342,6 @@ static PARAMETERS: Lazy<Value> = Lazy::new(|| {
     })
 });
 
-pub struct SqlTool {}
-
 #[async_trait]
 impl SpiceModelTool for SqlTool {
     fn name(&self) -> &'static str {
@@ -346,7 +353,7 @@ impl SpiceModelTool for SqlTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(PARAMETERS.clone())
+        Some(SQL_PARAMETERS.clone())
     }
 
     async fn call(
