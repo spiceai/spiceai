@@ -686,6 +686,8 @@ async fn make_a_stream(
                             state.function.arguments.push_str(arguments);
                         }
                     }
+                } else {
+                    finished_choices.push(chat_choice.clone());
                 }
 
                 // If a tool has finished (i.e. we have all chunks), process them.
