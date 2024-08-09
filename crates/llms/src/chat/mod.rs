@@ -138,11 +138,11 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 
 #[async_trait]
 pub trait Chat: Sync + Send {
-    async fn run(&mut self, prompt: String) -> Result<Option<String>>;
+    async fn run(&self, prompt: String) -> Result<Option<String>>;
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
-    async fn health(&mut self) -> Result<()> {
+    async fn health(&self) -> Result<()> {
         self.run("health".to_string())
             .await
             .boxed()
@@ -151,7 +151,7 @@ pub trait Chat: Sync + Send {
     }
 
     async fn stream<'a>(
-        &mut self,
+        &self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         let resp = self.run(prompt).await;
@@ -160,7 +160,7 @@ pub trait Chat: Sync + Send {
 
     #[allow(deprecated)]
     async fn chat_stream(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let model_id = req.model.clone();
@@ -226,7 +226,7 @@ pub trait Chat: Sync + Send {
     /// implementation will be constructed based on the trait's [`run`] method.
     #[allow(deprecated)]
     async fn chat_request(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let model_id = req.model.clone();
