@@ -21,13 +21,10 @@ use std::{any::Any, pin::Pin, sync::Arc};
 
 use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
-    config::ConfigOptions,
     datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
-    logical_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF},
+    logical_expr::Expr,
     physical_plan::{empty::EmptyExec, ExecutionPlan},
-    sql::{planner::ContextProvider, TableReference},
 };
 use futures::Future;
 
@@ -106,58 +103,6 @@ impl DataConnector for SinkConnector {
         _dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
-    }
-}
-
-struct SinkContextProvider {
-    options: ConfigOptions,
-}
-
-impl SinkContextProvider {
-    pub fn new() -> Self {
-        Self {
-            options: ConfigOptions::default(),
-        }
-    }
-}
-
-impl ContextProvider for SinkContextProvider {
-    fn get_table_source(&self, _name: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
-        Err(DataFusionError::NotImplemented(
-            "SinkContextProvider::get_table_source".to_string(),
-        ))
-    }
-
-    fn get_function_meta(&self, _name: &str) -> Option<Arc<ScalarUDF>> {
-        None
-    }
-
-    fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
-        None
-    }
-
-    fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
-        None
-    }
-
-    fn options(&self) -> &ConfigOptions {
-        &self.options
-    }
-
-    fn get_window_meta(&self, _name: &str) -> Option<Arc<WindowUDF>> {
-        None
-    }
-
-    fn udf_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn udaf_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn udwf_names(&self) -> Vec<String> {
-        Vec::new()
     }
 }
 
