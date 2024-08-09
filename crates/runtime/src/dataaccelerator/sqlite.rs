@@ -25,7 +25,7 @@ use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTablePr
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::{component::dataset::Dataset, parameters::ParameterSpec};
+use crate::{component::dataset::Dataset, make_spice_data_directory, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -34,6 +34,11 @@ pub enum Error {
     #[snafu(display("Unable to create table: {source}"))]
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Acceleration creation failed: {source}"))]
+    AccelerationCreationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -91,6 +96,11 @@ impl DataAccelerator for SqliteAccelerator {
         &self,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        if !cmd.options.contains_key("sqlite_file") {
+            make_spice_data_directory()
+                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+        }
+
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), cmd)
             .await
