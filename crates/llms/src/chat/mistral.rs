@@ -269,7 +269,7 @@ impl MistralLlama {
         })
     }
 
-    async fn run_internal(&mut self, prompt: String) -> Result<Option<(String, Usage)>> {
+    async fn run_internal(&self, prompt: String) -> Result<Option<(String, Usage)>> {
         let (snd, mut rcv) = channel::<MistralResponse>(10_000);
         tracing::trace!("Sending request to pipeline");
         self.pipeline
@@ -306,13 +306,13 @@ impl MistralLlama {
 
 #[async_trait]
 impl Chat for MistralLlama {
-    async fn health(&mut self) -> Result<()> {
+    async fn health(&self) -> Result<()> {
         // If [`MistralLlama`] is instantiated successfully, it is healthy.
         Ok(())
     }
 
     async fn stream<'a>(
-        &mut self,
+        &self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         let (snd, mut rcv) = channel::<MistralResponse>(1000);
@@ -375,7 +375,7 @@ impl Chat for MistralLlama {
         })))
     }
 
-    async fn run(&mut self, prompt: String) -> Result<Option<String>> {
+    async fn run(&self, prompt: String) -> Result<Option<String>> {
         match self.run_internal(prompt).await? {
             Some((response, _usage)) => Ok(Some(response)),
             None => Ok(None),
@@ -384,7 +384,7 @@ impl Chat for MistralLlama {
 
     #[allow(deprecated, clippy::cast_possible_truncation)]
     async fn chat_request(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let model_id = req.model.clone();
