@@ -328,8 +328,9 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
-        if uniq_partition_columns.len() != 1
-            || !uniq_partition_columns.contains(&partition_cols.len())
+        if !uniq_partition_columns.is_empty()
+            && (uniq_partition_columns.len() != 1
+                || !uniq_partition_columns.contains(&partition_cols.len()))
         {
             return Err(DataFusionError::Execution(format!(
                 "various number of partition values from the partitioned files: {uniq_partition_columns:?}"
