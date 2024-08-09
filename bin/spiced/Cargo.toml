@@ -16,6 +16,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry-zipkin.workspace = true
+opentelemetry-http.workspace = true
 prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }

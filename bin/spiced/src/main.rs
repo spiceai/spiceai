@@ -83,6 +83,8 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
         None => None,
     };
 
+    init_otel_tracing()?;
+
     spiced::run(args, prometheus_registry).await?;
     Ok(())
 }
@@ -99,8 +101,6 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(true)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
-
-    init_otel_tracing()?;
 
     Ok(())
 }
