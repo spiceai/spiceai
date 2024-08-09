@@ -151,7 +151,7 @@ spice chat --model <model> --cloud
 				var chatResponse ChatCompletion = ChatCompletion{}
 				err = json.Unmarshal([]byte(chunk), &chatResponse)
 				if err != nil {
-					cmd.Println(err)
+					cmd.Printf("Error: %v\n\n", err)
 					continue
 				}
 
@@ -160,13 +160,21 @@ spice chat --model <model> --cloud
 					doneLoading = true
 				}
 
+				if len(chatResponse.Choices) == 0 {
+					continue
+				}
+
 				token := chatResponse.Choices[0].Delta.Content
 				cmd.Printf("%s", token)
 				responseMessage = responseMessage + token
 			}
 
-			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+			if !doneLoading {
+				done <- true
+				doneLoading = true
+			}
 
+			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			cmd.Print("\n\n")
 		}
 	},
