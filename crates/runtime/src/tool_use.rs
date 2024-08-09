@@ -557,11 +557,14 @@ impl Chat for ToolUsingChat {
 
         let s = self.inner_chat.chat_stream(inner_req).await?;
         Ok(make_a_stream(
-            Self::new(self.inner_chat.clone(), self.rt.clone(), &self.opts),
+            Self::new(
+                Arc::clone(&self.inner_chat),
+                Arc::clone(&self.rt),
+                &self.opts,
+            ),
             req.clone(),
             s,
-        )
-        .await)
+        ))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
@@ -624,7 +627,8 @@ impl Stream for CustomStream {
     }
 }
 
-async fn make_a_stream(
+#[allow(clippy::too_many_lines)]
+fn make_a_stream(
     model: ToolUsingChat,
     req: CreateChatCompletionRequest,
     mut s: ChatCompletionResponseStream,
@@ -654,12 +658,28 @@ async fn make_a_stream(
                 // Appending the tool call chunks
                 // TODO: only concatenate, spiced tools
                 if let Some(ref tool_calls) = chat_choice.delta.tool_calls {
-                    for tool_call_chunk in tool_calls.into_iter() {
-                        let key = (chat_choice.index as i32, tool_call_chunk.index);
-                        let states = tool_call_states.clone();
+                    for tool_call_chunk in tool_calls {
+                        let key = if let Ok(index) = chat_choice.index.try_into() {
+                            (index, tool_call_chunk.index)
+                        } else {
+                            tracing::error!(
+                                "chat_choice.index value {} is too large to fit in an i32",
+                                chat_choice.index
+                            );
+                            return;
+                        };
+
+                        let states = Arc::clone(&tool_call_states);
                         let tool_call_data = tool_call_chunk.clone();
 
-                        let mut states_lock = states.lock().unwrap();
+                        let mut states_lock = match states.lock() {
+                            Ok(lock) => lock,
+                            Err(e) => {
+                                tracing::error!("Failed to lock tool_call_states: {}", e);
+                                return;
+                            }
+                        };
+
                         let state = states_lock.entry(key).or_insert_with(|| {
                             ChatCompletionMessageToolCall {
                                 id: tool_call_data.id.clone().unwrap_or_default(),
@@ -678,6 +698,7 @@ async fn make_a_stream(
                                 },
                             }
                         });
+
                         if let Some(arguments) = tool_call_chunk
                             .function
                             .as_ref()
@@ -693,14 +714,19 @@ async fn make_a_stream(
                 // If a tool has finished (i.e. we have all chunks), process them.
                 if let Some(finish_reason) = &chat_choice.finish_reason {
                     if matches!(finish_reason, FinishReason::ToolCalls) {
-                        let tool_call_states_clone = tool_call_states.clone();
+                        let tool_call_states_clone = Arc::clone(&tool_call_states);
 
                         let tool_calls_to_process = {
-                            let states_lock = tool_call_states_clone.lock().unwrap();
-                            states_lock
-                                .iter()
-                                .map(|(_key, tool_call)| tool_call.clone())
-                                .collect::<Vec<_>>()
+                            match tool_call_states_clone.lock() {
+                                Ok(states_lock) => states_lock
+                                    .iter()
+                                    .map(|(_key, tool_call)| tool_call.clone())
+                                    .collect::<Vec<_>>(),
+                                Err(e) => {
+                                    tracing::error!("Failed to lock tool_call_states: {}", e);
+                                    return;
+                                }
+                            }
                         };
 
                         let new_messages = match model
@@ -725,7 +751,7 @@ async fn make_a_stream(
                         };
 
                         let mut new_req = req.clone();
-                        new_req.messages = new_messages.clone();
+                        new_req.messages.clone_from(&new_messages);
                         match model.chat_stream(new_req).await {
                             Ok(mut s) => {
                                 while let Some(resp) = s.next().await {
