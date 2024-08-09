@@ -395,7 +395,7 @@ impl Chat for MistralLlama {
             .collect::<Vec<String>>()
             .join("\n");
         let (choices, usage): (Vec<ChatChoice>, Option<Usage>) =
-            match self.run_internal(prompt).await.map_err(|e| {
+            match &self.run_internal(prompt).await.map_err(|e| {
                 OpenAIError::ApiError(ApiError {
                     message: e.to_string(),
                     r#type: None,
@@ -406,7 +406,7 @@ impl Chat for MistralLlama {
                 Some((resp, usage)) => {
                     let choice = vec![ChatChoice {
                         message: ChatCompletionResponseMessage {
-                            content: Some(resp),
+                            content: Some(resp.clone()),
                             tool_calls: None,
                             role: Role::System,
                             function_call: None,
@@ -415,7 +415,7 @@ impl Chat for MistralLlama {
                         finish_reason: None,
                         logprobs: None,
                     }];
-                    (choice, Some(usage))
+                    (choice, Some(usage.clone()))
                 }
                 None => (vec![], None),
             };
