@@ -326,5 +326,26 @@ async fn test_arrow_postgres_types_conversion() -> Result<(), String> {
     //     Err(e) => panic!("{}", e),
     // };
 
+    // // Pending on datafusion-table-providers fix
+    // let interval_record_batch = get_arrow_interval_record_batch();
+    // match arrow_postgres_round_trip(port, interval_record_batch, "interval_types").await {
+    //     Ok(_) => (),
+    //     Err(e) => panic!("{}", e),
+    // };
+
+    // // Pending on datafusion-table-providers fix
+    // let duration_record_batch = get_arrow_duration_record_batch();
+    // match arrow_postgres_round_trip(port, duration_record_batch, "duration_types").await {
+    //     Ok(_) => (),
+    //     Err(e) => panic!("{}", e),
+    // };
+
+    // Pending on datafusion-table-providers fix
+    // let list_record_batch = get_arrow_list_record_batch();
+    // match arrow_postgres_round_trip(port, list_record_batch, "list_types").await {
+    //     Ok(_) => (),
+    //     Err(e) => panic!("{}", e),
+    // };
+
     Ok(())
 }

@@ -19,7 +19,10 @@ use std::{sync::Arc, time::Duration};
 use arrow::array::RecordBatch;
 use arrow::{
     array::*,
-    datatypes::{i256, DataType, Date32Type, Date64Type, Field, Fields, Schema, TimeUnit},
+    datatypes::{
+        i256, DataType, Date32Type, Date64Type, Field, Fields, IntervalDayTime,
+        IntervalMonthDayNano, IntervalUnit, Schema, TimeUnit,
+    },
 };
 use chrono::NaiveDate;
 use datafusion::{
@@ -30,6 +33,7 @@ use futures::Future;
 use runtime::{datafusion::DataFusion, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+use types::DurationSecondType;
 
 mod catalog;
 mod docker;
@@ -452,6 +456,142 @@ fn get_arrow_decimal_record_batch() -> RecordBatch {
     .expect("Failed to created arrow decimal record batch")
 }
 
-// TODO
-// Duration, Interval
+fn get_arrow_duration_record_batch() -> RecordBatch {
+    let duration_nano_array = DurationNanosecondArray::from(vec![1, 2, 3]);
+    let duration_micro_array = DurationMicrosecondArray::from(vec![1, 2, 3]);
+    let duration_milli_array = DurationMillisecondArray::from(vec![1, 2, 3]);
+    let duration_sec_array = DurationSecondArray::from(vec![1, 2, 3]);
+
+    let schema = Schema::new(vec![
+        Field::new(
+            "duration_nano",
+            DataType::Duration(TimeUnit::Nanosecond),
+            false,
+        ),
+        Field::new(
+            "duration_micro",
+            DataType::Duration(TimeUnit::Microsecond),
+            false,
+        ),
+        Field::new(
+            "duration_milli",
+            DataType::Duration(TimeUnit::Millisecond),
+            false,
+        ),
+        Field::new("duration_sec", DataType::Duration(TimeUnit::Second), false),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(duration_nano_array),
+            Arc::new(duration_micro_array),
+            Arc::new(duration_milli_array),
+            Arc::new(duration_sec_array),
+        ],
+    )
+    .expect("Failed to created arrow interval record batch")
+}
+
+fn get_arrow_interval_record_batch() -> RecordBatch {
+    let interval_daytime_array = IntervalDayTimeArray::from(vec![
+        IntervalDayTime::new(1, 1000),
+        IntervalDayTime::new(33, 0),
+        IntervalDayTime::new(0, 12 * 60 * 60 * 1000),
+    ]);
+    let interval_monthday_nano_array = IntervalMonthDayNanoArray::from(vec![
+        IntervalMonthDayNano::new(1, 2, 1000),
+        IntervalMonthDayNano::new(12, 1, 0),
+        IntervalMonthDayNano::new(0, 0, 12 * 1000 * 1000),
+    ]);
+    let interval_yearmonth_array = IntervalYearMonthArray::from(vec![2, 25, -1]);
+
+    let schema = Schema::new(vec![
+        Field::new(
+            "interval_daytime",
+            DataType::Interval(IntervalUnit::DayTime),
+            false,
+        ),
+        Field::new(
+            "interval_monthday_nano",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            false,
+        ),
+        Field::new(
+            "interval_yearmonth",
+            DataType::Interval(IntervalUnit::YearMonth),
+            false,
+        ),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(interval_daytime_array),
+            Arc::new(interval_monthday_nano_array),
+            Arc::new(interval_yearmonth_array),
+        ],
+    )
+    .expect("Failed to created arrow interval record batch")
+}
+
 // List/FixedSizeList/LargeList
+
+fn get_arrow_list_record_batch() -> RecordBatch {
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.append_value([Some(1), Some(2), Some(3)]);
+    list_builder.append_value([Some(4)]);
+    list_builder.append_value([Some(6)]);
+    let list_array = list_builder.finish();
+
+    let mut large_list_builder = LargeListBuilder::new(Int32Builder::new());
+    large_list_builder.append_value([Some(1), Some(2), Some(3)]);
+    large_list_builder.append_value([Some(4)]);
+    large_list_builder.append_value([Some(6)]);
+    let large_list_array = large_list_builder.finish();
+
+    let mut fixed_size_list_builder = FixedSizeListBuilder::new(Int32Builder::new(), 3);
+    fixed_size_list_builder.values().append_value(0);
+    fixed_size_list_builder.values().append_value(1);
+    fixed_size_list_builder.values().append_value(2);
+    fixed_size_list_builder.append(true);
+    fixed_size_list_builder.values().append_value(3);
+    fixed_size_list_builder.values().append_value(4);
+    fixed_size_list_builder.values().append_value(5);
+    fixed_size_list_builder.append(true);
+    fixed_size_list_builder.values().append_value(6);
+    fixed_size_list_builder.values().append_value(7);
+    fixed_size_list_builder.values().append_value(8);
+    fixed_size_list_builder.append(true);
+    let fixed_size_list_array = fixed_size_list_builder.finish();
+
+    let schema = Schema::new(vec![
+        Field::new(
+            "list",
+            DataType::List(Field::new("item", DataType::Int32, true).into()),
+            false,
+        ),
+        Field::new(
+            "large_list",
+            DataType::LargeList(Field::new("item", DataType::Int32, true).into()),
+            false,
+        ),
+        Field::new(
+            "fixed_size_list",
+            DataType::FixedSizeList(Field::new("item", DataType::Int32, true).into(), 3),
+            false,
+        ),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(list_array),
+            Arc::new(large_list_array),
+            Arc::new(fixed_size_list_array),
+        ],
+    )
+    .expect("Failed to created arrow list record batch")
+}
+
+// TODO: Arrow null types
