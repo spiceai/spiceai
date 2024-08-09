@@ -299,7 +299,7 @@ impl Default for Runtime {
             secrets: Arc::new(RwLock::new(secrets::Secrets::default())),
             datasets_health_monitor: None,
             metrics_endpoint: None,
-            metrics_handle: None,
+            prometheus_registry: None,
             autoload_extensions: Arc::new(HashMap::new()),
             extensions: Arc::new(RwLock::new(HashMap::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::default()),
