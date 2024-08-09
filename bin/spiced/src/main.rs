@@ -100,6 +100,16 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
+    init_otel_tracing()?;
+
+    Ok(())
+}
+
+fn init_otel_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = opentelemetry_zipkin::new_pipeline()
+        .with_http_client(reqwest::Client::new())
+        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
     Ok(())
 }
 

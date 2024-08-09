@@ -15,7 +15,9 @@ flightrepl = { path = "../../crates/flightrepl" }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-prometheus.workspace = true
+opentelemetry-zipkin.workspace = true
 prometheus.workspace = true
+reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 rustls.workspace = true
 rustls-pemfile.workspace = true
