@@ -23,7 +23,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{self, try_cast_to};
 use chrono::Utc;
 use datafusion::sql::TableReference;
-use metrics_exporter_prometheus::PrometheusHandle;
+use prometheus::TextEncoder;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::RwLock;
@@ -46,8 +46,8 @@ pub enum Error {
     #[snafu(display("Error casting record batch: {source}",))]
     UnableToCastRecordBatch { source: record_batch::Error },
 
-    #[snafu(display("Error querying prometheus metrics: {source}"))]
-    FailedToQueryPrometheusMetrics { source: reqwest::Error },
+    #[snafu(display("Error rendering Prometheus metrics: {source}",))]
+    UnableToRenderPrometheusMetrics { source: prometheus::Error },
 
     #[snafu(display("Error parsing prometheus metrics: {source}"))]
     UnableToParsePrometheusMetrics { source: std::io::Error },
@@ -63,15 +63,15 @@ pub enum Error {
 }
 
 pub struct MetricsRecorder {
-    metrics_handle: PrometheusHandle,
     remote_schema: Arc<Option<Arc<Schema>>>,
+    registry: prometheus::Registry,
 }
 
 impl MetricsRecorder {
     #[must_use]
-    pub fn new(metrics_handle: PrometheusHandle) -> Self {
+    pub fn new(registry: prometheus::Registry) -> Self {
         Self {
-            metrics_handle,
+            registry,
             remote_schema: Arc::new(None),
         }
     }
@@ -110,12 +110,17 @@ impl MetricsRecorder {
     }
 
     async fn tick(
-        metrics_handle: &PrometheusHandle,
+        registry: &prometheus::Registry,
         instance_name: String,
         datafusion: &Arc<DataFusion>,
         remote_schema: &Arc<Option<Arc<Schema>>>,
     ) -> Result<(), Error> {
-        let body = metrics_handle.render();
+        let encoder = TextEncoder::new();
+        let metric_families = registry.gather();
+        let mut body = String::new();
+        encoder
+            .encode_utf8(&metric_families, &mut body)
+            .context(UnableToRenderPrometheusMetricsSnafu)?;
 
         let lines = body.lines().map(|s| Ok(s.to_owned()));
         let scrape =
@@ -192,14 +197,14 @@ impl MetricsRecorder {
     }
 
     pub fn start(&self, instance_name: String, datafusion: &Arc<DataFusion>) {
-        let handle = self.metrics_handle.clone();
+        let registry = self.registry.clone();
         let df = Arc::clone(datafusion);
         let schema = Arc::clone(&self.remote_schema);
 
         spawn(async move {
             loop {
                 if let Err(err) =
-                    MetricsRecorder::tick(&handle, instance_name.clone(), &df, &schema).await
+                    MetricsRecorder::tick(&registry, instance_name.clone(), &df, &schema).await
                 {
                     tracing::error!("{err}");
                 }

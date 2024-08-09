@@ -20,7 +20,7 @@ use std::fmt::Formatter;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -34,11 +34,11 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
 use lru_cache::LruCache;
-use metrics::atomics::AtomicU64;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::ResultsCache;
 
 mod lru_cache;
+mod metrics;
 mod utils;
 
 pub use utils::get_logical_plan_input_tables;
@@ -124,8 +124,7 @@ impl QueryResultsCacheProvider {
             ignore_schemas,
         };
 
-        #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!("results_cache_max_size").set(cache_max_size as f64);
+        metrics::MAX_SIZE.record(cache_max_size, &[]);
 
         Ok(cache_provider)
     }
@@ -134,10 +133,10 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
-        metrics::counter!("results_cache_request_count").increment(1);
+        metrics::REQUEST_COUNT.add(1, &[]);
         match self.cache.get(plan).await {
             Ok(Some(cached_result)) => {
-                metrics::counter!("results_cache_hit_count").increment(1);
+                metrics::HIT_COUNT.add(1, &[]);
                 Ok(Some(cached_result))
             }
             Ok(None) => Ok(None),
@@ -169,10 +168,8 @@ impl QueryResultsCacheProvider {
         if now_seconds - self.metrics_reported_last_time.load(Ordering::Relaxed) >= 5 {
             self.metrics_reported_last_time
                 .store(now_seconds, Ordering::Relaxed);
-            #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!("results_cache_size").set(self.size() as f64);
-            #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!("results_cache_item_count").set(self.item_count() as f64);
+            metrics::SIZE.record(self.size(), &[]);
+            metrics::ITEM_COUNT.add(self.item_count(), &[]);
         }
     }
 

@@ -62,12 +62,14 @@ fundu = "2.0.0"
 futures = "0.3.30"
 globset = "0.4.14"
 itertools = "0.12"
-metrics = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
-metrics-exporter-prometheus = { git = "https://github.com/spiceai/metrics.git", rev = "b7aa6388e08f395fc6e361a5ff13174ebd4562fe" }
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.2" }
 odbc-api = { version = "8.1.2" }
+opentelemetry = { version = "0.24", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics"] }
+opentelemetry-prometheus = "0.17"
 pem = "3.0.4"
+prometheus = "0.13"
 r2d2 = "0.8.10"
 regex = "1.10.3"
 rusqlite = { version = "0.31.0", features = ["bundled"] }

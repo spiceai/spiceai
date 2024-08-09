@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use clap::Parser;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use opentelemetry::global;
+use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
@@ -77,12 +78,12 @@ fn main() {
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    let metrics_handle = match args.metrics {
-        Some(_) => Some(PrometheusBuilder::new().install_recorder()?),
+    let prometheus_registry = match args.metrics {
+        Some(_) => Some(init_metrics()?),
         None => None,
     };
 
-    spiced::run(args, metrics_handle).await?;
+    spiced::run(args, prometheus_registry).await?;
     Ok(())
 }
 
@@ -100,4 +101,26 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     Ok(())
+}
+
+fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>> {
+    let registry = prometheus::Registry::new();
+
+    let resource = Resource::default();
+
+    let prometheus_exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()?;
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(prometheus_exporter)
+        .build();
+    global::set_meter_provider(provider);
+
+    Ok(registry)
 }

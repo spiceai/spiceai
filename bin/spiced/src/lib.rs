@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
-use metrics_exporter_prometheus::PrometheusHandle;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
@@ -112,7 +111,7 @@ pub struct Args {
     pub tls_key_file: Option<String>,
 }
 
-pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result<()> {
+pub async fn run(args: Args, prometheus_registry: Option<prometheus::Registry>) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
     let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
@@ -147,7 +146,7 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         )]))
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
-        .with_metrics_server_opt(args.metrics, metrics_handle)
+        .with_metrics_server_opt(args.metrics, prometheus_registry)
         .build()
         .await;
 

@@ -35,10 +35,12 @@ use crate::{
     config,
     datafusion::DataFusion,
     embeddings::vector_search::{self, compute_primary_keys},
+    metrics as runtime_metrics,
     model::{EmbeddingModelStore, LLMModelStore},
     tls::TlsConfig,
 };
 
+mod metrics;
 mod routes;
 mod v1;
 
@@ -89,7 +91,7 @@ where
         .context(UnableToBindServerToPortSnafu)?;
     tracing::info!("Spice Runtime HTTP listening on {bind_address:?}");
 
-    metrics::counter!("spiced_runtime_http_server_start").increment(1);
+    runtime_metrics::spiced_runtime::HTTP_SERVER_START.add(1, &[]);
 
     loop {
         let stream = match listener.accept().await {
