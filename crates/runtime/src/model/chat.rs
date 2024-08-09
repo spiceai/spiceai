@@ -22,8 +22,9 @@ use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::tool_use::{SpiceToolsOptions, ToolUsingChat};
+use super::tool_use::{SpiceToolsOptions, ToolUsingChat};
 use crate::Runtime;
+
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
 
 /// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
@@ -51,7 +52,9 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
 
     match spice_tool_opt {
-        Some(tools) if tools.can_use_tools() => Ok(Box::new(ToolUsingChat::new(model, rt, &tools))),
+        Some(tools) if tools.can_use_tools() => {
+            Ok(Box::new(ToolUsingChat::new(Arc::new(model), rt, &tools)))
+        }
         Some(_) | None => Ok(model),
     }
 }
