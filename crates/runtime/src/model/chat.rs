@@ -51,7 +51,9 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
 
     match spice_tool_opt {
-        Some(tools) if tools.can_use_tools() => Ok(Box::new(ToolUsingChat::new(model, rt, &tools))),
+        Some(tools) if tools.can_use_tools() => {
+            Ok(Box::new(ToolUsingChat::new(Arc::new(model), rt, &tools)))
+        }
         Some(_) | None => Ok(model),
     }
 }

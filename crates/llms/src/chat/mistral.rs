@@ -376,8 +376,8 @@ impl Chat for MistralLlama {
     }
 
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        match &self.run_internal(prompt).await? {
-            Some((response, _usage)) => Ok(Some(response.clone())),
+        match self.run_internal(prompt).await? {
+            Some((response, _usage)) => Ok(Some(response)),
             None => Ok(None),
         }
     }
