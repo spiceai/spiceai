@@ -96,7 +96,7 @@ impl DataAccelerator for SqliteAccelerator {
         &self,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        if !cmd.options.contains_key("sqlite_file") {
+        if !cmd.options.contains_key("file") {
             make_spice_data_directory()
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
