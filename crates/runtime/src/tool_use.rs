@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::future::Future;
+
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
@@ -42,7 +42,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::mpsc;
 
 use crate::datafusion::query::Protocol;
 use crate::embeddings::vector_search::VectorSearch;
@@ -388,33 +388,11 @@ impl SpiceModelTool for SqlTool {
     }
 }
 
-struct CustomStream {
-    receiver: mpsc::Receiver<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
-}
-
-impl Stream for CustomStream {
-    type Item = Result<CreateChatCompletionStreamResponse, OpenAIError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
-    }
-}
-
 pub struct ToolUsingChat {
     inner_chat: Arc<Box<dyn Chat>>,
     rt: Arc<Runtime>,
     tools: Vec<Box<dyn SpiceModelTool>>,
     opts: SpiceToolsOptions,
-}
-
-impl Default for ToolUsingChat {
-    fn default() -> Self {
-        Self {
-            inner_chat: Box::new(Openai::default()),
-            rt: Arc::new(Runtime::default()),
-            tools: vec![],
-        }
-    }
 }
 
 impl ToolUsingChat {
