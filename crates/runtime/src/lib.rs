@@ -98,7 +98,6 @@ pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
-mod tool_use;
 pub(crate) mod tracers;
 mod tracing_util;
 
