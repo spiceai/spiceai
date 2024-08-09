@@ -37,6 +37,7 @@ use async_openai::types::{
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
+use llms::openai::Openai;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -405,6 +406,16 @@ pub struct ToolUsingChat {
     tools: Vec<Box<dyn SpiceModelTool>>,
 }
 
+impl Default for ToolUsingChat {
+    fn default() -> Self {
+        Self {
+            inner_chat: Box::new(Openai::default()),
+            rt: Arc::new(Runtime::default()),
+            tools: vec![],
+        }
+    }
+}
+
 impl ToolUsingChat {
     pub fn new(inner_chat: Box<dyn Chat>, rt: Arc<Runtime>, tools_opt: &SpiceToolsOptions) -> Self {
         Self {
@@ -560,13 +571,14 @@ impl Chat for ToolUsingChat {
         let mut inner_req = req.clone();
         let mut runtime_tools = self.runtime_tools();
         if !runtime_tools.is_empty() {
-            runtime_tools.extend(req.tools.unwrap_or_default());
+            runtime_tools.extend(req.clone().tools.unwrap_or_default());
             inner_req.tools = Some(runtime_tools);
         };
 
-        let mut s = self.inner_chat.chat_stream(inner_req).await?;
+        let s = self.inner_chat.chat_stream(req.clone()).await?;
+        let original_self = std::mem::take(self);
 
-        let self_arc = Arc::new(RwLock::new(std::mem::take(self)));
+        let self_arc = Arc::new(RwLock::new(original_self));
         Ok(make_a_stream(self_arc, req.clone(), s).await)
     }
 
@@ -631,17 +643,21 @@ async fn make_a_stream(
             Arc::new(Mutex::new(HashMap::new()));
 
         while let Some(result) = s.next().await {
+            tracing::info!("Received a result from the stream");
+
             let response = match result {
                 Ok(response) => response,
                 Err(e) => {
+                    tracing::error!("Error in stream result: {}", e);
                     if let Err(e) = sender_clone.send(Err(e)).await {
-                        tracing::error!("Error sending error: {}", e);
+                        tracing::error!("Error sending error 1: {}", e);
                     }
                     return;
                 }
             };
 
             let mut finished_choices: Vec<ChatChoiceStream> = vec![];
+
             for chat_choice1 in &response.choices {
                 let chat_choice = chat_choice1.clone();
                 // Appending the tool call chunks
@@ -679,11 +695,15 @@ async fn make_a_stream(
                             state.function.arguments.push_str(arguments);
                         }
                     }
+                } else {
+                    finished_choices.push(chat_choice.clone())
                 }
 
                 // If a tool has finished, process them.
                 if let Some(finish_reason) = &chat_choice.finish_reason {
                     if matches!(finish_reason, FinishReason::ToolCalls) {
+                        tracing::info!("Tool call finished, processing tool calls");
+
                         let tool_call_states_clone = tool_call_states.clone();
 
                         let tool_calls_to_process = {
@@ -702,13 +722,13 @@ async fn make_a_stream(
                         {
                             Ok(Some(messages)) => messages,
                             Ok(None) => {
-                                // No spice tools within returned tools, so return as message in stream.
                                 finished_choices.push(chat_choice);
                                 continue;
                             }
                             Err(e) => {
+                                tracing::error!("Error processing tool calls: {}", e);
                                 if let Err(e) = sender_clone.send(Err(e)).await {
-                                    tracing::error!("Error sending error: {}", e);
+                                    tracing::error!("Error sending error 2: {}", e);
                                 }
                                 return;
                             }
@@ -716,6 +736,7 @@ async fn make_a_stream(
 
                         let mut new_req = req.clone();
                         new_req.messages = new_messages.clone();
+
                         match model.write().await.chat_stream(new_req).await {
                             Ok(mut s) => {
                                 while let Some(resp) = s.next().await {
@@ -727,8 +748,9 @@ async fn make_a_stream(
                                 }
                             }
                             Err(e) => {
+                                tracing::error!("Error in chat stream: {}", e);
                                 if let Err(e) = sender_clone.send(Err(e)).await {
-                                    tracing::error!("Error sending error: {}", e);
+                                    tracing::error!("Error sending error 3: {}", e);
                                 }
                                 return;
                             }
@@ -741,10 +763,11 @@ async fn make_a_stream(
                     }
                 }
             }
+
             let mut resp2 = response.clone();
             resp2.choices = finished_choices;
             if let Err(e) = sender_clone.send(Ok(resp2)).await {
-                tracing::error!("Error sending error: {}", e);
+                tracing::error!("Error sending response: {}", e);
             }
         }
     });

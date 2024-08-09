@@ -286,6 +286,27 @@ pub struct Runtime {
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            instance_name: String::new(),
+            app: Arc::new(RwLock::new(None)),
+            df: Arc::new(DataFusion::new()),
+            models: Arc::new(RwLock::new(HashMap::new())),
+            llms: Arc::new(RwLock::new(LLMModelStore::default())),
+            embeds: Arc::new(RwLock::new(EmbeddingModelStore::default())),
+            pods_watcher: Arc::new(RwLock::new(None)),
+            secrets: Arc::new(RwLock::new(secrets::Secrets::default())),
+            datasets_health_monitor: None,
+            metrics_endpoint: None,
+            metrics_handle: None,
+            autoload_extensions: Arc::new(HashMap::new()),
+            extensions: Arc::new(RwLock::new(HashMap::new())),
+            spaced_tracer: Arc::new(tracers::SpacedTracer::default()),
+        }
+    }
+}
+
 impl Runtime {
     #[must_use]
     pub fn builder() -> RuntimeBuilder {
