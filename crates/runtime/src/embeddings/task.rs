@@ -23,6 +23,7 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use llms::embeddings::{Embed, Result as EmbedResult};
+use tracing::Instrument;
 
 pub struct TaskEmbed {
     inner: Box<dyn Embed>,
@@ -45,8 +46,9 @@ impl Embed for TaskEmbed {
             Arc::from(serde_json::to_string(&input).unwrap_or_default()),
             None,
         );
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input_text = %serde_json::to_string(&input).unwrap_or_default());
 
-        match self.inner.embed(input).await {
+        match self.inner.embed(input).instrument(span).await {
             Ok(response) => {
                 task_span.outputs_produced(response.len() as u64).finish();
                 Ok(response)
@@ -80,7 +82,9 @@ impl Embed for TaskEmbed {
         )
         .label("model".to_string(), req.model.clone());
 
-        match self.inner.embed_request(req).await {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input_text = %serde_json::to_string(&req.input).unwrap_or_default());
+
+        match self.inner.embed_request(req).instrument(span).await {
             Ok(response) => {
                 task_span
                     .outputs_produced(response.data.len() as u64)

@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 use futures::StreamExt;
 
@@ -240,8 +241,11 @@ pub(crate) async fn post(
     )
     .label("tables".to_string(), format!("{input_tables:?}"));
 
+    let tspan = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input_text = %payload.text);
+
     let relevant_data = match vs
         .search(payload.text.clone(), input_tables, RetrievalLimit::TopN(3))
+        .instrument(tspan)
         .await
     {
         Ok(relevant_data) => {

@@ -29,6 +29,7 @@ use axum::{
 };
 use futures::StreamExt;
 use tokio::sync::RwLock;
+use tracing::{Instrument, Span};
 
 use crate::{
     datafusion::DataFusion,
@@ -50,13 +51,22 @@ pub(crate) async fn post(
     )
     .label("model".to_string(), req.model.clone());
 
+    let tspan = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input_text = %serde_json::to_string(&req).unwrap_or_default());
+
     let model_id = req.model.clone();
-    match llms.read().await.get(&model_id) {
+    match llms.read().instrument(tspan.clone()).await.get(&model_id) {
         Some(model) => {
             if req.stream.unwrap_or_default() {
-                match model.write().await.chat_stream(req).await {
+                match model
+                    .write()
+                    .instrument(tspan.clone())
+                    .await
+                    .chat_stream(req)
+                    .instrument(tspan.clone())
+                    .await
+                {
                     Ok(strm) => {
-                        create_sse_response(strm, time::Duration::from_secs(30), Some(span))
+                        create_sse_response(strm, time::Duration::from_secs(30), Some(span), tspan)
                     }
                     Err(e) => {
                         span.with_error_message(e.to_string()).finish();
@@ -92,9 +102,10 @@ fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
     finish_span: Option<TaskSpan>,
+    tspan: Span,
 ) -> Response {
     Sse::new(Box::pin(stream! {
-        while let Some(msg) = strm.next().await {
+        while let Some(msg) = strm.next().instrument(tspan.clone()).await {
             match msg {
                 Ok(resp) => {
                     let y = Event::default();
@@ -112,7 +123,7 @@ fn create_sse_response(
         if let Some(span) = finish_span {
             span.finish();
         }
-
+        drop(tspan);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))
     .into_response()

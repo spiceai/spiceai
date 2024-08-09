@@ -9193,6 +9193,7 @@ dependencies = [
  "spice-cloud",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -10094,6 +10095,24 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9784ed4da7d921bc8df6963f8c80a0e4ce34ba6ba76668acadd3edbd985ff3b"
+dependencies = [
+ "js-sys",
+ "once_cell",
+ "opentelemetry 0.24.0",
+ "opentelemetry_sdk 0.24.1",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]
