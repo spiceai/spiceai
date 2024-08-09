@@ -18,6 +18,7 @@ use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexT
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
+use crate::spice_data_base_path;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -209,6 +210,8 @@ impl AcceleratorExternalTableBuilder {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
+
+        options.insert("data_directory".to_string(), spice_data_base_path());
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
@@ -421,6 +424,38 @@ mod test {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params,
+            enabled: true,
+            mode: Mode::File,
+            engine: Engine::Sqlite,
+            ..Acceleration::default()
+        };
+        let _ = create_accelerator_table(
+            "abc".into(),
+            schema,
+            None,
+            &acceleration_settings,
+            Arc::new(RwLock::new(Secrets::new())),
+        )
+        .await
+        .expect("accelerator table created");
+
+        let path = Path::new(&path);
+        assert!(path.is_file());
+        fs::remove_file(path).expect("file removed");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_file_mode_sqlite_creation_default_path() {
+        use std::{fs, path::Path};
+
+        let spice_data_dir = crate::spice_data_base_path();
+        let path = format!("{spice_data_dir}/abc_sqlite.db");
+
+        register_all().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let acceleration_settings = Acceleration {
+            params: HashMap::new(),
             enabled: true,
             mode: Mode::File,
             engine: Engine::Sqlite,
