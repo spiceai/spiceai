@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::array::RecordBatch;
 use itertools::Itertools;
@@ -24,20 +27,18 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    FunctionObject,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject
 };
 
 use async_openai::types::CreateChatCompletionRequestArgs;
 use async_trait::async_trait;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
+use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::datafusion::query::Protocol;
 use crate::Runtime;
@@ -135,6 +136,60 @@ impl SpiceModelTool for ListTablesTool {
     }
 }
 
+pub struct TableSchemaTool {}
+#[async_trait]
+impl SpiceModelTool for TableSchemaTool {
+    fn name(&self) -> String {
+        "table_schema".to_string()
+    }
+
+    fn description(&self) -> Option<String> {
+        Some("Retrieve the schema of all available SQL tables".to_string())
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tables": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Which subset of tables to return results for. Default to all tables.",
+            },
+            },
+            "required": [],
+            "additionalProperties": false,
+        }))
+    }
+
+    async fn call(
+        &self,
+        arg: &str,
+        rt: Arc<Runtime>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let arg_v = Value::from_str(arg).boxed()?;
+        // TODO support default == all tables
+        let tables: Vec<String> = arg_v["tables"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .into_iter()
+            .map(|t| t.as_str().unwrap_or_default().to_string())
+            .filter(|t| !t.is_empty())
+            .collect_vec();
+
+        let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
+        for t in &tables {
+            let schema = rt.datafusion().get_arrow_schema(t).await.boxed()?;
+
+            // Should use a better structure
+            table_create_stms.push(schema.to_string());
+        }
+        Ok(Value::String(table_create_stms.join("\n")))
+    }
+}
+
 static PARAMETERS: Lazy<Value> = Lazy::new(|| {
     serde_json::json!({
         "type": "object",
@@ -191,6 +246,19 @@ impl SpiceModelTool for SqlTool {
     }
 }
 
+
+struct CustomStream {
+    receiver: mpsc::Receiver<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
+}
+
+impl Stream for CustomStream {
+    type Item = Result<CreateChatCompletionStreamResponse, OpenAIError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
 pub struct ToolUsingChat {
     inner_chat: Box<dyn Chat>,
     rt: Arc<Runtime>,
@@ -202,7 +270,11 @@ impl ToolUsingChat {
         Self {
             inner_chat,
             rt,
-            tools: tools_opt.filter_tools(vec![Box::new(SqlTool {}), Box::new(ListTablesTool {})]),
+            tools: tools_opt.filter_tools(vec![
+                Box::new(TableSchemaTool {}),
+                Box::new(SqlTool {}),
+                Box::new(ListTablesTool {}),
+            ]),
         }
     }
 
@@ -228,14 +300,77 @@ impl ToolUsingChat {
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
-    async fn call_tool(&self, req: &ChatCompletionMessageToolCall) -> Value {
-        match self.tools.iter().find(|t| t.name() == req.function.name) {
+    async fn call_tool(&self, func: &FunctionCall) -> Value {
+        match self.tools.iter().find(|t| t.name() == func.name) {
             Some(t) => t
-                .call(&req.function.arguments, Arc::<Runtime>::clone(&self.rt))
+                .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
                 .await
                 .unwrap_or(Value::String(format!("Error calling tool {}", t.name()))),
             None => Value::Null,
         }
+    }
+
+    ///
+    /// For `requested_tools` requested from processing `original_messages` through a model, check
+    /// if any are spiced runtime tools, and if so, run them locally and create new messages to be
+    ///  reprocessed by the model.
+    ///
+    /// Returns
+    /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
+    ///     requested.
+    /// - `Some(messages)` if spiced runtime tools were used. The returned messages are ready to be
+    ///     reprocessed by the model.
+    async fn process_tool_calls_and_run_spice_tools(
+        &self,
+        original_messages: Vec<ChatCompletionRequestMessage>,
+        requested_tools: Vec<ChatCompletionMessageToolCall>,
+    ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
+        let spiced_tools = requested_tools
+            .iter()
+            .filter(|&t| self.is_spiced_tool(t))
+            .cloned()
+            .collect_vec();
+
+        // Return early if no spiced runtime tools used.
+        if spiced_tools.is_empty() {
+            tracing::debug!("No spiced tools used by chat model, returning early");
+            return Ok(None);
+        }
+
+        // Tell model the assistant has these tools
+        let assistant_message: ChatCompletionRequestMessage =
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(spiced_tools.clone()) // TODO - should this include non-spiced tools?
+                .build()?
+                .into();
+
+        let mut tool_and_response_content = vec![];
+        for t in spiced_tools {
+            let content = self.call_tool(&t.function).await;
+            tool_and_response_content.push((t, content));
+        }
+        tracing::debug!(
+            "Ran tools, and retrieved responses: {:?}",
+            tool_and_response_content
+        );
+
+        // Tell model the assistant used these tools, and provided result.
+        let tool_messages: Vec<ChatCompletionRequestMessage> = tool_and_response_content
+            .iter()
+            .map(|(tool_call, response_content)| {
+                Ok(ChatCompletionRequestToolMessageArgs::default()
+                    .content(response_content.to_string())
+                    .tool_call_id(tool_call.id.clone())
+                    .build()?
+                    .into())
+            })
+            .collect::<Result<_, OpenAIError>>()?;
+
+        let mut messages = original_messages.clone();
+        messages.push(assistant_message);
+        messages.extend(tool_messages);
+
+        Ok(Some(messages))
     }
 }
 
@@ -274,7 +409,11 @@ impl Chat for ToolUsingChat {
             inner_req.tools = Some(runtime_tools);
         };
 
-        self.inner_chat.chat_stream(inner_req).await
+        let mut s = self.inner_chat.chat_stream(inner_req).await?;
+
+        let self_arc = Arc::new(RwLock::new(std::mem::take(self)));
+        Ok(make_a_stream(self_arc, req.clone(), s).await)
+        
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
@@ -307,59 +446,147 @@ impl Chat for ToolUsingChat {
             .choices
             .first()
             .and_then(|c| c.message.tool_calls.clone());
-        let spiced_tools = tools_used
-            .map(|ts| {
-                ts.iter()
-                    .filter(|&t| self.is_spiced_tool(t))
-                    .cloned()
-                    .collect_vec()
-            })
-            .unwrap_or_default();
 
-        // Return early if no spiced runtime tools used.
-        if spiced_tools.is_empty() {
-            tracing::debug!("No spiced tools used by chat model, returning early");
-            return Ok(resp);
+        match self
+            .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
+            .await?
+        {
+            // New messages means we have run spice tools locally, ready to recall model.
+            Some(messages) => {
+                let new_req = CreateChatCompletionRequestArgs::default()
+                    .model(req.model)
+                    .messages(messages)
+                    .build()?;
+                self.chat_request(new_req).await
+            }
+            None => Ok(resp),
         }
-
-        // Tell model the assistant has these tools
-        let assistant_message: ChatCompletionRequestMessage =
-            ChatCompletionRequestAssistantMessageArgs::default()
-                .tool_calls(spiced_tools.clone()) // TODO - should this include non-spiced tools?
-                .build()?
-                .into();
-
-        let mut tool_and_response_content = vec![];
-        for t in spiced_tools {
-            let content = self.call_tool(&t).await;
-            tool_and_response_content.push((t, content));
-        }
-        tracing::debug!(
-            "Ran tools, and retrieved responses: {:?}",
-            tool_and_response_content
-        );
-
-        // Tell model the assistant used these tools, and provided result.
-        let tool_messages: Vec<ChatCompletionRequestMessage> = tool_and_response_content
-            .iter()
-            .map(|(tool_call, response_content)| {
-                Ok(ChatCompletionRequestToolMessageArgs::default()
-                    .content(response_content.to_string())
-                    .tool_call_id(tool_call.id.clone())
-                    .build()?
-                    .into())
-            })
-            .collect::<Result<_, OpenAIError>>()?;
-
-        let mut messages = req.messages.clone();
-        messages.push(assistant_message);
-        messages.extend(tool_messages);
-
-        // TODO: get hyperparameters from the original request.
-        let new_req = CreateChatCompletionRequestArgs::default()
-            .messages(messages)
-            .build()?;
-
-        self.inner_chat.chat_request(new_req).await
     }
+}
+
+
+async fn make_a_stream(mut model: Arc<RwLock<ToolUsingChat>>, req: CreateChatCompletionRequest, mut s: ChatCompletionResponseStream) -> ChatCompletionResponseStream {
+        
+    let (sender, receiver) = mpsc::channel(100);
+    let sender_clone = sender.clone();
+
+    tokio::spawn(async move {
+
+        let tool_call_states: Arc<Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        while let Some(result) = s.next().await {
+            let response = match result {
+                Ok(response) => response,
+                Err(e) => {
+                    if let Err(e) = sender_clone.send(Err(e)).await {
+                        tracing::error!("Error sending error: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let mut finished_choices: Vec<ChatChoiceStream> = vec![];
+            for chat_choice1 in &response.choices {
+                let chat_choice = chat_choice1.clone();
+                // Appending the tool call chunks 
+                // TODO: only concatenate, spiced tools
+                if let Some(ref tool_calls) = chat_choice.delta.tool_calls {
+                    for tool_call_chunk in tool_calls.into_iter() {
+                        let key = (chat_choice.index as i32, tool_call_chunk.index);
+                        let states = tool_call_states.clone();
+                        let tool_call_data = tool_call_chunk.clone();
+
+                        let mut states_lock = states.lock().await;
+                        let state = states_lock.entry(key).or_insert_with(|| {
+                            ChatCompletionMessageToolCall {
+                                id: tool_call_data.id.clone().unwrap_or_default(),
+                                r#type: ChatCompletionToolType::Function,
+                                function: FunctionCall {
+                                    name: tool_call_data
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.name.clone())
+                                        .unwrap_or_default(),
+                                    arguments: tool_call_data
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.arguments.clone())
+                                        .unwrap_or_default(),
+                                },
+                            }
+                        });
+                        if let Some(arguments) = tool_call_chunk
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.arguments.as_ref())
+                        {
+                            state.function.arguments.push_str(arguments);
+                        }
+                    }
+                }
+
+                // If a tool has finished, process them.
+                if let Some(finish_reason) = &chat_choice.finish_reason {
+                    if matches!(finish_reason, FinishReason::ToolCalls) {
+                        let tool_call_states_clone = tool_call_states.clone();
+
+                        let tool_calls_to_process = {
+                            let states_lock = tool_call_states_clone.lock().await;
+                            states_lock
+                                .iter()
+                                .map(|(_key, tool_call)| tool_call.clone())
+                                .collect::<Vec<_>>()
+                        };
+
+                        let new_messages = match model.read().await.process_tool_calls_and_run_spice_tools(vec![], tool_calls_to_process).await {
+                            Ok(Some(messages)) => messages,
+                            Ok(None) => {
+                                // No spice tools within returned tools, so return as message in stream.
+                                finished_choices.push(chat_choice);
+                                continue;
+                            },
+                            Err(e) => {
+                                if let Err(e) = sender_clone.send(Err(e)).await {
+                                    tracing::error!("Error sending error: {}", e);
+                                }
+                                return;
+                            }
+                        };
+
+                        let mut new_req = req.clone();
+                        new_req.messages = new_messages.clone();
+                        match model.write().await.chat_stream(new_req).await {
+                            Ok(mut s) => {
+                                while let Some(resp) = s.next().await {
+                                    // TODO check if this works for choices > 1. 
+                                    if let Err(e) = sender_clone.send(resp).await {
+                                        tracing::error!("Error sending error: {}", e);
+                                        return; 
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if let Err(e) = sender_clone.send(Err(e)).await {
+                                    tracing::error!("Error sending error: {}", e);
+                                }
+                                return;
+                            }
+                        };
+                        
+                    }
+                    else if matches!(finish_reason, FinishReason::Stop) || matches!(finish_reason, FinishReason::Length) {
+                        // If complete, return to stream original.
+                        finished_choices.push(chat_choice.clone());
+                    }
+                }
+            }
+            let mut resp2 = response.clone();
+            resp2.choices = finished_choices;
+            if let Err(e) = sender_clone.send(Ok(resp2)).await {
+                tracing::error!("Error sending error: {}", e);
+            }
+        }
+    });
+
+    Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
 }
