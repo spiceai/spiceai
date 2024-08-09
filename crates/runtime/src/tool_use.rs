@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use datafusion::sql::TableReference;
 use itertools::Itertools;
 use llms::chat::{Chat, Result as ChatResult};
 
@@ -39,6 +41,7 @@ use serde_json::Value;
 use snafu::ResultExt;
 
 use crate::datafusion::query::Protocol;
+use crate::embeddings::vector_search::VectorSearch;
 use crate::Runtime;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,7 +108,99 @@ pub trait SpiceModelTool: Sync + Send {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-pub struct SqlTool {}
+pub struct DocumentSimilarityTool {}
+
+#[derive(Deserialize)]
+struct DocumentSimilarityToolArgs {
+    text: String,
+    from: Vec<String>,
+    limit: Option<usize>,
+}
+
+#[async_trait]
+impl SpiceModelTool for DocumentSimilarityTool {
+    fn name(&self) -> String {
+        "document_similarity".to_string()
+    }
+
+    fn description(&self) -> Option<String> {
+        Some("Search and retrieve documents from available datasets".to_string())
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The text to search documents for similarity",
+                },
+                "from": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "The datasets to search for similarity. For available datasets, use the 'list_dataset' tool",
+                    "default": []
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of documents to return for each dataset",
+                    "default": 3
+                }
+            },
+            "required": ["text", "from"],
+            "additionalProperties": false
+        }))
+    }
+
+    async fn call(
+        &self,
+        arg: &str,
+        rt: Arc<Runtime>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let args: DocumentSimilarityToolArgs = serde_json::from_str(arg)?;
+
+        let text = args.text;
+        let datasets = args
+            .from
+            .iter()
+            .map(|d| TableReference::parse_str(d))
+            .collect_vec();
+        let limit = args.limit.unwrap_or(3);
+
+        // TODO: implement `explicit_primary_keys` parsing from rt.app
+        let vs = VectorSearch::new(rt.datafusion(), Arc::clone(&rt.embeds), HashMap::default());
+
+        let result = vs
+            .search(
+                text,
+                datasets,
+                crate::embeddings::vector_search::RetrievalLimit::TopN(limit),
+            )
+            .await
+            .boxed()?;
+
+        Ok(Value::Object(
+            result
+                .retrieved_entries
+                .iter()
+                .map(|(dataset, documents)| {
+                    (
+                        dataset.to_string(),
+                        Value::Array(
+                            documents
+                                .iter()
+                                .map(|d| Value::String(d.to_string()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect(),
+        ))
+    }
+}
+
 pub struct ListTablesTool {}
 
 #[async_trait]
@@ -131,6 +226,41 @@ impl SpiceModelTool for ListTablesTool {
         Ok(Value::Array(
             tables.iter().map(|t| Value::String(t.clone())).collect(),
         ))
+    }
+}
+
+pub struct ListDatasetsTool {}
+
+#[async_trait]
+impl SpiceModelTool for ListDatasetsTool {
+    fn name(&self) -> String {
+        "list_datasets".to_string()
+    }
+
+    fn description(&self) -> Option<String> {
+        Some("List all datasets that contain searchable documents".to_string())
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        None
+    }
+
+    async fn call(
+        &self,
+        _arg: &str,
+        rt: Arc<Runtime>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let embedding_datasets = match &*rt.app.read().await {
+            Some(app) => app
+                .datasets
+                .iter()
+                .filter(|d| !d.embeddings.is_empty())
+                .map(|d| Value::String(d.name.clone()))
+                .collect_vec(),
+            None => vec![],
+        };
+
+        Ok(Value::Array(embedding_datasets))
     }
 }
 
@@ -202,6 +332,8 @@ static PARAMETERS: Lazy<Value> = Lazy::new(|| {
     })
 });
 
+pub struct SqlTool {}
+
 #[async_trait]
 impl SpiceModelTool for SqlTool {
     fn name(&self) -> String {
@@ -256,6 +388,8 @@ impl ToolUsingChat {
             inner_chat,
             rt,
             tools: tools_opt.filter_tools(vec![
+                Box::new(DocumentSimilarityTool {}),
+                Box::new(ListDatasetsTool {}),
                 Box::new(TableSchemaTool {}),
                 Box::new(SqlTool {}),
                 Box::new(ListTablesTool {}),
