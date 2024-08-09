@@ -25,6 +25,7 @@ use datafusion::datasource::physical_plan::{
     FileScanConfig, ParquetExec, ParquetFileReaderFactory,
 };
 use datafusion::datasource::{TableProvider, TableType};
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
@@ -33,6 +34,7 @@ use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -42,6 +44,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -54,6 +57,9 @@ pub enum Error {
 
     #[snafu(display("An error occured with handling Arrow data: {source}"))]
     ArrowError { source: arrow::error::ArrowError },
+
+    #[snafu(display("An error occured with handling partition columns: {message}"))]
+    PartitionColumnMismatchError { message: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -263,6 +269,8 @@ impl TableProvider for DeltaTable {
 
         let scan = ScanBuilder::new(Arc::new(snapshot))
             .with_schema(projected_delta_schema)
+            // technically filter can be converted into predicates but right now delta_kernel
+            // ignores it
             .build()
             .map_err(map_delta_error_to_datafusion_err)?;
         let engine = Arc::clone(&self.engine);
@@ -290,8 +298,21 @@ impl TableProvider for DeltaTable {
         }
 
         let mut partitioned_files: Vec<PartitionedFile> = vec![];
+        let mut uniq_partition_columns = HashSet::new();
+        let mut partition_cols = HashSet::new();
         for file in scan_context.files {
             let mut partitioned_file = file.partitioned_file;
+            uniq_partition_columns.insert(file.partition_values.len());
+            partitioned_file.partition_values = file
+                .partition_values
+                .iter()
+                .map(|(k, v)| {
+                    let schema = self.schema();
+                    let field = schema.field_with_name(k)?;
+                    partition_cols.insert(field.clone());
+                    ScalarValue::try_from_string(v.clone(), field.data_type())
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
 
             // If there is a selection vector, create a ParquetAccessPlan that will be used to skip rows based on the selection vector
             if let Some(selection_vector) = file.selection_vector {
@@ -307,15 +328,31 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
+        if uniq_partition_columns.len() != 1
+            || !uniq_partition_columns.contains(&partition_cols.len())
+        {
+            return Err(DataFusionError::Execution(format!(
+                "various number of partition values from the partitioned files: {uniq_partition_columns:?}"
+            )));
+        }
+
         // FileScanConfig requires an ObjectStoreUrl, but it isn't actually used because we pass in a ParquetFileReaderFactory
         // which specifies which object store to read from.
-        let file_scan_config = FileScanConfig::new(
-            ObjectStoreUrl::local_filesystem(),
-            Arc::clone(&self.arrow_schema),
-        )
-        .with_limit(limit)
-        .with_projection(projection.cloned())
-        .with_file_group(partitioned_files);
+        let schema = self.arrow_schema.project(
+            &self
+                .arrow_schema
+                .fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| (!partition_cols.contains(f)).then_some(i))
+                .collect::<Vec<_>>(),
+        )?;
+        let file_scan_config =
+            FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::new(schema))
+                .with_limit(limit)
+                .with_projection(projection.cloned())
+                .with_table_partition_cols(partition_cols.into_iter().collect::<Vec<_>>())
+                .with_file_group(partitioned_files);
         let exec = ParquetExec::builder(file_scan_config)
             .with_parquet_file_reader_factory(Arc::clone(&parquet_file_reader_factory))
             .with_predicate(Arc::clone(&physical_expr))
@@ -366,6 +403,7 @@ fn project_delta_schema(
 struct PartitionFileContext {
     partitioned_file: PartitionedFile,
     selection_vector: Option<Vec<bool>>,
+    partition_values: HashMap<String, String>,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -376,7 +414,7 @@ fn handle_scan_file(
     size: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
-    _partition_values: HashMap<String, String>,
+    partition_values: HashMap<String, String>,
 ) {
     let root_url = match Url::parse(&scan_context.scan_state.table_root) {
         Ok(url) => url,
@@ -410,6 +448,7 @@ fn handle_scan_file(
     scan_context.files.push(PartitionFileContext {
         partitioned_file,
         selection_vector,
+        partition_values,
     });
 }
 

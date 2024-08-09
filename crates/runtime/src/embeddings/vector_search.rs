@@ -107,16 +107,17 @@ impl VectorSearch {
         tbl: &TableReference,
         primary_keys: &[String],
         embedding: Vec<f32>,
-        embedding_column: String,
+        embedding_column: &str,
         n: usize,
     ) -> Result<(Vec<std::string::String>, Vec<arrow::array::RecordBatch>)> {
+        let projection = if primary_keys.is_empty() {
+            embedding_column.to_string()
+        } else {
+            [primary_keys.join(", "), embedding_column.to_string()].join(", ")
+        };
+
         let query = format!(
-            "SELECT {} FROM {} ORDER BY array_distance({}_embedding, {:?}) LIMIT {}",
-            [primary_keys.join(", "), embedding_column.clone()].join(", "),
-            tbl,
-            embedding_column,
-            embedding,
-            n
+            "SELECT {projection} FROM {tbl} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {n}"
         );
 
         let batches = self
@@ -241,7 +242,7 @@ impl VectorSearch {
                             &tbl,
                             &primary_keys,
                             embedding.clone(),
-                            embedding_column,
+                            &embedding_column,
                             n,
                         )
                         .await?;
