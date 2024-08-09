@@ -1,3 +1,5 @@
+use std::{fs::File, io::Write};
+
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
@@ -23,19 +25,18 @@ impl Drop for FileCleanup {
 
 #[tokio::test]
 async fn query_delta_lake_with_partitions() -> Result<(), String> {
-    // unzip a file into a tmp folder
     let tmp_dir = std::env::temp_dir();
-
     let path = format!("{}/nation", tmp_dir.display());
     let _hook = FileCleanup { path: path.clone() };
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir(&path);
-    let current_dir = std::env::current_dir().expect("current dir");
-    let zip_path = format!(
-        "{}/../../test/assets/delta-lake-nation-with-partitionkey.zip",
-        current_dir.display()
-    );
-    let _ = std::fs::copy(zip_path, format!("{path}/nation.zip")).expect("copy failed");
+
+    let resp =
+        reqwest::get("https://public-data.spiceai.org/delta-lake-nation-with-partitionkey.zip")
+            .await
+            .expect("request failed");
+    let mut out = File::create(format!("{path}/nation.zip")).expect("failed to create file");
+    let _ = out.write_all(&resp.bytes().await.expect("failed to read bytes"));
     let _ = std::process::Command::new("unzip")
         .stdin(std::process::Stdio::null())
         .arg(format!("{path}/nation.zip"))
