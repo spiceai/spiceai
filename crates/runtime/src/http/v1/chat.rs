@@ -53,48 +53,49 @@ pub(crate) async fn post(
 
     let tspan = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input_text = %serde_json::to_string(&req).unwrap_or_default());
 
-    let model_id = req.model.clone();
-    match llms.read().instrument(tspan.clone()).await.get(&model_id) {
-        Some(model) => {
-            if req.stream.unwrap_or_default() {
-                match model
-                    .write()
-                    .instrument(tspan.clone())
-                    .await
-                    .chat_stream(req)
-                    .instrument(tspan.clone())
-                    .await
-                {
-                    Ok(strm) => {
-                        create_sse_response(strm, time::Duration::from_secs(30), Some(span), tspan)
+    let tspan_clone = tspan.clone();
+    async move {
+        let model_id = req.model.clone();
+        match llms.read().await.get(&model_id) {
+            Some(model) => {
+                if req.stream.unwrap_or_default() {
+                    match model.write().await.chat_stream(req).await {
+                        Ok(strm) => create_sse_response(
+                            strm,
+                            time::Duration::from_secs(30),
+                            Some(span),
+                            tspan_clone,
+                        ),
+                        Err(e) => {
+                            span.with_error_message(e.to_string()).finish();
+                            tracing::debug!("Error from v1/chat: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
                     }
-                    Err(e) => {
-                        span.with_error_message(e.to_string()).finish();
-                        tracing::debug!("Error from v1/chat: {e}");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    }
-                }
-            } else {
-                match model.write().await.chat_request(req).await {
-                    Ok(response) => {
-                        let preview = response
-                            .choices
-                            .first()
-                            .map(|s| serde_json::to_string(s).unwrap_or_default())
-                            .unwrap_or_default();
-                        span.truncated_output_text(Arc::from(preview)).finish();
-                        Json(response).into_response()
-                    }
-                    Err(e) => {
-                        span.with_error_message(e.to_string()).finish();
-                        tracing::debug!("Error from v1/chat: {e}");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else {
+                    match model.write().await.chat_request(req).await {
+                        Ok(response) => {
+                            let preview = response
+                                .choices
+                                .first()
+                                .map(|s| serde_json::to_string(s).unwrap_or_default())
+                                .unwrap_or_default();
+                            span.truncated_output_text(Arc::from(preview)).finish();
+                            Json(response).into_response()
+                        }
+                        Err(e) => {
+                            span.with_error_message(e.to_string()).finish();
+                            tracing::debug!("Error from v1/chat: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
                     }
                 }
             }
+            None => StatusCode::NOT_FOUND.into_response(),
         }
-        None => StatusCode::NOT_FOUND.into_response(),
     }
+    .instrument(tspan)
+    .await
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].

@@ -68,6 +68,8 @@ fn main() {
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
         eprintln!("Spice Runtime error: {err}");
     }
+
+    global::shutdown_tracer_provider();
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,7 +91,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
         EnvFilter::new(env_log)
     } else {
-        EnvFilter::new("spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO")
+        EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO")
     };
 
     let registry = Registry::default();
@@ -105,13 +107,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
                     metadata.target() == "task_history"
                 })),
         )
-        .with(
-            fmt::layer()
-                .with_ansi(true)
-                .with_filter(filter::filter_fn(|metadata| {
-                    metadata.target() != "task_history"
-                })),
-        );
+        .with(fmt::layer().with_ansi(true));
 
     tracing::subscriber::set_global_default(subscriber)?;
 
