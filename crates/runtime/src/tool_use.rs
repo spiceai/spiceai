@@ -140,7 +140,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
                     "items": {
                         "type": "string"
                     },
-                    "description": "The datasets to search for similarity. For available datasets, use the 'list_dataset' tool",
+                    "description": "The datasets to search for similarity. For available datasets, use the 'list_datasets' tool",
                     "default": []
                 },
                 "limit": {
@@ -167,6 +167,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
             .iter()
             .map(|d| TableReference::parse_str(d))
             .collect_vec();
+
         let limit = args.limit.unwrap_or(3);
 
         // TODO: implement `explicit_primary_keys` parsing from rt.app
@@ -324,7 +325,7 @@ static PARAMETERS: Lazy<Value> = Lazy::new(|| {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The SQL query to run.",
+                "description": "The SQL query to run. Quote wrap all columns and never select columns ending in '_embedding'.",
             },
         },
         "required": ["query"],
@@ -421,10 +422,18 @@ impl ToolUsingChat {
     /// Return the result as a JSON value.
     async fn call_tool(&self, func: &FunctionCall) -> Value {
         match self.tools.iter().find(|t| t.name() == func.name) {
-            Some(t) => t
-                .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
-                .await
-                .unwrap_or(Value::String(format!("Error calling tool {}", t.name()))),
+            Some(t) => {
+                match t
+                    .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Error calling tool: {}", e);
+                        Value::String(format!("Error calling tool {}", t.name()))
+                    }
+                }
+            }
             None => Value::Null,
         }
     }
@@ -449,6 +458,12 @@ impl ToolUsingChat {
             .filter(|&t| self.is_spiced_tool(t))
             .cloned()
             .collect_vec();
+
+        tracing::debug!(
+            "spiced_tools available: {:?}. Used {:?}",
+            self.tools.iter().map(|t| t.name().clone()).collect_vec(),
+            spiced_tools
+        );
 
         // Return early if no spiced runtime tools used.
         if spiced_tools.is_empty() {
