@@ -176,7 +176,7 @@ impl Chat for Openai {
             })
             .last()
             .unwrap_or_default();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "OpenAI::chat_stream", prompt = %prompt, model = %self.model);
+        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "OpenAI::chat_stream", prompt = %prompt, model = %self.model);
 
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
