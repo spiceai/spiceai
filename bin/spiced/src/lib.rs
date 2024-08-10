@@ -31,6 +31,8 @@ use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 
+#[path = "tracing.rs"]
+mod spiced_tracing;
 mod tls;
 
 #[derive(Debug, Snafu)]
@@ -60,6 +62,9 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS: {source}"))]
     UnableToInitializeTls { source: Box<dyn std::error::Error> },
+
+    #[snafu(display("Unable to initialize tracing: {source}"))]
+    UnableToInitializeTracing { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
@@ -133,7 +138,10 @@ pub async fn run(args: Args, prometheus_registry: Option<prometheus::Registry>) 
         }
     }
 
-    let spicepod_tls_config = app.as_ref().and_then(|app| app.runtime.tls.clone());
+    let runtime_config = app.as_ref().map(|app| &app.runtime);
+    let app_name = app.as_ref().map(|app| app.name.clone());
+    let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
+    let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
 
     let rt: Runtime = Runtime::builder()
         .with_app_opt(app)
@@ -150,7 +158,10 @@ pub async fn run(args: Args, prometheus_registry: Option<prometheus::Registry>) 
         .build()
         .await;
 
-    let tls_config = tls::load_tls_config(&args, spicepod_tls_config, rt.secrets())
+    spiced_tracing::init_tracing(app_name, tracing_config.as_ref())
+        .context(UnableToInitializeTracingSnafu)?;
+
+    let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
         .await
         .context(UnableToInitializeTlsSnafu)?;
 

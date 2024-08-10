@@ -16,10 +16,9 @@ limitations under the License.
 
 use clap::Parser;
 use opentelemetry::global;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::Tracer, Resource};
+use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
-use tracing_subscriber::{filter, fmt, prelude::*, EnvFilter, Registry};
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
@@ -78,48 +77,8 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
         None => None,
     };
 
-    if let Err(err) = init_tracing() {
-        eprintln!("Unable to initialize tracing: {err}");
-        std::process::exit(1);
-    }
-
     spiced::run(args, prometheus_registry).await?;
     Ok(())
-}
-
-fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
-        EnvFilter::new(env_log)
-    } else {
-        EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO")
-    };
-
-    let registry = Registry::default();
-
-    let otel_tracer = init_otel_tracing()?;
-
-    let subscriber = registry
-        .with(filter)
-        .with(
-            tracing_opentelemetry::layer()
-                .with_tracer(otel_tracer)
-                .with_filter(filter::filter_fn(|metadata| {
-                    metadata.target() == "task_history"
-                })),
-        )
-        .with(fmt::layer().with_ansi(true));
-
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    Ok(())
-}
-
-fn init_otel_tracing() -> Result<Tracer, Box<dyn std::error::Error>> {
-    let tracer = opentelemetry_zipkin::new_pipeline()
-        .with_http_client(reqwest::Client::new())
-        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
-
-    Ok(tracer)
 }
 
 fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>> {
