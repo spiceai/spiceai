@@ -274,8 +274,6 @@ impl SpiceModelTool for ListDatasetsTool {
             None => vec![],
         };
 
-        print!("embedding_datasets: {:?}", embedding_datasets);
-
         Ok(Value::Array(embedding_datasets))
     }
 }
