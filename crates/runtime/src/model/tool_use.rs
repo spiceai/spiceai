@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use snafu::ResultExt;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -269,7 +269,12 @@ impl SpiceModelTool for ListDatasetsTool {
                 .datasets
                 .iter()
                 .filter(|d| !d.embeddings.is_empty())
-                .map(|d| Value::String(d.name.clone()))
+                .map(|d| {
+                    json!({
+                        "name": d.name,
+                        "description": d.description,
+                    })
+                })
                 .collect_vec(),
             None => vec![],
         };

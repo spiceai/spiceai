@@ -56,6 +56,8 @@ pub struct Dataset {
 
     pub name: String,
 
+    pub description: Option<String>,
+
     #[serde(default)]
     pub mode: Mode,
 
@@ -98,6 +100,7 @@ impl Dataset {
         Dataset {
             from,
             name,
+            description: None,
             mode: Mode::default(),
             params: None,
             has_metadata_table: None,
@@ -116,6 +119,7 @@ impl WithDependsOn<Dataset> for Dataset {
         Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
+            description: self.description.clone(),
             mode: self.mode.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,
