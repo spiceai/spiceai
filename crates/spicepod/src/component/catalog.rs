@@ -27,6 +27,8 @@ pub struct Catalog {
 
     pub name: String,
 
+    pub description: Option<String>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 
@@ -47,6 +49,7 @@ impl Catalog {
         Catalog {
             from,
             name,
+            description: None,
             include: Vec::default(),
             params: None,
             dataset_params: None,
@@ -60,6 +63,7 @@ impl WithDependsOn<Catalog> for Catalog {
         Catalog {
             from: self.from.clone(),
             name: self.name.clone(),
+            description: self.description.clone(),
             include: self.include.clone(),
             params: self.params.clone(),
             dataset_params: self.dataset_params.clone(),
