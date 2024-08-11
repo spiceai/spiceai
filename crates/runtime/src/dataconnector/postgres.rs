@@ -66,7 +66,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("db"),
     ParameterSpec::connector("sslmode"),
     ParameterSpec::connector("sslrootcert"),
-    ParameterSpec::connector("connection_pool_size")
+    ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool")
         .default("10"),
 ];
