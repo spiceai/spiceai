@@ -57,7 +57,7 @@ pub struct CandleLlama {
 
 #[async_trait]
 impl Chat for CandleLlama {
-    async fn run(&mut self, prompt: String) -> Result<Option<String>> {
+    async fn run(&self, prompt: String) -> Result<Option<String>> {
         // tknzr.clone() is bad
         Self::perform_inference(
             prompt,

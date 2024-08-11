@@ -98,7 +98,6 @@ pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
-mod tool_use;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -260,6 +259,9 @@ pub enum Error {
 
     #[snafu(display("Error converting GlobSet to Regex: {source}"))]
     ErrorConvertingGlobSetToRegex { source: globset::Error },
+
+    #[snafu(display("Unable to create directory: {source}"))]
+    UnableToCreateDirectory { source: std::io::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1135,7 +1137,7 @@ impl Runtime {
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+        let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1605,4 +1607,18 @@ pub struct RegisterDatasetContext {
     federated_read_table: Arc<dyn TableProvider>,
     source: String,
     accelerated_table: Option<AcceleratedTable>,
+}
+
+pub(crate) fn spice_data_base_path() -> String {
+    let Some(home_dir) = dirs::home_dir() else {
+        return ".".to_string();
+    };
+
+    let base_folder = home_dir.join(".spice/data");
+    base_folder.to_str().unwrap_or(".").to_string()
+}
+
+pub(crate) fn make_spice_data_directory() -> Result<()> {
+    let base_folder = spice_data_base_path();
+    std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
 }

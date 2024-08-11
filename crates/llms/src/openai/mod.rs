@@ -86,7 +86,7 @@ impl Openai {
 
 #[async_trait]
 impl Chat for Openai {
-    async fn run(&mut self, prompt: String) -> ChatResult<Option<String>> {
+    async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
         let req = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
             .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
@@ -113,7 +113,7 @@ impl Chat for Openai {
     }
 
     async fn stream<'a>(
-        &mut self,
+        &self,
         prompt: String,
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
         let req = CreateChatCompletionRequestArgs::default()
@@ -148,7 +148,7 @@ impl Chat for Openai {
     }
 
     async fn chat_stream(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let mut inner_req = req.clone();
@@ -159,7 +159,7 @@ impl Chat for Openai {
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
     async fn chat_request(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let mut inner_req = req.clone();
