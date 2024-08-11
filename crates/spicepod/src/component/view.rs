@@ -25,6 +25,8 @@ use super::{Nameable, WithDependsOn};
 pub struct View {
     pub name: String,
 
+    pub description: Option<String>,
+
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
@@ -49,6 +51,7 @@ impl View {
     pub fn new(name: String) -> Self {
         Self {
             name,
+            description: None,
             sql: None,
             sql_ref: None,
             depends_on: Vec::default(),
@@ -60,6 +63,7 @@ impl WithDependsOn<View> for View {
     fn depends_on(&self, depends_on: &[String]) -> View {
         Self {
             name: self.name.clone(),
+            description: self.description.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             depends_on: depends_on.to_vec(),

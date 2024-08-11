@@ -27,6 +27,8 @@ pub struct Model {
     pub from: String,
     pub name: String,
 
+    pub description: Option<String>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "files", default)]
     pub files: Vec<ModelFile>,
@@ -53,6 +55,7 @@ impl WithDependsOn<Model> for Model {
         Model {
             from: self.from.clone(),
             name: self.name.clone(),
+            description: self.description.clone(),
             files: self.files.clone(),
             params: self.params.clone(),
             datasets: self.datasets.clone(),
