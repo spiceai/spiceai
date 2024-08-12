@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 
-use arrow::array::{Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::sql::TableReference;
 use itertools::Itertools;
 use llms::chat::{Chat, Result as ChatResult};
@@ -198,6 +198,8 @@ impl DocumentSimilarityTool {
                     if let Some(array) = batch.column_by_name(&col_name) {
                         if let Some(str_array) = array.as_any().downcast_ref::<StringArray>() {
                             pk_map.insert(col_name, Value::String(str_array.value(i).to_string()));
+                        } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+                            pk_map.insert(col_name, Value::Number(array.value(i).into()));
                         }
                     };
                 });
