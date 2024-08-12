@@ -151,27 +151,25 @@ fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapAr
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
     pub(crate) df: Arc<crate::datafusion::DataFusion>,
-    pub(crate) id: Uuid,
+    pub(crate) trace_id: String,
 
     /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
-    pub(crate) context_id: Uuid,
+    pub(crate) span_id: String,
 
     /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
-    pub(crate) parent_id: Option<Uuid>,
+    pub(crate) parent_span_id: Option<String>,
 
-    pub(crate) task_type: TaskType,
-    pub(crate) input_text: Arc<str>,
-    pub(crate) truncated_output_text: Option<Arc<str>>,
+    pub(crate) task: String,
+    pub(crate) input: Arc<str>,
+    pub(crate) truncated_output: Option<Arc<str>>,
 
     pub(crate) start_time: SystemTime,
-    pub(crate) end_time: Option<SystemTime>,
-    pub(crate) execution_duration_ms: Option<f64>,
-    pub(crate) outputs_produced: u64,
-    pub(crate) cache_hit: Option<bool>,
+    pub(crate) end_time: SystemTime,
+    pub(crate) execution_duration_ms: f64,
     pub(crate) error_message: Option<String>,
     pub(crate) labels: HashMap<String, String>,
-
-    pub(crate) timer: Instant,
+    // For top-level HTTP tasks, have a label:
+    // - "http_status" (200, 400)
 }
 
 impl TaskSpan {

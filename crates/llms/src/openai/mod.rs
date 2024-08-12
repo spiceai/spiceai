@@ -21,7 +21,6 @@ use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent,
     ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
     CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse,
 };
@@ -124,7 +123,7 @@ impl Chat for Openai {
         &self,
         prompt: String,
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "OpenAI::stream", prompt = %prompt, model = %self.model);
+        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "openai::stream", prompt = %prompt, model = %self.model);
         let guard = span.enter();
         let req = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
@@ -163,20 +162,7 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let prompt = req
-            .messages
-            .last()
-            .iter()
-            .filter_map(|m| match m {
-                ChatCompletionRequestMessage::User(u) => match u.content {
-                    ChatCompletionRequestUserMessageContent::Text(ref t) => Some(t.clone()),
-                    ChatCompletionRequestUserMessageContent::Array(_) => None,
-                },
-                _ => None,
-            })
-            .last()
-            .unwrap_or_default();
-        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "OpenAI::chat_stream", prompt = %prompt, model = %self.model);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default(), model = %self.model);
 
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
@@ -191,9 +177,11 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default(), model = %self.model);
+
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        self.client.chat().create(inner_req).await
+        self.client.chat().create(inner_req).instrument(span).await
     }
 }
 

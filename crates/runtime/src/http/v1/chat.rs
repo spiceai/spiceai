@@ -51,7 +51,7 @@ pub(crate) async fn post(
     )
     .label("model".to_string(), req.model.clone());
 
-    let tspan = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input_text = %serde_json::to_string(&req).unwrap_or_default());
+    let tspan = tracing::span!(target: "task_history", tracing::Level::DEBUG, "POST /v1/chat", input = %serde_json::to_string(&req).unwrap_or_default(), model = %req.model);
 
     let tspan_clone = tspan.clone();
     async move {
