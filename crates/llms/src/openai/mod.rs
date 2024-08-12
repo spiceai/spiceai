@@ -37,6 +37,7 @@ use async_trait::async_trait;
 use futures::future::try_join_all;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
+use tracing::Span;
 use tracing_futures::Instrument;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
@@ -166,7 +167,14 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+        let span = match Span::current() {
+            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "ai_completion") => {
+                span
+            }
+            _ => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default())
+            }
+        };
         span.in_scope(
             || tracing::info!(name: "labels", target: "task_history", model = %self.model),
         );
@@ -189,7 +197,14 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+        let span = match Span::current() {
+            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "ai_completion") => {
+                span
+            }
+            _ => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default())
+            }
+        };
         span.in_scope(
             || tracing::info!(name: "labels", target: "task_history", model = %self.model),
         );

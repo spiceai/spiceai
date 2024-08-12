@@ -79,6 +79,8 @@ pub(crate) async fn post(
         .map(TableReference::from)
         .collect();
 
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.text);
+
     match vs
         .search(
             payload.text.clone(),
@@ -89,19 +91,22 @@ pub(crate) async fn post(
     {
         Ok(resp) => match SearchResponse::from_vector_search(resp) {
             Ok(r) => {
-                // task_history::TODO
-                //span.outputs_produced(r.entries.len() as u64).finish();
+                span.in_scope(|| {
+                    tracing::info!(name = "labels", target = "task_history", outputs_produced = %r.entries.len());
+                });
                 (StatusCode::OK, Json(r)).into_response()
             }
             Err(e) => {
-                // task_history::TODO
-                //span.with_error_message(e.to_string()).finish();
+                span.in_scope(|| {
+                    tracing::error!(target: "task_history", "{e}");
+                });
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         },
         Err(e) => {
-            // task_history::TODO
-            //span.with_error_message(e.to_string()).finish();
+            span.in_scope(|| {
+                tracing::error!(target: "task_history", "{e}");
+            });
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }

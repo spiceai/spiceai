@@ -160,7 +160,7 @@ impl QueryTracker {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        trace_query(self, truncated_output);
+        trace_query(self, &truncated_output);
 
         Ok(())
     }
@@ -229,8 +229,7 @@ impl QueryTracker {
     }
 }
 
-fn trace_query(query_tracker: &QueryTracker, truncated_output: Arc<str>) {
-    // task_history::TODO: Add top-level span for query, setting the name and input properly
+fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
     if let Some(schema) = &query_tracker.schema {
         tracing::info!(name: "labels", target: "task_history", schema = ?schema);
     }
