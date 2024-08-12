@@ -144,7 +144,7 @@ pub trait Chat: Sync + Send {
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
-        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "health", input = "health");
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
         self.run("health".to_string())
             .instrument(span)
             .await
