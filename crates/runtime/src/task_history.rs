@@ -118,28 +118,13 @@ pub(crate) struct TaskSpan {
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: SystemTime,
     pub(crate) execution_duration_ms: f64,
-    pub(crate) error_message: Option<String>,
-    pub(crate) labels: HashMap<String, String>,
+    pub(crate) error_message: Option<Arc<str>>,
+    pub(crate) labels: HashMap<Arc<str>, Arc<str>>,
     // For top-level HTTP tasks, have a label:
     // - "http_status" (200, 400)
 }
 
 impl TaskSpan {
-    pub fn with_error_message(mut self, error_message: String) -> Self {
-        self.error_message = Some(error_message);
-        self
-    }
-
-    pub fn label(mut self, key: String, value: String) -> Self {
-        self.labels.insert(key, value);
-        self
-    }
-
-    pub fn labels<I: IntoIterator<Item = (String, String)>>(mut self, labels: I) -> Self {
-        self.labels.extend(labels);
-        self
-    }
-
     pub async fn instantiate_table() -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
         let time_format = Some(TimeFormat::UnixSeconds);
