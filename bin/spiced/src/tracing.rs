@@ -14,15 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use app::spicepod::component::runtime::TracingConfig;
+use opentelemetry_sdk::{
+    trace::{Config, TracerProvider},
+    Resource,
+};
+use runtime::{datafusion::DataFusion, task_history};
 use tracing::Subscriber;
 use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
 
 pub(crate) fn init_tracing(
     app_name: Option<String>,
     config: Option<&TracingConfig>,
+    df: Arc<DataFusion>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
         EnvFilter::new(env_log)
@@ -32,7 +38,8 @@ pub(crate) fn init_tracing(
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(zipkin_task_history_tracing(app_name, config)?)
+        //.with(zipkin_task_history_tracing(app_name, config)?)
+        .with(datafusion_task_history_tracing(df))
         .with(
             fmt::layer()
                 .with_ansi(true)
@@ -44,6 +51,31 @@ pub(crate) fn init_tracing(
     tracing::subscriber::set_global_default(subscriber)?;
 
     Ok(())
+}
+
+fn datafusion_task_history_tracing<S>(df: Arc<DataFusion>) -> impl Layer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    let trace_config = Config::default().with_resource(Resource::empty());
+
+    let exporter = task_history::otel_exporter::TaskHistoryExporter::new(df);
+
+    let mut provider_builder =
+        TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
+    provider_builder = provider_builder.with_config(trace_config);
+    let provider = provider_builder.build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer_builder(&provider, "task_history")
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .build();
+
+    let layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(filter::filter_fn(|metadata| {
+            metadata.target() == "task_history"
+        }));
+
+    layer
 }
 
 fn zipkin_task_history_tracing<S>(

@@ -38,6 +38,7 @@ pub(crate) async fn post(
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+    span.in_scope(|| tracing::info!(name: "labels", target: "task_history", model = %req.model));
 
     let span_clone = span.clone();
     async move {

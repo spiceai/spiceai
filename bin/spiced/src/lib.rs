@@ -158,7 +158,7 @@ pub async fn run(args: Args, prometheus_registry: Option<prometheus::Registry>) 
         .build()
         .await;
 
-    spiced_tracing::init_tracing(app_name, tracing_config.as_ref())
+    spiced_tracing::init_tracing(app_name, tracing_config.as_ref(), rt.datafusion())
         .context(UnableToInitializeTracingSnafu)?;
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
