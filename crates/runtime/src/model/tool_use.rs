@@ -231,10 +231,17 @@ impl SpiceModelTool for ListTablesTool {
         _arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let tables = rt.datafusion().get_public_table_names().boxed()?;
-        Ok(Value::Array(
-            tables.iter().map(|t| Value::String(t.clone())).collect(),
-        ))
+        if let Some(app) = rt.app.read().await.as_ref() {
+            return Ok(Value::Array(
+                app.datasets
+                    .iter()
+                    .map(|d| {
+                        Value::from_str(&TableReference::parse_str(&d.name).to_quoted_string()).boxed()
+                    }).collect::<Result::<Vec<Value>, _>>()?
+            ));
+        } else {
+            Ok(Value::Array(vec![]))
+        }
     }
 }
 
