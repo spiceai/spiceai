@@ -14,68 +14,45 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fs::File;
-use std::io::Write;
+use std::fmt;
+use std::sync::Arc;
+use std::{
+    fmt::{Debug, Formatter},
+    io::Write,
+};
 
 use futures::future::BoxFuture;
+use opentelemetry::trace::TraceError;
 use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 
-#[derive(Debug)]
+use crate::datafusion::DataFusion;
+
+use super::TaskSpan;
+
+#[derive(Clone)]
 pub struct TaskHistoryExporter {
-    file: File,
+    df: Arc<DataFusion>,
+}
+
+impl Debug for TaskHistoryExporter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskHistoryExporter").finish()
+    }
 }
 
 impl TaskHistoryExporter {
-    pub fn new() -> Self {
-        let Ok(file) = File::create("task_history_exporter.log") else {
-            panic!("Unable to create task history exporter log file");
-        };
-        Self { file }
+    pub fn new(df: Arc<DataFusion>) -> Self {
+        Self { df }
     }
 }
 
 impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        for span in batch {
-            writeln!(self.file, "{span:#?}");
-        }
-        Box::pin(async move { Ok(()) })
-    }
-
-    fn shutdown(&mut self) {}
-
-    fn force_flush(&mut self) -> BoxFuture<'static, ExportResult> {
-        self.file.flush();
-        Box::pin(async { Ok(()) })
+        let df = Arc::clone(&self.df);
+        Box::pin(async move {
+            TaskSpan::write(df, vec![])
+                .await
+                .map_err(|e| TraceError::Other(Box::new(e)))
+        })
     }
 }
-
-// async fn write(&self) -> Result<(), Error> {
-//     if self.end_time.is_none() {
-//         return Err(Error::MissingColumnsInRow {
-//             columns: "end_time".to_string(),
-//         });
-//     }
-
-//     let data = self
-//         .to_record_batch()
-//         .boxed()
-//         .context(UnableToWriteToTableSnafu)?;
-
-//     let data_update = DataUpdate {
-//         schema: Arc::new(Self::table_schema()),
-//         data: vec![data],
-//         update_type: crate::dataupdate::UpdateType::Append,
-//     };
-
-//     self.df
-//         .write_data(
-//             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
-//             data_update,
-//         )
-//         .await
-//         .boxed()
-//         .context(UnableToWriteToTableSnafu)?;
-
-//     Ok(())
-// }

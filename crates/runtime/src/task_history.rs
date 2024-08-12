@@ -15,15 +15,21 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
+use crate::datafusion::DataFusion;
+use crate::dataupdate::DataUpdate;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
+use arrow::array::{ArrayBuilder, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use data_components::arrow::struct_builder::StructBuilder;
 use datafusion::sql::TableReference;
+use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
@@ -97,43 +103,42 @@ impl Display for TaskType {
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
-    // pub(crate) df: Arc<crate::datafusion::DataFusion>,
-    // pub(crate) trace_id: Arc<str>,
+    pub(crate) trace_id: Arc<str>,
 
-    // /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
-    // pub(crate) span_id: Arc<str>,
+    /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
+    pub(crate) span_id: Arc<str>,
 
-    // /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
-    // pub(crate) parent_span_id: Option<Arc<str>>,
+    /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
+    pub(crate) parent_span_id: Option<Arc<str>>,
 
-    // pub(crate) task: Arc<str>,
-    // pub(crate) input: Arc<str>,
-    // pub(crate) truncated_output: Option<Arc<str>>,
+    pub(crate) task: Arc<str>,
+    pub(crate) input: Arc<str>,
+    pub(crate) truncated_output: Option<Arc<str>>,
 
-    // pub(crate) start_time: SystemTime,
-    // pub(crate) end_time: SystemTime,
-    // pub(crate) execution_duration_ms: f64,
-    // pub(crate) error_message: Option<String>,
-    // pub(crate) labels: HashMap<String, String>,
+    pub(crate) start_time: SystemTime,
+    pub(crate) end_time: SystemTime,
+    pub(crate) execution_duration_ms: f64,
+    pub(crate) error_message: Option<String>,
+    pub(crate) labels: HashMap<String, String>,
     // For top-level HTTP tasks, have a label:
     // - "http_status" (200, 400)
 }
 
 impl TaskSpan {
-    // pub fn with_error_message(mut self, error_message: String) -> Self {
-    //     self.error_message = Some(error_message);
-    //     self
-    // }
+    pub fn with_error_message(mut self, error_message: String) -> Self {
+        self.error_message = Some(error_message);
+        self
+    }
 
-    // pub fn label(mut self, key: String, value: String) -> Self {
-    //     self.labels.insert(key, value);
-    //     self
-    // }
+    pub fn label(mut self, key: String, value: String) -> Self {
+        self.labels.insert(key, value);
+        self
+    }
 
-    // pub fn labels<I: IntoIterator<Item = (String, String)>>(mut self, labels: I) -> Self {
-    //     self.labels.extend(labels);
-    //     self
-    // }
+    pub fn labels<I: IntoIterator<Item = (String, String)>>(mut self, labels: I) -> Self {
+        self.labels.extend(labels);
+        self
+    }
 
     pub async fn instantiate_table() -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
@@ -200,97 +205,80 @@ impl TaskSpan {
         ])
     }
 
-    // pub fn finish(mut self) {
-    //     if self.end_time.is_none() {
-    //         self.end_time = Some(SystemTime::now());
-    //     }
+    pub async fn write(df: Arc<DataFusion>, spans: Vec<TaskSpan>) -> Result<(), Error> {
+        let data = Self::to_record_batch(spans)
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
 
-    //     let duration = self.timer.elapsed();
+        let data_update = DataUpdate {
+            schema: Arc::new(Self::table_schema()),
+            data: vec![data],
+            update_type: crate::dataupdate::UpdateType::Append,
+        };
 
-    //     if self.execution_duration_ms.is_none() {
-    //         self.execution_duration_ms = Some(1000.0 * duration.as_secs_f64());
-    //     }
+        df.write_data(
+            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+            data_update,
+        )
+        .await
+        .boxed()
+        .context(UnableToWriteToTableSnafu)?;
 
-    //     tokio::task::spawn(async move {
-    //         if let Err(err) = self.write().await {
-    //             tracing::error!("Error writing task history: {err}");
-    //         }
-    //     });
-    // }
+        Ok(())
+    }
 
-    // pub async fn write(&self) -> Result<(), Error> {
-    //     let data = self
-    //         .to_record_batch()
-    //         .boxed()
-    //         .context(UnableToWriteToTableSnafu)?;
+    fn to_record_batch(spans: Vec<TaskSpan>) -> Result<RecordBatch, Error> {
+        let schema = Self::table_schema();
+        let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), spans.len());
 
-    //     let data_update = DataUpdate {
-    //         schema: Arc::new(Self::table_schema()),
-    //         data: vec![data],
-    //         update_type: crate::dataupdate::UpdateType::Append,
-    //     };
+        for span in spans {
+            struct_builder.append(true);
 
-    //     self.df
-    //         .write_data(
-    //             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
-    //             data_update,
-    //         )
-    //         .await
-    //         .boxed()
-    //         .context(UnableToWriteToTableSnafu)?;
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let field_builder = struct_builder.field_builder_array(col_idx);
+                match field.name().as_str() {
+                    "trace_id" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        str_builder.append_value(&span.trace_id);
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+            // let end_time = self
+            //     .end_time
+            //     .and_then(|s| {
+            //         s.duration_since(SystemTime::UNIX_EPOCH)
+            //             .map(|x| i64::try_from(x.as_nanos()))
+            //             .ok()
+            //     })
+            //     .transpose()
+            //     .boxed()
+            //     .context(UnableToCreateRowSnafu)?;
 
-    //     Ok(())
-    // }
+            // let start_time = self
+            //     .start_time
+            //     .duration_since(SystemTime::UNIX_EPOCH)
+            //     .map(|duration| i64::try_from(duration.as_nanos()).ok())
+            //     .boxed()
+            //     .context(UnableToCreateRowSnafu)?;
 
-    // fn to_record_batch(&self) -> Result<RecordBatch, Error> {
-    //     let end_time = self
-    //         .end_time
-    //         .and_then(|s| {
-    //             s.duration_since(SystemTime::UNIX_EPOCH)
-    //                 .map(|x| i64::try_from(x.as_nanos()))
-    //                 .ok()
-    //         })
-    //         .transpose()
-    //         .boxed()
-    //         .context(UnableToCreateRowSnafu)?;
+            // let labels = convert_hashmap_to_maparray(&self.labels)
+            //     .boxed()
+            //     .context(UnableToCreateRowSnafu)?;
+        }
 
-    //     let start_time = self
-    //         .start_time
-    //         .duration_since(SystemTime::UNIX_EPOCH)
-    //         .map(|duration| i64::try_from(duration.as_nanos()).ok())
-    //         .boxed()
-    //         .context(UnableToCreateRowSnafu)?;
+        Ok(struct_builder.finish().into())
+    }
+}
 
-    //     let labels = convert_hashmap_to_maparray(&self.labels)
-    //         .boxed()
-    //         .context(UnableToCreateRowSnafu)?;
-
-    //     RecordBatch::try_new(
-    //         Arc::new(Self::table_schema()),
-    //         vec![
-    //             Arc::new(StringArray::from(vec![self.id.to_string()])),
-    //             Arc::new(StringArray::from(vec![self.context_id.to_string()])),
-    //             Arc::new(StringArray::from(vec![self
-    //                 .parent_id
-    //                 .map(|s| s.to_string())])),
-    //             Arc::new(StringArray::from(vec![self.task_type.to_string()])),
-    //             Arc::new(StringArray::from(vec![self.input_text.to_string()])),
-    //             Arc::new(StringArray::from(vec![self
-    //                 .truncated_output_text
-    //                 .clone()
-    //                 .map(|s| s.to_string())])),
-    //             Arc::new(TimestampNanosecondArray::from(vec![start_time])),
-    //             Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-    //             Arc::new(Float64Array::from(vec![self.execution_duration_ms])),
-    //             Arc::new(UInt64Array::from(vec![self.outputs_produced])),
-    //             Arc::new(BooleanArray::from(vec![self.cache_hit.unwrap_or(false)])),
-    //             Arc::new(StringArray::from(vec![self.error_message.clone()])),
-    //             Arc::new(labels),
-    //         ],
-    //     )
-    //     .boxed()
-    //     .context(UnableToCreateRowSnafu)
-    // }
+pub(crate) fn downcast_builder<T: ArrayBuilder>(
+    builder: &mut dyn ArrayBuilder,
+) -> Result<&mut T, Error> {
+    let builder = builder
+        .as_any_mut()
+        .downcast_mut::<T>()
+        .context(DowncastBuilderSnafu)?;
+    Ok(builder)
 }
 
 #[derive(Debug, Snafu)]
@@ -319,4 +307,7 @@ pub enum Error {
     UnableToGetTableProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    DowncastBuilder,
 }
