@@ -164,10 +164,10 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %self.model),
-        );
+        // let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+        // span.in_scope(
+        //     || tracing::info!(name: "labels", target: "task_history", model = %self.model),
+        // );
 
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
@@ -175,10 +175,11 @@ impl Chat for Openai {
             .client
             .chat()
             .create_stream(inner_req)
-            .instrument(span.clone())
+            // .instrument(span.clone())
             .await?;
 
-        Ok(Box::pin(stream.instrument(span)))
+        // Ok(Box::pin(stream.instrument(span)))
+        Ok(Box::pin(stream))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
@@ -187,14 +188,15 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %self.model),
-        );
+        // let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+        // span.in_scope(
+        //     || tracing::info!(name: "labels", target: "task_history", model = %self.model),
+        // );
 
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        self.client.chat().create(inner_req).instrument(span).await
+        // self.client.chat().create(inner_req).instrument(span).await
+        self.client.chat().create(inner_req).await
     }
 }
 
