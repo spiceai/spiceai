@@ -110,9 +110,11 @@ impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let span = match &self.tracker.nsql {
-            Some(nsql) => tracing::span!(tracing::Level::INFO, "nsql_query", input = %nsql),
+            Some(nsql) => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql)
+            }
             None => {
-                tracing::span!(tracing::Level::INFO, "sql_query", input = %self.sql)
+                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql)
             }
         };
         let session = self.df.ctx.state();
