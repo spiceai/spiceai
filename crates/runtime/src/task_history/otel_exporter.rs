@@ -94,13 +94,7 @@ fn span_to_task_span(span: SpanData) -> TaskSpan {
                 .iter()
                 .any(|kv| kv.key.as_str() == "level" && kv.value.as_str() == "ERROR")
         })
-        .map(|idx| {
-            span.events[idx]
-                .attributes
-                .iter()
-                .find(|kv| kv.key.as_str() == "message")
-                .map_or_else(|| "".into(), |kv| kv.value.as_str().into())
-        });
+        .map(|idx| span.events[idx].name.clone().into());
     let labels: HashMap<Arc<str>, Arc<str>> = span
         .attributes
         .iter()

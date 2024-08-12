@@ -531,7 +531,7 @@ impl ToolUsingChat {
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::error!("Error calling tool: {}", e);
+                        tracing::error!(target: "task_history", "{e}");
                         Value::String(format!("Error calling tool {}", t.name()))
                     }
                 }
