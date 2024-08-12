@@ -227,6 +227,7 @@ impl TaskSpan {
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn to_record_batch(spans: Vec<TaskSpan>) -> Result<RecordBatch, Error> {
         let schema = Self::table_schema();
         let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), spans.len());
@@ -241,30 +242,83 @@ impl TaskSpan {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
                         str_builder.append_value(&span.trace_id);
                     }
-                    _ => unimplemented!(),
+                    "span_id" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        str_builder.append_value(&span.span_id);
+                    }
+                    "parent_span_id" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        match &span.parent_span_id {
+                            Some(parent_span_id) => str_builder.append_value(parent_span_id),
+                            None => str_builder.append_null(),
+                        }
+                    }
+                    "task" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        str_builder.append_value(&span.task);
+                    }
+                    "input" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        str_builder.append_value(&span.input);
+                    }
+                    "truncated_output" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        match &span.truncated_output {
+                            Some(truncated_output) => str_builder.append_value(truncated_output),
+                            None => str_builder.append_null(),
+                        }
+                    }
+                    "start_time" => {
+                        let timestamp_builder = downcast_builder::<
+                            arrow::array::TimestampNanosecondBuilder,
+                        >(field_builder)?;
+                        let start_time = span
+                            .start_time
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .boxed()
+                            .context(UnableToCreateRowSnafu)?;
+                        timestamp_builder.append_value(start_time.as_nanos() as i64);
+                    }
+                    "end_time" => {
+                        let timestamp_builder = downcast_builder::<
+                            arrow::array::TimestampNanosecondBuilder,
+                        >(field_builder)?;
+                        let end_time = span
+                            .end_time
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .boxed()
+                            .context(UnableToCreateRowSnafu)?;
+                        timestamp_builder.append_value(end_time.as_nanos() as i64);
+                    }
+                    "execution_duration_ms" => {
+                        let float_builder =
+                            downcast_builder::<arrow::array::Float64Builder>(field_builder)?;
+                        float_builder.append_value(span.execution_duration_ms);
+                    }
+                    "error_message" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        match &span.error_message {
+                            Some(error_message) => str_builder.append_value(error_message),
+                            None => str_builder.append_null(),
+                        }
+                    }
+                    "labels" => {
+                        let map_builder = downcast_builder::<
+                            arrow::array::MapBuilder<StringBuilder, StringBuilder>,
+                        >(field_builder)?;
+                        let (keys_field, values_field) = map_builder.entries();
+                        for (key, value) in &span.labels {
+                            keys_field.append_value(key);
+                            values_field.append_value(value);
+                        }
+                        map_builder
+                            .append(true)
+                            .boxed()
+                            .context(UnableToCreateRowSnafu)?;
+                    }
+                    name => unreachable!("unexpected field name: {name}"),
                 }
             }
-            // let end_time = self
-            //     .end_time
-            //     .and_then(|s| {
-            //         s.duration_since(SystemTime::UNIX_EPOCH)
-            //             .map(|x| i64::try_from(x.as_nanos()))
-            //             .ok()
-            //     })
-            //     .transpose()
-            //     .boxed()
-            //     .context(UnableToCreateRowSnafu)?;
-
-            // let start_time = self
-            //     .start_time
-            //     .duration_since(SystemTime::UNIX_EPOCH)
-            //     .map(|duration| i64::try_from(duration.as_nanos()).ok())
-            //     .boxed()
-            //     .context(UnableToCreateRowSnafu)?;
-
-            // let labels = convert_hashmap_to_maparray(&self.labels)
-            //     .boxed()
-            //     .context(UnableToCreateRowSnafu)?;
         }
 
         Ok(struct_builder.finish().into())

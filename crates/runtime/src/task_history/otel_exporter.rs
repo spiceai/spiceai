@@ -15,11 +15,8 @@ limitations under the License.
 */
 
 use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::{
-    fmt::{Debug, Formatter},
-    io::Write,
-};
 
 use futures::future::BoxFuture;
 use opentelemetry::trace::TraceError;
