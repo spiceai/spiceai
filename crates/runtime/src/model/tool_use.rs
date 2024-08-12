@@ -46,6 +46,7 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
 use crate::datafusion::query::Protocol;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::embeddings::vector_search::{parse_explicit_primary_keys, VectorSearch};
 use crate::Runtime;
 
@@ -303,7 +304,13 @@ impl SpiceModelTool for ListTablesTool {
             Ok(Value::Array(
                 app.datasets
                     .iter()
-                    .map(|d| Value::String(TableReference::parse_str(&d.name).to_quoted_string()))
+                    .map(|d| {
+                        Value::String(
+                            TableReference::parse_str(&d.name)
+                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                                .to_string(),
+                        )
+                    })
                     .collect::<Vec<Value>>(),
             ))
         } else {
@@ -341,7 +348,7 @@ impl SpiceModelTool for ListDatasetsTool {
                 .filter(|d| !d.embeddings.is_empty())
                 .map(|d| {
                     json!({
-                        "name": d.name,
+                        "name": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
                         "description": d.description,
                     })
                 })
@@ -424,7 +431,7 @@ static SQL_PARAMETERS: Lazy<Value> = Lazy::new(|| {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The SQL query to run. Quote wrap all columns and never select columns ending in '_embedding'.",
+                "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The table_catalog is 'spice'. Always use it in the query",
             },
         },
         "required": ["query"],
