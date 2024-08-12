@@ -3,7 +3,7 @@ set -e
 
 clean_up () {
     ARG=$?
-		rm runqueries.tmp.txt
+		rm -f runqueries.tmp.txt
     exit $ARG
 }
 
@@ -30,12 +30,12 @@ for i in `ls -d $query_folder/**`; do
 		result=`cat runqueries.tmp.txt`
 		echo "$result"
     # if result contains error string, then it failed
-    if [[ $result == *"Query Error"* ]]; then
+    if [[ $result == *"Query Error"* ]] || [[ $result == *"ERROR"* ]]; then
         failed_queries+=($i)
     fi
 done
 
-if [ ${failed_queries[@]} -eq 0 ]; then
+if [ ${#failed_queries[@]} -eq 0 ]; then
     echo "All queries passed!"
 else
     echo "Failed queries:"
