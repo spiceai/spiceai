@@ -162,7 +162,7 @@ impl RuntimeBuilder {
             let mut extension = factory.create();
             let extension_name = extension.name();
             if let Err(err) = extension.initialize(&rt).await {
-                tracing::warn!("Failed to initialize extension {extension_name}: {err}");
+                eprintln!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.insert(extension_name.into(), extension.into());
             };
@@ -178,7 +178,7 @@ impl RuntimeBuilder {
 
         if let Some(app) = app {
             if let Err(e) = secrets.load_from(&app.secrets).await {
-                tracing::error!("Error loading secret stores: {e}");
+                eprintln!("Error loading secret stores: {e}");
             };
         }
 

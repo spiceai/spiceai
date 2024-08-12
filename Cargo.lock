@@ -2766,7 +2766,7 @@ dependencies = [
  "object_store",
  "rdkafka",
  "regex",
- "reqwest 0.11.27",
+ "reqwest 0.12.5",
  "rusqlite",
  "secrecy",
  "serde",
@@ -3799,7 +3799,7 @@ dependencies = [
  "futures",
  "llms",
  "prost 0.12.6",
- "reqwest 0.11.27",
+ "reqwest 0.12.5",
  "rustyline",
  "serde_json",
  "tonic",
@@ -4769,7 +4769,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.0",
  "tower-service",
- "webpki-roots 0.26.3",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5534,6 +5534,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "tracing-futures",
 ]
 
 [[package]]
@@ -5919,7 +5920,7 @@ dependencies = [
  "dirs",
  "ndarray",
  "regex",
- "reqwest 0.11.27",
+ "reqwest 0.12.5",
  "secrecy",
  "serde",
  "serde_json",
@@ -6756,6 +6757,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-http"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad31e9de44ee3538fb9d64fe3376c1362f406162434609e79aea2a41a0af78ab"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.1.0",
+ "opentelemetry 0.24.0",
+ "reqwest 0.12.5",
+]
+
+[[package]]
 name = "opentelemetry-prometheus"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6778,6 +6792,33 @@ dependencies = [
  "opentelemetry_sdk 0.23.0",
  "prost 0.12.6",
  "tonic",
+]
+
+[[package]]
+name = "opentelemetry-semantic-conventions"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cefe0543875379e47eb5f1e68ff83f45cc41366a92dfd0d073d513bf68e9a05"
+
+[[package]]
+name = "opentelemetry-zipkin"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e68336254a44c5c20574989699582175910b933be85a593a13031ee58811d93d"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "http 1.1.0",
+ "once_cell",
+ "opentelemetry 0.24.0",
+ "opentelemetry-http",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk 0.24.1",
+ "reqwest 0.12.5",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "typed-builder",
 ]
 
 [[package]]
@@ -6811,7 +6852,12 @@ dependencies = [
  "glob",
  "once_cell",
  "opentelemetry 0.24.0",
+ "percent-encoding",
+ "rand",
+ "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -7905,7 +7951,6 @@ dependencies = [
  "http 0.2.12",
  "http-body 0.4.6",
  "hyper 0.14.30",
- "hyper-rustls 0.24.2",
  "hyper-tls 0.5.0",
  "ipnet",
  "js-sys",
@@ -7915,7 +7960,6 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
- "rustls 0.21.12",
  "rustls-pemfile 1.0.4",
  "serde",
  "serde_json",
@@ -7924,13 +7968,11 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls 0.24.1",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 0.25.4",
  "winreg 0.50.0",
 ]
 
@@ -7944,6 +7986,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2 0.4.5",
@@ -7983,7 +8026,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 0.26.3",
+ "webpki-roots",
  "winreg 0.52.0",
 ]
 
@@ -8214,7 +8257,7 @@ dependencies = [
  "prost 0.12.6",
  "rand",
  "regex",
- "reqwest 0.11.27",
+ "reqwest 0.12.5",
  "rustls 0.23.11",
  "rustls-pemfile 2.1.2",
  "secrecy",
@@ -8232,6 +8275,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-futures",
  "tracing-subscriber",
  "tract-core",
  "url",
@@ -9120,7 +9164,7 @@ dependencies = [
  "datafusion",
  "futures",
  "globset",
- "reqwest 0.11.27",
+ "reqwest 0.12.5",
  "runtime",
  "serde",
  "serde_json",
@@ -9137,9 +9181,12 @@ dependencies = [
  "clap",
  "flightrepl",
  "opentelemetry 0.24.0",
+ "opentelemetry-http",
  "opentelemetry-prometheus",
+ "opentelemetry-zipkin",
  "opentelemetry_sdk 0.24.1",
  "prometheus",
+ "reqwest 0.12.5",
  "runtime",
  "rustls 0.23.11",
  "rustls-pemfile 2.1.2",
@@ -9148,6 +9195,7 @@ dependencies = [
  "spice-cloud",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -10041,6 +10089,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-futures"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
+dependencies = [
+ "futures",
+ "futures-task",
+ "pin-project",
+ "tracing",
+]
+
+[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10049,6 +10109,24 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9784ed4da7d921bc8df6963f8c80a0e4ce34ba6ba76668acadd3edbd985ff3b"
+dependencies = [
+ "js-sys",
+ "once_cell",
+ "opentelemetry 0.24.0",
+ "opentelemetry_sdk 0.24.1",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]
@@ -10319,6 +10397,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-builder"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77739c880e00693faef3d65ea3aad725f196da38b22fdc7ea6ded6e1ce4d3add"
+dependencies = [
+ "typed-builder-macro",
+]
+
+[[package]]
+name = "typed-builder-macro"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f718dfaf347dcb5b983bfc87608144b0bad87970aebcbea5ce44d2a30c08e63"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.71",
+]
+
+[[package]]
 name = "typenum"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10438,7 +10536,7 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
- "webpki-roots 0.26.3",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -10721,12 +10819,6 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "webpki-roots"
-version = "0.25.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "webpki-roots"
