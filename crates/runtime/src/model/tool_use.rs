@@ -300,15 +300,11 @@ impl SpiceModelTool for ListTablesTool {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), arg);
         if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
-            // if let Some(app) = rt.app.read().instrument(span.clone()).await {
             Ok(Value::Array(
                 app.datasets
                     .iter()
-                    .map(|d| {
-                        Value::from_str(&TableReference::parse_str(&d.name).to_quoted_string())
-                            .boxed()
-                    })
-                    .collect::<Result<Vec<Value>, _>>()?,
+                    .map(|d| Value::String(TableReference::parse_str(&d.name).to_quoted_string()))
+                    .collect::<Vec<Value>>(),
             ))
         } else {
             Ok(Value::Array(vec![]))
