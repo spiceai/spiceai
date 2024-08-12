@@ -56,6 +56,20 @@ impl SpanExporter for TaskHistoryExporter {
     }
 }
 
+fn first_n_chars(s: &str, n: usize) -> &str {
+    let mut end_index = 0;
+    for (i, (pos, _)) in s.char_indices().enumerate() {
+        if i == n {
+            end_index = pos;
+            break;
+        }
+    }
+    if end_index == 0 && s.chars().count() <= 200 {
+        return s;
+    }
+    &s[..end_index]
+}
+
 fn span_to_task_span(span: SpanData) -> TaskSpan {
     let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
     let span_id: Arc<str> = span.span_context.span_id().to_string().into();
@@ -71,7 +85,7 @@ fn span_to_task_span(span: SpanData) -> TaskSpan {
         .position(|kv| kv.key.as_str() == "input")
         .map_or_else(
             || "".into(),
-            |idx| span.attributes[idx].value.as_str().into(),
+            |idx| first_n_chars(&span.attributes[idx].value.as_str(), 200).into(),
         );
     let truncated_output: Option<Arc<str>> = span.events.iter().find_map(|event| {
         let event_attr_idx = event

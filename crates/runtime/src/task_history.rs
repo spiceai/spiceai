@@ -20,7 +20,7 @@ use crate::dataupdate::DataUpdate;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use arrow::array::{ArrayBuilder, RecordBatch, StringBuilder};
+use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use data_components::arrow::struct_builder::StructBuilder;
 use datafusion::sql::TableReference;
@@ -289,9 +289,11 @@ impl TaskSpan {
                     }
                     "labels" => {
                         let map_builder = downcast_builder::<
-                            arrow::array::MapBuilder<StringBuilder, StringBuilder>,
+                            MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>,
                         >(field_builder)?;
                         let (keys_field, values_field) = map_builder.entries();
+                        let keys_field = downcast_builder::<StringBuilder>(keys_field)?;
+                        let values_field = downcast_builder::<StringBuilder>(values_field)?;
                         for (key, value) in &span.labels {
                             keys_field.append_value(key);
                             values_field.append_value(value);
