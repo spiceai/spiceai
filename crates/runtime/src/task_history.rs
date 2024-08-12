@@ -27,7 +27,6 @@ use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -38,67 +37,24 @@ pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 
-pub enum TaskType {
-    SqlQuery,
-    NsqlQuery,
-    AiCompletion,
-    TextEmbed,
-    VectorSearch,
-}
+// pub enum TaskType {
+//     SqlQuery,
+//     NsqlQuery,
+//     AiCompletion,
+//     TextEmbed,
+//     VectorSearch,
+// }
 
-impl Display for TaskType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TaskType::SqlQuery => write!(f, "sql_query"),
-            TaskType::NsqlQuery => write!(f, "nsql_query"),
-            TaskType::AiCompletion => write!(f, "ai_completion"),
-            TaskType::TextEmbed => write!(f, "text_embed"),
-            TaskType::VectorSearch => write!(f, "vector_search"),
-        }
-    }
-}
-
-// fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapArray, ArrowError> {
-//     let keys_field = Arc::new(Field::new("keys", DataType::Utf8, false));
-//     let values_field = Arc::new(Field::new("values", DataType::Utf8, false));
-
-//     let (keys, values): (Vec<&str>, Vec<&str>) =
-//         labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).unzip();
-
-//     let keys_array = StringArray::from(keys);
-//     let values_array = StringArray::from(values);
-
-//     let entry_struct = StructArray::from(vec![
-//         (
-//             Arc::clone(&keys_field),
-//             Arc::new(keys_array) as Arc<dyn arrow::array::Array>,
-//         ),
-//         (
-//             Arc::clone(&values_field),
-//             Arc::new(values_array) as Arc<dyn arrow::array::Array>,
-//         ),
-//     ]);
-
-//     let entry_offsets = Buffer::from_vec(vec![0, labels.len() as u64]);
-//     let map_data_type = DataType::Map(
-//         Arc::new(Field::new_struct(
-//             "entries",
-//             vec![
-//                 Arc::new(Field::new("keys", DataType::Utf8, false)),
-//                 Arc::new(Field::new("values", DataType::Utf8, false)),
-//             ],
-//             false,
-//         )),
-//         false,
-//     );
-
-//     let map_data = ArrayData::builder(map_data_type)
-//         .len(1)
-//         .add_buffer(entry_offsets)
-//         .add_child_data(entry_struct.to_data())
-//         .build()?;
-
-//     Ok(MapArray::from(map_data))
+// impl Display for TaskType {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         match self {
+//             TaskType::SqlQuery => write!(f, "sql_query"),
+//             TaskType::NsqlQuery => write!(f, "nsql_query"),
+//             TaskType::AiCompletion => write!(f, "ai_completion"),
+//             TaskType::TextEmbed => write!(f, "text_embed"),
+//             TaskType::VectorSearch => write!(f, "vector_search"),
+//         }
+//     }
 // }
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
