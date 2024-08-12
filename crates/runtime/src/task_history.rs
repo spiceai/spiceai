@@ -28,6 +28,8 @@ use tokio::sync::RwLock;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
 
+pub mod otel_exporter;
+
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 
 pub enum TaskType {

@@ -558,6 +558,9 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+        span.in_scope(
+            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
+        );
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
@@ -599,6 +602,9 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
+        span.in_scope(
+            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
+        );
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
