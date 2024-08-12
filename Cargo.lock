@@ -9180,6 +9180,7 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
+ "futures",
  "opentelemetry 0.24.0",
  "opentelemetry-http",
  "opentelemetry-prometheus",
