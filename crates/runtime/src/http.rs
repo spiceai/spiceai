@@ -34,7 +34,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::{
     config,
     datafusion::DataFusion,
-    embeddings::vector_search::{self, compute_primary_keys},
+    embeddings::vector_search::{self, parse_explicit_primary_keys},
     metrics as runtime_metrics,
     model::{EmbeddingModelStore, LLMModelStore},
     tls::TlsConfig,
@@ -73,7 +73,7 @@ where
     let vsearch = Arc::new(vector_search::VectorSearch::new(
         Arc::clone(&df),
         Arc::clone(&embeddings),
-        compute_primary_keys(Arc::clone(&app)).await,
+        parse_explicit_primary_keys(Arc::clone(&app)).await,
     ));
     let routes = routes::routes(
         app,

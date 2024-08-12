@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::sql::TableReference;
 use itertools::Itertools;
 use llms::chat::{Chat, Result as ChatResult};
@@ -40,12 +40,12 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use snafu::ResultExt;
 use tokio::sync::mpsc;
 
 use crate::datafusion::query::Protocol;
-use crate::embeddings::vector_search::VectorSearch;
+use crate::embeddings::vector_search::{parse_explicit_primary_keys, VectorSearch};
 use crate::Runtime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,8 +112,6 @@ pub trait SpiceModelTool: Sync + Send {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-pub struct DocumentSimilarityTool {}
-
 static DOCUMENT_SIMILARITY_PARAMETERS: Lazy<Value> = Lazy::new(|| {
     serde_json::json!({
         "type": "object",
@@ -147,6 +145,71 @@ struct DocumentSimilarityToolArgs {
     from: Vec<String>,
     limit: Option<usize>,
 }
+pub struct DocumentSimilarityTool {}
+impl DocumentSimilarityTool {
+    /// Format the document & primary keys retrieved from a [`VectorSearch::search`] into a format suitable as a tool response.
+    ///
+    /// The format is:
+    /// ```json
+    /// [
+    ///    {
+    ///       "document": "document text",
+    ///       "primary_key": {
+    ///         "column_name": "value1",
+    ///         "column_name2": "value2"
+    ///       }
+    ///   },
+    /// ]
+    fn format_table_response(
+        documents: &Vec<String>,
+        primary_keys: &[RecordBatch],
+    ) -> serde_json::Value {
+        let flatten_formatted_pks = Self::format_primary_keys(primary_keys);
+        Value::Array(
+            flatten_formatted_pks
+                .iter()
+                .zip_longest(documents)
+                .map(|zip| {
+                    let (pk_map_opt, document) = match zip {
+                        itertools::EitherOrBoth::Both(pk_batch, document) => {
+                            (Some(pk_batch), document.to_string())
+                        }
+                        itertools::EitherOrBoth::Left(pk_batch) => (Some(pk_batch), String::new()),
+                        itertools::EitherOrBoth::Right(document) => (None, document.to_string()),
+                    };
+                    let mut z = Map::new();
+                    z.insert("document".to_string(), Value::String(document));
+                    if let Some(pk_map) = pk_map_opt {
+                        z.insert("primary_key".to_string(), Value::Object(pk_map.clone()));
+                    }
+                    Value::Object(z)
+                })
+                .collect_vec(),
+        )
+    }
+
+    fn format_primary_keys(rb: &[RecordBatch]) -> Vec<serde_json::Map<String, Value>> {
+        let mut result = Vec::new();
+        for batch in rb {
+            (0..batch.num_rows()).for_each(|i| {
+                let mut pk_map = serde_json::Map::new();
+                batch.schema().fields().iter().for_each(|field| {
+                    let col_name = field.name().clone();
+                    if let Some(array) = batch.column_by_name(&col_name) {
+                        if let Some(str_array) = array.as_any().downcast_ref::<StringArray>() {
+                            pk_map.insert(col_name, Value::String(str_array.value(i).to_string()));
+                        } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+                            pk_map.insert(col_name, Value::Number(array.value(i).into()));
+                        }
+                    };
+                });
+                result.push(pk_map);
+            });
+        }
+
+        result
+    }
+}
 
 #[async_trait]
 impl SpiceModelTool for DocumentSimilarityTool {
@@ -179,7 +242,11 @@ impl SpiceModelTool for DocumentSimilarityTool {
         let limit = args.limit.unwrap_or(3);
 
         // TODO: implement `explicit_primary_keys` parsing from rt.app
-        let vs = VectorSearch::new(rt.datafusion(), Arc::clone(&rt.embeds), HashMap::default());
+        let vs = VectorSearch::new(
+            rt.datafusion(),
+            Arc::clone(&rt.embeds),
+            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+        );
 
         let result = vs
             .search(
@@ -195,14 +262,11 @@ impl SpiceModelTool for DocumentSimilarityTool {
                 .retrieved_entries
                 .iter()
                 .map(|(dataset, documents)| {
+                    let empty = Vec::new();
+                    let primary_keys = result.retrieved_primary_keys.get(dataset).unwrap_or(&empty);
                     (
                         dataset.to_string(),
-                        Value::Array(
-                            documents
-                                .iter()
-                                .map(|d| Value::String(d.to_string()))
-                                .collect(),
-                        ),
+                        Self::format_table_response(documents, primary_keys),
                     )
                 })
                 .collect(),

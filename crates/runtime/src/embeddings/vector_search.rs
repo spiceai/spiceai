@@ -20,8 +20,10 @@ use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
+use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 
+use itertools::Itertools;
 use tokio::sync::RwLock;
 
 use crate::{
@@ -110,10 +112,19 @@ impl VectorSearch {
         embedding_column: &str,
         n: usize,
     ) -> Result<(Vec<std::string::String>, Vec<arrow::array::RecordBatch>)> {
+        // Need to handle quoting projection columns manually (when needed).
         let projection = if primary_keys.is_empty() {
-            embedding_column.to_string()
+            quote_identifier(embedding_column).to_string()
         } else {
-            [primary_keys.join(", "), embedding_column.to_string()].join(", ")
+            [
+                primary_keys
+                    .iter()
+                    .map(|s| quote_identifier(s))
+                    .collect_vec()
+                    .join(", "),
+                quote_identifier(embedding_column).to_string(),
+            ]
+            .join(", ")
         };
 
         let query = format!(
@@ -429,7 +440,7 @@ fn string_to_boxed_err(s: String) -> Box<dyn std::error::Error + Send + Sync> {
 }
 
 /// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
-pub async fn compute_primary_keys(
+pub async fn parse_explicit_primary_keys(
     app: Arc<RwLock<Option<App>>>,
 ) -> HashMap<TableReference, Vec<String>> {
     app.read().await.as_ref().map_or(HashMap::new(), |app| {
