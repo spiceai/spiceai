@@ -234,15 +234,18 @@ impl SpiceModelTool for ListTablesTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let _span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), arg).entered();
-        if let Some(app) = rt.app.read().await.as_ref() {
-            return Ok(Value::Array(
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), arg);
+        if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
+            // if let Some(app) = rt.app.read().instrument(span.clone()).await {
+            Ok(Value::Array(
                 app.datasets
                     .iter()
                     .map(|d| {
-                        Value::from_str(&TableReference::parse_str(&d.name).to_quoted_string()).boxed()
-                    }).collect::<Result::<Vec<Value>, _>>()?
-            ));
+                        Value::from_str(&TableReference::parse_str(&d.name).to_quoted_string())
+                            .boxed()
+                    })
+                    .collect::<Result<Vec<Value>, _>>()?,
+            ))
         } else {
             Ok(Value::Array(vec![]))
         }
