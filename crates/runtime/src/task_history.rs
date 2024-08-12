@@ -15,14 +15,10 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
-use crate::dataupdate::DataUpdate;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use arrow::array::{
-    Array, ArrayData, BooleanArray, Float64Array, MapArray, RecordBatch, StringArray, StructArray,
-    TimestampNanosecondArray, UInt64Array,
-};
+use arrow::array::{Array, ArrayData, MapArray, StringArray, StructArray};
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;

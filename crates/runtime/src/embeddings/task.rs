@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use crate::datafusion::DataFusion;
 use async_openai::{
     error::OpenAIError,
     types::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
@@ -27,12 +24,11 @@ use tracing::{Instrument, Span};
 
 pub struct TaskEmbed {
     inner: Box<dyn Embed>,
-    df: Arc<DataFusion>,
 }
 
 impl TaskEmbed {
-    pub fn new(inner: Box<dyn Embed>, df: Arc<DataFusion>) -> Self {
-        Self { inner, df }
+    pub fn new(inner: Box<dyn Embed>) -> Self {
+        Self { inner }
     }
 }
 
