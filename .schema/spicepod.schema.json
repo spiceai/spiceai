@@ -72,7 +72,8 @@
           "eviction_policy": null,
           "item_ttl": null
         },
-        "tls": null
+        "tls": null,
+        "tracing": null
       },
       "allOf": [
         {
@@ -724,6 +725,16 @@
               "type": "null"
             }
           ]
+        },
+        "tracing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TracingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -814,6 +825,24 @@
         },
         "key_file": {
           "description": "A filesystem path to a file containing the PEM encoded private key",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TracingConfig": {
+      "type": "object",
+      "required": [
+        "zipkin_enabled"
+      ],
+      "properties": {
+        "zipkin_enabled": {
+          "type": "boolean"
+        },
+        "zipkin_endpoint": {
           "type": [
             "string",
             "null"
