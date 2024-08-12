@@ -71,7 +71,7 @@ fn span_to_task_span(span: SpanData) -> TaskSpan {
         .position(|kv| kv.key.as_str() == "input")
         .map_or_else(
             || "".into(),
-            |idx| &span.attributes[idx].value.as_str().into(),
+            |idx| span.attributes[idx].value.as_str().into(),
         );
     let truncated_output: Option<Arc<str>> = span.events.iter().find_map(|event| {
         let event_attr_idx = event
