@@ -17,7 +17,9 @@ limitations under the License.
 use std::{borrow::Cow, sync::Arc};
 
 use app::spicepod::component::runtime::TracingConfig;
+use futures::future::BoxFuture;
 use opentelemetry_sdk::{
+    export::trace::{ExportResult, SpanData, SpanExporter},
     trace::{Config, TracerProvider},
     Resource,
 };
@@ -38,8 +40,7 @@ pub(crate) fn init_tracing(
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        //.with(zipkin_task_history_tracing(app_name, config)?)
-        .with(datafusion_task_history_tracing(df))
+        .with(datafusion_task_history_tracing(df, app_name, config))
         .with(
             fmt::layer()
                 .with_ansi(true)
@@ -53,13 +54,25 @@ pub(crate) fn init_tracing(
     Ok(())
 }
 
-fn datafusion_task_history_tracing<S>(df: Arc<DataFusion>) -> impl Layer<S>
+fn datafusion_task_history_tracing<S>(
+    df: Arc<DataFusion>,
+    app_name: Option<String>,
+    config: Option<&TracingConfig>,
+) -> impl Layer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
     let trace_config = Config::default().with_resource(Resource::empty());
 
-    let exporter = task_history::otel_exporter::TaskHistoryExporter::new(df);
+    let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
+        task_history::otel_exporter::TaskHistoryExporter::new(df),
+    )];
+
+    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config) {
+        exporters.push(zipkin_exporter);
+    }
+
+    let exporter = OtelExportMultiplexer::new(exporters);
 
     let mut provider_builder =
         TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
@@ -78,13 +91,10 @@ where
     layer
 }
 
-fn zipkin_task_history_tracing<S>(
+fn zipkin_task_history_otel_exporter(
     app_name: Option<String>,
     config: Option<&TracingConfig>,
-) -> Result<Option<impl Layer<S>>, Box<dyn std::error::Error>>
-where
-    S: Subscriber + for<'span> LookupSpan<'span>,
-{
+) -> Result<Option<Box<dyn SpanExporter>>, Box<dyn std::error::Error>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -101,17 +111,62 @@ where
         None => Cow::Borrowed("Spice.ai"),
     };
 
-    let tracer = opentelemetry_zipkin::new_pipeline()
-        .with_service_name(service_name)
-        .with_collector_endpoint(zipkin_endpoint)
-        .with_http_client(reqwest::Client::new())
-        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+    Ok(Some(Box::new(
+        opentelemetry_zipkin::new_pipeline()
+            .with_service_name(service_name)
+            .with_collector_endpoint(zipkin_endpoint)
+            .with_http_client(reqwest::Client::new())
+            .init_exporter()?,
+    )))
+}
 
-    let layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer)
-        .with_filter(filter::filter_fn(|metadata| {
-            metadata.target() == "task_history"
-        }));
+#[derive(Debug)]
+struct OtelExportMultiplexer {
+    exporters: Vec<Box<dyn SpanExporter>>,
+}
 
-    Ok(Some(layer))
+impl OtelExportMultiplexer {
+    pub fn new(exporters: Vec<Box<dyn SpanExporter>>) -> Self {
+        Self { exporters }
+    }
+}
+
+impl SpanExporter for OtelExportMultiplexer {
+    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
+        let mut futures = Vec::new();
+        for exporter in &mut self.exporters {
+            futures.push(exporter.export(batch.clone()));
+        }
+
+        Box::pin(async move {
+            futures::future::join_all(futures).await;
+
+            Ok(())
+        })
+    }
+
+    fn shutdown(&mut self) {
+        for exporter in &mut self.exporters {
+            exporter.shutdown();
+        }
+    }
+
+    fn force_flush(&mut self) -> BoxFuture<'static, ExportResult> {
+        let mut futures = Vec::new();
+        for exporter in &mut self.exporters {
+            futures.push(exporter.force_flush());
+        }
+
+        Box::pin(async move {
+            futures::future::join_all(futures).await;
+
+            Ok(())
+        })
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        for exporter in &mut self.exporters {
+            exporter.set_resource(resource);
+        }
+    }
 }

@@ -12,6 +12,7 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
+futures.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-prometheus.workspace = true
