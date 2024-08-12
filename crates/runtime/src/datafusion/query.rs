@@ -107,6 +107,7 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let span = match &self.tracker.nsql {
             Some(nsql) => tracing::span!(tracing::Level::INFO, "nsql_query", input = %nsql),
