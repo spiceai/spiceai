@@ -34,7 +34,6 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
@@ -151,15 +150,15 @@ fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapAr
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
     pub(crate) df: Arc<crate::datafusion::DataFusion>,
-    pub(crate) trace_id: String,
+    pub(crate) trace_id: Arc<str>,
 
     /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
-    pub(crate) span_id: String,
+    pub(crate) span_id: Arc<str>,
 
     /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
-    pub(crate) parent_span_id: Option<String>,
+    pub(crate) parent_span_id: Option<Arc<str>>,
 
-    pub(crate) task: String,
+    pub(crate) task: Arc<str>,
     pub(crate) input: Arc<str>,
     pub(crate) truncated_output: Option<Arc<str>>,
 
@@ -175,37 +174,42 @@ pub(crate) struct TaskSpan {
 impl TaskSpan {
     pub fn new(
         df: Arc<crate::datafusion::DataFusion>,
-        context_id: Uuid,
-        task_type: TaskType,
-        input_text: Arc<str>,
+        trace_id: Arc<str>,
+        task: Arc<str>,
+        input: Arc<str>,
         id: Option<Uuid>,
+        start_time: SystemTime,
+        end_time: SystemTime,
     ) -> Self {
+        let elapsed_duration_ms = end_time
+            .duration_since(start_time)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+
         Self {
             df,
             id: id.unwrap_or_else(Uuid::new_v4),
             context_id,
             parent_id: None,
-            task_type,
-            input_text,
-            start_time: SystemTime::now(),
-            end_time: None,
-            execution_duration_ms: None,
-            outputs_produced: 0,
-            cache_hit: None,
+            task,
+            input,
+            start_time,
+            end_time,
+            execution_duration_ms,
             error_message: None,
             labels: HashMap::default(),
-            timer: Instant::now(),
-            truncated_output_text: None,
+            truncated_output: None,
         }
     }
 
-    pub fn truncated_output_text(mut self, truncated_output_text: Arc<str>) -> Self {
-        self.truncated_output_text = Some(truncated_output_text);
+    pub fn truncated_output(mut self, truncated_output: Arc<str>) -> Self {
+        self.truncated_output = Some(truncated_output);
         self
     }
 
     pub fn outputs_produced(mut self, outputs_produced: u64) -> Self {
-        self.outputs_produced = outputs_produced;
+        self.labels
+            .insert("outputs_produced".to_string(), outputs_produced.to_string());
         self
     }
 
@@ -253,12 +257,12 @@ impl TaskSpan {
 
     fn table_schema() -> Schema {
         Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("context_id", DataType::Utf8, false),
-            Field::new("parent_id", DataType::Utf8, true),
-            Field::new("task_type", DataType::Utf8, false),
-            Field::new("input_text", DataType::Utf8, false),
-            Field::new("truncated_output_text", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("span_id", DataType::Utf8, false),
+            Field::new("parent_span_id", DataType::Utf8, true),
+            Field::new("task", DataType::Utf8, false),
+            Field::new("input", DataType::Utf8, false),
+            Field::new("truncated_output", DataType::Utf8, true),
             Field::new(
                 "start_time",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -270,8 +274,6 @@ impl TaskSpan {
                 false,
             ),
             Field::new("execution_duration_ms", DataType::Float64, false),
-            Field::new("outputs_produced", DataType::UInt64, false),
-            Field::new("cache_hit", DataType::Boolean, false),
             Field::new("error_message", DataType::Utf8, true),
             Field::new(
                 "labels",
@@ -310,12 +312,6 @@ impl TaskSpan {
     }
 
     pub async fn write(&self) -> Result<(), Error> {
-        if self.end_time.is_none() {
-            return Err(Error::MissingColumnsInRow {
-                columns: "end_time".to_string(),
-            });
-        }
-
         let data = self
             .to_record_batch()
             .boxed()

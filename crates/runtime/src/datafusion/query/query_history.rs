@@ -165,7 +165,7 @@ impl QueryTracker {
 
         // Whilst both the query history and task history tables exist, don't need a `TaskTracker` for recording queries.
         Into::<TaskSpan>::into(self)
-            .truncated_output_text(truncated_output)
+            .truncated_output(truncated_output)
             .write()
             .await
             .boxed()

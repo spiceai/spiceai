@@ -16,14 +16,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{datafusion::DataFusion, task_history};
+use crate::datafusion::DataFusion;
 use async_openai::{
     error::OpenAIError,
     types::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
 };
 use async_trait::async_trait;
 use llms::embeddings::{Embed, Result as EmbedResult};
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 
 pub struct TaskEmbed {
     inner: Box<dyn Embed>,
@@ -39,22 +39,15 @@ impl TaskEmbed {
 #[async_trait]
 impl Embed for TaskEmbed {
     async fn embed<'b>(&'b mut self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
-        let task_span = task_history::TaskSpan::new(
-            Arc::clone(&self.df),
-            uuid::Uuid::new_v4(),
-            task_history::TaskType::TextEmbed,
-            Arc::from(serde_json::to_string(&input).unwrap_or_default()),
-            None,
-        );
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input_text = %serde_json::to_string(&input).unwrap_or_default());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&input).unwrap_or_default());
 
-        match self.inner.embed(input).instrument(span).await {
+        match self.inner.embed(input).instrument(span.clone()).await {
             Ok(response) => {
-                task_span.outputs_produced(response.len() as u64).finish();
+                tracing::info!(name: "labels", target: "task_history", parent: &span, outputs_produced = response.len());
                 Ok(response)
             }
             Err(e) => {
-                task_span.with_error_message(e.to_string().clone()).finish();
+                tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
             }
         }
@@ -73,28 +66,38 @@ impl Embed for TaskEmbed {
         &'b mut self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
-        let task_span = task_history::TaskSpan::new(
-            Arc::clone(&self.df),
-            uuid::Uuid::new_v4(),
-            task_history::TaskType::TextEmbed,
-            Arc::from(serde_json::to_string(&req.input).unwrap_or_default()),
-            None,
-        )
-        .label("model".to_string(), req.model.clone());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&req.input).unwrap_or_default());
 
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input_text = %serde_json::to_string(&req.input).unwrap_or_default());
-
-        match self.inner.embed_request(req).instrument(span).await {
+        labels_from_request(&req, &span);
+        match self.inner.embed_request(req).instrument(span.clone()).await {
             Ok(response) => {
-                task_span
-                    .outputs_produced(response.data.len() as u64)
-                    .finish();
+                tracing::info!(name: "labels", target: "task_history", parent: &span, outputs_produced = response.data.len());
                 Ok(response)
             }
             Err(e) => {
-                task_span.with_error_message(e.to_string().clone()).finish();
+                tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
             }
         }
+    }
+}
+
+fn labels_from_request(req: &CreateEmbeddingRequest, span: &Span) {
+    let _guard = span.enter();
+    tracing::info!(name: "labels", target: "task_history", model = req.model);
+
+    if let Some(encoding_format) = &req.encoding_format {
+        let encoding_format_str = match encoding_format {
+            async_openai::types::EncodingFormat::Base64 => "base64",
+            async_openai::types::EncodingFormat::Float => "float",
+        };
+        tracing::info!(name: "labels", target: "task_history", encoding_format = %encoding_format_str);
+    }
+    if let Some(user) = &req.user {
+        tracing::info!(name: "labels", target: "task_history", user = %user);
+    }
+
+    if let Some(dims) = req.dimensions {
+        tracing::info!(name: "labels", target: "task_history", dimensions = %dims);
     }
 }

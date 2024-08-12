@@ -23,7 +23,7 @@ use async_openai::types::EmbeddingInput;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use itertools::Itertools;
 use tokio::sync::RwLock;
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 
 use crate::{
     accelerated_table::AcceleratedTable, datafusion::DataFusion, model::EmbeddingModelStore,
@@ -192,7 +192,18 @@ impl VectorSearch {
         tables: Vec<TableReference>,
         limit: RetrievalLimit,
     ) -> Result<VectorSearchResult> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", query, tables = tables.iter().join(","), limit = %limit);
+        let span = match Span::current() {
+            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "vector_search") => {
+                span
+            }
+            _ => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = query)
+            }
+        };
+        span.in_scope(|| {
+            tracing::info!(name: "labels", target: "task_history", tables = tables.iter().join(","), limit = %limit);
+        });
+
         let n = match limit {
             RetrievalLimit::TopN(n) => n,
             RetrievalLimit::Threshold(_) => unimplemented!(),
