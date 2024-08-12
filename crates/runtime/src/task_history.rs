@@ -18,16 +18,12 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use arrow::array::{Array, ArrayData, MapArray, StringArray, StructArray};
-use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::error::ArrowError;
 use datafusion::sql::TableReference;
 use snafu::{ResultExt, Snafu};
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
@@ -54,88 +50,88 @@ impl Display for TaskType {
     }
 }
 
-fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapArray, ArrowError> {
-    let keys_field = Arc::new(Field::new("keys", DataType::Utf8, false));
-    let values_field = Arc::new(Field::new("values", DataType::Utf8, false));
+// fn convert_hashmap_to_maparray(labels: &HashMap<String, String>) -> Result<MapArray, ArrowError> {
+//     let keys_field = Arc::new(Field::new("keys", DataType::Utf8, false));
+//     let values_field = Arc::new(Field::new("values", DataType::Utf8, false));
 
-    let (keys, values): (Vec<&str>, Vec<&str>) =
-        labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).unzip();
+//     let (keys, values): (Vec<&str>, Vec<&str>) =
+//         labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).unzip();
 
-    let keys_array = StringArray::from(keys);
-    let values_array = StringArray::from(values);
+//     let keys_array = StringArray::from(keys);
+//     let values_array = StringArray::from(values);
 
-    let entry_struct = StructArray::from(vec![
-        (
-            Arc::clone(&keys_field),
-            Arc::new(keys_array) as Arc<dyn arrow::array::Array>,
-        ),
-        (
-            Arc::clone(&values_field),
-            Arc::new(values_array) as Arc<dyn arrow::array::Array>,
-        ),
-    ]);
+//     let entry_struct = StructArray::from(vec![
+//         (
+//             Arc::clone(&keys_field),
+//             Arc::new(keys_array) as Arc<dyn arrow::array::Array>,
+//         ),
+//         (
+//             Arc::clone(&values_field),
+//             Arc::new(values_array) as Arc<dyn arrow::array::Array>,
+//         ),
+//     ]);
 
-    let entry_offsets = Buffer::from_vec(vec![0, labels.len() as u64]);
-    let map_data_type = DataType::Map(
-        Arc::new(Field::new_struct(
-            "entries",
-            vec![
-                Arc::new(Field::new("keys", DataType::Utf8, false)),
-                Arc::new(Field::new("values", DataType::Utf8, false)),
-            ],
-            false,
-        )),
-        false,
-    );
+//     let entry_offsets = Buffer::from_vec(vec![0, labels.len() as u64]);
+//     let map_data_type = DataType::Map(
+//         Arc::new(Field::new_struct(
+//             "entries",
+//             vec![
+//                 Arc::new(Field::new("keys", DataType::Utf8, false)),
+//                 Arc::new(Field::new("values", DataType::Utf8, false)),
+//             ],
+//             false,
+//         )),
+//         false,
+//     );
 
-    let map_data = ArrayData::builder(map_data_type)
-        .len(1)
-        .add_buffer(entry_offsets)
-        .add_child_data(entry_struct.to_data())
-        .build()?;
+//     let map_data = ArrayData::builder(map_data_type)
+//         .len(1)
+//         .add_buffer(entry_offsets)
+//         .add_child_data(entry_struct.to_data())
+//         .build()?;
 
-    Ok(MapArray::from(map_data))
-}
+//     Ok(MapArray::from(map_data))
+// }
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
-    pub(crate) df: Arc<crate::datafusion::DataFusion>,
-    pub(crate) trace_id: Arc<str>,
+    // pub(crate) df: Arc<crate::datafusion::DataFusion>,
+    // pub(crate) trace_id: Arc<str>,
 
-    /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
-    pub(crate) span_id: Arc<str>,
+    // /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
+    // pub(crate) span_id: Arc<str>,
 
-    /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
-    pub(crate) parent_span_id: Option<Arc<str>>,
+    // /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
+    // pub(crate) parent_span_id: Option<Arc<str>>,
 
-    pub(crate) task: Arc<str>,
-    pub(crate) input: Arc<str>,
-    pub(crate) truncated_output: Option<Arc<str>>,
+    // pub(crate) task: Arc<str>,
+    // pub(crate) input: Arc<str>,
+    // pub(crate) truncated_output: Option<Arc<str>>,
 
-    pub(crate) start_time: SystemTime,
-    pub(crate) end_time: SystemTime,
-    pub(crate) execution_duration_ms: f64,
-    pub(crate) error_message: Option<String>,
-    pub(crate) labels: HashMap<String, String>,
+    // pub(crate) start_time: SystemTime,
+    // pub(crate) end_time: SystemTime,
+    // pub(crate) execution_duration_ms: f64,
+    // pub(crate) error_message: Option<String>,
+    // pub(crate) labels: HashMap<String, String>,
     // For top-level HTTP tasks, have a label:
     // - "http_status" (200, 400)
 }
 
 impl TaskSpan {
-    pub fn with_error_message(mut self, error_message: String) -> Self {
-        self.error_message = Some(error_message);
-        self
-    }
+    // pub fn with_error_message(mut self, error_message: String) -> Self {
+    //     self.error_message = Some(error_message);
+    //     self
+    // }
 
-    pub fn label(mut self, key: String, value: String) -> Self {
-        self.labels.insert(key, value);
-        self
-    }
+    // pub fn label(mut self, key: String, value: String) -> Self {
+    //     self.labels.insert(key, value);
+    //     self
+    // }
 
-    pub fn labels<I: IntoIterator<Item = (String, String)>>(mut self, labels: I) -> Self {
-        self.labels.extend(labels);
-        self
-    }
+    // pub fn labels<I: IntoIterator<Item = (String, String)>>(mut self, labels: I) -> Self {
+    //     self.labels.extend(labels);
+    //     self
+    // }
 
     pub async fn instantiate_table() -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());

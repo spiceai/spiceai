@@ -19,6 +19,7 @@ use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{path::Path, pin::Pin};
+use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
@@ -143,7 +144,9 @@ pub trait Chat: Sync + Send {
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
+        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "health", input = "health");
         self.run("health".to_string())
+            .instrument(span)
             .await
             .boxed()
             .context(HealthCheckSnafu)?;

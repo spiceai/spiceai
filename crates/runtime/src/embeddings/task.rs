@@ -27,6 +27,7 @@ pub struct TaskEmbed {
 }
 
 impl TaskEmbed {
+    #[must_use]
     pub fn new(inner: Box<dyn Embed>) -> Self {
         Self { inner }
     }

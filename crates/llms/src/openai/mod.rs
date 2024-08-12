@@ -89,10 +89,7 @@ impl Openai {
 #[async_trait]
 impl Chat for Openai {
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "openai::run", input = %prompt);
-        span.in_scope(
-            || tracing::debug!(name: "labels", target: "task_history", model = %self.model),
-        );
+        let span = tracing::Span::current();
 
         async move {
             let req = CreateChatCompletionRequestArgs::default()
@@ -167,14 +164,7 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = match Span::current() {
-            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "ai_completion") => {
-                span
-            }
-            _ => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default())
-            }
-        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
         span.in_scope(
             || tracing::info!(name: "labels", target: "task_history", model = %self.model),
         );
@@ -197,14 +187,7 @@ impl Chat for Openai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = match Span::current() {
-            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "ai_completion") => {
-                span
-            }
-            _ => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default())
-            }
-        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
         span.in_scope(
             || tracing::info!(name: "labels", target: "task_history", model = %self.model),
         );
