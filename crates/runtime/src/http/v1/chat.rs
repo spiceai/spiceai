@@ -37,7 +37,7 @@ pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
-    let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "POST /v1/chat", input = %serde_json::to_string(&req).unwrap_or_default(), model = %req.model);
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
 
     let span_clone = span.clone();
     async move {
@@ -50,9 +50,7 @@ pub(crate) async fn post(
                             create_sse_response(strm, time::Duration::from_secs(30), span_clone)
                         }
                         Err(e) => {
-                            // task_history::TODO
-                            //span.with_error_message(e.to_string()).finish();
-                            //tracing::error!(name: "error", target: "task_history", parent: span_clone, "Error from v1/chat: {e}");
+                            tracing::error!(target: "task_history", "{e}");
                             tracing::debug!("Error from v1/chat: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
@@ -60,19 +58,17 @@ pub(crate) async fn post(
                 } else {
                     match model.write().await.chat_request(req).await {
                         Ok(response) => {
-                            // task_history::TODO
-                            // let preview = response
-                            //     .choices
-                            //     .first()
-                            //     .map(|s| serde_json::to_string(s).unwrap_or_default())
-                            //     .unwrap_or_default();
+                            let preview = response
+                                .choices
+                                .first()
+                                .map(|s| serde_json::to_string(s).unwrap_or_default())
+                                .unwrap_or_default();
 
-                            //span.truncated_output_text(Arc::from(preview)).finish();
+                            tracing::info!(name: "labels", target: "task_history", truncated_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
-                            // task_history::TODO
-                            //span.with_error_message(e.to_string()).finish();
+                            tracing::error!(target: "task_history", "{e}");
                             tracing::debug!("Error from v1/chat: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }

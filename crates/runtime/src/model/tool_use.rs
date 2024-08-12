@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::ResultExt;
 use tokio::sync::mpsc;
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 
 use crate::datafusion::query::Protocol;
 use crate::embeddings::vector_search::VectorSearch;
@@ -557,13 +557,14 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
-            return self.inner_chat.chat_stream(req).await;
+            return self.inner_chat.chat_stream(req).instrument(span).await;
         };
 
         // Append spiced runtime tools to the request.
@@ -574,8 +575,13 @@ impl Chat for ToolUsingChat {
             inner_req.tools = Some(runtime_tools);
         };
 
-        let s = self.inner_chat.chat_stream(inner_req).await?;
+        let s = self
+            .inner_chat
+            .chat_stream(inner_req)
+            .instrument(span.clone())
+            .await?;
         Ok(make_a_stream(
+            span,
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
@@ -592,6 +598,7 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
@@ -599,7 +606,7 @@ impl Chat for ToolUsingChat {
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_chat.chat_request(req).await;
+            return self.inner_chat.chat_request(req).instrument(span).await;
         };
 
         // Append spiced runtime tools to the request.
@@ -610,7 +617,11 @@ impl Chat for ToolUsingChat {
             inner_req.tools = Some(runtime_tools);
         };
 
-        let resp = self.inner_chat.chat_request(inner_req).await?;
+        let resp = self
+            .inner_chat
+            .chat_request(inner_req)
+            .instrument(span.clone())
+            .await?;
 
         let tools_used = resp
             .choices
@@ -619,6 +630,7 @@ impl Chat for ToolUsingChat {
 
         match self
             .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
+            .instrument(span.clone())
             .await?
         {
             // New messages means we have run spice tools locally, ready to recall model.
@@ -627,7 +639,7 @@ impl Chat for ToolUsingChat {
                     .model(req.model)
                     .messages(messages)
                     .build()?;
-                self.chat_request(new_req).await
+                self.chat_request(new_req).instrument(span.clone()).await
             }
             None => Ok(resp),
         }
@@ -648,14 +660,13 @@ impl Stream for CustomStream {
 
 #[allow(clippy::too_many_lines)]
 fn make_a_stream(
+    span: Span,
     model: ToolUsingChat,
     req: CreateChatCompletionRequest,
     mut s: ChatCompletionResponseStream,
 ) -> ChatCompletionResponseStream {
     let (sender, receiver) = mpsc::channel(100);
     let sender_clone = sender.clone();
-
-    let current_span = tracing::Span::current();
 
     tokio::spawn(
         async move {
@@ -806,7 +817,7 @@ fn make_a_stream(
                 }
             }
         }
-        .instrument(current_span),
+        .instrument(span),
     );
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
 }
