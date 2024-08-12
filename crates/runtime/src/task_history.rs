@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
-use crate::datafusion::query::QueryTracker;
 use crate::dataupdate::DataUpdate;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
@@ -56,50 +55,6 @@ impl Display for TaskType {
             TaskType::AiCompletion => write!(f, "ai_completion"),
             TaskType::TextEmbed => write!(f, "text_embed"),
             TaskType::VectorSearch => write!(f, "vector_search"),
-        }
-    }
-}
-
-impl From<&QueryTracker> for TaskSpan {
-    fn from(qt: &QueryTracker) -> Self {
-        let mut labels = HashMap::new();
-        if let Some(schema) = &qt.schema {
-            labels.insert("schema".to_string(), format!("{schema:?}"));
-        }
-        if let Some(error_code) = &qt.error_code {
-            labels.insert("error_code".to_string(), format!("{error_code}"));
-        }
-        labels.insert("protocol".to_string(), format!("{:?}", qt.protocol));
-        labels.insert("datasets".to_string(), format!("{:?}", qt.datasets));
-
-        let task_type = if qt.nsql.is_some() {
-            TaskType::NsqlQuery
-        } else {
-            TaskType::SqlQuery
-        };
-
-        let input_text = if let Some(nsql) = &qt.nsql {
-            Arc::clone(nsql)
-        } else {
-            Arc::<str>::clone(&qt.sql)
-        };
-
-        TaskSpan {
-            df: Arc::clone(&qt.df),
-            id: qt.query_id,
-            context_id: qt.query_id, // assuming context_id and id are the same; adjust as needed
-            parent_id: None,
-            task_type,
-            input_text,
-            start_time: qt.start_time,
-            end_time: qt.end_time,
-            execution_duration_ms: qt.execution_time.map(|t| f64::from(1000.0 * t)), // convert s to ms.
-            outputs_produced: qt.rows_produced,
-            cache_hit: qt.results_cache_hit,
-            error_message: qt.error_message.clone(),
-            labels,
-            timer: qt.timer,
-            truncated_output_text: None,
         }
     }
 }

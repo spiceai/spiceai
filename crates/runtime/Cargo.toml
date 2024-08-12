@@ -98,6 +98,7 @@ tokio.workspace = true
 tonic-health.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+tracing-futures.workspace = true
 tract-core = "0.21.0"
 url = "2.5.0"
 util = { path = "../util" }

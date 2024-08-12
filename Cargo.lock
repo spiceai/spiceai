@@ -8275,6 +8275,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-futures",
  "tracing-subscriber",
  "tract-core",
  "url",
