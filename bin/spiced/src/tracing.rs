@@ -33,7 +33,13 @@ pub(crate) fn init_tracing(
     let subscriber = tracing_subscriber::registry()
         .with(filter)
         .with(zipkin_task_history_tracing(app_name, config)?)
-        .with(fmt::layer().with_ansi(true));
+        .with(
+            fmt::layer()
+                .with_ansi(true)
+                .with_filter(filter::filter_fn(|metadata| {
+                    metadata.target() != "task_history"
+                })),
+        );
 
     tracing::subscriber::set_global_default(subscriber)?;
 
