@@ -19,10 +19,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{
-    component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA,
-    task_history::TaskSpan,
-};
+use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::{
     array::{
@@ -163,13 +160,9 @@ impl QueryTracker {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        // Whilst both the query history and task history tables exist, don't need a `TaskTracker` for recording queries.
-        Into::<TaskSpan>::into(self)
-            .truncated_output_text(truncated_output)
-            .write()
-            .await
-            .boxed()
-            .context(UnableToWriteToTaskTableSnafu)
+        trace_query(self, &truncated_output);
+
+        Ok(())
     }
 
     fn to_record_batch(&self) -> Result<RecordBatch, Error> {
@@ -234,4 +227,14 @@ impl QueryTracker {
             })
         }
     }
+}
+
+fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
+    if let Some(schema) = &query_tracker.schema {
+        tracing::info!(name: "labels", target: "task_history", schema = ?schema);
+    }
+    if let Some(error_code) = &query_tracker.error_code {
+        tracing::info!(name: "labels", target: "task_history", error_code = %error_code);
+    }
+    tracing::info!(name: "labels", target: "task_history", protocol = ?query_tracker.protocol, datasets = ?query_tracker.datasets, truncated_output = %truncated_output);
 }

@@ -28,7 +28,7 @@ use crate::Args;
 
 pub(crate) async fn load_tls_config(
     args: &Args,
-    spicepod_tls_config: Option<SpicepodTlsConfig>,
+    spicepod_tls_config: Option<&SpicepodTlsConfig>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> std::result::Result<Option<Arc<TlsConfig>>, Box<dyn std::error::Error>> {
     let tls_enabled = args.tls_enabled || spicepod_tls_config.as_ref().is_some_and(|c| c.enabled);
@@ -40,7 +40,7 @@ pub(crate) async fn load_tls_config(
 
     let app_cert_bytes = load_spicepod_tls_param(
         &secrets,
-        &spicepod_tls_config,
+        spicepod_tls_config,
         |tls| &tls.certificate_file,
         |tls| &tls.certificate,
         "certificate",
@@ -50,7 +50,7 @@ pub(crate) async fn load_tls_config(
 
     let app_key_bytes = load_spicepod_tls_param(
         &secrets,
-        &spicepod_tls_config,
+        spicepod_tls_config,
         |tls| &tls.key_file,
         |tls| &tls.key,
         "key",
@@ -82,7 +82,7 @@ pub(crate) async fn load_tls_config(
 
 async fn load_spicepod_tls_param(
     secrets: &RwLockReadGuard<'_, Secrets>,
-    spicepod_tls_config: &Option<SpicepodTlsConfig>,
+    spicepod_tls_config: Option<&SpicepodTlsConfig>,
     file_field: impl Fn(&SpicepodTlsConfig) -> &Option<String>,
     secret_field: impl Fn(&SpicepodTlsConfig) -> &Option<String>,
     secret_name: &str,

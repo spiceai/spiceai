@@ -19,18 +19,12 @@ use opentelemetry::global;
 use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
-use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn main() {
     let args = spiced::Args::parse();
-
-    if let Err(err) = init_tracing() {
-        eprintln!("Unable to initialize tracing: {err}");
-        std::process::exit(1);
-    }
 
     if args.version {
         if cfg!(feature = "release") {
@@ -55,26 +49,26 @@ fn main() {
     let tokio_runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            tracing::error!("Unable to start Tokio runtime: {err}");
+            eprintln!("Unable to start Tokio runtime: {err}");
             std::process::exit(1);
         }
     };
 
     if args.repl {
         if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
-            tracing::error!("SQL REPL Error: {e}");
+            eprintln!("SQL REPL Error: {e}");
         };
         return;
     }
-
-    tracing::trace!("Starting Spice Runtime!");
 
     // Install the default AWS LC RS crypto provider for rusttls
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        tracing::error!("Spice Runtime error: {err}");
+        eprintln!("Spice Runtime error: {err}");
     }
+
+    global::shutdown_tracer_provider();
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -84,22 +78,6 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
     };
 
     spiced::run(args, prometheus_registry).await?;
-    Ok(())
-}
-
-fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
-        EnvFilter::new(env_log)
-    } else {
-        EnvFilter::new("spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO")
-    };
-
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     Ok(())
 }
 
