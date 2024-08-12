@@ -33,7 +33,6 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
 
@@ -127,47 +126,6 @@ pub(crate) struct TaskSpan {
 }
 
 impl TaskSpan {
-    pub fn new(
-        df: Arc<crate::datafusion::DataFusion>,
-        trace_id: Arc<str>,
-        task: Arc<str>,
-        input: Arc<str>,
-        id: Option<Uuid>,
-        start_time: SystemTime,
-        end_time: SystemTime,
-    ) -> Self {
-        let elapsed_duration_ms = end_time
-            .duration_since(start_time)
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .unwrap_or(0.0);
-
-        Self {
-            df,
-            id: id.unwrap_or_else(Uuid::new_v4),
-            context_id,
-            parent_id: None,
-            task,
-            input,
-            start_time,
-            end_time,
-            execution_duration_ms,
-            error_message: None,
-            labels: HashMap::default(),
-            truncated_output: None,
-        }
-    }
-
-    pub fn truncated_output(mut self, truncated_output: Arc<str>) -> Self {
-        self.truncated_output = Some(truncated_output);
-        self
-    }
-
-    pub fn outputs_produced(mut self, outputs_produced: u64) -> Self {
-        self.labels
-            .insert("outputs_produced".to_string(), outputs_produced.to_string());
-        self
-    }
-
     pub fn with_error_message(mut self, error_message: String) -> Self {
         self.error_message = Some(error_message);
         self
@@ -248,97 +206,97 @@ impl TaskSpan {
         ])
     }
 
-    pub fn finish(mut self) {
-        if self.end_time.is_none() {
-            self.end_time = Some(SystemTime::now());
-        }
+    // pub fn finish(mut self) {
+    //     if self.end_time.is_none() {
+    //         self.end_time = Some(SystemTime::now());
+    //     }
 
-        let duration = self.timer.elapsed();
+    //     let duration = self.timer.elapsed();
 
-        if self.execution_duration_ms.is_none() {
-            self.execution_duration_ms = Some(1000.0 * duration.as_secs_f64());
-        }
+    //     if self.execution_duration_ms.is_none() {
+    //         self.execution_duration_ms = Some(1000.0 * duration.as_secs_f64());
+    //     }
 
-        tokio::task::spawn(async move {
-            if let Err(err) = self.write().await {
-                tracing::error!("Error writing task history: {err}");
-            }
-        });
-    }
+    //     tokio::task::spawn(async move {
+    //         if let Err(err) = self.write().await {
+    //             tracing::error!("Error writing task history: {err}");
+    //         }
+    //     });
+    // }
 
-    pub async fn write(&self) -> Result<(), Error> {
-        let data = self
-            .to_record_batch()
-            .boxed()
-            .context(UnableToWriteToTableSnafu)?;
+    // pub async fn write(&self) -> Result<(), Error> {
+    //     let data = self
+    //         .to_record_batch()
+    //         .boxed()
+    //         .context(UnableToWriteToTableSnafu)?;
 
-        let data_update = DataUpdate {
-            schema: Arc::new(Self::table_schema()),
-            data: vec![data],
-            update_type: crate::dataupdate::UpdateType::Append,
-        };
+    //     let data_update = DataUpdate {
+    //         schema: Arc::new(Self::table_schema()),
+    //         data: vec![data],
+    //         update_type: crate::dataupdate::UpdateType::Append,
+    //     };
 
-        self.df
-            .write_data(
-                TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
-                data_update,
-            )
-            .await
-            .boxed()
-            .context(UnableToWriteToTableSnafu)?;
+    //     self.df
+    //         .write_data(
+    //             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+    //             data_update,
+    //         )
+    //         .await
+    //         .boxed()
+    //         .context(UnableToWriteToTableSnafu)?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    fn to_record_batch(&self) -> Result<RecordBatch, Error> {
-        let end_time = self
-            .end_time
-            .and_then(|s| {
-                s.duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|x| i64::try_from(x.as_nanos()))
-                    .ok()
-            })
-            .transpose()
-            .boxed()
-            .context(UnableToCreateRowSnafu)?;
+    // fn to_record_batch(&self) -> Result<RecordBatch, Error> {
+    //     let end_time = self
+    //         .end_time
+    //         .and_then(|s| {
+    //             s.duration_since(SystemTime::UNIX_EPOCH)
+    //                 .map(|x| i64::try_from(x.as_nanos()))
+    //                 .ok()
+    //         })
+    //         .transpose()
+    //         .boxed()
+    //         .context(UnableToCreateRowSnafu)?;
 
-        let start_time = self
-            .start_time
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|duration| i64::try_from(duration.as_nanos()).ok())
-            .boxed()
-            .context(UnableToCreateRowSnafu)?;
+    //     let start_time = self
+    //         .start_time
+    //         .duration_since(SystemTime::UNIX_EPOCH)
+    //         .map(|duration| i64::try_from(duration.as_nanos()).ok())
+    //         .boxed()
+    //         .context(UnableToCreateRowSnafu)?;
 
-        let labels = convert_hashmap_to_maparray(&self.labels)
-            .boxed()
-            .context(UnableToCreateRowSnafu)?;
+    //     let labels = convert_hashmap_to_maparray(&self.labels)
+    //         .boxed()
+    //         .context(UnableToCreateRowSnafu)?;
 
-        RecordBatch::try_new(
-            Arc::new(Self::table_schema()),
-            vec![
-                Arc::new(StringArray::from(vec![self.id.to_string()])),
-                Arc::new(StringArray::from(vec![self.context_id.to_string()])),
-                Arc::new(StringArray::from(vec![self
-                    .parent_id
-                    .map(|s| s.to_string())])),
-                Arc::new(StringArray::from(vec![self.task_type.to_string()])),
-                Arc::new(StringArray::from(vec![self.input_text.to_string()])),
-                Arc::new(StringArray::from(vec![self
-                    .truncated_output_text
-                    .clone()
-                    .map(|s| s.to_string())])),
-                Arc::new(TimestampNanosecondArray::from(vec![start_time])),
-                Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-                Arc::new(Float64Array::from(vec![self.execution_duration_ms])),
-                Arc::new(UInt64Array::from(vec![self.outputs_produced])),
-                Arc::new(BooleanArray::from(vec![self.cache_hit.unwrap_or(false)])),
-                Arc::new(StringArray::from(vec![self.error_message.clone()])),
-                Arc::new(labels),
-            ],
-        )
-        .boxed()
-        .context(UnableToCreateRowSnafu)
-    }
+    //     RecordBatch::try_new(
+    //         Arc::new(Self::table_schema()),
+    //         vec![
+    //             Arc::new(StringArray::from(vec![self.id.to_string()])),
+    //             Arc::new(StringArray::from(vec![self.context_id.to_string()])),
+    //             Arc::new(StringArray::from(vec![self
+    //                 .parent_id
+    //                 .map(|s| s.to_string())])),
+    //             Arc::new(StringArray::from(vec![self.task_type.to_string()])),
+    //             Arc::new(StringArray::from(vec![self.input_text.to_string()])),
+    //             Arc::new(StringArray::from(vec![self
+    //                 .truncated_output_text
+    //                 .clone()
+    //                 .map(|s| s.to_string())])),
+    //             Arc::new(TimestampNanosecondArray::from(vec![start_time])),
+    //             Arc::new(TimestampNanosecondArray::from(vec![end_time])),
+    //             Arc::new(Float64Array::from(vec![self.execution_duration_ms])),
+    //             Arc::new(UInt64Array::from(vec![self.outputs_produced])),
+    //             Arc::new(BooleanArray::from(vec![self.cache_hit.unwrap_or(false)])),
+    //             Arc::new(StringArray::from(vec![self.error_message.clone()])),
+    //             Arc::new(labels),
+    //         ],
+    //     )
+    //     .boxed()
+    //     .context(UnableToCreateRowSnafu)
+    // }
 }
 
 #[derive(Debug, Snafu)]
