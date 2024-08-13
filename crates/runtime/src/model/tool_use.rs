@@ -350,6 +350,7 @@ impl SpiceModelTool for ListDatasetsTool {
                     json!({
                         "name": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
                         "description": d.description,
+                        "metadata": d.metadata,
                     })
                 })
                 .collect_vec(),
