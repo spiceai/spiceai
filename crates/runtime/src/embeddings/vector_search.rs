@@ -85,6 +85,7 @@ impl Display for RetrievalLimit {
 
 pub type ModelKey = String;
 
+#[derive(Debug)]
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
     pub retrieved_primary_keys: HashMap<TableReference, Vec<RecordBatch>>,
