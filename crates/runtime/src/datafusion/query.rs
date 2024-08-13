@@ -43,6 +43,8 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
+use super::SPICE_RUNTIME_SCHEMA;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -111,10 +113,10 @@ impl Query {
     pub async fn run(self) -> Result<QueryResult> {
         let span = match &self.tracker.nsql {
             Some(nsql) => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql)
+                tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
             }
             None => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql)
+                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
             }
         };
         let session = self.df.ctx.state();
@@ -196,7 +198,15 @@ impl Query {
             }
         }
 
-        tracker = tracker.datasets(Arc::new(get_logical_plan_input_tables(&plan)));
+        let input_tables = get_logical_plan_input_tables(&plan);
+        if input_tables
+            .iter()
+            .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+        {
+            span.record("runtime_query", true);
+        }
+
+        tracker = tracker.datasets(Arc::new(input_tables));
 
         let df = match ctx
             .df

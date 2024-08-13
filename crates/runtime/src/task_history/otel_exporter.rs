@@ -46,7 +46,7 @@ impl TaskHistoryExporter {
 
 impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        let spans = batch.into_iter().map(span_to_task_span).collect();
+        let spans = batch.into_iter().filter_map(span_to_task_span).collect();
         let df = Arc::clone(&self.df);
         Box::pin(async move {
             TaskSpan::write(df, spans)
@@ -56,7 +56,7 @@ impl SpanExporter for TaskHistoryExporter {
     }
 }
 
-fn span_to_task_span(span: SpanData) -> TaskSpan {
+fn span_to_task_span(span: SpanData) -> Option<TaskSpan> {
     let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
     let span_id: Arc<str> = span.span_context.span_id().to_string().into();
     let parent_span_id: Option<Arc<str>> = if span.parent_span_id == SpanId::INVALID {
@@ -65,6 +65,13 @@ fn span_to_task_span(span: SpanData) -> TaskSpan {
         Some(span.parent_span_id.to_string().into())
     };
     let task: Arc<str> = span.name.into();
+    let runtime_query = span.attributes.iter().any(|kv| {
+        kv.key.as_str() == "runtime_query" && matches!(kv.value, opentelemetry::Value::Bool(true))
+    });
+    // Filter out internal runtime queries from the task history table
+    if runtime_query {
+        return None;
+    }
     let input: Arc<str> = span
         .attributes
         .iter()
@@ -102,7 +109,7 @@ fn span_to_task_span(span: SpanData) -> TaskSpan {
         .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
         .collect();
 
-    TaskSpan {
+    Some(TaskSpan {
         trace_id,
         span_id,
         parent_span_id,
@@ -114,5 +121,5 @@ fn span_to_task_span(span: SpanData) -> TaskSpan {
         execution_duration_ms,
         error_message,
         labels,
-    }
+    })
 }
