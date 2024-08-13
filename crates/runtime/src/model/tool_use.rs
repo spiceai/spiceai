@@ -501,7 +501,7 @@ impl ToolUsingChat {
                 Box::new(ListDatasetsTool {}),
                 Box::new(TableSchemaTool {}),
                 Box::new(SqlTool {}),
-                Box::new(ListTablesTool {}),
+                //Box::new(ListTablesTool {}),
             ]),
             opts: opts.clone(),
         }
