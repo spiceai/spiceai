@@ -502,7 +502,7 @@ impl ToolUsingChat {
                 Box::new(ListDatasetsTool {}),
                 Box::new(TableSchemaTool {}),
                 Box::new(SqlTool {}),
-                Box::new(ListTablesTool {}),
+                //Box::new(ListTablesTool {}),
             ]),
             opts: opts.clone(),
         }
@@ -757,6 +757,8 @@ fn make_a_stream(
             let tool_call_states: Arc<Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>> =
                 Arc::new(Mutex::new(HashMap::new()));
 
+            let mut chat_output = String::new();
+
             while let Some(result) = s.next().await {
                 let response = match result {
                     Ok(response) => response,
@@ -894,12 +896,19 @@ fn make_a_stream(
                         }
                     }
                 }
+                if let Some(choice) = finished_choices.first() {
+                    if let Some(intermediate_chat_output) = &choice.delta.content {
+                        chat_output.push_str(intermediate_chat_output);
+                    }
+                }
                 let mut resp2 = response.clone();
                 resp2.choices = finished_choices;
                 if let Err(e) = sender_clone.send(Ok(resp2)).await {
                     tracing::error!("Error sending error: {}", e);
                 }
             }
+
+            tracing::info!(target: "task_history", truncated_output = %chat_output);
         }
         .instrument(span),
     );

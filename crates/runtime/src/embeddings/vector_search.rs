@@ -26,6 +26,7 @@ use itertools::Itertools;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
     accelerated_table::AcceleratedTable, datafusion::DataFusion, model::EmbeddingModelStore,
 };
@@ -85,6 +86,7 @@ impl Display for RetrievalLimit {
 
 pub type ModelKey = String;
 
+#[derive(Debug)]
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
     pub retrieved_primary_keys: HashMap<TableReference, Vec<RecordBatch>>,
@@ -284,6 +286,9 @@ impl VectorSearch {
             "Relevant data from vector search: {:#?}",
             response.retrieved_entries,
         );
+        span.in_scope(|| {
+            tracing::info!(target: "task_history", truncated_output = ?response);
+        });
         Ok(response)
     }
 
@@ -466,7 +471,14 @@ pub async fn parse_explicit_primary_keys(
                 d.embeddings
                     .iter()
                     .find_map(|e| e.primary_keys.clone())
-                    .map(|pks| (TableReference::parse_str(&d.name), pks))
+                    .map(|pks| {
+                        (
+                            TableReference::parse_str(&d.name)
+                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                                .into(),
+                            pks,
+                        )
+                    })
             })
             .collect::<HashMap<TableReference, Vec<_>>>()
     })
