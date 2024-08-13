@@ -67,7 +67,7 @@ mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.2" }
 odbc-api = { version = "8.1.2" }
 opentelemetry = { version = "0.24", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics", "rt-tokio", "trace"] }
 opentelemetry-prometheus = "0.17"
 opentelemetry-zipkin = { version = "0.22.0", default-features = false, features = ["reqwest", "reqwest-rustls"] }
 opentelemetry-http = { version = "0.13.0", features = ["reqwest-rustls"] }
