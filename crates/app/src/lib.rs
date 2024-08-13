@@ -34,7 +34,7 @@ use spicepod::{
     Spicepod,
 };
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq)]
 pub struct App {
     pub name: String,
 

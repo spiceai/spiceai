@@ -52,12 +52,12 @@ const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
 const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
 
 pub(crate) async fn get(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(filter): Query<CatalogFilter>,
     accept: Option<TypedHeader<Accept>>,
 ) -> Response {
     let app_lock = app.read().await;
-    let Some(readable_app) = &*app_lock else {
+    let Some(readable_app) = app_lock.as_ref() else {
         return (
             status::StatusCode::INTERNAL_SERVER_ERROR,
             Json::<Vec<CatalogResponseItem>>(vec![]),
@@ -65,7 +65,9 @@ pub(crate) async fn get(
             .into_response();
     };
 
-    let valid_catalogs = Runtime::get_valid_catalogs(readable_app, LogErrors(false));
+    let readable_app = Arc::clone(readable_app);
+
+    let valid_catalogs = Runtime::get_valid_catalogs(&readable_app, LogErrors(false));
     let catalogs: Vec<Catalog> = match filter.from {
         Some(provider) => valid_catalogs
             .into_iter()

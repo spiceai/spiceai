@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
@@ -114,10 +115,10 @@ pub struct Args {
 pub async fn run(args: Args, prometheus_registry: Option<prometheus::Registry>) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
+    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
-        Ok(app) => Some(app),
+        Ok(app) => Some(Arc::new(app)),
         Err(e) => {
             tracing::warn!("{}", e);
             None
