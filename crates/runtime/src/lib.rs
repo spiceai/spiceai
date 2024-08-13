@@ -486,7 +486,12 @@ impl Runtime {
     }
 
     fn datasets_iter(app: &App) -> impl Iterator<Item = Result<Dataset>> + '_ {
-        app.datasets.iter().cloned().map(Dataset::try_from)
+        let app_ref = Arc::new(app.clone());
+        app.datasets
+            .iter()
+            .cloned()
+            .map(Dataset::try_from)
+            .map(move |ds| ds.map(|ds| Dataset::with_app(ds, Arc::clone(&app_ref))))
     }
 
     fn catalogs_iter(app: &App) -> impl Iterator<Item = Result<Catalog>> + '_ {

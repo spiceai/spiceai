@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use acceleration::Engine;
+use app::App;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference;
@@ -22,7 +23,7 @@ use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -119,6 +120,7 @@ pub struct Dataset {
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     schema: Option<SchemaRef>,
+    app: Option<Arc<App>>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {
@@ -150,6 +152,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             embeddings: dataset.embeddings,
             acceleration,
             schema: None,
+            app: None,
         })
     }
 }
@@ -168,7 +171,18 @@ impl Dataset {
             acceleration: None,
             embeddings: Vec::default(),
             schema: None,
+            app: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_app(mut self, app: Arc<App>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    pub fn app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     #[must_use]
