@@ -28,6 +28,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use chrono::Utc;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
@@ -173,10 +174,7 @@ fn create_acceleration(engine: &str, mode: acceleration::Mode) -> Acceleration {
 }
 
 fn get_current_unix_ms() -> i64 {
-    let now = std::time::SystemTime::now();
-    now.duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-        .unwrap_or(0)
+    Utc::now().timestamp_millis()
 }
 
 async fn run_query_and_record_result(
