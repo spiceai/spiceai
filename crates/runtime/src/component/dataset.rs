@@ -181,6 +181,7 @@ impl Dataset {
         self
     }
 
+    #[must_use]
     pub fn app(&self) -> Option<Arc<App>> {
         self.app.clone()
     }
