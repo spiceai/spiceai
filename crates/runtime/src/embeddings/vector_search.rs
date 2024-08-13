@@ -285,7 +285,7 @@ impl VectorSearch {
             response.retrieved_entries,
         );
         span.in_scope(|| {
-            tracing::info!(target: "task_history", truncated_output = ?response.retrieved_entries);
+            tracing::info!(target: "task_history", truncated_output = ?response);
         });
         Ok(response)
     }
