@@ -2,6 +2,8 @@
 name: benchmark tests
 
 on:
+  schedule:
+    - cron: '0 10 * * 3,7'
   workflow_dispatch:
     inputs:
       features:
@@ -15,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: ${{ contains(inputs.features, 'mysql') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
+        image: ${{ (contains(inputs.features, 'mysql') || github.event_name == 'schedule') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
           --health-cmd="mysqladmin ping -uroot -proot --silent"
           --health-interval 10s
@@ -26,7 +28,7 @@ jobs:
         env:
           MYSQL_ROOT_PASSWORD: root
       postgres:
-        image: ${{ contains(inputs.features, 'postgres') && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
+        image: ${{ (contains(inputs.features, 'postgres') || github.event_name == 'schedule') && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="pg_isready -U postgres"
@@ -50,11 +52,11 @@ jobs:
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
       - name: Install Protoc
-        if: contains(inputs.features, 'spark')
+        if: contains(inputs.features, 'spark') || github.event_name == 'schedule'
         uses: arduino/setup-protoc@v3
 
       - name: Install Databricks ODBC driver
-        if: contains(inputs.features, 'odbc')
+        if: contains(inputs.features, 'odbc') || github.event_name == 'schedule'
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
@@ -62,13 +64,13 @@ jobs:
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
 
       - name: Install Athena ODBC driver
-        if: contains(inputs.features, 'odbc')
+        if: contains(inputs.features, 'odbc') || github.event_name == 'schedule'
         run: |
           sudo apt-get install alien -y
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
-      - run: cargo bench -p runtime --features ${{ inputs.features }}
+      - run: cargo bench -p runtime --features ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
