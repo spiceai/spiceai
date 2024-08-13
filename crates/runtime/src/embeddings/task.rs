@@ -40,7 +40,7 @@ impl Embed for TaskEmbed {
 
         match self.inner.embed(input).instrument(span.clone()).await {
             Ok(response) => {
-                tracing::info!(name: "labels", target: "task_history", parent: &span, outputs_produced = response.len());
+                tracing::info!(target: "task_history", parent: &span, outputs_produced = response.len(), "labels");
                 Ok(response)
             }
             Err(e) => {
@@ -68,7 +68,7 @@ impl Embed for TaskEmbed {
         labels_from_request(&req, &span);
         match self.inner.embed_request(req).instrument(span.clone()).await {
             Ok(response) => {
-                tracing::info!(name: "labels", target: "task_history", parent: &span, outputs_produced = response.data.len());
+                tracing::info!( target: "task_history", parent: &span, outputs_produced = response.data.len(), "labels");
                 Ok(response)
             }
             Err(e) => {
@@ -81,20 +81,20 @@ impl Embed for TaskEmbed {
 
 fn labels_from_request(req: &CreateEmbeddingRequest, span: &Span) {
     let _guard = span.enter();
-    tracing::info!(name: "labels", target: "task_history", model = req.model);
+    tracing::info!(target: "task_history", model = req.model, "labels");
 
     if let Some(encoding_format) = &req.encoding_format {
         let encoding_format_str = match encoding_format {
             async_openai::types::EncodingFormat::Base64 => "base64",
             async_openai::types::EncodingFormat::Float => "float",
         };
-        tracing::info!(name: "labels", target: "task_history", encoding_format = %encoding_format_str);
+        tracing::info!(target: "task_history", encoding_format = %encoding_format_str, "labels");
     }
     if let Some(user) = &req.user {
-        tracing::info!(name: "labels", target: "task_history", user = %user);
+        tracing::info!(target: "task_history", user = %user, "labels");
     }
 
     if let Some(dims) = req.dimensions {
-        tracing::info!(name: "labels", target: "task_history", dimensions = %dims);
+        tracing::info!(target: "task_history", dimensions = %dims, "labels");
     }
 }

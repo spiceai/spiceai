@@ -65,7 +65,7 @@ pub(crate) async fn post(
                                 .map(|s| serde_json::to_string(s).unwrap_or_default())
                                 .unwrap_or_default();
 
-                            tracing::info!(name: "labels", target: "task_history", truncated_output = %preview);
+                            tracing::info!(target: "task_history", truncated_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
@@ -90,9 +90,15 @@ fn create_sse_response(
     span: Span,
 ) -> Response {
     Sse::new(Box::pin(stream! {
+        let mut chat_output = String::new();
         while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
                 Ok(resp) => {
+                    if let Some(choice) = resp.choices.first() {
+                        if let Some(intermediate_chat_output) = &choice.delta.content {
+                            chat_output.push_str(intermediate_chat_output);
+                        }
+                    }
                     let y = Event::default();
                     match y.json_data(resp).map_err(axum::Error::new) {
                         Ok(a) => yield Ok(a),
@@ -105,6 +111,7 @@ fn create_sse_response(
                 }
             }
         };
+        tracing::info!(target: "task_history", parent: &span, truncated_output = %chat_output);
         drop(span);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))

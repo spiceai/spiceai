@@ -284,6 +284,9 @@ impl VectorSearch {
             "Relevant data from vector search: {:#?}",
             response.retrieved_entries,
         );
+        span.in_scope(|| {
+            tracing::info!(target: "task_history", truncated_output = ?response.retrieved_entries);
+        });
         Ok(response)
     }
 
