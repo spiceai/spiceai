@@ -86,6 +86,7 @@ impl Display for RetrievalLimit {
 
 pub type ModelKey = String;
 
+#[derive(Debug)]
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
     pub retrieved_primary_keys: HashMap<TableReference, Vec<RecordBatch>>,
@@ -286,7 +287,7 @@ impl VectorSearch {
             response.retrieved_entries,
         );
         span.in_scope(|| {
-            tracing::info!(target: "task_history", truncated_output = ?response.retrieved_entries);
+            tracing::info!(target: "task_history", truncated_output = ?response);
         });
         Ok(response)
     }
