@@ -71,7 +71,7 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
-    #[serde(rename = "metadata", default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_metadata_table: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

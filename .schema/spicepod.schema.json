@@ -411,11 +411,15 @@
         "from": {
           "type": "string"
         },
-        "metadata": {
+        "has_metadata_table": {
           "type": [
             "boolean",
             "null"
           ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "mode": {
           "default": "read",
