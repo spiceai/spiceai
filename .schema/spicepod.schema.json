@@ -263,6 +263,10 @@
             "type": "string"
           }
         },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "name": {
           "type": "string"
         },
@@ -571,6 +575,10 @@
         "from": {
           "type": "string"
         },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "name": {
           "type": "string"
         },
@@ -868,6 +876,10 @@
             "string",
             "null"
           ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "name": {
           "type": "string"
