@@ -239,7 +239,7 @@ pub(crate) async fn post(
         .await
     {
         Ok(relevant_data) => {
-            tracing::info!(name: "labels", target: "task_history", parent: &span, outputs_produced = relevant_data.retrieved_entries.len());
+            tracing::info!(target: "task_history", parent: &span, outputs_produced = relevant_data.retrieved_entries.len(), "labels");
             relevant_data
         }
         Err(e) => {

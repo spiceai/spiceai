@@ -37,25 +37,6 @@ pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 
-// pub enum TaskType {
-//     SqlQuery,
-//     NsqlQuery,
-//     AiCompletion,
-//     TextEmbed,
-//     VectorSearch,
-// }
-
-// impl Display for TaskType {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match self {
-//             TaskType::SqlQuery => write!(f, "sql_query"),
-//             TaskType::NsqlQuery => write!(f, "nsql_query"),
-//             TaskType::AiCompletion => write!(f, "ai_completion"),
-//             TaskType::TextEmbed => write!(f, "text_embed"),
-//             TaskType::VectorSearch => write!(f, "vector_search"),
-//         }
-//     }
-// }
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
