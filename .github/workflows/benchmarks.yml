@@ -14,14 +14,13 @@ on:
         required: true
         default: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
+env:
+  FEATURES: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
+
 jobs:
   run-database-bench:
     name: Benchmark Tests
     runs-on: ubuntu-latest
-
-    env:
-      FEATURES: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
-
     services:
       mysql:
         image: ${{ contains(env.FEATURES, 'mysql') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
