@@ -3102,7 +3102,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=1c6d92ac3030582f95a3fdec519029a04e672209#1c6d92ac3030582f95a3fdec519029a04e672209"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=03f3e07583d08436f1c5f4ed729e71ad6d24358f#03f3e07583d08436f1c5f4ed729e71ad6d24358f"
 dependencies = [
  "arrow",
  "async-stream",
@@ -3117,6 +3117,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-federation-sql",
  "duckdb",
+ "dyn-clone",
  "fallible-iterator 0.3.0",
  "futures",
  "itertools 0.13.0",
@@ -3423,7 +3424,7 @@ checksum = "f25c0e292a7ca6d6498557ff1df68f32c99850012b6ea401cf8daf771f22ff53"
 [[package]]
 name = "duckdb"
 version = "1.0.0"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115#85935dbbc64d2af1ca132ad7e2309a9d87bf3115"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=dec2847ca458441fdfb84468a1aa75aa863dcc2b#dec2847ca458441fdfb84468a1aa75aa863dcc2b"
 dependencies = [
  "arrow",
  "cast",
@@ -5339,7 +5340,7 @@ checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
 [[package]]
 name = "libduckdb-sys"
 version = "1.0.0"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=85935dbbc64d2af1ca132ad7e2309a9d87bf3115#85935dbbc64d2af1ca132ad7e2309a9d87bf3115"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=dec2847ca458441fdfb84468a1aa75aa863dcc2b#dec2847ca458441fdfb84468a1aa75aa863dcc2b"
 dependencies = [
  "autocfg",
  "cc",

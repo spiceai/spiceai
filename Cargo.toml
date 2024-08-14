@@ -55,7 +55,7 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
 datafusion = "40.0.0"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1c6d92ac3030582f95a3fdec519029a04e672209" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "03f3e07583d08436f1c5f4ed729e71ad6d24358f" }
 dirs = "5.0.1"
 dotenvy = "0.15"
 duckdb = "1.0.0"
@@ -104,7 +104,7 @@ x509-certificate = "0.23.1"
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4986265c3b6ce43e34e98ea45b7e4f438c5d2fa3" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "dec2847ca458441fdfb84468a1aa75aa863dcc2b" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
 
