@@ -165,11 +165,7 @@ impl Chat for Openai {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        let stream = self
-            .client
-            .chat()
-            .create_stream(inner_req)
-            .await?;
+        let stream = self.client.chat().create_stream(inner_req).await?;
 
         Ok(Box::pin(stream))
     }

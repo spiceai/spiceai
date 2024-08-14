@@ -37,7 +37,6 @@ pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 
-
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
     pub(crate) trace_id: Arc<str>,
