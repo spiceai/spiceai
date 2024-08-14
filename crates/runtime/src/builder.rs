@@ -138,7 +138,7 @@ impl RuntimeBuilder {
             None
         };
 
-        let secrets = Self::load_secrets(self.app.clone()).await;
+        let secrets = Self::load_secrets(&self.app).await;
 
         let mut rt = Runtime {
             instance_name: format!("{name}-{hash}").to_string(),
@@ -172,7 +172,7 @@ impl RuntimeBuilder {
         rt
     }
 
-    async fn load_secrets(app: Option<Arc<App>>) -> Secrets {
+    async fn load_secrets(app: &Option<Arc<App>>) -> Secrets {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
