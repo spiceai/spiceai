@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: ${{ contains(env.FEATURES, 'mysql') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
+        image: ${{ (contains(inputs.features, 'mysql') || github.event_name == 'schedule') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
           --health-cmd="mysqladmin ping -uroot -proot --silent"
           --health-interval 10s
@@ -34,7 +34,7 @@ jobs:
         env:
           MYSQL_ROOT_PASSWORD: root
       postgres:
-        image: ${{ contains(env.FEATURES, 'postgres') && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
+        image: ${{ (contains(inputs.features, 'postgres') || github.event_name == 'schedule') && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="pg_isready -U postgres"
