@@ -43,7 +43,7 @@ pub(crate) struct ModelResponse {
 }
 
 pub(crate) async fn get(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
     let resp = match app.read().await.as_ref() {

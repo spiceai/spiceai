@@ -122,7 +122,7 @@ pub struct AccelerationRequest {
 }
 
 pub(crate) async fn refresh(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
 ) -> Response {
@@ -176,7 +176,7 @@ pub(crate) async fn refresh(
 }
 
 pub(crate) async fn acceleration(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,
