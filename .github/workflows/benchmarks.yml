@@ -2,9 +2,6 @@
 name: benchmark tests
 
 on:
-  push:
-    branches:
-      - qianqian/fix-workflow
   schedule:
     - cron: '0 10 * * 3,0'
   workflow_dispatch:
@@ -15,7 +12,7 @@ on:
         default: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 env:
-  FEATURES: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
+  FEATURES: ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
 
 jobs:
   run-database-bench:
