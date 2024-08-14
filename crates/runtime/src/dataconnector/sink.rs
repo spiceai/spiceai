@@ -21,8 +21,8 @@ use std::{any::Any, pin::Pin, sync::Arc};
 
 use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
+    catalog::Session,
     datasource::{TableProvider, TableType},
-    execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::{empty::EmptyExec, ExecutionPlan},
 };
@@ -122,7 +122,7 @@ impl TableProvider for SinkConnector {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -132,7 +132,7 @@ impl TableProvider for SinkConnector {
 
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         _input: Arc<dyn ExecutionPlan>,
         _overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {

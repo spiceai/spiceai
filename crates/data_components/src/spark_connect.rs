@@ -22,6 +22,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -33,7 +34,6 @@ use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::Result,
-    execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
     sql::TableReference,
@@ -184,7 +184,7 @@ impl TableProvider for SparkConnectTableProvider {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,

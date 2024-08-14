@@ -9,7 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-backoff = "0.4.0"
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 humantime = "2.1.0"
 rand = "0.8.5"
 tokio = { workspace = true }

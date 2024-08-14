@@ -19,9 +19,10 @@ use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -116,7 +117,7 @@ impl TableProvider for FlightTableStreamer {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,

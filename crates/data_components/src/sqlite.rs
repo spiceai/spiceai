@@ -16,8 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, execution::context::SessionState, logical_expr::Expr,
-    physical_plan::ExecutionPlan,
+    catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
 };
 use datafusion_table_providers::{
     sql::sql_provider_datafusion::expr::Engine,
@@ -33,7 +32,7 @@ use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 impl DeletionTableProvider for SqliteTableWriter {
     async fn delete_from(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(

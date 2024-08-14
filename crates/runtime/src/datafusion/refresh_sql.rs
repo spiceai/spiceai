@@ -74,14 +74,7 @@ pub fn validate_refresh_sql(expected_table: TableReference, refresh_sql: &str) -
                     );
 
                     match &select.from[0].relation {
-                        sqlparser::ast::TableFactor::Table {
-                            name,
-                            alias: _,
-                            args: _,
-                            with_hints: _,
-                            version: _,
-                            partitions: _,
-                        } => {
+                        sqlparser::ast::TableFactor::Table { name, .. } => {
                             let table_name_with_schema = name
                                 .0
                                 .iter()

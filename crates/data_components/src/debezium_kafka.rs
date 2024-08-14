@@ -25,10 +25,10 @@ use crate::{
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::{Constraints, DFSchema},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
-    execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::{empty::EmptyExec, ExecutionPlan},
     sql::sqlparser::ast::{Ident, TableConstraint},
@@ -123,7 +123,7 @@ impl TableProvider for DebeziumKafka {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
