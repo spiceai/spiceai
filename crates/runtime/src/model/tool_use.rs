@@ -232,7 +232,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name(), arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name(), input = arg);
         let args: DocumentSimilarityToolArgs = serde_json::from_str(arg)?;
 
         let text = args.text;
@@ -299,7 +299,7 @@ impl SpiceModelTool for ListTablesTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), input = arg);
         if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
             Ok(Value::Array(
                 app.datasets
@@ -340,7 +340,7 @@ impl SpiceModelTool for ListDatasetsTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
         let embedding_datasets = match &*rt.app.read().instrument(span.clone()).await {
             Some(app) => app
                 .datasets
@@ -398,7 +398,7 @@ impl SpiceModelTool for TableSchemaTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = arg);
         let arg_v = Value::from_str(arg).boxed()?;
         // TODO support default == all tables
         let tables: Vec<String> = arg_v["tables"]
@@ -459,7 +459,7 @@ impl SpiceModelTool for SqlTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
         let arg_v = Value::from_str(arg).boxed()?;
         let q = arg_v["query"].as_str().unwrap_or_default();
 
