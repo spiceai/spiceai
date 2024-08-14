@@ -1177,7 +1177,7 @@ impl Runtime {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
 
-                        let m = Box::new(TaskEmbed::new(e, Arc::clone(&self.df))) as Box<dyn Embed>;
+                        let m = Box::new(TaskEmbed::new(e)) as Box<dyn Embed>;
                         embeds_map.insert(in_embed.name.clone(), m.into());
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);

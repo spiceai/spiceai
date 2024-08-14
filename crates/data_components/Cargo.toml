@@ -42,7 +42,7 @@ globset.workspace = true
 object_store = { workspace = true }
 rdkafka = { version = "0.36.2", optional = true }
 regex = "1.10.4"
-reqwest = { version = "0.11.24", features = ["json"] }
+reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
