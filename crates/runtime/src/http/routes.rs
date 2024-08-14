@@ -40,7 +40,7 @@ use super::{metrics, v1};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routes(
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,

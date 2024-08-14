@@ -441,7 +441,7 @@ fn string_to_boxed_err(s: String) -> Box<dyn std::error::Error + Send + Sync> {
 
 /// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
 pub async fn parse_explicit_primary_keys(
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
 ) -> HashMap<TableReference, Vec<String>> {
     app.read().await.as_ref().map_or(HashMap::new(), |app| {
         app.datasets

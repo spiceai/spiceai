@@ -58,7 +58,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start<A>(
     bind_address: A,
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
