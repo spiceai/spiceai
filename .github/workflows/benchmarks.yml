@@ -3,7 +3,7 @@ name: benchmark tests
 
 on:
   schedule:
-    - cron: '0 10 * * 3,7'
+    - cron: '0 10 * * 3,0'
   workflow_dispatch:
     inputs:
       features:
