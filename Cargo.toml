@@ -55,7 +55,8 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
 datafusion = "40.0.0"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1c6d92ac3030582f95a3fdec519029a04e672209" }
+#datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1c6d92ac3030582f95a3fdec519029a04e672209" }
+datafusion-table-providers = { path = "../datafusion-table-providers" }
 dirs = "5.0.1"
 dotenvy = "0.15"
 duckdb = "1.0.0"

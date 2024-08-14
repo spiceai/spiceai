@@ -27,7 +27,7 @@ use datafusion_table_providers::postgres::{
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::parameters::ParameterSpec;
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -84,6 +84,7 @@ impl DataAccelerator for PostgresAccelerator {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        _dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         let table_provider =

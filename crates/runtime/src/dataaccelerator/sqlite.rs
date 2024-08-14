@@ -25,7 +25,12 @@ use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTablePr
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::{component::dataset::Dataset, make_spice_data_directory, parameters::ParameterSpec};
+use crate::{
+    component::dataset::{acceleration::Engine, Dataset},
+    make_spice_data_directory,
+    parameters::ParameterSpec,
+    spice_data_base_path, Runtime,
+};
 
 use super::DataAccelerator;
 
@@ -52,9 +57,7 @@ impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sqlite_factory: SqliteTableProviderFactory::new()
-                .db_path_param("file")
-                .db_base_folder_param("data_directory"),
+            sqlite_factory: SqliteTableProviderFactory::new(),
         }
     }
 
@@ -64,7 +67,11 @@ impl SqliteAccelerator {
         if !dataset.is_file_accelerated() {
             return None;
         }
-        let acceleration = dataset.acceleration.as_ref()?;
+        let mut acceleration = dataset.acceleration.clone()?;
+
+        acceleration
+            .params
+            .insert("data_directory".to_string(), spice_data_base_path());
 
         Some(
             self.sqlite_factory
@@ -95,14 +102,40 @@ impl DataAccelerator for SqliteAccelerator {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut cmd = cmd.clone();
         if !cmd.options.contains_key("file") {
             make_spice_data_directory()
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
+        if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
+            this_dataset.app.as_ref().map(|a| {
+                let datasets = Runtime::get_valid_datasets(a, crate::LogErrors(false));
+                datasets
+                    .iter()
+                    .filter(|d| {
+                        d.acceleration
+                            .as_ref()
+                            .map_or(false, |a| a.engine == Engine::Sqlite)
+                    })
+                    .filter_map(|other_dataset| {
+                        if **other_dataset == *this_dataset {
+                            None
+                        } else {
+                            self.sqlite_file_path(other_dataset)
+                        }
+                    })
+                    .collect::<Vec<String>>()
+            })
+        }) {
+            cmd.options
+                .insert("attach_databases".to_string(), attach_databases.join(";"));
+        }
+
         let ctx = SessionContext::new();
-        let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), cmd)
+        let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), &cmd)
             .await
             .context(UnableToCreateTableSnafu)
             .boxed()?;
@@ -171,7 +204,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
-            .create_external_table(&external_table)
+            .create_external_table(&external_table, None)
             .await
             .expect("table should be created");
 

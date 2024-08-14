@@ -119,8 +119,8 @@ pub struct Dataset {
     pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
+    pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
-    app: Option<Arc<App>>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {

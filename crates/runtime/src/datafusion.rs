@@ -663,6 +663,7 @@ impl DataFusion {
             source_table_provider.constraints(),
             &acceleration_settings,
             secrets,
+            Some(dataset),
         )
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
