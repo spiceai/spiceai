@@ -15,6 +15,10 @@ jobs:
   run-database-bench:
     name: Benchmark Tests
     runs-on: ubuntu-latest
+
+    env:
+      FEATURES: ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || ''}}
+
     services:
       mysql:
         image: ${{ (contains(inputs.features, 'mysql') || github.event_name == 'schedule') && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
@@ -70,7 +74,7 @@ jobs:
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
-      - run: cargo bench -p runtime --features ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
+      - run: cargo bench -p runtime --features ${{ inputs.features || env.FEATURES }}
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
