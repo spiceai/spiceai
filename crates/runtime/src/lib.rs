@@ -272,7 +272,7 @@ pub struct LogErrors(pub bool);
 #[derive(Clone)]
 pub struct Runtime {
     instance_name: String,
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
@@ -485,16 +485,20 @@ impl Runtime {
         }
     }
 
-    fn datasets_iter(app: &App) -> impl Iterator<Item = Result<Dataset>> + '_ {
-        app.datasets.iter().cloned().map(Dataset::try_from)
+    fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
+        app.datasets
+            .clone()
+            .into_iter()
+            .map(Dataset::try_from)
+            .map(move |ds| ds.map(|ds| Dataset::with_app(ds, Arc::clone(app))))
     }
 
-    fn catalogs_iter(app: &App) -> impl Iterator<Item = Result<Catalog>> + '_ {
-        app.catalogs.iter().cloned().map(Catalog::try_from)
+    fn catalogs_iter<'a>(app: &Arc<App>) -> impl Iterator<Item = Result<Catalog>> + 'a {
+        app.catalogs.clone().into_iter().map(Catalog::try_from)
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
+    fn get_valid_datasets(app: &Arc<App>, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
         Self::datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
@@ -515,7 +519,7 @@ impl Runtime {
     }
 
     /// Returns a list of valid catalogs from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_catalogs(app: &App, log_errors: LogErrors) -> Vec<Catalog> {
+    fn get_valid_catalogs(app: &Arc<App>, log_errors: LogErrors) -> Vec<Catalog> {
         Self::catalogs_iter(app)
             .zip(&app.catalogs)
             .filter_map(|(catalog, spicepod_catalog)| match catalog {
@@ -536,7 +540,7 @@ impl Runtime {
     }
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_views(app: &App, log_errors: LogErrors) -> Vec<View> {
+    fn get_valid_views(app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
         let datasets = Self::get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())
@@ -615,7 +619,7 @@ impl Runtime {
         self.load_views(app, &valid_datasets);
     }
 
-    fn load_views(&self, app: &App, valid_datasets: &[Arc<Dataset>]) {
+    fn load_views(&self, app: &Arc<App>, valid_datasets: &[Arc<Dataset>]) {
         let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
 
         for view in &views {
@@ -1325,7 +1329,7 @@ impl Runtime {
                 recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
             } else {
                 tracing::debug!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&Arc::clone(&self.df))
+                MetricsRecorder::register_metrics_table(&self.df)
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
@@ -1346,6 +1350,7 @@ impl Runtime {
         while let Some(new_app) = rx.recv().await {
             let mut app_lock = self.app.write().await;
             if let Some(current_app) = app_lock.as_mut() {
+                let new_app = Arc::new(new_app);
                 if *current_app == new_app {
                     continue;
                 }
@@ -1428,7 +1433,7 @@ impl Runtime {
 
                 *current_app = new_app;
             } else {
-                *app_lock = Some(new_app);
+                *app_lock = Some(Arc::new(new_app));
             }
         }
 

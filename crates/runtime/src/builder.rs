@@ -32,7 +32,7 @@ use crate::{
 };
 
 pub struct RuntimeBuilder {
-    app: Option<app::App>,
+    app: Option<Arc<app::App>>,
     autoload_extensions: HashMap<String, Box<dyn ExtensionFactory>>,
     extensions: Vec<Box<dyn ExtensionFactory>>,
     pods_watcher: Option<podswatcher::PodsWatcher>,
@@ -57,11 +57,11 @@ impl RuntimeBuilder {
     }
 
     pub fn with_app(mut self, app: app::App) -> Self {
-        self.app = Some(app);
+        self.app = Some(Arc::new(app));
         self
     }
 
-    pub fn with_app_opt(mut self, app: Option<app::App>) -> Self {
+    pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
         self
     }
@@ -138,7 +138,7 @@ impl RuntimeBuilder {
             None
         };
 
-        let secrets = Self::load_secrets(self.app.as_ref()).await;
+        let secrets = Self::load_secrets(&self.app).await;
 
         let mut rt = Runtime {
             instance_name: format!("{name}-{hash}").to_string(),
@@ -172,7 +172,7 @@ impl RuntimeBuilder {
         rt
     }
 
-    async fn load_secrets(app: Option<&App>) -> Secrets {
+    async fn load_secrets(app: &Option<Arc<App>>) -> Secrets {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 

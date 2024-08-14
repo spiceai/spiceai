@@ -73,7 +73,7 @@ pub enum PredictStatus {
 }
 
 pub(crate) async fn get(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(model_name): Path<String>,
     Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
@@ -94,7 +94,7 @@ pub(crate) async fn get(
 }
 
 pub(crate) async fn post(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     Json(payload): Json<BatchPredictRequest>,
@@ -128,7 +128,7 @@ pub(crate) async fn post(
 }
 
 async fn run_inference(
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     model_name: String,

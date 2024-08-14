@@ -57,7 +57,7 @@ pub(crate) struct SpicepodCsvRow {
 }
 
 pub(crate) async fn get(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(params): Query<SpicepodQueryParams>,
 ) -> Response {
     let Some(readable_app) = &*app.read().await else {
