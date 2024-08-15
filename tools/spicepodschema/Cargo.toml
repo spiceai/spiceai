@@ -10,5 +10,5 @@ version.workspace = true
 
 [dependencies]
 schemars = "0.8.19"
-serde_json = "1.0.117"
+serde_json = "1"
 spicepod = { path = "../../crates/spicepod", features = ["schemars"] }

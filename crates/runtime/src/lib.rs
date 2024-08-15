@@ -1571,21 +1571,10 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
 
                     for relation in relations {
                         match relation {
-                            TableFactor::Table {
-                                name,
-                                alias: _,
-                                args: _,
-                                with_hints: _,
-                                version: _,
-                                partitions: _,
-                            } => {
+                            TableFactor::Table { name, .. } => {
                                 table_names.push(name.to_string().into());
                             }
-                            TableFactor::Derived {
-                                lateral: _,
-                                subquery,
-                                alias: _,
-                            } => {
+                            TableFactor::Derived { subquery, .. } => {
                                 table_names.extend(get_dependent_table_names(
                                     &parser::Statement::Statement(Box::new(ast::Statement::Query(
                                         subquery,

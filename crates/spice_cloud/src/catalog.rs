@@ -16,7 +16,7 @@ limitations under the License.
 
 use datafusion::{
     arrow::{self, datatypes::TimeUnit},
-    catalog::{schema::SchemaProvider, CatalogProvider},
+    catalog::{CatalogProvider, SchemaProvider},
 };
 use globset::GlobSet;
 use runtime::{

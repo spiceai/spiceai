@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{schema::SchemaProvider, CatalogProvider},
+    catalog::{CatalogProvider, SchemaProvider},
     datasource::TableProvider,
     error::DataFusionError,
     sql::TableReference,
