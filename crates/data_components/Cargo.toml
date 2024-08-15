@@ -83,6 +83,7 @@ snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite"]
 sharepoint = ["dep:graph-rs-sdk"]
+default=["sharepoint"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

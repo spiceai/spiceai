@@ -129,7 +129,7 @@ clickhouse = [
 ]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
-default = ["keyring-secret-store", "aws-secrets-manager"]
+default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
 delta_lake = ["data_components/delta_lake"]
 dev = []
 dremio = []
