@@ -125,6 +125,14 @@ pub trait DataAccelerator: Send + Sync {
 
     // The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
+
+    // Initialize the accelerator for a dataset
+    async fn init(
+        &self,
+        _dataset: &Dataset,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 pub struct AcceleratorExternalTableBuilder {

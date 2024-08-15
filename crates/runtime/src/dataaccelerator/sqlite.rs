@@ -20,7 +20,10 @@ use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory};
+use datafusion_table_providers::{
+    sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
+    sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory},
+};
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
@@ -42,6 +45,11 @@ pub enum Error {
 
     #[snafu(display("Acceleration creation failed: {source}"))]
     AccelerationCreationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Acceleration initialization failed: {source}"))]
+    AccelerationInitializationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -95,6 +103,21 @@ impl DataAccelerator for SqliteAccelerator {
 
     fn name(&self) -> &'static str {
         "sqlite"
+    }
+
+    async fn init(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let path = self.sqlite_file_path(dataset);
+
+        if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
+            SqliteConnectionPool::init(path, acceleration.mode.to_string().as_str().into())
+                .await
+                .context(AccelerationInitializationFailedSnafu)?;
+        }
+
+        Ok(())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
