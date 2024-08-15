@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::{
-    catalog::schema::SchemaProvider,
+    catalog::SchemaProvider,
     datasource::TableProvider,
     error::{DataFusionError, Result},
     execution::context::SessionContext,

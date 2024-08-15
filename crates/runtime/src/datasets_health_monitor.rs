@@ -253,8 +253,7 @@ mod test {
     use crate::component::dataset::Dataset;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
-        catalog::schema::{MemorySchemaProvider, SchemaProvider},
-        datasource::MemTable,
+        catalog::SchemaProvider, catalog_common::MemorySchemaProvider, datasource::MemTable,
     };
     use std::sync::Arc;
 

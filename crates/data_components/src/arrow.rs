@@ -17,9 +17,9 @@ limitations under the License.
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
+    catalog::{Session, TableProviderFactory},
+    datasource::TableProvider,
     error::Result as DataFusionResult,
-    execution::context::SessionState,
     logical_expr::CreateExternalTable,
 };
 use std::sync::Arc;
@@ -50,7 +50,7 @@ impl Default for ArrowFactory {
 impl TableProviderFactory for ArrowFactory {
     async fn create(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let schema: Schema = cmd.schema.as_ref().into();

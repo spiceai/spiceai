@@ -17,9 +17,10 @@ limitations under the License.
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
         insert::{DataSink, DataSinkExec},
@@ -77,7 +78,7 @@ impl TableProvider for FlightTableWriter {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -89,7 +90,7 @@ impl TableProvider for FlightTableWriter {
 
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {

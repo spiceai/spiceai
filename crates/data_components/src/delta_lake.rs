@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -26,7 +27,6 @@ use datafusion::datasource::physical_plan::{
 };
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
@@ -236,7 +236,7 @@ impl TableProvider for DeltaTable {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,

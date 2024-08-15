@@ -17,9 +17,9 @@ limitations under the License.
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_stream::stream;
 use axum::async_trait;
+use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -169,7 +169,7 @@ impl TableProvider for EnsureSchema {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
