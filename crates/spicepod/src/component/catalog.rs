@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{params::Params, WithDependsOn};
 
@@ -28,6 +31,10 @@ pub struct Catalog {
     pub name: String,
 
     pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
@@ -50,6 +57,7 @@ impl Catalog {
             from,
             name,
             description: None,
+            metadata: HashMap::default(),
             include: Vec::default(),
             params: None,
             dataset_params: None,
@@ -64,6 +72,7 @@ impl WithDependsOn<Catalog> for Catalog {
             from: self.from.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
+            metadata: self.metadata.clone(),
             include: self.include.clone(),
             params: self.params.clone(),
             dataset_params: self.dataset_params.clone(),

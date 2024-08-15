@@ -1177,7 +1177,7 @@ impl Runtime {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
 
-                        let m = Box::new(TaskEmbed::new(e, Arc::clone(&self.df))) as Box<dyn Embed>;
+                        let m = Box::new(TaskEmbed::new(e)) as Box<dyn Embed>;
                         embeds_map.insert(in_embed.name.clone(), m.into());
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
@@ -1571,21 +1571,10 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
 
                     for relation in relations {
                         match relation {
-                            TableFactor::Table {
-                                name,
-                                alias: _,
-                                args: _,
-                                with_hints: _,
-                                version: _,
-                                partitions: _,
-                            } => {
+                            TableFactor::Table { name, .. } => {
                                 table_names.push(name.to_string().into());
                             }
-                            TableFactor::Derived {
-                                lateral: _,
-                                subquery,
-                                alias: _,
-                            } => {
+                            TableFactor::Derived { subquery, .. } => {
                                 table_names.extend(get_dependent_table_names(
                                     &parser::Statement::Statement(Box::new(ast::Statement::Query(
                                         subquery,

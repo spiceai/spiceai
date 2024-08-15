@@ -22,10 +22,11 @@ use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
-
 use itertools::Itertools;
 use tokio::sync::RwLock;
+use tracing::{Instrument, Span};
 
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
     accelerated_table::AcceleratedTable, datafusion::DataFusion, model::EmbeddingModelStore,
 };
@@ -85,6 +86,7 @@ impl Display for RetrievalLimit {
 
 pub type ModelKey = String;
 
+#[derive(Debug)]
 pub struct VectorSearchResult {
     pub retrieved_entries: HashMap<TableReference, Vec<String>>,
     pub retrieved_primary_keys: HashMap<TableReference, Vec<RecordBatch>>,
@@ -202,6 +204,18 @@ impl VectorSearch {
         tables: Vec<TableReference>,
         limit: RetrievalLimit,
     ) -> Result<VectorSearchResult> {
+        let span = match Span::current() {
+            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "vector_search") => {
+                span
+            }
+            _ => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = query)
+            }
+        };
+        span.in_scope(|| {
+            tracing::info!(name: "labels", target: "task_history", tables = tables.iter().join(","), limit = %limit);
+        });
+
         let n = match limit {
             RetrievalLimit::TopN(n) => n,
             RetrievalLimit::Threshold(_) => unimplemented!(),
@@ -209,10 +223,12 @@ impl VectorSearch {
 
         let per_table_embeddings = self
             .calculate_embeddings_per_table(query.clone(), tables.clone())
+            .instrument(span.clone())
             .await?;
 
         let table_primary_keys = self
             .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.clone())
+            .instrument(span.clone())
             .await?;
 
         let mut response = VectorSearchResult {
@@ -225,13 +241,14 @@ impl VectorSearch {
             let primary_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
 
             // Only support one embedding column per table.
-            let table_provider =
-                self.df
-                    .get_table(tbl.clone())
-                    .await
-                    .ok_or(Error::DataSourceNotFound {
-                        data_source: tbl.to_string(),
-                    })?;
+            let table_provider = self
+                .df
+                .get_table(tbl.clone())
+                .instrument(span.clone())
+                .await
+                .ok_or(Error::DataSourceNotFound {
+                    data_source: tbl.to_string(),
+                })?;
 
             let embedding_column = get_embedding_table(&table_provider)
                 .and_then(|e| e.get_embedding_columns().first().cloned())
@@ -256,6 +273,7 @@ impl VectorSearch {
                             &embedding_column,
                             n,
                         )
+                        .instrument(span.clone())
                         .await?;
                     response.retrieved_entries.insert(tbl.clone(), outtt);
                     response
@@ -268,6 +286,9 @@ impl VectorSearch {
             "Relevant data from vector search: {:#?}",
             response.retrieved_entries,
         );
+        span.in_scope(|| {
+            tracing::info!(target: "task_history", truncated_output = ?response);
+        });
         Ok(response)
     }
 
@@ -450,7 +471,14 @@ pub async fn parse_explicit_primary_keys(
                 d.embeddings
                     .iter()
                     .find_map(|e| e.primary_keys.clone())
-                    .map(|pks| (TableReference::parse_str(&d.name), pks))
+                    .map(|pks| {
+                        (
+                            TableReference::parse_str(&d.name)
+                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                                .into(),
+                            pks,
+                        )
+                    })
             })
             .collect::<HashMap<TableReference, Vec<_>>>()
     })

@@ -17,8 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::delete::DeletionTableProviderAdapter;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory};
@@ -135,9 +134,10 @@ mod tests {
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
-        physical_plan::{collect, test::exec::MockExec},
+        physical_plan::collect,
         scalar::ScalarValue,
     };
+    use datafusion_table_providers::util::test::MockExec;
 
     use crate::dataaccelerator::{duckdb::DuckDBAccelerator, DataAccelerator};
 

@@ -21,8 +21,8 @@ use crate::{
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, execution::context::SessionState, logical_expr::Expr,
-    physical_plan::ExecutionPlan, sql::TableReference,
+    catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
+    sql::TableReference,
 };
 use datafusion_table_providers::{
     duckdb::{write::DuckDBTableWriter, DuckDB, DuckDBTableFactory},
@@ -56,7 +56,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 impl DeletionTableProvider for DuckDBTableWriter {
     async fn delete_from(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(

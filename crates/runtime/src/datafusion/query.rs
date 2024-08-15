@@ -29,6 +29,8 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
+use tracing::Span;
+use tracing_futures::Instrument;
 pub(crate) use tracker::QueryTracker;
 
 pub mod builder;
@@ -40,6 +42,8 @@ mod tracker;
 
 use async_stream::stream;
 use futures::StreamExt;
+
+use super::SPICE_RUNTIME_SCHEMA;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -94,27 +98,41 @@ pub struct Query {
 }
 
 macro_rules! handle_error {
-    ($self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
+    ($span:expr, $self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
         $self
             .finish_with_error(snafu_error.to_string(), $error_code)
+            .instrument($span)
             .await;
         return Err(snafu_error);
     }};
 }
 
 impl Query {
+    #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
+        let span = match &self.tracker.nsql {
+            Some(nsql) => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
+            }
+            None => {
+                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
+            }
+        };
         let session = self.df.ctx.state();
 
         let ctx = self;
         let mut tracker = ctx.tracker;
 
-        let plan = match session.create_logical_plan(&ctx.sql).await {
+        let plan = match session
+            .create_logical_plan(&ctx.sql)
+            .instrument(span.clone())
+            .await
+        {
             Ok(plan) => plan,
             Err(e) => {
                 let error_code = ErrorCode::from(&e);
-                handle_error!(tracker, error_code, e, UnableToExecuteQuery)
+                handle_error!(span.clone(), tracker, error_code, e, UnableToExecuteQuery)
             }
         };
 
@@ -122,11 +140,19 @@ impl Query {
         let plan_cache_key = cache::key_for_logical_plan(&plan);
 
         if let Some(cache_provider) = &ctx.df.cache_provider() {
-            if let Some(cached_result) = match cache_provider.get(&plan).await {
-                Ok(Some(v)) => Some(v),
-                Ok(None) => None,
-                Err(e) => handle_error!(tracker, ErrorCode::InternalError, e, FailedToAccessCache),
-            } {
+            if let Some(cached_result) =
+                match cache_provider.get(&plan).instrument(span.clone()).await {
+                    Ok(Some(v)) => Some(v),
+                    Ok(None) => None,
+                    Err(e) => handle_error!(
+                        span.clone(),
+                        tracker,
+                        ErrorCode::InternalError,
+                        e,
+                        FailedToAccessCache
+                    ),
+                }
+            {
                 tracker = tracker
                     .datasets(cached_result.input_tables)
                     .results_cache_hit(true);
@@ -139,6 +165,7 @@ impl Query {
                     Ok(stream) => stream,
                     Err(e) => {
                         handle_error!(
+                            span.clone(),
                             tracker,
                             ErrorCode::InternalError,
                             e,
@@ -148,7 +175,7 @@ impl Query {
                 };
 
                 return Ok(QueryResult::new(
-                    attach_query_tracker_to_stream(tracker, Box::pin(record_batch_stream)),
+                    attach_query_tracker_to_stream(span, tracker, Box::pin(record_batch_stream)),
                     Some(true),
                 ));
             }
@@ -162,6 +189,7 @@ impl Query {
                 RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
             {
                 handle_error!(
+                    span.clone(),
                     tracker,
                     ErrorCode::QueryPlanningError,
                     e,
@@ -170,30 +198,51 @@ impl Query {
             }
         }
 
-        tracker = tracker.datasets(Arc::new(get_logical_plan_input_tables(&plan)));
+        let input_tables = get_logical_plan_input_tables(&plan);
+        if input_tables
+            .iter()
+            .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+        {
+            span.record("runtime_query", true);
+        }
 
-        let df = match ctx.df.ctx.execute_logical_plan(plan).await {
+        tracker = tracker.datasets(Arc::new(input_tables));
+
+        let df = match ctx
+            .df
+            .ctx
+            .execute_logical_plan(plan)
+            .instrument(span.clone())
+            .await
+        {
             Ok(df) => df,
             Err(e) => {
                 let error_code = ErrorCode::from(&e);
-                handle_error!(tracker, error_code, e, UnableToExecuteQuery)
+                handle_error!(span.clone(), tracker, error_code, e, UnableToExecuteQuery)
             }
         };
 
         let df_schema: SchemaRef = Arc::clone(df.schema().inner());
 
-        let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                let error_code = ErrorCode::from(&e);
-                handle_error!(tracker, error_code, e, UnableToExecuteQuery)
-            }
-        };
+        let res_stream: SendableRecordBatchStream =
+            match df.execute_stream().instrument(span.clone()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(span.clone(), tracker, error_code, e, UnableToExecuteQuery)
+                }
+            };
 
         let res_schema = res_stream.schema();
 
         if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-            handle_error!(tracker, ErrorCode::InternalError, e, SchemaMismatch)
+            handle_error!(
+                span.clone(),
+                tracker,
+                ErrorCode::InternalError,
+                e,
+                SchemaMismatch
+            )
         };
 
         if plan_is_cache_enabled {
@@ -206,14 +255,14 @@ impl Query {
                 );
 
                 return Ok(QueryResult::new(
-                    attach_query_tracker_to_stream(tracker, record_batch_stream),
+                    attach_query_tracker_to_stream(span, tracker, record_batch_stream),
                     Some(false),
                 ));
             }
         }
 
         Ok(QueryResult::new(
-            attach_query_tracker_to_stream(tracker, res_stream),
+            attach_query_tracker_to_stream(span, tracker, res_stream),
             None,
         ))
     }
@@ -239,6 +288,7 @@ impl Query {
 /// Note: If an error occurs during stream processing, the query tracker
 /// is finalized with error details, and further streaming is terminated.
 fn attach_query_tracker_to_stream(
+    span: Span,
     ctx: QueryTracker,
     mut stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
@@ -282,7 +332,7 @@ fn attach_query_tracker_to_stream(
 
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        Box::pin(updated_stream),
+        Box::pin(updated_stream.instrument(span)),
     ))
 }
 

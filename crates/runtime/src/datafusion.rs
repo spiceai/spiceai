@@ -28,7 +28,6 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
-use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
 use crate::{embeddings, get_dependent_table_names};
 
@@ -36,11 +35,13 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use cache::QueryResultsCacheProvider;
-use datafusion::catalog::schema::SchemaProvider;
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
+use datafusion::catalog::CatalogProvider;
+use datafusion::catalog::SchemaProvider;
+use datafusion::catalog_common::MemoryCatalogProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -247,8 +248,11 @@ impl DataFusion {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let state = SessionState::new_with_config_rt(df_config, default_runtime_env())
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
+        let state = SessionStateBuilder::new()
+            .with_config(df_config)
+            .with_default_features()
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));

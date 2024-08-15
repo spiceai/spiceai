@@ -17,8 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::delete::DeletionTableProviderAdapter;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{

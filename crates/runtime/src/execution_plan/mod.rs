@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::catalog::Session;
 use datafusion::common::ToDFSchema;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
@@ -37,15 +38,22 @@ pub struct TableScanParams {
 }
 
 impl TableScanParams {
+    /// # Panics
+    ///
+    /// Will panic if the `state` cannot be downcast to `SessionState`.
+    /// This isn't possible with the current version of `DataFusion` (v41).
     #[must_use]
     pub fn new(
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Self {
+        let Some(session_state) = state.as_any().downcast_ref::<SessionState>() else {
+            panic!("Failed to downcast Session to SessionState");
+        };
         Self {
-            state: state.clone(),
+            state: session_state.clone(),
             projection: projection.cloned(),
             filters: filters.to_vec(),
             limit,

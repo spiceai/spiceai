@@ -52,11 +52,10 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
   "tokio_io",
   "tls",
 ] }
-datafusion = "40.0.0"
+datafusion = "41.0.0"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
-#datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1c6d92ac3030582f95a3fdec519029a04e672209" }
-datafusion-table-providers = { path = "../datafusion-table-providers" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "ae9da45f8b90451119f3ca032b75ad82a28d7547" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "fa39588806bb6d859ca6a92ec8ace676607a0090" }
 dirs = "5.0.1"
 dotenvy = "0.15"
 duckdb = "1.0.0"
@@ -68,18 +67,21 @@ mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.2" }
 odbc-api = { version = "8.1.2" }
 opentelemetry = { version = "0.24", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics", "rt-tokio", "trace"] }
 opentelemetry-prometheus = "0.17"
+opentelemetry-zipkin = { version = "0.22.0", default-features = false, features = ["reqwest", "reqwest-rustls"] }
+opentelemetry-http = { version = "0.13.0", features = ["reqwest-rustls"] }
 pem = "3.0.4"
 prometheus = "0.13"
 r2d2 = "0.8.10"
 regex = "1.10.3"
+reqwest = {version = "0.12.5", features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.2"
 secrecy = "0.8.0"
 serde = { version = "1.0.195", features = ["derive"] }
-serde_json = "1.0.1"
+serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.0"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
@@ -99,12 +101,14 @@ tonic = { version = "0.11", features = ["gzip", "tls"] }
 tonic-health = { version = "0.11" }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-opentelemetry = "0.25.0"
+tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4986265c3b6ce43e34e98ea45b7e4f438c5d2fa3" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eeb9b9c0ed41650db282ba27bc663feb64e62147" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "7c6c88b637db8109a2e899849fe6b023f55cf8c1" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "ae9da45f8b90451119f3ca032b75ad82a28d7547" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }

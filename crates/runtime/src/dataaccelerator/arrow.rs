@@ -17,11 +17,10 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
-use snafu::prelude::*;
+use snafu::ResultExt;
 use std::{any::Any, sync::Arc};
 
 use crate::{component::dataset::Dataset, parameters::ParameterSpec};

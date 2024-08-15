@@ -20,9 +20,9 @@ use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
 use datafusion::{
+    catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
@@ -520,7 +520,7 @@ impl TableProvider for GraphQLTableProvider {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,

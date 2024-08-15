@@ -72,7 +72,8 @@
           "eviction_policy": null,
           "item_ttl": null
         },
-        "tls": null
+        "tls": null,
+        "tracing": null
       },
       "allOf": [
         {
@@ -262,6 +263,10 @@
             "type": "string"
           }
         },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "name": {
           "type": "string"
         },
@@ -406,11 +411,15 @@
         "from": {
           "type": "string"
         },
-        "metadata": {
+        "has_metadata_table": {
           "type": [
             "boolean",
             "null"
           ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "mode": {
           "default": "read",
@@ -570,6 +579,10 @@
         "from": {
           "type": "string"
         },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "name": {
           "type": "string"
         },
@@ -724,6 +737,16 @@
               "type": "null"
             }
           ]
+        },
+        "tracing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TracingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -822,6 +845,24 @@
       },
       "additionalProperties": false
     },
+    "TracingConfig": {
+      "type": "object",
+      "required": [
+        "zipkin_enabled"
+      ],
+      "properties": {
+        "zipkin_enabled": {
+          "type": "boolean"
+        },
+        "zipkin_endpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "View": {
       "type": "object",
       "required": [
@@ -839,6 +880,10 @@
             "string",
             "null"
           ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "name": {
           "type": "string"
