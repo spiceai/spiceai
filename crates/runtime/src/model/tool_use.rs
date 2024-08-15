@@ -826,7 +826,7 @@ fn make_a_stream(
                                 state.function.arguments.push_str(arguments);
                             }
                         }
-                    } else {
+                    } else if chat_choice.delta.content.is_some() {
                         finished_choices.push(chat_choice.clone());
                     }
 
@@ -900,11 +900,12 @@ fn make_a_stream(
                     if let Some(intermediate_chat_output) = &choice.delta.content {
                         chat_output.push_str(intermediate_chat_output);
                     }
-                }
-                let mut resp2 = response.clone();
-                resp2.choices = finished_choices;
-                if let Err(e) = sender_clone.send(Ok(resp2)).await {
-                    tracing::error!("Error sending error: {}", e);
+
+                    let mut resp2 = response.clone();
+                    resp2.choices = finished_choices;
+                    if let Err(e) = sender_clone.send(Ok(resp2)).await {
+                        tracing::error!("Error sending error: {}", e);
+                    }
                 }
             }
 
