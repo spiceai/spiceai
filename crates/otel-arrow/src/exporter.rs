@@ -20,13 +20,13 @@ use opentelemetry::metrics::MetricsError;
 use opentelemetry_sdk::metrics::{
     data::{ResourceMetrics, Temporality},
     exporter::PushMetricsExporter,
-    reader::{AggregationSelector, DefaultAggregationSelector, TemporalitySelector},
+    reader::{AggregationSelector, TemporalitySelector},
     Aggregation, InstrumentKind,
 };
 
 #[async_trait]
-pub trait ArrowExporter: Send + Sync + 'static {
-    async fn export(&self, record: RecordBatch) -> Result<(), MetricsError>;
+pub trait ArrowExporter: AggregationSelector + TemporalitySelector + Send + Sync + 'static {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError>;
 
     async fn force_flush(&self) -> Result<(), MetricsError>;
 
@@ -35,27 +35,23 @@ pub trait ArrowExporter: Send + Sync + 'static {
 
 pub struct OtelArrowExporter<E: ArrowExporter> {
     exporter: E,
-    aggregation_selector: Box<dyn AggregationSelector>,
 }
 
 impl<E: ArrowExporter> OtelArrowExporter<E> {
     pub fn new(exporter: E) -> Self {
-        OtelArrowExporter {
-            exporter,
-            aggregation_selector: Box::new(DefaultAggregationSelector::new()),
-        }
+        OtelArrowExporter { exporter }
     }
 }
 
 impl<E: ArrowExporter> TemporalitySelector for OtelArrowExporter<E> {
-    fn temporality(&self, _kind: InstrumentKind) -> Temporality {
-        Temporality::Cumulative
+    fn temporality(&self, kind: InstrumentKind) -> Temporality {
+        self.exporter.temporality(kind)
     }
 }
 
 impl<E: ArrowExporter> AggregationSelector for OtelArrowExporter<E> {
     fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
-        self.aggregation_selector.aggregation(kind)
+        self.exporter.aggregation(kind)
     }
 }
 
@@ -66,10 +62,10 @@ impl<E: ArrowExporter> PushMetricsExporter for OtelArrowExporter<E> {
     }
 
     async fn force_flush(&self) -> Result<(), MetricsError> {
-        todo!()
+        self.exporter.force_flush().await
     }
 
     fn shutdown(&self) -> Result<(), MetricsError> {
-        todo!()
+        self.exporter.shutdown()
     }
 }

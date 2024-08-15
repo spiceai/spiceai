@@ -17,5 +17,6 @@ limitations under the License.
 mod schema;
 pub use schema::*;
 
+mod converter;
 pub mod error;
 mod exporter;

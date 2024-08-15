@@ -226,11 +226,11 @@ pub enum AttributeValueType {
 }
 
 impl AttributeValueType {
-    fn to_u8(self) -> u8 {
+    pub fn to_u8(self) -> u8 {
         self as u8
     }
 
-    fn from_u8(value: u8) -> Option<AttributeValueType> {
+    pub fn from_u8(value: u8) -> Option<AttributeValueType> {
         match value {
             1 => Some(AttributeValueType::Str),
             2 => Some(AttributeValueType::Int),
