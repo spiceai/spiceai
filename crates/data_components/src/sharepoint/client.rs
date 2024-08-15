@@ -77,7 +77,7 @@ pub struct SharepointClient {
 }
 
 impl SharepointClient {
-    pub fn new_from_client(client: Arc<GraphClient>) -> Self {
+    pub fn new(client: Arc<GraphClient>) -> Self {
         Self { client: client }
     }
 

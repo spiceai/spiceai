@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
+use data_components::sharepoint::client::SharepointClient;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use graph_rs_sdk::{
     error::AuthorizationFailure,
     identity::{AuthorizationCodeCredential, ConfidentialClientApplication},
@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -53,7 +53,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Sharepoint {
-    _client: Arc<GraphClient>,
+    client: Arc<GraphClient>,
 }
 
 /// Create a [`GraphClient`] from a client authorization code (i.e. OAuth 2.0 authorization code flow).
@@ -145,7 +145,7 @@ impl Sharepoint {
             }?;
 
         Ok(Sharepoint {
-            _client: Arc::new(graph_client),
+            client: Arc::new(graph_client),
         })
     }
 }
@@ -209,11 +209,20 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
+        _dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        Ok(Arc::new(SharepointClient::new(Arc::clone(&self.client))))
+    }
+
+    async fn metadata_provider(
+        &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let _table_reference = TableReference::from(dataset.path());
-        Err(DataConnectorError::UnableToConnectTlsError {
-            dataconnector: "sharepoint".to_string(),
-        })
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        if !dataset.has_metadata_table {
+            return None;
+        }
+        Some(Ok(Arc::new(SharepointClient::new(Arc::clone(
+            &self.client,
+        )))))
     }
 }
