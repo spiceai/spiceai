@@ -49,6 +49,7 @@ flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
+graph-rs-sdk = { version = "2.0.1", optional = true }
 headers-accept = "0.1.3"
 http = "1.1.0"
 http-body-util = "0.1.2"
@@ -144,6 +145,7 @@ postgres = [
   "data_components/postgres",
   "datafusion-table-providers/postgres",
 ]
+sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snowflake = [
   "dep:snowflake-api",
   "db_connection_pool/snowflake",
