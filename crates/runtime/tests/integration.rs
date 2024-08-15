@@ -114,6 +114,7 @@ where
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
+    println!("Query: {query}");
     assert_batches_eq!(expected_plan, &plan_results);
 
     // Check the result
