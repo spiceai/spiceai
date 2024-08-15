@@ -171,10 +171,9 @@ impl Model {
                 let from = &self.from;
                 if let Some(stripped) = from.strip_prefix(&format!("{p}/")) {
                     Some(stripped.to_string())
-                } else if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
-                    Some(stripped.to_string())
                 } else {
-                    None
+                    from.strip_prefix(&format!("{p}:"))
+                        .map(std::string::ToString::to_string)
                 }
             }
             None => None,
