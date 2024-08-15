@@ -17,14 +17,20 @@ limitations under the License.
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
-use std::{any::Any, pin::Pin, sync::Arc};
+use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
 use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
-    physical_plan::{empty::EmptyExec, ExecutionPlan},
+    physical_plan::{
+        empty::EmptyExec,
+        insert::{DataSink, DataSinkExec},
+        metrics::MetricsSet,
+        DisplayAs, DisplayFormatType, ExecutionPlan,
+    },
 };
 use futures::Future;
 
@@ -133,9 +139,54 @@ impl TableProvider for SinkConnector {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
         _overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(SinkDataSink::new()),
+            self.schema(),
+            None,
+        )) as _)
+    }
+}
+
+#[derive(Clone)]
+struct SinkDataSink {}
+
+#[async_trait]
+impl DataSink for SinkDataSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    async fn write_all(
+        &self,
+        _data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> datafusion::common::Result<u64> {
+        Ok(0)
+    }
+}
+
+impl SinkDataSink {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl std::fmt::Debug for SinkDataSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "SinkDataSink")
+    }
+}
+
+impl DisplayAs for SinkDataSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "SinkDataSink")
     }
 }
