@@ -161,13 +161,22 @@ impl Model {
     /// - `openai`
     ///    - Prefix: `openai`
     ///    - Source: None
+    /// - `openai:gpt-4o`
+    ///    - Prefix: `openai`
+    ///    - Source: `gpt-4o`
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_source() {
-            Some(p) => self
-                .from
-                .strip_prefix(&format!("{p}/"))
-                .map(ToString::to_string),
+            Some(p) => {
+                let from = &self.from;
+                if let Some(stripped) = from.strip_prefix(&format!("{p}/")) {
+                    Some(stripped.to_string())
+                } else if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
+                    Some(stripped.to_string())
+                } else {
+                    None
+                }
+            }
             None => None,
         }
     }
