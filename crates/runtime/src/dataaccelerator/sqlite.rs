@@ -74,15 +74,15 @@ impl SqliteAccelerator {
         if !dataset.is_file_accelerated() {
             return None;
         }
-        let mut acceleration = dataset.acceleration.clone()?;
 
-        acceleration
-            .params
-            .insert("data_directory".to_string(), spice_data_base_path());
+        let acceleration = dataset.acceleration.as_ref()?;
+        let mut acceleration_params = acceleration.params.clone();
+
+        acceleration_params.insert("data_directory".to_string(), spice_data_base_path());
 
         Some(
             self.sqlite_factory
-                .sqlite_file_path(&dataset.name.to_string(), &acceleration.params),
+                .sqlite_file_path(&dataset.name.to_string(), &acceleration_params),
         )
     }
 }
