@@ -47,10 +47,6 @@ pub mod mysql;
 pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-
-pub mod cdc;
-pub mod delete;
-pub mod object;
 #[cfg(feature = "sharepoint")]
 pub mod sharepoint;
 #[cfg(feature = "snowflake")]
@@ -60,6 +56,10 @@ pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod unity_catalog;
+
+pub mod cdc;
+pub mod delete;
+pub mod object;
 
 #[async_trait]
 pub trait Read: Send + Sync {
