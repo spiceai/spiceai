@@ -41,7 +41,7 @@ arrow-json = "52.2.0"
 arrow-ipc = "52.2.0"
 parquet = "52.2.0"
 arrow-odbc = "11.2.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "48173bdee3d3be04dcc579b3211662e359b72734" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "9b0f8caa3be0eb97ec35e0abebb31d016821035d" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
 base64 = "0.22.1"
