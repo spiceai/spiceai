@@ -53,6 +53,7 @@ use crate::execution_plan::TableScanParams;
 mod metrics;
 pub mod refresh;
 pub mod refresh_task;
+pub mod federation;
 mod refresh_task_runner;
 
 #[derive(Debug, Snafu)]
@@ -496,6 +497,8 @@ impl Drop for AcceleratedTable {
         }
     }
 }
+
+
 
 #[async_trait]
 impl TableProvider for AcceleratedTable {
