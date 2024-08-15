@@ -14,8 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod schema;
-pub use schema::*;
+use std::fmt::Display;
 
-pub mod error;
-mod exporter;
+#[derive(Debug)]
+pub enum Error {
+    Other(Box<dyn std::error::Error>),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<Box<dyn std::error::Error>> for Error {
+    fn from(error: Box<dyn std::error::Error>) -> Self {
+        Error::Other(error)
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Other(err) => write!(f, "Error: {err}"),
+        }
+    }
+}

@@ -10,3 +10,6 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+async-trait.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true

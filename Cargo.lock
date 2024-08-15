@@ -6962,6 +6962,9 @@ name = "otel-arrow"
 version = "0.17.2-beta"
 dependencies = [
  "arrow",
+ "async-trait",
+ "opentelemetry 0.24.0",
+ "opentelemetry_sdk 0.24.1",
 ]
 
 [[package]]
