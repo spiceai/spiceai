@@ -42,14 +42,13 @@ struct LastModifiedBy {
     user: User,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Folder {
     child_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct DriveItemResponse {
     pub value: Vec<DriveItem>,
 
@@ -68,7 +67,7 @@ pub(crate) struct DriveItem {
     created_date_time: String,
     c_tag: String,
     e_tag: String,
-    folder: Folder,
+    folder: Option<Folder>,
     id: String,
     last_modified_by: LastModifiedBy,
     last_modified_date_time: String,
@@ -94,7 +93,7 @@ pub fn drive_item_table_schema() -> arrow::datatypes::Schema {
         arrow::datatypes::Field::new(
             "folder_child_count",
             arrow::datatypes::DataType::UInt32,
-            false,
+            true,
         ),
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Utf8, false),
         arrow::datatypes::Field::new(
@@ -144,9 +143,9 @@ pub(crate) fn drive_items_to_record_batch(drive_items: Vec<DriveItem>) -> ArrowR
         .collect();
     let c_tag: Vec<&str> = drive_items.iter().map(|item| item.c_tag.as_str()).collect();
     let e_tag: Vec<&str> = drive_items.iter().map(|item| item.e_tag.as_str()).collect();
-    let folder_child_count: Vec<u32> = drive_items
+    let folder_child_count: Vec<Option<u32>> = drive_items
         .iter()
-        .map(|item| item.folder.child_count)
+        .map(|item| item.folder.clone().map(|f| f.child_count))
         .collect();
     let id: Vec<&str> = drive_items.iter().map(|item| item.id.as_str()).collect();
     let last_modified_by_id: Vec<&str> = drive_items

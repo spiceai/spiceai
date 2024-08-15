@@ -40,6 +40,7 @@ use futures::{Stream, StreamExt};
 use graph_rs_sdk::{
     default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient, GraphClient, GraphFailure,
 };
+use serde_json::Value;
 use snafu::ResultExt;
 
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
