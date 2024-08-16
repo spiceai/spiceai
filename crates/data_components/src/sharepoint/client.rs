@@ -44,7 +44,10 @@ use snafu::ResultExt;
 
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
 
-use super::drive_items::{drive_item_table_schema, DriveItemResponse};
+use super::{
+    drive_items::{drive_item_table_schema, DriveItemResponse},
+    error::Error,
+};
 
 /// Represents all the ways a Sharepoint [Drive](https://learn.microsoft.com/en-us/graph/api/resources/drive?view=graph-rest-1.0) can be identified.
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -57,11 +60,6 @@ pub enum DrivePtr {
     Me,
 }
 
-enum DriveApi {
-    Id(DrivesIdApiClient),
-    Default(DefaultDriveApiClient),
-}
-
 /// Represents all the ways a Sharepoint [DriveItem](https://learn.microsoft.com/en-us/graph/api/resources/driveitem?view=graph-rest-1.0) can be identified.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub enum DriveItemPtr {
@@ -72,13 +70,99 @@ pub enum DriveItemPtr {
     Root,
 }
 
+/// Parse a spicepod dataset's `from` string into its [`DrivePtr`] and [`DriveItemPtr`] components.
+///
+/// The input string is expected to follow the format:
+/// `sharepoint:<drive_type>:<drive_id>/<item_type>:<item_value>`.
+///
+/// - `<drive_type>` can be "me", "drive", "user", or "group".
+/// - `<drive_id>` (optional) is a string identifier corresponding to the drive type. Only empty if `drive_type` is "me".
+/// - `<item_type>` can be "root", "item", or "path".
+/// - `<item_value>` is a string identifier or path corresponding to the item type. Only empty if `drive_type` is "root".
+///
+/// # Returns
+///
+/// A `Result` containing a tuple `(DrivePtr, DriveItemPtr)` if the parsing is successful,
+/// or an `Error` if the input format is invalid.
+///
+/// # Errors
+///
+/// This function will return an `Error::DriveFormatError` if the input string does not match
+/// the expected format or contains an unknown `drive_type` or `item_type`.
+///
+/// # Example Formats
+///
+/// - `"sharepoint:drive:b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd/id:01KLLPFP5RRWHNEMUG75BKNGSRXGDRL5C4"`
+/// - `"sharepoint:me/root"`
+/// - `"sharepoint:user:48d31887-5fad-4d73-a9f5-3c356e68a038/path:/documents/reports"`
+/// ```
+pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
+    let (drive, item) = from
+        .trim_start_matches("sharepoint:")
+        .split_once('/')
+        .ok_or(Error::DriveFormatError {
+            input: from.to_string(),
+        })?;
+
+    let drive_ptr = match drive.split_once(':') {
+        None => {
+            if drive != "me" {
+                return Err(Error::DriveFormatError {
+                    input: drive.to_string(),
+                });
+            };
+            DrivePtr::Me
+        }
+        Some(("drive", id)) => DrivePtr::DriveId(id.to_string()),
+        Some(("user", id)) => DrivePtr::UserId(id.to_string()),
+        Some(("group", id)) => DrivePtr::GroupId(id.to_string()),
+        _ => {
+            return Err(Error::DriveFormatError {
+                input: drive.to_string(),
+            })
+        }
+    };
+
+    let item_ptr = match item.split_once(':') {
+        None => {
+            if item != "root" {
+                return Err(Error::DriveFormatError {
+                    input: item.to_string(),
+                });
+            };
+            DriveItemPtr::Root
+        }
+        Some(("id", id)) => DriveItemPtr::ItemId(id.to_string()),
+        Some(("path", path)) => DriveItemPtr::ItemPath(path.to_string()),
+        _ => {
+            return Err(Error::DriveFormatError {
+                input: item.to_string(),
+            })
+        }
+    };
+
+    Ok((drive_ptr, item_ptr))
+}
+
+enum DriveApi {
+    Id(DrivesIdApiClient),
+    Default(DefaultDriveApiClient),
+}
+
 pub struct SharepointClient {
     client: Arc<GraphClient>,
+    drive: DrivePtr,
+    drive_item: DriveItemPtr,
 }
 
 impl SharepointClient {
-    pub fn new(client: Arc<GraphClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<GraphClient>, from: &str) -> Result<Self, Error> {
+        let (drive, drive_item) = parse_from(from)?;
+        Ok(Self {
+            client,
+            drive,
+            drive_item,
+        })
     }
 
     #[must_use]
@@ -110,8 +194,8 @@ impl TableProvider for SharepointClient {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(SharepointListExec::new(
             Arc::clone(&self.client),
-            &DrivePtr::Me,
-            &DriveItemPtr::Root,
+            &self.drive,
+            &self.drive_item,
             projection,
         )?))
     }
@@ -173,16 +257,21 @@ impl SharepointListExec {
         let req = match Self::drive_client(graph, drive) {
             DriveApi::Id(client) => match drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),
-                DriveItemPtr::ItemPath(path) => client.item_by_path(path).list_children(),
+                DriveItemPtr::ItemPath(path) => {
+                    client.item_by_path(format!(":{path}:")).list_children()
+                }
                 DriveItemPtr::Root => client.item_by_path("").list_children(),
             },
             DriveApi::Default(client) => match drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),
-                DriveItemPtr::ItemPath(path) => client.item_by_path(path).list_children(),
+                DriveItemPtr::ItemPath(path) => {
+                    client.item_by_path(format!(":{path}:")).list_children()
+                }
                 DriveItemPtr::Root => client.item_by_path("").list_children(),
             },
         };
 
+        println!("req={}", req.url());
         req.paging().stream::<DriveItemResponse>()
     }
 }

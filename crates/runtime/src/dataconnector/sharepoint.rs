@@ -30,7 +30,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
+    UnableToGetReadProviderSnafu,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -209,9 +212,15 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Arc::new(SharepointClient::new(Arc::clone(&self.client))))
+        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
+            .boxed()
+            .context(UnableToGetReadProviderSnafu {
+                dataconnector: "sharepoint",
+            })?;
+
+        Ok(Arc::new(client))
     }
 
     async fn metadata_provider(
@@ -221,8 +230,14 @@ impl DataConnector for Sharepoint {
         if !dataset.has_metadata_table {
             return None;
         }
-        Some(Ok(Arc::new(SharepointClient::new(Arc::clone(
-            &self.client,
-        )))))
+
+        match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
+            .boxed()
+            .context(UnableToGetReadProviderSnafu {
+                dataconnector: "sharepoint",
+            }) {
+            Err(e) => Some(Err(e)),
+            Ok(client) => Some(Ok(Arc::new(client))),
+        }
     }
 }

@@ -52,16 +52,10 @@ pub(crate) async fn get(
 ) -> Response {
     match service.as_str() {
         "sharepoint" => {
-            println!("Sharing!!");
-            let state = SharepointState::new(params.state);
-            (
-                status::StatusCode::OK,
-                format!(
-                    "Sharepoint is good. Code={}. State={:#?}!!",
-                    params.code, state
-                ),
-            )
-                .into_response()
+            // let state = SharepointState::new(params.state);
+            println!("Here's the code={}", params.code);
+
+            (status::StatusCode::OK, "Sharepoint is good!!").into_response()
         }
         s => (
             status::StatusCode::BAD_REQUEST,

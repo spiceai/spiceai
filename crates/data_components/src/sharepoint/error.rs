@@ -17,4 +17,7 @@ limitations under the License.
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
-pub enum Error {}
+pub enum Error {
+    #[snafu(display("Invalid drive format: {}", input))]
+    DriveFormatError { input: String },
+}
