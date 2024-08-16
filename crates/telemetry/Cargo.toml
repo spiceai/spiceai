@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "telemetry"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+globset.workspace = true
+reqwest.workspace = true
+runtime = { path = "../runtime" }
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true

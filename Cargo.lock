@@ -9631,6 +9631,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "telemetry"
+version = "0.17.2-beta"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "futures",
+ "globset",
+ "reqwest 0.12.5",
+ "runtime",
+ "serde",
+ "serde_json",
+ "snafu 0.8.4",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
