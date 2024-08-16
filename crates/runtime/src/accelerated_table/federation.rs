@@ -1,42 +1,47 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-use data_components::sandwich::SandwichTableProvider;
+use data_components::poly::PolyTableProvider;
 use datafusion::datasource::TableType;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::{datasource::TableProvider, logical_expr::TableSource};
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
 };
+use uuid::Uuid;
+
+use crate::component::dataset::acceleration::ZeroResultsAction;
 
 use super::AcceleratedTable;
 
 impl AcceleratedTable {
     fn get_federation_provider_for_accelerator(&self) -> Option<Arc<dyn FederationProvider>> {
-        let sandwich = self
+        let poly = self
             .accelerator
             .as_any()
-            .downcast_ref::<SandwichTableProvider>()?;
+            .downcast_ref::<PolyTableProvider>()?;
 
-        Some(Arc::new(sandwich.clone()))
+        Some(Arc::new(poly.clone()))
     }
 
     fn create_federated_table_source(&self) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
         let schema = Arc::clone(&self.schema());
         let fed_provider = Arc::new(FederationProviderAdapter::new(
-            "test".to_string(),
-            self.get_federation_provider_for_accelerator().unwrap(),
+            self.get_federation_provider_for_accelerator()
+                .ok_or(DataFusionError::Execution(format!(
+                    "Unable to get federated provider for accelerator {}",
+                    self.dataset_name
+                )))?,
+            self.zero_results_action != ZeroResultsAction::UseSource,
         ));
-        Ok(Arc::new(SomeTableSource::new_with_schema(
-            fed_provider,
-            schema,
-        )?))
+        Ok(Arc::new(
+            AcceleratedTableFederatedTableSource::new_with_schema(fed_provider, schema)?,
+        ))
     }
 
     pub fn create_federated_table_provider(
         self: Arc<Self>,
     ) -> DataFusionResult<FederatedTableProviderAdaptor> {
-        dbg!("here");
         let table_source = self.create_federated_table_source()?;
         Ok(FederatedTableProviderAdaptor::new_with_provider(
             table_source,
@@ -46,25 +51,29 @@ impl AcceleratedTable {
 }
 
 pub struct FederationProviderAdapter {
-    pub name: String,
     pub inner: Arc<dyn FederationProvider>,
+    pub enabled: bool,
 }
 
 impl FederationProviderAdapter {
-    fn new(name: String, inner: Arc<dyn FederationProvider>) -> Self {
-        Self { name, inner }
+    fn new(inner: Arc<dyn FederationProvider>, enabled: bool) -> Self {
+        Self { inner, enabled }
     }
 }
 
 impl FederationProvider for FederationProviderAdapter {
     fn name(&self) -> &str {
-        &self.name
+        "FederationProviderForAcceleratedDataset"
     }
 
     fn compute_context(&self) -> Option<String> {
-        let a = self.inner.compute_context();
-        dbg!(&a);
-        a
+        if !self.enabled {
+            return None;
+        }
+
+        // To ensure this is unique
+        // This will need to call the inner.compute_context to enable inter-table
+        Some(Uuid::new_v4().to_string())
     }
 
     fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
@@ -72,12 +81,12 @@ impl FederationProvider for FederationProviderAdapter {
     }
 }
 
-pub struct SomeTableSource {
+pub struct AcceleratedTableFederatedTableSource {
     provider: Arc<FederationProviderAdapter>,
     schema: SchemaRef,
 }
 
-impl SomeTableSource {
+impl AcceleratedTableFederatedTableSource {
     pub fn new_with_schema(
         provider: Arc<FederationProviderAdapter>,
         schema: SchemaRef,
@@ -86,13 +95,13 @@ impl SomeTableSource {
     }
 }
 
-impl FederatedTableSource for SomeTableSource {
+impl FederatedTableSource for AcceleratedTableFederatedTableSource {
     fn federation_provider(&self) -> Arc<dyn FederationProvider> {
         Arc::clone(&self.provider) as Arc<dyn FederationProvider>
     }
 }
 
-impl TableSource for SomeTableSource {
+impl TableSource for AcceleratedTableFederatedTableSource {
     fn as_any(&self) -> &dyn Any {
         self
     }

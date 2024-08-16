@@ -58,7 +58,7 @@ pub mod unity_catalog;
 pub mod cdc;
 pub mod delete;
 pub mod object;
-pub mod sandwich;
+pub mod poly;
 
 #[async_trait]
 pub trait Read: Send + Sync {

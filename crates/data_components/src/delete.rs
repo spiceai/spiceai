@@ -20,7 +20,7 @@ use datafusion::{
     },
 };
 
-use crate::sandwich::SandwichTableProvider;
+use crate::poly::PolyTableProvider;
 
 #[async_trait]
 pub trait DeletionTableProvider: TableProvider {
@@ -145,7 +145,7 @@ impl DeletionTableProviderAdapter {
 pub fn get_deletion_provider(
     from: Arc<dyn TableProvider>,
 ) -> Option<Arc<dyn DeletionTableProvider>> {
-    if let Some(p) = from.as_any().downcast_ref::<SandwichTableProvider>() {
+    if let Some(p) = from.as_any().downcast_ref::<PolyTableProvider>() {
         return Some(Arc::new(p.clone()));
     }
     if let Some(p) = from.as_any().downcast_ref::<DeletionTableProviderAdapter>() {

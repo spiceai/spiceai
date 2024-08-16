@@ -409,7 +409,7 @@ impl DataFusion {
                             Arc::new(
                                 Arc::new(accelerated_table)
                                     .create_federated_table_provider()
-                                    .unwrap(),
+                                    .context(UnableToRegisterTableToDataFusionSnafu)?,
                             ),
                         )
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -771,7 +771,7 @@ impl DataFusion {
                 Arc::new(
                     Arc::new(accelerated_table)
                         .create_federated_table_provider()
-                        .unwrap(),
+                        .context(UnableToRegisterTableToDataFusionSnafu)?,
                 ),
             )
             .context(UnableToRegisterTableToDataFusionSnafu)?;

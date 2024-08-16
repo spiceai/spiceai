@@ -16,19 +16,19 @@ use datafusion_federation::{FederatedTableProviderAdaptor, FederationProvider};
 use crate::delete::{get_deletion_provider, DeletionTableProvider};
 
 #[derive(Clone)]
-pub struct SandwichTableProvider {
+pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn TableProvider>,
     fed: Arc<dyn TableProvider>,
 }
 
-impl SandwichTableProvider {
+impl PolyTableProvider {
     pub fn new(
         write: Arc<dyn TableProvider>,
         delete: Arc<dyn TableProvider>,
         fed: Arc<dyn TableProvider>,
     ) -> Self {
-        SandwichTableProvider { write, delete, fed }
+        PolyTableProvider { write, delete, fed }
     }
 
     fn get_federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
@@ -40,22 +40,23 @@ impl SandwichTableProvider {
 }
 
 #[async_trait]
-impl DeletionTableProvider for SandwichTableProvider {
+impl DeletionTableProvider for PolyTableProvider {
     async fn delete_from(
         &self,
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let delete = get_deletion_provider(Arc::clone(&self.delete))
-            .ok_or(DataFusionError::Plan("Not implemented".to_string()))?;
+        let delete = get_deletion_provider(Arc::clone(&self.delete)).ok_or(
+            DataFusionError::Plan("No deletion provider found".to_string()),
+        )?;
 
         delete.delete_from(state, filters).await
     }
 }
 
-impl FederationProvider for SandwichTableProvider {
+impl FederationProvider for PolyTableProvider {
     fn name(&self) -> &str {
-        "SandwichFederationProvider"
+        "FederationProviderForPolyTableProvider"
     }
 
     fn compute_context(&self) -> Option<String> {
@@ -69,7 +70,7 @@ impl FederationProvider for SandwichTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for SandwichTableProvider {
+impl TableProvider for PolyTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
