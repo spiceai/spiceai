@@ -116,3 +116,6 @@ arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdf
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
+
+[patch."https://github.com/datafusion-contrib/datafusion-table-providers.git"]
+datafusion-table-providers = { path = "../../datafusion-contrib/datafusion-table-providers" }

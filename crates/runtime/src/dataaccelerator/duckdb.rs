@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
+use data_components::{delete::DeletionTableProviderAdapter, sandwich::SandwichTableProvider};
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -106,8 +106,13 @@ impl DataAccelerator for DuckDBAccelerator {
         };
 
         let duckdb_writer = Arc::new(duckdb_writer.clone());
+        let cloned_writer = Arc::clone(&duckdb_writer);
 
         let deletion_adapter = DeletionTableProviderAdapter::new(duckdb_writer);
+
+        SandwichTableProvider::new(cloned_writer, Arc::new(deletion_adapter), duckdb_writer);
+
+
         Ok(Arc::new(deletion_adapter))
     }
 

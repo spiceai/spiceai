@@ -1,6 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
+use data_components::delete::get_deletion_provider;
 use datafusion::datasource::TableType;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::{datasource::TableProvider, logical_expr::TableSource};
@@ -12,9 +13,16 @@ use super::AcceleratedTable;
 
 impl AcceleratedTable {
     fn get_federation_provider_for_accelerator(&self) -> Option<Arc<dyn FederationProvider>> {
-        let provider = self.accelerator.as_any().downcast_ref::<_>()?;
+        if let Some(deletion_provider) = get_deletion_provider(Arc::clone(&self.accelerator)) {
+            if let Some(federated) = deletion_provider
+                .as_any()
+                .downcast_ref::<Arc<FederatedTableProviderAdaptor>>()
+            {
+                return Some(federated.source.federation_provider());
+            }
+        }
 
-        Some(Arc::clone(provider) as Arc<dyn FederationProvider>)
+        todo!()
     }
 
     fn create_federated_table_source(&self) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
