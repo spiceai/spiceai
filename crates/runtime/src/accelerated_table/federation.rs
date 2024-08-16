@@ -1,5 +1,6 @@
 use std::{any::Any, sync::Arc};
 
+use crate::component::dataset::acceleration::ZeroResultsAction;
 use arrow::datatypes::SchemaRef;
 use data_components::poly::PolyTableProvider;
 use datafusion::datasource::TableType;
@@ -8,9 +9,6 @@ use datafusion::{datasource::TableProvider, logical_expr::TableSource};
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
 };
-use uuid::Uuid;
-
-use crate::component::dataset::acceleration::ZeroResultsAction;
 
 use super::AcceleratedTable;
 
@@ -67,16 +65,13 @@ impl FederationProvider for FederationProviderAdapter {
     }
 
     fn compute_context(&self) -> Option<String> {
-        if !self.enabled {
-            return None;
-        }
-
-        // To ensure this is unique
-        // This will need to call the inner.compute_context to enable inter-table
-        Some(Uuid::new_v4().to_string())
+        self.inner.compute_context()
     }
 
     fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
+        if !self.enabled {
+            return None;
+        }
         self.inner.analyzer()
     }
 }
