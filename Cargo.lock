@@ -6958,6 +6958,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "otel-arrow"
+version = "0.17.2-beta"
+dependencies = [
+ "arrow",
+]
+
+[[package]]
 name = "outref"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8317,6 +8324,7 @@ dependencies = [
  "opentelemetry-prometheus",
  "opentelemetry-proto",
  "opentelemetry_sdk 0.24.1",
+ "otel-arrow",
  "pin-project",
  "prometheus",
  "prometheus-parse",

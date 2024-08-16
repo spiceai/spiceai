@@ -14,6 +14,7 @@ members = [
   "crates/ns_lookup",
   "crates/util",
   "crates/spice_cloud",
+  "crates/otel-arrow",
   "tools/flightpublisher/",
   "tools/flightsubscriber/",
   "tools/spicepodschema/",
