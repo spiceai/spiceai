@@ -17,12 +17,12 @@ limitations under the License.
 #![allow(clippy::struct_field_names)]
 
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, ListBuilder,
-    StringBuilder, StructArray, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
-    UInt8Builder,
+    Array, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Builder,
+    Int64Builder, ListArray, ListBuilder, StringBuilder, StructArray, TimestampNanosecondBuilder,
+    UInt32Builder, UInt64Builder, UInt8Builder,
 };
 use arrow::record_batch::RecordBatch;
-use arrow_buffer::NullBufferBuilder;
+use arrow_buffer::{BufferBuilder, NullBufferBuilder, OffsetBuffer};
 use opentelemetry::metrics::MetricsError;
 use opentelemetry::InstrumentationLibrary;
 use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    attributes_fields, histogram_data_fields, number_fields, resource_fields, scope_fields,
-    temporality_to_i64,
+    attribute_list_field, attribute_struct_fields, histogram_data_fields, number_fields,
+    resource_fields, scope_fields, temporality_to_i32,
 };
 
 pub struct OtelToArrowConverter {
@@ -45,7 +45,7 @@ pub struct OtelToArrowConverter {
     name_builder: StringBuilder,
     description_builder: StringBuilder,
     unit_builder: StringBuilder,
-    aggregation_temporality_builder: Int64Builder,
+    aggregation_temporality_builder: Int32Builder,
     is_monotonic_builder: BooleanBuilder,
     flags_builder: UInt32Builder,
     attributes_builder: AttributesBuilder,
@@ -70,6 +70,11 @@ impl DataNumberBuilder {
 
     fn append(&mut self, is_valid: bool) {
         self.null_buffer_builder.append(is_valid);
+
+        if !is_valid {
+            self.int_builder.append_null();
+            self.double_builder.append_null();
+        }
     }
 
     fn finish(&mut self) -> StructArray {
@@ -86,7 +91,7 @@ impl DataNumberBuilder {
 }
 
 struct DataHistogramBuilder {
-    count_builder: Int64Builder,
+    count_builder: UInt64Builder,
     sum_builder: Float64Builder,
     bucket_counts_builder: ListBuilder<UInt64Builder>,
     // explicit_bounds specifies buckets with explicitly defined bounds for values.
@@ -104,7 +109,7 @@ struct DataHistogramBuilder {
 impl DataHistogramBuilder {
     fn with_capacity(capacity: usize) -> Self {
         DataHistogramBuilder {
-            count_builder: Int64Builder::with_capacity(capacity),
+            count_builder: UInt64Builder::with_capacity(capacity),
             sum_builder: Float64Builder::with_capacity(capacity),
             bucket_counts_builder: ListBuilder::new(UInt64Builder::with_capacity(capacity)),
             explicit_bounds_builder: ListBuilder::new(Float64Builder::with_capacity(capacity)),
@@ -116,6 +121,15 @@ impl DataHistogramBuilder {
 
     fn append(&mut self, is_valid: bool) {
         self.null_buffer_builder.append(is_valid);
+
+        if !is_valid {
+            self.count_builder.append_null();
+            self.sum_builder.append_null();
+            self.bucket_counts_builder.append_null();
+            self.explicit_bounds_builder.append_null();
+            self.min_builder.append_null();
+            self.max_builder.append_null();
+        }
     }
 
     fn finish(&mut self) -> StructArray {
@@ -218,10 +232,15 @@ struct AttributesBuilder {
     bytes_builder: BinaryBuilder,
     ser_builder: BinaryBuilder,
     null_buffer_builder: NullBufferBuilder,
+
+    list_offsets_builder: BufferBuilder<i32>,
+    list_null_buffer_builder: NullBufferBuilder,
 }
 
 impl AttributesBuilder {
     fn with_capacity(capacity: usize) -> Self {
+        let mut offsets_builder = BufferBuilder::new(capacity);
+        offsets_builder.append(0);
         AttributesBuilder {
             key_builder: StringBuilder::with_capacity(capacity, capacity),
             type_builder: UInt8Builder::with_capacity(capacity),
@@ -232,14 +251,24 @@ impl AttributesBuilder {
             bytes_builder: BinaryBuilder::with_capacity(capacity, capacity),
             ser_builder: BinaryBuilder::with_capacity(capacity, capacity),
             null_buffer_builder: NullBufferBuilder::new(capacity),
+            list_offsets_builder: offsets_builder,
+            list_null_buffer_builder: NullBufferBuilder::new(capacity),
         }
     }
 
-    fn append(&mut self, is_valid: bool) {
+    fn append_value(&mut self, is_valid: bool) {
         self.null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> StructArray {
+    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_truncation)]
+    fn append(&mut self, is_valid: bool) {
+        self.list_offsets_builder
+            .append(self.key_builder.len() as i32);
+        self.list_null_buffer_builder.append(is_valid);
+    }
+
+    fn finish(&mut self) -> ListArray {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.key_builder.finish()),
             Arc::new(self.type_builder.finish()),
@@ -250,10 +279,22 @@ impl AttributesBuilder {
             Arc::new(self.bytes_builder.finish()),
             Arc::new(self.ser_builder.finish()),
         ];
-        StructArray::new(
-            attributes_fields().into(),
+        let values = StructArray::new(
+            attribute_struct_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
+        );
+
+        let offsets = self.list_offsets_builder.finish();
+        // Safety: Safe by construction
+        let offsets = unsafe { OffsetBuffer::new_unchecked(offsets.into()) };
+        self.list_offsets_builder.append(0);
+
+        ListArray::new(
+            Arc::new(attribute_list_field()),
+            offsets,
+            Arc::new(values),
+            self.list_null_buffer_builder.finish(),
         )
     }
 }
@@ -270,7 +311,7 @@ impl OtelToArrowConverter {
             name_builder: StringBuilder::with_capacity(capacity, capacity),
             description_builder: StringBuilder::with_capacity(capacity, capacity),
             unit_builder: StringBuilder::with_capacity(capacity, capacity),
-            aggregation_temporality_builder: Int64Builder::with_capacity(capacity),
+            aggregation_temporality_builder: Int32Builder::with_capacity(capacity),
             is_monotonic_builder: BooleanBuilder::with_capacity(capacity),
             flags_builder: UInt32Builder::with_capacity(capacity),
             attributes_builder: AttributesBuilder::with_capacity(capacity),
@@ -369,12 +410,12 @@ impl OtelToArrowConverter {
             self.unit_builder.append_value(&metric.unit);
 
             self.aggregation_temporality_builder
-                .append_value(temporality_to_i64(sum.temporality));
+                .append_value(temporality_to_i32(sum.temporality));
             self.is_monotonic_builder.append_value(sum.is_monotonic);
 
             self.flags_builder.append_null();
 
-            self.add_attributes(&data_point.attributes);
+            Self::add_attributes_to_builder(&mut self.attributes_builder, &data_point.attributes);
 
             data_point.value.append(&mut self.data_number_builder);
             self.data_histogram_builder.append(false);
@@ -409,14 +450,13 @@ impl OtelToArrowConverter {
 
             self.flags_builder.append_null();
 
-            self.add_attributes(&data_point.attributes);
+            Self::add_attributes_to_builder(&mut self.attributes_builder, &data_point.attributes);
 
             data_point.value.append(&mut self.data_number_builder);
             self.data_histogram_builder.append(false);
         }
     }
 
-    #[allow(clippy::cast_possible_wrap)]
     fn process_histogram<T: AppendFloat64 + Clone>(
         &mut self,
         histogram: &Histogram<T>,
@@ -441,18 +481,18 @@ impl OtelToArrowConverter {
             self.unit_builder.append_value(&metric.unit);
 
             self.aggregation_temporality_builder
-                .append_value(temporality_to_i64(histogram.temporality));
+                .append_value(temporality_to_i32(histogram.temporality));
             self.is_monotonic_builder.append_null();
 
             self.flags_builder.append_null();
 
-            self.add_attributes(&data_point.attributes);
+            Self::add_attributes_to_builder(&mut self.attributes_builder, &data_point.attributes);
 
             self.data_number_builder.append(false);
 
             self.data_histogram_builder
                 .count_builder
-                .append_value(data_point.count as i64);
+                .append_value(data_point.count);
             data_point
                 .sum
                 .append(&mut self.data_histogram_builder.sum_builder);
@@ -532,11 +572,6 @@ impl OtelToArrowConverter {
             .append_option(scope.schema_url.as_ref());
     }
 
-    fn add_attributes(&mut self, attributes: &[opentelemetry::KeyValue]) {
-        Self::add_attributes_to_builder(&mut self.attributes_builder, attributes);
-        self.attributes_builder.append(true);
-    }
-
     fn add_attributes_to_builder(
         builder: &mut AttributesBuilder,
         attributes: &[opentelemetry::KeyValue],
@@ -601,8 +636,10 @@ impl OtelToArrowConverter {
                     builder.ser_builder.append_null();
                 }
             }
-            builder.append(true);
+            builder.append_value(true);
         }
+
+        builder.append(true);
     }
 }
 

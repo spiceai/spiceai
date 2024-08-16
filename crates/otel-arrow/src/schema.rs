@@ -88,10 +88,10 @@ thread_local! {
     ///              └── AggregationTemporality
     static METRICS_SCHEMA: LazyCell<Arc<Schema>> = LazyCell::new(|| {
         let fields = vec![
-            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), false),
+            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new(
                 "start_time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
                 true,
             ),
             Field::new("resource", DataType::Struct(
@@ -111,7 +111,7 @@ thread_local! {
             Field::new("aggregation_temporality", DataType::Int32, true),
             Field::new("is_monotonic", DataType::Boolean, true),
             Field::new("flags", DataType::UInt32, true),
-            Field::new("attributes", attributes_type(), true),
+            Field::new("attributes", attributes_list_type(), true),
 
             // Only one of these will be set, based on the metric_type.
             // Gauge and Sum will use data_number, Histogram will use data_histogram.
@@ -125,7 +125,7 @@ thread_local! {
 pub(crate) fn resource_fields() -> Vec<Field> {
     vec![
         Field::new("schema_url", DataType::Utf8, true),
-        Field::new("attributes", attributes_type(), true),
+        Field::new("attributes", attributes_list_type(), true),
         Field::new("dropped_attributes_count", DataType::UInt32, true),
     ]
 }
@@ -134,12 +134,12 @@ pub(crate) fn scope_fields() -> Vec<Field> {
     vec![
         Field::new("name", DataType::Utf8, true),
         Field::new("version", DataType::Utf8, true),
-        Field::new("attributes", attributes_type(), true),
+        Field::new("attributes", attributes_list_type(), true),
         Field::new("dropped_attributes_count", DataType::UInt32, true),
     ]
 }
 
-pub(crate) fn attributes_fields() -> Vec<Field> {
+pub(crate) fn attribute_struct_fields() -> Vec<Field> {
     vec![
         Field::new("key", DataType::Utf8, false),
         // AttributeValueType is the Rust enum corresponding to the UInt8 `type`.
@@ -154,8 +154,16 @@ pub(crate) fn attributes_fields() -> Vec<Field> {
     ]
 }
 
-pub(crate) fn attributes_type() -> DataType {
-    DataType::Struct(attributes_fields().into())
+pub(crate) fn attribute_list_field() -> Field {
+    Field::new(
+        "attributes",
+        DataType::Struct(attribute_struct_fields().into()),
+        false,
+    )
+}
+
+pub(crate) fn attributes_list_type() -> DataType {
+    DataType::List(Arc::new(attribute_list_field()))
 }
 
 pub(crate) fn number_fields() -> Vec<Field> {
@@ -175,12 +183,12 @@ pub(crate) fn histogram_data_fields() -> Vec<Field> {
         Field::new("sum", DataType::Float64, true),
         Field::new(
             "bucket_counts",
-            DataType::List(Arc::new(Field::new("item", DataType::UInt64, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
             true,
         ),
         Field::new(
             "explicit_bounds",
-            DataType::List(Arc::new(Field::new("item", DataType::Float64, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
             true,
         ),
         Field::new("min", DataType::Float64, true),
@@ -274,9 +282,9 @@ impl std::fmt::Display for AttributeValueType {
     }
 }
 
-pub(crate) fn temporality_to_i64(
+pub(crate) fn temporality_to_i32(
     temporality: opentelemetry_sdk::metrics::data::Temporality,
-) -> i64 {
+) -> i32 {
     // Based on https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L278
     match temporality {
         opentelemetry_sdk::metrics::data::Temporality::Delta => 1,
