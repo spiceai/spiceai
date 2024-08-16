@@ -50,7 +50,6 @@ impl DuckDBAccelerator {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new()
                 .db_path_param("file")
-                .federated_reader_in_writer(true)
                 .access_mode(AccessMode::ReadWrite),
         }
     }
