@@ -3,10 +3,10 @@ use std::{any::Any, sync::Arc};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::Constraints,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::context::SessionState,
     logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
     prelude::Expr,
@@ -15,6 +15,7 @@ use datafusion_federation::{FederatedTableProviderAdaptor, FederationProvider};
 
 use crate::delete::{get_deletion_provider, DeletionTableProvider};
 
+#[derive(Clone)]
 pub struct SandwichTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn TableProvider>,
@@ -33,7 +34,7 @@ impl SandwichTableProvider {
     fn get_federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
         self.fed
             .as_any()
-            .downcast_ref::<Arc<FederatedTableProviderAdaptor>>()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
             .map(|x| x.source.federation_provider())
     }
 }
@@ -42,7 +43,7 @@ impl SandwichTableProvider {
 impl DeletionTableProvider for SandwichTableProvider {
     async fn delete_from(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let delete = get_deletion_provider(Arc::clone(&self.delete))
@@ -90,7 +91,7 @@ impl TableProvider for SandwichTableProvider {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -100,7 +101,7 @@ impl TableProvider for SandwichTableProvider {
 
     async fn insert_into(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {

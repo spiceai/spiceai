@@ -1,7 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-use data_components::delete::get_deletion_provider;
+use data_components::sandwich::SandwichTableProvider;
 use datafusion::datasource::TableType;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::{datasource::TableProvider, logical_expr::TableSource};
@@ -13,16 +13,12 @@ use super::AcceleratedTable;
 
 impl AcceleratedTable {
     fn get_federation_provider_for_accelerator(&self) -> Option<Arc<dyn FederationProvider>> {
-        if let Some(deletion_provider) = get_deletion_provider(Arc::clone(&self.accelerator)) {
-            if let Some(federated) = deletion_provider
-                .as_any()
-                .downcast_ref::<Arc<FederatedTableProviderAdaptor>>()
-            {
-                return Some(federated.source.federation_provider());
-            }
-        }
+        let sandwich = self
+            .accelerator
+            .as_any()
+            .downcast_ref::<SandwichTableProvider>()?;
 
-        todo!()
+        Some(Arc::new(sandwich.clone()))
     }
 
     fn create_federated_table_source(&self) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
@@ -40,27 +36,12 @@ impl AcceleratedTable {
     pub fn create_federated_table_provider(
         self: Arc<Self>,
     ) -> DataFusionResult<FederatedTableProviderAdaptor> {
+        dbg!("here");
         let table_source = self.create_federated_table_source()?;
         Ok(FederatedTableProviderAdaptor::new_with_provider(
             table_source,
             self,
         ))
-    }
-}
-
-impl FederationProvider for AcceleratedTable {
-    fn name(&self) -> &str {
-        "AcceleratorTableFederatedProvider"
-    }
-
-    fn compute_context(&self) -> Option<String> {
-        // Return uuid for now which doesn't plan to be accelerating
-        Some(uuid::Uuid::new_v4().to_string())
-    }
-
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
-        self.get_federation_provider_for_accelerator()
-            .and_then(|x| x.analyzer())
     }
 }
 
@@ -81,7 +62,9 @@ impl FederationProvider for FederationProviderAdapter {
     }
 
     fn compute_context(&self) -> Option<String> {
-        self.inner.compute_context()
+        let a = self.inner.compute_context();
+        dbg!(&a);
+        a
     }
 
     fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {

@@ -404,7 +404,14 @@ impl DataFusion {
                     );
 
                     self.ctx
-                        .register_table(dataset_table_ref.clone(), Arc::new(accelerated_table))
+                        .register_table(
+                            dataset_table_ref.clone(),
+                            Arc::new(
+                                Arc::new(accelerated_table)
+                                    .create_federated_table_provider()
+                                    .unwrap(),
+                            ),
+                        )
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
@@ -759,7 +766,14 @@ impl DataFusion {
             .await?;
 
         self.ctx
-            .register_table(dataset.name.clone(), Arc::new(accelerated_table))
+            .register_table(
+                dataset.name.clone(),
+                Arc::new(
+                    Arc::new(accelerated_table)
+                        .create_federated_table_provider()
+                        .unwrap(),
+                ),
+            )
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         self.register_metadata_table(&dataset, Arc::clone(&source))

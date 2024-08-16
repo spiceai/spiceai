@@ -50,6 +50,7 @@ impl DuckDBAccelerator {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new()
                 .db_path_param("file")
+                .federated_reader_in_writer(true)
                 .access_mode(AccessMode::ReadWrite),
         }
     }
@@ -105,15 +106,17 @@ impl DataAccelerator for DuckDBAccelerator {
             unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
         };
 
+        let cloned_reader = Arc::clone(&duckdb_writer.clone().read_provider);
         let duckdb_writer = Arc::new(duckdb_writer.clone());
         let cloned_writer = Arc::clone(&duckdb_writer);
 
         let deletion_adapter = DeletionTableProviderAdapter::new(duckdb_writer);
 
-        SandwichTableProvider::new(cloned_writer, Arc::new(deletion_adapter), duckdb_writer);
-
-
-        Ok(Arc::new(deletion_adapter))
+        Ok(Arc::new(SandwichTableProvider::new(
+            cloned_writer,
+            Arc::new(deletion_adapter),
+            cloned_reader,
+        )))
     }
 
     fn prefix(&self) -> &'static str {
