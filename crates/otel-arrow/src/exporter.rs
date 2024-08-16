@@ -32,6 +32,11 @@ pub trait ArrowExporter: AggregationSelector + TemporalitySelector + Send + Sync
 
     async fn force_flush(&self) -> Result<(), MetricsError>;
 
+    /// Shutdown the exporter.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the shutdown couldn't complete successfully.
     fn shutdown(&self) -> Result<(), MetricsError>;
 }
 

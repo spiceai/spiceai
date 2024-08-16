@@ -9271,6 +9271,7 @@ dependencies = [
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
  "opentelemetry_sdk 0.24.1",
+ "otel-arrow",
  "prometheus",
  "reqwest 0.12.5",
  "runtime",

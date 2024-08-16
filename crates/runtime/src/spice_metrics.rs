@@ -17,7 +17,15 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::RecordBatch;
+use async_trait::async_trait;
 use datafusion::sql::TableReference;
+use opentelemetry::metrics::MetricsError;
+use opentelemetry_sdk::metrics::data::Temporality;
+use opentelemetry_sdk::metrics::reader::{
+    AggregationSelector, DefaultAggregationSelector, TemporalitySelector,
+};
+use opentelemetry_sdk::metrics::{Aggregation, InstrumentKind};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -27,6 +35,7 @@ use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
 use crate::secrets::Secrets;
 
@@ -37,6 +46,56 @@ pub enum Error {
 
     #[snafu(display("Error registering metrics table: {source}"))]
     UnableToRegisterToMetricsTable { source: DataFusionError },
+}
+
+pub struct SpiceMetricsExporter {
+    datafusion: Arc<DataFusion>,
+    aggregation_selector: DefaultAggregationSelector,
+}
+
+impl SpiceMetricsExporter {
+    pub fn new(datafusion: Arc<DataFusion>) -> Self {
+        SpiceMetricsExporter {
+            datafusion,
+            aggregation_selector: DefaultAggregationSelector::new(),
+        }
+    }
+}
+
+impl AggregationSelector for SpiceMetricsExporter {
+    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
+        self.aggregation_selector.aggregation(kind)
+    }
+}
+
+impl TemporalitySelector for SpiceMetricsExporter {
+    fn temporality(&self, _kind: InstrumentKind) -> Temporality {
+        Temporality::Cumulative
+    }
+}
+
+#[async_trait]
+impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError> {
+        let data_update = DataUpdate {
+            schema: metrics.schema(),
+            data: vec![metrics],
+            update_type: UpdateType::Append,
+        };
+
+        self.datafusion
+            .write_data(get_metrics_table_reference(), data_update)
+            .await
+            .map_err(|e| MetricsError::Other(e.to_string()))
+    }
+
+    async fn force_flush(&self) -> Result<(), MetricsError> {
+        Ok(())
+    }
+
+    fn shutdown(&self) -> Result<(), MetricsError> {
+        Ok(())
+    }
 }
 
 pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), Error> {

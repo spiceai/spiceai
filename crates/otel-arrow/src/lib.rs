@@ -20,3 +20,4 @@ pub use schema::*;
 mod converter;
 pub mod error;
 mod exporter;
+pub use exporter::*;
