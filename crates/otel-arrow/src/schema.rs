@@ -273,3 +273,14 @@ impl std::fmt::Display for AttributeValueType {
         write!(f, "{s}")
     }
 }
+
+pub(crate) fn temporality_to_i64(
+    temporality: opentelemetry_sdk::metrics::data::Temporality,
+) -> i64 {
+    // Based on https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L278
+    match temporality {
+        opentelemetry_sdk::metrics::data::Temporality::Delta => 1,
+        opentelemetry_sdk::metrics::data::Temporality::Cumulative => 2,
+        _ => panic!("Invalid temporality"),
+    }
+}

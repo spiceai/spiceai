@@ -26,13 +26,14 @@ use arrow::record_batch::RecordBatch;
 use arrow_buffer::NullBufferBuilder;
 use opentelemetry::metrics::MetricsError;
 use opentelemetry::InstrumentationLibrary;
-use opentelemetry_sdk::metrics::data::{Gauge, Metric, ResourceMetrics};
+use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
 use opentelemetry_sdk::Resource;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     attributes_fields, histogram_data_fields, number_fields, resource_fields, scope_fields,
+    temporality_to_i64,
 };
 
 pub struct OtelToArrowConverter {
@@ -89,6 +90,12 @@ struct DataHistogramBuilder {
     count_builder: Int64Builder,
     sum_builder: Float64Builder,
     bucket_counts_builder: ListBuilder<UInt64Builder>,
+    // explicit_bounds specifies buckets with explicitly defined bounds for values.
+    // The boundaries for bucket at index i are:
+    // (-infinity, explicit_bounds[i]] for i == 0
+    // (explicit_bounds[i-1], explicit_bounds[i]] for 0 < i < size(explicit_bounds)
+    // (explicit_bounds[i-1], +infinity) for i == size(explicit_bounds)
+    // The values in the explicit_bounds array must be strictly increasing.
     explicit_bounds_builder: ListBuilder<Float64Builder>,
     min_builder: Float64Builder,
     max_builder: Float64Builder,
@@ -313,21 +320,20 @@ impl OtelToArrowConverter {
     ) -> Result<(), MetricsError> {
         let data = metric.data.as_any();
 
-        // This is unfortunately the only way to downcast a the generic trait object
-        // if let Some(hist) = data.downcast_ref::<Histogram<i64>>() {
-        //     add_histogram_metric(&mut res, hist, description, &scope_labels, name);
-        // } else if let Some(hist) = data.downcast_ref::<Histogram<u64>>() {
-        //     add_histogram_metric(&mut res, hist, description, &scope_labels, name);
-        // } else if let Some(hist) = data.downcast_ref::<Histogram<f64>>() {
-        //     add_histogram_metric(&mut res, hist, description, &scope_labels, name);
-        // } else if let Some(sum) = data.downcast_ref::<Sum<u64>>() {
-        //     add_sum_metric(&mut res, sum, description, &scope_labels, name);
-        // } else if let Some(sum) = data.downcast_ref::<Sum<i64>>() {
-        //     add_sum_metric(&mut res, sum, description, &scope_labels, name);
-        // } else if let Some(sum) = data.downcast_ref::<Sum<f64>>() {
-        //     add_sum_metric(&mut res, sum, description, &scope_labels, name);
-        //} else
-        if let Some(gauge) = data.downcast_ref::<Gauge<u64>>() {
+        // This is unfortunately the only way to downcast a generic trait object
+        if let Some(hist) = data.downcast_ref::<Histogram<i64>>() {
+            self.process_histogram(hist, metric, resource, instrument_scope);
+        } else if let Some(hist) = data.downcast_ref::<Histogram<u64>>() {
+            self.process_histogram(hist, metric, resource, instrument_scope);
+        } else if let Some(hist) = data.downcast_ref::<Histogram<f64>>() {
+            self.process_histogram(hist, metric, resource, instrument_scope);
+        } else if let Some(sum) = data.downcast_ref::<Sum<u64>>() {
+            self.process_sum(sum, metric, resource, instrument_scope);
+        } else if let Some(sum) = data.downcast_ref::<Sum<i64>>() {
+            self.process_sum(sum, metric, resource, instrument_scope);
+        } else if let Some(sum) = data.downcast_ref::<Sum<f64>>() {
+            self.process_sum(sum, metric, resource, instrument_scope);
+        } else if let Some(gauge) = data.downcast_ref::<Gauge<u64>>() {
             self.process_gauge(gauge, metric, resource, instrument_scope);
         } else if let Some(gauge) = data.downcast_ref::<Gauge<i64>>() {
             self.process_gauge(gauge, metric, resource, instrument_scope);
@@ -340,7 +346,43 @@ impl OtelToArrowConverter {
         Ok(())
     }
 
-    fn process_gauge<T: ProcessGaugeData>(
+    fn process_sum<T: AppendDataNumber>(
+        &mut self,
+        sum: &Sum<T>,
+        metric: &Metric,
+        resource: &Resource,
+        instrument_scope: &InstrumentationLibrary,
+    ) {
+        for data_point in &sum.data_points {
+            self.time_unix_nano_builder
+                .append_option(data_point.time.map(system_time_to_nanos));
+            self.start_time_unix_nano_builder
+                .append_option(data_point.start_time.map(system_time_to_nanos));
+
+            self.add_resource(resource);
+            self.add_scope(instrument_scope);
+
+            self.metric_type_builder
+                .append_value(crate::schema::MetricType::Sum.to_u8());
+
+            self.name_builder.append_value(&metric.name);
+            self.description_builder.append_value(&metric.description);
+            self.unit_builder.append_value(&metric.unit);
+
+            self.aggregation_temporality_builder
+                .append_value(temporality_to_i64(sum.temporality));
+            self.is_monotonic_builder.append_value(sum.is_monotonic);
+
+            self.flags_builder.append_null();
+
+            self.add_attributes(&data_point.attributes);
+
+            data_point.value.append(&mut self.data_number_builder);
+            self.data_histogram_builder.append(false);
+        }
+    }
+
+    fn process_gauge<T: AppendDataNumber>(
         &mut self,
         gauge: &Gauge<T>,
         metric: &Metric,
@@ -371,8 +413,80 @@ impl OtelToArrowConverter {
             self.add_attributes(&data_point.attributes);
 
             data_point.value.append(&mut self.data_number_builder);
-
             self.data_histogram_builder.append(false);
+        }
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn process_histogram<T: AppendFloat64 + Clone>(
+        &mut self,
+        histogram: &Histogram<T>,
+        metric: &Metric,
+        resource: &Resource,
+        instrument_scope: &InstrumentationLibrary,
+    ) {
+        for data_point in &histogram.data_points {
+            self.time_unix_nano_builder
+                .append_value(system_time_to_nanos(data_point.time));
+            self.start_time_unix_nano_builder
+                .append_value(system_time_to_nanos(data_point.start_time));
+
+            self.add_resource(resource);
+            self.add_scope(instrument_scope);
+
+            self.metric_type_builder
+                .append_value(crate::schema::MetricType::Histogram.to_u8());
+
+            self.name_builder.append_value(&metric.name);
+            self.description_builder.append_value(&metric.description);
+            self.unit_builder.append_value(&metric.unit);
+
+            self.aggregation_temporality_builder
+                .append_value(temporality_to_i64(histogram.temporality));
+            self.is_monotonic_builder.append_null();
+
+            self.flags_builder.append_null();
+
+            self.add_attributes(&data_point.attributes);
+
+            self.data_number_builder.append(false);
+
+            self.data_histogram_builder
+                .count_builder
+                .append_value(data_point.count as i64);
+            data_point
+                .sum
+                .append(&mut self.data_histogram_builder.sum_builder);
+            AppendFloat64::append_option(
+                data_point.min.clone(),
+                &mut self.data_histogram_builder.min_builder,
+            );
+            AppendFloat64::append_option(
+                data_point.max.clone(),
+                &mut self.data_histogram_builder.max_builder,
+            );
+
+            self.data_histogram_builder
+                .bucket_counts_builder
+                .append_value(
+                    data_point
+                        .bucket_counts
+                        .iter()
+                        .map(|bc| Some(*bc))
+                        .collect::<Vec<Option<u64>>>(),
+                );
+
+            self.data_histogram_builder
+                .explicit_bounds_builder
+                .append_value(
+                    data_point
+                        .bounds
+                        .iter()
+                        .map(|b| Some(*b))
+                        .collect::<Vec<Option<f64>>>(),
+                );
+
+            self.data_histogram_builder.append(true);
         }
     }
 
@@ -493,11 +607,45 @@ impl OtelToArrowConverter {
     }
 }
 
-trait ProcessGaugeData {
+trait AppendFloat64 {
+    fn append(&self, builder: &mut Float64Builder);
+
+    fn append_option(value: Option<Self>, builder: &mut Float64Builder)
+    where
+        Self: Sized,
+    {
+        match value {
+            Some(value) => value.append(builder),
+            None => builder.append_null(),
+        }
+    }
+}
+
+impl AppendFloat64 for f64 {
+    fn append(&self, builder: &mut Float64Builder) {
+        builder.append_value(*self);
+    }
+}
+
+impl AppendFloat64 for i64 {
+    #[allow(clippy::cast_precision_loss)]
+    fn append(&self, builder: &mut Float64Builder) {
+        builder.append_value(*self as f64);
+    }
+}
+
+impl AppendFloat64 for u64 {
+    #[allow(clippy::cast_precision_loss)]
+    fn append(&self, builder: &mut Float64Builder) {
+        builder.append_value(*self as f64);
+    }
+}
+
+trait AppendDataNumber {
     fn append(&self, builder: &mut DataNumberBuilder);
 }
 
-impl ProcessGaugeData for u64 {
+impl AppendDataNumber for u64 {
     #[allow(clippy::cast_possible_wrap)]
     fn append(&self, builder: &mut DataNumberBuilder) {
         builder.int_builder.append_value(*self as i64);
@@ -507,7 +655,7 @@ impl ProcessGaugeData for u64 {
     }
 }
 
-impl ProcessGaugeData for i64 {
+impl AppendDataNumber for i64 {
     fn append(&self, builder: &mut DataNumberBuilder) {
         builder.int_builder.append_value(*self);
         builder.double_builder.append_null();
@@ -516,7 +664,7 @@ impl ProcessGaugeData for i64 {
     }
 }
 
-impl ProcessGaugeData for f64 {
+impl AppendDataNumber for f64 {
     fn append(&self, builder: &mut DataNumberBuilder) {
         builder.int_builder.append_null();
         builder.double_builder.append_value(*self);
