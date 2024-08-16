@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Will remove in a follow-up PR
-#![allow(dead_code)]
-
 use std::{cell::LazyCell, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -88,27 +85,18 @@ thread_local! {
     ///              └── AggregationTemporality
     static METRICS_SCHEMA: LazyCell<Arc<Schema>> = LazyCell::new(|| {
         let fields = vec![
-            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), false),
+            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new(
                 "start_time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
                 true,
             ),
             Field::new("resource", DataType::Struct(
-                vec![
-                    Field::new("schema_url", DataType::Utf8, true),
-                    Field::new("attributes", attributes_type(), true),
-                    Field::new("dropped_attributes_count", DataType::UInt32, true),
-                ]
+                resource_fields()
                 .into(),
             ), true),
             Field::new("scope", DataType::Struct(
-                vec![
-                    Field::new("name", DataType::Utf8, true),
-                    Field::new("version", DataType::Utf8, true),
-                    Field::new("attributes", attributes_type(), true),
-                    Field::new("dropped_attributes_count", DataType::UInt32, true),
-                ]
+                scope_fields()
                 .into(),
             ), true),
             Field::new("schema_url", DataType::Utf8, true),
@@ -120,7 +108,7 @@ thread_local! {
             Field::new("aggregation_temporality", DataType::Int32, true),
             Field::new("is_monotonic", DataType::Boolean, true),
             Field::new("flags", DataType::UInt32, true),
-            Field::new("attributes", attributes_type(), true),
+            Field::new("attributes", attributes_list_type(), true),
 
             // Only one of these will be set, based on the metric_type.
             // Gauge and Sum will use data_number, Histogram will use data_histogram.
@@ -131,54 +119,82 @@ thread_local! {
     });
 }
 
-fn attributes_type() -> DataType {
-    DataType::Struct(
-        vec![
-            Field::new("key", DataType::Utf8, false),
-            // AttributeValueType is the Rust enum corresponding to the UInt8 `type`.
-            Field::new("type", DataType::UInt8, false),
-            Field::new("str", DataType::Utf8, false),
-            Field::new("int", DataType::Int64, true),
-            Field::new("double", DataType::Float64, true),
-            Field::new("bool", DataType::Boolean, true),
-            Field::new("bytes", DataType::Binary, true),
-            // cbor encoded map
-            Field::new("ser", DataType::Binary, true),
-        ]
-        .into(),
+pub(crate) fn resource_fields() -> Vec<Field> {
+    vec![
+        Field::new("schema_url", DataType::Utf8, true),
+        Field::new("attributes", attributes_list_type(), true),
+        Field::new("dropped_attributes_count", DataType::UInt32, true),
+    ]
+}
+
+pub(crate) fn scope_fields() -> Vec<Field> {
+    vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("version", DataType::Utf8, true),
+        Field::new("attributes", attributes_list_type(), true),
+        Field::new("dropped_attributes_count", DataType::UInt32, true),
+    ]
+}
+
+pub(crate) fn attribute_struct_fields() -> Vec<Field> {
+    vec![
+        Field::new("key", DataType::Utf8, false),
+        // AttributeValueType is the Rust enum corresponding to the UInt8 `type`.
+        Field::new("type", DataType::UInt8, false),
+        Field::new("str", DataType::Utf8, false),
+        Field::new("int", DataType::Int64, true),
+        Field::new("double", DataType::Float64, true),
+        Field::new("bool", DataType::Boolean, true),
+        Field::new("bytes", DataType::Binary, true),
+        // cbor encoded map
+        Field::new("ser", DataType::Binary, true),
+    ]
+}
+
+pub(crate) fn attribute_list_field() -> Field {
+    Field::new(
+        "attributes",
+        DataType::Struct(attribute_struct_fields().into()),
+        false,
     )
 }
 
-fn number_data_type() -> DataType {
-    DataType::Struct(
-        vec![
-            Field::new("int_value", DataType::Int64, true),
-            Field::new("double_value", DataType::Float64, true),
-        ]
-        .into(),
-    )
+pub(crate) fn attributes_list_type() -> DataType {
+    DataType::List(Arc::new(attribute_list_field()))
 }
 
-fn histogram_data_type() -> DataType {
-    DataType::Struct(
-        vec![
-            Field::new("count", DataType::UInt64, true),
-            Field::new("sum", DataType::Float64, true),
-            Field::new(
-                "bucket_counts",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt64, false))),
-                true,
-            ),
-            Field::new(
-                "explicit_bounds",
-                DataType::List(Arc::new(Field::new("item", DataType::Float64, false))),
-                true,
-            ),
-            Field::new("min", DataType::Float64, true),
-            Field::new("max", DataType::Float64, true),
-        ]
-        .into(),
-    )
+pub(crate) fn number_fields() -> Vec<Field> {
+    vec![
+        Field::new("int_value", DataType::Int64, true),
+        Field::new("double_value", DataType::Float64, true),
+    ]
+}
+
+pub(crate) fn number_data_type() -> DataType {
+    DataType::Struct(number_fields().into())
+}
+
+pub(crate) fn histogram_data_fields() -> Vec<Field> {
+    vec![
+        Field::new("count", DataType::UInt64, true),
+        Field::new("sum", DataType::Float64, true),
+        Field::new(
+            "bucket_counts",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+            true,
+        ),
+        Field::new(
+            "explicit_bounds",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ),
+        Field::new("min", DataType::Float64, true),
+        Field::new("max", DataType::Float64, true),
+    ]
+}
+
+pub(crate) fn histogram_data_type() -> DataType {
+    DataType::Struct(histogram_data_fields().into())
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -189,11 +205,13 @@ pub enum MetricType {
 }
 
 impl MetricType {
-    fn to_u8(self) -> u8 {
+    #[must_use]
+    pub fn to_u8(self) -> u8 {
         self as u8
     }
 
-    fn from_u8(value: u8) -> Option<MetricType> {
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<MetricType> {
         match value {
             0 => Some(MetricType::Gauge),
             1 => Some(MetricType::Sum),
@@ -226,11 +244,13 @@ pub enum AttributeValueType {
 }
 
 impl AttributeValueType {
-    fn to_u8(self) -> u8 {
+    #[must_use]
+    pub fn to_u8(self) -> u8 {
         self as u8
     }
 
-    fn from_u8(value: u8) -> Option<AttributeValueType> {
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<AttributeValueType> {
         match value {
             1 => Some(AttributeValueType::Str),
             2 => Some(AttributeValueType::Int),
@@ -256,5 +276,16 @@ impl std::fmt::Display for AttributeValueType {
             AttributeValueType::Bytes => "Bytes",
         };
         write!(f, "{s}")
+    }
+}
+
+pub(crate) fn temporality_to_i32(
+    temporality: opentelemetry_sdk::metrics::data::Temporality,
+) -> i32 {
+    // Based on https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L278
+    match temporality {
+        opentelemetry_sdk::metrics::data::Temporality::Delta => 1,
+        opentelemetry_sdk::metrics::data::Temporality::Cumulative => 2,
+        _ => panic!("Invalid temporality"),
     }
 }
