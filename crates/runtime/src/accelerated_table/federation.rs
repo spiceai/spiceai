@@ -4,7 +4,7 @@ use crate::component::dataset::acceleration::ZeroResultsAction;
 use arrow::datatypes::SchemaRef;
 use data_components::poly::PolyTableProvider;
 use datafusion::datasource::TableType;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::error::Result as DataFusionResult;
 use datafusion::{datasource::TableProvider, logical_expr::TableSource};
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
@@ -25,11 +25,7 @@ impl AcceleratedTable {
     fn create_federated_table_source(&self) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
         let schema = Arc::clone(&self.schema());
         let fed_provider = Arc::new(FederationProviderAdapter::new(
-            self.get_federation_provider_for_accelerator()
-                .ok_or(DataFusionError::Execution(format!(
-                    "Unable to get federated provider for accelerator {}",
-                    self.dataset_name
-                )))?,
+            self.get_federation_provider_for_accelerator(),
             self.zero_results_action != ZeroResultsAction::UseSource,
         ));
         Ok(Arc::new(
@@ -49,12 +45,12 @@ impl AcceleratedTable {
 }
 
 pub struct FederationProviderAdapter {
-    pub inner: Arc<dyn FederationProvider>,
+    pub inner: Option<Arc<dyn FederationProvider>>,
     pub enabled: bool,
 }
 
 impl FederationProviderAdapter {
-    fn new(inner: Arc<dyn FederationProvider>, enabled: bool) -> Self {
+    fn new(inner: Option<Arc<dyn FederationProvider>>, enabled: bool) -> Self {
         Self { inner, enabled }
     }
 }
@@ -65,14 +61,14 @@ impl FederationProvider for FederationProviderAdapter {
     }
 
     fn compute_context(&self) -> Option<String> {
-        self.inner.compute_context()
+        self.inner.clone().and_then(|x| x.compute_context())
     }
 
     fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
         if !self.enabled {
             return None;
         }
-        self.inner.analyzer()
+        self.inner.clone().and_then(|x| x.analyzer())
     }
 }
 
