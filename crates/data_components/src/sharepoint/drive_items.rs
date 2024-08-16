@@ -16,8 +16,7 @@ limitations under the License.
 */
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampSecondArray, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::error::Result as ArrowResult;
+use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -57,7 +56,7 @@ pub(crate) struct DriveItemResponse {
     pub next_link: Option<String>,
 }
 
-/// Represents a Sharepoint DriveItem. JSON representation from:
+/// Represents a Sharepoint [`DriveItem`]. JSON representation from:
 ///  - get: `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#response-1>`
 ///  - list: `<https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0&tabs=http#response>`
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,7 +72,7 @@ pub(crate) struct DriveItem {
     last_modified_date_time: String,
     name: String,
     // root: Option<Root>, struct Root {}
-    size: u64,
+    size: i64,
     web_url: String,
 }
 
@@ -117,16 +116,16 @@ pub fn drive_item_table_schema() -> arrow::datatypes::Schema {
     ])
 }
 
-pub(crate) fn drive_items_to_record_batch(drive_items: Vec<DriveItem>) -> ArrowResult<RecordBatch> {
-    let schema = Arc::new(drive_item_table_schema());
+/// Microsoft graph returns timestamps in ISO 8601 format
+fn parse_timestamp(ts: &str) -> ArrowResult<i64> {
+    Ok(DateTime::parse_from_rfc3339(ts)
+        .map_err(|e| ArrowError::CastError(e.to_string()))?
+        .with_timezone(&Utc)
+        .timestamp())
+}
 
-    /// Microsoft graph returns timestamps in ISO 8601 format
-    fn parse_timestamp(ts: &str) -> i64 {
-        DateTime::parse_from_rfc3339(ts)
-            .unwrap()
-            .with_timezone(&Utc)
-            .timestamp()
-    }
+pub(crate) fn drive_items_to_record_batch(drive_items: &[DriveItem]) -> ArrowResult<RecordBatch> {
+    let schema = Arc::new(drive_item_table_schema());
 
     // Aggregate column wise
     let created_by_id: Vec<&str> = drive_items
@@ -140,7 +139,7 @@ pub(crate) fn drive_items_to_record_batch(drive_items: Vec<DriveItem>) -> ArrowR
     let created_date_time: Vec<i64> = drive_items
         .iter()
         .map(|item| parse_timestamp(&item.created_date_time))
-        .collect();
+        .collect::<ArrowResult<Vec<i64>>>()?;
     let c_tag: Vec<&str> = drive_items.iter().map(|item| item.c_tag.as_str()).collect();
     let e_tag: Vec<&str> = drive_items.iter().map(|item| item.e_tag.as_str()).collect();
     let folder_child_count: Vec<Option<u32>> = drive_items
@@ -159,9 +158,9 @@ pub(crate) fn drive_items_to_record_batch(drive_items: Vec<DriveItem>) -> ArrowR
     let last_modified_date_time: Vec<i64> = drive_items
         .iter()
         .map(|item| parse_timestamp(&item.last_modified_date_time))
-        .collect();
+        .collect::<ArrowResult<Vec<i64>>>()?;
     let name: Vec<&str> = drive_items.iter().map(|item| item.name.as_str()).collect();
-    let size: Vec<i64> = drive_items.iter().map(|item| item.size as i64).collect();
+    let size: Vec<i64> = drive_items.iter().map(|item| item.size).collect();
     let web_url: Vec<&str> = drive_items
         .iter()
         .map(|item| item.web_url.as_str())

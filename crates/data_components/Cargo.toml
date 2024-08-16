@@ -40,6 +40,7 @@ flight_client = { path = "../flight_client" }
 futures.workspace = true
 globset.workspace = true
 graph-rs-sdk = {version= "2.0.1", optional=true}
+http = {version= "1.1.0", optional=true}
 object_store = { workspace = true }
 rdkafka = { version = "0.36.2", optional = true }
 regex = "1.10.4"
@@ -82,7 +83,7 @@ postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite"]
-sharepoint = ["dep:graph-rs-sdk"]
+sharepoint = ["dep:graph-rs-sdk", "dep:http"]
 default=["sharepoint"]
 
 [dev-dependencies]

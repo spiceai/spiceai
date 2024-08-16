@@ -2803,6 +2803,7 @@ dependencies = [
  "futures",
  "globset",
  "graph-rs-sdk",
+ "http 1.1.0",
  "object_store",
  "rdkafka",
  "regex",

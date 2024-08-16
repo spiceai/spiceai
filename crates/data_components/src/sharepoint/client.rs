@@ -17,10 +17,7 @@ limitations under the License.
 #[allow(unused_variables, dead_code)]
 use std::{any::Any, sync::Arc};
 
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -38,9 +35,11 @@ use datafusion::{
 use futures::{Stream, StreamExt};
 
 use graph_rs_sdk::{
-    default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient, GraphClient, GraphFailure,
+    default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient, error::ErrorMessage,
+    GraphClient, GraphFailure,
 };
-use serde_json::Value;
+
+use http::Response;
 use snafu::ResultExt;
 
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
@@ -79,9 +78,10 @@ pub struct SharepointClient {
 
 impl SharepointClient {
     pub fn new(client: Arc<GraphClient>) -> Self {
-        Self { client: client }
+        Self { client }
     }
 
+    #[must_use]
     pub fn table_schema() -> arrow::datatypes::Schema {
         drive_item_table_schema()
     }
@@ -149,7 +149,7 @@ impl SharepointListExec {
         })
     }
 
-    fn drive_client(graph: Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
+    fn drive_client(graph: &Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
         match drive {
             DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
             DrivePtr::UserId(user_id) => DriveApi::Default(graph.user(user_id).drive()),
@@ -161,11 +161,14 @@ impl SharepointListExec {
     /// TODO: "You can use the $expand query string parameter to include the children of an item in the same call as retrieving the metadata of an item if the item has a children relationship."
     /// `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#optional-query-parameters>`
     /// TODO: might need to explicitly
-    async fn list_from_path(
-        graph: Arc<GraphClient>,
+    fn list_from_path(
+        graph: &Arc<GraphClient>,
         drive: &DrivePtr,
         drive_item: &DriveItemPtr,
-    ) -> Result<DriveItemResponse, GraphFailure> {
+    ) -> Result<
+        impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,
+        GraphFailure,
+    > {
         // `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
         let req = match Self::drive_client(graph, drive) {
             DriveApi::Id(client) => match drive_item {
@@ -179,11 +182,8 @@ impl SharepointListExec {
                 DriveItemPtr::Root => client.item_by_path("").list_children(),
             },
         };
-        req.send()
-            .await?
-            .json::<DriveItemResponse>()
-            .await
-            .map_err(|e| GraphFailure::ReqwestError(e))
+
+        req.paging().stream::<DriveItemResponse>()
     }
 }
 
@@ -217,13 +217,13 @@ impl ExecutionPlan for SharepointListExec {
 
     fn execute(
         &self,
-        partition: usize,
-        context: Arc<TaskContext>,
+        _partition: usize,
+        _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
             process_list_drive_items(
-                self.client.clone(),
+                Arc::clone(&self.client),
                 self.drive.clone(),
                 self.drive_item.clone(),
             ),
@@ -259,18 +259,25 @@ fn process_list_drive_items(
     drive_item: DriveItemPtr,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
-        match SharepointListExec::list_from_path(graph, &drive, &drive_item).await.boxed().map_err(|e| DataFusionError::External(e)) {
-            Ok(resp) => match drive_items_to_record_batch(resp.value) {
-                Ok(batch) => yield Ok(batch),
-                Err(e) => yield Err(DataFusionError::ArrowError(e, None)),
+        match SharepointListExec::list_from_path(&graph, &drive, &drive_item).boxed().map_err(DataFusionError::External) {
+            Ok(mut resp) => {
+
+                while let Some(s) = resp.next().await {
+                    match s.boxed() {
+                        Ok(r) => {
+                            match r.body() {
+                                Ok(drive_item) => match drive_items_to_record_batch(&drive_item.value).boxed() {
+                                    Ok(batch) => yield Ok(batch),
+                                    Err(e) => yield Err(DataFusionError::External(e)),
+                                },
+                                Err(e) => yield Err(DataFusionError::External(Box::new(e.clone()))),
+                            }
+                        },
+                        Err(e) => yield Err(DataFusionError::External(e)),
+                    }
+                }
             },
             Err(e) => yield Err(e),
         }
-
-        // TODO: handle pagination
-        // while let Some(next_link) = resp.next_link {
-
-        // }
-
     }
 }
