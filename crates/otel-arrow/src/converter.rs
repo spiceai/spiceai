@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 #![allow(clippy::struct_field_names)]
-#![allow(dead_code)]
 
 use arrow::array::{
     Array, ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, ListBuilder,
