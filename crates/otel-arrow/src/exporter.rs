@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(dead_code)]
+
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use opentelemetry::metrics::MetricsError;
@@ -23,6 +25,8 @@ use opentelemetry_sdk::metrics::{
     reader::{AggregationSelector, TemporalitySelector},
     Aggregation, InstrumentKind,
 };
+
+use crate::converter::OtelToArrowConverter;
 
 #[async_trait]
 pub trait ArrowExporter: AggregationSelector + TemporalitySelector + Send + Sync + 'static {
@@ -58,7 +62,10 @@ impl<E: ArrowExporter> AggregationSelector for OtelArrowExporter<E> {
 #[async_trait]
 impl<E: ArrowExporter> PushMetricsExporter for OtelArrowExporter<E> {
     async fn export(&self, metrics: &mut ResourceMetrics) -> Result<(), MetricsError> {
-        todo!()
+        let mut converter = OtelToArrowConverter::new(metrics.scope_metrics.len());
+        let batch = converter.convert(metrics)?;
+
+        self.exporter.export(batch).await
     }
 
     async fn force_flush(&self) -> Result<(), MetricsError> {
