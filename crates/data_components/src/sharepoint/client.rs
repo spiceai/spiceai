@@ -198,7 +198,7 @@ impl TableProvider for SharepointClient {
             &self.drive,
             &self.drive_item,
             projection,
-            self.schema(),
+            &self.schema(),
         )?))
     }
 }
@@ -218,9 +218,9 @@ impl SharepointListExec {
         drive: &DrivePtr,
         drive_item: &DriveItemPtr,
         projections: Option<&Vec<usize>>,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> DataFusionResult<Self> {
-        let schema = project_schema(&schema, projections)?;
+        let schema = project_schema(schema, projections)?;
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -289,7 +289,7 @@ impl SharepointListExec {
         .send()
         .await?;
 
-        resp.text().await.map_err(|e| GraphFailure::ReqwestError(e))
+        resp.text().await.map_err(GraphFailure::ReqwestError)
     }
 }
 
@@ -376,12 +376,9 @@ async fn response_to_record_with_file_content(
             let file = SharepointListExec::get_file(&graph, drive, &item.id)
                 .await
                 .boxed()
-                .map_err(|e| ArrowError::ExternalError(e))?;
+                .map_err(ArrowError::ExternalError)?;
 
-            println!("file String: {:#?}", file);
             content.push(file);
-            // let file_utf8 = std::str::from_utf8(&file).map_err(|e| ArrowError::CastError(e.to_string()))?;
-            // content.push(file_utf8.to_string());
         }
         Some(content)
     } else {
@@ -407,7 +404,7 @@ fn process_list_drive_items(
         };
 
         while let Some(s) = resp_stream.next().await {
-            let response = match s.boxed().map_err(|e| DataFusionError::External(e)) {
+            let response = match s.boxed().map_err(DataFusionError::External) {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(e);
@@ -417,7 +414,7 @@ fn process_list_drive_items(
 
             match response.body() {
                 Ok(drive_item) => {
-                    match response_to_record_with_file_content(Arc::clone(&graph), &drive, &drive_item, include_file_content).await {
+                    match response_to_record_with_file_content(Arc::clone(&graph), &drive, drive_item, include_file_content).await {
                         Ok(record_batch) => yield Ok(record_batch),
                         Err(e) => yield Err(DataFusionError::External(Box::new(e))),
                     }

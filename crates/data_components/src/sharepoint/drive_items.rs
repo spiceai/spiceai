@@ -120,7 +120,7 @@ pub fn drive_item_table_schema(include_file_content: bool) -> arrow::datatypes::
             DRIVE_ITEM_FILE_CONTENT_COLUMN,
             arrow::datatypes::DataType::Utf8,
             false,
-        ))
+        ));
     }
     arrow::datatypes::Schema::new(fields)
 }
@@ -218,7 +218,7 @@ pub(crate) fn drive_items_to_record_batch(
                 "drive item content length does not match drive items in list".to_string(),
             ));
         }
-        let content_array = Arc::new(StringArray::from(content.to_vec())) as ArrayRef;
+        let content_array = Arc::new(StringArray::from(content)) as ArrayRef;
         columns.push(content_array);
     }
 
