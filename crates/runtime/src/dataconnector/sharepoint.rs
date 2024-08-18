@@ -214,7 +214,7 @@ impl DataConnector for Sharepoint {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
+        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from, true)
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
@@ -231,7 +231,7 @@ impl DataConnector for Sharepoint {
             return None;
         }
 
-        match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
+        match SharepointClient::new(Arc::clone(&self.client), &dataset.from, false)
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",

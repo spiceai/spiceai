@@ -17,7 +17,7 @@ limitations under the License.
 #[allow(unused_variables, dead_code)]
 use std::{any::Any, sync::Arc};
 
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -45,7 +45,7 @@ use snafu::ResultExt;
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
 
 use super::{
-    drive_items::{drive_item_table_schema, DriveItemResponse},
+    drive_items::{drive_item_table_schema, DriveItemResponse, DRIVE_ITEM_FILE_CONTENT_COLUMN},
     error::Error,
 };
 
@@ -153,21 +153,22 @@ pub struct SharepointClient {
     client: Arc<GraphClient>,
     drive: DrivePtr,
     drive_item: DriveItemPtr,
+    include_file_content: bool,
 }
 
 impl SharepointClient {
-    pub fn new(client: Arc<GraphClient>, from: &str) -> Result<Self, Error> {
+    pub fn new(
+        client: Arc<GraphClient>,
+        from: &str,
+        include_file_content: bool,
+    ) -> Result<Self, Error> {
         let (drive, drive_item) = parse_from(from)?;
         Ok(Self {
             client,
             drive,
             drive_item,
+            include_file_content,
         })
-    }
-
-    #[must_use]
-    pub fn table_schema() -> arrow::datatypes::Schema {
-        drive_item_table_schema()
     }
 }
 
@@ -178,7 +179,7 @@ impl TableProvider for SharepointClient {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(Self::table_schema())
+        Arc::new(drive_item_table_schema(self.include_file_content))
     }
 
     fn table_type(&self) -> TableType {
@@ -197,6 +198,7 @@ impl TableProvider for SharepointClient {
             &self.drive,
             &self.drive_item,
             projection,
+            self.schema(),
         )?))
     }
 }
@@ -216,8 +218,9 @@ impl SharepointListExec {
         drive: &DrivePtr,
         drive_item: &DriveItemPtr,
         projections: Option<&Vec<usize>>,
+        schema: SchemaRef,
     ) -> DataFusionResult<Self> {
-        let schema = project_schema(&Arc::new(SharepointClient::table_schema()), projections)?;
+        let schema = project_schema(&schema, projections)?;
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -271,8 +274,22 @@ impl SharepointListExec {
             },
         };
 
-        println!("req={}", req.url());
         req.paging().stream::<DriveItemResponse>()
+    }
+
+    async fn get_file(
+        graph: &Arc<GraphClient>,
+        drive: &DrivePtr,
+        item_id: &str,
+    ) -> Result<String, GraphFailure> {
+        let resp = match Self::drive_client(graph, drive) {
+            DriveApi::Id(client) => client.item(item_id).get_items_content(),
+            DriveApi::Default(client) => client.item(item_id).get_items_content(),
+        }
+        .send()
+        .await?;
+
+        resp.text().await.map_err(|e| GraphFailure::ReqwestError(e))
     }
 }
 
@@ -309,12 +326,17 @@ impl ExecutionPlan for SharepointListExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        // Only retrieve file content if it is in projected schema.
+        let include_file_content: bool =
+            self.schema.index_of(DRIVE_ITEM_FILE_CONTENT_COLUMN).is_ok();
+
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
             process_list_drive_items(
                 Arc::clone(&self.client),
                 self.drive.clone(),
                 self.drive_item.clone(),
+                include_file_content,
             ),
         );
 
@@ -342,31 +364,66 @@ impl DisplayAs for SharepointListExec {
     }
 }
 
+async fn response_to_record_with_file_content(
+    graph: Arc<GraphClient>,
+    drive: &DrivePtr,
+    resp: &DriveItemResponse,
+    include_file_content: bool,
+) -> Result<RecordBatch, ArrowError> {
+    let item_content = if include_file_content {
+        let mut content: Vec<String> = Vec::with_capacity(resp.value.len());
+        for item in &resp.value {
+            let file = SharepointListExec::get_file(&graph, drive, &item.id)
+                .await
+                .boxed()
+                .map_err(|e| ArrowError::ExternalError(e))?;
+
+            println!("file String: {:#?}", file);
+            content.push(file);
+            // let file_utf8 = std::str::from_utf8(&file).map_err(|e| ArrowError::CastError(e.to_string()))?;
+            // content.push(file_utf8.to_string());
+        }
+        Some(content)
+    } else {
+        None
+    };
+
+    drive_items_to_record_batch(&resp.value, item_content)
+}
+
 fn process_list_drive_items(
     graph: Arc<GraphClient>,
     drive: DrivePtr,
     drive_item: DriveItemPtr,
+    include_file_content: bool,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
-        match SharepointListExec::list_from_path(&graph, &drive, &drive_item).boxed().map_err(DataFusionError::External) {
-            Ok(mut resp) => {
+        let mut resp_stream = match SharepointListExec::list_from_path(&graph, &drive, &drive_item) {
+            Ok(stream) => stream,
+            Err(e) => {
+                yield Err(DataFusionError::External(Box::new(e)));
+                return;
+            }
+        };
 
-                while let Some(s) = resp.next().await {
-                    match s.boxed() {
-                        Ok(r) => {
-                            match r.body() {
-                                Ok(drive_item) => match drive_items_to_record_batch(&drive_item.value).boxed() {
-                                    Ok(batch) => yield Ok(batch),
-                                    Err(e) => yield Err(DataFusionError::External(e)),
-                                },
-                                Err(e) => yield Err(DataFusionError::External(Box::new(e.clone()))),
-                            }
-                        },
-                        Err(e) => yield Err(DataFusionError::External(e)),
-                    }
+        while let Some(s) = resp_stream.next().await {
+            let response = match s.boxed().map_err(|e| DataFusionError::External(e)) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(e);
+                    continue;
                 }
-            },
-            Err(e) => yield Err(e),
+            };
+
+            match response.body() {
+                Ok(drive_item) => {
+                    match response_to_record_with_file_content(Arc::clone(&graph), &drive, &drive_item, include_file_content).await {
+                        Ok(record_batch) => yield Ok(record_batch),
+                        Err(e) => yield Err(DataFusionError::External(Box::new(e))),
+                    }
+                },
+                Err(e) => yield Err(DataFusionError::External(Box::new(e.clone()))),
+            }
         }
     }
 }

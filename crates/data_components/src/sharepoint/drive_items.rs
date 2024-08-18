@@ -67,7 +67,7 @@ pub(crate) struct DriveItem {
     c_tag: String,
     e_tag: String,
     folder: Option<Folder>,
-    id: String,
+    pub(crate) id: String,
     last_modified_by: LastModifiedBy,
     last_modified_date_time: String,
     name: String,
@@ -76,12 +76,13 @@ pub(crate) struct DriveItem {
     web_url: String,
 }
 
+pub(crate) static DRIVE_ITEM_FILE_CONTENT_COLUMN: &str = "content";
+
 /// Flattened Arrow schema for [`DriveItem`].
-pub fn drive_item_table_schema() -> arrow::datatypes::Schema {
-    arrow::datatypes::Schema::new(vec![
+pub fn drive_item_table_schema(include_file_content: bool) -> arrow::datatypes::Schema {
+    let mut fields = vec![
         arrow::datatypes::Field::new("created_by_id", arrow::datatypes::DataType::Utf8, false),
         arrow::datatypes::Field::new("created_by_name", arrow::datatypes::DataType::Utf8, true),
-        // "2016-03-21T20:01:37Z",
         arrow::datatypes::Field::new(
             "created_date_time",
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -113,7 +114,15 @@ pub fn drive_item_table_schema() -> arrow::datatypes::Schema {
         arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
         arrow::datatypes::Field::new("size", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("web_url", arrow::datatypes::DataType::Utf8, false),
-    ])
+    ];
+    if include_file_content {
+        fields.push(arrow::datatypes::Field::new(
+            DRIVE_ITEM_FILE_CONTENT_COLUMN,
+            arrow::datatypes::DataType::Utf8,
+            false,
+        ))
+    }
+    arrow::datatypes::Schema::new(fields)
 }
 
 /// Microsoft graph returns timestamps in ISO 8601 format
@@ -124,8 +133,11 @@ fn parse_timestamp(ts: &str) -> ArrowResult<i64> {
         .timestamp())
 }
 
-pub(crate) fn drive_items_to_record_batch(drive_items: &[DriveItem]) -> ArrowResult<RecordBatch> {
-    let schema = Arc::new(drive_item_table_schema());
+pub(crate) fn drive_items_to_record_batch(
+    drive_items: &[DriveItem],
+    item_content: Option<Vec<String>>,
+) -> ArrowResult<RecordBatch> {
+    let schema = Arc::new(drive_item_table_schema(item_content.is_some()));
 
     // Aggregate column wise
     let created_by_id: Vec<&str> = drive_items
@@ -184,22 +196,31 @@ pub(crate) fn drive_items_to_record_batch(drive_items: &[DriveItem]) -> ArrowRes
     let size_array = Arc::new(Int64Array::from(size)) as ArrayRef;
     let web_url_array = Arc::new(StringArray::from(web_url)) as ArrayRef;
 
-    RecordBatch::try_new(
-        schema,
-        vec![
-            created_by_id_array,
-            created_by_name_array,
-            created_date_time_array,
-            c_tag_array,
-            e_tag_array,
-            folder_child_count_array,
-            id_array,
-            last_modified_by_id_array,
-            last_modified_by_name_array,
-            last_modified_date_time_array,
-            name_array,
-            size_array,
-            web_url_array,
-        ],
-    )
+    let mut columns = vec![
+        created_by_id_array,
+        created_by_name_array,
+        created_date_time_array,
+        c_tag_array,
+        e_tag_array,
+        folder_child_count_array,
+        id_array,
+        last_modified_by_id_array,
+        last_modified_by_name_array,
+        last_modified_date_time_array,
+        name_array,
+        size_array,
+        web_url_array,
+    ];
+
+    if let Some(content) = item_content {
+        if content.len() != drive_items.len() {
+            return Err(ArrowError::InvalidArgumentError(
+                "drive item content length does not match drive items in list".to_string(),
+            ));
+        }
+        let content_array = Arc::new(StringArray::from(content.to_vec())) as ArrayRef;
+        columns.push(content_array);
+    }
+
+    RecordBatch::try_new(schema, columns)
 }
