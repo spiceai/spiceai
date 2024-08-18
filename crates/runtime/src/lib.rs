@@ -21,7 +21,6 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
@@ -277,7 +276,6 @@ pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
 pub struct Runtime {
-    instance_name: String,
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
@@ -350,7 +348,7 @@ impl Runtime {
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
     ) -> Result<()> {
-        self.register_metrics_table(self.prometheus_registry.clone())
+        self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
         let http_server_future = tokio::spawn(http::start(
@@ -1368,26 +1366,17 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    async fn register_metrics_table(
-        &self,
-        with_metrics: Option<prometheus::Registry>,
-    ) -> Result<()> {
-        if let Some(registry) = with_metrics {
-            let mut recorder = MetricsRecorder::new(registry);
-
+    async fn register_metrics_table(&self, metrics_enabled: bool) -> Result<()> {
+        if metrics_enabled {
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;
 
-            if let Some(metrics_table) = metrics_table {
-                recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
-            } else {
+            if metrics_table.is_none() {
                 tracing::debug!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&self.df)
+                spice_metrics::register_metrics_table(&self.df)
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
-
-            recorder.start(self.instance_name.clone(), &self.df);
         }
 
         Ok(())

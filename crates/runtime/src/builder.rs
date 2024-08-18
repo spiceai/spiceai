@@ -18,7 +18,6 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::{
     dataaccelerator, dataconnector,
@@ -119,12 +118,6 @@ impl RuntimeBuilder {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
-        let hash = Uuid::new_v4().to_string()[..8].to_string();
-        let name = match &self.app {
-            Some(app) => app.name.clone(),
-            None => "spice".to_string(),
-        };
-
         let df = match self.datafusion {
             Some(df) => df,
             None => Arc::new(DataFusion::new()),
@@ -141,7 +134,6 @@ impl RuntimeBuilder {
         let secrets = Self::load_secrets(&self.app).await;
 
         let mut rt = Runtime {
-            instance_name: format!("{name}-{hash}").to_string(),
             app: Arc::new(RwLock::new(self.app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),

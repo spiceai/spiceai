@@ -16,7 +16,6 @@ limitations under the License.
 
 use clap::Parser;
 use opentelemetry::global;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
 
@@ -72,33 +71,6 @@ fn main() {
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    let prometheus_registry = match args.metrics {
-        Some(_) => Some(init_metrics()?),
-        None => None,
-    };
-
-    spiced::run(args, prometheus_registry).await?;
+    spiced::run(args).await?;
     Ok(())
-}
-
-fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>> {
-    let registry = prometheus::Registry::new();
-
-    let resource = Resource::default();
-
-    let prometheus_exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry.clone())
-        .without_scope_info()
-        .without_units()
-        .without_counter_suffixes()
-        .without_target_info()
-        .build()?;
-
-    let provider = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_reader(prometheus_exporter)
-        .build();
-    global::set_meter_provider(provider);
-
-    Ok(registry)
 }

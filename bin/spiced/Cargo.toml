@@ -18,6 +18,7 @@ opentelemetry_sdk.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry-zipkin.workspace = true
 opentelemetry-http.workspace = true
+otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
