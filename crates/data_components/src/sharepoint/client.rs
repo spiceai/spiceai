@@ -36,7 +36,7 @@ use futures::{Stream, StreamExt};
 
 use graph_rs_sdk::{
     default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient, error::ErrorMessage,
-    GraphClient, GraphFailure,
+    GraphClient, GraphFailure, ODataQuery,
 };
 
 use http::Response;
@@ -191,7 +191,7 @@ impl TableProvider for SharepointClient {
         _state: &SessionState,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(SharepointListExec::new(
             Arc::clone(&self.client),
@@ -199,6 +199,7 @@ impl TableProvider for SharepointClient {
             &self.drive_item,
             projection,
             &self.schema(),
+            limit,
         )?))
     }
 }
@@ -210,6 +211,7 @@ struct SharepointListExec {
 
     schema: SchemaRef,
     properties: PlanProperties,
+    limit: Option<usize>,
 }
 
 impl SharepointListExec {
@@ -219,6 +221,7 @@ impl SharepointListExec {
         drive_item: &DriveItemPtr,
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
+        limit: Option<usize>,
     ) -> DataFusionResult<Self> {
         let schema = project_schema(schema, projections)?;
         let properties = PlanProperties::new(
@@ -233,39 +236,29 @@ impl SharepointListExec {
             drive_item: drive_item.clone(),
             schema,
             properties,
+            limit,
         })
-    }
-
-    fn drive_client(graph: &Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
-        match drive {
-            DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
-            DrivePtr::UserId(user_id) => DriveApi::Default(graph.user(user_id).drive()),
-            DrivePtr::GroupId(_group_id) => unimplemented!("group id not supported"), // self.client.group(group_id).get_drive().url(),
-            DrivePtr::Me => DriveApi::Default(graph.me().drive()),
-        }
     }
 
     /// TODO: "You can use the $expand query string parameter to include the children of an item in the same call as retrieving the metadata of an item if the item has a children relationship."
     /// `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#optional-query-parameters>`
     /// TODO: might need to explicitly
     fn list_from_path(
-        graph: &Arc<GraphClient>,
-        drive: &DrivePtr,
-        drive_item: &DriveItemPtr,
+        &self,
     ) -> Result<
         impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,
         GraphFailure,
     > {
         // `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
-        let req = match Self::drive_client(graph, drive) {
-            DriveApi::Id(client) => match drive_item {
+        let mut req = match Self::drive_client(&self.client, &self.drive) {
+            DriveApi::Id(client) => match &self.drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),
                 DriveItemPtr::ItemPath(path) => {
                     client.item_by_path(format!(":{path}:")).list_children()
                 }
                 DriveItemPtr::Root => client.item_by_path("").list_children(),
             },
-            DriveApi::Default(client) => match drive_item {
+            DriveApi::Default(client) => match &self.drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),
                 DriveItemPtr::ItemPath(path) => {
                     client.item_by_path(format!(":{path}:")).list_children()
@@ -274,7 +267,52 @@ impl SharepointListExec {
             },
         };
 
+        // LIMIT `value`
+        if let Some(value) = self.limit {
+            req = req.top(value.to_string());
+        };
+
+        // TODO: Implement the following to improve efficiency.
+        // req.filter() // `WHERE <expr>`
+        // req.order_by() // `ORDER BY <expr>`
+        // req.expand() // To include file content
+
         req.paging().stream::<DriveItemResponse>()
+    }
+
+    fn process_list_drive_items(
+        &self,
+        include_file_content: bool,
+    ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>>> {
+        let mut resp_stream = self
+            .list_from_path()
+            .boxed()
+            .map_err(DataFusionError::External)?;
+
+        let graph = Arc::clone(&self.client);
+        let drive = self.drive.clone();
+        Ok(stream! {
+
+            while let Some(s) = resp_stream.next().await {
+                let response = match s.boxed().map_err(DataFusionError::External) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield Err(e);
+                        continue;
+                    }
+                };
+
+                match response.body() {
+                    Ok(drive_item) => {
+                        match response_to_record_with_file_content(Arc::clone(&graph), &drive, drive_item, include_file_content).await {
+                            Ok(record_batch) => yield Ok(record_batch),
+                            Err(e) => yield Err(DataFusionError::External(Box::new(e))),
+                        }
+                    },
+                    Err(e) => yield Err(DataFusionError::External(Box::new(e.clone()))),
+                }
+            }
+        })
     }
 
     async fn get_file(
@@ -290,6 +328,15 @@ impl SharepointListExec {
         .await?;
 
         resp.text().await.map_err(GraphFailure::ReqwestError)
+    }
+
+    fn drive_client(graph: &Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
+        match drive {
+            DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
+            DrivePtr::UserId(user_id) => DriveApi::Default(graph.user(user_id).drive()),
+            DrivePtr::GroupId(_group_id) => unimplemented!("group id not supported"), // self.client.group(group_id).get_drive().url(),
+            DrivePtr::Me => DriveApi::Default(graph.me().drive()),
+        }
     }
 }
 
@@ -332,12 +379,7 @@ impl ExecutionPlan for SharepointListExec {
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
-            process_list_drive_items(
-                Arc::clone(&self.client),
-                self.drive.clone(),
-                self.drive_item.clone(),
-                include_file_content,
-            ),
+            self.process_list_drive_items(include_file_content)?,
         );
 
         Ok(Box::pin(stream_adapter))
@@ -386,41 +428,4 @@ async fn response_to_record_with_file_content(
     };
 
     drive_items_to_record_batch(&resp.value, item_content)
-}
-
-fn process_list_drive_items(
-    graph: Arc<GraphClient>,
-    drive: DrivePtr,
-    drive_item: DriveItemPtr,
-    include_file_content: bool,
-) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    stream! {
-        let mut resp_stream = match SharepointListExec::list_from_path(&graph, &drive, &drive_item) {
-            Ok(stream) => stream,
-            Err(e) => {
-                yield Err(DataFusionError::External(Box::new(e)));
-                return;
-            }
-        };
-
-        while let Some(s) = resp_stream.next().await {
-            let response = match s.boxed().map_err(DataFusionError::External) {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(e);
-                    continue;
-                }
-            };
-
-            match response.body() {
-                Ok(drive_item) => {
-                    match response_to_record_with_file_content(Arc::clone(&graph), &drive, drive_item, include_file_content).await {
-                        Ok(record_batch) => yield Ok(record_batch),
-                        Err(e) => yield Err(DataFusionError::External(Box::new(e))),
-                    }
-                },
-                Err(e) => yield Err(DataFusionError::External(Box::new(e.clone()))),
-            }
-        }
-    }
 }
