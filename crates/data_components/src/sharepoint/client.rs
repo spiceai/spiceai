@@ -21,16 +21,10 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    common::project_schema,
-    datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
-    logical_expr::Expr,
-    physical_expr::EquivalenceProperties,
-    physical_plan::{
+    catalog::Session, common::project_schema, datasource::{TableProvider, TableType}, error::{DataFusionError, Result as DataFusionResult}, execution::{SendableRecordBatchStream, TaskContext}, logical_expr::Expr, physical_expr::EquivalenceProperties, physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
-    },
+    }
 };
 use futures::{Stream, StreamExt};
 
@@ -188,7 +182,7 @@ impl TableProvider for SharepointClient {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         limit: Option<usize>,
@@ -240,16 +234,13 @@ impl SharepointListExec {
         })
     }
 
-    /// TODO: "You can use the $expand query string parameter to include the children of an item in the same call as retrieving the metadata of an item if the item has a children relationship."
-    /// `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#optional-query-parameters>`
-    /// TODO: might need to explicitly
     fn list_from_path(
         &self,
     ) -> Result<
         impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,
         GraphFailure,
     > {
-        // `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
+        // Request docs: `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
         let mut req = match Self::drive_client(&self.client, &self.drive) {
             DriveApi::Id(client) => match &self.drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),

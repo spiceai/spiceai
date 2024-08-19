@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -18,6 +17,7 @@ limitations under the License.
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampSecondArray, UInt32Array};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,7 @@ struct Folder {
 pub(crate) struct DriveItemResponse {
     pub value: Vec<DriveItem>,
 
-    // @odata.nextLink e.g. `"https://graph.microsoft.com/v1.0/users?$top=5&$skiptoken=RFNwdAIAAQAAAD8...AAAAAAAA"`
+    // This is the pagination token
     #[serde(rename = "@odata.nextLink")]
     pub next_link: Option<String>,
 }
@@ -71,7 +71,6 @@ pub(crate) struct DriveItem {
     last_modified_by: LastModifiedBy,
     last_modified_date_time: String,
     name: String,
-    // root: Option<Root>, struct Root {}
     size: i64,
     web_url: String,
 }
