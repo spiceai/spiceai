@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -98,10 +98,15 @@ impl DataAccelerator for PostgresAccelerator {
             unreachable!("PostgresTableWriter should be returned from PostgresTableProviderFactory")
         };
 
+        let read_provider = Arc::clone(&postgres_writer.read_provider);
         let postgres_writer = Arc::new(postgres_writer.clone());
+        let cloned_writer = Arc::clone(&postgres_writer);
 
-        let deletion_adapter = DeletionTableProviderAdapter::new(postgres_writer);
-        Ok(Arc::new(deletion_adapter))
+        Ok(Arc::new(PolyTableProvider::new(
+            cloned_writer,
+            postgres_writer,
+            read_provider,
+        )))
     }
 
     fn prefix(&self) -> &'static str {
