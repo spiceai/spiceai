@@ -103,10 +103,10 @@ impl Nameable for Dataset {
 
 impl Dataset {
     #[must_use]
-    pub fn new(from: String, name: String) -> Self {
+    pub fn new(from: impl Into<String>, name: impl Into<String>) -> Self {
         Dataset {
-            from,
-            name,
+            from: from.into(),
+            name: name.into(),
             description: None,
             metadata: HashMap::default(),
             mode: Mode::default(),
