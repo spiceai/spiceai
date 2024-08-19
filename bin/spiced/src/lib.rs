@@ -128,7 +128,7 @@ pub struct Args {
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
 
-    /// Enable TLS for the runtime.
+    /// Enable/disable anonymous telemetry collection.
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 }
