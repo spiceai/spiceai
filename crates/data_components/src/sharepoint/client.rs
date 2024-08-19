@@ -21,10 +21,17 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session, common::project_schema, datasource::{TableProvider, TableType}, error::{DataFusionError, Result as DataFusionResult}, execution::{SendableRecordBatchStream, TaskContext}, logical_expr::Expr, physical_expr::EquivalenceProperties, physical_plan::{
+    catalog::Session,
+    common::project_schema,
+    datasource::{TableProvider, TableType},
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::Expr,
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
-    }
+    },
 };
 use futures::{Stream, StreamExt};
 
