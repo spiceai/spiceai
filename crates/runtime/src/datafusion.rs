@@ -28,6 +28,7 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
+use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
 use crate::{embeddings, get_dependent_table_names};
 
@@ -257,6 +258,7 @@ impl DataFusion {
             .with_config(df_config)
             .with_default_features()
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_runtime_env(default_runtime_env())
             .build();
 
         let ctx = SessionContext::new_with_state(state);
