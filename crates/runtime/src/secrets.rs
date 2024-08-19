@@ -386,6 +386,9 @@ mod tests {
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
+        // Ensure `MY_SECRET_KEY` is not set from other tests.
+        std::env::remove_var("MY_SECRET_KEY");
+
         let result = secrets
             .inject_secrets(
                 "MY_SECRET_KEY",
