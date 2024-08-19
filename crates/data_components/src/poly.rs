@@ -6,7 +6,7 @@ use datafusion::{
     catalog::Session,
     common::Constraints,
     datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
+    error::Result as DataFusionResult,
     logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
     prelude::Expr,
@@ -15,19 +15,19 @@ use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
 };
 
-use crate::delete::{get_deletion_provider, DeletionTableProvider};
+use crate::delete::DeletionTableProvider;
 
 #[derive(Clone)]
 pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
-    delete: Arc<dyn TableProvider>,
+    delete: Arc<dyn DeletionTableProvider>,
     fed: Arc<dyn TableProvider>,
 }
 
 impl PolyTableProvider {
     pub fn new(
         write: Arc<dyn TableProvider>,
-        delete: Arc<dyn TableProvider>,
+        delete: Arc<dyn DeletionTableProvider>,
         fed: Arc<dyn TableProvider>,
     ) -> Self {
         PolyTableProvider { write, delete, fed }
@@ -58,11 +58,7 @@ impl DeletionTableProvider for PolyTableProvider {
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let delete = get_deletion_provider(Arc::clone(&self.delete)).ok_or(
-            DataFusionError::Plan("No deletion provider found".to_string()),
-        )?;
-
-        delete.delete_from(state, filters).await
+        self.delete.delete_from(state, filters).await
     }
 }
 

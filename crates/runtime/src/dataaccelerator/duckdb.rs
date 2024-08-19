@@ -111,7 +111,7 @@ impl DataAccelerator for DuckDBAccelerator {
 
         Ok(Arc::new(PolyTableProvider::new(
             cloned_writer,
-            Arc::new(DeletionTableProviderAdapter::new(duckdb_writer)),
+            duckdb_writer,
             read_provider,
         )))
     }
