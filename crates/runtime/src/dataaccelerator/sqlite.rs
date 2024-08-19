@@ -141,8 +141,6 @@ impl DataAccelerator for SqliteAccelerator {
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
-        println!("{:?}", cmd.options);
-
         if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
             this_dataset.app.as_ref().map(|a| {
                 let datasets = Runtime::get_valid_datasets(a, crate::LogErrors(false));

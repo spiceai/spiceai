@@ -299,7 +299,6 @@ pub async fn create_accelerator_table(
     for (k, v) in &acceleration_settings.params {
         let secret = secret_guard.inject_secrets(k, ParamStr(v)).await;
         params_with_secrets.insert(k.clone(), secret);
-        println!("{k}: {v}");
     }
 
     let params = Parameters::try_new(
@@ -443,7 +442,6 @@ mod test {
             ..Acceleration::default()
         };
 
-        println!("{params:?}");
         let _ = create_accelerator_table(
             "abc".into(),
             schema,
