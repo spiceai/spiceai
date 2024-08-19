@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use crate::exporter::AnonymousTelemetryExporter;
-use opentelemetry::{global::GlobalMeterProvider, metrics::MeterProvider};
+use opentelemetry::global::GlobalMeterProvider;
 use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     runtime::Tokio,
@@ -31,16 +34,17 @@ const ENDPOINT_CONST: &str = "https://data.spiceai.io";
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
 const TELEMETRY_TIMEOUT_SECONDS: u64 = 30;
 
-thread_local! {
-     static ENDPOINT: LazyCell<String> = LazyCell::new(|| {
-         std::env::var("SPICEAI_ENDPOINT").unwrap_or_else(|_| ENDPOINT_CONST.into())
-     });
-}
+static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
+    std::env::var("SPICEAI_ENDPOINT")
+        .unwrap_or_else(|_| ENDPOINT_CONST.into())
+        .into()
+});
 
-pub fn start() {
+pub async fn start() {
     let resource = Resource::default();
 
-    let oss_telemetry_exporter = OtelArrowExporter::new(AnonymousTelemetryExporter::new());
+    let oss_telemetry_exporter =
+        OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
 
     let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter, Tokio)
         .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
@@ -52,13 +56,11 @@ pub fn start() {
         .with_reader(periodic_reader)
         .build();
 
-    let provider = crate::meter::METER_PROVIDER.get_or_init(|| GlobalMeterProvider::new(provider));
+    let _ = crate::meter::METER_PROVIDER.get_or_init(|| GlobalMeterProvider::new(provider));
 
-    let meter = provider.meter("start");
-    meter.u64_counter("ping").init().add(1, &[]);
-    ENDPOINT.with(|endpoint| {
-        println!("Starting with {}...", **endpoint);
-    });
+    crate::meter::METER.u64_counter("start").init().add(1, &[]);
+
+    tracing::debug!("Started anonymous telemetry collection to {}", *ENDPOINT);
 }
 
 #[cfg(test)]
@@ -67,6 +69,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_start() {
-        start();
+        start().await;
     }
 }

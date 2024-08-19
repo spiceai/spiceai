@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true
+flight_client = { path = "../flight_client" }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }

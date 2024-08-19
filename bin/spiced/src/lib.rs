@@ -189,7 +189,7 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context(UnableToInitializeTlsSnafu)?;
 
-    start_anonymous_telemetry(&args, telemetry_config.as_ref());
+    start_anonymous_telemetry(&args, telemetry_config.as_ref()).await;
 
     let cloned_rt = rt.clone();
     let server_thread =
@@ -242,12 +242,15 @@ fn init_metrics(
     Ok(())
 }
 
-fn start_anonymous_telemetry(args: &Args, spicepod_telemetry_config: Option<&TelemetryConfig>) {
+async fn start_anonymous_telemetry(
+    args: &Args,
+    spicepod_telemetry_config: Option<&TelemetryConfig>,
+) {
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
     if !explicitly_disabled {
         #[cfg(feature = "anonymous_telemetry")]
-        telemetry::anonymous::start();
+        telemetry::anonymous::start().await;
     }
 }
