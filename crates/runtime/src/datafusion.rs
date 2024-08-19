@@ -830,7 +830,7 @@ impl DataFusion {
         Ok(())
     }
 
-    async fn get_accelerated_table_provider(
+    pub async fn get_accelerated_table_provider(
         &self,
         dataset_name: &str,
     ) -> Result<Arc<dyn TableProvider>> {
