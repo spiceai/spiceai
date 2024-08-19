@@ -105,6 +105,10 @@ impl DataAccelerator for SqliteAccelerator {
         "sqlite"
     }
 
+    /// Initializes an SQLite database for the dataset
+    /// If the dataset is not file-accelerated, this is a no-op
+    /// This step is required for federation, as SQLite connections attach to all other configured SQLite databases.
+    /// Federation then requires that all attached databases exist before dataset registration.
     async fn init(
         &self,
         dataset: &Dataset,
@@ -112,6 +116,11 @@ impl DataAccelerator for SqliteAccelerator {
         let path = self.sqlite_file_path(dataset);
 
         if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
+            if !acceleration.params.contains_key("sqlite_file") {
+                make_spice_data_directory()
+                    .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+            }
+
             SqliteConnectionPool::init(path, acceleration.mode.to_string().as_str().into())
                 .await
                 .context(AccelerationInitializationFailedSnafu)?;
@@ -131,6 +140,8 @@ impl DataAccelerator for SqliteAccelerator {
             make_spice_data_directory()
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
+
+        println!("{:?}", cmd.options);
 
         if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
             this_dataset.app.as_ref().map(|a| {

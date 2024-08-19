@@ -598,6 +598,9 @@ impl Runtime {
         let _ = join_all(futures).await;
     }
 
+    /// Initialize datasets configured with accelerators before registering the datasets.
+    /// This ensures that the required resources for acceleration are available before registration,
+    /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
     async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
