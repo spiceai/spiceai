@@ -3153,7 +3153,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b29a188e92126f79bf3b982fdcf359efa1e051c3#b29a188e92126f79bf3b982fdcf359efa1e051c3"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c07ae3cc1b28686e7d25948a3fa9ddce01df3593#c07ae3cc1b28686e7d25948a3fa9ddce01df3593"
 dependencies = [
  "arrow",
  "async-stream",
