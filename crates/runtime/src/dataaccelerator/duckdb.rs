@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -105,10 +105,15 @@ impl DataAccelerator for DuckDBAccelerator {
             unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
         };
 
+        let read_provider = Arc::clone(&duckdb_writer.read_provider);
         let duckdb_writer = Arc::new(duckdb_writer.clone());
+        let cloned_writer = Arc::clone(&duckdb_writer);
 
-        let deletion_adapter = DeletionTableProviderAdapter::new(duckdb_writer);
-        Ok(Arc::new(deletion_adapter))
+        Ok(Arc::new(PolyTableProvider::new(
+            cloned_writer,
+            duckdb_writer,
+            read_provider,
+        )))
     }
 
     fn prefix(&self) -> &'static str {
