@@ -129,12 +129,14 @@ impl Secrets {
             result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
 
             // Get the secret value from the store
-            let secret = self.get_store_secret(
-                &param_str,
-                &secret_replacement.store_name,
-                &secret_replacement.key,
-            )
-            .await.unwrap_or_default();
+            let secret = self
+                .get_store_secret(
+                    &param_str,
+                    &secret_replacement.store_name,
+                    &secret_replacement.key,
+                )
+                .await
+                .unwrap_or_default();
 
             // Replace the token with the secret value or keep the original text if secret not found
             result.push_str(&secret);
@@ -390,9 +392,6 @@ mod tests {
                 super::ParamStr("This is a secret: ${ env:MY_SECRET_KEY }! 🫡"),
             )
             .await;
-        assert_eq!(
-            "This is a secret: ! 🫡",
-            result.expose_secret().as_str()
-        );
+        assert_eq!("This is a secret: ! 🫡", result.expose_secret().as_str());
     }
 }
