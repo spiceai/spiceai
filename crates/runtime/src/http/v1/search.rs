@@ -111,11 +111,10 @@ pub(crate) async fn post(
     }
 }
 
-#[allow(clippy::from_iter_instead_of_collect)]
 pub(crate) fn create_primary_key_payload(
     table_primary_keys: &HashMap<TableReference, Vec<RecordBatch>>,
 ) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
-    let from_value_iter = table_primary_keys
+    table_primary_keys
         .iter()
         .map(|(tbl, pks)| {
             let buf = Vec::new();
@@ -133,8 +132,5 @@ pub(crate) fn create_primary_key_payload(
             };
             Ok((tbl.to_string(), res))
         })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-    let from_value: HashMap<String, Value> =
-        HashMap::from_iter(from_value_iter.iter().map(|(k, v)| (k.clone(), v.clone())));
-    Ok(from_value)
+        .collect()
 }
