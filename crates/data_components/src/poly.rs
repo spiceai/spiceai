@@ -11,7 +11,9 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
-use datafusion_federation::{FederatedTableProviderAdaptor, FederationProvider};
+use datafusion_federation::{
+    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
+};
 
 use crate::delete::{get_deletion_provider, DeletionTableProvider};
 
@@ -36,6 +38,16 @@ impl PolyTableProvider {
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .map(|x| x.source.federation_provider())
+    }
+
+    #[must_use]
+    pub fn get_table_source(&self) -> Option<Arc<dyn FederatedTableSource>> {
+        let adaptor = self
+            .fed
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>();
+
+        adaptor.map(|f| Arc::clone(&f.source))
     }
 }
 

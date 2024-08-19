@@ -8321,6 +8321,7 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-federation",
+ "datafusion-federation-sql",
  "datafusion-table-providers",
  "db_connection_pool",
  "dirs",

@@ -1,5 +1,6 @@
 use std::{any::Any, sync::Arc};
 
+use super::AcceleratedTable;
 use crate::component::dataset::acceleration::ZeroResultsAction;
 use arrow::datatypes::SchemaRef;
 use data_components::poly::PolyTableProvider;
@@ -10,10 +11,8 @@ use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
 };
 
-use super::AcceleratedTable;
-
 impl AcceleratedTable {
-    fn get_federation_provider_for_accelerator(&self) -> Option<Arc<dyn FederationProvider>> {
+    fn get_federation_provider_for_accelerator(&self) -> Option<Arc<PolyTableProvider>> {
         let poly = self
             .accelerator
             .as_any()
@@ -24,10 +23,20 @@ impl AcceleratedTable {
 
     fn create_federated_table_source(&self) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
         let schema = Arc::clone(&self.schema());
-        let fed_provider = Arc::new(FederationProviderAdapter::new(
-            self.get_federation_provider_for_accelerator(),
+        let inner = self.get_federation_provider_for_accelerator();
+
+        let fed_provider = Arc::new(FederationAdaptor::new(
+            inner.clone().map(|x| x as Arc<dyn FederationProvider>),
             self.zero_results_action != ZeroResultsAction::UseSource,
         ));
+
+        if let Some(inner) = inner {
+            if let Some(table_source) = inner.get_table_source() {
+                return Ok(table_source);
+            }
+        }
+
+        // For other queries to continue running without enabling federation
         Ok(Arc::new(
             AcceleratedTableFederatedTableSource::new_with_schema(fed_provider, schema)?,
         ))
@@ -44,18 +53,18 @@ impl AcceleratedTable {
     }
 }
 
-pub struct FederationProviderAdapter {
+pub struct FederationAdaptor {
     pub inner: Option<Arc<dyn FederationProvider>>,
     pub enabled: bool,
 }
 
-impl FederationProviderAdapter {
+impl FederationAdaptor {
     fn new(inner: Option<Arc<dyn FederationProvider>>, enabled: bool) -> Self {
         Self { inner, enabled }
     }
 }
 
-impl FederationProvider for FederationProviderAdapter {
+impl FederationProvider for FederationAdaptor {
     fn name(&self) -> &str {
         "FederationProviderForAcceleratedDataset"
     }
@@ -73,13 +82,13 @@ impl FederationProvider for FederationProviderAdapter {
 }
 
 pub struct AcceleratedTableFederatedTableSource {
-    provider: Arc<FederationProviderAdapter>,
+    provider: Arc<FederationAdaptor>,
     schema: SchemaRef,
 }
 
 impl AcceleratedTableFederatedTableSource {
     pub fn new_with_schema(
-        provider: Arc<FederationProviderAdapter>,
+        provider: Arc<FederationAdaptor>,
         schema: SchemaRef,
     ) -> DataFusionResult<Self> {
         Ok(Self { provider, schema })
