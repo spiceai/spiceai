@@ -52,8 +52,7 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
 
     let traces_table = rt
         .datafusion()
-        .ctx
-        .table_provider("traces")
+        .get_accelerated_table_provider("traces")
         .await
         .map_err(|e| e.to_string())?;
 

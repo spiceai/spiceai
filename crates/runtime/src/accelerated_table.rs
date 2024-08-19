@@ -50,6 +50,7 @@ use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
+pub mod federation;
 mod metrics;
 pub mod refresh;
 pub mod refresh_task;
