@@ -22,14 +22,14 @@ use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
+use datafusion_federation::FederatedTableProviderAdaptor;
 use itertools::Itertools;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
+use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::{
-    accelerated_table::AcceleratedTable, datafusion::DataFusion, model::EmbeddingModelStore,
-};
+use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 
 use super::table::EmbeddingTable;
 use snafu::prelude::*;
@@ -444,6 +444,13 @@ fn get_embedding_table(tbl: &Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTabl
     if let Some(embedding_table) = tbl.as_any().downcast_ref::<EmbeddingTable>() {
         return Some(Arc::new(embedding_table.clone()));
     }
+
+    let tbl = if let Some(adaptor) = tbl.as_any().downcast_ref::<FederatedTableProviderAdaptor>() {
+        adaptor.table_provider.clone()?
+    } else {
+        Arc::clone(tbl)
+    };
+
     if let Some(accelerated_table) = tbl.as_any().downcast_ref::<AcceleratedTable>() {
         if let Some(embedding_table) = accelerated_table
             .get_federated_table()

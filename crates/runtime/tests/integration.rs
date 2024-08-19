@@ -41,6 +41,7 @@ mod postgres;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
+mod s3;
 mod tls;
 
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
@@ -114,6 +115,7 @@ where
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
+    println!("Query: {query}");
     assert_batches_eq!(expected_plan, &plan_results);
 
     // Check the result

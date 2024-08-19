@@ -91,8 +91,7 @@ async fn prepare_test_environment() -> Result<RunningContainer<'static>, String>
 async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTask, String> {
     let table = rt
         .datafusion()
-        .ctx
-        .table_provider(table_name)
+        .get_accelerated_table_provider(table_name)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -112,8 +111,7 @@ async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTa
 async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn TableProvider>, String> {
     let table = rt
         .datafusion()
-        .ctx
-        .table_provider(table_name)
+        .get_accelerated_table_provider(table_name)
         .await
         .map_err(|e| e.to_string())?;
 

@@ -7,10 +7,11 @@ use ::arrow::{
 };
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::Constraints,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, LogicalPlan},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -19,11 +20,13 @@ use datafusion::{
     },
 };
 
+use crate::poly::PolyTableProvider;
+
 #[async_trait]
 pub trait DeletionTableProvider: TableProvider {
     async fn delete_from(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         _filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Err(DataFusionError::Plan("Not implemented".to_string()))
@@ -142,6 +145,9 @@ impl DeletionTableProviderAdapter {
 pub fn get_deletion_provider(
     from: Arc<dyn TableProvider>,
 ) -> Option<Arc<dyn DeletionTableProvider>> {
+    if let Some(p) = from.as_any().downcast_ref::<PolyTableProvider>() {
+        return Some(Arc::new(p.clone()));
+    }
     if let Some(p) = from.as_any().downcast_ref::<DeletionTableProviderAdapter>() {
         return Some(Arc::clone(&p.source));
     }
@@ -172,7 +178,7 @@ impl TableProvider for DeletionTableProviderAdapter {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -182,7 +188,7 @@ impl TableProvider for DeletionTableProviderAdapter {
 
     async fn insert_into(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {

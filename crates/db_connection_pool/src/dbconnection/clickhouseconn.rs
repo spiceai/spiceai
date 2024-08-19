@@ -23,10 +23,10 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow_sql_gen::clickhouse::block_to_arrow;
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };

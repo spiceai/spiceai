@@ -36,16 +36,20 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use cache::QueryResultsCacheProvider;
-use datafusion::catalog::schema::SchemaProvider;
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
+use datafusion::catalog::CatalogProvider;
+use datafusion::catalog::SchemaProvider;
+use datafusion::catalog_common::MemoryCatalogProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
-use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+use datafusion_federation::{
+    FederatedQueryPlanner, FederatedTableProviderAdaptor, FederationAnalyzerRule,
+};
 use query::{Protocol, QueryBuilder};
 use snafu::prelude::*;
 use tokio::spawn;
@@ -190,6 +194,9 @@ pub enum Error {
 
     #[snafu(display("Acceleration mode {mode} not supported for dataset from source {from}"))]
     UnsupportedAccelerationMode { mode: String, from: String },
+
+    #[snafu(display("Unable to retrieve underlying table provider from federation"))]
+    UnableToRetrieveTableFromFederation { table_name: String },
 }
 
 pub enum Table {
@@ -247,8 +254,12 @@ impl DataFusion {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let state = SessionState::new_with_config_rt(df_config, default_runtime_env())
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
+        let state = SessionStateBuilder::new()
+            .with_config(df_config)
+            .with_default_features()
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_runtime_env(default_runtime_env())
+            .build();
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
@@ -400,7 +411,14 @@ impl DataFusion {
                     );
 
                     self.ctx
-                        .register_table(dataset_table_ref.clone(), Arc::new(accelerated_table))
+                        .register_table(
+                            dataset_table_ref.clone(),
+                            Arc::new(
+                                Arc::new(accelerated_table)
+                                    .create_federated_table_provider()
+                                    .context(UnableToRegisterTableToDataFusionSnafu)?,
+                            ),
+                        )
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
@@ -755,7 +773,14 @@ impl DataFusion {
             .await?;
 
         self.ctx
-            .register_table(dataset.name.clone(), Arc::new(accelerated_table))
+            .register_table(
+                dataset.name.clone(),
+                Arc::new(
+                    Arc::new(accelerated_table)
+                        .create_federated_table_provider()
+                        .context(UnableToRegisterTableToDataFusionSnafu)?,
+                ),
+            )
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         self.register_metadata_table(&dataset, Arc::clone(&source))
@@ -765,27 +790,18 @@ impl DataFusion {
     }
 
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
-        let table = self
-            .ctx
-            .table_provider(TableReference::from(dataset_name.to_string()))
-            .await
-            .context(UnableToGetTableSnafu)?;
-
+        let table = self.get_accelerated_table_provider(dataset_name).await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
-            accelerated_table
-                .trigger_refresh()
-                .await
-                .context(UnableToTriggerRefreshSnafu {
+            return accelerated_table.trigger_refresh().await.context(
+                UnableToTriggerRefreshSnafu {
                     table_name: dataset_name.to_string(),
-                })?;
-        } else {
-            NotAcceleratedTableSnafu {
-                table_name: dataset_name.to_string(),
-            }
-            .fail()?;
+                },
+            );
         }
-
-        Ok(())
+        NotAcceleratedTableSnafu {
+            table_name: dataset_name.to_string(),
+        }
+        .fail()?
     }
 
     pub async fn update_refresh_sql(
@@ -799,10 +815,8 @@ impl DataFusion {
         }
 
         let table = self
-            .ctx
-            .table_provider(dataset_name.clone())
-            .await
-            .context(UnableToGetTableSnafu)?;
+            .get_accelerated_table_provider(&dataset_name.to_string())
+            .await?;
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
@@ -812,7 +826,33 @@ impl DataFusion {
                     table_name: dataset_name.to_string(),
                 })?;
         }
+
         Ok(())
+    }
+
+    pub async fn get_accelerated_table_provider(
+        &self,
+        dataset_name: &str,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let mut table = self
+            .ctx
+            .table_provider(dataset_name)
+            .await
+            .context(UnableToGetTableSnafu)?;
+        if let Some(adaptor) = table
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            if let Some(nested_table) = adaptor.table_provider.clone() {
+                table = nested_table;
+            } else {
+                return UnableToRetrieveTableFromFederationSnafu {
+                    table_name: dataset_name.to_string(),
+                }
+                .fail();
+            }
+        }
+        Ok(table)
     }
 
     /// Federated tables are attached directly as tables visible in the public `DataFusion` context.

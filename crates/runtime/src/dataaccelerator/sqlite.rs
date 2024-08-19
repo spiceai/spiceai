@@ -15,10 +15,9 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory};
@@ -52,9 +51,7 @@ impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sqlite_factory: SqliteTableProviderFactory::new()
-                .db_path_param("file")
-                .db_base_folder_param("data_directory"),
+            sqlite_factory: SqliteTableProviderFactory::new(),
         }
     }
 
@@ -112,10 +109,15 @@ impl DataAccelerator for SqliteAccelerator {
             unreachable!("SqliteTableWriter should be returned from SqliteTableProviderFactory")
         };
 
+        let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
+        let cloned_writer = Arc::clone(&sqlite_writer);
 
-        let deletion_adapter = DeletionTableProviderAdapter::new(sqlite_writer);
-        Ok(Arc::new(deletion_adapter))
+        Ok(Arc::new(PolyTableProvider::new(
+            cloned_writer,
+            sqlite_writer,
+            read_provider,
+        )))
     }
 
     fn prefix(&self) -> &'static str {
@@ -141,9 +143,10 @@ mod tests {
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
-        physical_plan::{collect, test::exec::MockExec},
+        physical_plan::collect,
         scalar::ScalarValue,
     };
+    use datafusion_table_providers::util::test::MockExec;
 
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 

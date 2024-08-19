@@ -1,11 +1,11 @@
 use arrow::datatypes::DataType;
 use datafusion::{
     common::{plan_err, Result as DataFusionResult},
+    functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
     logical_expr::{
         type_coercion::functions::data_types, Accumulator, ColumnarValue, ScalarUDFImpl, Signature,
         Volatility,
     },
-    physical_plan::expressions::{MaxAccumulator, MinAccumulator},
     scalar::ScalarValue,
 };
 
