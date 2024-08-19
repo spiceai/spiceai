@@ -138,7 +138,7 @@ impl Secrets {
                 .await
                 .unwrap_or_default();
 
-            // Replace the token with the secret value or keep the original text if secret not found
+            // Replace the token with the desired string
             result.push_str(&secret);
 
             // Update the last end to the end of the current match
