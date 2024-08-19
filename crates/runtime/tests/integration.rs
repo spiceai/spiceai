@@ -41,6 +41,7 @@ mod postgres;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
+mod s3;
 mod tls;
 
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
