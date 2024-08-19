@@ -129,18 +129,14 @@ impl Secrets {
             result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
 
             // Get the secret value from the store
-            let Some(secret) = self
-                .get_store_secret(
-                    &param_str,
-                    &secret_replacement.store_name,
-                    &secret_replacement.key,
-                )
-                .await
-            else {
-                continue;
-            };
+            let secret = self.get_store_secret(
+                &param_str,
+                &secret_replacement.store_name,
+                &secret_replacement.key,
+            )
+            .await.unwrap_or_default();
 
-            // Replace the token with the desired string
+            // Replace the token with the secret value or keep the original text if secret not found
             result.push_str(&secret);
 
             // Update the last end to the end of the current match
@@ -379,6 +375,23 @@ mod tests {
             .await;
         assert_eq!(
             "This is a secret: super_secret! 🫡",
+            result.expose_secret().as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inject_secrets_no_env() {
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
+
+        let result = secrets
+            .inject_secrets(
+                "MY_SECRET_KEY",
+                super::ParamStr("This is a secret: ${ env:MY_SECRET_KEY }! 🫡"),
+            )
+            .await;
+        assert_eq!(
+            "This is a secret: ! 🫡",
             result.expose_secret().as_str()
         );
     }
