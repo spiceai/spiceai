@@ -601,48 +601,45 @@ impl Runtime {
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
-    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) {
+    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> bool {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {
-                let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
-                let _ = retry(retry_strategy, || async {
-                    let accelerator =
-                        match dataaccelerator::get_accelerator_engine(acceleration.engine)
-                            .await
-                            .context(AcceleratorEngineNotAvailableSnafu {
-                                name: acceleration.engine.to_string(),
-                            }) {
-                            Ok(accelerator) => accelerator,
-                            Err(err) => {
-                                let ds_name = &ds.name;
-                                status::update_dataset(ds_name, status::ComponentStatus::Error);
-                                metrics::datasets::LOAD_ERROR.add(1, &[]);
-                                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                                return Err(RetryError::transient(err));
-                            }
-                        };
-
-                    match accelerator
-                        .init(ds)
-                        .await
-                        .context(AcceleratorInitializationFailedSnafu {
-                            name: acceleration.engine.to_string(),
-                        }) {
-                        Ok(()) => Ok(()),
-                        Err(err) => {
-                            let ds_name = &ds.name;
-                            status::update_dataset(ds_name, status::ComponentStatus::Error);
-                            metrics::datasets::LOAD_ERROR.add(1, &[]);
-                            warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                            Err(RetryError::transient(err))
-                        }
+                let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(accelerator) => accelerator,
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        return false;
                     }
-                })
-                .await;
+                };
+
+                match accelerator
+                    .init(ds)
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        return false;
+                    }
+                }
             }
         }
+
+        return true;
     }
 
     async fn load_datasets(&self) {
@@ -654,7 +651,9 @@ impl Runtime {
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
 
-        self.initialize_accelerators(&valid_datasets).await;
+        if !self.initialize_accelerators(&valid_datasets).await {
+            return;
+        }
 
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
