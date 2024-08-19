@@ -30,32 +30,15 @@ pub(crate) struct OAuthResponse {
     pub state: Option<String>,
 }
 
-/// The additional state provided in `/oauth2/v2.0/authorize`.
-/// `<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow#request-an-authorization-code>`
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) struct SharepointState {
-    pub datasets: Vec<String>,
-}
-
-impl SharepointState {
-    pub(crate) fn new(from_state: Option<String>) -> Self {
-        from_state
-            .and_then(|state| serde_json::from_str(&state).ok())
-            .unwrap_or_default()
-    }
-}
-
 pub(crate) async fn get(
     Path(service): Path<String>,
     Query(params): Query<OAuthResponse>,
 ) -> Response {
     match service.as_str() {
         "sharepoint" => {
-            // let state = SharepointState::new(params.state);
-            println!("Here's the code={}", params.code);
+            println!("\nHere's the code={}\n", params.code);
 
-            (status::StatusCode::OK, "Sharepoint is good!!").into_response()
+            (status::StatusCode::OK, "Check your terminal!!").into_response()
         }
         s => (
             status::StatusCode::BAD_REQUEST,
