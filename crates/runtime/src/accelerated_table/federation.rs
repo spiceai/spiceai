@@ -25,14 +25,18 @@ impl AcceleratedTable {
         let schema = Arc::clone(&self.schema());
         let inner = self.get_federation_provider_for_accelerator();
 
+        let enabled = self.zero_results_action != ZeroResultsAction::UseSource;
+
         let fed_provider = Arc::new(FederationAdaptor::new(
             inner.clone().map(|x| x as Arc<dyn FederationProvider>),
-            self.zero_results_action != ZeroResultsAction::UseSource,
+            enabled,
         ));
 
-        if let Some(inner) = inner {
-            if let Some(table_source) = inner.get_table_source() {
-                return Ok(table_source);
+        if enabled {
+            if let Some(inner) = inner {
+                if let Some(table_source) = inner.get_table_source() {
+                    return Ok(table_source);
+                }
             }
         }
 
@@ -70,6 +74,9 @@ impl FederationProvider for FederationAdaptor {
     }
 
     fn compute_context(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
         self.inner.clone().and_then(|x| x.compute_context())
     }
 
