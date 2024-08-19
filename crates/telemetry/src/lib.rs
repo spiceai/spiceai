@@ -13,3 +13,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+use meter::METER;
+use opentelemetry::metrics::Counter;
+use std::sync::LazyLock;
+
+#[cfg(feature = "anonymous_telemetry")]
+pub mod anonymous;
+mod exporter;
+mod meter;
+
+pub static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_count")
+        .with_description("Number of queries run.")
+        .with_unit("queries")
+        .init()
+});

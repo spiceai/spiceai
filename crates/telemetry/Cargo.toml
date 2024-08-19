@@ -9,14 +9,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow.workspace = true
 async-trait.workspace = true
-datafusion.workspace = true
-futures.workspace = true
-globset.workspace = true
-reqwest.workspace = true
-runtime = { path = "../runtime" }
-serde.workspace = true
-serde_json.workspace = true
-snafu.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+otel-arrow = { path = "../otel-arrow" }
 tokio.workspace = true
 tracing.workspace = true
+
+[features]
+anonymous_telemetry = []

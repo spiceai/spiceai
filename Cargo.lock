@@ -8347,6 +8347,7 @@ dependencies = [
  "spicepod",
  "ssh2",
  "suppaftp",
+ "telemetry",
  "tokio",
  "tokio-rusqlite",
  "tokio-rustls 0.26.0",
@@ -9280,6 +9281,7 @@ dependencies = [
  "snafu 0.8.4",
  "snmalloc-rs",
  "spice-cloud",
+ "telemetry",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
@@ -9634,15 +9636,11 @@ dependencies = [
 name = "telemetry"
 version = "0.17.2-beta"
 dependencies = [
+ "arrow",
  "async-trait",
- "datafusion",
- "futures",
- "globset",
- "reqwest 0.12.5",
- "runtime",
- "serde",
- "serde_json",
- "snafu 0.8.4",
+ "opentelemetry 0.24.0",
+ "opentelemetry_sdk 0.24.1",
+ "otel-arrow",
  "tokio",
  "tracing",
 ]
