@@ -182,9 +182,9 @@ impl FlightTable {
             table_reference,
             dialect,
             join_push_down_context: format!(
-                "url={},username={:?}",
+                "url={},username={}",
                 client.url(),
-                client.username()
+                client.username().unwrap_or_default()
             ),
         })
     }
@@ -206,7 +206,7 @@ impl FlightTable {
             join_push_down_context: format!(
                 "url={},username={:?}",
                 client.url(),
-                client.username()
+                client.username().unwrap_or_default()
             ),
         }
     }
