@@ -627,7 +627,7 @@ impl Runtime {
                     .context(AcceleratorInitializationFailedSnafu {
                         name: acceleration.engine.to_string(),
                     }) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {}
                     Err(err) => {
                         let ds_name = &ds.name;
                         status::update_dataset(ds_name, status::ComponentStatus::Error);
@@ -639,7 +639,7 @@ impl Runtime {
             }
         }
 
-        return true;
+        true
     }
 
     async fn load_datasets(&self) {
