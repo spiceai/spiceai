@@ -201,6 +201,12 @@ pub enum Error {
     #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
     AcceleratorEngineNotAvailable { name: String },
 
+    #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
+    AcceleratorInitializationFailed {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "Dataset names should not include a catalog. Unexpected '{}' in '{}'. Remove '{}' from the dataset name and try again.",
         catalog,
@@ -592,6 +598,54 @@ impl Runtime {
         let _ = join_all(futures).await;
     }
 
+    /// Initialize datasets configured with accelerators before registering the datasets.
+    /// This ensures that the required resources for acceleration are available before registration,
+    /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
+    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        let mut initialized_datasets = vec![];
+        for ds in datasets {
+            if let Some(acceleration) = &ds.acceleration {
+                let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(accelerator) => accelerator,
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        continue;
+                    }
+                };
+
+                match accelerator
+                    .init(ds)
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(()) => {
+                        initialized_datasets.push(Arc::clone(ds));
+                    }
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    }
+                }
+            } else {
+                initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
+            }
+        }
+
+        initialized_datasets
+    }
+
     async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
@@ -600,7 +654,9 @@ impl Runtime {
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
-        for ds in &valid_datasets {
+
+        // Load only successfully initialized datasets
+        for ds in &self.initialize_accelerators(&valid_datasets).await {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
             futures.push(self.load_dataset(Arc::clone(ds)));
         }

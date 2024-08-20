@@ -96,6 +96,7 @@ pub async fn create_internal_accelerated_table(
         None,
         &acceleration,
         secrets,
+        None,
     )
     .await
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;

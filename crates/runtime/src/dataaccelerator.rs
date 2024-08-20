@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::component::dataset::Dataset;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
@@ -113,6 +114,7 @@ pub trait DataAccelerator: Send + Sync {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     // The name of the accelerator
@@ -123,6 +125,14 @@ pub trait DataAccelerator: Send + Sync {
 
     // The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
+
+    // Initialize the accelerator for a dataset
+    async fn init(
+        &self,
+        _dataset: &Dataset,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 pub struct AcceleratorExternalTableBuilder {
@@ -262,6 +272,7 @@ pub async fn create_accelerator_table(
     constraints: Option<&Constraints>,
     acceleration_settings: &acceleration::Acceleration,
     secrets: Arc<RwLock<Secrets>>,
+    dataset: Option<&Dataset>,
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
@@ -345,7 +356,7 @@ pub async fn create_accelerator_table(
     let external_table = external_table_builder.build()?;
 
     let table_provider = accelerator
-        .create_external_table(&external_table)
+        .create_external_table(&external_table, dataset)
         .await
         .context(AccelerationCreationFailedSnafu)?;
 
@@ -401,6 +412,7 @@ mod test {
             None,
             &acceleration_settings,
             Arc::new(RwLock::new(Secrets::new())),
+            None,
         )
         .await
         .expect("accelerator table created");
@@ -423,18 +435,20 @@ mod test {
         register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
-            params,
+            params: params.clone(),
             enabled: true,
             mode: Mode::File,
             engine: Engine::Sqlite,
             ..Acceleration::default()
         };
+
         let _ = create_accelerator_table(
             "abc".into(),
             schema,
             None,
             &acceleration_settings,
             Arc::new(RwLock::new(Secrets::new())),
+            None,
         )
         .await
         .expect("accelerator table created");
@@ -467,6 +481,7 @@ mod test {
             None,
             &acceleration_settings,
             Arc::new(RwLock::new(Secrets::new())),
+            None,
         )
         .await
         .expect("accelerator table created");
