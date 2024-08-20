@@ -729,7 +729,9 @@ impl DataFusion {
 
         accelerated_table_builder.cache_provider(self.cache_provider());
 
-        accelerated_table_builder.disable_federation(acceleration_settings.disable_federation);
+        if acceleration_settings.disable_query_push_down {
+            accelerated_table_builder.disable_query_push_down();
+        }
 
         if refresh_mode == RefreshMode::Changes {
             let source = Box::leak(Box::new(Arc::clone(&source)));

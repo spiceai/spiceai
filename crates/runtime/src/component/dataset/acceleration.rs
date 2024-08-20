@@ -244,7 +244,7 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
-    pub disable_federation: bool,
+    pub disable_query_push_down: bool,
 }
 
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -343,7 +343,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             retention_period: acceleration.retention_period,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
-            disable_federation: disable_query_push_down,
+            disable_query_push_down,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
             indexes,
             primary_key,
@@ -373,7 +373,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
-            disable_federation: false,
+            disable_query_push_down: false,
         }
     }
 }
