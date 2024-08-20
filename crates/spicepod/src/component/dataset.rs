@@ -236,7 +236,6 @@ pub mod acceleration {
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[allow(clippy::struct_excessive_bools)]
     pub struct Acceleration {
         #[serde(default = "default_true")]
         pub enabled: bool,
