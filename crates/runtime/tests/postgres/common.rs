@@ -27,10 +27,10 @@ use crate::{
     docker::{ContainerRunnerBuilder, RunningContainer},
 };
 
-const PG_PASSWORD: &str = "runtime-integration-test-pw";
+pub const PG_PASSWORD: &str = "runtime-integration-test-pw";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
 
-fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
+pub fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     let mut params = HashMap::new();
     params.insert(
         "pg_host".to_string(),
@@ -56,12 +56,12 @@ fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     params
 }
 
-pub(super) fn get_random_port() -> usize {
+pub fn get_random_port() -> usize {
     rand::thread_rng().gen_range(15432..65535)
 }
 
 #[instrument]
-pub(super) async fn start_postgres_docker_container(
+pub async fn start_postgres_docker_container(
     port: usize,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{PG_DOCKER_CONTAINER}-{port}");
@@ -96,7 +96,7 @@ pub(super) async fn start_postgres_docker_container(
 }
 
 #[instrument]
-pub(super) async fn get_postgres_connection_pool(
+pub async fn get_postgres_connection_pool(
     port: usize,
 ) -> Result<PostgresConnectionPool, anyhow::Error> {
     let pool = PostgresConnectionPool::new(get_pg_params(port)).await?;

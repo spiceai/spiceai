@@ -367,12 +367,13 @@ mod tests {
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
-        std::env::set_var("MY_SECRET_KEY", "super_secret");
+        let key = &format!("MY_SECRET_KEY_{}", rand::random::<u64>());
+        std::env::set_var(key, "super_secret");
 
         let result = secrets
             .inject_secrets(
-                "MY_SECRET_KEY",
-                super::ParamStr("This is a secret: ${ env:MY_SECRET_KEY }! 🫡"),
+                key,
+                super::ParamStr(&format!("This is a secret: ${{ env:{key} }}! 🫡")),
             )
             .await;
         assert_eq!(
@@ -386,13 +387,15 @@ mod tests {
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
+        let key = &format!("MY_SECRET_KEY_{}", rand::random::<u64>());
+
         // Ensure `MY_SECRET_KEY` is not set from other tests.
-        std::env::remove_var("MY_SECRET_KEY");
+        std::env::remove_var(key);
 
         let result = secrets
             .inject_secrets(
-                "MY_SECRET_KEY",
-                super::ParamStr("This is a secret: ${ env:MY_SECRET_KEY }! 🫡"),
+                key,
+                super::ParamStr(&format!("This is a secret: ${{ env:{key} }}! 🫡")),
             )
             .await;
         assert_eq!("This is a secret: ! 🫡", result.expose_secret().as_str());

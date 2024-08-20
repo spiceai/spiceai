@@ -26,6 +26,7 @@ use runtime::{datafusion::DataFusion, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
+mod acceleration;
 mod catalog;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
