@@ -41,6 +41,7 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
 use datafusion::sql::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
+use flight_client::Credentials;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use ns_lookup::verify_endpoint_connection;
@@ -124,17 +125,17 @@ impl DataConnectorFactory for SpiceAIFactory {
         &self,
         params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let default_flight_url = if cfg!(feature = "dev") {
-            "https://dev-flight.spiceai.io".to_string()
+        let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
+            "https://dev-flight.spiceai.io".into()
         } else {
-            "https://flight.spiceai.io".to_string()
+            "https://flight.spiceai.io".into()
         };
         Box::pin(async move {
-            let url: String = params
+            let url: Arc<str> = params
                 .get("endpoint")
                 .expose()
                 .ok()
-                .map_or(default_flight_url, str::to_string);
+                .map_or(default_flight_url, Into::into);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
             verify_endpoint_connection(&url).await.with_context(|_| {
@@ -147,7 +148,8 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .get("api_key")
                 .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
-            let flight_client = FlightClient::try_new(url.as_str(), "", api_key)
+            let credentials = Credentials::new("", api_key);
+            let flight_client = FlightClient::try_new(url, credentials)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory = FlightFactory::new(
