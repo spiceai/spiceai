@@ -29,6 +29,8 @@ pub struct Runtime {
     pub tls: Option<TlsConfig>,
 
     pub tracing: Option<TracingConfig>,
+
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,4 +84,11 @@ pub struct TlsConfig {
 pub struct TracingConfig {
     pub zipkin_enabled: bool,
     pub zipkin_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TelemetryConfig {
+    pub enabled: bool,
 }

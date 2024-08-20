@@ -23,7 +23,7 @@ use datafusion::{
 use snafu::ResultExt;
 use std::{any::Any, sync::Arc};
 
-use crate::parameters::ParameterSpec;
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -60,6 +60,7 @@ impl DataAccelerator for ArrowAccelerator {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        _dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         TableProviderFactory::create(&self.arrow_factory, &ctx.state(), cmd)
