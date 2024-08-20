@@ -426,6 +426,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokio-rustls 0.26.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rustls/tokio-rustls
 
+- tokio-util 0.7.11, MIT 
+  <br/>https://github.com/tokio-rs/tokio
+
 - tonic 0.9.2, MIT 
   <br/>https://github.com/hyperium/tonic
 

@@ -19,9 +19,9 @@ use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::{project_schema, Constraints, Statistics};
 use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
@@ -34,7 +34,7 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::embeddings::execution_plan::EmbeddingTableExec;
-use crate::EmbeddingModelStore;
+use crate::model::EmbeddingModelStore;
 
 #[derive(Debug, Snafu)]
 pub enum Error {}
@@ -208,7 +208,7 @@ impl TableProvider for EmbeddingTable {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -307,7 +307,7 @@ impl TableProvider for EmbeddingTable {
 
     async fn insert_into(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {

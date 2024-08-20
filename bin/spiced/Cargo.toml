@@ -12,7 +12,15 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
-metrics-exporter-prometheus = { workspace = true }
+futures.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-prometheus.workspace = true
+opentelemetry-zipkin.workspace = true
+opentelemetry-http.workspace = true
+otel-arrow = { path = "../../crates/otel-arrow" }
+prometheus.workspace = true
+reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 rustls.workspace = true
 rustls-pemfile.workspace = true
@@ -20,10 +28,13 @@ snafu.workspace = true
 snmalloc-rs = "0.3.6"
 spice-cloud = { path = "../../crates/spice_cloud" }
 tokio.workspace = true
+telemetry = { path = "../../crates/telemetry" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
 
 [features]
+anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
 databricks = ["runtime/databricks"]
@@ -42,6 +53,7 @@ default = [
   "snowflake",
   "ftp",
   "debezium",
+  "anonymous_telemetry",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]

@@ -25,13 +25,12 @@ use arrow_flight::{
     sql::{CommandStatementQuery, ProstMessageExt},
     FlightDescriptor,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
 use prost::Message;
 use rand::Rng;
 use runtime::{config::Config, tls::TlsConfig, Runtime};
 use rustls::crypto::{self, CryptoProvider};
 use tonic::transport::Channel;
-use tonic_health_0_9_0::pb::health_client::HealthClient;
+use tonic_health::pb::health_client::HealthClient;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
@@ -57,17 +56,16 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     let cert_bytes = include_bytes!("../../../../test/tls/spiced_cert.pem").to_vec();
     let key_bytes = include_bytes!("../../../../test/tls/spiced_key.pem").to_vec();
 
-    let metrics_recorder = PrometheusBuilder::new().build_recorder();
-    let metrics_handle = metrics_recorder.handle();
-
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
         .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
     let tls_config = TlsConfig::try_new(cert_bytes.clone(), key_bytes).expect("valid TlsConfig");
 
+    let registry = prometheus::Registry::new();
+
     let rt = Runtime::builder()
-        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), metrics_handle)
+        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
         .build()
         .await;
 
@@ -137,20 +135,17 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     tracing::info!("Flight (GRPC) health check passed");
 
     // OpenTelemetry (GRPC)
-    let root_cert_tonic_0_9_0 = tonic_0_9_0::transport::Certificate::from_pem(&root_cert_bytes);
+    let root_cert_tonic = tonic::transport::Certificate::from_pem(&root_cert_bytes);
     let otel_channel =
-        tonic_0_9_0::transport::Channel::from_shared(format!("https://127.0.0.1:{otel_port}"))?
-            .tls_config(
-                tonic_0_9_0::transport::ClientTlsConfig::new()
-                    .ca_certificate(root_cert_tonic_0_9_0),
-            )
+        tonic::transport::Channel::from_shared(format!("https://127.0.0.1:{otel_port}"))?
+            .tls_config(tonic::transport::ClientTlsConfig::new().ca_certificate(root_cert_tonic))
             .expect("valid tls config")
             .connect()
             .await
             .expect("to connect to otel port");
     let mut health_client = HealthClient::new(otel_channel);
     health_client
-        .check(tonic_health_0_9_0::pb::HealthCheckRequest {
+        .check(tonic_health::pb::HealthCheckRequest {
             service: String::new(),
         })
         .await

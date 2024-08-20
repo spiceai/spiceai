@@ -27,6 +27,10 @@ pub struct Runtime {
 
     /// If set, the runtime will configure all endpoints to use TLS
     pub tls: Option<TlsConfig>,
+
+    pub tracing: Option<TracingConfig>,
+
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,4 +76,19 @@ pub struct TlsConfig {
 
     /// A PEM encoded private key
     pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TracingConfig {
+    pub zipkin_enabled: bool,
+    pub zipkin_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TelemetryConfig {
+    pub enabled: bool,
 }

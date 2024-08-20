@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use acceleration::Engine;
+use app::App;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference;
@@ -22,7 +23,7 @@ use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -118,6 +119,7 @@ pub struct Dataset {
     pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
+    pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
 }
 
@@ -150,6 +152,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             embeddings: dataset.embeddings,
             acceleration,
             schema: None,
+            app: None,
         })
     }
 }
@@ -168,7 +171,19 @@ impl Dataset {
             acceleration: None,
             embeddings: Vec::default(),
             schema: None,
+            app: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_app(mut self, app: Arc<App>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    #[must_use]
+    pub fn app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     #[must_use]
@@ -228,8 +243,8 @@ impl Dataset {
         if parts.len() > 1 {
             parts[0].to_string()
         } else {
-            if self.from == "localhost" || self.from.is_empty() {
-                return "localhost".to_string();
+            if self.from == "sink" || self.from.is_empty() {
+                return "sink".to_string();
             }
             "spiceai".to_string()
         }

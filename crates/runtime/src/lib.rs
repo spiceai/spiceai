@@ -21,7 +21,6 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
@@ -30,6 +29,7 @@ use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
 use ::datafusion::sql::TableReference;
+use ::opentelemetry::Key;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
@@ -43,14 +43,13 @@ use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
+use embeddings::task::TaskEmbed;
 use extension::ExtensionFactory;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use metrics::SetRecorderError;
-use metrics_exporter_prometheus::PrometheusHandle;
-use model::{try_to_chat_model, try_to_embedding, LLMModelStore};
+use model::{try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -59,6 +58,7 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -83,15 +83,18 @@ pub mod extension;
 mod flight;
 mod http;
 pub mod internal_table;
+mod metrics;
 mod metrics_server;
 pub mod model;
 pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
+mod parameters;
 pub mod podswatcher;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
+pub mod task_history;
 pub mod timing;
 pub mod tls;
 pub(crate) mod tracers;
@@ -198,6 +201,12 @@ pub enum Error {
     #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
     AcceleratorEngineNotAvailable { name: String },
 
+    #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
+    AcceleratorInitializationFailed {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "Dataset names should not include a catalog. Unexpected '{}' in '{}'. Remove '{}' from the dataset name and try again.",
         catalog,
@@ -227,16 +236,14 @@ pub enum Error {
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
 
-    #[snafu(display("Unable to install metrics recorder: {source}"))]
-    UnableToInstallMetricsServer {
-        source: SetRecorderError<MetricsRecorder>,
-    },
-
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
     #[snafu(display("Unable to track query history: {source}"))]
     UnableToTrackQueryHistory { source: query_history::Error },
+
+    #[snafu(display("Unable to track task history: {source}"))]
+    UnableToTrackTaskHistory { source: task_history::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
@@ -257,19 +264,19 @@ pub enum Error {
 
     #[snafu(display("Error converting GlobSet to Regex: {source}"))]
     ErrorConvertingGlobSetToRegex { source: globset::Error },
+
+    #[snafu(display("Unable to create directory: {source}"))]
+    UnableToCreateDirectory { source: std::io::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 #[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
 pub struct Runtime {
-    instance_name: String,
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
@@ -278,7 +285,7 @@ pub struct Runtime {
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
-    metrics_handle: Option<PrometheusHandle>,
+    prometheus_registry: Option<prometheus::Registry>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -341,7 +348,7 @@ impl Runtime {
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
     ) -> Result<()> {
-        self.register_metrics_table(self.metrics_handle.clone())
+        self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
         let http_server_future = tokio::spawn(http::start(
@@ -358,11 +365,12 @@ impl Runtime {
 
         // Spawn the metrics server in the background
         let metrics_endpoint = self.metrics_endpoint;
-        let metrics_handle = self.metrics_handle.clone();
+        let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                metrics_server::start(metrics_endpoint, metrics_handle, cloned_tls_config).await
+                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
+                    .await
             {
                 tracing::error!("Prometheus metrics server error: {e}");
             }
@@ -481,27 +489,31 @@ impl Runtime {
         }
     }
 
-    fn datasets_iter(app: &App) -> impl Iterator<Item = Result<Dataset>> + '_ {
-        app.datasets.iter().cloned().map(Dataset::try_from)
+    fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
+        app.datasets
+            .clone()
+            .into_iter()
+            .map(Dataset::try_from)
+            .map(move |ds| ds.map(|ds| Dataset::with_app(ds, Arc::clone(app))))
     }
 
-    fn catalogs_iter(app: &App) -> impl Iterator<Item = Result<Catalog>> + '_ {
-        app.catalogs.iter().cloned().map(Catalog::try_from)
+    fn catalogs_iter<'a>(app: &Arc<App>) -> impl Iterator<Item = Result<Catalog>> + 'a {
+        app.catalogs.clone().into_iter().map(Catalog::try_from)
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_datasets(app: &App, log_errors: LogErrors) -> Vec<Dataset> {
+    fn get_valid_datasets(app: &Arc<App>, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
         Self::datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
-                Ok(ds) => Some(ds),
+                Ok(ds) => Some(Arc::new(ds)),
                 Err(e) => {
                     if log_errors.0 {
                         status::update_dataset(
                             &TableReference::parse_str(&spicepod_ds.name),
                             status::ComponentStatus::Error,
                         );
-                        metrics::counter!("datasets_load_error").increment(1);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
                         tracing::error!(dataset = &spicepod_ds.name, "{e}");
                     }
                     None
@@ -511,7 +523,7 @@ impl Runtime {
     }
 
     /// Returns a list of valid catalogs from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_catalogs(app: &App, log_errors: LogErrors) -> Vec<Catalog> {
+    fn get_valid_catalogs(app: &Arc<App>, log_errors: LogErrors) -> Vec<Catalog> {
         Self::catalogs_iter(app)
             .zip(&app.catalogs)
             .filter_map(|(catalog, spicepod_catalog)| match catalog {
@@ -522,7 +534,7 @@ impl Runtime {
                             &spicepod_catalog.name,
                             status::ComponentStatus::Error,
                         );
-                        metrics::counter!("catalogs_load_error").increment(1);
+                        metrics::catalogs::LOAD_ERROR.add(1, &[]);
                         tracing::error!(catalog = &spicepod_catalog.name, "{e}");
                     }
                     None
@@ -532,7 +544,7 @@ impl Runtime {
     }
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_views(app: &App, log_errors: LogErrors) -> Vec<View> {
+    fn get_valid_views(app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
         let datasets = Self::get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())
@@ -548,7 +560,7 @@ impl Runtime {
                     // only load this view if the name isn't used by an existing dataset
                     if datasets.contains(&view.name) {
                         if log_errors.0 {
-                            metrics::counter!("views_load_error").increment(1);
+                            metrics::views::LOAD_ERROR.add(1, &[]);
                             tracing::error!(
                                 view = &spicepod_view.name,
                                 "View name is already in use by a dataset."
@@ -561,7 +573,7 @@ impl Runtime {
                 }
                 Err(e) => {
                     if log_errors.0 {
-                        metrics::counter!("views_load_error").increment(1);
+                        metrics::views::LOAD_ERROR.add(1, &[]);
                         tracing::error!(view = &spicepod_view.name, "{e}");
                     }
                     None
@@ -586,6 +598,54 @@ impl Runtime {
         let _ = join_all(futures).await;
     }
 
+    /// Initialize datasets configured with accelerators before registering the datasets.
+    /// This ensures that the required resources for acceleration are available before registration,
+    /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
+    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        let mut initialized_datasets = vec![];
+        for ds in datasets {
+            if let Some(acceleration) = &ds.acceleration {
+                let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(accelerator) => accelerator,
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        continue;
+                    }
+                };
+
+                match accelerator
+                    .init(ds)
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(()) => {
+                        initialized_datasets.push(Arc::clone(ds));
+                    }
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    }
+                }
+            } else {
+                initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
+            }
+        }
+
+        initialized_datasets
+    }
+
     async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
@@ -594,9 +654,11 @@ impl Runtime {
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
-        for ds in &valid_datasets {
+
+        // Load only successfully initialized datasets
+        for ds in &self.initialize_accelerators(&valid_datasets).await {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds));
+            futures.push(self.load_dataset(Arc::clone(ds)));
         }
 
         if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
@@ -611,7 +673,7 @@ impl Runtime {
         self.load_views(app, &valid_datasets);
     }
 
-    fn load_views(&self, app: &App, valid_datasets: &[Dataset]) {
+    fn load_views(&self, app: &Arc<App>, valid_datasets: &[Arc<Dataset>]) {
         let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
 
         for view in &views {
@@ -632,7 +694,7 @@ impl Runtime {
                 Err(err) => {
                     let catalog_name = &catalog.name;
                     status::update_catalog(catalog_name, status::ComponentStatus::Error);
-                    metrics::counter!("catalogs_load_error").increment(1);
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
                 }
@@ -651,24 +713,27 @@ impl Runtime {
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
-    async fn load_dataset(&self, ds: &Dataset) {
+    async fn load_dataset(&self, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let _ = retry(retry_strategy, || async {
-            let connector = match self.load_dataset_connector(ds).await {
+            let connector = match self.load_dataset_connector(Arc::clone(&ds)).await {
                 Ok(connector) => connector,
                 Err(err) => {
                     let ds_name = &ds.name;
                     status::update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
                 }
             };
 
-            if let Err(err) = self.register_loaded_dataset(ds, connector, None).await {
+            if let Err(err) = self
+                .register_loaded_dataset(Arc::clone(&ds), connector, None)
+                .await
+            {
                 return Err(RetryError::transient(err));
             };
 
@@ -679,7 +744,7 @@ impl Runtime {
         .await;
     }
 
-    fn load_view(&self, view: &View, all_datasets: &[Dataset]) -> Result<()> {
+    fn load_view(&self, view: &View, all_datasets: &[Arc<Dataset>]) -> Result<()> {
         let existing_tables = all_datasets
             .iter()
             .map(|d| d.name.clone())
@@ -711,7 +776,7 @@ impl Runtime {
                 Err(err) => {
                     let catalog_name = &catalog.name;
                     status::update_catalog(catalog_name, status::ComponentStatus::Error);
-                    metrics::counter!("catalogs_load_error").increment(1);
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: catalog_name.clone(),
@@ -723,9 +788,8 @@ impl Runtime {
         Ok(data_connector)
     }
 
-    async fn load_dataset_connector(&self, ds: &Dataset) -> Result<Arc<dyn DataConnector>> {
+    async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let ds = ds.clone();
 
         let source = ds.source();
         let params = ds.params.clone();
@@ -735,7 +799,7 @@ impl Runtime {
                 Err(err) => {
                     let ds_name = &ds.name;
                     status::update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
@@ -803,11 +867,10 @@ impl Runtime {
 
     async fn register_loaded_dataset(
         &self,
-        ds: &Dataset,
+        ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
-        let ds = ds.clone();
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration {
@@ -829,7 +892,7 @@ impl Runtime {
             Ok(provider) => provider,
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                metrics::counter!("datasets_load_error").increment(1);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
@@ -840,7 +903,7 @@ impl Runtime {
 
         match self
             .register_dataset(
-                &ds,
+                Arc::clone(&ds),
                 RegisterDatasetContext {
                     data_connector: Arc::clone(&data_connector),
                     federated_read_table: read_provider,
@@ -867,7 +930,7 @@ impl Runtime {
                         );
                     };
                 }
-                let engine = ds.acceleration.map_or_else(
+                let engine = ds.acceleration.as_ref().map_or_else(
                     || "None".to_string(),
                     |acc| {
                         if acc.enabled {
@@ -877,14 +940,14 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
+                metrics::datasets::COUNT.add(1, &[Key::from_static_str("engine").string(engine)]);
                 status::update_dataset(&ds.name, status::ComponentStatus::Ready);
 
                 Ok(())
             }
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                metrics::counter!("datasets_load_error").increment(1);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: datafusion::Error::RefreshSql { source },
                     data_connector: _,
@@ -924,18 +987,18 @@ impl Runtime {
                 }
             },
         );
-        metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
+        metrics::datasets::COUNT.add(-1, &[Key::from_static_str("engine").string(engine)]);
     }
 
-    async fn update_dataset(&self, ds: &Dataset) {
+    async fn update_dataset(&self, ds: Arc<Dataset>) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        match self.load_dataset_connector(ds).await {
+        match self.load_dataset_connector(Arc::clone(&ds)).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
-                if Self::accelerated_dataset_supports_hot_reload(ds, &*connector) {
+                if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Updating accelerated dataset {}...", &ds.name);
                     if let Ok(()) = &self
-                        .reload_accelerated_dataset(ds, Arc::clone(&connector))
+                        .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
                         .await
                     {
                         status::update_dataset(&ds.name, status::ComponentStatus::Ready);
@@ -944,10 +1007,10 @@ impl Runtime {
                     tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
                 }
 
-                self.remove_dataset(ds).await;
+                self.remove_dataset(&ds).await;
 
                 if let Ok(()) = self
-                    .register_loaded_dataset(ds, Arc::clone(&connector), None)
+                    .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
                     .await
                 {
                     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
@@ -993,10 +1056,10 @@ impl Runtime {
 
     async fn reload_accelerated_dataset(
         &self,
-        ds: &Dataset,
+        ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(ds).await.map_err(|_| {
+        let read_table = connector.read_provider(&ds).await.map_err(|_| {
             UnableToLoadDatasetConnectorSnafu {
                 dataset: ds.name.clone(),
             }
@@ -1006,7 +1069,7 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(ds, Arc::clone(&connector), read_table, self.secrets())
+            .create_accelerated_table(&ds, Arc::clone(&connector), read_table, self.secrets())
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -1043,17 +1106,15 @@ impl Runtime {
 
     async fn register_dataset(
         &self,
-        ds: impl Borrow<Dataset>,
+        ds: Arc<Dataset>,
         register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
         let RegisterDatasetContext {
             data_connector,
-            federated_read_table,
+            mut federated_read_table,
             source,
             accelerated_table,
         } = register_dataset_ctx;
-
-        let ds = ds.borrow();
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
@@ -1061,10 +1122,13 @@ impl Runtime {
         let connector = if ds.embeddings.is_empty() {
             data_connector
         } else {
-            Arc::new(EmbeddingConnector::new(
-                data_connector,
-                Arc::clone(&self.embeds),
-            )) as Arc<dyn DataConnector>
+            let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
+            federated_read_table = connector
+                .wrap_table(federated_read_table, &ds)
+                .await
+                .boxed()
+                .context(UnableToInitializeDataConnectorSnafu)?;
+            Arc::new(connector) as Arc<dyn DataConnector>
         };
 
         // FEDERATED TABLE
@@ -1131,7 +1195,7 @@ impl Runtime {
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
-        let mut l = try_to_chat_model(&m, &params)
+        let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1142,6 +1206,7 @@ impl Runtime {
         Ok(l)
     }
 
+    #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
@@ -1156,6 +1221,7 @@ impl Runtime {
         Ok(l)
     }
 
+    #[allow(dead_code)]
     async fn load_embeddings(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -1164,13 +1230,27 @@ impl Runtime {
                 match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
-                        embeds_map.insert(in_embed.name.clone(), e.into());
+
+                        let m = Box::new(TaskEmbed::new(e)) as Box<dyn Embed>;
+                        embeds_map.insert(in_embed.name.clone(), m.into());
+
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
-                        metrics::gauge!("embeddings_count", "embeddings" => in_embed.name.clone(), "source" => in_embed.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        metrics::embeddings::COUNT.add(
+                            1,
+                            &[
+                                Key::from_static_str("embeddings").string(in_embed.name.clone()),
+                                Key::from_static_str("source").string(
+                                    in_embed
+                                        .get_prefix()
+                                        .map(|x| x.to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            ],
+                        );
                         status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);
                     }
                     Err(e) => {
-                        metrics::counter!("embeddings_load_error").increment(1);
+                        metrics::embeddings::LOAD_ERROR.add(1, &[]);
                         status::update_embedding(&in_embed.name, status::ComponentStatus::Error);
                         tracing::warn!(
                             "Unable to load embedding from spicepod {}, error: {}",
@@ -1198,7 +1278,13 @@ impl Runtime {
         let source = m.get_source();
         let source_str = source.clone().map(|s| s.to_string()).unwrap_or_default();
         let model = m.clone();
-        measure_scope_ms!("load_model", "model" => m.name, "source" => source_str);
+        let _guard = TimeMeasurement::new(
+            &metrics::models::LOAD_DURATION_MS,
+            &[
+                Key::from_static_str("model").string(m.name.clone()),
+                Key::from_static_str("source").string(source_str.clone()),
+            ],
+        );
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
         let params = self.get_params_with_secrets(&m.params).await;
@@ -1236,12 +1322,17 @@ impl Runtime {
         match result {
             Ok(()) => {
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => source_str)
-                    .increment(1.0);
+                metrics::models::COUNT.add(
+                    1,
+                    &[
+                        Key::from_static_str("model").string(m.name.clone()),
+                        Key::from_static_str("source").string(source_str),
+                    ],
+                );
                 status::update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
-                metrics::counter!("models_load_error").increment(1);
+                metrics::models::LOAD_ERROR.add(1, &[]);
                 status::update_model(&model.name, status::ComponentStatus::Error);
                 tracing::warn!(e);
             }
@@ -1262,8 +1353,14 @@ impl Runtime {
         };
 
         tracing::info!("Model [{}] has been unloaded", m.name);
-        metrics::gauge!("models_count", "llm" => m.name.clone(), "source" => m.get_source().map(|s| s.to_string()).unwrap_or_default())
-            .decrement(1.0);
+        let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
+        metrics::models::COUNT.add(
+            -1,
+            &[
+                Key::from_static_str("model").string(m.name.clone()),
+                Key::from_static_str("source").string(source_str),
+            ],
+        );
     }
 
     async fn update_model(&self, m: &SpicepodModel) {
@@ -1272,23 +1369,17 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    async fn register_metrics_table(&self, with_metrics: Option<PrometheusHandle>) -> Result<()> {
-        if let Some(handle) = with_metrics {
-            let mut recorder = MetricsRecorder::new(handle);
-
+    async fn register_metrics_table(&self, metrics_enabled: bool) -> Result<()> {
+        if metrics_enabled {
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(table_reference).await;
 
-            if let Some(metrics_table) = metrics_table {
-                recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
-            } else {
+            if metrics_table.is_none() {
                 tracing::debug!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&Arc::clone(&self.df))
+                spice_metrics::register_metrics_table(&self.df)
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
-
-            recorder.start(self.instance_name.clone(), &self.df);
         }
 
         Ok(())
@@ -1304,6 +1395,7 @@ impl Runtime {
         while let Some(new_app) = rx.recv().await {
             let mut app_lock = self.app.write().await;
             if let Some(current_app) = app_lock.as_mut() {
+                let new_app = Arc::new(new_app);
                 if *current_app == new_app {
                     continue;
                 }
@@ -1336,9 +1428,9 @@ impl Runtime {
                 let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
                 let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
-                for ds in &valid_datasets {
+                for ds in valid_datasets {
                     if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
-                        if ds != current_ds {
+                        if ds != *current_ds {
                             self.update_dataset(ds).await;
                         }
                     } else {
@@ -1386,7 +1478,7 @@ impl Runtime {
 
                 *current_app = new_app;
             } else {
-                *app_lock = Some(new_app);
+                *app_lock = Some(Arc::new(new_app));
             }
         }
 
@@ -1422,12 +1514,29 @@ impl Runtime {
             SPICE_RUNTIME_SCHEMA,
             query_history::DEFAULT_QUERY_HISTORY_TABLE,
         );
+
         match query_history::instantiate_query_history_table().await {
+            Ok(table) => {
+                let _ = self
+                    .df
+                    .register_runtime_table(query_history_table_reference, table)
+                    .context(UnableToCreateBackendSnafu);
+            }
+            Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
+        };
+
+        match task_history::TaskSpan::instantiate_table().await {
             Ok(table) => self
                 .df
-                .register_runtime_table(query_history_table_reference, table)
+                .register_runtime_table(
+                    TableReference::partial(
+                        SPICE_RUNTIME_SCHEMA,
+                        task_history::DEFAULT_TASK_HISTORY_TABLE,
+                    ),
+                    table,
+                )
                 .context(UnableToCreateBackendSnafu),
-            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+            Err(source) => Err(Error::UnableToTrackTaskHistory { source }),
         }
     }
 }
@@ -1507,21 +1616,10 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
 
                     for relation in relations {
                         match relation {
-                            TableFactor::Table {
-                                name,
-                                alias: _,
-                                args: _,
-                                with_hints: _,
-                                version: _,
-                                partitions: _,
-                            } => {
+                            TableFactor::Table { name, .. } => {
                                 table_names.push(name.to_string().into());
                             }
-                            TableFactor::Derived {
-                                lateral: _,
-                                subquery,
-                                alias: _,
-                            } => {
+                            TableFactor::Derived { subquery, .. } => {
                                 table_names.extend(get_dependent_table_names(
                                     &parser::Statement::Statement(Box::new(ast::Statement::Query(
                                         subquery,
@@ -1548,4 +1646,18 @@ pub struct RegisterDatasetContext {
     federated_read_table: Arc<dyn TableProvider>,
     source: String,
     accelerated_table: Option<AcceleratedTable>,
+}
+
+pub(crate) fn spice_data_base_path() -> String {
+    let Some(home_dir) = dirs::home_dir() else {
+        return ".".to_string();
+    };
+
+    let base_folder = home_dir.join(".spice/data");
+    base_folder.to_str().unwrap_or(".").to_string()
+}
+
+pub(crate) fn make_spice_data_directory() -> Result<()> {
+    let base_folder = spice_data_base_path();
+    std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
 }

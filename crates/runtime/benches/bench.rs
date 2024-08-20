@@ -132,10 +132,15 @@ async fn main() -> Result<(), String> {
     }
 
     let accelerators: Vec<Acceleration> = vec![
+        create_acceleration("arrow", acceleration::Mode::Memory),
         #[cfg(feature = "duckdb")]
         create_acceleration("duckdb", acceleration::Mode::Memory),
         #[cfg(feature = "duckdb")]
         create_acceleration("duckdb", acceleration::Mode::File),
+        #[cfg(feature = "sqlite")]
+        create_acceleration("sqlite", acceleration::Mode::Memory),
+        #[cfg(feature = "sqlite")]
+        create_acceleration("sqlite", acceleration::Mode::File),
     ];
 
     for accelerator in accelerators {
@@ -181,6 +186,10 @@ async fn run_query_and_record_result(
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
+    // Additional round of query run before recording results.
+    // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
+    let _ = run_query(rt, connector, query_name, query).await;
+
     tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
 

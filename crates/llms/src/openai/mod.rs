@@ -1,9 +1,12 @@
 /*
 Copyright 2024 The Spice.ai OSS Authors
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-https://www.apache.org/licenses/LICENSE-2.0
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -34,6 +37,7 @@ use async_trait::async_trait;
 use futures::future::try_join_all;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
+use tracing_futures::Instrument;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
@@ -83,36 +87,45 @@ impl Openai {
 
 #[async_trait]
 impl Chat for Openai {
-    async fn run(&mut self, prompt: String) -> ChatResult<Option<String>> {
-        let req = CreateChatCompletionRequestArgs::default()
-            .model(self.model.clone())
-            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                .content(prompt)
+    async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
+        let span = tracing::Span::current();
+
+        async move {
+            let req = CreateChatCompletionRequestArgs::default()
+                .model(self.model.clone())
+                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                    .content(prompt)
+                    .build()
+                    .boxed()
+                    .map_err(|source| ChatError::FailedToLoadTokenizer { source })?
+                    .into()])
                 .build()
                 .boxed()
-                .map_err(|source| ChatError::FailedToLoadTokenizer { source })?
-                .into()])
-            .build()
-            .boxed()
-            .map_err(|source| ChatError::FailedToLoadModel { source })?;
+                .map_err(|source| ChatError::FailedToLoadModel { source })?;
 
-        let resp = self
-            .chat_request(req)
-            .await
-            .boxed()
-            .map_err(|source| ChatError::FailedToRunModel { source })?;
+            let resp = self
+                .chat_request(req)
+                .await
+                .boxed()
+                .map_err(|source| ChatError::FailedToRunModel { source })?;
 
-        Ok(resp
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content))
+            Ok(resp
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn stream<'a>(
-        &mut self,
+        &self,
         prompt: String,
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
+        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "openai::stream", input = %prompt);
+        let guard = span.enter();
+        tracing::debug!(name: "labels", target: "task_history", model = %self.model);
         let req = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
             .stream(true)
@@ -125,13 +138,15 @@ impl Chat for Openai {
             .build()
             .boxed()
             .map_err(|source| ChatError::FailedToLoadModel { source })?;
+        drop(guard);
         let mut chat_stream = self
             .chat_stream(req)
+            .instrument(span.clone())
             .await
             .boxed()
             .map_err(|source| ChatError::FailedToRunModel { source })?;
         Ok(Box::pin(stream! {
-            while let Some(msg) = chat_stream.next().await {
+            while let Some(msg) = chat_stream.next().instrument(span.clone()).await {
                 match msg {
                     Ok(resp) => {
                         yield Ok(resp.choices.into_iter().next().and_then(|c| c.delta.content));
@@ -145,18 +160,20 @@ impl Chat for Openai {
     }
 
     async fn chat_stream(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        self.client.chat().create_stream(inner_req).await
+        let stream = self.client.chat().create_stream(inner_req).await?;
+
+        Ok(Box::pin(stream))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
     async fn chat_request(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let mut inner_req = req.clone();

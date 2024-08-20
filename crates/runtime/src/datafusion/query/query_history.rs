@@ -106,6 +106,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Error writing to task_history table: {source}"))]
+    UnableToWriteToTaskTable {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Error creating query_history row: {source}"))]
     UnableToCreateRow {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -132,7 +137,7 @@ macro_rules! check_required_field {
 }
 
 impl QueryTracker {
-    pub async fn write_query_history(&self) -> Result<(), Error> {
+    pub async fn write_query_history(&self, truncated_output: Arc<str>) -> Result<(), Error> {
         self.validate()?;
 
         let data = self
@@ -154,6 +159,8 @@ impl QueryTracker {
             .await
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
+
+        trace_query(self, &truncated_output);
 
         Ok(())
     }
@@ -220,4 +227,14 @@ impl QueryTracker {
             })
         }
     }
+}
+
+fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
+    if let Some(schema) = &query_tracker.schema {
+        tracing::info!(name: "labels", target: "task_history", schema = ?schema);
+    }
+    if let Some(error_code) = &query_tracker.error_code {
+        tracing::info!(name: "labels", target: "task_history", error_code = %error_code);
+    }
+    tracing::info!(name: "labels", target: "task_history", protocol = ?query_tracker.protocol, datasets = ?query_tracker.datasets, truncated_output = %truncated_output);
 }

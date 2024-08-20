@@ -24,10 +24,11 @@ use arrow::{
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::{project_schema, Constraint, Constraints},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -158,7 +159,7 @@ impl TableProvider for ObjectStoreMetadataTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,

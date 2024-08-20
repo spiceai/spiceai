@@ -46,21 +46,21 @@ fn default_limit() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub entries: HashMap<String, Vec<String>>,
-    pub retrieved_public_keys: HashMap<String, Value>,
+    pub retrieved_primary_keys: HashMap<String, Value>,
 }
 
 impl SearchResponse {
     pub fn from_vector_search(
         result: VectorSearchResult,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let keys = create_primary_key_payload(&result.retrieved_public_keys)?;
+        let keys = create_primary_key_payload(&result.retrieved_primary_keys)?;
         Ok(Self {
             entries: result
                 .retrieved_entries
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
-            retrieved_public_keys: keys,
+            retrieved_primary_keys: keys,
         })
     }
 }
@@ -79,6 +79,8 @@ pub(crate) async fn post(
         .map(TableReference::from)
         .collect();
 
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.text);
+
     match vs
         .search(
             payload.text.clone(),
@@ -88,9 +90,24 @@ pub(crate) async fn post(
         .await
     {
         Ok(resp) => match SearchResponse::from_vector_search(resp) {
-            Ok(r) => (StatusCode::OK, Json(r)).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Ok(r) => {
+                span.in_scope(|| {
+                    tracing::info!(name = "labels", target = "task_history", outputs_produced = %r.entries.len());
+                });
+                (StatusCode::OK, Json(r)).into_response()
+            }
+            Err(e) => {
+                span.in_scope(|| {
+                    tracing::error!(target: "task_history", "{e}");
+                });
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            span.in_scope(|| {
+                tracing::error!(target: "task_history", "{e}");
+            });
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }

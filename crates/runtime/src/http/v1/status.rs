@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use csv::Writer;
-use flight_client::FlightClient;
+use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
-use tonic_0_9_0::transport::Channel;
-use tonic_health_0_9_0::{pb::health_client::HealthClient, ServingStatus};
+use tonic::transport::Channel;
+use tonic_health::{pb::health_client::HealthClient, ServingStatus};
 
 use axum::{
     extract::Query,
@@ -133,7 +133,12 @@ fn convert_details_to_csv(
 
 async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
     tracing::trace!("Checking flight status at {flight_addr}");
-    match FlightClient::try_new(&format!("http://{flight_addr}"), "", "").await {
+    match FlightClient::try_new(
+        format!("http://{flight_addr}").into(),
+        Credentials::anonymous(),
+    )
+    .await
+    {
         Ok(_) => ComponentStatus::Ready,
         Err(e) => {
             tracing::error!("Error connecting to flight when checking status: {e}");
@@ -162,7 +167,7 @@ async fn get_opentelemetry_status(
     let mut client = HealthClient::new(channel);
 
     let resp = client
-        .check(tonic_health_0_9_0::pb::HealthCheckRequest {
+        .check(tonic_health::pb::HealthCheckRequest {
             service: String::new(),
         })
         .await?;

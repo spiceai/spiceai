@@ -29,6 +29,7 @@ use axum::{
 };
 use futures::StreamExt;
 use tokio::sync::RwLock;
+use tracing::{Instrument, Span};
 
 use crate::model::LLMModelStore;
 
@@ -36,40 +37,68 @@ pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
-    let model_id = req.model.clone();
-    match llms.read().await.get(&model_id) {
-        Some(model) => {
-            if req.stream.unwrap_or_default() {
-                match model.write().await.chat_stream(req).await {
-                    Ok(strm) => create_sse_response(strm, time::Duration::from_secs(30)),
-                    Err(e) => {
-                        tracing::debug!("Error from v1/chat: {e}");
-                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_chat", input = %serde_json::to_string(&req).unwrap_or_default());
+    span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
+
+    let span_clone = span.clone();
+    async move {
+        let model_id = req.model.clone();
+        match llms.read().await.get(&model_id) {
+            Some(model) => {
+                if req.stream.unwrap_or_default() {
+                    match model.write().await.chat_stream(req).await {
+                        Ok(strm) => {
+                            create_sse_response(strm, time::Duration::from_secs(30), span_clone)
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "task_history", "{e}");
+                            tracing::debug!("Error from v1/chat: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
                     }
-                }
-            } else {
-                match model.write().await.chat_request(req).await {
-                    Ok(response) => Json(response).into_response(),
-                    Err(e) => {
-                        tracing::debug!("Error from v1/chat: {e}");
-                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                } else {
+                    match model.write().await.chat_request(req).await {
+                        Ok(response) => {
+                            let preview = response
+                                .choices
+                                .first()
+                                .map(|s| serde_json::to_string(s).unwrap_or_default())
+                                .unwrap_or_default();
+
+                            tracing::info!(target: "task_history", truncated_output = %preview);
+                            Json(response).into_response()
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "task_history", "{e}");
+                            tracing::debug!("Error from v1/chat: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
                     }
                 }
             }
+            None => StatusCode::NOT_FOUND.into_response(),
         }
-        None => StatusCode::NOT_FOUND.into_response(),
     }
+    .instrument(span)
+    .await
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].
 fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
+    span: Span,
 ) -> Response {
     Sse::new(Box::pin(stream! {
-        while let Some(msg) = strm.next().await {
+        let mut chat_output = String::new();
+        while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
                 Ok(resp) => {
+                    if let Some(choice) = resp.choices.first() {
+                        if let Some(intermediate_chat_output) = &choice.delta.content {
+                            chat_output.push_str(intermediate_chat_output);
+                        }
+                    }
                     let y = Event::default();
                     match y.json_data(resp).map_err(axum::Error::new) {
                         Ok(a) => yield Ok(a),
@@ -82,6 +111,8 @@ fn create_sse_response(
                 }
             }
         };
+        tracing::info!(target: "task_history", parent: &span, truncated_output = %chat_output);
+        drop(span);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))
     .into_response()

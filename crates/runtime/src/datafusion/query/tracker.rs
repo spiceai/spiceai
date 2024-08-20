@@ -18,10 +18,11 @@ use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
+use opentelemetry::Key;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::{error_code::ErrorCode, Protocol};
+use super::{error_code::ErrorCode, metrics, Protocol};
 
 pub(crate) struct QueryTracker {
     pub(crate) df: Arc<crate::datafusion::DataFusion>,
@@ -46,10 +47,10 @@ impl QueryTracker {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish().await;
+        self.finish(Arc::from("")).await;
     }
 
-    pub async fn finish(mut self) {
+    pub async fn finish(mut self, truncated_output: Arc<str>) {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -76,26 +77,25 @@ impl QueryTracker {
         }
 
         let mut labels = vec![
-            ("tags", tags.join(",")),
-            (
-                "datasets",
+            Key::from_static_str("tags").string(tags.join(",")),
+            Key::from_static_str("datasets").string(
                 self.datasets
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<String>>()
                     .join(","),
             ),
-            ("protocol", self.protocol.to_string()),
+            Key::from_static_str("protocol").string(self.protocol.to_string()),
         ];
 
-        metrics::histogram!("query_duration_seconds", &labels).record(duration.as_secs_f32());
+        metrics::DURATION_SECONDS.record(duration.as_secs_f64(), &labels);
 
         if let Some(err) = &self.error_code {
-            labels.push(("err_code", err.to_string()));
-            metrics::counter!("query_failures", &labels).increment(1);
+            labels.push(Key::from_static_str("err_code").string(err.to_string()));
+            metrics::FAILURES.add(1, &labels);
         }
 
-        if let Err(err) = self.write_query_history().await {
+        if let Err(err) = self.write_query_history(truncated_output).await {
             tracing::error!("Error writing query history: {err}");
         };
     }

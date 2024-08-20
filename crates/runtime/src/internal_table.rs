@@ -29,7 +29,7 @@ use crate::secrets::Secrets;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{localhost::LocalhostConnector, DataConnector, DataConnectorError},
+    dataconnector::{sink::SinkConnector, DataConnector, DataConnectorError},
 };
 
 #[derive(Debug, Snafu)]
@@ -62,15 +62,14 @@ async fn get_local_table_provider(
     schema: &Arc<Schema>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
     // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
-    let mut dataset = Dataset::try_new("localhost://internal".to_string(), &name.to_string())
+    let mut dataset = Dataset::try_new("sink".to_string(), &name.to_string())
         .boxed()
         .context(InternalSnafu {
             code: "IT-GLTP-DTN".to_string(), // InternalTable - GetLocalTableProvider - DatasetTryNew
         })?;
     dataset.mode = Mode::ReadWrite;
 
-    let data_connector =
-        Arc::new(LocalhostConnector::new(Arc::clone(schema))) as Arc<dyn DataConnector>;
+    let data_connector = Arc::new(SinkConnector::new(Arc::clone(schema))) as Arc<dyn DataConnector>;
 
     let source_table_provider = data_connector
         .read_write_provider(&dataset)
@@ -97,6 +96,7 @@ pub async fn create_internal_accelerated_table(
         None,
         &acceleration,
         secrets,
+        None,
     )
     .await
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;

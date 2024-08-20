@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 use crate::timing::{TimeMeasurement, TimedStream};
 
+use super::metrics;
+
 type HandshakeResponseStream =
     Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
 
@@ -36,7 +38,7 @@ pub(crate) fn handle() -> Result<Response<HandshakeResponseStream>, Status> {
     };
     let result = Ok(result);
     let output = TimedStream::new(futures::stream::iter(vec![result]), || {
-        TimeMeasurement::new("flight_handshake_request_duration_ms", vec![])
+        TimeMeasurement::new(&metrics::HANDSHAKE_REQUEST_DURATION_MS, vec![])
     });
     let str = format!("Bearer {token}");
     let mut resp: Response<HandshakeResponseStream> = Response::new(Box::pin(output));

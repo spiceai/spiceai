@@ -72,7 +72,8 @@
           "eviction_policy": null,
           "item_ttl": null
         },
-        "tls": null
+        "tls": null,
+        "tracing": null
       },
       "allOf": [
         {
@@ -247,6 +248,12 @@
             "type": "string"
           }
         },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "from": {
           "type": "string"
         },
@@ -255,6 +262,10 @@
           "items": {
             "type": "string"
           }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "name": {
           "type": "string"
@@ -385,6 +396,12 @@
             "type": "string"
           }
         },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "embeddings": {
           "type": "array",
           "items": {
@@ -394,11 +411,15 @@
         "from": {
           "type": "string"
         },
-        "metadata": {
+        "has_metadata_table": {
           "type": [
             "boolean",
             "null"
           ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "mode": {
           "default": "read",
@@ -543,6 +564,12 @@
             "type": "string"
           }
         },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "files": {
           "type": "array",
           "items": {
@@ -551,6 +578,10 @@
         },
         "from": {
           "type": "string"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "name": {
           "type": "string"
@@ -706,6 +737,16 @@
               "type": "null"
             }
           ]
+        },
+        "tracing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TracingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -717,6 +758,12 @@
         "name"
       ],
       "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "from": {
           "type": "string"
         },
@@ -759,6 +806,9 @@
     },
     "TlsConfig": {
       "type": "object",
+      "required": [
+        "enabled"
+      ],
       "properties": {
         "certificate": {
           "description": "A PEM encoded certificate",
@@ -774,6 +824,10 @@
             "null"
           ]
         },
+        "enabled": {
+          "description": "If set, the runtime will configure all endpoints to use TLS",
+          "type": "boolean"
+        },
         "key": {
           "description": "A PEM encoded private key",
           "type": [
@@ -783,6 +837,24 @@
         },
         "key_file": {
           "description": "A filesystem path to a file containing the PEM encoded private key",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TracingConfig": {
+      "type": "object",
+      "required": [
+        "zipkin_enabled"
+      ],
+      "properties": {
+        "zipkin_enabled": {
+          "type": "boolean"
+        },
+        "zipkin_endpoint": {
           "type": [
             "string",
             "null"
@@ -802,6 +874,16 @@
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "name": {
           "type": "string"

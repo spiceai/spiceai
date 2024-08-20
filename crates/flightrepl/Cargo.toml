@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 ansi_term = "0.12.1"
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-arrow-json = "52.0.0"
+arrow-json.workspace = true
 clap.workspace = true
 datafusion.workspace = true
 futures.workspace = true
@@ -19,7 +19,7 @@ llms = { path = "../llms" }
 prost = { version = "0.12.1", default-features = false, features = [
   "prost-derive",
 ] }
-reqwest = { version = "0.11.24", features = ["json"] }
+reqwest.workspace = true
 rustyline = "13.0.0"
 serde_json.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }

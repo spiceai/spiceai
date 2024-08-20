@@ -26,10 +26,11 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::{future::join_all, stream::TryStreamExt};
+use opentelemetry::Key;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, metrics};
 
 const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
 const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 10 * 60; // 10 minutes
@@ -196,20 +197,19 @@ async fn update_dataset_availability_info(
 }
 
 fn report_dataset_unavailable_time(dataset_name: &String, last_available_time: Option<SystemTime>) {
-    let labels = [("dataset", dataset_name.to_string())];
+    let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
 
     match last_available_time {
-        Some(last_available_time) => {
-            metrics::gauge!("datasets_unavailable_time", &labels).set(
-                last_available_time
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64(),
-            );
-        }
+        Some(last_available_time) => metrics::datasets::UNAVAILABLE_TIME.record(
+            last_available_time
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+            &labels,
+        ),
         None => {
             // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
-            metrics::gauge!("datasets_unavailable_time", &labels).set(0);
+            metrics::datasets::UNAVAILABLE_TIME.record(0.0, &labels);
         }
     }
 }
@@ -253,8 +253,7 @@ mod test {
     use crate::component::dataset::Dataset;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
-        catalog::schema::{MemorySchemaProvider, SchemaProvider},
-        datasource::MemTable,
+        catalog::SchemaProvider, catalog_common::MemorySchemaProvider, datasource::MemTable,
     };
     use std::sync::Arc;
 

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::EmbeddingModelStore;
+use crate::model::EmbeddingModelStore;
 use async_openai::types::CreateEmbeddingRequest;
 use axum::{
     http::StatusCode,
@@ -33,10 +33,16 @@ pub(crate) async fn post(
     match embeddings.read().await.get(&model_id) {
         Some(model_lock) => {
             let mut model = model_lock.write().await;
-            match model.embed_request(req).await {
+
+            let resp: Response = match model.embed_request(req).await {
                 Ok(response) => Json(response).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
+                }
+            };
+
+            resp
         }
         None => (StatusCode::NOT_FOUND, "model not found").into_response(),
     }

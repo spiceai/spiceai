@@ -129,16 +129,14 @@ impl Secrets {
             result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
 
             // Get the secret value from the store
-            let Some(secret) = self
+            let secret = self
                 .get_store_secret(
                     &param_str,
                     &secret_replacement.store_name,
                     &secret_replacement.key,
                 )
                 .await
-            else {
-                continue;
-            };
+                .unwrap_or_default();
 
             // Replace the token with the desired string
             result.push_str(&secret);
@@ -381,5 +379,22 @@ mod tests {
             "This is a secret: super_secret! 🫡",
             result.expose_secret().as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn test_inject_secrets_no_env() {
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
+
+        // Ensure `MY_SECRET_KEY` is not set from other tests.
+        std::env::remove_var("MY_SECRET_KEY");
+
+        let result = secrets
+            .inject_secrets(
+                "MY_SECRET_KEY",
+                super::ParamStr("This is a secret: ${ env:MY_SECRET_KEY }! 🫡"),
+            )
+            .await;
+        assert_eq!("This is a secret: ! 🫡", result.expose_secret().as_str());
     }
 }

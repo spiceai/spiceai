@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::component::dataset::Dataset;
+use crate::parameters::ParameterSpec;
+use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
+use crate::spice_data_base_path;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -110,7 +114,25 @@ pub trait DataAccelerator: Send + Sync {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // The name of the accelerator
+    fn name(&self) -> &'static str;
+
+    // The prefix of the table name
+    fn prefix(&self) -> &'static str;
+
+    // The parameters of the accelerator
+    fn parameters(&self) -> &'static [ParameterSpec];
+
+    // Initialize the accelerator for a dataset
+    async fn init(
+        &self,
+        _dataset: &Dataset,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 pub struct AcceleratorExternalTableBuilder {
@@ -118,7 +140,7 @@ pub struct AcceleratorExternalTableBuilder {
     schema: SchemaRef,
     engine: Engine,
     mode: Mode,
-    options: Option<HashMap<String, SecretString>>,
+    options: Option<Parameters>,
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
@@ -158,7 +180,7 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn options(mut self, options: HashMap<String, SecretString>) -> Self {
+    pub fn options(mut self, options: Parameters) -> Self {
         self.options = Some(options);
         self
     }
@@ -191,10 +213,15 @@ impl AcceleratorExternalTableBuilder {
 
         let mut options: HashMap<String, String> = self
             .options
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
-            .collect();
+            .map(|x| x.to_secret_map())
+            .map(|x| {
+                x.into_iter()
+                    .map(|(k, v)| (k, v.expose_secret().to_string()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        options.insert("data_directory".to_string(), spice_data_base_path());
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
@@ -245,6 +272,7 @@ pub async fn create_accelerator_table(
     constraints: Option<&Constraints>,
     acceleration_settings: &acceleration::Acceleration,
     secrets: Arc<RwLock<Secrets>>,
+    dataset: Option<&Dataset>,
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
@@ -262,7 +290,8 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
-    let secret_guard = secrets.read().await;
+    let cloned_secrets = Arc::clone(&secrets);
+    let secret_guard = cloned_secrets.read().await;
     let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
 
     // Inject secrets from the user-supplied params.
@@ -272,10 +301,20 @@ pub async fn create_accelerator_table(
         params_with_secrets.insert(k.clone(), secret);
     }
 
+    let params = Parameters::try_new(
+        &format!("accelerator {}", accelerator.name()),
+        params_with_secrets.into_iter().collect::<Vec<_>>(),
+        accelerator.prefix(),
+        secrets,
+        accelerator.parameters(),
+    )
+    .await
+    .context(AccelerationCreationFailedSnafu)?;
+
     let mut external_table_builder =
         AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
-            .options(params_with_secrets)
+            .options(params)
             .indexes(acceleration_settings.indexes.clone());
 
     // If there are constraints from the federated table, then add them to the accelerated table
@@ -317,7 +356,7 @@ pub async fn create_accelerator_table(
     let external_table = external_table_builder.build()?;
 
     let table_provider = accelerator
-        .create_external_table(&external_table)
+        .create_external_table(&external_table, dataset)
         .await
         .context(AccelerationCreationFailedSnafu)?;
 
@@ -340,4 +379,115 @@ fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaR
         })
         .flatten()
         .collect()
+}
+
+#[cfg(test)]
+mod test {
+    use ::arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_file_mode_duckdb_creation() {
+        use std::{fs, path::Path};
+
+        let tmp_dir = std::env::temp_dir();
+        let path = format!("{}/abc-duckdb.db", tmp_dir.display());
+
+        let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
+
+        register_all().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let acceleration_settings = Acceleration {
+            params,
+            enabled: true,
+            mode: Mode::File,
+            engine: Engine::DuckDB,
+            ..Acceleration::default()
+        };
+        let _ = create_accelerator_table(
+            "abc".into(),
+            schema,
+            None,
+            &acceleration_settings,
+            Arc::new(RwLock::new(Secrets::new())),
+            None,
+        )
+        .await
+        .expect("accelerator table created");
+
+        let path = Path::new(&path);
+        assert!(path.is_file());
+        fs::remove_file(path).expect("file removed");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_file_mode_sqlite_creation() {
+        use std::{fs, path::Path};
+
+        let tmp_dir = std::env::temp_dir();
+        let path = format!("{}/abc-sqlite.db", tmp_dir.display());
+
+        let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
+
+        register_all().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let acceleration_settings = Acceleration {
+            params: params.clone(),
+            enabled: true,
+            mode: Mode::File,
+            engine: Engine::Sqlite,
+            ..Acceleration::default()
+        };
+
+        let _ = create_accelerator_table(
+            "abc".into(),
+            schema,
+            None,
+            &acceleration_settings,
+            Arc::new(RwLock::new(Secrets::new())),
+            None,
+        )
+        .await
+        .expect("accelerator table created");
+
+        let path = Path::new(&path);
+        assert!(path.is_file());
+        fs::remove_file(path).expect("file removed");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_file_mode_sqlite_creation_default_path() {
+        use std::{fs, path::Path};
+
+        let spice_data_dir = crate::spice_data_base_path();
+        let path = format!("{spice_data_dir}/abc_sqlite.db");
+
+        register_all().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let acceleration_settings = Acceleration {
+            params: HashMap::new(),
+            enabled: true,
+            mode: Mode::File,
+            engine: Engine::Sqlite,
+            ..Acceleration::default()
+        };
+        let _ = create_accelerator_table(
+            "abc".into(),
+            schema,
+            None,
+            &acceleration_settings,
+            Arc::new(RwLock::new(Secrets::new())),
+            None,
+        )
+        .await
+        .expect("accelerator table created");
+
+        let path = Path::new(&path);
+        assert!(path.is_file());
+        fs::remove_file(path).expect("file removed");
+    }
 }

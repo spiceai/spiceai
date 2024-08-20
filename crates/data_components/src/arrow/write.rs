@@ -17,6 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
+use datafusion::catalog::Session;
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
 use datafusion::dataframe::DataFrame;
 use std::any::Any;
@@ -30,7 +31,7 @@ use async_trait::async_trait;
 use datafusion::common::{Constraints, SchemaExt};
 use datafusion::datasource::{provider_as_source, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::{SessionContext, SessionState};
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
@@ -129,7 +130,7 @@ impl TableProvider for MemTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -160,7 +161,7 @@ impl TableProvider for MemTable {
     /// * A plan that returns the number of rows written.
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -273,7 +274,7 @@ impl DataSink for MemSink {
 impl DeletionTableProvider for MemTable {
     async fn delete_from(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(

@@ -15,10 +15,9 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory};
@@ -26,7 +25,7 @@ use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -50,7 +49,7 @@ impl DuckDBAccelerator {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new()
-                .db_path_param("duckdb_file")
+                .db_path_param("file")
                 .access_mode(AccessMode::ReadWrite),
         }
     }
@@ -78,16 +77,23 @@ impl Default for DuckDBAccelerator {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::accelerator("file")];
+
 #[async_trait]
 impl DataAccelerator for DuckDBAccelerator {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "duckdb"
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        _dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), cmd)
@@ -100,10 +106,23 @@ impl DataAccelerator for DuckDBAccelerator {
             unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
         };
 
+        let read_provider = Arc::clone(&duckdb_writer.read_provider);
         let duckdb_writer = Arc::new(duckdb_writer.clone());
+        let cloned_writer = Arc::clone(&duckdb_writer);
 
-        let deletion_adapter = DeletionTableProviderAdapter::new(duckdb_writer);
-        Ok(Arc::new(deletion_adapter))
+        Ok(Arc::new(PolyTableProvider::new(
+            cloned_writer,
+            duckdb_writer,
+            read_provider,
+        )))
+    }
+
+    fn prefix(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
 
@@ -120,9 +139,10 @@ mod tests {
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
-        physical_plan::{collect, test::exec::MockExec},
+        physical_plan::collect,
         scalar::ScalarValue,
     };
+    use datafusion_table_providers::util::test::MockExec;
 
     use crate::dataaccelerator::{duckdb::DuckDBAccelerator, DataAccelerator};
 
@@ -165,7 +185,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
-            .create_external_table(&external_table)
+            .create_external_table(&external_table, None)
             .await
             .expect("table should be created");
 

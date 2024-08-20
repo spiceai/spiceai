@@ -60,13 +60,13 @@ pub(crate) struct DatasetResponseItem {
 }
 
 pub(crate) async fn get(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Query(filter): Query<DatasetFilter>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Response {
     let app_lock = app.read().await;
-    let Some(readable_app) = &*app_lock else {
+    let Some(readable_app) = app_lock.as_ref() else {
         return (
             status::StatusCode::INTERNAL_SERVER_ERROR,
             Json::<Vec<DatasetResponseItem>>(vec![]),
@@ -75,7 +75,7 @@ pub(crate) async fn get(
     };
 
     let valid_datasets = Runtime::get_valid_datasets(readable_app, LogErrors(false));
-    let datasets: Vec<Dataset> = match filter.source {
+    let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()
             .filter(|d| d.source() == source)
@@ -122,7 +122,7 @@ pub struct AccelerationRequest {
 }
 
 pub(crate) async fn refresh(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
 ) -> Response {
@@ -176,7 +176,7 @@ pub(crate) async fn refresh(
 }
 
 pub(crate) async fn acceleration(
-    Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,

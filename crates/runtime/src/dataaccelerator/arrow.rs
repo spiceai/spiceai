@@ -17,12 +17,13 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
-use snafu::prelude::*;
+use snafu::ResultExt;
 use std::{any::Any, sync::Arc};
+
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -51,14 +52,27 @@ impl DataAccelerator for ArrowAccelerator {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "arrow"
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        _dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         TableProviderFactory::create(&self.arrow_factory, &ctx.state(), cmd)
             .await
             .boxed()
+    }
+
+    fn prefix(&self) -> &'static str {
+        "arrow"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &[]
     }
 }

@@ -34,7 +34,7 @@ use std::{any::Any, sync::Arc};
 use std::fmt;
 use tokio::sync::RwLock;
 
-use crate::EmbeddingModelStore;
+use crate::model::EmbeddingModelStore;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -192,7 +192,7 @@ fn construct_record_batch(
     embedding_cols: &HashMap<String, ArrayRef>,
 ) -> Result<RecordBatch, ArrowError> {
     let cols: Vec<ArrayRef> = projected_schema
-        .all_fields()
+        .flattened_fields()
         .iter()
         .filter_map(|&f| match embedding_cols.get(f.name()).cloned() {
             Some(embedded_col) => Some(embedded_col),

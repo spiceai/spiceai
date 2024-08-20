@@ -20,10 +20,11 @@ use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::{project_schema, TableReference},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -63,6 +64,14 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve schema"))]
     UnableToRetrieveSchema,
+
+    #[snafu(display("{source}"))]
+    UnableToDecodeFlightData {
+        source: arrow_flight::error::FlightError,
+    },
+
+    #[snafu(display("Unable to subscribe to data from the Arrow Flight endpoint: {source}"))]
+    UnableToSubscribeToFlightData { source: flight_client::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -82,6 +91,11 @@ impl FlightFactory {
             client,
             dialect,
         }
+    }
+
+    #[must_use]
+    pub fn client(&self) -> FlightClient {
+        self.client.clone()
     }
 }
 
@@ -156,14 +170,22 @@ impl FlightTable {
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(client.clone(), &table_reference).await?;
+        let schema = Self::get_query_schema(
+            client.clone(),
+            &format!("SELECT * FROM {}", table_reference.to_quoted_string()),
+        )
+        .await?;
         Ok(Self {
             name,
             client: client.clone(),
             schema,
             table_reference,
             dialect,
-            join_push_down_context: format!("url={},username={}", client.url(), client.username()),
+            join_push_down_context: format!(
+                "url={},username={}",
+                client.url(),
+                client.username().unwrap_or_default()
+            ),
         })
     }
 
@@ -181,38 +203,49 @@ impl FlightTable {
             schema,
             table_reference,
             dialect,
-            join_push_down_context: format!("url={},username={}", client.url(), client.username()),
+            join_push_down_context: format!(
+                "url={},username={:?}",
+                client.url(),
+                client.username().unwrap_or_default()
+            ),
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
     async fn get_schema(
         client: FlightClient,
         table_reference: &TableReference,
     ) -> Result<SchemaRef> {
-        let mut stream = client
-            .clone()
-            .query(
-                format!(
-                    "SELECT * FROM {} limit 1",
-                    table_reference.to_quoted_string()
-                )
-                .as_str(),
-            )
+        let table_paths = match table_reference {
+            TableReference::Bare { table } => vec![table.to_string()],
+            TableReference::Partial { schema, table } => {
+                vec![schema.to_string(), table.to_string()]
+            }
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+            }
+        };
+
+        let schema = client
+            .get_schema(table_paths)
             .await
             .context(UnableToGetSchemaSnafu {
                 table: table_reference.to_quoted_string(),
             })?;
 
-        if stream.next().await.is_some() {
-            if let Some(schema) = stream.schema() {
-                Ok(Arc::clone(schema))
-            } else {
-                UnableToRetrieveSchemaSnafu.fail()?
-            }
-        } else {
-            UnableToRetrieveSchemaSnafu.fail()?
-        }
+        Ok(Arc::new(schema))
+    }
+
+    async fn get_query_schema(client: FlightClient, sql: &str) -> Result<SchemaRef> {
+        let schema = client
+            .get_query_schema(sql.into())
+            .await
+            .context(FlightSnafu)?;
+
+        Ok(Arc::new(schema))
     }
 
     fn create_physical_plan(
@@ -230,6 +263,14 @@ impl FlightTable {
             filters,
             limit,
         )?))
+    }
+
+    pub fn get_flight_client(&self) -> FlightClient {
+        self.client.clone()
+    }
+
+    pub fn get_table_reference(&self) -> String {
+        self.table_reference.to_string()
     }
 }
 
@@ -264,7 +305,7 @@ impl TableProvider for FlightTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,

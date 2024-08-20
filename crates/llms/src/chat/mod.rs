@@ -19,6 +19,7 @@ use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{path::Path, pin::Pin};
+use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
@@ -88,6 +89,9 @@ pub enum Error {
 
     #[snafu(display("No model from {from} currently supports {task}"))]
     UnsupportedTaskForModel { from: String, task: String },
+
+    #[snafu(display("Invalid value for 'params.spice_tools'"))]
+    UnsupportedSpiceToolUseParameterError {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -202,12 +206,14 @@ pub fn messages_to_mistral(messages: Vec<ChatCompletionRequestMessage>) -> Reque
 
 #[async_trait]
 pub trait Chat: Sync + Send {
-    async fn run(&mut self, prompt: String) -> Result<Option<String>>;
+    async fn run(&self, prompt: String) -> Result<Option<String>>;
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
-    async fn health(&mut self) -> Result<()> {
+    async fn health(&self) -> Result<()> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
         self.run("health".to_string())
+            .instrument(span)
             .await
             .boxed()
             .context(HealthCheckSnafu)?;
@@ -215,7 +221,7 @@ pub trait Chat: Sync + Send {
     }
 
     async fn stream<'a>(
-        &mut self,
+        &self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         let resp = self.run(prompt).await;
@@ -224,7 +230,7 @@ pub trait Chat: Sync + Send {
 
     #[allow(deprecated)]
     async fn chat_stream(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let model_id = req.model.clone();
@@ -290,7 +296,7 @@ pub trait Chat: Sync + Send {
     /// implementation will be constructed based on the trait's [`run`] method.
     #[allow(deprecated)]
     async fn chat_request(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let model_id = req.model.clone();

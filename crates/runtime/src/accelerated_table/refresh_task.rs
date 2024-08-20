@@ -25,6 +25,7 @@ use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
 use futures::{stream, Stream, StreamExt};
+use opentelemetry::Key;
 use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
@@ -42,7 +43,7 @@ use crate::{
 };
 
 use super::refresh::get_timestamp;
-use super::UnableToCreateMemTableFromUpdateSnafu;
+use super::{metrics, UnableToCreateMemTableFromUpdateSnafu};
 
 use crate::component::dataset::TimeFormat;
 use std::time::UNIX_EPOCH;
@@ -167,8 +168,8 @@ impl RefreshTask {
 
         retry(retry_strategy, || async {
             self.run_once().await.map_err(|err| {
-                let labels = [("dataset", dataset_name.to_string())];
-                metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+                let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
+                metrics::REFRESH_ERRORS.add(1, &labels);
                 err
             })
         })
@@ -189,16 +190,22 @@ impl RefreshTask {
 
         let _timer = TimeMeasurement::new(
             match mode {
-                RefreshMode::Full => "load_dataset_duration_ms",
-                RefreshMode::Append => "append_dataset_duration_ms",
+                RefreshMode::Disabled => {
+                    unreachable!("Refresh cannot be called when acceleration is disabled")
+                }
+                RefreshMode::Full => &metrics::LOAD_DURATION_MS,
+                RefreshMode::Append => &metrics::APPEND_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            vec![("dataset", dataset_name.to_string())],
+            vec![Key::from_static_str("dataset").string(dataset_name.to_string())],
         );
 
         let start_time = SystemTime::now();
 
         let get_data_update_result = match mode {
+            RefreshMode::Disabled => {
+                unreachable!("Refresh cannot be called when acceleration is disabled")
+            }
             RefreshMode::Full => self.get_full_update().await,
             RefreshMode::Append => self.get_incremental_append_update().await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
@@ -450,7 +457,7 @@ impl RefreshTask {
     }
 
     fn trace_dataset_loaded(&self, start_time: SystemTime, num_rows: usize, memory_size: usize) {
-        if let Ok(elapse) = util::humantime_elapsed(start_time) {
+        if let Ok(elapsed) = util::humantime_elapsed(start_time) {
             let dataset_name = &self.dataset_name;
             let num_rows = util::pretty_print_number(num_rows);
             let memory_size = if memory_size > 0 {
@@ -461,11 +468,11 @@ impl RefreshTask {
 
             if self.dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
                 tracing::debug!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}.",
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}.",
                 );
             } else {
                 tracing::info!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}."
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}."
                 );
             }
         }
@@ -486,6 +493,9 @@ impl RefreshTask {
             (
                 refresh.sql.clone(),
                 match refresh.mode {
+                    RefreshMode::Disabled => {
+                        unreachable!("Refresh cannot be called when acceleration is disabled")
+                    }
                     RefreshMode::Full => UpdateType::Overwrite,
                     RefreshMode::Append => UpdateType::Append,
                     RefreshMode::Changes => unreachable!("changes are handled upstream"),
@@ -718,8 +728,8 @@ impl RefreshTask {
         status::update_dataset(&self.dataset_name, status);
 
         if status == status::ComponentStatus::Error {
-            let labels = [("dataset", self.dataset_name.to_string())];
-            metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+            let labels = [Key::from_static_str("dataset").string(self.dataset_name.to_string())];
+            metrics::REFRESH_ERRORS.add(1, &labels);
         }
 
         if status == status::ComponentStatus::Ready {
@@ -727,13 +737,13 @@ impl RefreshTask {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
 
-            let mut labels = vec![("dataset", self.dataset_name.to_string())];
+            let mut labels =
+                vec![Key::from_static_str("dataset").string(self.dataset_name.to_string())];
             if let Some(sql) = &self.refresh.read().await.sql {
-                labels.push(("sql", sql.to_string()));
+                labels.push(Key::from_static_str("sql").string(sql.to_string()));
             };
 
-            metrics::gauge!("datasets_acceleration_last_refresh_time", &labels)
-                .set(now.as_secs_f64());
+            metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
         }
     }
 }

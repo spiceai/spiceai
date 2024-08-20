@@ -528,7 +528,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (protocol, quantile)(query_duration_seconds{quantile=~\"${percentile}\",pod=~\"${pods}\"}>0)",
+          "expr": "sum by (protocol, quantile)(query_duration_seconds_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"}>0)",
           "instant": false,
           "legendFormat": "{{protocol}} (P{{quantile}})",
           "range": true,
@@ -1452,7 +1452,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds{quantile=~\"${percentile}\",pod=~\"${pods}\"} > 0)",
+          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} > 0)",
           "instant": false,
           "legendFormat": "{{method}} {{path}} (P{{quantile}})",
           "range": true,
@@ -1654,7 +1654,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_dataset_duration_ms{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
+          "expr": "datasets_acceleration_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
           "instant": false,
           "legendFormat": "{{dataset}} (P{{quantile}})",
           "range": true,
@@ -1748,7 +1748,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "1000*load_model{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_model == 0",
+          "expr": "1000*models_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless models_load_duration_ms == 0",
           "instant": false,
           "legendFormat": "{{model}} (P{{quantile}})",
           "range": true,
@@ -1843,7 +1843,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "load_secrets{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_secrets == 0",
+          "expr": "secrets_stores_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless secrets_stores_load_duration_ms_summary == 0",
           "instant": false,
           "legendFormat": "P{{quantile}}",
           "range": true,
@@ -1952,7 +1952,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_put_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"}",
+          "expr": "flight_do_put_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"}",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,
@@ -2140,7 +2140,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_get_tables_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms == 0",
+          "expr": "flight_do_get_get_tables_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms_summary == 0",
           "instant": false,
           "legendFormat": "CommandGetTables",
           "range": true,
@@ -2152,7 +2152,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_statement_query_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms == 0",
+          "expr": "flight_do_get_statement_query_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms_summary == 0",
           "hide": false,
           "instant": false,
           "legendFormat": "CommandStatementQuery",
@@ -2355,7 +2355,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_get_flight_info_request_duration_ms{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms == 0",
+          "expr": "flight_get_flight_info_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms_summary == 0",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,

@@ -34,12 +34,13 @@ use tokio_rustls::TlsAcceptor;
 use crate::{
     config,
     datafusion::DataFusion,
-    embeddings::vector_search::{self, compute_primary_keys},
-    model::LLMModelStore,
+    embeddings::vector_search::{self, parse_explicit_primary_keys},
+    metrics as runtime_metrics,
+    model::{EmbeddingModelStore, LLMModelStore},
     tls::TlsConfig,
-    EmbeddingModelStore,
 };
 
+mod metrics;
 mod routes;
 mod v1;
 
@@ -57,7 +58,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start<A>(
     bind_address: A,
-    app: Arc<RwLock<Option<App>>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
@@ -72,7 +73,7 @@ where
     let vsearch = Arc::new(vector_search::VectorSearch::new(
         Arc::clone(&df),
         Arc::clone(&embeddings),
-        compute_primary_keys(Arc::clone(&app)).await,
+        parse_explicit_primary_keys(Arc::clone(&app)).await,
     ));
     let routes = routes::routes(
         app,
@@ -90,7 +91,7 @@ where
         .context(UnableToBindServerToPortSnafu)?;
     tracing::info!("Spice Runtime HTTP listening on {bind_address:?}");
 
-    metrics::counter!("spiced_runtime_http_server_start").increment(1);
+    runtime_metrics::spiced_runtime::HTTP_SERVER_START.add(1, &[]);
 
     loop {
         let stream = match listener.accept().await {

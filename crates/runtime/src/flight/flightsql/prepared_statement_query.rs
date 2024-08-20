@@ -25,7 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{to_tonic_err, util::attach_cache_metadata, Service},
+    flight::{metrics, to_tonic_err, util::attach_cache_metadata, Service},
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -94,8 +94,10 @@ pub(crate) async fn do_get(
     tracing::trace!("do_get: {query:?}");
     match std::str::from_utf8(&query.prepared_statement_handle) {
         Ok(sql) => {
-            let start =
-                TimeMeasurement::new("flight_do_get_prepared_statement_query_duration_ms", vec![]);
+            let start = TimeMeasurement::new(
+                &metrics::flightsql::DO_GET_PREPARED_STATEMENT_QUERY_DURATION_MS,
+                vec![],
+            );
             let (output, from_cache) =
                 Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
             let timed_output = TimedStream::new(output, move || start);

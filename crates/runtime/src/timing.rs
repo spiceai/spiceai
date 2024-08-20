@@ -21,95 +21,35 @@ use std::{
 };
 
 use futures::Stream;
+use opentelemetry::{metrics::Histogram, KeyValue};
 use pin_project::pin_project;
 
-/// `measure_scope_ms!` measures the time for which the designated scope lives.
-///
-/// ## Usage
-///   - Example, measure a function's whole duration:
-///   ```
-///   use std::thread::sleep;
-///   use std::time::Duration;
-///   use runtime::measure_scope_ms;
-///
-///   fn my_function() {
-///     measure_scope_ms!("process_data");
-///     sleep(Duration::from_secs(1))
-///   
-///   } // 'process_data' measures until the end of the function scope (via implementing `Drop`).
-///   ```
-///
-///   - Example, measure a specific scope
-///   ```
-///   use std::thread::sleep;
-///   use std::time::Duration;
-///   use runtime::measure_scope_ms;
-///
-///   fn my_function() {
-///     // Some work
-///     sleep(Duration::from_secs(1));
-///     {
-///         // Some work we don't want to measure
-///         let x = 1+2;
-///
-///         // Some work we want to measure
-///         measure_scope_ms!("process_data");
-///         let y = 2*3;
-///         sleep(Duration::from_secs(1));
-///     } // 'process_data' duration ends here.
-///   }
-///   ```
-///   - **Example**: Add properties to the measurement (key `&str`, value `ToString`)
-///   ```
-///   use runtime::measure_scope_ms;
-///
-///   fn my_function(x: usize, y: String) {
-///     measure_scope_ms!("process_data", "x" => x, "y" => y);
-///   }
-///   ```
-/// ## Parameters
-///
-/// - `$name:expr` — A string literal representing the name of the scope being measured.
-/// - `$key:expr => $value:expr` — Optional key-value pairs provided as additional metadata
-///   for the timing measurement.
-///
-/// ```
-#[macro_export]
-macro_rules! measure_scope_ms {
-    ($name:expr, $($key:expr => $value:expr),+ $(,)?) => {
-        let args = vec![$(($key, $value.to_string())),+];
-        let _ = $crate::timing::TimeMeasurement::new($name, args);
-    };
-    ($name:expr) => {
-        let _ = $crate::timing::TimeMeasurement::new($name, vec![]);
-    };
-}
-
+/// Measures the time in milliseconds it takes to execute a block of code and records it in a histogram metric.
 pub struct TimeMeasurement {
     start: Instant,
-    metric_name: &'static str,
-    labels: Vec<(&'static str, String)>,
+    metric: &'static Histogram<f64>,
+    labels: Vec<KeyValue>,
 }
 
 impl TimeMeasurement {
     #[must_use]
-    pub fn new(metric_name: &'static str, labels: Vec<(&'static str, String)>) -> Self {
+    pub fn new(metric: &'static Histogram<f64>, labels: impl Into<Vec<KeyValue>>) -> Self {
         Self {
             start: Instant::now(),
-            metric_name,
-            labels,
+            metric,
+            labels: labels.into(),
         }
     }
 
-    pub fn with_labels(&mut self, labels: Vec<(&'static str, String)>) {
-        self.labels.extend(labels);
+    pub fn with_labels(&mut self, labels: impl Into<Vec<KeyValue>>) {
+        self.labels.extend(labels.into());
     }
 }
 
 impl Drop for TimeMeasurement {
     fn drop(&mut self) {
-        metrics::histogram!(self.metric_name, &self.labels)
-            .record(1000_f64 * self.start.elapsed().as_secs_f64());
+        self.metric
+            .record(1000_f64 * self.start.elapsed().as_secs_f64(), &self.labels);
     }
 }
 

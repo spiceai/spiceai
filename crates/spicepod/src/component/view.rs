@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{Nameable, WithDependsOn};
 
@@ -24,6 +27,12 @@ use super::{Nameable, WithDependsOn};
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct View {
     pub name: String,
+
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,6 +58,8 @@ impl View {
     pub fn new(name: String) -> Self {
         Self {
             name,
+            description: None,
+            metadata: HashMap::default(),
             sql: None,
             sql_ref: None,
             depends_on: Vec::default(),
@@ -60,6 +71,8 @@ impl WithDependsOn<View> for View {
     fn depends_on(&self, depends_on: &[String]) -> View {
         Self {
             name: self.name.clone(),
+            description: self.description.clone(),
+            metadata: self.metadata.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             depends_on: depends_on.to_vec(),

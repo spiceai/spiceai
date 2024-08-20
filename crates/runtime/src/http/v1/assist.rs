@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 use futures::StreamExt;
 
@@ -128,7 +129,7 @@ async fn context_aware_stream(
         Ok(model_stream) => model_stream,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let vector_data = match create_primary_key_payload(&vector_search_data.retrieved_public_keys) {
+    let vector_data = match create_primary_key_payload(&vector_search_data.retrieved_primary_keys) {
         Ok(vector_data) => vector_data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -162,7 +163,7 @@ async fn context_aware_chat(
 ) -> Response {
     match model.write().await.run(model_input).await {
         Ok(Some(text)) => {
-            match create_primary_key_payload(&vector_search_data.retrieved_public_keys) {
+            match create_primary_key_payload(&vector_search_data.retrieved_primary_keys) {
                 Ok(from) => (StatusCode::OK, Json(AssistResponse { text, from })).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -230,12 +231,21 @@ pub(crate) async fn post(
         .map(TableReference::from)
         .collect();
 
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.text);
+
     let relevant_data = match vs
         .search(payload.text.clone(), input_tables, RetrievalLimit::TopN(3))
+        .instrument(span.clone())
         .await
     {
-        Ok(relevant_data) => relevant_data,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(relevant_data) => {
+            tracing::info!(target: "task_history", parent: &span, outputs_produced = relevant_data.retrieved_entries.len(), "labels");
+            relevant_data
+        }
+        Err(e) => {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     };
 
     tracing::debug!(

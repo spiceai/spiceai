@@ -15,9 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion::{
-    catalog::schema::SchemaProvider, datasource::TableProvider, error::DataFusionError,
-};
+use datafusion::{catalog::SchemaProvider, datasource::TableProvider, error::DataFusionError};
 use futures::{stream::FuturesUnordered, StreamExt};
 use runtime::{
     component::dataset::Dataset,

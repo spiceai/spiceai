@@ -713,6 +713,7 @@ jobs:
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
+          HOME=$GITHUB_WORKSPACE
           spice run &> spice.log &
           # time to initialize added dataset
           sleep 10

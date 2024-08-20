@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use cache::QueryResultsCacheProvider;
 use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
+use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
@@ -50,6 +50,8 @@ use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
+pub mod federation;
+mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
@@ -167,6 +169,7 @@ pub struct Builder {
     zero_results_action: ZeroResultsAction,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
+    append_stream: Option<ChangesStream>,
 }
 
 impl Builder {
@@ -185,6 +188,7 @@ impl Builder {
             zero_results_action: ZeroResultsAction::default(),
             cache_provider: None,
             changes_stream: None,
+            append_stream: None,
         }
     }
 
@@ -217,6 +221,17 @@ impl Builder {
         self
     }
 
+    /// Set the append stream for the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode isn't `RefreshMode::Append`.
+    pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
+        assert!(self.refresh.mode == RefreshMode::Append);
+        self.append_stream = Some(append_stream);
+        self
+    }
+
     /// Build the accelerated table
     ///
     /// # Panics
@@ -226,9 +241,17 @@ impl Builder {
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
+            RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
-                    (refresh::AccelerationRefreshMode::Append(None), None)
+                    // Get the append stream
+                    let Some(append_stream) = self.append_stream else {
+                        panic!("Append stream is required for `RefreshMode::Append` without time_column");
+                    };
+                    (
+                        refresh::AccelerationRefreshMode::Changes(append_stream),
+                        None,
+                    )
                 } else {
                     let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
                     (
@@ -271,7 +294,9 @@ impl Builder {
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
-        handlers.push(refresh_handle);
+        if let Some(refresh_handle) = refresh_handle {
+            handlers.push(refresh_handle);
+        }
 
         if let Some(retention) = self.retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
@@ -496,7 +521,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -521,7 +546,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn insert_into(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {

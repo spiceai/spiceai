@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{embeddings::ColumnEmbeddingConfig, params::Params, Nameable, WithDependsOn};
 
@@ -56,13 +59,19 @@ pub struct Dataset {
 
     pub name: String,
 
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+
     #[serde(default)]
     pub mode: Mode,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
-    #[serde(rename = "metadata", default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_metadata_table: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,10 +103,12 @@ impl Nameable for Dataset {
 
 impl Dataset {
     #[must_use]
-    pub fn new(from: String, name: String) -> Self {
+    pub fn new(from: impl Into<String>, name: impl Into<String>) -> Self {
         Dataset {
-            from,
-            name,
+            from: from.into(),
+            name: name.into(),
+            description: None,
+            metadata: HashMap::default(),
             mode: Mode::default(),
             params: None,
             has_metadata_table: None,
@@ -116,6 +127,8 @@ impl WithDependsOn<Dataset> for Dataset {
         Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
+            description: self.description.clone(),
+            metadata: self.metadata.clone(),
             mode: self.mode.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,

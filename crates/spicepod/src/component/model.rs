@@ -20,12 +20,19 @@ use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Model {
     pub from: String,
     pub name: String,
+
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "files", default)]
@@ -53,6 +60,8 @@ impl WithDependsOn<Model> for Model {
         Model {
             from: self.from.clone(),
             name: self.name.clone(),
+            description: self.description.clone(),
+            metadata: self.metadata.clone(),
             files: self.files.clone(),
             params: self.params.clone(),
             datasets: self.datasets.clone(),
@@ -152,13 +161,21 @@ impl Model {
     /// - `openai`
     ///    - Prefix: `openai`
     ///    - Source: None
+    /// - `openai:gpt-4o`
+    ///    - Prefix: `openai`
+    ///    - Source: `gpt-4o`
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_source() {
-            Some(p) => self
-                .from
-                .strip_prefix(&format!("{p}/"))
-                .map(ToString::to_string),
+            Some(p) => {
+                let from = &self.from;
+                if let Some(stripped) = from.strip_prefix(&format!("{p}/")) {
+                    Some(stripped.to_string())
+                } else {
+                    from.strip_prefix(&format!("{p}:"))
+                        .map(std::string::ToString::to_string)
+                }
+            }
             None => None,
         }
     }

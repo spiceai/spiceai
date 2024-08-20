@@ -20,18 +20,28 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
+use app::spicepod::component::runtime::TelemetryConfig;
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
-use metrics_exporter_prometheus::PrometheusHandle;
+use opentelemetry::global;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::runtime::Tokio;
+use opentelemetry_sdk::Resource;
+use otel_arrow::OtelArrowExporter;
 use runtime::config::Config as RuntimeConfig;
-
+use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
+use runtime::spice_metrics;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 
+#[path = "tracing.rs"]
+mod spiced_tracing;
 mod tls;
 
 #[derive(Debug, Snafu)]
@@ -62,6 +72,12 @@ pub enum Error {
     #[snafu(display("Unable to configure TLS: {source}"))]
     UnableToInitializeTls { source: Box<dyn std::error::Error> },
 
+    #[snafu(display("Unable to initialize tracing: {source}"))]
+    UnableToInitializeTracing { source: Box<dyn std::error::Error> },
+
+    #[snafu(display("Unable to initialize metrics: {source}"))]
+    UnableToInitializeMetrics { source: Box<dyn std::error::Error> },
+
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 }
@@ -71,6 +87,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Parser)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
@@ -110,15 +127,21 @@ pub struct Args {
     /// Path to the TLS PEM-encoded private key file.
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
+
+    /// Enable/disable anonymous telemetry collection.
+    #[arg(long)]
+    pub telemetry_enabled: Option<bool>,
 }
 
-pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result<()> {
+pub async fn run(args: Args) -> Result<()> {
+    let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
+
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
+    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
-        Ok(app) => Some(app),
+        Ok(app) => Some(Arc::new(app)),
         Err(e) => {
             tracing::warn!("{}", e);
             None
@@ -134,7 +157,11 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         }
     }
 
-    let spicepod_tls_config = app.as_ref().and_then(|app| app.runtime.tls.clone());
+    let runtime_config = app.as_ref().map(|app| &app.runtime);
+    let app_name = app.as_ref().map(|app| app.name.clone());
+    let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
+    let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
+    let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
 
     let rt: Runtime = Runtime::builder()
         .with_app_opt(app)
@@ -147,13 +174,22 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         )]))
         .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
-        .with_metrics_server_opt(args.metrics, metrics_handle)
+        .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .build()
         .await;
 
-    let tls_config = tls::load_tls_config(&args, spicepod_tls_config, rt.secrets())
+    spiced_tracing::init_tracing(app_name, tracing_config.as_ref(), rt.datafusion())
+        .context(UnableToInitializeTracingSnafu)?;
+
+    if let Some(metrics_registry) = prometheus_registry {
+        init_metrics(rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+    }
+
+    let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
         .await
         .context(UnableToInitializeTlsSnafu)?;
+
+    start_anonymous_telemetry(&args, telemetry_config.as_ref()).await;
 
     let cloned_rt = rt.clone();
     let server_thread =
@@ -171,5 +207,50 @@ pub async fn run(args: Args, metrics_handle: Option<PrometheusHandle>) -> Result
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),
         }),
+    }
+}
+
+fn init_metrics(
+    df: Arc<DataFusion>,
+    registry: prometheus::Registry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resource = Resource::default();
+
+    let prometheus_exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry)
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()?;
+
+    let spice_metrics_exporter =
+        OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
+
+    let periodic_reader = PeriodicReader::builder(spice_metrics_exporter, Tokio)
+        .with_interval(Duration::from_secs(30))
+        .with_timeout(Duration::from_secs(10))
+        .build();
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(prometheus_exporter)
+        .with_reader(periodic_reader)
+        .build();
+    global::set_meter_provider(provider);
+
+    Ok(())
+}
+
+async fn start_anonymous_telemetry(
+    args: &Args,
+    spicepod_telemetry_config: Option<&TelemetryConfig>,
+) {
+    let explicitly_disabled = args.telemetry_enabled == Some(false)
+        || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
+
+    if !explicitly_disabled {
+        #[cfg(feature = "anonymous_telemetry")]
+        telemetry::anonymous::start().await;
     }
 }

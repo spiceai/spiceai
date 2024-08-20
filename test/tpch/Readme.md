@@ -44,6 +44,8 @@ PGPORT=5432 PGUSER=postgres make tpch-run-pq
 
 ## Load test dataset to MySQL
 
+Ensure `local_infile` is enabled on the MySQL database by first connecting using your `mysql` client and running `SET GLOBAL local_infile=ON;`. This security setting permits the loading on data from files on the client-side, and is disabled by default. The option will disable again at server reboot.
+
 Run commands below to create `tpch` dataset and load test data:
 
 ```bash

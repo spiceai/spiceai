@@ -329,13 +329,13 @@ impl MistralLlama {
 
 #[async_trait]
 impl Chat for MistralLlama {
-    async fn health(&mut self) -> Result<()> {
+    async fn health(&self) -> Result<()> {
         // If [`MistralLlama`] is instantiated successfully, it is healthy.
         Ok(())
     }
 
     async fn stream<'a>(
-        &mut self,
+        &self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         let (snd, mut rcv) = channel::<MistralResponse>(1000);
@@ -408,151 +408,72 @@ impl Chat for MistralLlama {
         })))
     }
 
-    async fn run(&mut self, prompt: String) -> Result<Option<String>> {
-        match self
-            .run_internal(
-                RequestMessage::Completion {
-                    text: prompt,
-                    echo_prompt: false,
-                    best_of: 1,
-                },
-                None,
-                None,
-            )
-            .await?
-        {
-            Some(response) => Ok(response
-                .choices
-                .first()
-                .and_then(|c| c.message.content.clone())),
+    async fn run(&self, prompt: String) -> Result<Option<String>> {
+        match self.run_internal(prompt).await? {
+            Some((response, _usage)) => Ok(Some(response)),
             None => Ok(None),
         }
     }
 
     #[allow(deprecated, clippy::cast_possible_truncation)]
     async fn chat_request(
-        &mut self,
+        &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let model_id = req.model.clone();
-        let messages = messages_to_mistral(req.messages);
-        let tools = req.tools.map(|f| {
-            f.iter()
-                .map(|t| Tool {
-                    tp: ToolType::Function,
-                    function: Function {
-                        name: t.function.name.clone(),
-                        description: None,
-                        parameters: None,
-                    },
-                })
-                .collect()
-        });
-        let tool_choice = req.tool_choice.map(|c| {
-            match c {
-                async_openai::types::ChatCompletionToolChoiceOption::None => ToolChoice::None,
-                async_openai::types::ChatCompletionToolChoiceOption::Auto => ToolChoice::Auto,
-                async_openai::types::ChatCompletionToolChoiceOption::Required => {
-                    unimplemented!("Required tool choice is not supported in mistral.rs")
-                }
-                async_openai::types::ChatCompletionToolChoiceOption::Named(c) => {
-                    ToolChoice::Tool(Tool {
-                        tp: ToolType::Function,
-                        function: Function {
-                            name: c.function.name,
-                            // These are incorrectly needed by mistral.rs
-                            description: None,
-                            parameters: None,
-                        },
-                    })
-                }
-            }
-        });
 
-        let resp = self
-            .run_internal(messages, tools, tool_choice)
-            .await
-            .map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: e.to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?
-            .ok_or_else(|| {
-                OpenAIError::ApiError(ApiError {
-                    message: "No response from model".to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?;
-
-        Ok(to_openai_response(resp))
-    }
-
-    #[allow(deprecated)]
-    async fn chat_stream(
-        &mut self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let model_id = req.model.clone();
         let prompt = req
             .messages
             .iter()
             .map(message_to_content)
             .collect::<Vec<String>>()
             .join("\n");
+        let (choices, usage): (Vec<ChatChoice>, Option<Usage>) =
+            match &self.run_internal(prompt).await.map_err(|e| {
+                OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                })
+            })? {
+                Some((resp, usage)) => {
+                    let choice = vec![ChatChoice {
+                        message: ChatCompletionResponseMessage {
+                            content: Some(resp.clone()),
+                            tool_calls: None,
+                            role: Role::System,
+                            function_call: None,
+                        },
+                        index: 0,
+                        finish_reason: None,
+                        logprobs: None,
+                    }];
+                    (choice, Some(usage.clone()))
+                }
+                None => (vec![], None),
+            };
 
-        let mut stream = self.stream(prompt).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
-
-        let strm_id: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(10)
-            .map(char::from)
-            .collect();
-        let strm = stream! {
-            let mut i  = 0;
-            while let Some(msg) = stream.next().await {
-                let choice = ChatChoiceStream {
-                    delta: ChatCompletionStreamResponseDelta {
-                        content: Some(msg?.unwrap_or_default()),
-                        tool_calls: None,
-                        role: Some(Role::System),
-                        function_call: None,
-                    },
-                    index: i,
-                    finish_reason: None,
-                    logprobs: None,
-                };
-
-            yield Ok(CreateChatCompletionStreamResponse {
-                id: format!("{}-{}-{i}", model_id.clone(), strm_id),
-                choices: vec![choice],
-                model: model_id.clone(),
-                created: 0,
-                system_fingerprint: None,
-                object: "list".to_string(),
-                usage: None,
-            });
-            i+=1;
-        }};
-
-        Ok(Box::pin(strm.map_err(|e: super::Error| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })))
+        Ok(CreateChatCompletionResponse {
+            id: format!(
+                "{}-{}",
+                model_id.clone(),
+                thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(10)
+                    .map(char::from)
+                    .collect::<String>()
+            ),
+            choices,
+            model: model_id,
+            created: 0,
+            system_fingerprint: None,
+            object: "list".to_string(),
+            usage: usage.map(|u| CompletionUsage {
+                prompt_tokens: u.prompt_tokens as u32,
+                completion_tokens: u.completion_tokens as u32,
+                total_tokens: u.total_tokens as u32,
+            }),
+        })
     }
 }

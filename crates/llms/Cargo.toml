@@ -24,6 +24,7 @@ hf-hub = { version = "0.3.0", features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
 tokenizers = { version = "0.19.1" }
 tracing.workspace = true
+tracing-futures.workspace = true
 
 ## `candle` feature packages
 candle-core = { version = "0.5.0", optional = true }

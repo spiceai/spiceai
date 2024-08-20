@@ -15,10 +15,9 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
-    datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{
@@ -26,6 +25,8 @@ use datafusion_table_providers::postgres::{
 };
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
+
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::DataAccelerator;
 
@@ -58,16 +59,31 @@ impl Default for PostgresAccelerator {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::accelerator("host"),
+    ParameterSpec::accelerator("port"),
+    ParameterSpec::accelerator("db"),
+    ParameterSpec::accelerator("user").secret(),
+    ParameterSpec::accelerator("pass").secret(),
+    ParameterSpec::accelerator("sslmode"),
+    ParameterSpec::accelerator("sslrootcert"),
+];
+
 #[async_trait]
 impl DataAccelerator for PostgresAccelerator {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        _dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         let table_provider =
@@ -83,9 +99,22 @@ impl DataAccelerator for PostgresAccelerator {
             unreachable!("PostgresTableWriter should be returned from PostgresTableProviderFactory")
         };
 
+        let read_provider = Arc::clone(&postgres_writer.read_provider);
         let postgres_writer = Arc::new(postgres_writer.clone());
+        let cloned_writer = Arc::clone(&postgres_writer);
 
-        let deletion_adapter = DeletionTableProviderAdapter::new(postgres_writer);
-        Ok(Arc::new(deletion_adapter))
+        Ok(Arc::new(PolyTableProvider::new(
+            cloned_writer,
+            postgres_writer,
+            read_provider,
+        )))
+    }
+
+    fn prefix(&self) -> &'static str {
+        "pg"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
     }
 }
