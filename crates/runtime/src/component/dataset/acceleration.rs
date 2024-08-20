@@ -205,6 +205,7 @@ impl Display for OnConflictBehavior {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
     pub enabled: bool,
