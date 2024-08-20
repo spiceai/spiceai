@@ -601,9 +601,10 @@ impl Runtime {
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
-    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> bool {
+    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
+        let mut initialized_datasets = vec![];
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {
                 let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
@@ -617,7 +618,6 @@ impl Runtime {
                         status::update_dataset(ds_name, status::ComponentStatus::Error);
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                        return false;
                     }
                 };
 
@@ -627,19 +627,22 @@ impl Runtime {
                     .context(AcceleratorInitializationFailedSnafu {
                         name: acceleration.engine.to_string(),
                     }) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        initialized_datasets.push(Arc::clone(ds));
+                    }
                     Err(err) => {
                         let ds_name = &ds.name;
                         status::update_dataset(ds_name, status::ComponentStatus::Error);
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                        return false;
                     }
                 }
+            } else {
+                initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
             }
         }
 
-        true
+        initialized_datasets
     }
 
     async fn load_datasets(&self) {
@@ -651,11 +654,8 @@ impl Runtime {
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
 
-        if !self.initialize_accelerators(&valid_datasets).await {
-            return;
-        }
-
-        for ds in &valid_datasets {
+        // Load only successfully initialized datasets
+        for ds in &self.initialize_accelerators(&valid_datasets).await {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
             futures.push(self.load_dataset(Arc::clone(ds)));
         }
