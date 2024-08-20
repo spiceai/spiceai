@@ -165,7 +165,7 @@ CREATE TABLE test (
         "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                        |",
         "|               |     TableScan: abc                                                                                                                                                         |",
         "| physical_plan | SchemaCastScanExec                                                                                                                                                         |",
-        "|               |   RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                                                                                    |",
+        "|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                                    |",
         "|               |     VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM abc |",
         "|               |                                                                                                                                                                            |",
         "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
