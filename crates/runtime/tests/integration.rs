@@ -26,6 +26,7 @@ use runtime::{datafusion::DataFusion, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
+mod acceleration;
 mod catalog;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
@@ -43,7 +44,6 @@ mod refresh_sql;
 mod results_cache;
 mod s3;
 mod tls;
-mod acceleration;
 
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
