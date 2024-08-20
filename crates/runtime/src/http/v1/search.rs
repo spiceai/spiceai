@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::embeddings::vector_search::{RetrievalLimit, VectorSearch, VectorSearchResult};
+use crate::embeddings::vector_search::{to_matches, Match, RetrievalLimit, VectorSearch};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -21,10 +21,7 @@ use axum::{
 };
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
-
-use super::assist::create_primary_key_payload;
+use std::{sync::Arc, time::Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,38 +34,27 @@ pub struct Request {
 
     #[serde(default = "default_limit")]
     pub limit: usize,
+
+    #[serde(rename = "where", default)]
+    pub where_cond: Option<String>,
 }
 
 fn default_limit() -> usize {
     3
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResponse {
-    pub entries: HashMap<String, Vec<String>>,
-    pub retrieved_primary_keys: HashMap<String, Value>,
-}
-
-impl SearchResponse {
-    pub fn from_vector_search(
-        result: VectorSearchResult,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let keys = create_primary_key_payload(&result.retrieved_primary_keys)?;
-        Ok(Self {
-            entries: result
-                .retrieved_entries
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            retrieved_primary_keys: keys,
-        })
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SearchResponse {
+    matches: Vec<Match>,
+    duration_ms: u128,
 }
 
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<VectorSearch>>,
     Json(payload): Json<Request>,
 ) -> Response {
+    let start_time = Instant::now();
+
     // For now, force the user to specify which data.
     if payload.data_source.is_empty() {
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
@@ -85,23 +71,21 @@ pub(crate) async fn post(
         .search(
             payload.text.clone(),
             input_tables,
+            payload.where_cond.clone(),
             RetrievalLimit::TopN(payload.limit),
         )
         .await
     {
-        Ok(resp) => match SearchResponse::from_vector_search(resp) {
-            Ok(r) => {
-                span.in_scope(|| {
-                    tracing::info!(name = "labels", target = "task_history", outputs_produced = %r.entries.len());
-                });
-                (StatusCode::OK, Json(r)).into_response()
-            }
-            Err(e) => {
-                span.in_scope(|| {
-                    tracing::error!(target: "task_history", "{e}");
-                });
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
+        Ok(resp) => match to_matches(&resp) {
+            Ok(m) => (
+                StatusCode::OK,
+                Json(SearchResponse {
+                    matches: m,
+                    duration_ms: start_time.elapsed().as_millis(),
+                }),
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {
             span.in_scope(|| {
