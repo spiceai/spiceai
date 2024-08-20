@@ -93,6 +93,7 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
+        _dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), cmd)
@@ -184,7 +185,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
-            .create_external_table(&external_table)
+            .create_external_table(&external_table, None)
             .await
             .expect("table should be created");
 
