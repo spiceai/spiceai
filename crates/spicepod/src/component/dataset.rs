@@ -291,9 +291,6 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub on_conflict: HashMap<String, OnConflictBehavior>,
-
-        #[serde(default, skip_serializing_if = "is_false")]
-        pub disable_federation: bool,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -326,7 +323,6 @@ pub mod acceleration {
                 indexes: HashMap::default(),
                 primary_key: None,
                 on_conflict: HashMap::default(),
-                disable_federation: false,
             }
         }
     }

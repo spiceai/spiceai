@@ -43,6 +43,7 @@ mod refresh_sql;
 mod results_cache;
 mod s3;
 mod tls;
+mod acceleration;
 
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///

@@ -312,6 +312,16 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
+        let mut params = acceleration.params.clone();
+
+        let disable_query_push_down = match params
+            .as_mut()
+            .and_then(|x| x.data.remove("disable_query_push_down"))
+        {
+            Some(spicepod::component::params::ParamValue::Bool(value)) => value,
+            _ => false,
+        };
+
         Ok(Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
@@ -326,15 +336,14 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             )?,
             refresh_retry_enabled: acceleration.refresh_retry_enabled,
             refresh_retry_max_attempts: acceleration.refresh_retry_max_attempts,
-            params: acceleration
-                .params
+            params: params
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
             retention_period: acceleration.retention_period,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
-            disable_federation: acceleration.disable_federation,
+            disable_federation: disable_query_push_down,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
             indexes,
             primary_key,

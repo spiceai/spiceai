@@ -27,7 +27,7 @@ use datafusion_table_providers::{
 
 use crate::init_tracing;
 
-mod common;
+pub mod common;
 
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {
