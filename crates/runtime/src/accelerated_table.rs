@@ -138,6 +138,7 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
+    disable_federation: bool,
 }
 
 fn validate_refresh_data_window(
@@ -170,6 +171,7 @@ pub struct Builder {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
+    disable_federation: bool,
 }
 
 impl Builder {
@@ -189,6 +191,7 @@ impl Builder {
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
+            disable_federation: false,
         }
     }
 
@@ -207,6 +210,11 @@ impl Builder {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
+        self
+    }
+
+    pub fn disable_federation(&mut self, disable_federation: bool) -> &mut Self {
+        self.disable_federation = disable_federation;
         self
     }
 
@@ -317,6 +325,7 @@ impl Builder {
                 zero_results_action: self.zero_results_action,
                 refresh_params,
                 refresher,
+                disable_federation: self.disable_federation,
             },
             is_ready,
         )

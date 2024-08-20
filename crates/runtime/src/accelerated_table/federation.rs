@@ -25,7 +25,8 @@ impl AcceleratedTable {
         let schema = Arc::clone(&self.schema());
         let inner = self.get_federation_provider_for_accelerator();
 
-        let enabled = self.zero_results_action != ZeroResultsAction::UseSource;
+        let enabled =
+            self.zero_results_action != ZeroResultsAction::UseSource && !self.disable_federation;
 
         let fed_provider = Arc::new(FederationAdaptor::new(
             inner.clone().map(|x| x as Arc<dyn FederationProvider>),

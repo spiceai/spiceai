@@ -728,6 +728,8 @@ impl DataFusion {
 
         accelerated_table_builder.cache_provider(self.cache_provider());
 
+        accelerated_table_builder.disable_federation(acceleration_settings.disable_federation);
+
         if refresh_mode == RefreshMode::Changes {
             let source = Box::leak(Box::new(Arc::clone(&source)));
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));

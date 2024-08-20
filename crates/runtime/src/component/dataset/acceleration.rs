@@ -206,6 +206,7 @@ impl Display for OnConflictBehavior {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Acceleration {
     pub enabled: bool,
 
@@ -242,6 +243,8 @@ pub struct Acceleration {
     pub primary_key: Option<ColumnReference>,
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
+
+    pub disable_federation: bool,
 }
 
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
@@ -331,6 +334,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             retention_period: acceleration.retention_period,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
+            disable_federation: acceleration.disable_federation,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
             indexes,
             primary_key,
@@ -360,6 +364,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            disable_federation: false,
         }
     }
 }
