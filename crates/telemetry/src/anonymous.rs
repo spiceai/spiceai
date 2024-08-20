@@ -28,14 +28,14 @@ use opentelemetry_sdk::{
 };
 use otel_arrow::OtelArrowExporter;
 
-const ENDPOINT_CONST: &str = "https://data.spiceai.io";
+const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
 /// How often to send telemetry data to the endpoint
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
 const TELEMETRY_TIMEOUT_SECONDS: u64 = 30;
 
 static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
-    std::env::var("SPICEAI_ENDPOINT")
+    std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
         .unwrap_or_else(|_| ENDPOINT_CONST.into())
         .into()
 });
