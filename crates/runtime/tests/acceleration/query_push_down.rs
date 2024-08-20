@@ -9,7 +9,10 @@ use spicepod::component::{
     params::Params,
 };
 
-use crate::{init_tracing, postgres::common, wait_until_true};
+#[cfg(feature = "postgres")]
+use crate::postgres::common;
+
+use crate::{init_tracing, wait_until_true};
 
 #[cfg(feature = "postgres")]
 #[allow(clippy::too_many_lines)]
