@@ -618,6 +618,7 @@ impl Runtime {
                         status::update_dataset(ds_name, status::ComponentStatus::Error);
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        continue;
                     }
                 };
 
