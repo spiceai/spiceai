@@ -140,7 +140,8 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequesstMessage`] type.
 #[cfg(feature = "mistralrs")]
-pub fn messages_to_mistral(messages: Vec<ChatCompletionRequestMessage>) -> RequestMessage {
+#[must_use]
+pub fn messages_to_mistral(messages: &[ChatCompletionRequestMessage]) -> RequestMessage {
     use either::Either;
     use indexmap::IndexMap;
     use mistralrs::MessageContent;
