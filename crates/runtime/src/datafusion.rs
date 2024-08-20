@@ -681,6 +681,7 @@ impl DataFusion {
             source_table_provider.constraints(),
             &acceleration_settings,
             secrets,
+            Some(dataset),
         )
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
@@ -727,6 +728,10 @@ impl DataFusion {
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
+
+        if acceleration_settings.disable_query_push_down {
+            accelerated_table_builder.disable_query_push_down();
+        }
 
         if refresh_mode == RefreshMode::Changes {
             let source = Box::leak(Box::new(Arc::clone(&source)));

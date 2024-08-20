@@ -111,6 +111,7 @@ macro_rules! handle_error {
 impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
+        telemetry::QUERY_COUNT.add(1, &[]);
         let span = match &self.tracker.nsql {
             Some(nsql) => {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)

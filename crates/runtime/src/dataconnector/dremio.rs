@@ -29,6 +29,7 @@ use datafusion::sql::sqlparser::ast::TimezoneInfo;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
+use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
@@ -45,7 +46,7 @@ pub enum Error {
     #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
-        endpoint: String,
+        endpoint: Arc<str>,
     },
 
     #[snafu(display("Unable to create flight client: {source}"))]
@@ -109,27 +110,27 @@ impl DataConnectorFactory for DremioFactory {
         params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let endpoint: String = params
+            let endpoint: Arc<str> = params
                 .get("endpoint")
                 .expose()
                 .ok_or_else(|p| Error::MissingParameter {
                     parameter: p.to_string(),
                 })?
-                .to_string();
+                .into();
 
             verify_endpoint_connection(&endpoint)
                 .await
                 .with_context(|_| UnableToVerifyEndpointConnectionSnafu {
-                    endpoint: endpoint.clone(),
+                    endpoint: Arc::clone(&endpoint),
                 })?;
 
-            let flight_client = FlightClient::try_new(
-                endpoint.as_str(),
+            let credentials = Credentials::new(
                 params.get("username").expose().ok().unwrap_or_default(),
                 params.get("password").expose().ok().unwrap_or_default(),
-            )
-            .await
-            .context(UnableToCreateFlightClientSnafu)?;
+            );
+            let flight_client = FlightClient::try_new(endpoint, credentials)
+                .await
+                .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
                 FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
             Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)

@@ -94,6 +94,7 @@ snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
+telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio.workspace = true

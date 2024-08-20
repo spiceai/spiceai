@@ -81,6 +81,30 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug, Clone)]
+pub enum Credentials {
+    UsernamePassword {
+        username: Arc<str>,
+        password: Arc<str>,
+    },
+    Anonymous,
+}
+
+impl Credentials {
+    #[must_use]
+    pub fn new(username: &str, password: &str) -> Self {
+        Credentials::UsernamePassword {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn anonymous() -> Self {
+        Credentials::Anonymous
+    }
+}
+
 /// Apache Arrow Flight client for interacting with Apache Arrow Flight services.
 ///
 /// This client is cheap to clone. Most fields are wrapped in `Arc`, and the `FlightServiceClient` is
@@ -88,8 +112,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Clone)]
 pub struct FlightClient {
     flight_client: FlightServiceClient<Channel>,
-    username: Arc<str>,
-    password: Arc<str>,
+    credentials: Credentials,
     url: Arc<str>,
 }
 
@@ -104,8 +127,8 @@ impl FlightClient {
     /// # Errors
     ///
     /// Returns an error if unable to create the `FlightClient`.
-    pub async fn try_new(url: &str, username: &str, password: &str) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel(url)
+    pub async fn try_new(url: Arc<str>, credentials: Credentials) -> Result<Self> {
+        let flight_channel = tls::new_tls_flight_channel(&url)
             .await
             .context(UnableToConnectToServerSnafu)?;
 
@@ -113,9 +136,8 @@ impl FlightClient {
             flight_client: FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(100 * 1024 * 1024)
                 .max_decoding_message_size(100 * 1024 * 1024),
-            username: username.into(),
-            password: password.into(),
-            url: url.into(),
+            credentials,
+            url,
         })
     }
 
@@ -328,18 +350,15 @@ impl FlightClient {
         });
 
         let mut publish_request = request_stream.into_streaming_request();
-        let auth_header_value = match token {
-            Some(token) => format!("Bearer {token}")
+        if let Some(token) = token {
+            let auth_header_value = format!("Bearer {token}")
                 .parse()
-                .context(InvalidMetadataSnafu)?,
-            None => {
-                return UnauthorizedSnafu.fail();
-            }
-        };
+                .context(InvalidMetadataSnafu)?;
 
-        publish_request
-            .metadata_mut()
-            .insert("authorization", auth_header_value);
+            publish_request
+                .metadata_mut()
+                .insert("authorization", auth_header_value);
+        };
 
         let resp = match self.flight_client.clone().do_put(publish_request).await {
             Ok(resp) => resp,
@@ -358,12 +377,16 @@ impl FlightClient {
     }
 
     async fn authenticate_basic_token(&self) -> Result<Option<String>> {
+        let Credentials::UsernamePassword { username, password } = &self.credentials else {
+            return Ok(None);
+        };
+
         let cmd = HandshakeRequest {
             protocol_version: 0,
             payload: Bytes::default(),
         };
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!("{}:{}", self.username, self.password));
+        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
         let val = format!("Basic {val}")
             .parse()
             .context(InvalidMetadataSnafu)?;
@@ -388,8 +411,11 @@ impl FlightClient {
         &self.url
     }
 
-    pub fn username(&self) -> &str {
-        &self.username
+    pub fn username(&self) -> Option<&str> {
+        let Credentials::UsernamePassword { username, .. } = &self.credentials else {
+            return None;
+        };
+        Some(username)
     }
 }
 
