@@ -14,7 +14,7 @@ use crate::{init_tracing, postgres::common, wait_until_true};
 #[cfg(feature = "postgres")]
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn s3_acceleration() -> Result<(), anyhow::Error> {
+async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = 20962;
     let running_container = common::start_postgres_docker_container(port).await?;
