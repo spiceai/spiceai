@@ -9,9 +9,6 @@ use spicepod::component::{
     params::Params,
 };
 
-#[cfg(feature = "postgres")]
-use crate::postgres::common;
-
 use crate::{init_tracing, wait_until_true};
 
 #[cfg(feature = "postgres")]
