@@ -19,6 +19,7 @@ use crate::{init_tracing, wait_until_true};
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::get_test_datafusion;
+    use crate::postgres::common;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = 20962;
@@ -168,18 +169,18 @@ CREATE TABLE test (
         .expect("collect working");
 
     let expected_plan = [
-        "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                                                                                                                       |",
-        "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| logical_plan  | Federated                                                                                                                                                                  |",
-        "|               |  Projection: count(Int64(1))                                                                                                                                               |",
-        "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                        |",
-        "|               |     TableScan: abc                                                                                                                                                         |",
-        "| physical_plan | SchemaCastScanExec                                                                                                                                                         |",
-        "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                     |",
-        "|               |     VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM abc |",
-        "|               |                                                                                                                                                                            |",
-        "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                                                                                                                         |",
+        "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| logical_plan  | Federated                                                                                                                                                                    |",
+        "|               |  Projection: count(Int64(1))                                                                                                                                                 |",
+        "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                          |",
+        "|               |     TableScan: abc                                                                                                                                                           |",
+        "| physical_plan | SchemaCastScanExec                                                                                                                                                           |",
+        "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
+        "|               |     VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
+        "|               |                                                                                                                                                                              |",
+        "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected_plan, &plan_results);
 

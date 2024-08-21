@@ -178,7 +178,7 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .await;
 
-    spiced_tracing::init_tracing(app_name, tracing_config.as_ref(), rt.datafusion())
+    spiced_tracing::init_tracing(app_name.clone(), tracing_config.as_ref(), rt.datafusion())
         .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
@@ -189,7 +189,7 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context(UnableToInitializeTlsSnafu)?;
 
-    start_anonymous_telemetry(&args, telemetry_config.as_ref()).await;
+    start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let cloned_rt = rt.clone();
     let server_thread =
@@ -245,12 +245,13 @@ fn init_metrics(
 async fn start_anonymous_telemetry(
     args: &Args,
     spicepod_telemetry_config: Option<&TelemetryConfig>,
+    spicepod_name: Option<&String>,
 ) {
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
     if !explicitly_disabled {
         #[cfg(feature = "anonymous_telemetry")]
-        telemetry::anonymous::start().await;
+        telemetry::anonymous::start(spicepod_name.map_or_else(|| "unknown", String::as_str)).await;
     }
 }
