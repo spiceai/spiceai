@@ -32,12 +32,13 @@ pub(crate) struct QueryTracker {
     pub(crate) nsql: Option<Arc<str>>,
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: Option<SystemTime>,
-    pub(crate) execution_time: Option<f32>,
+    pub(crate) query_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
     pub(crate) results_cache_hit: Option<bool>,
     pub(crate) error_message: Option<String>,
     pub(crate) error_code: Option<ErrorCode>,
     pub(crate) timer: Instant,
+    pub(crate) execution_timer: Instant,
     pub(crate) datasets: Arc<HashSet<TableReference>>,
     pub(crate) protocol: Protocol,
 }
@@ -57,8 +58,8 @@ impl QueryTracker {
 
         let duration = self.timer.elapsed();
 
-        if self.execution_time.is_none() {
-            self.execution_time = Some(duration.as_secs_f32());
+        if self.query_duration_secs.is_none() {
+            self.query_duration_secs = Some(duration.as_secs_f32());
         }
 
         let mut tags = vec![];
@@ -85,10 +86,15 @@ impl QueryTracker {
                     .collect::<Vec<String>>()
                     .join(","),
             ),
-            Key::from_static_str("protocol").string(self.protocol.to_string()),
+            Key::from_static_str("protocol").string(self.protocol.as_arc_str()),
         ];
 
         metrics::DURATION_SECONDS.record(duration.as_secs_f64(), &labels);
+        telemetry::track_query_duration(duration, self.protocol.as_arc_str());
+        telemetry::track_query_execution_duration(
+            self.execution_timer.elapsed(),
+            self.protocol.as_arc_str(),
+        );
 
         if let Some(err) = &self.error_code {
             labels.push(Key::from_static_str("err_code").string(err.to_string()));

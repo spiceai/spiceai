@@ -25,6 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    datafusion::query::Protocol,
     flight::{metrics, to_tonic_err, util::attach_cache_metadata, Service},
     timing::{TimeMeasurement, TimedStream},
 };
@@ -35,10 +36,13 @@ pub(crate) async fn do_action_create_prepared_statement(
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
-    let arrow_schema =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &statement.query)
-            .await
-            .map_err(to_tonic_err)?;
+    let arrow_schema = Service::get_arrow_schema(
+        Arc::clone(&flight_svc.datafusion),
+        &statement.query,
+        Protocol::FlightSQL,
+    )
+    .await
+    .map_err(to_tonic_err)?;
 
     let schema_bytes = Service::serialize_schema(&arrow_schema)?;
 
@@ -65,9 +69,10 @@ pub(crate) async fn get_flight_info(
         }
     };
 
-    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
-        .await
-        .map_err(to_tonic_err)?;
+    let arrow_schema =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql, Protocol::FlightSQL)
+            .await
+            .map_err(to_tonic_err)?;
 
     tracing::trace!("get_flight_info_prepared_statement: arrow_schema={arrow_schema:?}");
 
@@ -98,8 +103,12 @@ pub(crate) async fn do_get(
                 &metrics::flightsql::DO_GET_PREPARED_STATEMENT_QUERY_DURATION_MS,
                 vec![],
             );
-            let (output, from_cache) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
+            let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
+                datafusion,
+                sql,
+                Protocol::FlightSQL,
+            ))
+            .await?;
             let timed_output = TimedStream::new(output, move || start);
 
             let mut response =

@@ -465,7 +465,7 @@ impl SpiceModelTool for SqlTool {
 
         let query_result = rt
             .datafusion()
-            .query_builder(q, Protocol::Flight)
+            .query_builder(q, Protocol::Internal)
             .build()
             .run()
             .instrument(span.clone())

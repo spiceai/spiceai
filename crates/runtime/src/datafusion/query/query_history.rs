@@ -201,7 +201,7 @@ impl QueryTracker {
                 Arc::new(StringArray::from(vec![self.nsql.as_ref().map(Arc::as_ref)])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-                Arc::new(Float32Array::from(vec![self.execution_time])),
+                Arc::new(Float32Array::from(vec![self.query_duration_secs])),
                 Arc::new(Int8Array::from(vec![execution_status])),
                 Arc::new(UInt64Array::from(vec![self.rows_produced])),
                 Arc::new(BooleanArray::from(vec![self

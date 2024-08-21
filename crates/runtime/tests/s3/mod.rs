@@ -48,7 +48,7 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
 
     let mut query_result = rt
         .datafusion()
-        .query_builder("SELECT * FROM taxi_trips LIMIT 10", Protocol::Flight)
+        .query_builder("SELECT * FROM taxi_trips LIMIT 10", Protocol::Internal)
         .build()
         .run()
         .await
