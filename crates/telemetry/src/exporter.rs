@@ -26,6 +26,7 @@ use opentelemetry_sdk::metrics::{
     Aggregation, InstrumentKind,
 };
 
+#[derive(Debug, Clone)]
 pub struct AnonymousTelemetryExporter {
     aggregation_selector: DefaultAggregationSelector,
     flight_client: Option<FlightClient>,

@@ -80,7 +80,7 @@ pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
-mod flight;
+pub mod flight;
 mod http;
 pub mod internal_table;
 mod metrics;
