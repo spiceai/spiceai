@@ -161,8 +161,10 @@ impl DataAccelerator for SqliteAccelerator {
                     .collect::<Vec<String>>()
             })
         }) {
-            cmd.options
-                .insert("attach_databases".to_string(), attach_databases.join(";"));
+            if !attach_databases.is_empty() {
+                cmd.options
+                    .insert("attach_databases".to_string(), attach_databases.join(";"));
+            }
         }
 
         let ctx = SessionContext::new();
