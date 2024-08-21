@@ -15,14 +15,19 @@ limitations under the License.
 */
 
 use std::{
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Weak},
     time::Duration,
 };
 
 use crate::exporter::AnonymousTelemetryExporter;
 use opentelemetry::global::GlobalMeterProvider;
 use opentelemetry_sdk::{
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::{
+        data::{ResourceMetrics, Temporality},
+        exporter::PushMetricsExporter,
+        reader::{AggregationSelector, MetricReader, TemporalitySelector},
+        Aggregation, InstrumentKind, ManualReader, PeriodicReader, Pipeline, SdkMeterProvider,
+    },
     runtime::Tokio,
     Resource,
 };
@@ -40,25 +45,93 @@ static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
+#[derive(Debug, Clone)]
+struct InitialReader {
+    reader: Arc<ManualReader>,
+}
+
+impl InitialReader {
+    pub fn new() -> Self {
+        Self {
+            reader: Arc::new(ManualReader::builder().build()),
+        }
+    }
+}
+
+impl MetricReader for InitialReader {
+    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+        self.reader.register_pipeline(pipeline);
+    }
+
+    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry::metrics::Result<()> {
+        self.reader.collect(rm)
+    }
+
+    fn force_flush(&self) -> opentelemetry::metrics::Result<()> {
+        self.reader.force_flush()
+    }
+
+    fn shutdown(&self) -> opentelemetry::metrics::Result<()> {
+        self.reader.shutdown()
+    }
+}
+
+impl TemporalitySelector for InitialReader {
+    fn temporality(&self, kind: InstrumentKind) -> Temporality {
+        self.reader.temporality(kind)
+    }
+}
+
+impl AggregationSelector for InitialReader {
+    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
+        self.reader.aggregation(kind)
+    }
+}
+
 pub async fn start() {
     let resource = Resource::default();
 
     let oss_telemetry_exporter =
         OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
 
-    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter, Tokio)
+    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
         .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
         .with_timeout(Duration::from_secs(TELEMETRY_TIMEOUT_SECONDS))
         .build();
 
+    let initial_reader = InitialReader::new();
+
     let provider = SdkMeterProvider::builder()
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .with_reader(periodic_reader)
+        .with_reader(initial_reader.clone())
         .build();
 
-    let _ = crate::meter::METER_PROVIDER.get_or_init(|| GlobalMeterProvider::new(provider));
+    if crate::meter::METER_PROVIDER_ONCE
+        .set(GlobalMeterProvider::new(provider))
+        .is_err()
+    {
+        tracing::error!("Failed to set global meter provider for the anonymous telemetry, already set by another codepath?");
+    }
 
-    crate::meter::METER.u64_counter("start").init().add(1, &[]);
+    // Send an initial telemetry event to indicate the start of telemetry collection
+    crate::QUERY_COUNT.add(0, &[]);
+
+    let mut rm = ResourceMetrics {
+        resource,
+        scope_metrics: vec![],
+    };
+
+    if let Err(err) = initial_reader.collect(&mut rm) {
+        tracing::error!("Failed to collect initial telemetry: {:?}", err);
+    };
+
+    oss_telemetry_exporter
+        .export(&mut rm)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!("Failed to export initial telemetry: {:?}", err);
+        });
 
     tracing::debug!("Started anonymous telemetry collection to {}", *ENDPOINT);
 }

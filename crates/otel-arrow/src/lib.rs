@@ -18,6 +18,7 @@ mod schema;
 pub use schema::*;
 
 mod converter;
+pub use converter::*;
 pub mod error;
 mod exporter;
 pub use exporter::*;
