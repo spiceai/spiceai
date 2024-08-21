@@ -20,7 +20,7 @@ use std::{
 };
 
 use crate::exporter::AnonymousTelemetryExporter;
-use opentelemetry::global::GlobalMeterProvider;
+use opentelemetry::{global::GlobalMeterProvider, KeyValue};
 use opentelemetry_sdk::{
     metrics::{
         data::{ResourceMetrics, Temporality},
@@ -32,6 +32,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use otel_arrow::OtelArrowExporter;
+use sha2::{Digest, Sha256};
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
@@ -45,51 +46,33 @@ static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-#[derive(Debug, Clone)]
-struct InitialReader {
-    reader: Arc<ManualReader>,
+fn resource(spicepod_name: &str) -> Resource {
+    let hostname = hostname::get()
+        .unwrap_or_else(|_| "unknown".into())
+        .into_encoded_bytes();
+
+    // instance_id = SHA256(hostname + spicepod_name)
+    let mut instance_id_hasher = Sha256::new();
+    instance_id_hasher.update(hostname);
+    instance_id_hasher.update(spicepod_name);
+    let instance_id = format!("{:x}", instance_id_hasher.finalize());
+
+    // spicepod_id = SHA256(spicepod_name)
+    let mut spicepod_id_hasher = Sha256::new();
+    spicepod_id_hasher.update(spicepod_name);
+    let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
+
+    Resource::new(vec![
+        KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
+        KeyValue::new("name", "spiced"),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.instance.id", instance_id),
+        KeyValue::new("spicepod.id", spicepod_id),
+    ])
 }
 
-impl InitialReader {
-    pub fn new() -> Self {
-        Self {
-            reader: Arc::new(ManualReader::builder().build()),
-        }
-    }
-}
-
-impl MetricReader for InitialReader {
-    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
-        self.reader.register_pipeline(pipeline);
-    }
-
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry::metrics::Result<()> {
-        self.reader.collect(rm)
-    }
-
-    fn force_flush(&self) -> opentelemetry::metrics::Result<()> {
-        self.reader.force_flush()
-    }
-
-    fn shutdown(&self) -> opentelemetry::metrics::Result<()> {
-        self.reader.shutdown()
-    }
-}
-
-impl TemporalitySelector for InitialReader {
-    fn temporality(&self, kind: InstrumentKind) -> Temporality {
-        self.reader.temporality(kind)
-    }
-}
-
-impl AggregationSelector for InitialReader {
-    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
-        self.reader.aggregation(kind)
-    }
-}
-
-pub async fn start() {
-    let resource = Resource::default();
+pub async fn start(spicepod_name: &str) {
+    let resource = resource(spicepod_name);
 
     let oss_telemetry_exporter =
         OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
@@ -136,12 +119,45 @@ pub async fn start() {
     tracing::debug!("Started anonymous telemetry collection to {}", *ENDPOINT);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug, Clone)]
+struct InitialReader {
+    reader: Arc<ManualReader>,
+}
 
-    #[tokio::test]
-    async fn test_start() {
-        start().await;
+impl InitialReader {
+    pub fn new() -> Self {
+        Self {
+            reader: Arc::new(ManualReader::builder().build()),
+        }
+    }
+}
+
+impl MetricReader for InitialReader {
+    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+        self.reader.register_pipeline(pipeline);
+    }
+
+    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry::metrics::Result<()> {
+        self.reader.collect(rm)
+    }
+
+    fn force_flush(&self) -> opentelemetry::metrics::Result<()> {
+        self.reader.force_flush()
+    }
+
+    fn shutdown(&self) -> opentelemetry::metrics::Result<()> {
+        self.reader.shutdown()
+    }
+}
+
+impl TemporalitySelector for InitialReader {
+    fn temporality(&self, kind: InstrumentKind) -> Temporality {
+        self.reader.temporality(kind)
+    }
+}
+
+impl AggregationSelector for InitialReader {
+    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
+        self.reader.aggregation(kind)
     }
 }
