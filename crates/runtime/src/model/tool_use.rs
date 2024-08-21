@@ -39,6 +39,7 @@ use async_openai::types::{
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
+use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::ResultExt;
@@ -47,7 +48,9 @@ use tracing::{Instrument, Span};
 
 use crate::datafusion::query::Protocol;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::embeddings::vector_search::{parse_explicit_primary_keys, to_matches, VectorSearch};
+use crate::embeddings::vector_search::{
+    parse_explicit_primary_keys, to_matches, SearchRequest, VectorSearch,
+};
 use crate::Runtime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,46 +117,6 @@ pub trait SpiceModelTool: Sync + Send {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-static DOCUMENT_SIMILARITY_PARAMETERS: Lazy<Value> = Lazy::new(|| {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "description": "The text to search documents for similarity",
-            },
-            "from": {
-                "type": "array",
-                "items": {
-                    "type": "string"
-                },
-                "description": "The datasets to search for similarity. For available datasets, use the 'list_datasets' tool",
-                "default": []
-            },
-            "where": {
-                "type": "string",
-                "description": "SQL WHERE condition to filter the search",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Number of documents to return for each dataset",
-                "default": 3
-            }
-        },
-        "required": ["text", "from"],
-        "additionalProperties": false
-    })
-});
-
-#[derive(Deserialize)]
-struct DocumentSimilarityToolArgs {
-    text: String,
-    from: Vec<String>,
-    limit: Option<usize>,
-
-    #[serde(rename = "where")]
-    where_cond: Option<String>,
-}
 pub struct DocumentSimilarityTool {}
 impl DocumentSimilarityTool {}
 
@@ -168,7 +131,13 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(DOCUMENT_SIMILARITY_PARAMETERS.clone())
+        match serde_json::to_value(schema_for!(SearchRequest)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!("Unexpectedly cannot serialize `SearchRequest` schema: {e}",);
+                None
+            }
+        }
     }
 
     async fn call(
@@ -177,34 +146,22 @@ impl SpiceModelTool for DocumentSimilarityTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name(), input = arg);
-        let args: DocumentSimilarityToolArgs = serde_json::from_str(arg)?;
+        let mut req: SearchRequest = serde_json::from_str(arg)?;
 
-        let text = args.text;
-        let datasets = args
-            .from
-            .iter()
-            .map(|d| TableReference::parse_str(d))
-            .collect_vec();
-
-        let limit = args.limit.unwrap_or(3);
-
-        // TODO: implement `explicit_primary_keys` parsing from rt.app
         let vs = VectorSearch::new(
             rt.datafusion(),
             Arc::clone(&rt.embeds),
             parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
         );
 
-        let result = vs
-            .search(
-                text,
-                datasets,
-                args.where_cond,
-                crate::embeddings::vector_search::RetrievalLimit::TopN(limit),
-            )
-            .instrument(span.clone())
-            .await
-            .boxed()?;
+        // If model provides a `where` keyword in their [`where_cond`] field, strip it.
+        if let Some(cond) = &req.where_cond {
+            if cond.to_lowercase().starts_with("where ") {
+                req.where_cond = Some(cond[5..].to_string());
+            }
+        }
+
+        let result = vs.search(&req).instrument(span.clone()).await.boxed()?;
 
         let matches = to_matches(&result).boxed()?;
         serde_json::value::to_value(matches).boxed()
@@ -473,7 +430,7 @@ impl ToolUsingChat {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!(target: "task_history", "{e}");
-                        Value::String(format!("Error calling tool {}", t.name()))
+                        Value::String(format!("Error calling tool {}. Error: {e}", t.name()))
                     }
                 }
             }

@@ -25,6 +25,7 @@ use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use itertools::Itertools;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
@@ -47,7 +48,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Error occurred process Arrow records: {}", source))]
+    #[snafu(display("Error occurred processing Arrow records: {}", source))]
     RecordProcessingError { source: ArrowError },
 
     #[snafu(display("Could not format search results: {}", source))]
@@ -95,11 +96,58 @@ impl Display for RetrievalLimit {
     }
 }
 
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[allow(clippy::doc_markdown)]
+pub struct SearchRequest {
+    /// The text to search documents for similarity
+    pub text: String,
+
+    /// The datasets to search for similarity. For available datasets, use the 'list_datasets' tool
+    #[serde(default)]
+    pub datasets: Vec<String>,
+
+    /// Number of documents to return for each dataset
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+
+    /// An SQL filter predicate to apply. Format: 'WHERE <where_cond>'.
+    #[serde(rename = "where", default)]
+    pub where_cond: Option<String>,
+
+    /// Additional columns to return from the dataset.
+    #[serde(default)]
+    pub additional_columns: Vec<String>,
+}
+
+fn default_limit() -> usize {
+    3
+}
+
+impl SearchRequest {
+    #[must_use]
+    pub fn new(
+        text: String,
+        data_source: Vec<String>,
+        limit: usize,
+        where_cond: Option<String>,
+        additional_columns: Vec<String>,
+    ) -> Self {
+        SearchRequest {
+            text,
+            datasets: data_source,
+            limit,
+            where_cond,
+            additional_columns,
+        }
+    }
+}
+
 pub type ModelKey = String;
 
 #[derive(Debug)]
 pub struct VectorSearchTableResult {
-    pub primary_keys: Vec<RecordBatch>,
+    pub primary_key: Vec<RecordBatch>,
     pub embedded_column: Vec<RecordBatch>, // original data, not the embedding vector.
     pub additional_columns: Vec<RecordBatch>,
 }
@@ -111,7 +159,7 @@ pub struct Match {
     value: String,
     // score: f64,
     dataset: String,
-    primary_keys: HashMap<String, serde_json::Value>,
+    primary_key: HashMap<String, serde_json::Value>,
     metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -119,18 +167,15 @@ pub fn table_to_matches(
     tbl: &TableReference,
     result: &VectorSearchTableResult,
 ) -> Result<Vec<Match>> {
-    let pks: Vec<HashMap<String, serde_json::Value>> = if result
-        .primary_keys
-        .first()
-        .is_some_and(|p| p.num_rows() > 0)
-    {
-        let pk_str = write_to_json_string(&result.primary_keys).context(FormattingSnafu)?;
-        serde_json::from_str(&pk_str)
-            .boxed()
-            .context(FormattingSnafu)?
-    } else {
-        vec![]
-    };
+    let pks: Vec<HashMap<String, serde_json::Value>> =
+        if result.primary_key.first().is_some_and(|p| p.num_rows() > 0) {
+            let pk_str = write_to_json_string(&result.primary_key).context(FormattingSnafu)?;
+            serde_json::from_str(&pk_str)
+                .boxed()
+                .context(FormattingSnafu)?
+        } else {
+            vec![]
+        };
 
     let add_cols: Vec<HashMap<String, serde_json::Value>> = if result
         .additional_columns
@@ -163,7 +208,7 @@ pub fn table_to_matches(
         .map(|((pks, add_cols), value)| Match {
             value,
             dataset: tbl.to_string(),
-            primary_keys: pks,
+            primary_key: pks,
             metadata: add_cols,
         })
         .collect::<Vec<Match>>())
@@ -203,16 +248,16 @@ impl VectorSearch {
         where_cond: Option<&str>,
         n: usize,
     ) -> Result<VectorSearchTableResult> {
-        let mut projection = primary_keys.to_vec();
-        projection.push(embedding_column.to_string());
-        projection.extend(additional_columns.to_vec());
+        let projection: Vec<String> = primary_keys
+            .iter()
+            .cloned()
+            .chain(Some(embedding_column.to_string()))
+            .chain(additional_columns.iter().cloned())
+            .collect();
 
         let projection_str = projection.iter().map(|s| quote_identifier(s)).join(", ");
 
-        let where_str = match where_cond {
-            Some(cond) => format!("WHERE ({cond})"),
-            None => String::new(),
-        };
+        let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
         let query = format!(
             "SELECT {projection_str} FROM {tbl} {where_str} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {n}"
@@ -253,19 +298,23 @@ impl VectorSearch {
             .context(RecordProcessingSnafu)?;
 
         Ok(VectorSearchTableResult {
-            primary_keys: primary_keys_records,
+            primary_key: primary_keys_records,
             embedded_column: embedding_records,
             additional_columns: primary_keys,
         })
     }
 
-    pub async fn search(
-        &self,
-        query: String,
-        tables: Vec<TableReference>,
-        where_cond: Option<String>,
-        limit: RetrievalLimit,
-    ) -> Result<VectorSearchResult> {
+    pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
+        let SearchRequest {
+            text: query,
+            datasets: data_source,
+            limit,
+            where_cond,
+            additional_columns,
+        } = req;
+
+        let tables: Vec<TableReference> = data_source.iter().map(TableReference::from).collect();
+
         let span = match Span::current() {
             span if matches!(span.metadata(), Some(metadata) if metadata.name() == "vector_search") => {
                 span
@@ -277,11 +326,6 @@ impl VectorSearch {
         span.in_scope(|| {
             tracing::info!(name: "labels", target: "task_history", tables = tables.iter().join(","), limit = %limit);
         });
-
-        let n = match limit {
-            RetrievalLimit::TopN(n) => n,
-            RetrievalLimit::Threshold(_) => unimplemented!(),
-        };
 
         let per_table_embeddings = self
             .calculate_embeddings_per_table(query.clone(), tables.clone())
@@ -330,9 +374,9 @@ impl VectorSearch {
                             embedding.clone(),
                             &primary_keys,
                             &embedding_column,
-                            &[],
+                            additional_columns,
                             where_cond.as_deref(),
-                            n,
+                            *limit,
                         )
                         .instrument(span.clone())
                         .await?;
@@ -543,4 +587,18 @@ pub async fn parse_explicit_primary_keys(
             })
             .collect::<HashMap<TableReference, Vec<_>>>()
     })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use schemars::schema_for;
+    use snafu::ResultExt;
+
+    use crate::embeddings::vector_search::SearchRequest;
+
+    #[tokio::test]
+    async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        serde_json::to_value(schema_for!(SearchRequest)).boxed()?;
+        Ok(())
+    }
 }
