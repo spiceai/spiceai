@@ -38,8 +38,7 @@ use async_openai::types::{
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
-use once_cell::sync::Lazy;
-use schemars::schema_for;
+use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::ResultExt;
@@ -117,6 +116,16 @@ pub trait SpiceModelTool: Sync + Send {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
+    match serde_json::to_value(schema_for!(T)) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::error!("Unexpectedly cannot serialize schema: {e}",);
+            None
+        }
+    }
+}
+
 pub struct DocumentSimilarityTool {}
 impl DocumentSimilarityTool {}
 
@@ -131,13 +140,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        match serde_json::to_value(schema_for!(SearchRequest)) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::error!("Unexpectedly cannot serialize `SearchRequest` schema: {e}",);
-                None
-            }
-        }
+        parameters::<SearchRequest>()
     }
 
     async fn call(
@@ -190,16 +193,17 @@ impl SpiceModelTool for ListTablesTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), input = arg);
+
+        // TODO: handle catalogs
         if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
             Ok(Value::Array(
                 app.datasets
                     .iter()
                     .map(|d| {
-                        Value::String(
-                            TableReference::parse_str(&d.name)
-                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                                .to_string(),
-                        )
+                        json!({
+                            "table": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
+                            "can_search_documents": !d.embeddings.is_empty()
+                        })
                     })
                     .collect::<Vec<Value>>(),
             ))
@@ -209,65 +213,12 @@ impl SpiceModelTool for ListTablesTool {
     }
 }
 
-pub struct ListDatasetsTool {}
-
-#[async_trait]
-impl SpiceModelTool for ListDatasetsTool {
-    fn name(&self) -> &'static str {
-        "list_datasets"
-    }
-
-    fn description(&self) -> Option<&'static str> {
-        Some("List all datasets that contain searchable documents")
-    }
-
-    fn parameters(&self) -> Option<Value> {
-        None
-    }
-
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
-        let embedding_datasets = match &*rt.app.read().instrument(span.clone()).await {
-            Some(app) => app
-                .datasets
-                .iter()
-                .filter(|d| !d.embeddings.is_empty())
-                .map(|d| {
-                    json!({
-                        "name": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
-                        "description": d.description,
-                        "metadata": d.metadata,
-                    })
-                })
-                .collect_vec(),
-            None => vec![],
-        };
-
-        Ok(Value::Array(embedding_datasets))
-    }
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct TableSchemaToolParams {
+    /// Which subset of tables to return results for. Default to all tables.
+    tables: Vec<String>,
 }
-
 pub struct TableSchemaTool {}
-static TABLE_SCHEMA_PARAMETERS: Lazy<Value> = Lazy::new(|| {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "tables": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            },
-            "description": "Which subset of tables to return results for. Default to all tables.",
-        },
-        },
-        "required": [],
-        "additionalProperties": false,
-    })
-});
 
 #[async_trait]
 impl SpiceModelTool for TableSchemaTool {
@@ -280,7 +231,7 @@ impl SpiceModelTool for TableSchemaTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(TABLE_SCHEMA_PARAMETERS.clone())
+        parameters::<TableSchemaToolParams>()
     }
 
     async fn call(
@@ -289,18 +240,10 @@ impl SpiceModelTool for TableSchemaTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = arg);
-        let arg_v = Value::from_str(arg).boxed()?;
-        // TODO support default == all tables
-        let tables: Vec<String> = arg_v["tables"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|t| t.as_str().unwrap_or_default().to_string())
-            .filter(|t| !t.is_empty())
-            .collect_vec();
+        let req: TableSchemaToolParams = serde_json::from_str(arg)?;
 
-        let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
-        for t in &tables {
+        let mut table_schemas: Vec<Value> = Vec::with_capacity(req.tables.len());
+        for t in &req.tables {
             let schema = rt
                 .datafusion()
                 .get_arrow_schema(t)
@@ -308,27 +251,20 @@ impl SpiceModelTool for TableSchemaTool {
                 .await
                 .boxed()?;
 
-            // Should use a better structure
-            table_create_stms.push(schema.to_string());
+            let v = serde_json::value::to_value(schema).boxed()?;
+
+            table_schemas.push(v);
         }
-        Ok(Value::String(table_create_stms.join("\n")))
+        Ok(Value::Array(table_schemas))
     }
 }
 
 pub struct SqlTool {}
-static SQL_PARAMETERS: Lazy<Value> = Lazy::new(|| {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The table_catalog is 'spice'. Always use it in the query",
-            },
-        },
-        "required": ["query"],
-        "additionalProperties": false,
-    })
-});
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct SqlToolParams {
+    /// The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query
+    query: String,
+}
 
 #[async_trait]
 impl SpiceModelTool for SqlTool {
@@ -341,7 +277,7 @@ impl SpiceModelTool for SqlTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(SQL_PARAMETERS.clone())
+        parameters::<SqlToolParams>()
     }
 
     async fn call(
@@ -350,17 +286,17 @@ impl SpiceModelTool for SqlTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
-        let arg_v = Value::from_str(arg).boxed()?;
-        let q = arg_v["query"].as_str().unwrap_or_default();
+        let req: SqlToolParams = serde_json::from_str(arg)?;
 
         let query_result = rt
             .datafusion()
-            .query_builder(q, Protocol::Flight)
+            .query_builder(&req.query, Protocol::Flight)
             .build()
             .run()
             .instrument(span.clone())
             .await
             .boxed()?;
+
         let batches = query_result
             .data
             .try_collect::<Vec<RecordBatch>>()
@@ -389,7 +325,6 @@ impl ToolUsingChat {
             rt,
             tools: opts.filter_tools(vec![
                 Box::new(DocumentSimilarityTool {}),
-                Box::new(ListDatasetsTool {}),
                 Box::new(TableSchemaTool {}),
                 Box::new(SqlTool {}),
                 Box::new(ListTablesTool {}),
