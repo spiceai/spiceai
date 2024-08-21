@@ -21,12 +21,13 @@ use opentelemetry::{
     metrics::{noop::NoopMeterProvider, Meter, MeterProvider},
 };
 
-pub(crate) static METER_PROVIDER: OnceLock<GlobalMeterProvider> = OnceLock::new();
+pub(crate) static METER_PROVIDER_ONCE: OnceLock<GlobalMeterProvider> = OnceLock::new();
 
 /// If the meter provider isn't initialized for anonymous telemetry, use a `NoopMeterProvider`.
 ///
 /// This allows the instrumented code to not require any changes when anonymous telemetry is disabled/compiled out.
-pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
-    let meter = METER_PROVIDER.get_or_init(|| GlobalMeterProvider::new(NoopMeterProvider::new()));
-    meter.meter("oss_telemetry")
+static METER_PROVIDER: LazyLock<&'static GlobalMeterProvider> = LazyLock::new(|| {
+    METER_PROVIDER_ONCE.get_or_init(|| GlobalMeterProvider::new(NoopMeterProvider::new()))
 });
+
+pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("oss_telemetry"));
