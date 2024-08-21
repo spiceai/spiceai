@@ -86,6 +86,7 @@ regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+schemars = "0.8.19"
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
