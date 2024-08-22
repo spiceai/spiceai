@@ -547,7 +547,7 @@ impl Chat for ToolUsingChat {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let req = self.prepare_req(req).await?;
 
-      // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
             .as_ref()
