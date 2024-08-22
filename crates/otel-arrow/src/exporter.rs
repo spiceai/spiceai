@@ -44,6 +44,14 @@ pub struct OtelArrowExporter<E: ArrowExporter> {
     exporter: E,
 }
 
+impl<E: ArrowExporter + Clone> Clone for OtelArrowExporter<E> {
+    fn clone(&self) -> Self {
+        OtelArrowExporter {
+            exporter: self.exporter.clone(),
+        }
+    }
+}
+
 impl<E: ArrowExporter> OtelArrowExporter<E> {
     pub fn new(exporter: E) -> Self {
         OtelArrowExporter { exporter }

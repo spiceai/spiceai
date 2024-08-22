@@ -33,6 +33,7 @@ mod delta_lake;
 mod docker;
 mod federation;
 mod graphql;
+mod grpc_api;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]
