@@ -300,6 +300,7 @@ impl AttributesBuilder {
 }
 
 impl OtelToArrowConverter {
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         OtelToArrowConverter {
             time_unix_nano_builder: TimestampNanosecondBuilder::with_capacity(capacity),
@@ -320,6 +321,11 @@ impl OtelToArrowConverter {
         }
     }
 
+    /// Converts the given `ResourceMetrics` into an Arrow `RecordBatch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the conversion fails.
     pub fn convert(
         &mut self,
         resource_metrics: &ResourceMetrics,
