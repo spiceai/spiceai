@@ -115,7 +115,7 @@ impl DataAccelerator for SqliteAccelerator {
     }
 
     fn valid_file_extensions(&self) -> Vec<&'static str> {
-        vec!["sqlite"]
+        vec!["sqlite", "db"]
     }
 
     /// Initializes an SQLite database for the dataset
