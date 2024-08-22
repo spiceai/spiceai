@@ -326,21 +326,21 @@ impl VectorSearch {
 
         let vector_search_result = async {
             tracing::info!(name: "labels", target: "task_history", tables = tables.iter().join(","), limit = %limit);
-    
+
             let per_table_embeddings = self
                 .calculate_embeddings_per_table(query.clone(), tables.clone())
                 .await?;
-    
+
             let table_primary_keys = self
                 .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.clone())
                 .await?;
-    
+
             let mut response: VectorSearchResult = HashMap::new();
-    
+
             for (tbl, search_vectors) in per_table_embeddings {
                 tracing::debug!("Running vector search for table {:#?}", tbl.clone());
                 let primary_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
-    
+
                 // Only support one embedding column per table.
                 let table_provider = self
                     .df
@@ -349,13 +349,13 @@ impl VectorSearch {
                     .ok_or(Error::DataSourceNotFound {
                         data_source: tbl.to_string(),
                     })?;
-    
+
                 let embedding_column = get_embedding_table(&table_provider)
                     .and_then(|e| e.get_embedding_columns().first().cloned())
                     .ok_or(Error::NoEmbeddingColumns {
                         data_source: tbl.to_string(),
                     })?;
-    
+
                 if search_vectors.len() != 1 {
                     return Err(Error::IncorrectNumberOfEmbeddingColumns {
                         data_source: tbl.to_string(),
@@ -383,7 +383,7 @@ impl VectorSearch {
             tracing::info!(target: "task_history", truncated_output = ?response);
             Ok(response)
         }.instrument(span.clone()).await;
-        
+
         match vector_search_result {
             Ok(result) => Ok(result),
             Err(e) => {
