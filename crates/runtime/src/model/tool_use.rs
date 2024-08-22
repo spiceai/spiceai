@@ -29,11 +29,11 @@ use llms::chat::{Chat, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
 };
 
 use async_trait::async_trait;
@@ -42,6 +42,7 @@ use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::ResultExt;
+use spicepod::component::dataset::Dataset;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
@@ -126,6 +127,15 @@ fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
     }
 }
 
+/// Get all tables available in the [`Runtime`].
+// TODO: handle catalogs
+async fn get_tables(rt: Arc<Runtime>) -> Vec<Dataset> {
+    match &*rt.app.read().await {
+        Some(app) => app.datasets.clone(),
+        None => vec![],
+    }
+}
+
 pub struct DocumentSimilarityTool {}
 impl DocumentSimilarityTool {}
 
@@ -205,26 +215,20 @@ impl SpiceModelTool for ListDatasetsTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
+        tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
 
-        // TODO: handle catalogs
-        if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
-            Ok(Value::Array(
-                app.datasets
-                    .iter()
-                    .map(|d| {
-                        json!({
-                            "table": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
-                            "can_search_documents": !d.embeddings.is_empty(),
-                            "description": d.description.clone(),
-                            "metadata": d.metadata.clone(),
-                        })
-                    })
-                    .collect::<Vec<Value>>(),
-            ))
-        } else {
-            Ok(Value::Array(vec![]))
-        }
+        let tables = get_tables(Arc::clone(&rt)).await.iter()
+            .map(|d| {
+                json!({
+                    "table": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
+                    "can_search_documents": !d.embeddings.is_empty(),
+                    "description": d.description.clone(),
+                    "metadata": d.metadata.clone(),
+                })
+            })
+            .collect::<Vec<Value>>();
+
+        Ok(Value::Array(tables))
     }
 }
 
@@ -300,7 +304,7 @@ impl SpiceModelTool for SqlTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 
@@ -370,6 +374,63 @@ impl ToolUsingChat {
                 },
             })
             .collect_vec()
+    }
+
+    /// When there are runtime tools available, create a system prompt describing the capabilities
+    fn runtime_tool_system_prompt(&self) -> Option<String> {
+        let tool_names = self
+            .runtime_tools()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect_vec();
+
+        if tool_names.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "You have access to the following runtime tools: {}.",
+            tool_names.join(", ")
+        ))
+    }
+
+    /// Creates content for a system prompt that lists all available tables in the runtime.
+    async fn available_tables_system_prompt(&self) -> Option<String> {
+        let datasets = get_tables(Arc::clone(&self.rt)).await;
+        let mut table_names = datasets.iter().map(|d| {
+            let tbl: TableReference = TableReference::parse_str(&d.name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .into();
+            tbl.to_quoted_string()
+        });
+
+        Some(format!(
+            "The following datasets are available in the runtime: {}.",
+            table_names.join(", ")
+        ))
+    }
+
+    /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
+    async fn prepare_req(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
+        let content = format!(
+            "You have access to a runtime. {} {}",
+            self.available_tables_system_prompt()
+                .await
+                .unwrap_or_default(),
+            self.runtime_tool_system_prompt().unwrap_or_default(),
+        );
+
+        let message = ChatCompletionRequestSystemMessageArgs::default()
+            .content(content)
+            .build()?;
+
+        let mut req = req.clone();
+        req.messages
+            .insert(0, ChatCompletionRequestMessage::System(message));
+        Ok(req)
     }
 
     /// Check if a tool call is a spiced runtime tool.
@@ -480,20 +541,19 @@ impl Chat for ToolUsingChat {
         self.inner_chat.stream(prompt).await
     }
 
-    /// TODO: If response messages has ChatCompletionMessageToolCall that are spiced runtime tools, call locally, and pass back.
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
+        let req = self.prepare_req(req).await?;
+
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
-            return self.inner_chat.chat_stream(req).instrument(span).await;
+            return self.inner_chat.chat_stream(req).await;
         };
 
         // Append spiced runtime tools to the request.
@@ -504,13 +564,9 @@ impl Chat for ToolUsingChat {
             inner_req.tools = Some(runtime_tools);
         };
 
-        let s = self
-            .inner_chat
-            .chat_stream(inner_req)
-            .instrument(span.clone())
-            .await?;
+        let s = self.inner_chat.chat_stream(inner_req).await?;
         Ok(make_a_stream(
-            span,
+            Span::current(),
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
@@ -521,14 +577,12 @@ impl Chat for ToolUsingChat {
         ))
     }
 
-    /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
-    /// implementation will be constructed based on the trait's [`run`] method.
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
+        let req = self.prepare_req(req).await?;
+
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
@@ -536,7 +590,7 @@ impl Chat for ToolUsingChat {
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_chat.chat_request(req).instrument(span).await;
+            return self.inner_chat.chat_request(req).await;
         };
 
         // Append spiced runtime tools to the request.
@@ -547,11 +601,7 @@ impl Chat for ToolUsingChat {
             inner_req.tools = Some(runtime_tools);
         };
 
-        let resp = self
-            .inner_chat
-            .chat_request(inner_req)
-            .instrument(span.clone())
-            .await?;
+        let resp = self.inner_chat.chat_request(inner_req).await?;
 
         let tools_used = resp
             .choices
@@ -560,7 +610,6 @@ impl Chat for ToolUsingChat {
 
         match self
             .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
-            .instrument(span.clone())
             .await?
         {
             // New messages means we have run spice tools locally, ready to recall model.
@@ -569,7 +618,7 @@ impl Chat for ToolUsingChat {
                     .model(req.model)
                     .messages(messages)
                     .build()?;
-                self.chat_request(new_req).instrument(span.clone()).await
+                self.chat_request(new_req).await
             }
             None => Ok(resp),
         }
