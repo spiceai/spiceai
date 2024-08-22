@@ -71,7 +71,7 @@ impl UserDefinedLogicalNodeCore for BytesScannedNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.input)
+        write!(f, "BytesScannedNode")
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
