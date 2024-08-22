@@ -20,12 +20,20 @@ use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory};
+use datafusion_table_providers::{
+    duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory},
+    sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
+};
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, ffi::OsStr, sync::Arc};
 
-use crate::{component::dataset::Dataset, parameters::ParameterSpec};
+use crate::{
+    component::dataset::{acceleration::Engine, Dataset},
+    make_spice_data_directory,
+    parameters::ParameterSpec,
+    spice_data_base_path, Runtime,
+};
 
 use super::DataAccelerator;
 
@@ -35,6 +43,25 @@ pub enum Error {
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Acceleration creation failed: {source}"))]
+    AccelerationCreationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Acceleration initialization failed: {source}"))]
+    AccelerationInitializationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The \"duckdb_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    InvalidFileExtension {
+        valid_extensions: String,
+        extension: String,
+    },
+
+    #[snafu(display("The \"duckdb_file\" acceleration parameter is a directory."))]
+    InvalidFileIsDirectory,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -48,9 +75,7 @@ impl DuckDBAccelerator {
     pub fn new() -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new()
-                .db_path_param("file")
-                .access_mode(AccessMode::ReadWrite),
+            duckdb_factory: DuckDBTableProviderFactory::new().access_mode(AccessMode::ReadWrite),
         }
     }
 
@@ -63,6 +88,11 @@ impl DuckDBAccelerator {
         let acceleration = dataset.acceleration.as_ref()?;
 
         let mut params = acceleration.params.clone();
+        params.insert("data_directory".to_string(), spice_data_base_path());
+
+        if let Some(duckdb_file) = params.remove("duckdb_file") {
+            params.insert("duckdb_open".to_string(), duckdb_file.to_string());
+        }
 
         Some(
             self.duckdb_factory
@@ -89,14 +119,89 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
+    fn valid_file_extensions(&self) -> Vec<&'static str> {
+        vec!["db", "ddb", "duckdb"]
+    }
+
+    async fn init(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !dataset.is_file_accelerated() {
+            return Ok(());
+        }
+
+        let path = self.duckdb_file_path(dataset);
+
+        if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
+            if !acceleration.params.contains_key("duckdb_file") {
+                make_spice_data_directory().map_err(|err| {
+                    Error::AccelerationInitializationFailed { source: err.into() }
+                })?;
+            } else if !self.is_valid_file(path) {
+                if std::path::Path::new(path).is_dir() {
+                    return Err(Error::InvalidFileIsDirectory.into());
+                }
+
+                let extension = std::path::Path::new(path)
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("");
+
+                return Err(Error::InvalidFileExtension {
+                    valid_extensions: self.valid_file_extensions().join(","),
+                    extension: extension.to_string(),
+                }
+                .into());
+            }
+
+            DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
+                .context(AccelerationInitializationFailedSnafu)?;
+        }
+
+        Ok(())
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
-        _dataset: Option<&Dataset>,
+        dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut cmd = cmd.clone();
+        if let Some(duckdb_file) = cmd.options.remove("file") {
+            cmd.options
+                .insert("open".to_string(), duckdb_file.to_string());
+        }
+
+        if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
+            this_dataset.app.as_ref().map(|a| {
+                let datasets = Runtime::get_valid_datasets(a, crate::LogErrors(false));
+                datasets
+                    .iter()
+                    .filter(|d| {
+                        d.acceleration
+                            .as_ref()
+                            .map_or(false, |a| a.engine == Engine::DuckDB)
+                    })
+                    .filter_map(|other_dataset| {
+                        if **other_dataset == *this_dataset {
+                            None
+                        } else {
+                            self.duckdb_file_path(other_dataset)
+                        }
+                    })
+                    .collect::<Vec<String>>()
+            })
+        }) {
+            if !attach_databases.is_empty() {
+                cmd.options
+                    .insert("attach_databases".to_string(), attach_databases.join(";"));
+            }
+        }
+
         let ctx = SessionContext::new();
-        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), cmd)
+        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
             .await
             .context(UnableToCreateTableSnafu)
             .boxed()?;
