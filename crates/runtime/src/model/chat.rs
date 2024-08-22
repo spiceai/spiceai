@@ -141,3 +141,42 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
         }
     }
 }
+
+/// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts). 
+pub struct ChatWrapper {
+    pub chat: Box<dyn Chat>,
+    pub model_id: String,
+    pub system_prompts: Optional<String>,
+}
+
+#[async_trait]
+impl Chat for ChatWrapper {
+    async fn chat_stream(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+    }
+
+    async fn chat_request(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, &format!("{model_id}::request"), input = %serde_json::to_string(&req).unwrap_or_default());
+        span.in_scope(
+            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
+        );
+
+    }
+
+    async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
+        self.chat.run(prompt).await
+    }
+
+    async fn stream<'a>(
+        &self,
+        prompt: String,
+    ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
+        self.chat.stream(prompt).await
+    }
+
+}
