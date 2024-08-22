@@ -55,7 +55,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
         .datafusion()
         .query_builder(
             "SELECT * FROM spiceai.eth.recent_blocks LIMIT 10",
-            Protocol::Flight,
+            Protocol::Internal,
         )
         .build()
         .run()
@@ -111,7 +111,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
              WHERE table_schema != 'information_schema' 
                AND table_catalog = 'spiceai' 
              ORDER BY table_name",
-            Protocol::Flight,
+            Protocol::Internal,
         )
         .build()
         .run()

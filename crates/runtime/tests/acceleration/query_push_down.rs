@@ -122,7 +122,7 @@ CREATE TABLE test (
         wait_until_true(Duration::from_secs(30), || async {
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM abc LIMIT 1", Protocol::Flight)
+                .query_builder("SELECT * FROM abc LIMIT 1", Protocol::Internal)
                 .build()
                 .run()
                 .await
@@ -140,7 +140,10 @@ CREATE TABLE test (
         wait_until_true(Duration::from_secs(30), || async {
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM non_federated_abc LIMIT 1", Protocol::Flight)
+                .query_builder(
+                    "SELECT * FROM non_federated_abc LIMIT 1",
+                    Protocol::Internal,
+                )
                 .build()
                 .run()
                 .await

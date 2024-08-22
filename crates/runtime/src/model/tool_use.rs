@@ -313,14 +313,12 @@ impl SpiceModelTool for SqlTool {
                 .query_builder(&req.query, Protocol::Flight)
                 .build()
                 .run()
-                .instrument(span.clone())
                 .await
                 .boxed()?;
 
             let batches = query_result
                 .data
                 .try_collect::<Vec<RecordBatch>>()
-                .instrument(span.clone())
                 .await
                 .boxed()?;
 
@@ -549,7 +547,7 @@ impl Chat for ToolUsingChat {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let req = self.prepare_req(req).await?;
 
-        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+      // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
             .as_ref()

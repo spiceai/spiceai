@@ -325,7 +325,7 @@ impl VectorSearch {
         };
 
         let vector_search_result = async {
-            tracing::info!(name: "labels", target: "task_history", tables = tables.iter().join(","), limit = %limit);
+            tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
 
             let per_table_embeddings = self
                 .calculate_embeddings_per_table(query.clone(), tables.clone())

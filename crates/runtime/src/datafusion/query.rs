@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, sync::Arc};
+use std::{
+    cell::LazyCell,
+    sync::{Arc, LazyLock},
+};
 
 use arrow::{
     array::RecordBatch,
@@ -29,6 +32,7 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
+use tokio::time::Instant;
 use tracing::Span;
 use tracing_futures::Instrument;
 pub(crate) use tracker::QueryTracker;
@@ -69,6 +73,25 @@ pub enum Error {
 pub enum Protocol {
     Http,
     Flight,
+    FlightSQL,
+    Internal,
+}
+
+static HTTP: LazyLock<Arc<str>> = LazyLock::new(|| "http".into());
+static FLIGHT: LazyLock<Arc<str>> = LazyLock::new(|| "flight".into());
+static FLIGHTSQL: LazyLock<Arc<str>> = LazyLock::new(|| "flightsql".into());
+static INTERNAL: LazyLock<Arc<str>> = LazyLock::new(|| "internal".into());
+
+impl Protocol {
+    #[must_use]
+    pub fn as_arc_str(&self) -> Arc<str> {
+        match self {
+            Protocol::Http => Arc::clone(&HTTP),
+            Protocol::Flight => Arc::clone(&FLIGHT),
+            Protocol::FlightSQL => Arc::clone(&FLIGHTSQL),
+            Protocol::Internal => Arc::clone(&INTERNAL),
+        }
+    }
 }
 
 impl std::fmt::Display for Protocol {
@@ -76,6 +99,8 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::Http => write!(f, "http"),
             Protocol::Flight => write!(f, "flight"),
+            Protocol::FlightSQL => write!(f, "flightsql"),
+            Protocol::Internal => write!(f, "internal"),
         }
     }
 }
@@ -110,7 +135,7 @@ macro_rules! handle_error {
 impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
-        telemetry::QUERY_COUNT.add(1, &[]);
+        telemetry::track_query_count();
         let span = match &self.tracker.nsql {
             Some(nsql) => {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
@@ -203,6 +228,9 @@ impl Query {
 
             tracker = tracker.datasets(Arc::new(input_tables));
 
+            // Start the timer for the query execution
+            tracker.query_execution_duration_timer = Instant::now();
+
             let df = match ctx.df.ctx.execute_logical_plan(plan).await {
                 Ok(df) => df,
                 Err(e) => {
@@ -289,6 +317,7 @@ fn attach_query_tracker_to_stream(
     let schema_copy = Arc::clone(&schema);
 
     let mut num_records = 0u64;
+    let mut num_output_bytes = 0u64;
 
     let mut truncated_output = "[]".to_string(); // default to empty preview
 
@@ -302,6 +331,8 @@ fn attach_query_tracker_to_stream(
                     if num_records == 0 {
                         truncated_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
                     }
+
+                    num_output_bytes += batch.get_array_memory_size() as u64;
 
                     num_records += batch.num_rows() as u64;
                     yield batch_result
@@ -317,6 +348,8 @@ fn attach_query_tracker_to_stream(
                 }
             }
         }
+
+        telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
 
         ctx
             .schema(schema_copy)

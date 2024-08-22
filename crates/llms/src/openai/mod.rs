@@ -123,7 +123,6 @@ impl Chat for Openai {
         &self,
         prompt: String,
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
-        tracing::debug!(name: "labels", target: "task_history", model = %self.model);
         let req = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
             .stream(true)
