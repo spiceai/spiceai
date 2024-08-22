@@ -490,7 +490,7 @@ impl Runtime {
         }
     }
 
-    pub fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
+    fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
         app.datasets
             .clone()
             .into_iter()

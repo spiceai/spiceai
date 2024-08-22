@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use component::tool::Tool;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -73,6 +74,8 @@ pub struct Spicepod {
     pub dependencies: Vec<String>,
 
     pub embeddings: Vec<Embeddings>,
+
+    pub tools: Vec<Tool>,
 
     pub runtime: Runtime,
 }
@@ -149,11 +152,20 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_tools = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.tools,
+            "tools",
+        )
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         detect_duplicate_component_names("secrets", &spicepod_definition.secrets[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
+        detect_duplicate_component_names("tool", &resolved_tools[..])?;
 
         Ok(from_definition(
             spicepod_definition,
@@ -161,6 +173,7 @@ impl Spicepod {
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
+            resolved_tools,
             resolved_models,
         ))
     }
@@ -194,6 +207,7 @@ fn from_definition(
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
+    tools: Vec<Tool>,
     models: Vec<Model>,
 ) -> Spicepod {
     Spicepod {
@@ -206,6 +220,7 @@ fn from_definition(
         views,
         models,
         embeddings,
+        tools,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
     }

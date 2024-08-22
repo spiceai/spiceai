@@ -31,6 +31,7 @@ pub mod model;
 pub mod params;
 pub mod runtime;
 pub mod secret;
+pub mod tool;
 pub mod view;
 
 pub trait Nameable {
