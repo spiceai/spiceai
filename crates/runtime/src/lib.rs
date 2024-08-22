@@ -97,6 +97,7 @@ pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
+pub mod tools;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -489,7 +490,7 @@ impl Runtime {
         }
     }
 
-    fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
+    pub fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
         app.datasets
             .clone()
             .into_iter()

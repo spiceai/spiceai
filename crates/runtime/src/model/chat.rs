@@ -32,8 +32,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_futures::Instrument;
 
-use super::tool_use::{SpiceToolsOptions, ToolUsingChat};
-use crate::Runtime;
+use super::tool_use::ToolUsingChat;
+use crate::{tools::options::SpiceToolsOptions, Runtime};
 
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
 
