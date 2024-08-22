@@ -149,25 +149,38 @@ impl SpiceModelTool for DocumentSimilarityTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name(), input = arg);
-        let mut req: SearchRequest = serde_json::from_str(arg)?;
 
-        let vs = VectorSearch::new(
-            rt.datafusion(),
-            Arc::clone(&rt.embeds),
-            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
-        );
+        let tool_use_result = async {
+            let mut req: SearchRequest = serde_json::from_str(arg)?;
 
-        // If model provides a `where` keyword in their [`where_cond`] field, strip it.
-        if let Some(cond) = &req.where_cond {
-            if cond.to_lowercase().starts_with("where ") {
-                req.where_cond = Some(cond[5..].to_string());
+            let vs = VectorSearch::new(
+                rt.datafusion(),
+                Arc::clone(&rt.embeds),
+                parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+            );
+
+            // If model provides a `where` keyword in their [`where_cond`] field, strip it.
+            if let Some(cond) = &req.where_cond {
+                if cond.to_lowercase().starts_with("where ") {
+                    req.where_cond = Some(cond[5..].to_string());
+                }
+            }
+
+            let result = vs.search(&req).await.boxed()?;
+
+            let matches = to_matches(&result).boxed()?;
+            serde_json::value::to_value(matches).boxed()
+        }
+        .instrument(span.clone())
+        .await;
+
+        match tool_use_result {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
             }
         }
-
-        let result = vs.search(&req).instrument(span.clone()).await.boxed()?;
-
-        let matches = to_matches(&result).boxed()?;
-        serde_json::value::to_value(matches).boxed()
     }
 }
 
@@ -286,28 +299,40 @@ impl SpiceModelTool for SqlTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
-        let req: SqlToolParams = serde_json::from_str(arg)?;
+        let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            let req: SqlToolParams = serde_json::from_str(arg)?;
 
-        let query_result = rt
-            .datafusion()
-            .query_builder(&req.query, Protocol::Flight)
-            .build()
-            .run()
-            .instrument(span.clone())
-            .await
-            .boxed()?;
+            let query_result = rt
+                .datafusion()
+                .query_builder(&req.query, Protocol::Flight)
+                .build()
+                .run()
+                .instrument(span.clone())
+                .await
+                .boxed()?;
 
-        let batches = query_result
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .instrument(span.clone())
-            .await
-            .boxed()?;
+            let batches = query_result
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .instrument(span.clone())
+                .await
+                .boxed()?;
 
-        let buf = Vec::new();
-        let mut writer = arrow_json::ArrayWriter::new(buf);
-        writer.write_batches(batches.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
-        Ok(Value::String(String::from_utf8(writer.into_inner())?))
+            let buf = Vec::new();
+            let mut writer = arrow_json::ArrayWriter::new(buf);
+            writer.write_batches(batches.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
+            Ok(Value::String(String::from_utf8(writer.into_inner())?))
+        }
+        .instrument(span.clone())
+        .await;
+
+        match tool_use_result {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 }
 
