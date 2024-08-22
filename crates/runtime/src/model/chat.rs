@@ -201,14 +201,10 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let req = self.prepare_req(req)?;
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(),  "labels");
 
-        match self
-            .chat
-            .chat_stream(self.prepare_req(req)?)
-            .instrument(span.clone())
-            .await
-        {
+        match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => Ok(Box::pin(resp.instrument(span))),
             Err(e) => {
                 tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
@@ -222,14 +218,10 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let req = self.prepare_req(req)?;
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
 
-        match self
-            .chat
-            .chat_request(self.prepare_req(req)?)
-            .instrument(span)
-            .await
-        {
+        match self.chat.chat_request(req).instrument(span).await {
             Ok(resp) => {
                 let truncated_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&truncated_output) {
