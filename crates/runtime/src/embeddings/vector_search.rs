@@ -103,7 +103,7 @@ pub struct SearchRequest {
     /// The text to search documents for similarity
     pub text: String,
 
-    /// The datasets to search for similarity. For available datasets, use the 'list_datasets' tool
+    /// The datasets to search for similarity. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
     #[serde(default)]
     pub datasets: Vec<String>,
 

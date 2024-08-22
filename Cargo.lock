@@ -479,6 +479,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e972cd1ff4a4ccd22f86d3e53e835c2ed92e0eea6a3e8eadb72b4f1ac802cf8"
 dependencies = [
  "bitflags 2.6.0",
+ "serde",
 ]
 
 [[package]]
@@ -8308,6 +8309,7 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc",
  "arrow-json",
+ "arrow-schema",
  "arrow_sql_gen",
  "arrow_tools",
  "async-graphql",
