@@ -103,7 +103,7 @@ pub struct SearchRequest {
     /// The text to search documents for similarity
     pub text: String,
 
-    /// The datasets to search for similarity. For available datasets, use the 'list_datasets' tool
+    /// The datasets to search for similarity. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
     #[serde(default)]
     pub datasets: Vec<String>,
 
@@ -323,71 +323,74 @@ impl VectorSearch {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = query)
             }
         };
-        span.in_scope(|| {
+
+        let vector_search_result = async {
             tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
-        });
 
-        let per_table_embeddings = self
-            .calculate_embeddings_per_table(query.clone(), tables.clone())
-            .instrument(span.clone())
-            .await?;
+            let per_table_embeddings = self
+                .calculate_embeddings_per_table(query.clone(), tables.clone())
+                .await?;
 
-        let table_primary_keys = self
-            .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.clone())
-            .instrument(span.clone())
-            .await?;
+            let table_primary_keys = self
+                .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.clone())
+                .await?;
 
-        let mut response: VectorSearchResult = HashMap::new();
+            let mut response: VectorSearchResult = HashMap::new();
 
-        for (tbl, search_vectors) in per_table_embeddings {
-            tracing::debug!("Running vector search for table {:#?}", tbl.clone());
-            let primary_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
+            for (tbl, search_vectors) in per_table_embeddings {
+                tracing::debug!("Running vector search for table {:#?}", tbl.clone());
+                let primary_keys = table_primary_keys.get(&tbl).cloned().unwrap_or(vec![]);
 
-            // Only support one embedding column per table.
-            let table_provider = self
-                .df
-                .get_table(tbl.clone())
-                .instrument(span.clone())
-                .await
-                .ok_or(Error::DataSourceNotFound {
-                    data_source: tbl.to_string(),
-                })?;
+                // Only support one embedding column per table.
+                let table_provider = self
+                    .df
+                    .get_table(tbl.clone())
+                    .await
+                    .ok_or(Error::DataSourceNotFound {
+                        data_source: tbl.to_string(),
+                    })?;
 
-            let embedding_column = get_embedding_table(&table_provider)
-                .and_then(|e| e.get_embedding_columns().first().cloned())
-                .ok_or(Error::NoEmbeddingColumns {
-                    data_source: tbl.to_string(),
-                })?;
+                let embedding_column = get_embedding_table(&table_provider)
+                    .and_then(|e| e.get_embedding_columns().first().cloned())
+                    .ok_or(Error::NoEmbeddingColumns {
+                        data_source: tbl.to_string(),
+                    })?;
 
-            if search_vectors.len() != 1 {
-                return Err(Error::IncorrectNumberOfEmbeddingColumns {
-                    data_source: tbl.to_string(),
-                    num_embeddings: search_vectors.len(),
-                });
-            }
-            match search_vectors.first() {
-                None => unreachable!(),
-                Some(embedding) => {
-                    let result = self
-                        .individual_search(
-                            &tbl,
-                            embedding.clone(),
-                            &primary_keys,
-                            &embedding_column,
-                            additional_columns,
-                            where_cond.as_deref(),
-                            *limit,
-                        )
-                        .instrument(span.clone())
-                        .await?;
-                    response.insert(tbl.clone(), result);
+                if search_vectors.len() != 1 {
+                    return Err(Error::IncorrectNumberOfEmbeddingColumns {
+                        data_source: tbl.to_string(),
+                        num_embeddings: search_vectors.len(),
+                    });
                 }
-            };
-        }
-        span.in_scope(|| {
+                match search_vectors.first() {
+                    None => unreachable!(),
+                    Some(embedding) => {
+                        let result = self
+                            .individual_search(
+                                &tbl,
+                                embedding.clone(),
+                                &primary_keys,
+                                &embedding_column,
+                                additional_columns,
+                                where_cond.as_deref(),
+                                *limit,
+                            )
+                            .await?;
+                        response.insert(tbl.clone(), result);
+                    }
+                };
+            }
             tracing::info!(target: "task_history", truncated_output = ?response);
-        });
-        Ok(response)
+            Ok(response)
+        }.instrument(span.clone()).await;
+
+        match vector_search_result {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 
     /// For the data sources that assumedly exist in the [`DataFusion`] instance, find the embedding models used in each data source.

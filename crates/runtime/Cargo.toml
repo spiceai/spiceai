@@ -14,6 +14,7 @@ arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc.workspace = true
 arrow-json.workspace = true
 arrow.workspace = true
+arrow-schema = {version="52.2.0", features= ["serde"] }
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
@@ -88,7 +89,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 schemars = "0.8.19"
 secrecy.workspace = true
-serde.workspace = true
+serde = {workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
