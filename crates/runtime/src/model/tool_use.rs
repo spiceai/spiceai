@@ -37,6 +37,7 @@ use async_openai::types::{
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
+
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
