@@ -171,16 +171,16 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 }
 
-pub struct ListTablesTool {}
+pub struct ListDatasetsTool {}
 
 #[async_trait]
-impl SpiceModelTool for ListTablesTool {
+impl SpiceModelTool for ListDatasetsTool {
     fn name(&self) -> &'static str {
-        "list_tables"
+        "list_datasets"
     }
 
     fn description(&self) -> Option<&'static str> {
-        Some("List all SQL tables available")
+        Some("List all SQL tables available.")
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -192,7 +192,7 @@ impl SpiceModelTool for ListTablesTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), input = arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
 
         // TODO: handle catalogs
         if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
@@ -327,7 +327,7 @@ impl ToolUsingChat {
                 Box::new(DocumentSimilarityTool {}),
                 Box::new(TableSchemaTool {}),
                 Box::new(SqlTool {}),
-                Box::new(ListTablesTool {}),
+                Box::new(ListDatasetsTool {}),
             ]),
             opts: opts.clone(),
         }
