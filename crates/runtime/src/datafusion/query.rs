@@ -235,7 +235,7 @@ impl Query {
         tracker = tracker.datasets(Arc::new(input_tables));
 
         // Start the timer for the query execution
-        tracker.execution_timer = Instant::now();
+        tracker.query_execution_duration_timer = Instant::now();
 
         let df = match ctx
             .df

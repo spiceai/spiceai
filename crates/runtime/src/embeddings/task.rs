@@ -68,7 +68,7 @@ impl Embed for TaskEmbed {
         labels_from_request(&req, &span);
         match self.inner.embed_request(req).instrument(span.clone()).await {
             Ok(response) => {
-                tracing::info!( target: "task_history", parent: &span, outputs_produced = response.data.len(), "labels");
+                tracing::info!(target: "task_history", parent: &span, outputs_produced = response.data.len(), "labels");
                 Ok(response)
             }
             Err(e) => {

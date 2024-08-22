@@ -102,12 +102,26 @@ fn span_to_task_span(span: SpanData) -> Option<TaskSpan> {
                 .any(|kv| kv.key.as_str() == "level" && kv.value.as_str() == "ERROR")
         })
         .map(|idx| span.events[idx].name.clone().into());
-    let labels: HashMap<Arc<str>, Arc<str>> = span
+    let mut labels: HashMap<Arc<str>, Arc<str>> = span
         .attributes
         .iter()
         .filter(|kv| kv.key.as_str() != "input")
         .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
         .collect();
+
+    let event_labels: HashMap<Arc<str>, Arc<str>> = span
+        .events
+        .iter()
+        .filter(|event| event.name == "labels")
+        .flat_map(|event| {
+            event
+                .attributes
+                .iter()
+                .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
+        })
+        .collect();
+
+    labels.extend(event_labels);
 
     Some(TaskSpan {
         trace_id,

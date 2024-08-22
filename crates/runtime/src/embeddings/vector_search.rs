@@ -324,7 +324,7 @@ impl VectorSearch {
             }
         };
         span.in_scope(|| {
-            tracing::info!(name: "labels", target: "task_history", tables = tables.iter().join(","), limit = %limit);
+            tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
         });
 
         let per_table_embeddings = self

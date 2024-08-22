@@ -233,10 +233,14 @@ impl QueryTracker {
 
 fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
     if let Some(schema) = &query_tracker.schema {
-        tracing::info!(name: "labels", target: "task_history", schema = ?schema);
+        tracing::info!(target: "task_history", schema = ?schema, "labels");
     }
     if let Some(error_code) = &query_tracker.error_code {
-        tracing::info!(name: "labels", target: "task_history", error_code = %error_code);
+        tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
-    tracing::info!(name: "labels", target: "task_history", protocol = ?query_tracker.protocol, datasets = ?query_tracker.datasets, truncated_output = %truncated_output);
+    if let Some(query_execution_duration_secs) = &query_tracker.query_execution_duration_secs {
+        tracing::info!(target: "task_history", query_execution_duration_secs = %query_execution_duration_secs, "labels");
+    }
+    tracing::info!(target: "task_history", protocol = ?query_tracker.protocol, datasets = ?query_tracker.datasets,"labels");
+    tracing::info!(target: "task_history", truncated_output = %truncated_output);
 }
