@@ -25,7 +25,7 @@ use datafusion_table_providers::{
     sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory},
 };
 use snafu::prelude::*;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, ffi::OsStr, sync::Arc};
 
 use crate::{
     component::dataset::{acceleration::Engine, Dataset},
@@ -51,6 +51,12 @@ pub enum Error {
     #[snafu(display("Acceleration initialization failed: {source}"))]
     AccelerationInitializationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    InvalidFileExtension {
+        valid_extensions: String,
+        extension: String,
     },
 }
 
@@ -105,6 +111,10 @@ impl DataAccelerator for SqliteAccelerator {
         "sqlite"
     }
 
+    fn valid_file_extensions(&self) -> Vec<&'static str> {
+        vec!["sqlite"]
+    }
+
     /// Initializes an SQLite database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// This step is required for federation, as SQLite connections attach to all other configured SQLite databases.
@@ -119,6 +129,17 @@ impl DataAccelerator for SqliteAccelerator {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+            } else if !self.is_valid_file(path) {
+                let extension = std::path::Path::new(path)
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("");
+
+                return Err(Error::InvalidFileExtension {
+                    valid_extensions: self.valid_file_extensions().join(","),
+                    extension: extension.to_string(),
+                }
+                .into());
             }
 
             SqliteConnectionPool::init(path, acceleration.mode.to_string().as_str().into())
@@ -136,10 +157,6 @@ impl DataAccelerator for SqliteAccelerator {
         dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = cmd.clone();
-        if !cmd.options.contains_key("file") {
-            make_spice_data_directory()
-                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-        }
 
         if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
             this_dataset.app.as_ref().map(|a| {

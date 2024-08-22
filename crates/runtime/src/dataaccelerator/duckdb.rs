@@ -26,7 +26,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, ffi::OsStr, sync::Arc};
 
 use crate::{
     component::dataset::{acceleration::Engine, Dataset},
@@ -52,6 +52,12 @@ pub enum Error {
     #[snafu(display("Acceleration initialization failed: {source}"))]
     AccelerationInitializationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The \"duckdb_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    InvalidFileExtension {
+        valid_extensions: String,
+        extension: String,
     },
 }
 
@@ -81,6 +87,10 @@ impl DuckDBAccelerator {
         let mut params = acceleration.params.clone();
         params.insert("data_directory".to_string(), spice_data_base_path());
 
+        if let Some(duckdb_file) = params.remove("duckdb_file") {
+            params.insert("duckdb_open".to_string(), duckdb_file.to_string());
+        }
+
         Some(
             self.duckdb_factory
                 .duckdb_file_path(&dataset.name.to_string(), &mut params),
@@ -106,17 +116,36 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
+    fn valid_file_extensions(&self) -> Vec<&'static str> {
+        vec!["db", "ddb", "duckdb"]
+    }
+
     async fn init(
         &self,
         dataset: &Dataset,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !dataset.is_file_accelerated() {
+            return Ok(());
+        }
+
         let path = self.duckdb_file_path(dataset);
 
         if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
-            if !acceleration.params.contains_key("duckdb_open") {
+            if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
+            } else if !self.is_valid_file(path) {
+                let extension = std::path::Path::new(path)
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("");
+
+                return Err(Error::InvalidFileExtension {
+                    valid_extensions: self.valid_file_extensions().join(","),
+                    extension: extension.to_string(),
+                }
+                .into());
             }
 
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
@@ -133,9 +162,9 @@ impl DataAccelerator for DuckDBAccelerator {
         dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = cmd.clone();
-        if !cmd.options.contains_key("open") {
-            make_spice_data_directory()
-                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+        if let Some(duckdb_file) = cmd.options.remove("file") {
+            cmd.options
+                .insert("open".to_string(), duckdb_file.to_string());
         }
 
         if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
