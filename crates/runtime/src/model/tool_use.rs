@@ -215,7 +215,9 @@ impl SpiceModelTool for ListDatasetsTool {
                     .map(|d| {
                         json!({
                             "table": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
-                            "can_search_documents": !d.embeddings.is_empty()
+                            "can_search_documents": !d.embeddings.is_empty(),
+                            "description": d.description.clone(),
+                            "metadata": d.metadata.clone(),
                         })
                     })
                     .collect::<Vec<Value>>(),
