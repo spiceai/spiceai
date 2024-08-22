@@ -133,6 +133,19 @@ pub trait DataAccelerator: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
+
+    fn valid_file_extensions(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    fn is_valid_file(&self, file_path: &String) -> bool {
+        let path = std::path::Path::new(file_path);
+
+        !path.is_dir()
+            && path.extension().map_or(false, |ext| {
+                self.valid_file_extensions().iter().any(|&e| e == ext)
+            })
+    }
 }
 
 pub struct AcceleratorExternalTableBuilder {
