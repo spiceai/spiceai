@@ -23,6 +23,8 @@ use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
+use crate::datafusion::query::Protocol;
+
 use super::{to_tonic_err, Service};
 
 pub(crate) async fn handle(
@@ -36,9 +38,13 @@ pub(crate) async fn handle(
     match fd.r#type {
         x if x == DescriptorType::Cmd as i32 => {
             let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
-            let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
-                .await
-                .map_err(to_tonic_err)?;
+            let arrow_schema = Service::get_arrow_schema(
+                Arc::clone(&flight_svc.datafusion),
+                sql,
+                Protocol::Flight,
+            )
+            .await
+            .map_err(to_tonic_err)?;
             let options = IpcWriteOptions::default();
             let IpcMessage(schema) = SchemaAsIpc::new(&arrow_schema, &options)
                 .try_into()

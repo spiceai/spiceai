@@ -309,14 +309,12 @@ impl SpiceModelTool for SqlTool {
                 .query_builder(&req.query, Protocol::Flight)
                 .build()
                 .run()
-                .instrument(span.clone())
                 .await
                 .boxed()?;
 
             let batches = query_result
                 .data
                 .try_collect::<Vec<RecordBatch>>()
-                .instrument(span.clone())
                 .await
                 .boxed()?;
 
@@ -488,9 +486,7 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
-        );
+        span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice
@@ -532,9 +528,7 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
-        );
+        span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
         if req
             .tool_choice

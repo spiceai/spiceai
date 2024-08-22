@@ -86,7 +86,8 @@ fn table_schema() -> Schema {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
-        Field::new("execution_time", DataType::Float32, false),
+        Field::new("query_duration_secs", DataType::Float32, false),
+        Field::new("query_execution_duration_secs", DataType::Float32, false),
         Field::new("execution_status", DataType::Int8, false),
         Field::new("rows_produced", DataType::UInt64, false),
         Field::new("results_cache_hit", DataType::Boolean, false),
@@ -201,7 +202,8 @@ impl QueryTracker {
                 Arc::new(StringArray::from(vec![self.nsql.as_ref().map(Arc::as_ref)])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-                Arc::new(Float32Array::from(vec![self.execution_time])),
+                Arc::new(Float32Array::from(vec![self.query_duration_secs])),
+                Arc::new(Float32Array::from(vec![self.query_execution_duration_secs])),
                 Arc::new(Int8Array::from(vec![execution_status])),
                 Arc::new(UInt64Array::from(vec![self.rows_produced])),
                 Arc::new(BooleanArray::from(vec![self
@@ -230,11 +232,18 @@ impl QueryTracker {
 }
 
 fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
-    if let Some(schema) = &query_tracker.schema {
-        tracing::info!(name: "labels", target: "task_history", schema = ?schema);
-    }
     if let Some(error_code) = &query_tracker.error_code {
-        tracing::info!(name: "labels", target: "task_history", error_code = %error_code);
+        tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
-    tracing::info!(name: "labels", target: "task_history", protocol = ?query_tracker.protocol, datasets = ?query_tracker.datasets, truncated_output = %truncated_output);
+    if let Some(query_execution_duration_secs) = &query_tracker.query_execution_duration_secs {
+        tracing::info!(target: "task_history", query_execution_duration_ms = %query_execution_duration_secs * 1000.0, "labels");
+    }
+    let datasets_str = query_tracker
+        .datasets
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join(",");
+    tracing::info!(target: "task_history", protocol = ?query_tracker.protocol, datasets = datasets_str, "labels");
+    tracing::info!(target: "task_history", truncated_output = %truncated_output);
 }

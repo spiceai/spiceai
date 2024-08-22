@@ -125,7 +125,7 @@ impl Chat for Openai {
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
         let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "openai::stream", input = %prompt);
         let guard = span.enter();
-        tracing::debug!(name: "labels", target: "task_history", model = %self.model);
+        tracing::debug!(target: "task_history", model = %self.model, "labels");
         let req = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
             .stream(true)
