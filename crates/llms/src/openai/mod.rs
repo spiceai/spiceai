@@ -123,9 +123,6 @@ impl Chat for Openai {
         &self,
         prompt: String,
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, "openai::stream", input = %prompt);
-        let guard = span.enter();
-        tracing::debug!(target: "task_history", model = %self.model, "labels");
         let req = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
             .stream(true)
@@ -138,15 +135,13 @@ impl Chat for Openai {
             .build()
             .boxed()
             .map_err(|source| ChatError::FailedToLoadModel { source })?;
-        drop(guard);
         let mut chat_stream = self
             .chat_stream(req)
-            .instrument(span.clone())
             .await
             .boxed()
             .map_err(|source| ChatError::FailedToRunModel { source })?;
         Ok(Box::pin(stream! {
-            while let Some(msg) = chat_stream.next().instrument(span.clone()).await {
+            while let Some(msg) = chat_stream.next().await {
                 match msg {
                     Ok(resp) => {
                         yield Ok(resp.choices.into_iter().next().and_then(|c| c.delta.content));
