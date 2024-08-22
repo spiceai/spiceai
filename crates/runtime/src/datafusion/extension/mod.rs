@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use bytes_scanned::{BytesScannedExec, BytesScannedNode};
 use datafusion::{
     error::Result,
     execution::context::{QueryPlanner, SessionState},
@@ -24,10 +25,8 @@ use datafusion::{
 };
 use datafusion_federation::FederatedPlanner;
 use std::sync::Arc;
-use telemetry::{BytesScannedExec, BytesScannedNode};
 
-pub mod analyzer;
-pub mod telemetry;
+pub mod bytes_scanned;
 
 #[derive(Default)]
 pub struct SpiceQueryPlanner {}
@@ -74,7 +73,7 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // bytes_scanned Telemetry Extension
+        // bytes_scanned Extension
         let bytes_scanned_node = node.as_any().downcast_ref::<BytesScannedNode>();
         if bytes_scanned_node.is_some() {
             assert_eq!(logical_inputs.len(), 1, "should have 1 input");

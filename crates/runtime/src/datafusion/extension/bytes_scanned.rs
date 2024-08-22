@@ -14,17 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
 use async_stream::stream;
 use datafusion::{
-    common::DFSchemaRef,
+    common::{
+        tree_node::{Transformed, TreeNode},
+        DFSchemaRef,
+    },
+    config::ConfigOptions,
     error::Result,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
+    logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore},
+    optimizer::AnalyzerRule,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
     },
     prelude::Expr,
 };
+use datafusion_federation::FederatedPlanNode;
 use futures::StreamExt;
 use std::{
     any::Any,
@@ -35,7 +42,51 @@ use std::{
 
 use crate::datafusion::query::Protocol;
 
-/// Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
+#[derive(Default)]
+pub struct BytesScannedAnalyzerRule {}
+
+impl AnalyzerRule for BytesScannedAnalyzerRule {
+    /// Walk over the plan and insert a `BytesScannedNode` as the parent of any `TableScans` and `FederationNodes`.
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        let transformed_plan = plan.transform_up(|plan| match plan {
+            LogicalPlan::TableScan(table_scan) => {
+                let bytes_scanned = BytesScannedNode::new(LogicalPlan::TableScan(table_scan));
+                let ext_node = Extension {
+                    node: Arc::new(bytes_scanned),
+                };
+                Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
+            }
+            LogicalPlan::Extension(extension) => {
+                let plan_node = extension.node.as_any().downcast_ref::<FederatedPlanNode>();
+
+                if plan_node.is_some() {
+                    let bytes_scanned =
+                        BytesScannedNode::new(LogicalPlan::Extension(extension.clone()));
+                    let ext_node = Extension {
+                        node: Arc::new(bytes_scanned),
+                    };
+                    Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
+                } else {
+                    Ok(Transformed::no(LogicalPlan::Extension(extension)))
+                }
+            }
+            _ => Ok(Transformed::no(plan)),
+        })?;
+        Ok(transformed_plan.data)
+    }
+
+    /// A human readable name for this optimizer rule
+    fn name(&self) -> &str {
+        "bytes_scanned_analyzer_rule"
+    }
+}
+
+impl BytesScannedAnalyzerRule {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 pub(crate) struct BytesScannedNode {
     pub(super) input: LogicalPlan,
 }
