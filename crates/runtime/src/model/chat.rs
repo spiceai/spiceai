@@ -1,3 +1,5 @@
+use async_openai::error::OpenAIError;
+use itertools::Itertools;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -13,14 +15,21 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use llms::chat::{Chat, Error as LlmError};
+use async_openai::types::{
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+};
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
+use llms::chat::{Chat, Error as LlmError, Result as ChatResult};
 use llms::openai::DEFAULT_LLM_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::collections::HashMap;
-use std::result::Result;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing_futures::Instrument;
 
 use super::tool_use::{SpiceToolsOptions, ToolUsingChat};
 use crate::Runtime;
@@ -44,6 +53,7 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
 
     let model = construct_model(&prefix, model_id, component, params)?;
 
+    // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = params
         .get("spice_tools")
         .map(Secret::expose_secret)
@@ -51,12 +61,13 @@ pub fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         .transpose()
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
 
-    match spice_tool_opt {
+    let tool_model = match spice_tool_opt {
         Some(tools) if tools.can_use_tools() => {
-            Ok(Box::new(ToolUsingChat::new(Arc::new(model), rt, &tools)))
+            Box::new(ToolUsingChat::new(Arc::new(model), rt, &tools))
         }
-        Some(_) | None => Ok(model),
-    }
+        Some(_) | None => model,
+    };
+    Ok(tool_model)
 }
 
 pub fn construct_model<S: ::std::hash::BuildHasher>(
@@ -65,7 +76,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString, S>,
 ) -> Result<Box<dyn Chat>, LlmError> {
-    match prefix {
+    let model = match prefix {
         ModelSource::HuggingFace => {
             let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
 
@@ -137,35 +148,114 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 api_key,
                 org_id,
                 project_id,
-            )))
+            )) as Box<dyn Chat>)
+        }
+    }?;
+
+    // Handle runtime wrapping
+    let wrapper = ChatWrapper::new(
+        model,
+        component.name.clone(),
+        component.params.get("system_prompt").cloned(),
+    );
+    Ok(Box::new(wrapper))
+}
+
+/// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
+pub struct ChatWrapper {
+    pub chat: Box<dyn Chat>,
+    pub model_name: String,
+    pub system_prompt: Option<String>,
+}
+impl ChatWrapper {
+    pub fn new(chat: Box<dyn Chat>, model_name: String, system_prompt: Option<String>) -> Self {
+        Self {
+            chat,
+            model_name,
+            system_prompt,
+        }
+    }
+
+    /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message, if it exists.
+    fn prepare_req(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
+        match &self.system_prompt {
+            Some(prompt) => {
+                let system_message = ChatCompletionRequestSystemMessageArgs::default()
+                    .content(prompt)
+                    .build()?;
+                let mut req = req.clone();
+                req.messages
+                    .insert(0, ChatCompletionRequestMessage::System(system_message));
+                Ok(req)
+            }
+            None => Ok(req),
         }
     }
 }
 
-/// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts). 
-pub struct ChatWrapper {
-    pub chat: Box<dyn Chat>,
-    pub model_id: String,
-    pub system_prompts: Optional<String>,
-}
-
 #[async_trait]
 impl Chat for ChatWrapper {
+    /// Expect `truncated_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
+    /// ```rust
+    /// tracing::info!(target: "task_history", truncated_output = %chat_output)
+    /// ```
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-    }
-
-    async fn chat_request(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::DEBUG, &format!("{model_id}::request"), input = %serde_json::to_string(&req).unwrap_or_default());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = self.model_name, input = %serde_json::to_string(&req).unwrap_or_default());
         span.in_scope(
             || tracing::info!(name: "labels", target: "task_history", model = %req.model),
         );
 
+        match self
+            .chat
+            .chat_stream(self.prepare_req(req)?)
+            .instrument(span)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Unlike [`ChatWrapper::chat_stream`], this method will instrument the `truncated_output` for the model output.
+    async fn chat_request(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = self.model_name, input = %serde_json::to_string(&req).unwrap_or_default());
+        span.in_scope(
+            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
+        );
+
+        match self
+            .chat
+            .chat_request(self.prepare_req(req)?)
+            .instrument(span)
+            .await
+        {
+            Ok(resp) => {
+                let truncated_output = resp.choices.iter().map(|c| &c.message).collect_vec();
+                match serde_json::to_string(&truncated_output) {
+                    Ok(output) => {
+                        tracing::info!(target: "task_history", truncated_output = %output)
+                    }
+                    Err(e) => tracing::error!("Failed to serialize truncated output: {}", e),
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
+                Err(e)
+            }
+        }
     }
 
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
@@ -178,5 +268,4 @@ impl Chat for ChatWrapper {
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
         self.chat.stream(prompt).await
     }
-
 }

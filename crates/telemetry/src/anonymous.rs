@@ -77,16 +77,16 @@ pub async fn start(spicepod_name: &str) {
     let oss_telemetry_exporter =
         OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
 
-    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
-        .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
-        .with_timeout(Duration::from_secs(TELEMETRY_TIMEOUT_SECONDS))
-        .build();
+    // let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
+    //     .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
+    //     .with_timeout(Duration::from_secs(TELEMETRY_TIMEOUT_SECONDS))
+    //     .build();
 
     let initial_reader = InitialReader::new();
 
     let provider = SdkMeterProvider::builder()
         .with_resource(resource.clone())
-        .with_reader(periodic_reader)
+        // .with_reader(periodic_reader)
         .with_reader(initial_reader.clone())
         .build();
 
