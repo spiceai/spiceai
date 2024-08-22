@@ -78,9 +78,10 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
         if bytes_scanned_node.is_some() {
             assert_eq!(logical_inputs.len(), 1, "should have 1 input");
             assert_eq!(physical_inputs.len(), 1, "should have 1 input");
-            let Some(physical_input) = physical_inputs.iter().next() else {
-                panic!("should have 1 input");
-            };
+            let physical_input = &physical_inputs[0];
+            let logical_input = logical_inputs[0];
+
+            assert_eq!(*logical_input.schema().inner(), physical_input.schema());
 
             let exec_plan = Arc::new(BytesScannedExec::new(Arc::clone(physical_input)));
             return Ok(Some(exec_plan));

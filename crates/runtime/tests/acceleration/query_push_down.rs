@@ -169,18 +169,20 @@ CREATE TABLE test (
         .expect("collect working");
 
     let expected_plan = [
-        "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                                                                                                                         |",
-        "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| logical_plan  | Federated                                                                                                                                                                    |",
-        "|               |  Projection: count(Int64(1))                                                                                                                                                 |",
-        "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                          |",
-        "|               |     TableScan: abc                                                                                                                                                           |",
-        "| physical_plan | SchemaCastScanExec                                                                                                                                                           |",
-        "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
-        "|               |     VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
-        "|               |                                                                                                                                                                              |",
-        "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                                                                                                                           |",
+        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| logical_plan  | BytesScannedNode                                                                                                                                                               |",
+        "|               |   Federated                                                                                                                                                                    |",
+        "|               |  Projection: count(Int64(1))                                                                                                                                                   |",
+        "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                            |",
+        "|               |     TableScan: abc                                                                                                                                                             |",
+        "| physical_plan | BytesScannedExec                                                                                                                                                               |",
+        "|               |   SchemaCastScanExec                                                                                                                                                           |",
+        "|               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
+        "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
+        "|               |                                                                                                                                                                                |",
+        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected_plan, &plan_results);
 
@@ -195,19 +197,23 @@ CREATE TABLE test (
         .expect("collect working");
 
     let expected_plan = [
-    "+---------------+------------------------------------------------------------------------------+",
-    "| plan_type     | plan                                                                         |",
-    "+---------------+------------------------------------------------------------------------------+",
-    "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                            |",
-    "|               |   TableScan: non_federated_abc projection=[]                                 |",
-    "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                    |",
-    "|               |   CoalescePartitionsExec                                                     |",
-    "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]              |",
-    "|               |       SchemaCastScanExec                                                     |",
-    "|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
-    "|               |           SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
-    "|               |                                                                              |",
-    "+---------------+------------------------------------------------------------------------------+",
+        "+---------------+----------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                             |",
+        "+---------------+----------------------------------------------------------------------------------+",
+        "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                |",
+        "|               |   Projection:                                                                    |",
+        "|               |     BytesScannedNode                                                             |",
+        "|               |       TableScan: non_federated_abc                                               |",
+        "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                        |",
+        "|               |   CoalescePartitionsExec                                                         |",
+        "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                  |",
+        "|               |       ProjectionExec: expr=[]                                                    |",
+        "|               |         BytesScannedExec                                                         |",
+        "|               |           SchemaCastScanExec                                                     |",
+        "|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
+        "|               |               SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
+        "|               |                                                                                  |",
+        "+---------------+----------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected_plan, &plan_results);
 
