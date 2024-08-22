@@ -33,12 +33,13 @@ pub(crate) struct QueryTracker {
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: Option<SystemTime>,
     pub(crate) query_duration_secs: Option<f32>,
+    pub(crate) query_execution_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
     pub(crate) results_cache_hit: Option<bool>,
     pub(crate) error_message: Option<String>,
     pub(crate) error_code: Option<ErrorCode>,
-    pub(crate) timer: Instant,
-    pub(crate) execution_timer: Instant,
+    pub(crate) query_duration_timer: Instant,
+    pub(crate) query_execution_duration_timer: Instant,
     pub(crate) datasets: Arc<HashSet<TableReference>>,
     pub(crate) protocol: Protocol,
 }
@@ -56,10 +57,15 @@ impl QueryTracker {
             self.end_time = Some(SystemTime::now());
         }
 
-        let duration = self.timer.elapsed();
+        let query_duration = self.query_duration_timer.elapsed();
+        let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
         if self.query_duration_secs.is_none() {
-            self.query_duration_secs = Some(duration.as_secs_f32());
+            self.query_duration_secs = Some(query_duration.as_secs_f32());
+        }
+
+        if self.query_execution_duration_secs.is_none() {
+            self.query_execution_duration_secs = Some(query_execution_duration.as_secs_f32());
         }
 
         let mut tags = vec![];
@@ -89,10 +95,10 @@ impl QueryTracker {
             Key::from_static_str("protocol").string(self.protocol.as_arc_str()),
         ];
 
-        metrics::DURATION_SECONDS.record(duration.as_secs_f64(), &labels);
-        telemetry::track_query_duration(duration, self.protocol.as_arc_str());
+        metrics::DURATION_SECONDS.record(query_duration.as_secs_f64(), &labels);
+        telemetry::track_query_duration(query_duration, self.protocol.as_arc_str());
         telemetry::track_query_execution_duration(
-            self.execution_timer.elapsed(),
+            query_execution_duration,
             self.protocol.as_arc_str(),
         );
 

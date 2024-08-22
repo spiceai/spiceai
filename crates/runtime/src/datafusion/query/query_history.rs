@@ -86,7 +86,8 @@ fn table_schema() -> Schema {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
-        Field::new("execution_time", DataType::Float32, false),
+        Field::new("query_duration_secs", DataType::Float32, false),
+        Field::new("query_execution_duration_secs", DataType::Float32, false),
         Field::new("execution_status", DataType::Int8, false),
         Field::new("rows_produced", DataType::UInt64, false),
         Field::new("results_cache_hit", DataType::Boolean, false),
@@ -202,6 +203,7 @@ impl QueryTracker {
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
                 Arc::new(Float32Array::from(vec![self.query_duration_secs])),
+                Arc::new(Float32Array::from(vec![self.query_execution_duration_secs])),
                 Arc::new(Int8Array::from(vec![execution_status])),
                 Arc::new(UInt64Array::from(vec![self.rows_produced])),
                 Arc::new(BooleanArray::from(vec![self
