@@ -58,6 +58,9 @@ pub enum Error {
         valid_extensions: String,
         extension: String,
     },
+
+    #[snafu(display("The \"duckdb_file\" acceleration parameter is a directory."))]
+    InvalidFileIsDirectory,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -130,6 +133,10 @@ impl DataAccelerator for SqliteAccelerator {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
             } else if !self.is_valid_file(path) {
+                if std::path::Path::new(path).is_dir() {
+                    return Err(Error::InvalidFileIsDirectory.into());
+                }
+
                 let extension = std::path::Path::new(path)
                     .extension()
                     .and_then(OsStr::to_str)
