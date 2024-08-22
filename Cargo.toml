@@ -111,7 +111,7 @@ x509-certificate = "0.23.1"
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "7c6c88b637db8109a2e899849fe6b023f55cf8c1" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "ae9da45f8b90451119f3ca032b75ad82a28d7547" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "85935dbbc64d2af1ca132ad7e2309a9d87bf3115" }
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f2ca47d094a5636df8b9f3792b2f474a7b210dc1" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
 
