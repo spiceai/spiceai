@@ -1,5 +1,3 @@
-use async_openai::error::OpenAIError;
-use itertools::Itertools;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -15,12 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use async_openai::types::{
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    },
 };
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use llms::chat::{Chat, Error as LlmError, Result as ChatResult};
 use llms::openai::DEFAULT_LLM_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
@@ -153,25 +154,19 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
     }?;
 
     // Handle runtime wrapping
-    let wrapper = ChatWrapper::new(
-        model,
-        component.name.clone(),
-        component.params.get("system_prompt").cloned(),
-    );
+    let wrapper = ChatWrapper::new(model, component.params.get("system_prompt").cloned());
     Ok(Box::new(wrapper))
 }
 
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
 pub struct ChatWrapper {
     pub chat: Box<dyn Chat>,
-    pub model_name: String,
     pub system_prompt: Option<String>,
 }
 impl ChatWrapper {
-    pub fn new(chat: Box<dyn Chat>, model_name: String, system_prompt: Option<String>) -> Self {
+    pub fn new(chat: Box<dyn Chat>, system_prompt: Option<String>) -> Self {
         Self {
             chat,
-            model_name,
             system_prompt,
         }
     }
@@ -206,18 +201,15 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = self.model_name, input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
-        );
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(),  "labels");
 
         match self
             .chat
             .chat_stream(self.prepare_req(req)?)
-            .instrument(span)
+            .instrument(span.clone())
             .await
         {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => Ok(Box::pin(resp.instrument(span))),
             Err(e) => {
                 tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
                 Err(e)
@@ -230,10 +222,7 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = self.model_name, input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
-        );
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
 
         match self
             .chat
@@ -242,10 +231,10 @@ impl Chat for ChatWrapper {
             .await
         {
             Ok(resp) => {
-                let truncated_output = resp.choices.iter().map(|c| &c.message).collect_vec();
+                let truncated_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&truncated_output) {
                     Ok(output) => {
-                        tracing::info!(target: "task_history", truncated_output = %output)
+                        tracing::info!(target: "task_history", truncated_output = %output);
                     }
                     Err(e) => tracing::error!("Failed to serialize truncated output: {}", e),
                 }

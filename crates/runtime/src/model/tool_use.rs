@@ -29,12 +29,11 @@ use llms::chat::{Chat, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
 };
 
 use async_trait::async_trait;
@@ -569,7 +568,7 @@ impl Chat for ToolUsingChat {
 
         let s = self.inner_chat.chat_stream(inner_req).await?;
         Ok(make_a_stream(
-            tracing::span!(tracing::Level::INFO, ""), // TODO fix
+            Span::current(),
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
