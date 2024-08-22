@@ -29,6 +29,7 @@ use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
+    prelude::DataFrame,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -147,10 +148,15 @@ impl Query {
 
         let inner_span = span.clone();
         let query_result = async {
-            let session = self.df.ctx.state();
+            let mut session = self.df.ctx.state();
 
             let ctx = self;
             let mut tracker = ctx.tracker;
+
+            // Sets the protocol as an extension on DataFusion, to allow recovering it to track telemetry
+            session
+                .config_mut()
+                .set_extension(Arc::new(tracker.protocol));
 
             let plan = match session.create_logical_plan(&ctx.sql).await {
                 Ok(plan) => plan,
@@ -231,13 +237,7 @@ impl Query {
             // Start the timer for the query execution
             tracker.query_execution_duration_timer = Instant::now();
 
-            let df = match ctx.df.ctx.execute_logical_plan(plan).await {
-                Ok(df) => df,
-                Err(e) => {
-                    let error_code = ErrorCode::from(&e);
-                    handle_error!(tracker, error_code, e, UnableToExecuteQuery)
-                }
-            };
+            let df = DataFrame::new(session, plan);
 
             let df_schema: SchemaRef = Arc::clone(df.schema().inner());
 

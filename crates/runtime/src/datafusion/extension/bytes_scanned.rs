@@ -208,8 +208,13 @@ impl ExecutionPlan for BytesScannedExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let mut stream = self.input_exec.execute(partition, context)?;
+        let mut stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
+
+        let protocol: Protocol = context
+            .session_config()
+            .get_extension::<Protocol>()
+            .map_or_else(|| Protocol::Internal, |x| *x);
 
         let bytes_scanned_stream = stream! {
             let mut bytes_scanned = 0u64;
@@ -224,7 +229,7 @@ impl ExecutionPlan for BytesScannedExec {
                     }
                 }
             }
-            telemetry::track_bytes_scanned(bytes_scanned, Protocol::Internal.as_arc_str());
+            telemetry::track_bytes_scanned(bytes_scanned, protocol.as_arc_str());
         };
 
         let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_scanned_stream);
