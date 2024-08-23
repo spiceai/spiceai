@@ -27,7 +27,7 @@ use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
 
-use crate::{init_tracing, run_query_and_check_results, ValidateFn};
+use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
@@ -231,7 +231,12 @@ async fn test_graphql() -> Result<(), String> {
             "/data/users",
         ))
         .build();
-    let mut rt = Runtime::builder().with_app(app).build().await;
+    let df = get_test_datafusion();
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
@@ -271,7 +276,7 @@ async fn test_graphql() -> Result<(), String> {
                 "|               |   BytesScannedNode                                                                                        |",
                 "|               |     TableScan: test_graphql                                                                               |",
                 "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@2, 1), title) as test_graphql.posts[Int64(1)][title]] |",
-                "|               |   RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                   |",
+                "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                    |",
                 "|               |     BytesScannedExec                                                                                      |",
                 "|               |       MemoryExec: partitions=1, partition_sizes=[4]                                                       |",
                 "|               |                                                                                                           |",
@@ -312,7 +317,12 @@ async fn test_graphql_pagination() -> Result<(), String> {
             "/data/paginatedUsers/users",
         ))
         .build();
-    let mut rt = Runtime::builder().with_app(app).build().await;
+    let df = get_test_datafusion();
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
@@ -348,22 +358,22 @@ async fn test_graphql_pagination() -> Result<(), String> {
         (
             "SELECT * FROM test_graphql where id = '4' limit 1",
             vec![
-                "+---------------+-------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                          |",
-                "+---------------+-------------------------------------------------------------------------------+",
-                "| logical_plan  | Limit: skip=0, fetch=1                                                        |",
-                "|               |   Filter: test_graphql.id = Utf8(\"4\")                                         |",
-                "|               |     BytesScannedNode                                                          |",
-                "|               |       TableScan: test_graphql                                                 |",
-                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                                              |",
-                "|               |   CoalescePartitionsExec                                                      |",
-                "|               |     CoalesceBatchesExec: target_batch_size=8192, fetch=1                      |",
-                "|               |       FilterExec: id@0 = 4                                                    |",
-                "|               |         RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2 |",
-                "|               |           BytesScannedExec                                                    |",
-                "|               |             MemoryExec: partitions=2, partition_sizes=[2, 2]                  |",
-                "|               |                                                                               |",
-                "+---------------+-------------------------------------------------------------------------------+",
+                "+---------------+------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                         |",
+                "+---------------+------------------------------------------------------------------------------+",
+                "| logical_plan  | Limit: skip=0, fetch=1                                                       |",
+                "|               |   Filter: test_graphql.id = Utf8(\"4\")                                        |",
+                "|               |     BytesScannedNode                                                         |",
+                "|               |       TableScan: test_graphql                                                |",
+                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                                             |",
+                "|               |   CoalescePartitionsExec                                                     |",
+                "|               |     CoalesceBatchesExec: target_batch_size=8192, fetch=1                     |",
+                "|               |       FilterExec: id@0 = 4                                                   |",
+                "|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2 |",
+                "|               |           BytesScannedExec                                                   |",
+                "|               |             MemoryExec: partitions=2, partition_sizes=[2, 2]                 |",
+                "|               |                                                                              |",
+                "+---------------+------------------------------------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 let mut total = 0;
