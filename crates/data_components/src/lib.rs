@@ -57,6 +57,7 @@ pub mod unity_catalog;
 
 pub mod cdc;
 pub mod delete;
+pub mod graphql;
 pub mod object;
 pub mod poly;
 
