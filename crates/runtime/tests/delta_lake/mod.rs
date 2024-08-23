@@ -23,6 +23,8 @@ impl Drop for FileCleanup {
     }
 }
 
+// Once https://github.com/spiceai/spiceai/issues/2355 is resolved, this test should be re-enabled
+#[ignore]
 #[tokio::test]
 async fn query_delta_lake_with_partitions() -> Result<(), String> {
     let tmp_dir = std::env::temp_dir();

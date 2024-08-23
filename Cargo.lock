@@ -2945,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=ae9da45f8b90451119f3ca032b75ad82a28d7547#ae9da45f8b90451119f3ca032b75ad82a28d7547"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=21cfcc8cbc668b33235df52f16ea002f72efc74d#21cfcc8cbc668b33235df52f16ea002f72efc74d"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2956,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=ae9da45f8b90451119f3ca032b75ad82a28d7547#ae9da45f8b90451119f3ca032b75ad82a28d7547"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=21cfcc8cbc668b33235df52f16ea002f72efc74d#21cfcc8cbc668b33235df52f16ea002f72efc74d"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -3154,7 +3154,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c042b6011e76c1f5b88573d338e88559e91dece9#c042b6011e76c1f5b88573d338e88559e91dece9"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a20e87ed05286bf5a4b98e27b8ab46571ce36a28#a20e87ed05286bf5a4b98e27b8ab46571ce36a28"
 dependencies = [
  "arrow",
  "async-stream",
@@ -8767,6 +8767,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e5073b2cfed767511a57d18115f3b3d8bcb5690bf8c89518caec6cb22c0cd74"
 dependencies = [
  "bigdecimal 0.3.1",
+ "chrono",
  "inherent",
  "rust_decimal",
  "sea-query-derive",
