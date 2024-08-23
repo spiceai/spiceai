@@ -85,10 +85,10 @@ thread_local! {
     ///              └── AggregationTemporality
     static METRICS_SCHEMA: LazyCell<Arc<Schema>> = LazyCell::new(|| {
         let fields = vec![
-            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), false),
             Field::new(
                 "start_time_unix_nano",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                 true,
             ),
             Field::new("resource", DataType::Struct(
