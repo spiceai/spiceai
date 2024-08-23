@@ -41,17 +41,17 @@ pub fn track_query_count() {
     QUERY_COUNT.add(1, &[]);
 }
 
-static BYTES_SCANNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("bytes_scanned")
-        .with_description("Number of bytes scanned. This only reflects the bytes that DataFusion itself has read, and does not include any data read by the underlying data sources but did not transmit.")
+        .u64_counter("bytes_processed")
+        .with_description("Number of bytes processed by the runtime.")
         .with_unit("bytes")
         .init()
 });
 
-pub fn track_bytes_scanned(bytes: u64, protocol: Arc<str>) {
+pub fn track_bytes_processed(bytes: u64, protocol: Arc<str>) {
     let dimensions = create_dimensions(protocol);
-    BYTES_SCANNED.add(bytes, &dimensions);
+    BYTES_PROCESSED.add(bytes, &dimensions);
 }
 
 static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
