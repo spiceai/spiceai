@@ -234,6 +234,7 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -337,8 +338,7 @@ impl TableProvider for DeltaTable {
             )));
         }
 
-        // FileScanConfig requires an ObjectStoreUrl, but it isn't actually used because we pass in a ParquetFileReaderFactory
-        // which specifies which object store to read from.
+        let partition_cols = &partition_cols.into_iter().collect::<Vec<_>>();
         let schema = self.arrow_schema.project(
             &self
                 .arrow_schema
@@ -348,11 +348,31 @@ impl TableProvider for DeltaTable {
                 .filter_map(|(i, f)| (!partition_cols.contains(f)).then_some(i))
                 .collect::<Vec<_>>(),
         )?;
+
+        let new_projections = projection.map(|projection| {
+            projection
+                .iter()
+                .map(|&x| {
+                    let field = self.arrow_schema.field(x);
+
+                    if let Ok(i) = schema.clone().index_of(field.name()) {
+                        return i;
+                    }
+
+                    if let Some(i) = partition_cols.iter().position(|r| r == field) {
+                        return schema.clone().fields.len() + i;
+                    }
+
+                    unreachable!("all projected fields should be mapped to new projected position");
+                })
+                .collect::<Vec<_>>()
+        });
+
         let file_scan_config =
             FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::new(schema))
                 .with_limit(limit)
-                .with_projection(projection.cloned())
-                .with_table_partition_cols(partition_cols.into_iter().collect::<Vec<_>>())
+                .with_projection(new_projections)
+                .with_table_partition_cols(partition_cols.clone())
                 .with_file_group(partitioned_files);
         let exec = ParquetExec::builder(file_scan_config)
             .with_parquet_file_reader_factory(Arc::clone(&parquet_file_reader_factory))
