@@ -204,3 +204,32 @@ pub(crate) mod llms {
             .init()
     });
 }
+
+pub(crate) mod tools {
+    use super::{global, Counter, Gauge, LazyLock, Meter, UpDownCounter};
+
+    pub(crate) static TOOLS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("tools"));
+
+    pub(crate) static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+        TOOLS_METER
+            .i64_up_down_counter("tool_count")
+            .with_description("Number of currently loaded LLM tools.")
+            .init()
+    });
+
+    pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+        TOOLS_METER
+            .u64_gauge("tools_status")
+            .with_description(
+                "Status of the LLM tools. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
+            )
+            .init()
+    });
+
+    pub(crate) static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        TOOLS_METER
+            .u64_counter("tool_load_error")
+            .with_description("Number of errors loading the LLM tool.")
+            .init()
+    });
+}

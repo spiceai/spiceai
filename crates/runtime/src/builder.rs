@@ -27,7 +27,7 @@ use crate::{
     metrics, podswatcher,
     secrets::{self, Secrets},
     timing::TimeMeasurement,
-    tracers, Runtime,
+    tools, tracers, Runtime,
 };
 
 pub struct RuntimeBuilder {
@@ -117,6 +117,7 @@ impl RuntimeBuilder {
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
+        tools::factory::register_all().await;
 
         let df = match self.datafusion {
             Some(df) => df,
@@ -139,6 +140,7 @@ impl RuntimeBuilder {
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
+            tools: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
