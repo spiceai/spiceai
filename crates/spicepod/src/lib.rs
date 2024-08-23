@@ -152,13 +152,9 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        let resolved_tools = component::resolve_component_references(
-            fs,
-            &path,
-            &spicepod_definition.tools,
-            "tools",
-        )
-        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+        let resolved_tools =
+            component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
+                .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
         detect_duplicate_component_names("secrets", &spicepod_definition.secrets[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;

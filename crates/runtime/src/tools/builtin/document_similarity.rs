@@ -27,17 +27,36 @@ use crate::{
     Runtime,
 };
 
-pub struct DocumentSimilarityTool {}
-impl DocumentSimilarityTool {}
+pub struct DocumentSimilarityTool {
+    name: String,
+    description: Option<String>,
+}
+impl DocumentSimilarityTool {
+    #[must_use]
+    pub fn new(name: &str, description: Option<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            description,
+        }
+    }
+}
+impl Default for DocumentSimilarityTool {
+    fn default() -> Self {
+        Self::new(
+            "document_similarity",
+            Some("Search and retrieve documents from available datasets".to_string()),
+        )
+    }
+}
 
 #[async_trait]
 impl SpiceModelTool for DocumentSimilarityTool {
-    fn name(&self) -> &'static str {
-        "document_similarity"
+    fn name(&self) -> &str {
+        self.name.as_str()
     }
 
-    fn description(&self) -> Option<&'static str> {
-        Some("Search and retrieve documents from available datasets")
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     fn parameters(&self) -> Option<Value> {

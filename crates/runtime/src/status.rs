@@ -66,6 +66,14 @@ pub fn update_model(model_name: &str, status: ComponentStatus) {
     );
 }
 
+pub fn update_tool(tool_name: &str, status: ComponentStatus) {
+    let tool_name = tool_name.to_string();
+    metrics::tools::STATUS.record(
+        status as u64,
+        &[Key::from_static_str("tool").string(tool_name)],
+    );
+}
+
 pub fn update_llm(model_name: &str, status: ComponentStatus) {
     let model_name = model_name.to_string();
     metrics::llms::STATUS.record(

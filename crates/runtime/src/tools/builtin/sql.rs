@@ -30,21 +30,43 @@ use snafu::ResultExt;
 use tracing::Span;
 use tracing_futures::Instrument;
 
-pub struct SqlTool {}
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct SqlToolParams {
     /// The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query
     query: String,
 }
+pub struct SqlTool {
+    name: String,
+    description: Option<String>,
+}
+
+impl SqlTool {
+    #[must_use]
+    pub fn new(name: &str, description: Option<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            description,
+        }
+    }
+}
+
+impl Default for SqlTool {
+    fn default() -> Self {
+        Self::new(
+            "sql",
+            Some("Run an SQL query on the data source".to_string()),
+        )
+    }
+}
 
 #[async_trait]
 impl SpiceModelTool for SqlTool {
-    fn name(&self) -> &'static str {
-        "sql"
+    fn name(&self) -> &str {
+        self.name.as_str()
     }
 
-    fn description(&self) -> Option<&'static str> {
-        Some("Run an SQL query on the data source")
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     fn parameters(&self) -> Option<Value> {

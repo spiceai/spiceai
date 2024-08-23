@@ -19,8 +19,6 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use super::SpiceModelTool;
-
 /// Options to specify which and how tools can be used by a specific LLM.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,22 +41,6 @@ impl SpiceToolsOptions {
             SpiceToolsOptions::Auto => true,
             SpiceToolsOptions::Disabled => false,
             SpiceToolsOptions::Specific(t) => !t.is_empty(),
-        }
-    }
-
-    /// Filter out a list of tools permitted by the  [`SpiceToolsOptions`].
-    #[must_use]
-    pub fn filter_tools(
-        &self,
-        tools: Vec<Box<dyn SpiceModelTool>>,
-    ) -> Vec<Box<dyn SpiceModelTool>> {
-        match self {
-            SpiceToolsOptions::Auto => tools,
-            SpiceToolsOptions::Disabled => vec![],
-            SpiceToolsOptions::Specific(t) => tools
-                .into_iter()
-                .filter(|tool| t.iter().any(|s| s == tool.name()))
-                .collect(),
         }
     }
 }

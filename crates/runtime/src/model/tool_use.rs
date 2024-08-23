@@ -42,25 +42,25 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::tools::builtin::get_builtin_tools;
-use crate::tools::options::SpiceToolsOptions;
 use crate::tools::SpiceModelTool;
 use crate::Runtime;
 
 pub struct ToolUsingChat {
     inner_chat: Arc<Box<dyn Chat>>,
     rt: Arc<Runtime>,
-    tools: Vec<Box<dyn SpiceModelTool>>,
-    opts: SpiceToolsOptions,
+    tools: Vec<Arc<dyn SpiceModelTool>>,
 }
 
 impl ToolUsingChat {
-    pub fn new(inner_chat: Arc<Box<dyn Chat>>, rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Self {
+    pub fn new(
+        inner_chat: Arc<Box<dyn Chat>>,
+        rt: Arc<Runtime>,
+        tools: Vec<Arc<dyn SpiceModelTool>>,
+    ) -> Self {
         Self {
             inner_chat,
             rt,
-            tools: opts.filter_tools(get_builtin_tools()),
-            opts: opts.clone(),
+            tools,
         }
     }
 
@@ -276,7 +276,7 @@ impl Chat for ToolUsingChat {
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
-                &self.opts,
+                self.tools.clone(),
             ),
             req.clone(),
             s,

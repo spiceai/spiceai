@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use document_similarity::DocumentSimilarityTool;
 use list_datasets::ListDatasetsTool;
 use sql::SqlTool;
@@ -26,12 +28,11 @@ pub mod list_datasets;
 pub mod sql;
 pub mod table_schema;
 
-#[must_use]
-pub fn get_builtin_tools() -> Vec<Box<dyn SpiceModelTool>> {
+pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
     vec![
-        Box::new(DocumentSimilarityTool {}),
-        Box::new(TableSchemaTool {}),
-        Box::new(SqlTool {}),
-        Box::new(ListDatasetsTool {}),
+        Arc::new(DocumentSimilarityTool::default()),
+        Arc::new(TableSchemaTool::default()),
+        Arc::new(SqlTool::default()),
+        Arc::new(ListDatasetsTool::default()),
     ]
 }

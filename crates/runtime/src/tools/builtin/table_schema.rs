@@ -31,16 +31,36 @@ pub struct TableSchemaToolParams {
     /// Which subset of tables to return results for. Default to all tables.
     tables: Vec<String>,
 }
-pub struct TableSchemaTool {}
+pub struct TableSchemaTool {
+    name: String,
+    description: Option<String>,
+}
 
+impl TableSchemaTool {
+    #[must_use]
+    pub fn new(name: &str, description: Option<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            description,
+        }
+    }
+}
+impl Default for TableSchemaTool {
+    fn default() -> Self {
+        Self::new(
+            "table_schema",
+            Some("Retrieve the schema of all available SQL tables".to_string()),
+        )
+    }
+}
 #[async_trait]
 impl SpiceModelTool for TableSchemaTool {
-    fn name(&self) -> &'static str {
-        "table_schema"
+    fn name(&self) -> &str {
+        self.name.as_str()
     }
 
-    fn description(&self) -> Option<&'static str> {
-        Some("Retrieve the schema of all available SQL tables")
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     fn parameters(&self) -> Option<Value> {

@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(clippy::missing_errors_doc)]
 use async_trait::async_trait;
+use builtin::get_builtin_tools;
+use options::SpiceToolsOptions;
 use schemars::{schema_for, JsonSchema};
 use serde::Serialize;
 use serde_json::Value;
@@ -23,13 +24,14 @@ use std::sync::Arc;
 use crate::Runtime;
 
 pub mod builtin;
+pub mod factory;
 pub mod options;
 
 /// Tools that implement the [`SpiceModelTool`] trait can automatically be used by LLMs in the runtime.
 #[async_trait]
 pub trait SpiceModelTool: Sync + Send {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> Option<&'static str>;
+    fn name(&self) -> &str;
+    fn description(&self) -> Option<&str>;
     fn parameters(&self) -> Option<Value>;
     async fn call(
         &self,
@@ -45,6 +47,27 @@ fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
         Err(e) => {
             tracing::error!("Unexpectedly cannot serialize schema: {e}",);
             None
+        }
+    }
+}
+
+#[must_use]
+pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dyn SpiceModelTool>> {
+    match opts {
+        SpiceToolsOptions::Disabled => vec![],
+        SpiceToolsOptions::Auto => get_builtin_tools(),
+        SpiceToolsOptions::Specific(t) => {
+            let mut tools = vec![];
+            let all_tools = rt.tools.read().await;
+
+            for tt in t {
+                if let Some(tool) = all_tools.get(tt) {
+                    tools.push(Arc::<dyn SpiceModelTool>::clone(tool));
+                } else {
+                    tracing::warn!("Tool {tt} not found in registry");
+                }
+            }
+            tools
         }
     }
 }

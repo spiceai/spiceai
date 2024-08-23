@@ -62,6 +62,8 @@ use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
+use tools::factory as tool_factory;
+use tools::SpiceModelTool;
 use tracing_util::dataset_registered_trace;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 pub use util::shutdown_signal;
@@ -142,6 +144,11 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     UnableToInitializeEmbeddingModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToInitializeLlmTool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -282,6 +289,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    tools: Arc<RwLock<HashMap<String, Arc<dyn SpiceModelTool>>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -454,6 +462,7 @@ impl Runtime {
         ];
 
         if cfg!(feature = "models") {
+            self.load_tools().await; // Load tools before loading models.
             futures.push(Box::pin(self.load_models()));
         }
 
@@ -1197,6 +1206,7 @@ impl Runtime {
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
         let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+            .await
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1270,6 +1280,41 @@ impl Runtime {
             for model in &app.models {
                 status::update_model(&model.name, status::ComponentStatus::Initializing);
                 self.load_model(model).await;
+            }
+        }
+    }
+
+    #[allow(clippy::implicit_hasher)]
+    async fn load_tools(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for tool in &app.tools {
+                status::update_tool(&tool.name, status::ComponentStatus::Initializing);
+                let params_with_secrets: HashMap<String, SecretString> =
+                    self.get_params_with_secrets(&tool.params).await;
+
+                match tool_factory::forge(tool, params_with_secrets)
+                    .await
+                    .context(UnableToInitializeLlmToolSnafu)
+                {
+                    Ok(t) => {
+                        let mut tools_map = self.tools.write().await;
+                        tools_map.insert(tool.name.clone(), t);
+                        tracing::info!("Tool [{}] ready to use", tool.name);
+                        metrics::tools::COUNT
+                            .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
+                        status::update_tool(&tool.name, status::ComponentStatus::Ready);
+                    }
+                    Err(e) => {
+                        metrics::tools::LOAD_ERROR.add(1, &[]);
+                        status::update_tool(&tool.name, status::ComponentStatus::Error);
+                        tracing::warn!(
+                            "Unable to load tool from spicepod {}, error: {}",
+                            tool.name,
+                            e,
+                        );
+                    }
+                }
             }
         }
     }
