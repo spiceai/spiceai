@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use bytes_scanned::{BytesScannedExec, BytesScannedNode};
+use bytes_processed::{BytesProcessedExec, BytesProcessedNode};
 use datafusion::{
     error::Result,
     execution::context::{QueryPlanner, SessionState},
@@ -26,7 +26,7 @@ use datafusion::{
 use datafusion_federation::FederatedPlanner;
 use std::sync::Arc;
 
-pub mod bytes_scanned;
+pub mod bytes_processed;
 
 #[derive(Default)]
 pub struct SpiceQueryPlanner {}
@@ -73,9 +73,9 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // bytes_scanned Extension
-        let bytes_scanned_node = node.as_any().downcast_ref::<BytesScannedNode>();
-        if bytes_scanned_node.is_some() {
+        // bytes_processed Extension
+        let bytes_processed_node = node.as_any().downcast_ref::<BytesProcessedNode>();
+        if bytes_processed_node.is_some() {
             assert_eq!(logical_inputs.len(), 1, "should have 1 input");
             assert_eq!(physical_inputs.len(), 1, "should have 1 input");
             let physical_input = &physical_inputs[0];
@@ -83,7 +83,7 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
 
             assert_eq!(*logical_input.schema().inner(), physical_input.schema());
 
-            let exec_plan = Arc::new(BytesScannedExec::new(Arc::clone(physical_input)));
+            let exec_plan = Arc::new(BytesProcessedExec::new(Arc::clone(physical_input)));
             return Ok(Some(exec_plan));
         }
         Ok(None)

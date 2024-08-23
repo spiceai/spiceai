@@ -43,16 +43,16 @@ use std::{
 use crate::datafusion::query::Protocol;
 
 #[derive(Default)]
-pub struct BytesScannedAnalyzerRule {}
+pub struct BytesProcessedAnalyzerRule {}
 
-impl AnalyzerRule for BytesScannedAnalyzerRule {
-    /// Walk over the plan and insert a `BytesScannedNode` as the parent of any `TableScans` and `FederationNodes`.
+impl AnalyzerRule for BytesProcessedAnalyzerRule {
+    /// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         let transformed_plan = plan.transform_up(|plan| match plan {
             LogicalPlan::TableScan(table_scan) => {
-                let bytes_scanned = BytesScannedNode::new(LogicalPlan::TableScan(table_scan));
+                let bytes_processed = BytesProcessedNode::new(LogicalPlan::TableScan(table_scan));
                 let ext_node = Extension {
-                    node: Arc::new(bytes_scanned),
+                    node: Arc::new(bytes_processed),
                 };
                 Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
             }
@@ -60,10 +60,10 @@ impl AnalyzerRule for BytesScannedAnalyzerRule {
                 let plan_node = extension.node.as_any().downcast_ref::<FederatedPlanNode>();
 
                 if plan_node.is_some() {
-                    let bytes_scanned =
-                        BytesScannedNode::new(LogicalPlan::Extension(extension.clone()));
+                    let bytes_processed =
+                        BytesProcessedNode::new(LogicalPlan::Extension(extension.clone()));
                     let ext_node = Extension {
-                        node: Arc::new(bytes_scanned),
+                        node: Arc::new(bytes_processed),
                     };
                     Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
                 } else {
@@ -77,36 +77,36 @@ impl AnalyzerRule for BytesScannedAnalyzerRule {
 
     /// A human readable name for this optimizer rule
     fn name(&self) -> &str {
-        "bytes_scanned_analyzer_rule"
+        "bytes_processed_analyzer_rule"
     }
 }
 
-impl BytesScannedAnalyzerRule {
+impl BytesProcessedAnalyzerRule {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-pub(crate) struct BytesScannedNode {
+pub(crate) struct BytesProcessedNode {
     pub(super) input: LogicalPlan,
 }
 
-impl BytesScannedNode {
+impl BytesProcessedNode {
     pub(crate) fn new(input: LogicalPlan) -> Self {
         assert!(input.inputs().is_empty(), "should have no inputs");
         Self { input }
     }
 }
 
-impl Debug for BytesScannedNode {
+impl Debug for BytesProcessedNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         UserDefinedLogicalNodeCore::fmt_for_explain(self, f)
     }
 }
 
-impl UserDefinedLogicalNodeCore for BytesScannedNode {
+impl UserDefinedLogicalNodeCore for BytesProcessedNode {
     fn name(&self) -> &str {
-        "BytesScannedNode"
+        "BytesProcessedNode"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -122,7 +122,7 @@ impl UserDefinedLogicalNodeCore for BytesScannedNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "BytesScannedNode")
+        write!(f, "BytesProcessedNode")
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
@@ -135,49 +135,49 @@ impl UserDefinedLogicalNodeCore for BytesScannedNode {
     }
 }
 
-impl PartialEq<BytesScannedNode> for BytesScannedNode {
-    fn eq(&self, other: &BytesScannedNode) -> bool {
+impl PartialEq<BytesProcessedNode> for BytesProcessedNode {
+    fn eq(&self, other: &BytesProcessedNode) -> bool {
         self.input == other.input
     }
 }
 
-impl Eq for BytesScannedNode {}
+impl Eq for BytesProcessedNode {}
 
-impl Hash for BytesScannedNode {
+impl Hash for BytesProcessedNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.input.hash(state);
     }
 }
 
-pub(crate) struct BytesScannedExec {
+pub(crate) struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
 }
 
-impl BytesScannedExec {
+impl BytesProcessedExec {
     pub(crate) fn new(input_exec: Arc<dyn ExecutionPlan>) -> Self {
         Self { input_exec }
     }
 }
 
-impl std::fmt::Debug for BytesScannedExec {
+impl std::fmt::Debug for BytesProcessedExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BytesScannedExec")
+        write!(f, "BytesProcessedExec")
     }
 }
 
-impl DisplayAs for BytesScannedExec {
+impl DisplayAs for BytesProcessedExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "BytesScannedExec")
+                write!(f, "BytesProcessedExec")
             }
         }
     }
 }
 
-impl ExecutionPlan for BytesScannedExec {
+impl ExecutionPlan for BytesProcessedExec {
     fn name(&self) -> &str {
-        "BytesScannedExec"
+        "BytesProcessedExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -216,12 +216,12 @@ impl ExecutionPlan for BytesScannedExec {
             .get_extension::<Protocol>()
             .map_or_else(|| Protocol::Internal, |x| *x);
 
-        let bytes_scanned_stream = stream! {
-            let mut bytes_scanned = 0u64;
+        let bytes_processed_stream = stream! {
+            let mut bytes_processed = 0u64;
             while let Some(batch) = stream.next().await {
                 match batch {
                     Ok(batch) => {
-                        bytes_scanned += batch.get_array_memory_size() as u64;
+                        bytes_processed += batch.get_array_memory_size() as u64;
                         yield Ok(batch)
                     }
                     Err(e) => {
@@ -229,10 +229,10 @@ impl ExecutionPlan for BytesScannedExec {
                     }
                 }
             }
-            telemetry::track_bytes_scanned(bytes_scanned, protocol.as_arc_str());
+            telemetry::track_bytes_processed(bytes_processed, protocol.as_arc_str());
         };
 
-        let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_scanned_stream);
+        let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_processed_stream);
 
         Ok(Box::pin(stream_adapter))
     }
