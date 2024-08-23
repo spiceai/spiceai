@@ -213,9 +213,9 @@ impl MetricType {
     #[must_use]
     pub fn from_u8(value: u8) -> Option<MetricType> {
         match value {
-            0 => Some(MetricType::Gauge),
-            1 => Some(MetricType::Sum),
-            2 => Some(MetricType::Histogram),
+            1 => Some(MetricType::Gauge),
+            2 => Some(MetricType::Sum),
+            3 => Some(MetricType::Histogram),
             _ => None,
         }
     }
