@@ -165,6 +165,13 @@ impl DeltaTable {
         partitioned_files: &[PartitionedFile],
         physical_expr: &Arc<dyn PhysicalExpr>,
     ) -> Arc<dyn ExecutionPlan> {
+        // this is needed to pass the plan_extension
+        let projection = Some(
+            projection
+                .cloned()
+                .unwrap_or((0..self.arrow_schema.fields().len()).collect::<Vec<_>>()),
+        );
+
         let new_projections = projection.map(|projection| {
             projection
                 .iter()
