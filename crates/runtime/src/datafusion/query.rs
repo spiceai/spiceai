@@ -136,7 +136,7 @@ macro_rules! handle_error {
 impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
-        telemetry::track_query_count();
+        crate::metrics::telemetry::track_query_count();
         let span = match &self.tracker.nsql {
             Some(nsql) => {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
@@ -349,7 +349,7 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
+        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
 
         ctx
             .schema(schema_copy)

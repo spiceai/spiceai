@@ -229,7 +229,7 @@ impl ExecutionPlan for BytesProcessedExec {
                     }
                 }
             }
-            telemetry::track_bytes_processed(bytes_processed, protocol.as_arc_str());
+            crate::metrics::telemetry::track_bytes_processed(bytes_processed, protocol.as_arc_str());
         };
 
         let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_processed_stream);
