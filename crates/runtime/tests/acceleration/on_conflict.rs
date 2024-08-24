@@ -85,9 +85,9 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
     on_conflict_upsert.acceleration = Some(Acceleration {
         params: Some(params.clone()),
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("postgres".to_string()),
         refresh_mode: Some(RefreshMode::Append),
-        refresh_check_interval: Some("5s".to_string()),
+        refresh_check_interval: Some("1s".to_string()),
         primary_key: Some("event_id".to_string()),
         on_conflict: upsert_hashmap,
         ..Acceleration::default()
@@ -108,7 +108,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         enabled: true,
         engine: Some("postgres".to_string()),
         refresh_mode: Some(RefreshMode::Append),
-        refresh_check_interval: Some("5s".to_string()),
+        refresh_check_interval: Some("1s".to_string()),
         primary_key: Some("event_id".to_string()),
         on_conflict: drop_hashmap,
         ..Acceleration::default()
@@ -119,7 +119,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
 
     let app = AppBuilder::new("on_conflict_behavior")
         .with_dataset(on_conflict_upsert)
-        // .with_dataset(on_conflict_drop)
+        .with_dataset(on_conflict_drop)
         .build();
 
     let rt = Runtime::builder()
@@ -136,56 +136,91 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         () = rt.load_components() => {}
     }
 
-    let mut original_batches: Vec<RecordBatch> = vec![];
-    let mut original_data = rt
+    // Wait for both dataset to be setup
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT * FROM event_logs_upsert LIMIT 1",
+                    Protocol::Internal,
+                )
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM event_logs_drop LIMIT 1", Protocol::Internal)
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
+
+    let original_data = rt
         .datafusion()
-        .query_builder("SELECT * FROM event_logs_upsert", Protocol::Internal)
-        .build()
-        .run()
-        .await
-        .expect("result returned");
-    while let Some(batch) = original_data.data.next().await {
-        original_batches.push(batch.expect("batch"));
-    }
+        .ctx
+        .sql("SELECT * FROM event_logs_upsert")
+        .await?
+        .collect()
+        .await?;
 
     db_conn
         .conn
         .execute(
-            "UPDATE event_logs SET event_name = 'File Upload' WHERE event_id = 5;",
+            "
+UPDATE event_logs
+SET event_name = 'File Accessed',
+    event_timestamp = '2024-08-24 15:45:00'
+WHERE event_name = 'File Download'
+  AND event_timestamp = '2023-05-17 13:20:00';
+",
             &[],
         )
         .await
         .expect("inserted data");
 
-    // Wait 10 seconds for result to be refreshed
-    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    // Wait for result to be refreshed
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let mut upsert_result = rt
+    let upsert_data = rt
         .datafusion()
-        .query_builder("SELECT * FROM event_logs_upsert", Protocol::Internal)
-        .build()
-        .run()
-        .await
-        .expect("result returned");
-    let mut upsert_batches = vec![];
-    while let Some(batch) = upsert_result.data.next().await {
-        upsert_batches.push(batch.expect("batch"));
-    }
+        .ctx
+        .sql("SELECT * FROM event_logs_upsert")
+        .await?
+        .collect()
+        .await?;
 
-    let mut drop_result = rt
+    let drop_data = rt
         .datafusion()
-        .query_builder("SELECT * FROM event_logs_drop", Protocol::Internal)
-        .build()
-        .run()
-        .await
-        .expect("result returned");
-    let mut drop_batches = vec![];
-    while let Some(batch) = drop_result.data.next().await {
-        drop_batches.push(batch.expect("batch"));
-    }
+        .ctx
+        .sql("SELECT * FROM event_logs_drop")
+        .await?
+        .collect()
+        .await?;
 
-    assert_ne!(original_batches, drop_batches);
-    assert_eq!(original_batches, upsert_batches);
+    assert_eq!(original_data, drop_data);
+    assert_ne!(original_data, upsert_data);
 
     running_container.remove().await?;
     Ok(())
