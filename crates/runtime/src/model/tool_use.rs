@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use datafusion::sql::TableReference;
 use itertools::Itertools;
 use llms::chat::{Chat, Result as ChatResult};
 
@@ -41,7 +40,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::tools::builtin::list_datasets::{get_dataset_elements, ListDatasetElement};
 use crate::tools::SpiceModelTool;
 use crate::Runtime;
 
@@ -98,21 +97,14 @@ impl ToolUsingChat {
 
     /// Creates content for a system prompt that lists all available tables in the runtime.
     async fn available_tables_system_prompt(&self) -> Option<String> {
-        let datasets = match &*self.rt.app.read().await {
-            Some(app) => app.datasets.clone(),
-            None => vec![],
-        };
-
-        let mut table_names = datasets.iter().map(|d| {
-            let tbl: TableReference = TableReference::parse_str(&d.name)
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                .into();
-            tbl.to_quoted_string()
-        });
+        let datasets = get_dataset_elements(Arc::clone(&self.rt), None).await;
 
         Some(format!(
-            "The following datasets are available in the runtime: {}.",
-            table_names.join(", ")
+            "The following datasets are available in the runtime: \n{}",
+            datasets
+                .iter()
+                .map(ListDatasetElement::to_text_llms)
+                .join("\n---\n")
         ))
     }
 
