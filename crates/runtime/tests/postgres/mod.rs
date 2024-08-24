@@ -83,7 +83,7 @@ CREATE TABLE test (
         *record_batch.schema().fields()[0].data_type()
     );
     assert_eq!(
-        DataType::Timestamp(TimeUnit::Millisecond, None),
+        DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into())),
         *record_batch.schema().fields()[1].data_type()
     );
 

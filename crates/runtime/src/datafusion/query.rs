@@ -29,6 +29,7 @@ use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
+    prelude::DataFrame,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -135,7 +136,7 @@ macro_rules! handle_error {
 impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
-        telemetry::track_query_count();
+        crate::metrics::telemetry::track_query_count();
         let span = match &self.tracker.nsql {
             Some(nsql) => {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
@@ -147,10 +148,15 @@ impl Query {
 
         let inner_span = span.clone();
         let query_result = async {
-            let session = self.df.ctx.state();
+            let mut session = self.df.ctx.state();
 
             let ctx = self;
             let mut tracker = ctx.tracker;
+
+            // Sets the protocol as an extension on DataFusion, to allow recovering it to track telemetry
+            session
+                .config_mut()
+                .set_extension(Arc::new(tracker.protocol));
 
             let plan = match session.create_logical_plan(&ctx.sql).await {
                 Ok(plan) => plan,
@@ -231,13 +237,7 @@ impl Query {
             // Start the timer for the query execution
             tracker.query_execution_duration_timer = Instant::now();
 
-            let df = match ctx.df.ctx.execute_logical_plan(plan).await {
-                Ok(df) => df,
-                Err(e) => {
-                    let error_code = ErrorCode::from(&e);
-                    handle_error!(tracker, error_code, e, UnableToExecuteQuery)
-                }
-            };
+            let df = DataFrame::new(session, plan);
 
             let df_schema: SchemaRef = Arc::clone(df.schema().inner());
 
@@ -349,7 +349,7 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
+        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
 
         ctx
             .schema(schema_copy)

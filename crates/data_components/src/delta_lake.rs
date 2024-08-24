@@ -33,7 +33,7 @@ use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -152,6 +152,56 @@ impl DeltaTable {
         }
 
         Schema::new(fields)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_parquet_exec(
+        &self,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+        schema: &Arc<Schema>,
+        partition_cols: &[Field],
+        parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
+        partitioned_files: &[PartitionedFile],
+        physical_expr: &Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn ExecutionPlan> {
+        // this is needed to pass the plan_extension
+        let projection = Some(
+            projection
+                .cloned()
+                .unwrap_or((0..self.arrow_schema.fields().len()).collect::<Vec<_>>()),
+        );
+
+        let new_projections = projection.map(|projection| {
+            projection
+                .iter()
+                .map(|&x| {
+                    let field = self.arrow_schema.field(x);
+
+                    if let Ok(i) = schema.index_of(field.name()) {
+                        return i;
+                    }
+
+                    if let Some(i) = partition_cols.iter().position(|r| r == field) {
+                        return schema.fields.len() + i;
+                    }
+
+                    unreachable!("all projected fields should be mapped to new projected position");
+                })
+                .collect::<Vec<_>>()
+        });
+        let file_scan_config =
+            FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::clone(schema))
+                .with_limit(limit)
+                .with_projection(new_projections)
+                .with_table_partition_cols(partition_cols.to_vec())
+                .with_file_group(partitioned_files.to_vec());
+        let exec = ParquetExec::builder(file_scan_config)
+            .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
+            .with_predicate(Arc::clone(physical_expr))
+            .build();
+
+        Arc::new(exec)
     }
 }
 
@@ -337,8 +387,7 @@ impl TableProvider for DeltaTable {
             )));
         }
 
-        // FileScanConfig requires an ObjectStoreUrl, but it isn't actually used because we pass in a ParquetFileReaderFactory
-        // which specifies which object store to read from.
+        let partition_cols = &partition_cols.into_iter().collect::<Vec<_>>();
         let schema = self.arrow_schema.project(
             &self
                 .arrow_schema
@@ -348,18 +397,16 @@ impl TableProvider for DeltaTable {
                 .filter_map(|(i, f)| (!partition_cols.contains(f)).then_some(i))
                 .collect::<Vec<_>>(),
         )?;
-        let file_scan_config =
-            FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::new(schema))
-                .with_limit(limit)
-                .with_projection(projection.cloned())
-                .with_table_partition_cols(partition_cols.into_iter().collect::<Vec<_>>())
-                .with_file_group(partitioned_files);
-        let exec = ParquetExec::builder(file_scan_config)
-            .with_parquet_file_reader_factory(Arc::clone(&parquet_file_reader_factory))
-            .with_predicate(Arc::clone(&physical_expr))
-            .build();
 
-        Ok(Arc::new(exec))
+        Ok(self.create_parquet_exec(
+            projection,
+            limit,
+            &Arc::new(schema),
+            partition_cols,
+            &parquet_file_reader_factory,
+            &partitioned_files,
+            &physical_expr,
+        ))
     }
 }
 
