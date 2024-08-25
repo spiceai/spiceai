@@ -40,8 +40,8 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Data source {} does not exist", data_source))]
-    DataSourceNotFound { data_source: String },
+    #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
+    DataSourcesNotFound { data_source: Vec<TableReference> },
 
     #[snafu(display("Error occurred interacting with datafusion: {}", source))]
     DataFusionError {
@@ -56,12 +56,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Data source {} does not contain any embedding columns", data_source))]
-    NoEmbeddingColumns { data_source: String },
+    #[snafu(display("Data source {} does not contain any embedding columns", data_source.to_string()))]
+    NoEmbeddingColumns { data_source: TableReference },
 
-    #[snafu(display("Only one embedding column per table currently supported. Table: {data_source} has {num_embeddings} embeddings"))]
+    #[snafu(display("Only one embedding column per table currently supported. Table: {} has {num_embeddings} embeddings", data_source.to_string()))]
     IncorrectNumberOfEmbeddingColumns {
-        data_source: String,
+        data_source: TableReference,
         num_embeddings: usize,
     },
 
@@ -314,6 +314,17 @@ impl VectorSearch {
         } = req;
 
         let tables: Vec<TableReference> = data_source.iter().map(TableReference::from).collect();
+        let tables_not_found: Vec<TableReference> = tables
+            .iter()
+            .filter(|&t| !self.df.table_exists(t.clone()))
+            .cloned()
+            .collect();
+
+        if !tables_not_found.is_empty() {
+            return Err(Error::DataSourcesNotFound {
+                data_source: tables_not_found,
+            });
+        }
 
         let span = match Span::current() {
             span if matches!(span.metadata(), Some(metadata) if metadata.name() == "vector_search") => {
@@ -346,19 +357,19 @@ impl VectorSearch {
                     .df
                     .get_table(tbl.clone())
                     .await
-                    .ok_or(Error::DataSourceNotFound {
-                        data_source: tbl.to_string(),
+                    .ok_or(Error::DataSourcesNotFound {
+                        data_source: vec![tbl.clone()],
                     })?;
 
                 let embedding_column = get_embedding_table(&table_provider)
                     .and_then(|e| e.get_embedding_columns().first().cloned())
                     .ok_or(Error::NoEmbeddingColumns {
-                        data_source: tbl.to_string(),
+                        data_source: tbl.clone(),
                     })?;
 
                 if search_vectors.len() != 1 {
                     return Err(Error::IncorrectNumberOfEmbeddingColumns {
-                        data_source: tbl.to_string(),
+                        data_source: tbl.clone(),
                         num_embeddings: search_vectors.len(),
                     });
                 }
@@ -404,8 +415,8 @@ impl VectorSearch {
                 self.df
                     .get_table(data_source.clone())
                     .await
-                    .context(DataSourceNotFoundSnafu {
-                        data_source: data_source.to_string(),
+                    .context(DataSourcesNotFoundSnafu {
+                        data_source: vec![data_source.clone()],
                     })?;
 
             let embedding_models = get_embedding_table(&table)
@@ -423,8 +434,8 @@ impl VectorSearch {
             .df
             .get_table(table.clone())
             .await
-            .context(DataSourceNotFoundSnafu {
-                data_source: table.to_string(),
+            .context(DataSourcesNotFoundSnafu {
+                data_source: vec![table.clone()],
             })?;
 
         let constraint_idx = tbl_ref

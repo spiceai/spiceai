@@ -21,6 +21,7 @@ use arrow::array::{
     Int64Builder, ListArray, ListBuilder, StringBuilder, StructArray, TimestampNanosecondBuilder,
     UInt32Builder, UInt64Builder, UInt8Builder,
 };
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{BufferBuilder, NullBufferBuilder, OffsetBuffer};
 use opentelemetry::metrics::MetricsError;
@@ -303,8 +304,16 @@ impl OtelToArrowConverter {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         OtelToArrowConverter {
-            time_unix_nano_builder: TimestampNanosecondBuilder::with_capacity(capacity),
-            start_time_unix_nano_builder: TimestampNanosecondBuilder::with_capacity(capacity),
+            time_unix_nano_builder: TimestampNanosecondBuilder::with_capacity(capacity)
+                .with_data_type(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                )),
+            start_time_unix_nano_builder: TimestampNanosecondBuilder::with_capacity(capacity)
+                .with_data_type(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                )),
             resource_builder: ResourceBuilder::with_capacity(capacity),
             scope_builder: ScopeBuilder::with_capacity(capacity),
             schema_url_builder: StringBuilder::with_capacity(capacity, capacity),

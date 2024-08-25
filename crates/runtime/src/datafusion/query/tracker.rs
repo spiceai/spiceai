@@ -96,8 +96,8 @@ impl QueryTracker {
         ];
 
         metrics::DURATION_SECONDS.record(query_duration.as_secs_f64(), &labels);
-        telemetry::track_query_duration(query_duration, self.protocol.as_arc_str());
-        telemetry::track_query_execution_duration(
+        crate::metrics::telemetry::track_query_duration(query_duration, self.protocol.as_arc_str());
+        crate::metrics::telemetry::track_query_execution_duration(
             query_execution_duration,
             self.protocol.as_arc_str(),
         );

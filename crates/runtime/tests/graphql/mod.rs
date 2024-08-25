@@ -27,7 +27,7 @@ use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
 
-use crate::{init_tracing, run_query_and_check_results, ValidateFn};
+use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
@@ -231,7 +231,12 @@ async fn test_graphql() -> Result<(), String> {
             "/data/users",
         ))
         .build();
-    let mut rt = Runtime::builder().with_app(app).build().await;
+    let df = get_test_datafusion();
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
@@ -244,13 +249,15 @@ async fn test_graphql() -> Result<(), String> {
         (
             "SELECT * FROM test_graphql",
             vec![
-                "+---------------+------------------------------------------------------+",
-                "| plan_type     | plan                                                 |",
-                "+---------------+------------------------------------------------------+",
-                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |",
-                "| physical_plan | MemoryExec: partitions=1, partition_sizes=[4]        |",
-                "|               |                                                      |",
-                "+---------------+------------------------------------------------------+",
+                "+---------------+-------------------------------------------------+",
+                "| plan_type     | plan                                            |",
+                "+---------------+-------------------------------------------------+",
+                "| logical_plan  | BytesProcessedNode                              |",
+                "|               |   TableScan: test_graphql                       |",
+                "| physical_plan | BytesProcessedExec                              |",
+                "|               |   MemoryExec: partitions=1, partition_sizes=[4] |",
+                "|               |                                                 |",
+                "+---------------+-------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 for batch in result_batches {
@@ -266,9 +273,12 @@ async fn test_graphql() -> Result<(), String> {
                 "| plan_type     | plan                                                                                                      |",
                 "+---------------+-----------------------------------------------------------------------------------------------------------+",
                 "| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8(\"title\"))                         |",
-                "|               |   TableScan: test_graphql projection=[posts]                                                              |",
-                "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]] |",
-                "|               |   MemoryExec: partitions=1, partition_sizes=[4]                                                           |",
+                "|               |   BytesProcessedNode                                                                                      |",
+                "|               |     TableScan: test_graphql                                                                               |",
+                "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@2, 1), title) as test_graphql.posts[Int64(1)][title]] |",
+                "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                    |",
+                "|               |     BytesProcessedExec                                                                                    |",
+                "|               |       MemoryExec: partitions=1, partition_sizes=[4]                                                       |",
                 "|               |                                                                                                           |",
                 "+---------------+-----------------------------------------------------------------------------------------------------------+",
             ],
@@ -307,7 +317,12 @@ async fn test_graphql_pagination() -> Result<(), String> {
             "/data/paginatedUsers/users",
         ))
         .build();
-    let mut rt = Runtime::builder().with_app(app).build().await;
+    let df = get_test_datafusion();
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
@@ -320,13 +335,15 @@ async fn test_graphql_pagination() -> Result<(), String> {
         (
             "SELECT * FROM test_graphql",
             vec![
-                "+---------------+------------------------------------------------------+",
-                "| plan_type     | plan                                                 |",
-                "+---------------+------------------------------------------------------+",
-                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |",
-                "| physical_plan | MemoryExec: partitions=2, partition_sizes=[2, 2]     |",
-                "|               |                                                      |",
-                "+---------------+------------------------------------------------------+",
+                "+---------------+----------------------------------------------------+",
+                "| plan_type     | plan                                               |",
+                "+---------------+----------------------------------------------------+",
+                "| logical_plan  | BytesProcessedNode                                 |",
+                "|               |   TableScan: test_graphql                          |",
+                "| physical_plan | BytesProcessedExec                                 |",
+                "|               |   MemoryExec: partitions=2, partition_sizes=[2, 2] |",
+                "|               |                                                    |",
+                "+---------------+----------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 let mut total = 0;
@@ -341,19 +358,22 @@ async fn test_graphql_pagination() -> Result<(), String> {
         (
             "SELECT * FROM test_graphql where id = '4' limit 1",
             vec![
-                "+---------------+----------------------------------------------------------+",
-                "| plan_type     | plan                                                     |",
-                "+---------------+----------------------------------------------------------+",
-                "| logical_plan  | Limit: skip=0, fetch=1                                   |",
-                "|               |   Filter: test_graphql.id = Utf8(\"4\")                    |",
-                "|               |     TableScan: test_graphql projection=[id, name, posts] |",
-                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                         |",
-                "|               |   CoalescePartitionsExec                                 |",
-                "|               |     CoalesceBatchesExec: target_batch_size=8192, fetch=1 |",
-                "|               |       FilterExec: id@0 = 4                               |",
-                "|               |         MemoryExec: partitions=2, partition_sizes=[2, 2] |",
-                "|               |                                                          |",
-                "+---------------+----------------------------------------------------------+",
+                "+---------------+------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                         |",
+                "+---------------+------------------------------------------------------------------------------+",
+                "| logical_plan  | Limit: skip=0, fetch=1                                                       |",
+                "|               |   Filter: test_graphql.id = Utf8(\"4\")                                        |",
+                "|               |     BytesProcessedNode                                                       |",
+                "|               |       TableScan: test_graphql                                                |",
+                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                                             |",
+                "|               |   CoalescePartitionsExec                                                     |",
+                "|               |     CoalesceBatchesExec: target_batch_size=8192, fetch=1                     |",
+                "|               |       FilterExec: id@0 = 4                                                   |",
+                "|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2 |",
+                "|               |           BytesProcessedExec                                                 |",
+                "|               |             MemoryExec: partitions=2, partition_sizes=[2, 2]                 |",
+                "|               |                                                                              |",
+                "+---------------+------------------------------------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 let mut total = 0;
