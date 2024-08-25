@@ -2945,8 +2945,9 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=21cfcc8cbc668b33235df52f16ea002f72efc74d#21cfcc8cbc668b33235df52f16ea002f72efc74d"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=e0a4eaef873949c4f4bb3edf64e411821e62dcb2#e0a4eaef873949c4f4bb3edf64e411821e62dcb2"
 dependencies = [
+ "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",
@@ -2956,7 +2957,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=21cfcc8cbc668b33235df52f16ea002f72efc74d#21cfcc8cbc668b33235df52f16ea002f72efc74d"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=e0a4eaef873949c4f4bb3edf64e411821e62dcb2#e0a4eaef873949c4f4bb3edf64e411821e62dcb2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -3154,7 +3155,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a20e87ed05286bf5a4b98e27b8ab46571ce36a28#a20e87ed05286bf5a4b98e27b8ab46571ce36a28"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b2cac6789de4012a787096ec2c65de1b28502d36#b2cac6789de4012a787096ec2c65de1b28502d36"
 dependencies = [
  "arrow",
  "async-stream",
