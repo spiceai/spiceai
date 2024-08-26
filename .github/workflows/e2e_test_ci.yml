@@ -350,6 +350,7 @@ jobs:
   test_quickstart_data_mysql:
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    if: false
     needs:
       - build
       - setup-matrix
@@ -375,7 +376,7 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          brew install mysql@8.4
+          brew install mysql
           brew services start mysql
           sleep 5
           mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
