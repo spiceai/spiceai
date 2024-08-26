@@ -47,9 +47,8 @@ use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
-use datafusion_federation::{
-    FederatedQueryPlanner, FederatedTableProviderAdaptor, FederationAnalyzerRule,
-};
+use datafusion_federation::{FederatedTableProviderAdaptor, FederationAnalyzerRule};
+use extension::{bytes_processed::BytesProcessedAnalyzerRule, SpiceQueryPlanner};
 use query::{Protocol, QueryBuilder};
 use snafu::prelude::*;
 use tokio::spawn;
@@ -59,6 +58,7 @@ use tokio::time::{sleep, Instant};
 
 pub mod query;
 
+mod extension;
 pub mod filter_converter;
 pub mod initial_load;
 pub mod refresh_sql;
@@ -257,12 +257,13 @@ impl DataFusion {
         let state = SessionStateBuilder::new()
             .with_config(df_config)
             .with_default_features()
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
             .with_runtime_env(default_runtime_env())
             .build();
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
+        ctx.add_analyzer_rule(Arc::new(BytesProcessedAnalyzerRule::new()));
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
         ctx.register_udf(crate::datafusion::udf::Least::new().into());
@@ -728,6 +729,10 @@ impl DataFusion {
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
+
+        if acceleration_settings.disable_query_push_down {
+            accelerated_table_builder.disable_query_push_down();
+        }
 
         if refresh_mode == RefreshMode::Changes {
             let source = Box::leak(Box::new(Arc::clone(&source)));

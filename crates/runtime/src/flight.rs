@@ -42,7 +42,7 @@ use tokio::sync::RwLock;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
-mod actions;
+pub mod actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
@@ -157,8 +157,12 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: &str) -> Result<Schema, Status> {
-        let query = QueryBuilder::new(sql, datafusion, Protocol::Flight).build();
+    async fn get_arrow_schema(
+        datafusion: Arc<DataFusion>,
+        sql: &str,
+        protocol: Protocol,
+    ) -> Result<Schema, Status> {
+        let query = QueryBuilder::new(sql, datafusion, protocol).build();
 
         let schema = match query.get_schema().await {
             Ok(schema) => schema,
@@ -184,10 +188,11 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
+        protocol: Protocol,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion), Protocol::Flight)
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion), protocol)
             .use_restricted_sql_options()
-            .protocol(Protocol::Flight)
+            .protocol(protocol)
             .build();
 
         let query_result = query.run().await.map_err(to_tonic_err)?;

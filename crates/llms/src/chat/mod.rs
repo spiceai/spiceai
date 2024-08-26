@@ -17,7 +17,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
@@ -213,11 +213,16 @@ pub trait Chat: Sync + Send {
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
-        self.run("health".to_string())
-            .instrument(span)
+        if let Err(e) = self
+            .run("health".to_string())
+            .instrument(span.clone())
             .await
-            .boxed()
-            .context(HealthCheckSnafu)?;
+        {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(Error::HealthCheckError {
+                source: Box::new(e),
+            });
+        }
         Ok(())
     }
 

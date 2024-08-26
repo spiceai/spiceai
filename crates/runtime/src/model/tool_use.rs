@@ -18,493 +18,48 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use std::pin::Pin;
-use std::str::FromStr;
 use std::task::{Context, Poll};
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
-use datafusion::sql::TableReference;
 use itertools::Itertools;
 use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
 };
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
-use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use snafu::ResultExt;
+use futures::{Stream, StreamExt};
+use serde_json::Value;
+
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
-use crate::datafusion::query::Protocol;
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::embeddings::vector_search::{parse_explicit_primary_keys, VectorSearch};
+use crate::tools::builtin::list_datasets::{get_dataset_elements, ListDatasetElement};
+use crate::tools::SpiceModelTool;
 use crate::Runtime;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SpiceToolsOptions {
-    Auto,
-    Disabled,
-    Specific(Vec<String>),
-}
-
-impl SpiceToolsOptions {
-    // Check if spice tools can be used.
-    pub fn can_use_tools(&self) -> bool {
-        match self {
-            SpiceToolsOptions::Auto => true,
-            SpiceToolsOptions::Disabled => false,
-            SpiceToolsOptions::Specific(t) => !t.is_empty(),
-        }
-    }
-
-    /// Filter out a list of tools permitted by the  [`SpiceToolsOptions`].
-    pub fn filter_tools(
-        &self,
-        tools: Vec<Box<dyn SpiceModelTool>>,
-    ) -> Vec<Box<dyn SpiceModelTool>> {
-        match self {
-            SpiceToolsOptions::Auto => tools,
-            SpiceToolsOptions::Disabled => vec![],
-            SpiceToolsOptions::Specific(t) => tools
-                .into_iter()
-                .filter(|tool| t.iter().any(|s| s == tool.name()))
-                .collect(),
-        }
-    }
-}
-
-impl FromStr for SpiceToolsOptions {
-    type Err = Box<dyn std::error::Error + Send + Sync>;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "auto" => Ok(SpiceToolsOptions::Auto),
-            "disabled" => Ok(SpiceToolsOptions::Disabled),
-            _ => Ok(SpiceToolsOptions::Specific(
-                s.split(',')
-                    .map(|item| item.trim().to_string())
-                    .filter(|item| !item.is_empty())
-                    .collect(),
-            )),
-        }
-    }
-}
-
-/// Tools that implement this trait can be automatically used by LLMs in the runtime.
-#[async_trait]
-pub trait SpiceModelTool: Sync + Send {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> Option<&'static str>;
-    fn parameters(&self) -> Option<Value>;
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-static DOCUMENT_SIMILARITY_PARAMETERS: Lazy<Value> = Lazy::new(|| {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "description": "The text to search documents for similarity",
-            },
-            "from": {
-                "type": "array",
-                "items": {
-                    "type": "string"
-                },
-                "description": "The datasets to search for similarity. For available datasets, use the 'list_datasets' tool",
-                "default": []
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Number of documents to return for each dataset",
-                "default": 3
-            }
-        },
-        "required": ["text", "from"],
-        "additionalProperties": false
-    })
-});
-
-#[derive(Deserialize)]
-struct DocumentSimilarityToolArgs {
-    text: String,
-    from: Vec<String>,
-    limit: Option<usize>,
-}
-pub struct DocumentSimilarityTool {}
-impl DocumentSimilarityTool {
-    /// Format the document & primary keys retrieved from a [`VectorSearch::search`] into a format suitable as a tool response.
-    ///
-    /// The format is:
-    /// ```json
-    /// [
-    ///    {
-    ///       "document": "document text",
-    ///       "primary_key": {
-    ///         "column_name": "value1",
-    ///         "column_name2": "value2"
-    ///       }
-    ///   },
-    /// ]
-    fn format_table_response(
-        documents: &Vec<String>,
-        primary_keys: &[RecordBatch],
-    ) -> serde_json::Value {
-        let flatten_formatted_pks = Self::format_primary_keys(primary_keys);
-        Value::Array(
-            flatten_formatted_pks
-                .iter()
-                .zip_longest(documents)
-                .map(|zip| {
-                    let (pk_map_opt, document) = match zip {
-                        itertools::EitherOrBoth::Both(pk_batch, document) => {
-                            (Some(pk_batch), document.to_string())
-                        }
-                        itertools::EitherOrBoth::Left(pk_batch) => (Some(pk_batch), String::new()),
-                        itertools::EitherOrBoth::Right(document) => (None, document.to_string()),
-                    };
-                    let mut z = Map::new();
-                    z.insert("document".to_string(), Value::String(document));
-                    if let Some(pk_map) = pk_map_opt {
-                        z.insert("primary_key".to_string(), Value::Object(pk_map.clone()));
-                    }
-                    Value::Object(z)
-                })
-                .collect_vec(),
-        )
-    }
-
-    fn format_primary_keys(rb: &[RecordBatch]) -> Vec<serde_json::Map<String, Value>> {
-        let mut result = Vec::new();
-        for batch in rb {
-            (0..batch.num_rows()).for_each(|i| {
-                let mut pk_map = serde_json::Map::new();
-                batch.schema().fields().iter().for_each(|field| {
-                    let col_name = field.name().clone();
-                    if let Some(array) = batch.column_by_name(&col_name) {
-                        if let Some(str_array) = array.as_any().downcast_ref::<StringArray>() {
-                            pk_map.insert(col_name, Value::String(str_array.value(i).to_string()));
-                        } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
-                            pk_map.insert(col_name, Value::Number(array.value(i).into()));
-                        }
-                    };
-                });
-                result.push(pk_map);
-            });
-        }
-
-        result
-    }
-}
-
-#[async_trait]
-impl SpiceModelTool for DocumentSimilarityTool {
-    fn name(&self) -> &'static str {
-        "document_similarity"
-    }
-
-    fn description(&self) -> Option<&'static str> {
-        Some("Search and retrieve documents from available datasets")
-    }
-
-    fn parameters(&self) -> Option<Value> {
-        Some(DOCUMENT_SIMILARITY_PARAMETERS.clone())
-    }
-
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name(), input = arg);
-        let args: DocumentSimilarityToolArgs = serde_json::from_str(arg)?;
-
-        let text = args.text;
-        let datasets = args
-            .from
-            .iter()
-            .map(|d| TableReference::parse_str(d))
-            .collect_vec();
-
-        let limit = args.limit.unwrap_or(3);
-
-        // TODO: implement `explicit_primary_keys` parsing from rt.app
-        let vs = VectorSearch::new(
-            rt.datafusion(),
-            Arc::clone(&rt.embeds),
-            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
-        );
-
-        let result = vs
-            .search(
-                text,
-                datasets,
-                crate::embeddings::vector_search::RetrievalLimit::TopN(limit),
-            )
-            .instrument(span.clone())
-            .await
-            .boxed()?;
-
-        Ok(Value::Object(
-            result
-                .retrieved_entries
-                .iter()
-                .map(|(dataset, documents)| {
-                    let empty = Vec::new();
-                    let primary_keys = result.retrieved_primary_keys.get(dataset).unwrap_or(&empty);
-                    (
-                        dataset.to_string(),
-                        Self::format_table_response(documents, primary_keys),
-                    )
-                })
-                .collect(),
-        ))
-    }
-}
-
-pub struct ListTablesTool {}
-
-#[async_trait]
-impl SpiceModelTool for ListTablesTool {
-    fn name(&self) -> &'static str {
-        "list_tables"
-    }
-
-    fn description(&self) -> Option<&'static str> {
-        Some("List all SQL tables available")
-    }
-
-    fn parameters(&self) -> Option<Value> {
-        None
-    }
-
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_tables", tool = self.name(), input = arg);
-        if let Some(app) = &*rt.app.read().instrument(span.clone()).await {
-            Ok(Value::Array(
-                app.datasets
-                    .iter()
-                    .map(|d| {
-                        Value::String(
-                            TableReference::parse_str(&d.name)
-                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                                .to_string(),
-                        )
-                    })
-                    .collect::<Vec<Value>>(),
-            ))
-        } else {
-            Ok(Value::Array(vec![]))
-        }
-    }
-}
-
-pub struct ListDatasetsTool {}
-
-#[async_trait]
-impl SpiceModelTool for ListDatasetsTool {
-    fn name(&self) -> &'static str {
-        "list_datasets"
-    }
-
-    fn description(&self) -> Option<&'static str> {
-        Some("List all datasets that contain searchable documents")
-    }
-
-    fn parameters(&self) -> Option<Value> {
-        None
-    }
-
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
-        let embedding_datasets = match &*rt.app.read().instrument(span.clone()).await {
-            Some(app) => app
-                .datasets
-                .iter()
-                .filter(|d| !d.embeddings.is_empty())
-                .map(|d| {
-                    json!({
-                        "name": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
-                        "description": d.description,
-                        "metadata": d.metadata,
-                    })
-                })
-                .collect_vec(),
-            None => vec![],
-        };
-
-        Ok(Value::Array(embedding_datasets))
-    }
-}
-
-pub struct TableSchemaTool {}
-static TABLE_SCHEMA_PARAMETERS: Lazy<Value> = Lazy::new(|| {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "tables": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            },
-            "description": "Which subset of tables to return results for. Default to all tables.",
-        },
-        },
-        "required": [],
-        "additionalProperties": false,
-    })
-});
-
-#[async_trait]
-impl SpiceModelTool for TableSchemaTool {
-    fn name(&self) -> &'static str {
-        "table_schema"
-    }
-
-    fn description(&self) -> Option<&'static str> {
-        Some("Retrieve the schema of all available SQL tables")
-    }
-
-    fn parameters(&self) -> Option<Value> {
-        Some(TABLE_SCHEMA_PARAMETERS.clone())
-    }
-
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = arg);
-        let arg_v = Value::from_str(arg).boxed()?;
-        // TODO support default == all tables
-        let tables: Vec<String> = arg_v["tables"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|t| t.as_str().unwrap_or_default().to_string())
-            .filter(|t| !t.is_empty())
-            .collect_vec();
-
-        let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
-        for t in &tables {
-            let schema = rt
-                .datafusion()
-                .get_arrow_schema(t)
-                .instrument(span.clone())
-                .await
-                .boxed()?;
-
-            // Should use a better structure
-            table_create_stms.push(schema.to_string());
-        }
-        Ok(Value::String(table_create_stms.join("\n")))
-    }
-}
-
-pub struct SqlTool {}
-static SQL_PARAMETERS: Lazy<Value> = Lazy::new(|| {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The table_catalog is 'spice'. Always use it in the query",
-            },
-        },
-        "required": ["query"],
-        "additionalProperties": false,
-    })
-});
-
-#[async_trait]
-impl SpiceModelTool for SqlTool {
-    fn name(&self) -> &'static str {
-        "sql"
-    }
-
-    fn description(&self) -> Option<&'static str> {
-        Some("Run an SQL query on the data source")
-    }
-
-    fn parameters(&self) -> Option<Value> {
-        Some(SQL_PARAMETERS.clone())
-    }
-
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
-        let arg_v = Value::from_str(arg).boxed()?;
-        let q = arg_v["query"].as_str().unwrap_or_default();
-
-        let query_result = rt
-            .datafusion()
-            .query_builder(q, Protocol::Flight)
-            .build()
-            .run()
-            .instrument(span.clone())
-            .await
-            .boxed()?;
-        let batches = query_result
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .instrument(span.clone())
-            .await
-            .boxed()?;
-
-        let buf = Vec::new();
-        let mut writer = arrow_json::ArrayWriter::new(buf);
-        writer.write_batches(batches.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
-        Ok(Value::String(String::from_utf8(writer.into_inner())?))
-    }
-}
 
 pub struct ToolUsingChat {
     inner_chat: Arc<Box<dyn Chat>>,
     rt: Arc<Runtime>,
-    tools: Vec<Box<dyn SpiceModelTool>>,
-    opts: SpiceToolsOptions,
+    tools: Vec<Arc<dyn SpiceModelTool>>,
 }
 
 impl ToolUsingChat {
-    pub fn new(inner_chat: Arc<Box<dyn Chat>>, rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Self {
+    pub fn new(
+        inner_chat: Arc<Box<dyn Chat>>,
+        rt: Arc<Runtime>,
+        tools: Vec<Arc<dyn SpiceModelTool>>,
+    ) -> Self {
         Self {
             inner_chat,
             rt,
-            tools: opts.filter_tools(vec![
-                Box::new(DocumentSimilarityTool {}),
-                Box::new(ListDatasetsTool {}),
-                Box::new(TableSchemaTool {}),
-                Box::new(SqlTool {}),
-                Box::new(ListTablesTool {}),
-            ]),
-            opts: opts.clone(),
+            tools,
         }
     }
 
@@ -520,6 +75,60 @@ impl ToolUsingChat {
                 },
             })
             .collect_vec()
+    }
+
+    /// When there are runtime tools available, create a system prompt describing the capabilities
+    fn runtime_tool_system_prompt(&self) -> Option<String> {
+        let tool_names = self
+            .runtime_tools()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect_vec();
+
+        if tool_names.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "You have access to the following runtime tools: {}.",
+            tool_names.join(", ")
+        ))
+    }
+
+    /// Creates content for a system prompt that lists all available tables in the runtime.
+    async fn available_tables_system_prompt(&self) -> Option<String> {
+        let datasets = get_dataset_elements(Arc::clone(&self.rt), None).await;
+
+        Some(format!(
+            "The following datasets are available in the runtime: \n{}",
+            datasets
+                .iter()
+                .map(ListDatasetElement::to_text_llms)
+                .join("\n---\n")
+        ))
+    }
+
+    /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
+    async fn prepare_req(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
+        let content = format!(
+            "You have access to a runtime. {} {}",
+            self.available_tables_system_prompt()
+                .await
+                .unwrap_or_default(),
+            self.runtime_tool_system_prompt().unwrap_or_default(),
+        );
+
+        let message = ChatCompletionRequestSystemMessageArgs::default()
+            .content(content)
+            .build()?;
+
+        let mut req = req.clone();
+        req.messages
+            .insert(0, ChatCompletionRequestMessage::System(message));
+        Ok(req)
     }
 
     /// Check if a tool call is a spiced runtime tool.
@@ -540,7 +149,7 @@ impl ToolUsingChat {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!(target: "task_history", "{e}");
-                        Value::String(format!("Error calling tool {}", t.name()))
+                        Value::String(format!("Error calling tool {}. Error: {e}", t.name()))
                     }
                 }
             }
@@ -630,82 +239,67 @@ impl Chat for ToolUsingChat {
         self.inner_chat.stream(prompt).await
     }
 
-    /// TODO: If response messages has ChatCompletionMessageToolCall that are spiced runtime tools, call locally, and pass back.
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
-        );
+        let mut inner_req = self.prepare_req(&req).await?;
+
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-        if req
+        if inner_req
             .tool_choice
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
-            return self.inner_chat.chat_stream(req).instrument(span).await;
+            return self.inner_chat.chat_stream(inner_req).await;
         };
 
         // Append spiced runtime tools to the request.
-        let mut inner_req = req.clone();
         let mut runtime_tools = self.runtime_tools();
         if !runtime_tools.is_empty() {
-            runtime_tools.extend(req.tools.clone().unwrap_or_default());
+            runtime_tools.extend(inner_req.tools.clone().unwrap_or_default());
             inner_req.tools = Some(runtime_tools);
         };
 
-        let s = self
-            .inner_chat
-            .chat_stream(inner_req)
-            .instrument(span.clone())
-            .await?;
+        let s = self.inner_chat.chat_stream(inner_req).await?;
+
         Ok(make_a_stream(
-            span,
+            Span::current(),
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
-                &self.opts,
+                self.tools.clone(),
             ),
             req.clone(),
             s,
         ))
     }
 
-    /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
-    /// implementation will be constructed based on the trait's [`run`] method.
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", input = %serde_json::to_string(&req).unwrap_or_default());
-        span.in_scope(
-            || tracing::info!(name: "labels", target: "task_history", model = %req.model),
-        );
+        let inner_req = self.prepare_req(&req).await?;
+
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-        if req
+        if inner_req
             .tool_choice
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_chat.chat_request(req).instrument(span).await;
+            return self.inner_chat.chat_request(inner_req).await;
         };
 
         // Append spiced runtime tools to the request.
-        let mut inner_req = req.clone();
+        let mut inner_req = inner_req.clone();
         let mut runtime_tools = self.runtime_tools();
         if !runtime_tools.is_empty() {
-            runtime_tools.extend(req.tools.unwrap_or_default());
+            runtime_tools.extend(inner_req.tools.unwrap_or_default());
             inner_req.tools = Some(runtime_tools);
         };
 
-        let resp = self
-            .inner_chat
-            .chat_request(inner_req)
-            .instrument(span.clone())
-            .await?;
+        let resp = self.inner_chat.chat_request(inner_req).await?;
 
         let tools_used = resp
             .choices
@@ -714,7 +308,6 @@ impl Chat for ToolUsingChat {
 
         match self
             .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
-            .instrument(span.clone())
             .await?
         {
             // New messages means we have run spice tools locally, ready to recall model.
@@ -723,7 +316,7 @@ impl Chat for ToolUsingChat {
                     .model(req.model)
                     .messages(messages)
                     .build()?;
-                self.chat_request(new_req).instrument(span.clone()).await
+                self.chat_request(new_req).await
             }
             None => Ok(resp),
         }
@@ -769,7 +362,6 @@ fn make_a_stream(
                         return;
                     }
                 };
-
                 let mut finished_choices: Vec<ChatChoiceStream> = vec![];
                 for chat_choice1 in &response.choices {
                     let chat_choice = chat_choice1.clone();

@@ -25,6 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    datafusion::query::Protocol,
     flight::{metrics, util::attach_cache_metadata},
     timing::{TimeMeasurement, TimedStream},
 };
@@ -78,8 +79,12 @@ async fn do_get_simple(
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
             let start = TimeMeasurement::new(&metrics::DO_GET_SIMPLE_DURATION_MS, vec![]);
-            let (output, from_cache) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
+            let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
+                datafusion,
+                sql,
+                Protocol::Flight,
+            ))
+            .await?;
 
             let timed_output = TimedStream::new(output, move || start);
 

@@ -44,7 +44,7 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     let _span_guard = span.enter();
 
     let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
+    let http_port: u16 = rng.gen_range(50000..59990);
     let flight_port: u16 = http_port + 1;
     let otel_port: u16 = http_port + 2;
     let metrics_port: u16 = http_port + 3;

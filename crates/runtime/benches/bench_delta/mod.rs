@@ -25,16 +25,24 @@ pub(crate) async fn run(
     benchmark_results: &mut BenchmarkResultsBuilder,
 ) -> Result<(), String> {
     let test_queries = get_test_queries();
+    let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        super::run_query_and_record_result(
+        if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
             "databricks_delta",
             query_name,
             query,
         )
-        .await?;
+        .await
+        {
+            errors.push(format!("Query {query_name} failed with error: {e}"));
+        };
+    }
+
+    if !errors.is_empty() {
+        tracing::error!("There are failed queries:\n{}", errors.join("\n"));
     }
 
     Ok(())

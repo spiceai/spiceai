@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, sync::Arc};
+use std::{
+    cell::LazyCell,
+    sync::{Arc, LazyLock},
+};
 
 use arrow::{
     array::RecordBatch,
@@ -26,9 +29,11 @@ use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
+    prelude::DataFrame,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
+use tokio::time::Instant;
 use tracing::Span;
 use tracing_futures::Instrument;
 pub(crate) use tracker::QueryTracker;
@@ -69,6 +74,25 @@ pub enum Error {
 pub enum Protocol {
     Http,
     Flight,
+    FlightSQL,
+    Internal,
+}
+
+static HTTP: LazyLock<Arc<str>> = LazyLock::new(|| "http".into());
+static FLIGHT: LazyLock<Arc<str>> = LazyLock::new(|| "flight".into());
+static FLIGHTSQL: LazyLock<Arc<str>> = LazyLock::new(|| "flightsql".into());
+static INTERNAL: LazyLock<Arc<str>> = LazyLock::new(|| "internal".into());
+
+impl Protocol {
+    #[must_use]
+    pub fn as_arc_str(&self) -> Arc<str> {
+        match self {
+            Protocol::Http => Arc::clone(&HTTP),
+            Protocol::Flight => Arc::clone(&FLIGHT),
+            Protocol::FlightSQL => Arc::clone(&FLIGHTSQL),
+            Protocol::Internal => Arc::clone(&INTERNAL),
+        }
+    }
 }
 
 impl std::fmt::Display for Protocol {
@@ -76,6 +100,8 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::Http => write!(f, "http"),
             Protocol::Flight => write!(f, "flight"),
+            Protocol::FlightSQL => write!(f, "flightsql"),
+            Protocol::Internal => write!(f, "internal"),
         }
     }
 }
@@ -98,11 +124,10 @@ pub struct Query {
 }
 
 macro_rules! handle_error {
-    ($span:expr, $self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
+    ($self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
         $self
             .finish_with_error(snafu_error.to_string(), $error_code)
-            .instrument($span)
             .await;
         return Err(snafu_error);
     }};
@@ -111,7 +136,7 @@ macro_rules! handle_error {
 impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
-        telemetry::QUERY_COUNT.add(1, &[]);
+        crate::metrics::telemetry::track_query_count();
         let span = match &self.tracker.nsql {
             Some(nsql) => {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
@@ -120,152 +145,147 @@ impl Query {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
             }
         };
-        let session = self.df.ctx.state();
 
-        let ctx = self;
-        let mut tracker = ctx.tracker;
+        let inner_span = span.clone();
+        let query_result = async {
+            let mut session = self.df.ctx.state();
 
-        let plan = match session
-            .create_logical_plan(&ctx.sql)
-            .instrument(span.clone())
-            .await
-        {
-            Ok(plan) => plan,
-            Err(e) => {
-                let error_code = ErrorCode::from(&e);
-                handle_error!(span.clone(), tracker, error_code, e, UnableToExecuteQuery)
-            }
-        };
+            let ctx = self;
+            let mut tracker = ctx.tracker;
 
-        let mut plan_is_cache_enabled = false;
-        let plan_cache_key = cache::key_for_logical_plan(&plan);
+            // Sets the protocol as an extension on DataFusion, to allow recovering it to track telemetry
+            session
+                .config_mut()
+                .set_extension(Arc::new(tracker.protocol));
 
-        if let Some(cache_provider) = &ctx.df.cache_provider() {
-            if let Some(cached_result) =
-                match cache_provider.get(&plan).instrument(span.clone()).await {
-                    Ok(Some(v)) => Some(v),
-                    Ok(None) => None,
-                    Err(e) => handle_error!(
-                        span.clone(),
-                        tracker,
-                        ErrorCode::InternalError,
-                        e,
-                        FailedToAccessCache
-                    ),
-                }
-            {
-                tracker = tracker
-                    .datasets(cached_result.input_tables)
-                    .results_cache_hit(true);
-
-                let record_batch_stream = match MemoryStream::try_new(
-                    cached_result.records.to_vec(),
-                    cached_result.schema,
-                    None,
-                ) {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        handle_error!(
-                            span.clone(),
-                            tracker,
-                            ErrorCode::InternalError,
-                            e,
-                            UnableToCreateMemoryStream
-                        )
-                    }
-                };
-
-                return Ok(QueryResult::new(
-                    attach_query_tracker_to_stream(span, tracker, Box::pin(record_batch_stream)),
-                    Some(true),
-                ));
-            }
-
-            plan_is_cache_enabled = cache_provider.cache_is_enabled_for_plan(&plan);
-            tracker = tracker.results_cache_hit(false);
-        }
-
-        if ctx.restricted_sql_options {
-            if let Err(e) =
-                RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
-            {
-                handle_error!(
-                    span.clone(),
-                    tracker,
-                    ErrorCode::QueryPlanningError,
-                    e,
-                    UnableToExecuteQuery
-                )
-            }
-        }
-
-        let input_tables = get_logical_plan_input_tables(&plan);
-        if input_tables
-            .iter()
-            .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
-        {
-            span.record("runtime_query", true);
-        }
-
-        tracker = tracker.datasets(Arc::new(input_tables));
-
-        let df = match ctx
-            .df
-            .ctx
-            .execute_logical_plan(plan)
-            .instrument(span.clone())
-            .await
-        {
-            Ok(df) => df,
-            Err(e) => {
-                let error_code = ErrorCode::from(&e);
-                handle_error!(span.clone(), tracker, error_code, e, UnableToExecuteQuery)
-            }
-        };
-
-        let df_schema: SchemaRef = Arc::clone(df.schema().inner());
-
-        let res_stream: SendableRecordBatchStream =
-            match df.execute_stream().instrument(span.clone()).await {
-                Ok(stream) => stream,
+            let plan = match session.create_logical_plan(&ctx.sql).await {
+                Ok(plan) => plan,
                 Err(e) => {
                     let error_code = ErrorCode::from(&e);
-                    handle_error!(span.clone(), tracker, error_code, e, UnableToExecuteQuery)
+                    handle_error!(tracker, error_code, e, UnableToExecuteQuery)
                 }
             };
 
-        let res_schema = res_stream.schema();
+            let mut plan_is_cache_enabled = false;
+            let plan_cache_key = cache::key_for_logical_plan(&plan);
 
-        if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-            handle_error!(
-                span.clone(),
-                tracker,
-                ErrorCode::InternalError,
-                e,
-                SchemaMismatch
-            )
-        };
-
-        if plan_is_cache_enabled {
             if let Some(cache_provider) = &ctx.df.cache_provider() {
-                let record_batch_stream = to_cached_record_batch_stream(
-                    Arc::clone(cache_provider),
-                    res_stream,
-                    plan_cache_key,
-                    Arc::clone(&tracker.datasets),
-                );
+                if let Some(cached_result) = match cache_provider.get(&plan).await {
+                    Ok(Some(v)) => Some(v),
+                    Ok(None) => None,
+                    Err(e) => {
+                        handle_error!(tracker, ErrorCode::InternalError, e, FailedToAccessCache)
+                    }
+                } {
+                    tracker = tracker
+                        .datasets(cached_result.input_tables)
+                        .results_cache_hit(true);
 
-                return Ok(QueryResult::new(
-                    attach_query_tracker_to_stream(span, tracker, record_batch_stream),
-                    Some(false),
-                ));
+                    let record_batch_stream = match MemoryStream::try_new(
+                        cached_result.records.to_vec(),
+                        cached_result.schema,
+                        None,
+                    ) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            handle_error!(
+                                tracker,
+                                ErrorCode::InternalError,
+                                e,
+                                UnableToCreateMemoryStream
+                            )
+                        }
+                    };
+
+                    return Ok(QueryResult::new(
+                        attach_query_tracker_to_stream(
+                            inner_span,
+                            tracker,
+                            Box::pin(record_batch_stream),
+                        ),
+                        Some(true),
+                    ));
+                }
+
+                plan_is_cache_enabled = cache_provider.cache_is_enabled_for_plan(&plan);
+                tracker = tracker.results_cache_hit(false);
+            }
+
+            if ctx.restricted_sql_options {
+                if let Err(e) =
+                    RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
+                {
+                    handle_error!(
+                        tracker,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+            }
+
+            let input_tables = get_logical_plan_input_tables(&plan);
+            if input_tables
+                .iter()
+                .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+            {
+                inner_span.record("runtime_query", true);
+            }
+
+            tracker = tracker.datasets(Arc::new(input_tables));
+
+            // Start the timer for the query execution
+            tracker.query_execution_duration_timer = Instant::now();
+
+            let df = DataFrame::new(session, plan);
+
+            let df_schema: SchemaRef = Arc::clone(df.schema().inner());
+
+            let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(tracker, error_code, e, UnableToExecuteQuery)
+                }
+            };
+
+            let res_schema = res_stream.schema();
+
+            if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
+                handle_error!(tracker, ErrorCode::InternalError, e, SchemaMismatch)
+            };
+
+            if plan_is_cache_enabled {
+                if let Some(cache_provider) = &ctx.df.cache_provider() {
+                    let record_batch_stream = to_cached_record_batch_stream(
+                        Arc::clone(cache_provider),
+                        res_stream,
+                        plan_cache_key,
+                        Arc::clone(&tracker.datasets),
+                    );
+
+                    return Ok(QueryResult::new(
+                        attach_query_tracker_to_stream(inner_span, tracker, record_batch_stream),
+                        Some(false),
+                    ));
+                }
+            }
+
+            Ok(QueryResult::new(
+                attach_query_tracker_to_stream(inner_span, tracker, res_stream),
+                None,
+            ))
+        }
+        .instrument(span.clone())
+        .await;
+
+        match query_result {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
             }
         }
-
-        Ok(QueryResult::new(
-            attach_query_tracker_to_stream(span, tracker, res_stream),
-            None,
-        ))
     }
 
     pub async fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
@@ -297,9 +317,11 @@ fn attach_query_tracker_to_stream(
     let schema_copy = Arc::clone(&schema);
 
     let mut num_records = 0u64;
+    let mut num_output_bytes = 0u64;
 
     let mut truncated_output = "[]".to_string(); // default to empty preview
 
+    let inner_span = span.clone();
     let updated_stream = stream! {
         while let Some(batch_result) = stream.next().await {
 
@@ -310,19 +332,24 @@ fn attach_query_tracker_to_stream(
                         truncated_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
                     }
 
+                    num_output_bytes += batch.get_array_memory_size() as u64;
+
                     num_records += batch.num_rows() as u64;
                     yield batch_result
                 }
                 Err(e) => {
                     ctx
-                    .schema(schema_copy)
-                    .rows_produced(num_records)
-                    .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError).await;
+                        .schema(schema_copy)
+                        .rows_produced(num_records)
+                        .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError).await;
+                    tracing::error!(target: "task_history", parent: &inner_span, "{e}");
                     yield batch_result;
                     return;
                 }
             }
         }
+
+        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
 
         ctx
             .schema(schema_copy)

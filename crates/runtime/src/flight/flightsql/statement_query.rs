@@ -25,6 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    datafusion::query::Protocol,
     flight::{metrics, to_tonic_err, util::attach_cache_metadata, Service},
     timing::{TimeMeasurement, TimedStream},
 };
@@ -39,9 +40,10 @@ pub(crate) async fn get_flight_info(
 
     let sql = query.query.as_str();
 
-    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
-        .await
-        .map_err(to_tonic_err)?;
+    let arrow_schema =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql, Protocol::FlightSQL)
+            .await
+            .map_err(to_tonic_err)?;
 
     let fd = request.into_inner();
 
@@ -68,8 +70,12 @@ pub(crate) async fn do_get(
         &metrics::flightsql::DO_GET_STATEMENT_QUERY_DURATION_MS,
         vec![],
     );
-    let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query)).await?;
+    let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
+        datafusion,
+        &cmd.query,
+        Protocol::FlightSQL,
+    ))
+    .await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =

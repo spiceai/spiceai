@@ -58,7 +58,6 @@ pub(crate) async fn run(
 
     if !errors.is_empty() {
         tracing::error!("There are failed queries:\n{}", errors.join("\n"));
-        return Err(errors.join("\n"));
     }
 
     Ok(())

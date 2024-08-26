@@ -138,6 +138,7 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
+    disable_query_push_down: bool,
 }
 
 fn validate_refresh_data_window(
@@ -170,6 +171,7 @@ pub struct Builder {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
+    disable_query_push_down: bool,
 }
 
 impl Builder {
@@ -189,6 +191,7 @@ impl Builder {
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
+            disable_query_push_down: false,
         }
     }
 
@@ -207,6 +210,11 @@ impl Builder {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
+        self
+    }
+
+    pub fn disable_query_push_down(&mut self) -> &mut Self {
+        self.disable_query_push_down = true;
         self
     }
 
@@ -317,6 +325,7 @@ impl Builder {
                 zero_results_action: self.zero_results_action,
                 refresh_params,
                 refresher,
+                disable_query_push_down: self.disable_query_push_down,
             },
             is_ready,
         )
@@ -372,15 +381,17 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
+        let mut refresh = self.refresh_params.write().await;
+        refresh.sql.clone_from(&refresh_sql);
+
         if self.dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
             if let Some(sql_str) = &refresh_sql {
-                tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
+                tracing::info!("[refresh] Updated refresh SQL for {dataset_name} to {sql_str}");
             } else {
-                tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+                tracing::info!("[refresh] Removed refresh SQL for {dataset_name}");
             }
         }
-        let mut refresh = self.refresh_params.write().await;
-        refresh.sql = refresh_sql;
+
         Ok(())
     }
 
