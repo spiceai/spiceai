@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     datafusion::query::Protocol,
@@ -56,6 +56,18 @@ impl Default for SqlTool {
             "sql",
             Some("Run an SQL query on the data source".to_string()),
         )
+    }
+}
+
+impl From<SqlTool> for spicepod::component::tool::Tool {
+    fn from(val: SqlTool) -> Self {
+        spicepod::component::tool::Tool {
+            from: format!("builtin:{}", val.name()),
+            name: val.name().to_string(),
+            description: val.description().map(ToString::to_string),
+            params: HashMap::default(),
+            depends_on: Vec::default()
+        }
     }
 }
 

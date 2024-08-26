@@ -16,7 +16,7 @@ limitations under the License.
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
@@ -46,6 +46,18 @@ impl Default for DocumentSimilarityTool {
             "document_similarity",
             Some("Search and retrieve documents from available datasets".to_string()),
         )
+    }
+}
+
+impl From<DocumentSimilarityTool> for spicepod::component::tool::Tool {
+    fn from(val: DocumentSimilarityTool) -> Self {
+        spicepod::component::tool::Tool {
+            from: format!("builtin:{}", val.name()),
+            name: val.name().to_string(),
+            description: val.description().map(ToString::to_string),
+            params: HashMap::default(),
+            depends_on: Vec::default()
+        }
     }
 }
 
