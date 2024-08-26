@@ -73,7 +73,7 @@ jobs:
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
-      - run: cargo bench -p runtime --features ${{ env.FEATURES }} -- --release
+      - run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
