@@ -261,12 +261,13 @@ impl DataFusion {
             .with_runtime_env(default_runtime_env())
             .build();
 
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
         ctx.add_analyzer_rule(Arc::new(BytesProcessedAnalyzerRule::new()));
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
         ctx.register_udf(crate::datafusion::udf::Least::new().into());
+        datafusion_functions_json::register_all(&mut ctx)?;
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
