@@ -72,6 +72,7 @@
           "eviction_policy": null,
           "item_ttl": null
         },
+        "telemetry": null,
         "tls": null,
         "tracing": null
       },
@@ -87,6 +88,12 @@
       "type": "array",
       "items": {
         "$ref": "#/definitions/Secret"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ComponentOrReference_for_Tool"
       }
     },
     "version": {
@@ -341,6 +348,16 @@
       "anyOf": [
         {
           "$ref": "#/definitions/Model"
+        },
+        {
+          "$ref": "#/definitions/ComponentReference"
+        }
+      ]
+    },
+    "ComponentOrReference_for_Tool": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Tool"
         },
         {
           "$ref": "#/definitions/ComponentReference"
@@ -727,6 +744,16 @@
             }
           ]
         },
+        "telemetry": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TelemetryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
           "anyOf": [
@@ -794,6 +821,18 @@
         "v1beta1"
       ]
     },
+    "TelemetryConfig": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "TimeFormat": {
       "type": "string",
       "enum": [
@@ -844,6 +883,39 @@
         }
       },
       "additionalProperties": false
+    },
+    "Tool": {
+      "type": "object",
+      "required": [
+        "from",
+        "name"
+      ],
+      "properties": {
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
     },
     "TracingConfig": {
       "type": "object",
