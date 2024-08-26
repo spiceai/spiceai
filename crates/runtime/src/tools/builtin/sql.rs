@@ -66,7 +66,7 @@ impl From<SqlTool> for spicepod::component::tool::Tool {
             name: val.name().to_string(),
             description: val.description().map(ToString::to_string),
             params: HashMap::default(),
-            depends_on: Vec::default()
+            depends_on: Vec::default(),
         }
     }
 }
