@@ -108,45 +108,22 @@ jobs:
             Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
           }
 
+      ## Default flavor
       - name: Build spiced
         run: make -C bin/spiced
-
-      - name: Update build cache (macOS)
-        if: matrix.target_os == 'darwin'
-        run: |
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
-          fi
-
-      - name: Update build cache (Linux)
-        if: matrix.target_os == 'linux'
-        run: |
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
-          fi
-
-      - name: Update build cache (Windows)
-        if: matrix.target_os == 'windows'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
-          }
-
-      - name: Build spice
-        run: make -C bin/spice
 
       - name: tar binary
         if: matrix.target_os != 'windows'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
-          tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
+          tar czf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
 
       - name: tar binary (Windows)
         if: matrix.target_os == 'windows'
         run: |
           mv target/release/spiced.exe spiced.exe
-          tar cf spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced.exe
+          tar czf spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced.exe
 
       - name: Print version
         if: matrix.target_os != 'windows'
@@ -168,18 +145,60 @@ jobs:
           name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
+      ## Models flavor
+      - name: Build spiced (models)
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
+
+      - name: tar binary (models)
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
+
+      - name: tar binary (models) (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          rm spiced.exe
+          mv target/release/spiced.exe spiced.exe
+          tar czf spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced.exe
+
+      - name: Print version (models)
+        if: matrix.target_os != 'windows'
+        run: ./spiced --version
+      
+      - name: Print version (models) (Windows)
+        if: matrix.target_os == 'windows'
+        run: ./spiced.exe --version
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target_os != 'windows'
+        with:
+          name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target_os == 'windows'
+        with:
+          name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      ## CLI build
+      - name: Build spice
+        run: make -C bin/spice
+
       - name: tar binary
         if: matrix.target_os != 'windows'
         run: |
           mv target/release/spice spice
           chmod +x spice
-          tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
+          tar czf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
 
       - name: tar binary (Windows)
         if: matrix.target_os == 'windows'
         run: |
           mv target/release/spice.exe spice.exe
-          tar cf spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice.exe
+          tar czf spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice.exe
 
       - name: Print version
         if: matrix.target_os != 'windows'
@@ -200,6 +219,27 @@ jobs:
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+      
+      - name: Update build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av target/ /Users/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av target/ /home/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
@@ -255,6 +295,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os != 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: lists artifacts

@@ -27,7 +27,7 @@ fn main() {
 
     if args.version {
         if cfg!(feature = "release") {
-            println!("v{}", env!("CARGO_PKG_VERSION"));
+            println!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata());
         } else {
             print!(
                 "v{}-rc.{}",
@@ -38,6 +38,8 @@ fn main() {
             if cfg!(feature = "dev") {
                 print!("-dev");
             }
+
+            print!("{}", build_metadata());
 
             println!();
         };
@@ -73,4 +75,15 @@ fn main() {
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
     spiced::run(args).await?;
     Ok(())
+}
+
+/// Build metadata conforming to <https://semver.org/#spec-item-10>
+///
+/// Build metadata is always known at compile time, so return a string literal.
+const fn build_metadata() -> &'static str {
+    if cfg!(feature = "models") {
+        "+models"
+    } else {
+        ""
+    }
 }

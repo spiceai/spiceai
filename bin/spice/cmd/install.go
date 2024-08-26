@@ -25,10 +25,12 @@ import (
 )
 
 var installCmd = &cobra.Command{
-	Use:   "install",
-	Short: "Install the Spice.ai runtime",
+	Use:     "install [flavor]",
+	Aliases: []string{"i"},
+	Short:   "Install the Spice.ai runtime",
 	Example: `
 spice install
+spice install ai
 
 # See more at: https://docs.spiceai.org/
 `,
@@ -38,7 +40,12 @@ spice install
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
 		}
 
-		installed, err := runtime.EnsureInstalled()
+		flavor := ""
+		if len(args) > 0 {
+			flavor = args[0]
+		}
+
+		installed, err := runtime.EnsureInstalled(flavor)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			os.Exit(1)
