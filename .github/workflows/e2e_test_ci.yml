@@ -375,7 +375,7 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          brew install mysql
+          brew install mysql@8.4
           brew services start mysql
           sleep 5
           mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
@@ -751,119 +751,118 @@ jobs:
           cat spice.log
 
   test_results_caching:
-      name: 'Test results caching on ${{ matrix.target.name }}'
-      runs-on: ${{ matrix.target.runner }}
-      needs:
-        - build
-        - setup-matrix
+    name: 'Test results caching on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
 
-      strategy:
-          matrix:
-            target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
-      steps:
-        - uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v4
 
-        - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          uses: actions/download-artifact@v4
-          with:
-            name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-            path: ./build
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
 
-        - name: Install spice
-          uses: ./.github/actions/install-spice
-          with:
-            build-path: ./build
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
 
-        - name: Init spice app
-          run: |
-            spice init test_app
+      - name: Init spice app
+        run: |
+          spice init test_app
 
-        - name: Spice configure
-          working-directory: test_app
-          run: |
-            echo "runtime:" >> spicepod.yaml
-            echo "  results_cache:" >> spicepod.yaml
-            echo "    enabled: true" >> spicepod.yaml
-            echo "    eviction_policy: lru" >> spicepod.yaml
-            echo "    cache_max_size: 128MiB" >> spicepod.yaml
-            echo "    item_ttl: 300s" >> spicepod.yaml
-            echo "datasets:" >> spicepod.yaml
-            echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
-            echo "    name: customer" >> spicepod.yaml
-            echo "    params:" >> spicepod.yaml
-            echo "      file_format: parquet" >> spicepod.yaml
-            echo "    acceleration:" >> spicepod.yaml
-            echo "      enabled: true" >> spicepod.yaml
-            echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml
-            cat spicepod.yaml
+      - name: Spice configure
+        working-directory: test_app
+        run: |
+          echo "runtime:" >> spicepod.yaml
+          echo "  results_cache:" >> spicepod.yaml
+          echo "    enabled: true" >> spicepod.yaml
+          echo "    eviction_policy: lru" >> spicepod.yaml
+          echo "    cache_max_size: 128MiB" >> spicepod.yaml
+          echo "    item_ttl: 300s" >> spicepod.yaml
+          echo "datasets:" >> spicepod.yaml
+          echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
+          echo "    name: customer" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      file_format: parquet" >> spicepod.yaml
+          echo "    acceleration:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml
+          cat spicepod.yaml
 
-        - name: Start spice runtime
-          working-directory: test_app
-          run: |
-            spice run &> spice.log &
-            # time to initialize added dataset
-            sleep 10
+      - name: Start spice runtime
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
 
-        - name: Wait for Spice runtime healthy
-          working-directory: test_app
-          timeout-minutes: 1
-          run: |
-            while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
 
+      - name: Run SQL query and check Miss cache header
+        working-directory: test_app
+        run: |
+          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          echo "$response"
+          if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
+            echo "Cache miss detected as expected"
+          else
+            echo "Cache miss not detected" >&2
+            exit 1
+          fi
 
-        - name: Run SQL query and check Miss cache header
-          working-directory: test_app
-          run: |
-            response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-            echo "$response"
-            if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
-              echo "Cache miss detected as expected"
-            else
-              echo "Cache miss not detected" >&2
-              exit 1
-            fi
+      - name: Run SQL query and check Hit cache header
+        working-directory: test_app
+        run: |
+          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "select c_name from (select * from customer)")
+          echo "$response"
+          if echo "$response" | grep -q "x-cache: Hit from spiceai"; then
+            echo "Cache hit detected as expected"
+          else
+            echo "Cache hit not detected" >&2
+            exit 1
+          fi
 
-        - name: Run SQL query and check Hit cache header
-          working-directory: test_app
-          run: |
-            response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "select c_name from (select * from customer)")
-            echo "$response"
-            if echo "$response" | grep -q "x-cache: Hit from spiceai"; then
-              echo "Cache hit detected as expected"
-            else
-              echo "Cache hit not detected" >&2
-              exit 1
-            fi
+      - name: Manually refresh dataset
+        working-directory: test_app
+        run: |
+          output=$(spice refresh customer 2>&1)
+          echo "$output"
+          if [[ $output == *"Dataset refresh triggered"* ]]; then
+            # time to refresh dataset
+            sleep 3
+          else
+            echo "Failed to trigger dataset refresh."
+            exit 1
+          fi
 
-        - name: Manually refresh dataset
-          working-directory: test_app
-          run: |
-            output=$(spice refresh customer 2>&1)
-            echo "$output"
-            if [[ $output == *"Dataset refresh triggered"* ]]; then
-              # time to refresh dataset
-              sleep 3
-            else
-              echo "Failed to trigger dataset refresh."
-              exit 1
-            fi
-    
-        - name: Run SQL query and check Miss cache header
-          working-directory: test_app
-          run: |
-            response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-            echo "$response"
-            if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
-              echo "Cache miss detected as expected"
-            else
-              echo "Cache miss not detected" >&2
-              exit 1
-            fi
+      - name: Run SQL query and check Miss cache header
+        working-directory: test_app
+        run: |
+          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          echo "$response"
+          if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
+            echo "Cache miss detected as expected"
+          else
+            echo "Cache miss not detected" >&2
+            exit 1
+          fi
 
-        - name: Stop spice and check logs
-          working-directory: test_app
-          if: always()
-          run: |
-            killall spice
-            cat spice.log
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
