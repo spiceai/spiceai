@@ -15,9 +15,11 @@ limitations under the License.
 */
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
-use serde_json::{json, Value};
-use spicepod::component::dataset::Dataset;
-use std::sync::Arc;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use snafu::ResultExt;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
@@ -42,13 +44,6 @@ impl ListDatasetsTool {
             name: name.to_string(),
             description,
             table_allowlist: table_allowlist.map(|t| t.iter().map(ToString::to_string).collect()),
-        }
-    }
-
-    fn dataset_allowed(&self, ds: &Dataset) -> bool {
-        match &self.table_allowlist {
-            Some(t) => t.contains(&ds.name),
-            None => true,
         }
     }
 }
@@ -84,22 +79,61 @@ impl SpiceModelTool for ListDatasetsTool {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
 
-        let Some(app) = &*rt.app.read().await else {
-            return Err("Couldn't get runtime `App`".into());
-        };
+        let elements = get_dataset_elements(Arc::clone(&rt), self.table_allowlist.as_deref())
+            .await
+            .iter()
+            .map(serde_json::value::to_value)
+            .collect::<Result<Vec<Value>, _>>()
+            .boxed()?;
 
-        let tables = app.datasets.iter()
-            .filter(|d| self.dataset_allowed(d))
-            .map(|d| {
-                json!({
-                    "table": TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA).to_string(),
-                    "can_search_documents": !d.embeddings.is_empty(),
-                    "description": d.description.clone(),
-                    "metadata": d.metadata.clone(),
-                })
-            })
-            .collect::<Vec<Value>>();
+        Ok(Value::Array(elements))
+    }
+}
 
-        Ok(Value::Array(tables))
+/// Return all datasets available in the runtime, with the properties visible to LLMs.
+pub async fn get_dataset_elements(
+    rt: Arc<Runtime>,
+    opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
+    let Some(app) = &*rt.app.read().await else {
+        return vec![];
+    };
+
+    app.datasets
+        .iter()
+        .filter(|d| !opt_include.is_some_and(|ts| !ts.contains(&d.name)))
+        .map(|d| ListDatasetElement {
+            table: TableReference::parse_str(&d.name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .to_string(),
+            can_search_documents: !d.embeddings.is_empty(),
+            description: d.description.clone(),
+            metadata: d.metadata.clone(),
+        })
+        .collect_vec()
+}
+
+/// Details about each dataset outputted by the [`ListDatasetsTool`] tool.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListDatasetElement {
+    pub table: String,
+    pub can_search_documents: bool,
+    pub description: Option<String>,
+    pub metadata: HashMap<String, Value>,
+}
+
+impl ListDatasetElement {
+    /// A pretty-printed version of the dataset element suitable LLM instructions.
+    #[must_use]
+    pub fn to_text_llms(&self) -> String {
+        format!(
+            "Dataset: {}\nDescription: {}\nMetadata: {}",
+            self.table,
+            self.description.as_deref().unwrap_or("None"),
+            self.metadata
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .join(", ")
+        )
     }
 }
