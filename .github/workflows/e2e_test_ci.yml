@@ -203,7 +203,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_spiceai:
@@ -267,7 +267,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_data_postgres:
@@ -344,7 +344,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_data_mysql:
@@ -375,7 +375,7 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          brew install mysql
+          brew install mysql@8.4
           brew services start mysql
           sleep 5
           mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
@@ -441,7 +441,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_clickhouse:
@@ -539,7 +539,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_duckdb:
@@ -621,7 +621,7 @@ jobs:
         if: always()
         working-directory: duckdb-app
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_local_acceleration:
@@ -747,7 +747,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_results_caching:
@@ -865,5 +865,5 @@ jobs:
           working-directory: test_app
           if: always()
           run: |
-            killall spice
+            killall spice || true
             cat spice.log
