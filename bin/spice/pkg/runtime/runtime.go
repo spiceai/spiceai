@@ -48,7 +48,7 @@ func EnsureInstalled() (bool, error) {
 	}
 
 	if shouldInstall {
-		err = rtcontext.InstallOrUpgradeRuntime()
+		err = rtcontext.InstallOrUpgradeRuntime("")
 		if err != nil {
 			return shouldInstall, err
 		}

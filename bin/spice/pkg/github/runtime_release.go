@@ -52,8 +52,8 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 	return release, nil
 }
 
-func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {
-	assetName := GetRuntimeAssetName()
+func DownloadRuntimeAsset(flavor string, release *RepoRelease, downloadPath string) error {
+	assetName := GetRuntimeAssetName(flavor)
 	fmt.Println("Downloading the Spice runtime...", assetName)
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
@@ -62,8 +62,12 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
-func GetRuntimeAssetName() string {
-	assetName := fmt.Sprintf("%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, runtime.GOOS, getRustArch())
+func GetRuntimeAssetName(flavor string) string {
+	if flavor != "" {
+		flavor = fmt.Sprintf("_%s", flavor)
+	}
+
+	assetName := fmt.Sprintf("%s%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, flavor, runtime.GOOS, getRustArch())
 
 	return assetName
 }
