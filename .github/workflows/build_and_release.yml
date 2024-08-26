@@ -146,28 +146,28 @@ jobs:
           path: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
       ## Models flavor
-      - name: Build spiced
+      - name: Build spiced (models)
         run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
 
-      - name: tar binary
+      - name: tar binary (models)
         if: matrix.target_os != 'windows'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
           tar czf spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
 
-      - name: tar binary (Windows)
+      - name: tar binary (models) (Windows)
         if: matrix.target_os == 'windows'
         run: |
           rm spiced.exe
           mv target/release/spiced.exe spiced.exe
           tar czf spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced.exe
 
-      - name: Print version
+      - name: Print version (models)
         if: matrix.target_os != 'windows'
         run: ./spiced --version
       
-      - name: Print version (Windows)
+      - name: Print version (models) (Windows)
         if: matrix.target_os == 'windows'
         run: ./spiced.exe --version
 
