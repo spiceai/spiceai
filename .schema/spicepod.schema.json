@@ -72,7 +72,7 @@
           "eviction_policy": null,
           "item_ttl": null
         },
-        "telemetry": null, 
+        "telemetry": null,
         "tls": null,
         "tracing": null
       },
