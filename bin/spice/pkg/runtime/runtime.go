@@ -26,7 +26,11 @@ import (
 )
 
 // Ensures the runtime is installed. Returns true if the runtime was installed or upgraded, false if it was already installed.
-func EnsureInstalled() (bool, error) {
+func EnsureInstalled(flavor string) (bool, error) {
+	if flavor != "ai" && flavor != "" {
+		return false, fmt.Errorf("invalid flavor: %s", flavor)
+	}
+
 	rtcontext := context.NewContext()
 	err := rtcontext.Init()
 	if err != nil {
@@ -47,8 +51,12 @@ func EnsureInstalled() (bool, error) {
 		}
 	}
 
+	if flavor == "ai" && !rtcontext.ModelsFlavorInstalled() {
+		shouldInstall = true
+	}
+
 	if shouldInstall {
-		err = rtcontext.InstallOrUpgradeRuntime()
+		err = rtcontext.InstallOrUpgradeRuntime(flavor)
 		if err != nil {
 			return shouldInstall, err
 		}
@@ -68,7 +76,7 @@ func Run(args []string) error {
 		os.Exit(1)
 	}
 
-	_, err = EnsureInstalled()
+	_, err = EnsureInstalled("")
 	if err != nil {
 		return err
 	}

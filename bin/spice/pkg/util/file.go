@@ -125,7 +125,7 @@ func ExtractTarGzInsideZip(body []byte, downloadDir string) error {
 func ExtractTarGz(body []byte, downloadDir string) error {
 	bodyReader := bytes.NewReader(body)
 	err := Untar(bodyReader, downloadDir, true)
-	if err.Error() == "requires gzip-compressed body: gzip: invalid header" {
+	if err != nil && err.Error() == "requires gzip-compressed body: gzip: invalid header" {
 		_, err = bodyReader.Seek(0, io.SeekStart)
 		if err != nil {
 			return err
