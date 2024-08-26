@@ -58,6 +58,18 @@ impl Default for ListDatasetsTool {
     }
 }
 
+impl From<ListDatasetsTool> for spicepod::component::tool::Tool {
+    fn from(val: ListDatasetsTool) -> Self {
+        spicepod::component::tool::Tool {
+            from: format!("builtin:{}", val.name()),
+            name: val.name().to_string(),
+            description: val.description().map(ToString::to_string),
+            params: HashMap::default(),
+            depends_on: Vec::default(),
+        }
+    }
+}
+
 #[async_trait]
 impl SpiceModelTool for ListDatasetsTool {
     fn name(&self) -> &str {
