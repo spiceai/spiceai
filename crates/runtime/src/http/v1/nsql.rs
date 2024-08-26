@@ -54,7 +54,7 @@ fn clean_model_based_sql(input: &str) -> String {
 pub struct Request {
     pub query: String,
 
-    #[serde(rename = "model", default = "default_model")]
+    #[serde(default = "default_model")]
     pub model: String,
 }
 
