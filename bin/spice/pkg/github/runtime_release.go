@@ -63,7 +63,10 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 }
 
 func GetRuntimeAssetName(flavor string) string {
-	if flavor != "" {
+	switch {
+	case flavor == "ai":
+		flavor = "_models"
+	case flavor != "":
 		flavor = fmt.Sprintf("_%s", flavor)
 	}
 
