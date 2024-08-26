@@ -111,7 +111,7 @@ impl ToolUsingChat {
     /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
     async fn prepare_req(
         &self,
-        req: CreateChatCompletionRequest,
+        req: &CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         let content = format!(
             "You have access to a runtime. {} {}",
@@ -243,26 +243,26 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let req = self.prepare_req(req).await?;
+        let mut inner_req = self.prepare_req(&req).await?;
 
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-        if req
+        if inner_req
             .tool_choice
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
-            return self.inner_chat.chat_stream(req).await;
+            return self.inner_chat.chat_stream(inner_req).await;
         };
 
         // Append spiced runtime tools to the request.
-        let mut inner_req = req.clone();
         let mut runtime_tools = self.runtime_tools();
         if !runtime_tools.is_empty() {
-            runtime_tools.extend(req.tools.clone().unwrap_or_default());
+            runtime_tools.extend(inner_req.tools.clone().unwrap_or_default());
             inner_req.tools = Some(runtime_tools);
         };
 
         let s = self.inner_chat.chat_stream(inner_req).await?;
+
         Ok(make_a_stream(
             Span::current(),
             Self::new(
@@ -279,23 +279,23 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let req = self.prepare_req(req).await?;
+        let inner_req = self.prepare_req(&req).await?;
 
         // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-        if req
+        if inner_req
             .tool_choice
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_chat.chat_request(req).await;
+            return self.inner_chat.chat_request(inner_req).await;
         };
 
         // Append spiced runtime tools to the request.
-        let mut inner_req = req.clone();
+        let mut inner_req = inner_req.clone();
         let mut runtime_tools = self.runtime_tools();
         if !runtime_tools.is_empty() {
-            runtime_tools.extend(req.tools.unwrap_or_default());
+            runtime_tools.extend(inner_req.tools.unwrap_or_default());
             inner_req.tools = Some(runtime_tools);
         };
 
@@ -362,7 +362,6 @@ fn make_a_stream(
                         return;
                     }
                 };
-
                 let mut finished_choices: Vec<ChatChoiceStream> = vec![];
                 for chat_choice1 in &response.choices {
                     let chat_choice = chat_choice1.clone();
