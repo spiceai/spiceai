@@ -1,27 +1,22 @@
-use std::time::Duration;
-
+use crate::{get_test_datafusion, init_tracing, postgres::common, wait_until_true};
 use app::AppBuilder;
+use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use runtime::{datafusion::query::Protocol, Runtime};
 use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
+    dataset::{
+        acceleration::{Acceleration, OnConflictBehavior, RefreshMode},
+        Dataset,
+    },
     params::Params,
 };
-
-use crate::{init_tracing, wait_until_true};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[cfg(feature = "postgres")]
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
-    use arrow::array::RecordBatch;
-    use spicepod::component::dataset::acceleration::{OnConflictBehavior, RefreshMode};
-    use std::collections::HashMap;
-
-    use crate::get_test_datafusion;
-    use crate::postgres::common;
-
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = 20963;
     let running_container = common::start_postgres_docker_container(port).await?;
@@ -61,59 +56,18 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         .await
         .expect("inserted data");
 
-    let params = Params::from_string_map(
-        vec![
-            ("pg_host".to_string(), "localhost".to_string()),
-            ("pg_port".to_string(), port.to_string()),
-            ("pg_user".to_string(), "postgres".to_string()),
-            ("pg_pass".to_string(), common::PG_PASSWORD.to_string()),
-            ("pg_sslmode".to_string(), "disable".to_string()),
-        ]
-        .into_iter()
-        .collect(),
+    let on_conflict_upsert = create_test_dataset(
+        OnConflictBehavior::Upsert,
+        "postgres:event_logs",
+        "event_logs_upsert",
+        port,
     );
-
-    // Create dataset with on_conflict:upsert acceleration setting
-    let mut on_conflict_upsert = Dataset::new("postgres:event_logs", "event_logs_upsert");
-
-    let mut upsert_hashmap = HashMap::new();
-    upsert_hashmap
-        .insert("event_id".to_string(), OnConflictBehavior::Upsert)
-        .unwrap_or_default();
-
-    on_conflict_upsert.params = Some(params.clone());
-    on_conflict_upsert.acceleration = Some(Acceleration {
-        params: Some(params.clone()),
-        enabled: true,
-        engine: Some("postgres".to_string()),
-        refresh_mode: Some(RefreshMode::Append),
-        refresh_check_interval: Some("1s".to_string()),
-        primary_key: Some("event_id".to_string()),
-        on_conflict: upsert_hashmap,
-        ..Acceleration::default()
-    });
-    on_conflict_upsert.time_column = Some("event_timestamp".to_string());
-
-    // Create dataset with on_conflict:drop acceleration setting
-    let mut on_conflict_drop = Dataset::new("postgres:event_logs", "event_logs_drop");
-
-    let mut drop_hashmap = HashMap::new();
-    drop_hashmap
-        .insert("event_id".to_string(), OnConflictBehavior::Drop)
-        .unwrap_or_default();
-
-    on_conflict_drop.params = Some(params.clone());
-    on_conflict_drop.acceleration = Some(Acceleration {
-        params: Some(params.clone()),
-        enabled: true,
-        engine: Some("postgres".to_string()),
-        refresh_mode: Some(RefreshMode::Append),
-        refresh_check_interval: Some("1s".to_string()),
-        primary_key: Some("event_id".to_string()),
-        on_conflict: drop_hashmap,
-        ..Acceleration::default()
-    });
-    on_conflict_drop.time_column = Some("event_timestamp".to_string());
+    let on_conflict_drop = create_test_dataset(
+        OnConflictBehavior::Drop,
+        "postgres:event_logs",
+        "event_logs_drop",
+        port,
+    );
 
     let df = get_test_datafusion();
 
@@ -122,11 +76,13 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         .with_dataset(on_conflict_drop)
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .build()
-        .await;
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app(app)
+            .with_datafusion(df)
+            .build()
+            .await,
+    );
 
     // Set a timeout for the test
     tokio::select! {
@@ -136,54 +92,8 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         () = rt.load_components() => {}
     }
 
-    // Wait for both dataset to be setup
-    assert!(
-        wait_until_true(Duration::from_secs(30), || async {
-            let mut query_result = rt
-                .datafusion()
-                .query_builder(
-                    "SELECT * FROM event_logs_upsert LIMIT 1",
-                    Protocol::Internal,
-                )
-                .build()
-                .run()
-                .await
-                .expect("result returned");
-            let mut batches = vec![];
-            while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.expect("batch"));
-            }
-            !batches.is_empty() && batches[0].num_rows() == 1
-        })
-        .await,
-        "Expected 1 rows returned"
-    );
-    assert!(
-        wait_until_true(Duration::from_secs(30), || async {
-            let mut query_result = rt
-                .datafusion()
-                .query_builder("SELECT * FROM event_logs_drop LIMIT 1", Protocol::Internal)
-                .build()
-                .run()
-                .await
-                .expect("result returned");
-            let mut batches = vec![];
-            while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.expect("batch"));
-            }
-            !batches.is_empty() && batches[0].num_rows() == 1
-        })
-        .await,
-        "Expected 1 rows returned"
-    );
-
-    let original_data = rt
-        .datafusion()
-        .ctx
-        .sql("SELECT * FROM event_logs_upsert")
-        .await?
-        .collect()
-        .await?;
+    dataset_ready_check(Arc::clone(&rt), "SELECT * FROM event_logs_upsert LIMIT 1").await;
+    dataset_ready_check(Arc::clone(&rt), "SELECT * FROM event_logs_drop LIMIT 1").await;
 
     db_conn
         .conn
@@ -201,7 +111,7 @@ WHERE event_name = 'File Download'
         .expect("inserted data");
 
     // Wait for result to be refreshed
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
     let upsert_data = rt
         .datafusion()
@@ -219,9 +129,98 @@ WHERE event_name = 'File Download'
         .collect()
         .await?;
 
-    assert_eq!(original_data, drop_data);
-    assert_ne!(original_data, upsert_data);
+    assert_batches_eq!(
+        &[
+            "+----------+-------------------+---------------------+",
+            "| event_id | event_name        | event_timestamp     |",
+            "+----------+-------------------+---------------------+",
+            "| 1        | User Registration | 2023-05-16T10:00:00 |",
+            "| 2        | Password Change   | 2023-05-16T14:30:00 |",
+            "| 3        | User Login        | 2023-05-17T08:45:00 |",
+            "| 4        | User Logout       | 2023-05-17T18:00:00 |",
+            "| 5        | File Download     | 2023-05-17T13:20:00 |",
+            "+----------+-------------------+---------------------+"
+        ],
+        &drop_data
+    );
+
+    assert_batches_eq!(
+        &[
+            "+----------+-------------------+---------------------+",
+            "| event_id | event_name        | event_timestamp     |",
+            "+----------+-------------------+---------------------+",
+            "| 1        | User Registration | 2023-05-16T10:00:00 |",
+            "| 2        | Password Change   | 2023-05-16T14:30:00 |",
+            "| 3        | User Login        | 2023-05-17T08:45:00 |",
+            "| 4        | User Logout       | 2023-05-17T18:00:00 |",
+            "| 5        | File Accessed     | 2024-08-24T15:45:00 |",
+            "+----------+-------------------+---------------------+"
+        ],
+        &upsert_data
+    );
 
     running_container.remove().await?;
     Ok(())
+}
+
+async fn dataset_ready_check(rt: Arc<Runtime>, sql: &str) {
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(sql, Protocol::Internal)
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
+}
+
+fn create_test_dataset(
+    on_conflict: OnConflictBehavior,
+    from: &str,
+    name: &str,
+    port: usize,
+) -> Dataset {
+    let params = Params::from_string_map(
+        vec![
+            ("pg_host".to_string(), "localhost".to_string()),
+            ("pg_port".to_string(), port.to_string()),
+            ("pg_user".to_string(), "postgres".to_string()),
+            ("pg_pass".to_string(), common::PG_PASSWORD.to_string()),
+            ("pg_sslmode".to_string(), "disable".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let mut dataset = Dataset::new(from, name);
+
+    let mut on_conflict_hashmap = HashMap::new();
+    on_conflict_hashmap
+        .insert("event_id".to_string(), on_conflict)
+        .unwrap_or_default();
+
+    dataset.params = Some(params.clone());
+    dataset.acceleration = Some(Acceleration {
+        params: Some(params.clone()),
+        enabled: true,
+        engine: Some("postgres".to_string()),
+        refresh_mode: Some(RefreshMode::Append),
+        refresh_check_interval: Some("1s".to_string()),
+        primary_key: Some("event_id".to_string()),
+        on_conflict: on_conflict_hashmap,
+        ..Acceleration::default()
+    });
+    dataset.time_column = Some("event_timestamp".to_string());
+
+    dataset
 }
