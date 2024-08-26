@@ -31,12 +31,16 @@ pub struct Github {
     params: Parameters,
 }
 
+pub type GraphQLQuery = Arc<str>;
+pub type JSONPointer = Arc<str>;
+pub type UnnestDepth = usize;
+
 pub trait GithubTableArgs: Send + Sync {
     /// Converts the arguments for a Github table into a tuple of:
     ///   1. The GraphQL query string
     ///   2. The JSON pointer to the data in the response
     ///   3. The depth to unnest the data
-    fn get_graphql_values(&self) -> (String, String, usize);
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth);
 }
 
 // TODO: implement PR filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for pullRequests`.
@@ -46,7 +50,7 @@ pub struct PullRequestTableArgs {
 }
 
 impl GithubTableArgs for PullRequestTableArgs {
-    fn get_graphql_values(&self) -> (String, String, usize) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
         let query = format!(
             r#"
             {{
@@ -84,7 +88,12 @@ impl GithubTableArgs for PullRequestTableArgs {
             owner = self.owner,
             name = self.repo,
         );
-        (query, "/data/repository/pullRequests/nodes".to_string(), 1)
+
+        (
+            query.into(),
+            "/data/repository/pullRequests/nodes".into(),
+            1,
+        )
     }
 }
 
@@ -103,7 +112,7 @@ pub struct CommitTableArgs {
 }
 
 impl GithubTableArgs for CommitTableArgs {
-    fn get_graphql_values(&self) -> (String, String, usize) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
         let query = format!(
             r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
@@ -141,8 +150,8 @@ impl GithubTableArgs for CommitTableArgs {
             name = self.repo
         );
         (
-            query,
-            "/data/repository/defaultBranchRef/target/history/nodes".to_string(),
+            query.into(),
+            "/data/repository/defaultBranchRef/target/history/nodes".into(),
             1,
         )
     }
@@ -155,7 +164,7 @@ pub struct IssueTableArgs {
 }
 
 impl GithubTableArgs for IssueTableArgs {
-    fn get_graphql_values(&self) -> (String, String, usize) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
         let query = format!(
             r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
@@ -186,7 +195,7 @@ impl GithubTableArgs for IssueTableArgs {
             name = self.repo
         );
 
-        (query, "/data/repository/issues/nodes".to_string(), 1)
+        (query.into(), "/data/repository/issues/nodes".into(), 1)
     }
 }
 
@@ -233,7 +242,7 @@ impl Github {
         let access_token = self.params.get("access_token").expose().ok();
 
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
-            return Err("Github 'access_token' not provided".into());
+            return Err("Github 'endpoint' not provided".into());
         };
 
         let client = default_spice_client("application/json").boxed()?;

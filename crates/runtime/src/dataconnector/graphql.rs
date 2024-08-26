@@ -116,7 +116,7 @@ impl GraphQL {
             .ok()
             .map(str::to_string);
 
-        let query = self
+        let query: Arc<str> = self
             .params
             .get("query")
             .expose()
@@ -126,8 +126,7 @@ impl GraphQL {
                     message: format!("`{}` not found in params", p.0),
                 }
                 .build()
-            })?
-            .to_owned();
+            })?.into();
 
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
@@ -137,13 +136,12 @@ impl GraphQL {
         )?;
 
         // If json_pointer isn't provided, default to the root of the response
-        let json_pointer = self
+        let json_pointer: Arc<str> = self
             .params
             .get("json_pointer")
             .expose()
             .ok()
-            .unwrap_or_default()
-            .to_owned();
+            .unwrap_or_default().into();
 
         let unnest_depth = self
             .params

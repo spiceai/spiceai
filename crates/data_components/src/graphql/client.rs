@@ -24,7 +24,7 @@ use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, sync::{Arc, LazyLock}};
 use url::Url;
 
 pub enum Auth {
@@ -50,13 +50,15 @@ pub struct PaginationParameters {
     page_info_path: String,
 }
 
+static PAGINATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}").unwrap_or_else(|_| {
+        unreachable!("Invalid regex pagination pattern defined at compile time")
+    })
+});
+
 impl PaginationParameters {
     fn parse(query: &str, pointer: &str) -> Option<Self> {
-        let pagination_pattern = r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}";
-        let regex = Regex::new(pagination_pattern).unwrap_or_else(|_| {
-            unreachable!("Invalid regex pagination pattern defined at compile time")
-        });
-        match regex.captures(query) {
+        match PAGINATION_REGEX.captures(query) {
             Some(captures) => {
                 let resource_name = captures.get(1).map(|m| m.as_str().to_owned());
                 let count = captures
@@ -226,8 +228,8 @@ fn unnest_json_objects(
 pub struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
-    query: String,
-    pointer: String,
+    query: Arc<str>,
+    pointer: Arc<str>,
     unnest_parameters: UnnestParameters,
     pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
@@ -239,8 +241,8 @@ impl GraphQLClient {
     pub fn new(
         client: reqwest::Client,
         endpoint: Url,
-        query: String,
-        json_pointer: String,
+        query: Arc<str>,
+        json_pointer: Arc<str>,
         token: Option<&str>,
         user: Option<String>,
         pass: Option<String>,
@@ -299,7 +301,7 @@ impl GraphQLClient {
         handle_graphql_query_error(&response, &query)?;
 
         let extracted_data = response
-            .pointer(self.pointer.as_str())
+            .pointer(&self.pointer)
             .unwrap_or(&Value::Null)
             .to_owned();
 
