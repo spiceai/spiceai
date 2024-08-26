@@ -365,7 +365,7 @@ jobs:
         if: matrix.target.target_os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mysql-server
+          sudo apt-get install -y mysql-server=8.4*
           sudo systemctl start mysql.service
           sleep 5
           mysql -uroot -proot -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
