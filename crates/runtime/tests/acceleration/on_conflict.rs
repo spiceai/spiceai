@@ -91,8 +91,49 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(Arc::clone(&rt), "SELECT * FROM event_logs_upsert LIMIT 1").await;
-    dataset_ready_check(Arc::clone(&rt), "SELECT * FROM event_logs_drop LIMIT 1").await;
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT * FROM event_logs_upsert LIMIT 1",
+                    Protocol::Internal,
+                )
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
+
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM event_logs_drop LIMIT 1", Protocol::Internal)
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
+
+    // dataset_ready_check(Arc::clone(&rt), "SELECT * FROM event_logs_upsert LIMIT 1").await;
+    // dataset_ready_check(Arc::clone(&rt), "SELECT * FROM event_logs_drop LIMIT 1").await;
 
     db_conn
         .conn
@@ -171,10 +212,10 @@ async fn dataset_ready_check(rt: Arc<Runtime>, sql: &str) {
                 .build()
                 .run()
                 .await
-                .unwrap_or_default();
+                .expect("result returned");
             let mut batches = vec![];
             while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.unwrap_or_default());
+                batches.push(batch.expect("batch"));
             }
             !batches.is_empty() && batches[0].num_rows() == 1
         })
