@@ -15,14 +15,12 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
-use arrow_json::{reader::infer_json_schema_from_iterator, ReaderBuilder};
 use async_trait::async_trait;
-use data_components::{arrow::write::MemTable, graphql::{client::GraphQLClient, provider::GraphQLTableProvider}};
+use data_components::graphql::{client::GraphQLClient, provider::GraphQLTableProvider};
 use datafusion::datasource::TableProvider;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use snafu::{ResultExt, Snafu};
-use std::{any::Any, future::Future, io::Cursor, pin::Pin, sync::Arc};
+use snafu::ResultExt;
+use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
@@ -91,7 +89,7 @@ impl DataConnectorFactory for GraphQLFactory {
     }
 }
 
-pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
 
@@ -103,13 +101,8 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
 
 impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
-        let mut client_builder = reqwest::Client::builder();
-        let token = self
-            .params
-            .get("auth_token")
-            .expose()
-            .ok()
-            .map(str::to_string);
+        let token = self.params.get("auth_token").expose().ok();
+
         let user = self
             .params
             .get("auth_user")
@@ -157,8 +150,7 @@ impl GraphQL {
             .get("unnest_depth")
             .expose()
             .ok()
-            .map(|x| x.parse::<usize>())
-            .unwrap_or(Ok(0))
+            .map_or(Ok(0), str::parse)
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "graphql",

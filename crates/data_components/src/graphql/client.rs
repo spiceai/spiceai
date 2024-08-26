@@ -234,20 +234,26 @@ pub struct GraphQLClient {
 }
 
 impl GraphQLClient {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         client: reqwest::Client,
         endpoint: Url,
         query: String,
         json_pointer: String,
-        token: Option<String>,
+        token: Option<&str>,
         user: Option<String>,
         pass: Option<String>,
         unnest_depth: usize,
     ) -> Self {
         let pagination_parameters = PaginationParameters::parse(&query, &json_pointer);
+        tracing::debug!(
+            "Parsed pagination parameters for {:?}: {pagination_parameters:?}",
+            endpoint.to_string()
+        );
 
         let auth = match (token, user, pass) {
-            (Some(token), _, _) => Some(Auth::Bearer(token)),
+            (Some(token), _, _) => Some(Auth::Bearer(token.to_string())),
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
             _ => None,
         };
@@ -460,66 +466,141 @@ mod tests {
 
     use super::{handle_http_error, DuplicateBehavior, PaginationParameters};
 
+    struct TestPaginationParseCase {
+        name: &'static str,
+        query: &'static str,
+        pointer: &'static str,
+        expected: Option<PaginationParameters>,
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines, clippy::needless_raw_string_hashes)]
     fn test_pagination_parse() {
-        let query = r"query {
-      users(first: 10) {
-        pageInfo {
-          hasNextPage
-          endCursor
+        let test_cases = vec![
+            TestPaginationParseCase {
+                name: "Jeadie",
+                pointer: "/data/repository/pullRequests",
+                expected: Some(PaginationParameters {
+                    resource_name: "users".to_owned(),
+                    count: 10,
+                    page_info_path: "/data/users/pageInfo".to_owned(),
+                }),
+                query: r#"{
+                    repository(owner: 'spiceai', name: 'spiceai') {
+                        pullRequests(first: 100) {
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                            nodes {
+                                title
+                                url
+                                body
+                                state
+                                createdAt
+                                mergedAt
+                                closedAt
+                                number
+                                num_of_reviews: reviews {totalCount}
+                                ref: headRef { id }
+                                
+                                author {
+                                login
+                                }
+                                additions,
+                                deletions,
+                                changedFiles,
+                                comments(first: 100) {num_of_comments: totalCount}
+                                commits(first: 100) {num_of_commits: totalCount, hashes: nodes{ id } }
+                            }
+                        }
+                    }
+            }"#,
+            },
+            TestPaginationParseCase {
+                name: "Basic query with pageInfo",
+                query: r#"
+                    query {
+                        users(first: 10) {
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                "#,
+                pointer: "/data/users",
+                expected: Some(PaginationParameters {
+                    resource_name: "users".to_owned(),
+                    count: 10,
+                    page_info_path: "/data/users/pageInfo".to_owned(),
+                }),
+            },
+            TestPaginationParseCase {
+                name: "Query with reversed pageInfo fields",
+                query: r#"
+                    query {
+                        users(first: 10) {
+                            pageInfo {
+                                endCursor
+                                hasNextPage
+                            }
+                        }
+                    }
+                "#,
+                pointer: "/data/users",
+                expected: Some(PaginationParameters {
+                    resource_name: "users".to_owned(),
+                    count: 10,
+                    page_info_path: "/data/users/pageInfo".to_owned(),
+                }),
+            },
+            TestPaginationParseCase {
+                name: "Query without pageInfo",
+                query: r#"
+                    query {
+                        users(first: 10) {
+                            name
+                        }
+                    }
+                "#,
+                pointer: "/data/users",
+                expected: None,
+            },
+            TestPaginationParseCase {
+                name: "Nested query with pageInfo",
+                query: r#"
+                    query {
+                        paginatedUsers(first: 2) {
+                            users {
+                                id
+                                name
+                                posts {
+                                    id
+                                    title
+                                    content
+                                }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                "#,
+                pointer: "/data/paginatedUsers/users",
+                expected: Some(PaginationParameters {
+                    resource_name: "paginatedUsers".to_owned(),
+                    count: 2,
+                    page_info_path: "/data/paginatedUsers/pageInfo".to_owned(),
+                }),
+            },
+        ];
+
+        for case in test_cases {
+            let result = PaginationParameters::parse(case.query, case.pointer);
+            assert_eq!(result, case.expected, "Failed test case: {}", case.name);
         }
-        }
-    }";
-        let pointer = r"/data/users";
-        let pagination_parameters = PaginationParameters::parse(query, pointer);
-        assert_eq!(
-            pagination_parameters,
-            Some(PaginationParameters {
-                resource_name: "users".to_owned(),
-                count: 10,
-                page_info_path: "/data/users/pageInfo".to_owned(),
-            })
-        );
-
-        let query = r"query {
-            users(first: 10) {
-              pageInfo {
-                endCursor
-                hasNextPage
-              }
-              }
-          }";
-        let pointer = r"/data/users";
-        let pagination_parameters = PaginationParameters::parse(query, pointer);
-        assert_eq!(
-            pagination_parameters,
-            Some(PaginationParameters {
-                resource_name: "users".to_owned(),
-                count: 10,
-                page_info_path: "/data/users/pageInfo".to_owned(),
-            })
-        );
-
-        let query = r"query {
-            users(first: 10) {
-                name
-              }
-          }";
-        let pointer = r"/data/users";
-        let pagination_parameters = PaginationParameters::parse(query, pointer);
-        assert_eq!(pagination_parameters, None);
-
-        let query = r"query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }";
-        let pointer = r"/data/paginatedUsers/users";
-        let pagination_parameters = PaginationParameters::parse(query, pointer);
-        assert_eq!(
-            pagination_parameters,
-            Some(PaginationParameters {
-                resource_name: "paginatedUsers".to_owned(),
-                count: 2,
-                page_info_path: "/data/paginatedUsers/pageInfo".to_owned(),
-            })
-        );
     }
 
     #[test]

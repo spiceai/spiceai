@@ -69,7 +69,7 @@ impl TableProvider for GraphQLTableProvider {
             .execute_paginated(Arc::clone(&self.schema), limit)
             .await
             .boxed()
-            .map_err(|e| DataFusionError::External(e))?;
+            .map_err(DataFusionError::External)?;
 
         let table = MemTable::try_new(Arc::clone(&self.schema), res)?;
 
