@@ -14,7 +14,6 @@ use spicepod::component::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[cfg(feature = "postgres")]
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
