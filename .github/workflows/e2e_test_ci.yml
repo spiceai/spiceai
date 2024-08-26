@@ -628,6 +628,8 @@ jobs:
   test_local_acceleration:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
     runs-on: ${{ matrix.target.runner }}
+    env:
+      HOME: ${{ github.workspace }}
     needs:
       - build
       - setup-matrix
@@ -714,7 +716,6 @@ jobs:
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
-          HOME=$GITHUB_WORKSPACE
           spice run &> spice.log &
           # time to initialize added dataset
           sleep 10
