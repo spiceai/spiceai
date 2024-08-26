@@ -1,6 +1,5 @@
 use crate::{get_test_datafusion, init_tracing, postgres::common, wait_until_true};
 use app::AppBuilder;
-use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use runtime::{datafusion::query::Protocol, Runtime};
@@ -13,6 +12,7 @@ use spicepod::component::{
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+#[allow(clippy::too_many_lines)]
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
@@ -171,10 +171,10 @@ async fn dataset_ready_check(rt: Arc<Runtime>, sql: &str) {
                 .build()
                 .run()
                 .await
-                .expect("result returned");
+                .unwrap_or_default();
             let mut batches = vec![];
             while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.expect("batch"));
+                batches.push(batch.unwrap_or_default());
             }
             !batches.is_empty() && batches[0].num_rows() == 1
         })
