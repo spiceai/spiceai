@@ -382,7 +382,7 @@ impl AcceleratedTable {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
-        refresh.sql = refresh_sql.clone();
+        refresh.sql.clone_from(&refresh_sql);
 
         if self.dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
             if let Some(sql_str) = &refresh_sql {
