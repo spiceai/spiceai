@@ -159,6 +159,7 @@ jobs:
       - name: tar binary (Windows)
         if: matrix.target_os == 'windows'
         run: |
+          rm spiced.exe
           mv target/release/spiced.exe spiced.exe
           tar czf spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced.exe
 
