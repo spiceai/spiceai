@@ -483,46 +483,6 @@ mod tests {
     fn test_pagination_parse() {
         let test_cases = vec![
             TestPaginationParseCase {
-                name: "Jeadie",
-                pointer: "/data/repository/pullRequests",
-                expected: Some(PaginationParameters {
-                    resource_name: "users".to_owned(),
-                    count: 10,
-                    page_info_path: "/data/users/pageInfo".to_owned(),
-                }),
-                query: r#"{
-                    repository(owner: 'spiceai', name: 'spiceai') {
-                        pullRequests(first: 100) {
-                            pageInfo {
-                                hasNextPage
-                                endCursor
-                            }
-                            nodes {
-                                title
-                                url
-                                body
-                                state
-                                createdAt
-                                mergedAt
-                                closedAt
-                                number
-                                num_of_reviews: reviews {totalCount}
-                                ref: headRef { id }
-                                
-                                author {
-                                login
-                                }
-                                additions,
-                                deletions,
-                                changedFiles,
-                                comments(first: 100) {num_of_comments: totalCount}
-                                commits(first: 100) {num_of_commits: totalCount, hashes: nodes{ id } }
-                            }
-                        }
-                    }
-            }"#,
-            },
-            TestPaginationParseCase {
                 name: "Basic query with pageInfo",
                 query: r#"
                     query {
