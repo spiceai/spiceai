@@ -254,20 +254,23 @@ impl DataFusion {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let state = SessionStateBuilder::new()
+        let mut state = SessionStateBuilder::new()
             .with_config(df_config)
             .with_default_features()
             .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
             .with_runtime_env(default_runtime_env())
             .build();
 
-        let mut ctx = SessionContext::new_with_state(state);
+        if let Err(e) = datafusion_functions_json::register_all(&mut state) {
+            panic!("Unable to register JSON functions: {e}");
+        };
+
+        let ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
         ctx.add_analyzer_rule(Arc::new(BytesProcessedAnalyzerRule::new()));
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
         ctx.register_udf(crate::datafusion::udf::Least::new().into());
-        datafusion_functions_json::register_all(&mut ctx)?;
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
