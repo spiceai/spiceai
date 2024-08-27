@@ -183,6 +183,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-federation-sql 0.1.6, Apache-2.0 
   <br/>
 
+- datafusion-functions-json 0.41.0, Apache-2.0 
+  <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
+
 - datafusion-table-providers 0.1.0,  
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
