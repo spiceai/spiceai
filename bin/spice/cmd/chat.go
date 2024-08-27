@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
 const (
@@ -65,6 +66,25 @@ spice chat --model <model>
 spice chat --model <model> --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		rtcontext := context.NewContext()
+
+		if !rtcontext.ModelsFlavorInstalled() {
+			cmd.Print("This feature requires a runtime version with models enabled. Install (y/n)? ")
+			var confirm string
+			_, _ = fmt.Scanf("%s", &confirm)
+			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+				cmd.Println("Models runtime not installed, exiting...")
+				os.Exit(0)
+				return
+			}
+			cmd.Println("Installing models runtime...")
+			err := rtcontext.InstallOrUpgradeRuntime("models")
+			if err != nil {
+				cmd.Println("Error installing models runtime", err)
+				os.Exit(1)
+			}
+		}
+
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)

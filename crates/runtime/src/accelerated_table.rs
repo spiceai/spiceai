@@ -381,15 +381,17 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
+        let mut refresh = self.refresh_params.write().await;
+        refresh.sql.clone_from(&refresh_sql);
+
         if self.dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
             if let Some(sql_str) = &refresh_sql {
-                tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
+                tracing::info!("[refresh] Updated refresh SQL for {dataset_name} to {sql_str}");
             } else {
-                tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+                tracing::info!("[refresh] Removed refresh SQL for {dataset_name}");
             }
         }
-        let mut refresh = self.refresh_params.write().await;
-        refresh.sql = refresh_sql;
+
         Ok(())
     }
 

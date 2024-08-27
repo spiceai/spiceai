@@ -58,10 +58,12 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use spicepod::component::tool::Tool;
 use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
+use tools::builtin::get_builtin_tool_spec;
 use tools::factory as tool_factory;
 use tools::SpiceModelTool;
 use tracing_util::dataset_registered_trace;
@@ -1289,32 +1291,41 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for tool in &app.tools {
-                status::update_tool(&tool.name, status::ComponentStatus::Initializing);
-                let params_with_secrets: HashMap<String, SecretString> =
-                    self.get_params_with_secrets(&tool.params).await;
+                self.load_tool(tool).await;
+            }
+        }
 
-                match tool_factory::forge(tool, params_with_secrets)
-                    .await
-                    .context(UnableToInitializeLlmToolSnafu)
-                {
-                    Ok(t) => {
-                        let mut tools_map = self.tools.write().await;
-                        tools_map.insert(tool.name.clone(), t);
-                        tracing::info!("Tool [{}] ready to use", tool.name);
-                        metrics::tools::COUNT
-                            .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
-                        status::update_tool(&tool.name, status::ComponentStatus::Ready);
-                    }
-                    Err(e) => {
-                        metrics::tools::LOAD_ERROR.add(1, &[]);
-                        status::update_tool(&tool.name, status::ComponentStatus::Error);
-                        tracing::warn!(
-                            "Unable to load tool from spicepod {}, error: {}",
-                            tool.name,
-                            e,
-                        );
-                    }
-                }
+        // Load all built-in tools, regardless if they are in the spicepod
+        for tool in get_builtin_tool_spec() {
+            self.load_tool(&tool).await;
+        }
+    }
+
+    async fn load_tool(&self, tool: &Tool) {
+        status::update_tool(&tool.name, status::ComponentStatus::Initializing);
+        let params_with_secrets: HashMap<String, SecretString> =
+            self.get_params_with_secrets(&tool.params).await;
+
+        match tool_factory::forge(tool, params_with_secrets)
+            .await
+            .context(UnableToInitializeLlmToolSnafu)
+        {
+            Ok(t) => {
+                let mut tools_map = self.tools.write().await;
+                tools_map.insert(tool.name.clone(), t);
+                tracing::info!("Tool [{}] ready to use", tool.name);
+                metrics::tools::COUNT
+                    .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
+                status::update_tool(&tool.name, status::ComponentStatus::Ready);
+            }
+            Err(e) => {
+                metrics::tools::LOAD_ERROR.add(1, &[]);
+                status::update_tool(&tool.name, status::ComponentStatus::Error);
+                tracing::warn!(
+                    "Unable to load tool from spicepod {}, error: {}",
+                    tool.name,
+                    e,
+                );
             }
         }
     }
@@ -1695,11 +1706,11 @@ pub struct RegisterDatasetContext {
 }
 
 pub(crate) fn spice_data_base_path() -> String {
-    let Some(home_dir) = dirs::home_dir() else {
+    let Ok(working_dir) = std::env::current_dir() else {
         return ".".to_string();
     };
 
-    let base_folder = home_dir.join(".spice/data");
+    let base_folder = working_dir.join(".spice/data");
     base_folder.to_str().unwrap_or(".").to_string()
 }
 

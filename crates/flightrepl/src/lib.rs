@@ -82,7 +82,7 @@ async fn send_nsql_request(
         .header("Content-Type", "application/json")
         .json(&json!({
             "query": query,
-            "use": runtime,
+            "model": runtime,
         }))
         .send()
         .await?
