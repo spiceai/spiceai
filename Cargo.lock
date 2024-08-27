@@ -8370,7 +8370,6 @@ dependencies = [
  "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",
- "dirs",
  "dotenvy",
  "duckdb",
  "flight_client",
