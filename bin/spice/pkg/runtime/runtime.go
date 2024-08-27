@@ -41,6 +41,7 @@ func EnsureInstalled(flavor string) (bool, error) {
 	shouldInstall := false
 	var upgradeVersion string
 	if installRequired := rtcontext.IsRuntimeInstallRequired(); installRequired {
+		fmt.Println("Spice runtime installation required")
 		shouldInstall = true
 	} else {
 		upgradeVersion, err = rtcontext.IsRuntimeUpgradeAvailable()
