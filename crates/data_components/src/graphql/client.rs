@@ -24,7 +24,10 @@ use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
-use std::{io::Cursor, sync::{Arc, LazyLock}};
+use std::{
+    io::Cursor,
+    sync::{Arc, LazyLock},
+};
 use url::Url;
 
 pub enum Auth {

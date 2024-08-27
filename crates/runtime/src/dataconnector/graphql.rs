@@ -126,7 +126,8 @@ impl GraphQL {
                     message: format!("`{}` not found in params", p.0),
                 }
                 .build()
-            })?.into();
+            })?
+            .into();
 
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
@@ -141,7 +142,8 @@ impl GraphQL {
             .get("json_pointer")
             .expose()
             .ok()
-            .unwrap_or_default().into();
+            .unwrap_or_default()
+            .into();
 
         let unnest_depth = self
             .params
