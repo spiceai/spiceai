@@ -476,7 +476,10 @@ mod test {
     async fn test_file_mode_sqlite_creation_default_path() {
         use std::{fs, path::Path};
 
+        use crate::make_spice_data_directory;
+
         let spice_data_dir = crate::spice_data_base_path();
+        make_spice_data_directory().expect("spice data directory created");
         let path = format!("{spice_data_dir}/abc_sqlite.db");
 
         register_all().await;
