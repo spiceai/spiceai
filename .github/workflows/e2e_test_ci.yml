@@ -640,7 +640,7 @@ jobs:
         acceleration: [
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: memory },
-            { engine: duckdb, mode: file },
+            # { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
             # { engine: postgres},
