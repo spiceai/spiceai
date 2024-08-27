@@ -26,12 +26,14 @@ use runtime::{datafusion::DataFusion, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
+mod acceleration;
 mod catalog;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
 mod federation;
 mod graphql;
+mod grpc_api;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]

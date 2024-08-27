@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "telemetry"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+flight_client = { path = "../flight_client" }
+hostname = "0.4.0"
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+otel-arrow = { path = "../otel-arrow" }
+sha2 = "0.10.8"
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+anonymous_telemetry = []

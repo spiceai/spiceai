@@ -29,6 +29,7 @@ use spicepod::{
         model::Model,
         runtime::{ResultsCache, Runtime, TlsConfig},
         secret::Secret,
+        tool::Tool,
         view::View,
     },
     Spicepod,
@@ -51,6 +52,8 @@ pub struct App {
     pub models: Vec<Model>,
 
     pub embeddings: Vec<Embeddings>,
+
+    pub tools: Vec<Tool>,
 
     pub spicepods: Vec<Spicepod>,
 
@@ -77,6 +80,7 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
+    tools: Vec<Tool>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
 }
@@ -92,6 +96,7 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            tools: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
         }
@@ -106,6 +111,7 @@ impl AppBuilder {
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
+        self.tools.extend(spicepod.tools.clone());
         self.spicepods.push(spicepod);
         self
     }
@@ -153,6 +159,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_tool(mut self, tool: Tool) -> AppBuilder {
+        self.tools.push(tool);
+        self
+    }
+
+    #[must_use]
     pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
         self.runtime.results_cache = results_cache;
         self
@@ -175,6 +187,7 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
+            tools: self.tools,
             spicepods: self.spicepods,
             runtime: self.runtime,
         }
@@ -192,6 +205,7 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+        let mut tools: Vec<Tool> = vec![];
 
         for catalog in &spicepod_root.catalogs {
             catalogs.push(catalog.clone());
@@ -211,6 +225,10 @@ impl AppBuilder {
 
         for embedding in &spicepod_root.embeddings {
             embeddings.push(embedding.clone());
+        }
+
+        for tool in &spicepod_root.tools {
+            tools.push(tool.clone());
         }
 
         let root_spicepod_name = spicepod_root.name.clone();
@@ -237,6 +255,9 @@ impl AppBuilder {
             for embedding in &dependent_spicepod.embeddings {
                 embeddings.push(embedding.clone());
             }
+            for tool in &dependent_spicepod.tools {
+                tools.push(tool.clone());
+            }
             spicepods.push(dependent_spicepod);
         }
 
@@ -251,6 +272,7 @@ impl AppBuilder {
             views,
             models,
             embeddings,
+            tools,
             spicepods,
             runtime,
         })

@@ -76,7 +76,6 @@ pub(crate) fn routes(
             .route("/v1/nsql", post(v1::nsql::post))
             .route("/v1/chat/completions", post(v1::chat::post))
             .route("/v1/embeddings", post(v1::embeddings::post))
-            .route("/v1/assist", post(v1::assist::post))
             .route("/v1/search", post(v1::search::post))
             .layer(Extension(llms))
             .layer(Extension(models))

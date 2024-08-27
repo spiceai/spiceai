@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use app::spicepod::component::runtime::TelemetryConfig;
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
@@ -32,7 +33,6 @@ use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::Resource;
 use otel_arrow::OtelArrowExporter;
 use runtime::config::Config as RuntimeConfig;
-
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
@@ -87,6 +87,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Parser)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
@@ -126,6 +127,10 @@ pub struct Args {
     /// Path to the TLS PEM-encoded private key file.
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
+
+    /// Enable/disable anonymous telemetry collection.
+    #[arg(long)]
+    pub telemetry_enabled: Option<bool>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -156,6 +161,7 @@ pub async fn run(args: Args) -> Result<()> {
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
+    let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
 
     let rt: Runtime = Runtime::builder()
         .with_app_opt(app)
@@ -172,7 +178,7 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .await;
 
-    spiced_tracing::init_tracing(app_name, tracing_config.as_ref(), rt.datafusion())
+    spiced_tracing::init_tracing(app_name.clone(), tracing_config.as_ref(), rt.datafusion())
         .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
@@ -182,6 +188,8 @@ pub async fn run(args: Args) -> Result<()> {
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
         .await
         .context(UnableToInitializeTlsSnafu)?;
+
+    start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let cloned_rt = rt.clone();
     let server_thread =
@@ -232,4 +240,18 @@ fn init_metrics(
     global::set_meter_provider(provider);
 
     Ok(())
+}
+
+async fn start_anonymous_telemetry(
+    args: &Args,
+    spicepod_telemetry_config: Option<&TelemetryConfig>,
+    spicepod_name: Option<&String>,
+) {
+    let explicitly_disabled = args.telemetry_enabled == Some(false)
+        || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
+
+    if !explicitly_disabled {
+        #[cfg(feature = "anonymous_telemetry")]
+        telemetry::anonymous::start(spicepod_name.map_or_else(|| "unknown", String::as_str)).await;
+    }
 }

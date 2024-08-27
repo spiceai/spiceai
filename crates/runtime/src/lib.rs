@@ -58,10 +58,14 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use spicepod::component::tool::Tool;
 use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
+use tools::builtin::get_builtin_tool_spec;
+use tools::factory as tool_factory;
+use tools::SpiceModelTool;
 use tracing_util::dataset_registered_trace;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 pub use util::shutdown_signal;
@@ -80,7 +84,7 @@ pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
-mod flight;
+pub mod flight;
 mod http;
 pub mod internal_table;
 mod metrics;
@@ -97,6 +101,7 @@ pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
+pub mod tools;
 pub(crate) mod tracers;
 mod tracing_util;
 
@@ -141,6 +146,11 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     UnableToInitializeEmbeddingModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToInitializeLlmTool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -200,6 +210,12 @@ pub enum Error {
 
     #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
     AcceleratorEngineNotAvailable { name: String },
+
+    #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
+    AcceleratorInitializationFailed {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display(
         "Dataset names should not include a catalog. Unexpected '{}' in '{}'. Remove '{}' from the dataset name and try again.",
@@ -275,6 +291,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    tools: Arc<RwLock<HashMap<String, Arc<dyn SpiceModelTool>>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -447,6 +464,7 @@ impl Runtime {
         ];
 
         if cfg!(feature = "models") {
+            self.load_tools().await; // Load tools before loading models.
             futures.push(Box::pin(self.load_models()));
         }
 
@@ -592,6 +610,54 @@ impl Runtime {
         let _ = join_all(futures).await;
     }
 
+    /// Initialize datasets configured with accelerators before registering the datasets.
+    /// This ensures that the required resources for acceleration are available before registration,
+    /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
+    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        let mut initialized_datasets = vec![];
+        for ds in datasets {
+            if let Some(acceleration) = &ds.acceleration {
+                let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(accelerator) => accelerator,
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        continue;
+                    }
+                };
+
+                match accelerator
+                    .init(ds)
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(()) => {
+                        initialized_datasets.push(Arc::clone(ds));
+                    }
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    }
+                }
+            } else {
+                initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
+            }
+        }
+
+        initialized_datasets
+    }
+
     async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
@@ -600,7 +666,9 @@ impl Runtime {
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let mut futures = vec![];
-        for ds in &valid_datasets {
+
+        // Load only successfully initialized datasets
+        for ds in &self.initialize_accelerators(&valid_datasets).await {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
             futures.push(self.load_dataset(Arc::clone(ds)));
         }
@@ -1140,6 +1208,7 @@ impl Runtime {
         params: HashMap<String, SecretString>,
     ) -> Result<Box<dyn Chat>> {
         let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+            .await
             .boxed()
             .context(UnableToInitializeLlmSnafu)?;
 
@@ -1213,6 +1282,50 @@ impl Runtime {
             for model in &app.models {
                 status::update_model(&model.name, status::ComponentStatus::Initializing);
                 self.load_model(model).await;
+            }
+        }
+    }
+
+    #[allow(clippy::implicit_hasher)]
+    async fn load_tools(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for tool in &app.tools {
+                self.load_tool(tool).await;
+            }
+        }
+
+        // Load all built-in tools, regardless if they are in the spicepod
+        for tool in get_builtin_tool_spec() {
+            self.load_tool(&tool).await;
+        }
+    }
+
+    async fn load_tool(&self, tool: &Tool) {
+        status::update_tool(&tool.name, status::ComponentStatus::Initializing);
+        let params_with_secrets: HashMap<String, SecretString> =
+            self.get_params_with_secrets(&tool.params).await;
+
+        match tool_factory::forge(tool, params_with_secrets)
+            .await
+            .context(UnableToInitializeLlmToolSnafu)
+        {
+            Ok(t) => {
+                let mut tools_map = self.tools.write().await;
+                tools_map.insert(tool.name.clone(), t);
+                tracing::info!("Tool [{}] ready to use", tool.name);
+                metrics::tools::COUNT
+                    .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
+                status::update_tool(&tool.name, status::ComponentStatus::Ready);
+            }
+            Err(e) => {
+                metrics::tools::LOAD_ERROR.add(1, &[]);
+                status::update_tool(&tool.name, status::ComponentStatus::Error);
+                tracing::warn!(
+                    "Unable to load tool from spicepod {}, error: {}",
+                    tool.name,
+                    e,
+                );
             }
         }
     }

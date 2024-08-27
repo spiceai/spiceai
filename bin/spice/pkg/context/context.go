@@ -147,6 +147,33 @@ func (c *RuntimeContext) Version() (string, error) {
 	return strings.TrimSpace(string(version)), nil
 }
 
+func (c *RuntimeContext) ModelsFlavorInstalled() bool {
+	version, err := c.Version()
+	if err != nil {
+		return false
+	}
+
+	// Split the semver string by '+', the part after '+' is the build metadata
+	parts := strings.Split(version, "+")
+	if len(parts) < 2 {
+		// No build metadata present
+		return false
+	}
+
+	// Split build metadata by '.'
+	buildMetadata := parts[1]
+	metadataParts := strings.Split(buildMetadata, ".")
+
+	// Check if any of the metadata parts is 'models'
+	for _, part := range metadataParts {
+		if part == "models" {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (c *RuntimeContext) RuntimeUnavailableError() error {
 	return fmt.Errorf("the Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
 }
@@ -159,7 +186,7 @@ func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (c *RuntimeContext) InstallOrUpgradeRuntime() error {
+func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string) error {
 	err := c.prepareInstallDir()
 	if err != nil {
 		return err
@@ -174,7 +201,7 @@ func (c *RuntimeContext) InstallOrUpgradeRuntime() error {
 
 	fmt.Printf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion)
 
-	err = github.DownloadRuntimeAsset(release, c.spiceBinDir)
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir)
 	if err != nil {
 		fmt.Println("Error downloading Spice.ai runtime binaries.")
 		return err
