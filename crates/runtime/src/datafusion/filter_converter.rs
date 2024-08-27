@@ -20,12 +20,14 @@ use datafusion::{
     logical_expr::{binary_expr, cast, col, lit, Expr, Operator},
     scalar::ScalarValue,
 };
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum ExprTimeFormat {
     ISO8601,
     UnixTimestamp(ExprUnixTimestamp),
     Timestamp,
+    Timestamptz(Option<Arc<str>>),
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +71,10 @@ impl TimestampFilterConvert {
                 }
                 ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
             }
-            DataType::Timestamp(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_) => ExprTimeFormat::Timestamp,
+            DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => {
+                ExprTimeFormat::Timestamp
+            }
+            DataType::Timestamp(_, tz) => ExprTimeFormat::Timestamptz(tz.to_owned()),
             DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
             _ => {
                 tracing::warn!("Date type is not handled yet: {}", field.data_type());
@@ -114,6 +115,14 @@ impl TimestampFilterConvert {
                 Expr::Literal(ScalarValue::TimestampMillisecond(
                     Some((timestamp_in_nanos / 1_000_000) as i64),
                     None,
+                )),
+            ),
+            ExprTimeFormat::Timestamptz(tz) => binary_expr(
+                col(time_column),
+                op,
+                Expr::Literal(ScalarValue::TimestampMillisecond(
+                    Some((timestamp_in_nanos / 1_000_000) as i64),
+                    tz.to_owned(),
                 )),
             ),
         }
