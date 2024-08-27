@@ -107,7 +107,7 @@ impl std::fmt::Display for TimeFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Dataset {
     pub from: String,
     pub name: TableReference,
@@ -121,6 +121,25 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
+}
+
+// Implement a custom PartialEq for Dataset to ignore the app field
+// This allows the Runtime to compare datasets like-for-like between App reloads,
+// because different App instances will cause datasets that are exactly the same to be considered different.
+impl PartialEq for Dataset {
+    fn eq(&self, other: &Self) -> bool {
+        self.from == other.from
+            && self.name == other.name
+            && self.mode == other.mode
+            && self.params == other.params
+            && self.has_metadata_table == other.has_metadata_table
+            && self.replication == other.replication
+            && self.time_column == other.time_column
+            && self.time_format == other.time_format
+            && self.acceleration == other.acceleration
+            && self.embeddings == other.embeddings
+            && self.schema == other.schema
+    }
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {
