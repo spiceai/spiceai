@@ -96,11 +96,11 @@ impl TimestampFilterConvert {
             ExprTimeFormat::ISO8601 => binary_expr(
                 cast(
                     col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 ),
                 op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp_in_nanos / 1_000_000) as i64),
+                Expr::Literal(ScalarValue::TimestampNanosecond(
+                    Some(timestamp_in_nanos as i64),
                     None,
                 )),
             ),
@@ -110,18 +110,26 @@ impl TimestampFilterConvert {
                 lit((timestamp_in_nanos / format.scale) as u64),
             ),
             ExprTimeFormat::Timestamp => binary_expr(
-                col(time_column),
+                // The time unit of timestamp is unknown before filtering
+                // Convert the left and right expr to same unit for safe comparison
+                cast(
+                    col(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
                 op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp_in_nanos / 1_000_000) as i64),
+                Expr::Literal(ScalarValue::TimestampNanosecond(
+                    Some(timestamp_in_nanos as i64),
                     None,
                 )),
             ),
             ExprTimeFormat::Timestamptz(tz) => binary_expr(
-                col(time_column),
+                cast(
+                    col(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
                 op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp_in_nanos / 1_000_000) as i64),
+                Expr::Literal(ScalarValue::TimestampNanosecond(
+                    Some(timestamp_in_nanos as i64),
                     tz.to_owned(),
                 )),
             ),
@@ -156,7 +164,7 @@ mod test {
             ),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "timestamp > TimestampMillisecond(1620000000000, None)",
+            "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
         );
         test(
             Field::new(
@@ -166,7 +174,7 @@ mod test {
             ),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(Millisecond, None)) > TimestampMillisecond(1620000000000, None)",
+            "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 
