@@ -216,7 +216,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "bigdecimal 0.4.5",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "snafu 0.8.4",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2821,7 +2821,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3066,6 +3066,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-functions-json"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00900606bdd73248f0a0bea254379ef06832f4958510581e752fedd17b33b8b4"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "datafusion-common",
+ "datafusion-execution",
+ "datafusion-expr",
+ "jiter",
+ "log",
+ "paste",
+]
+
+[[package]]
 name = "datafusion-functions-nested"
 version = "41.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=4fa3dbc3a0f12202b9f700740069cb9e0dc2dc2a#4fa3dbc3a0f12202b9f700740069cb9e0dc2dc2a"
@@ -3210,7 +3226,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e9d9e7adca882101f8a8bef453f973097f9fcdda#e9d9e7adca882101f8a8bef453f973097f9fcdda"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e75565b74364e9f1da20f80f4c029d18bfaf9812#e75565b74364e9f1da20f80f4c029d18bfaf9812"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3253,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3898,7 +3914,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3913,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3926,7 +3942,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3944,7 +3960,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -5268,6 +5284,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b"
 
 [[package]]
+name = "jiter"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02e23549143ef50eddffd46ba8cd0229b0a4500aef7518cf2eb0f41c9a09d22b"
+dependencies = [
+ "ahash 0.8.11",
+ "bitvec",
+ "lexical-parse-float",
+ "num-bigint",
+ "num-traits",
+ "smallvec",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5681,7 +5711,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "async-openai",
  "async-stream",
@@ -6121,7 +6151,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6426,7 +6456,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "snafu 0.8.4",
  "tracing",
@@ -7120,7 +7150,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -8468,7 +8498,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "anyhow",
  "app",
@@ -8502,9 +8532,9 @@ dependencies = [
  "datafusion",
  "datafusion-federation",
  "datafusion-federation-sql",
+ "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",
- "dirs",
  "dotenvy",
  "duckdb",
  "flight_client",
@@ -9463,7 +9493,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -9480,7 +9510,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "app",
  "clap",
@@ -9509,7 +9539,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "schemars",
  "serde",
@@ -9521,7 +9551,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "schemars",
  "serde_json",
@@ -9868,7 +9898,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "async-trait",
@@ -10924,7 +10954,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "0.17.2-beta"
+version = "0.17.3-beta"
 dependencies = [
  "backoff",
  "humantime",

@@ -75,6 +75,7 @@ pub mod file;
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
+pub mod github;
 pub mod graphql;
 pub mod https;
 #[cfg(feature = "mysql")]
@@ -289,6 +290,7 @@ pub async fn register_all() {
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
     register_connector_factory("https", https::HttpsFactory::new_arc()).await;
+    register_connector_factory("github", github::GithubFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
     register_connector_factory("spiceai", spiceai::SpiceAIFactory::new_arc()).await;
