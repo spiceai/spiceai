@@ -2945,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=e0a4eaef873949c4f4bb3edf64e411821e62dcb2#e0a4eaef873949c4f4bb3edf64e411821e62dcb2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=21f07bec7284bcbff2bf4e570008290b66e3dc6f#21f07bec7284bcbff2bf4e570008290b66e3dc6f"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -2957,7 +2957,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=e0a4eaef873949c4f4bb3edf64e411821e62dcb2#e0a4eaef873949c4f4bb3edf64e411821e62dcb2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=21f07bec7284bcbff2bf4e570008290b66e3dc6f#21f07bec7284bcbff2bf4e570008290b66e3dc6f"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -3008,6 +3008,22 @@ dependencies = [
  "log",
  "paste",
  "sqlparser",
+]
+
+[[package]]
+name = "datafusion-functions-json"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00900606bdd73248f0a0bea254379ef06832f4958510581e752fedd17b33b8b4"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "datafusion-common",
+ "datafusion-execution",
+ "datafusion-expr",
+ "jiter",
+ "log",
+ "paste",
 ]
 
 [[package]]
@@ -3155,7 +3171,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=55f878c3accba051a1e06c33fd0b4b5937a05d66#55f878c3accba051a1e06c33fd0b4b5937a05d66"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e75565b74364e9f1da20f80f4c029d18bfaf9812#e75565b74364e9f1da20f80f4c029d18bfaf9812"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -5177,6 +5193,20 @@ name = "itoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b"
+
+[[package]]
+name = "jiter"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02e23549143ef50eddffd46ba8cd0229b0a4500aef7518cf2eb0f41c9a09d22b"
+dependencies = [
+ "ahash 0.8.11",
+ "bitvec",
+ "lexical-parse-float",
+ "num-bigint",
+ "num-traits",
+ "smallvec",
+]
 
 [[package]]
 name = "jni"
@@ -8337,9 +8367,9 @@ dependencies = [
  "datafusion",
  "datafusion-federation",
  "datafusion-federation-sql",
+ "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",
- "dirs",
  "dotenvy",
  "duckdb",
  "flight_client",

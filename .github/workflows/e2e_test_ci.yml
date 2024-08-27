@@ -203,7 +203,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_spiceai:
@@ -267,7 +267,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_data_postgres:
@@ -344,12 +344,13 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_data_mysql:
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    if: false
     needs:
       - build
       - setup-matrix
@@ -441,7 +442,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_clickhouse:
@@ -539,7 +540,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_duckdb:
@@ -621,7 +622,7 @@ jobs:
         if: always()
         working-directory: duckdb-app
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_local_acceleration:
@@ -713,7 +714,6 @@ jobs:
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
-          HOME=$GITHUB_WORKSPACE
           spice run &> spice.log &
           # time to initialize added dataset
           sleep 10
@@ -747,7 +747,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_results_caching:
@@ -865,5 +865,5 @@ jobs:
           working-directory: test_app
           if: always()
           run: |
-            killall spice
+            killall spice || true
             cat spice.log

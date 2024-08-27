@@ -1706,11 +1706,11 @@ pub struct RegisterDatasetContext {
 }
 
 pub(crate) fn spice_data_base_path() -> String {
-    let Some(home_dir) = dirs::home_dir() else {
+    let Ok(working_dir) = std::env::current_dir() else {
         return ".".to_string();
     };
 
-    let base_folder = home_dir.join(".spice/data");
+    let base_folder = working_dir.join(".spice/data");
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
