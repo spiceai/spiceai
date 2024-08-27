@@ -39,7 +39,6 @@ datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 datafusion.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
-dirs.workspace = true
 dotenvy.workspace = true
 duckdb = { workspace = true, features = [
   "bundled",
