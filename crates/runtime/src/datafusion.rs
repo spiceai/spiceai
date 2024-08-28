@@ -30,7 +30,7 @@ use crate::dataupdate::{
 };
 use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
-use crate::{embeddings, get_dependent_table_names};
+use crate::{embeddings, view};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -952,7 +952,7 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
-            let dependent_table_names = get_dependent_table_names(&statements[0]);
+            let dependent_table_names = view::get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
 
