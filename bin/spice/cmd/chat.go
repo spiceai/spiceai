@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/manifoldco/promptui"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -105,9 +106,30 @@ spice chat --model <model> --cloud
 				cmd.Println("No models found")
 				os.Exit(1)
 			}
-			fmt.Println("Using model:", models[0].Name)
+
+			modelsSelection := []string{}
+			selectedModel := models[0].Name
+			if len(models) > 1 {
+				for _, model := range models {
+					modelsSelection = append(modelsSelection, model.Name)
+				}
+
+				prompt := promptui.Select{
+					Label:        "Select the model to chat with",
+					Items:        modelsSelection,
+					HideSelected: true,
+				}
+
+				_, selectedModel, err = prompt.Run()
+				if err != nil {
+					fmt.Printf("Prompt failed %v\n", err)
+					return
+				}
+			}
+
+			fmt.Println("Using model:", selectedModel)
 			fmt.Println()
-			model = models[0].Name
+			model = selectedModel
 		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
