@@ -16,15 +16,19 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::graphql::{client::GraphQLClient, provider::GraphQLTableProvider};
+use data_components::{
+    github::{GithubFilesTableProvider, GithubRestClient},
+    graphql::{client::GraphQLClient, provider::GraphQLTableProvider},
+};
 use datafusion::datasource::TableProvider;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use std::{any::Any, error::Error, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
-    graphql::default_spice_client, DataConnector, DataConnectorFactory, ParameterSpec, Parameters,
+    graphql::default_spice_client, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters,
 };
 
 pub struct Github {
@@ -199,41 +203,6 @@ impl GithubTableArgs for IssueTableArgs {
     }
 }
 
-pub fn args_from_ds(
-    ds: &Dataset,
-) -> Result<Arc<dyn GithubTableArgs>, Box<dyn Error + Send + Sync>> {
-    let path = ds.path().clone();
-    let mut parts = path.split('/');
-
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
-            Ok(Arc::new(PullRequestTableArgs {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            }))
-        }
-        (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
-            Ok(Arc::new(CommitTableArgs {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            }))
-        }
-        (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
-            Ok(Arc::new(IssueTableArgs {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            }))
-        }
-        (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
-            Err(format!("Invalid Github table type: {invalid_table}").into())
-        }
-        (_, Some(owner), Some(repo), _) => {
-            Err(format!("`from` must start with 'github.com/{owner}/{repo}'").into())
-        }
-        _ => Err("Invalid Github dataset path".into()),
-    }
-}
-
 impl Github {
     pub(crate) fn create_graphql_client(
         &self,
@@ -251,13 +220,71 @@ impl Github {
 
         Ok(GraphQLClient::new(
             client,
-            Url::parse(endpoint).boxed()?,
+            Url::parse(&format!("{endpoint}/graphql")).boxed()?,
             query,
             json_pointer,
             access_token,
             None,
             None,
             unnest_depth,
+        ))
+    }
+
+    async fn create_gql_table_provider(
+        &self,
+        table_args: Arc<dyn GithubTableArgs>,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let client = self.create_graphql_client(&table_args).context(
+            super::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+            },
+        )?;
+
+        Ok(Arc::new(
+            GraphQLTableProvider::new(client).await.boxed().context(
+                super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                },
+            )?,
+        ))
+    }
+
+    pub(crate) fn create_rest_client(
+        &self,
+    ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(access_token) = self.params.get("access_token").expose().ok() else {
+            return Err("Github 'access_token' not provided".into());
+        };
+
+        Ok(GithubRestClient::new(access_token))
+    }
+
+    async fn create_files_table_provider(
+        &self,
+        owner: &str,
+        repo: &str,
+        tree_sha: Option<&str>,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                source: format!("Branch or tag name is required in dataset definition; must be 'github.com/{owner}/{repo}/files/BRANCH_NAME'").into(),
+            });
+        };
+
+        let client = self
+            .create_rest_client()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+            })?;
+
+        Ok(Arc::new(
+            GithubFilesTableProvider::new(client, owner, repo, tree_sha)
+                .await
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                })?,
         ))
     }
 }
@@ -283,7 +310,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
-        .default("https://api.github.com/graphql"),
+        .default("https://api.github.com"),
 ];
 
 impl DataConnectorFactory for GithubFactory {
@@ -313,21 +340,49 @@ impl DataConnector for Github {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let table_args = args_from_ds(dataset).context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "github".to_string(),
-        })?;
-        let client = self.create_graphql_client(&table_args).context(
-            super::UnableToGetReadProviderSnafu {
-                dataconnector: "github".to_string(),
-            },
-        )?;
+        let path = dataset.path().clone();
+        let mut parts = path.split('/');
 
-        Ok(Arc::new(
-            GraphQLTableProvider::new(client).await.boxed().context(
-                super::UnableToGetReadProviderSnafu {
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
+                let table_args = Arc::new(PullRequestTableArgs {
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                });
+                self.create_gql_table_provider(table_args).await
+            }
+            (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
+                let table_args = Arc::new(CommitTableArgs {
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                });
+                self.create_gql_table_provider(table_args).await
+            }
+            (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
+                let table_args = Arc::new(IssueTableArgs {
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                });
+                self.create_gql_table_provider(table_args).await
+            }
+            (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
+                self.create_files_table_provider(owner, repo, parts.next())
+                    .await
+            }
+            (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
+                Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                },
-            )?,
-        ))
+                    source: format!("Invalid Github table type: {invalid_table}").into(),
+                })
+            }
+            (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                source: format!("`from` must start with 'github.com/{owner}/{repo}'").into(),
+            }),
+            _ => Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                source: "Invalid Github dataset path".into(),
+            }),
+        }
     }
 }
