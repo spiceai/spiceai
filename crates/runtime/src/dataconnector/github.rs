@@ -317,7 +317,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
-    ParameterSpec::connector("include")
+    ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
 ];
