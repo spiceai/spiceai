@@ -17,15 +17,13 @@ limitations under the License.
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"strings"
 
-	"github.com/matttproud/golang_protobuf_extensions/pbutil"
-	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/common/expfmt"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
@@ -59,15 +57,57 @@ func (cs ComponentStatus) String() string {
 	}
 }
 
-const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
+type ComponentStatusResult struct {
+	Name          string `json:"name"`
+	Status        int    `json:"status"`
+	ComponentType string `json:"component_type"`
+}
 
 // Get the status of all models and datasets (respectively).
 func GetComponentStatuses(rtContext *context.RuntimeContext) (map[string]ComponentStatus, map[string]ComponentStatus, error) {
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/metrics", rtContext.MetricsEndpoint()), nil)
+	componentStatusQuery := `
+WITH combined_data AS (
+    SELECT 
+        array_element(attributes, 1)['str'] AS name, 
+        data_number.int_value AS status, 
+        'models' AS component_type, 
+        time_unix_nano
+    FROM runtime.metrics 
+    WHERE name = 'models_status'
+    
+    UNION ALL
+    
+    SELECT 
+        array_element(attributes, 1)['str'] AS name, 
+        data_number.int_value AS status, 
+        'datasets' AS component_type, 
+        time_unix_nano
+    FROM runtime.metrics 
+    WHERE name = 'datasets_status'
+),
+ranked_data AS (
+    SELECT
+        name,
+        status,
+        component_type,
+        ROW_NUMBER() OVER (PARTITION BY name, component_type ORDER BY time_unix_nano DESC) AS rn
+    FROM
+        combined_data
+)
+SELECT
+    name,
+    status,
+    component_type
+FROM
+    ranked_data
+WHERE
+    rn = 1 AND name NOT LIKE 'runtime.%';
+`
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/v1/sql", rtContext.HttpEndpoint()), bytes.NewReader([]byte(componentStatusQuery)))
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Add("Accept", acceptHeader)
 	resp, err := rtContext.Client().Do(req)
 	if err != nil {
 		if strings.HasSuffix(err.Error(), "connection refused") {
@@ -79,61 +119,24 @@ func GetComponentStatuses(rtContext *context.RuntimeContext) (map[string]Compone
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
-	metricFamilies, err := parseResponse(resp)
-	if err != nil {
-		return nil, nil, err
+	// Parse the JSON response
+	var componentStatuses []ComponentStatusResult
+	decoder := json.NewDecoder(resp.Body)
+	err = decoder.Decode(&componentStatuses)
+	if err == io.EOF {
+		return nil, nil, nil
+	} else if err != nil {
+		return nil, nil, fmt.Errorf("failed to decode JSON response: %v", err)
 	}
-	models, datasets := extractComponentStatuses(metricFamilies)
-	return models, datasets, nil
-}
-func parseResponse(resp *http.Response) (map[string]*dto.MetricFamily, error) {
-	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-
-	metricFamilies := make(map[string]*dto.MetricFamily, 0)
-	if err == nil && mediaType == "application/vnd.google.protobuf" && params["encoding"] == "delimited" && params["proto"] == "io.prometheus.client.MetricFamily" {
-		for {
-			mf := &dto.MetricFamily{}
-			if _, err = pbutil.ReadDelimited(resp.Body, mf); err != nil {
-				if err == io.EOF {
-					break
-				}
-			}
-			metricFamilies[*mf.Name] = mf
-		}
-	} else {
-		var parser expfmt.TextParser
-		var err error
-		metricFamilies, err = parser.TextToMetricFamilies(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("reading text format failed: %w", err)
+	datasetsStatusMap := make(map[string]ComponentStatus)
+	modelStatusMap := make(map[string]ComponentStatus)
+	for _, status := range componentStatuses {
+		switch status.ComponentType {
+		case "models":
+			modelStatusMap[status.Name] = ComponentStatus(status.Status)
+		case "datasets":
+			datasetsStatusMap[status.Name] = ComponentStatus(status.Status)
 		}
 	}
-	return metricFamilies, nil
-}
-
-func extractComponentStatuses(metricFamilies map[string]*dto.MetricFamily) (map[string]ComponentStatus, map[string]ComponentStatus) {
-	modelStatuses := make(map[string]ComponentStatus)
-	datasetStatuses := make(map[string]ComponentStatus)
-
-	for _, mf := range metricFamilies {
-		switch *mf.Name {
-		case "model_status":
-			for _, m := range mf.Metric {
-				for _, lp := range m.Label {
-					if lp.GetName() == "model" {
-						modelStatuses[lp.GetValue()] = ComponentStatus(m.GetGauge().GetValue())
-					}
-				}
-			}
-		case "dataset_status":
-			for _, m := range mf.Metric {
-				for _, lp := range m.Label {
-					if lp.GetName() == "dataset" {
-						datasetStatuses[lp.GetValue()] = ComponentStatus(m.GetGauge().GetValue())
-					}
-				}
-			}
-		}
-	}
-	return modelStatuses, datasetStatuses
+	return modelStatusMap, datasetsStatusMap, nil
 }
