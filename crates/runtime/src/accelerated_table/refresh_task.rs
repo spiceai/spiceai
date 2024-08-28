@@ -22,14 +22,12 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
-use data_components::debezium::change_event::Field;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
 use futures::{stream, Stream, StreamExt};
 use opentelemetry::Key;
 use snafu::{OptionExt, ResultExt};
-use spicepod::component::secret::Secret;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
@@ -774,10 +772,13 @@ fn filter_records(
             .fields()
             .iter()
             .map(|field| {
-                let column_idx = update_data.schema().index_of(field.name()).unwrap();
-                (Arc::clone(field), update_data.column(column_idx).clone())
+                let column_idx = update_data
+                    .schema()
+                    .index_of(field.name())
+                    .context(super::FailedToFilterUpdatesSnafu)?;
+                Ok((Arc::clone(field), update_data.column(column_idx).clone()))
             })
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>, _>>()?,
     );
 
     for existing in existing_records {
@@ -786,10 +787,13 @@ fn filter_records(
                 .fields()
                 .iter()
                 .map(|field| {
-                    let column_idx = existing.schema().index_of(field.name()).unwrap();
-                    (Arc::clone(field), existing.column(column_idx).clone())
+                    let column_idx = existing
+                        .schema()
+                        .index_of(field.name())
+                        .context(super::FailedToFilterUpdatesSnafu)?;
+                    Ok((Arc::clone(field), existing.column(column_idx).clone()))
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, _>>()?,
         );
 
         comparators.push((
