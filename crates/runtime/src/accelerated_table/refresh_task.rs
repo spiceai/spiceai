@@ -19,18 +19,22 @@ use arrow::{
     array::{make_comparator, RecordBatch, StructArray, TimestampNanosecondArray},
     datatypes::DataType,
 };
+use arrow_schema::SchemaRef;
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
+use data_components::debezium::change_event::Field;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
 use futures::{stream, Stream, StreamExt};
 use opentelemetry::Key;
 use snafu::{OptionExt, ResultExt};
+use spicepod::component::secret::Secret;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
+use crate::embeddings::table::EmbeddingTable;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -619,13 +623,19 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
+        let base_table_schema: Option<SchemaRef> =
+            match self.federated.as_any().downcast_ref::<EmbeddingTable>() {
+                Some(p) => Some(p.get_base_table_schema()),
+                None => None,
+            };
+
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
-                    let batch = filter_records(&batch?, &existing_records);
+                    let batch = filter_records(&batch?, &existing_records, base_table_schema.clone());
                     yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                 }
             }
@@ -751,18 +761,42 @@ impl RefreshTask {
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &Vec<RecordBatch>,
+    base_table_schema: Option<SchemaRef>,
 ) -> super::Result<RecordBatch> {
     let mut predicates = vec![];
     let mut comparators = vec![];
 
-    let update_struct_array = StructArray::from(update_data.clone());
+    // Only use columns existing in the base table for filtering
+    let schema = base_table_schema.unwrap_or_else(|| update_data.schema());
+
+    let update_struct_array = StructArray::from(
+        schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let column_idx = update_data.schema().index_of(field.name()).unwrap();
+                (Arc::clone(field), update_data.column(column_idx).clone())
+            })
+            .collect::<Vec<_>>(),
+    );
+
     for existing in existing_records {
-        let existing_array = StructArray::from(existing.clone());
+        let existing_struct_array = StructArray::from(
+            schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let column_idx = existing.schema().index_of(field.name()).unwrap();
+                    (Arc::clone(field), existing.column(column_idx).clone())
+                })
+                .collect::<Vec<_>>(),
+        );
+
         comparators.push((
             existing.num_rows(),
             make_comparator(
                 &update_struct_array,
-                &existing_array,
+                &existing_struct_array,
                 SortOptions::default(),
             )
             .context(super::FailedToFilterUpdatesSnafu)?,
