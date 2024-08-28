@@ -243,6 +243,20 @@ impl GithubRestClient {
                 );
                 Err(err_msg.into())
             }
+            401 => {
+                let err_msg = format!(
+                    "Github API ({endpoint}) failed with status code {}; Is the token correct?",
+                    response.status()
+                );
+                Err(err_msg.into())
+            }
+            403 => {
+                let err_msg = format!(
+                    "Github API ({endpoint}) failed with status code {}; Does the token have the right permissions?",
+                    response.status()
+                );
+                Err(err_msg.into())
+            }
             _ => {
                 let err_msg = format!(
                     "Github API ({endpoint}) failed with status code {}",
