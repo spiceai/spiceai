@@ -93,23 +93,12 @@ impl TimestampFilterConvert {
     pub(crate) fn convert(&self, timestamp_in_nanos: u128, op: Operator) -> Expr {
         let time_column: &str = &format!(r#""{}""#, &self.time_column);
         match &self.time_format {
-            ExprTimeFormat::ISO8601 => binary_expr(
-                cast(
-                    col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                ),
-                op,
-                Expr::Literal(ScalarValue::TimestampNanosecond(
-                    Some(timestamp_in_nanos as i64),
-                    None,
-                )),
-            ),
             ExprTimeFormat::UnixTimestamp(format) => binary_expr(
                 col(time_column),
                 op,
                 lit((timestamp_in_nanos / format.scale) as u64),
             ),
-            ExprTimeFormat::Timestamp => binary_expr(
+            ExprTimeFormat::Timestamp | ExprTimeFormat::ISO8601 => binary_expr(
                 // The time unit of timestamp is unknown before filtering
                 // Convert the left and right expr to same unit for safe comparison
                 cast(
