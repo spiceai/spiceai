@@ -82,6 +82,7 @@ impl EmbeddingTable {
     }
 
     // Get the schema of the base table.
+    #[must_use]
     pub fn get_base_table_schema(&self) -> SchemaRef {
         self.base_table.schema()
     }

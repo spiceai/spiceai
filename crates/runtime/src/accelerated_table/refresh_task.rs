@@ -621,11 +621,13 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
+        // Get the base table schema when table is EmbeddingTable
+        // The base table schema will be used as filter in filter_records
         let base_table_schema: Option<SchemaRef> = self
             .federated
             .as_any()
             .downcast_ref::<EmbeddingTable>()
-            .map(|p| p.get_base_table_schema());
+            .map(EmbeddingTable::get_base_table_schema);
 
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
@@ -759,13 +761,13 @@ impl RefreshTask {
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &Vec<RecordBatch>,
-    base_table_schema: Option<SchemaRef>,
+    filter_schema: Option<SchemaRef>,
 ) -> super::Result<RecordBatch> {
     let mut predicates = vec![];
     let mut comparators = vec![];
 
     // Only use columns existing in the base table for filtering
-    let schema = base_table_schema.unwrap_or_else(|| update_data.schema());
+    let schema = filter_schema.unwrap_or_else(|| update_data.schema());
 
     let update_struct_array = StructArray::from(
         schema
