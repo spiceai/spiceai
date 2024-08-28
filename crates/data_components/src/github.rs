@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
 
 use crate::arrow::write::MemTable;
@@ -52,6 +53,7 @@ pub struct GithubFilesTableProvider {
     repo: Arc<str>,
     tree_sha: Arc<str>,
     schema: SchemaRef,
+    include: Option<Arc<GlobSet>>,
 }
 
 impl GithubFilesTableProvider {
@@ -60,6 +62,7 @@ impl GithubFilesTableProvider {
         owner: &str,
         repo: &str,
         tree_sha: &str,
+        include: Option<Arc<GlobSet>>,
     ) -> Result<Self> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -72,7 +75,7 @@ impl GithubFilesTableProvider {
 
         // ensure configuration is correct
         client
-            .fetch_files(owner, repo, tree_sha, Some(1), Arc::clone(&schema))
+            .fetch_files(owner, repo, tree_sha, Some(1), None, Arc::clone(&schema))
             .await?;
 
         Ok(Self {
@@ -81,6 +84,7 @@ impl GithubFilesTableProvider {
             repo: repo.into(),
             tree_sha: tree_sha.into(),
             schema,
+            include,
         })
     }
 }
@@ -122,7 +126,8 @@ impl TableProvider for GithubFilesTableProvider {
                 &self.owner,
                 &self.repo,
                 &self.tree_sha,
-                limit,
+                None,
+                self.include.clone(),
                 Arc::clone(&self.schema),
             )
             .await
@@ -156,17 +161,23 @@ impl GithubRestClient {
         repo: &str,
         tree_sha: &str,
         limit: Option<usize>,
+        include_pattern: Option<Arc<GlobSet>>,
         schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
         let git_tree = self
             .fetch_git_tree(owner, repo, tree_sha)
             .await
             .context(GithubApiSnafu)?;
+
         let mut tree: Vec<GitTreeNode> = git_tree
             .tree
             .into_iter()
             .filter(|node| node.node_type == "blob")
             .collect();
+
+        if let Some(pattern) = include_pattern.as_ref() {
+            tree.retain(|node| pattern.is_match(&node.path));
+        }
 
         if let Some(limit) = limit {
             tree.truncate(limit);
