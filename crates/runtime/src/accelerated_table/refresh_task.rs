@@ -621,11 +621,11 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        let base_table_schema: Option<SchemaRef> =
-            match self.federated.as_any().downcast_ref::<EmbeddingTable>() {
-                Some(p) => Some(p.get_base_table_schema()),
-                None => None,
-            };
+        let base_table_schema: Option<SchemaRef> = self
+            .federated
+            .as_any()
+            .downcast_ref::<EmbeddingTable>()
+            .map(|p| p.get_base_table_schema());
 
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
@@ -776,7 +776,7 @@ fn filter_records(
                     .schema()
                     .index_of(field.name())
                     .context(super::FailedToFilterUpdatesSnafu)?;
-                Ok((Arc::clone(field), update_data.column(column_idx).clone()))
+                Ok((Arc::clone(field), update_data.column(column_idx).to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
@@ -791,7 +791,7 @@ fn filter_records(
                         .schema()
                         .index_of(field.name())
                         .context(super::FailedToFilterUpdatesSnafu)?;
-                    Ok((Arc::clone(field), existing.column(column_idx).clone()))
+                    Ok((Arc::clone(field), existing.column(column_idx).to_owned()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
