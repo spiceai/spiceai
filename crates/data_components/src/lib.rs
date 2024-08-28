@@ -55,6 +55,8 @@ pub mod spark_connect;
 pub mod sqlite;
 pub mod unity_catalog;
 
+pub mod github;
+
 pub mod cdc;
 pub mod delete;
 pub mod graphql;
