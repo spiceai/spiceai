@@ -161,7 +161,7 @@ impl GithubRestClient {
         repo: &str,
         tree_sha: &str,
         limit: Option<usize>,
-        include_patern: Option<Arc<GlobSet>>,
+        include_pattern: Option<Arc<GlobSet>>,
         schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
         let git_tree = self
@@ -175,7 +175,7 @@ impl GithubRestClient {
             .filter(|node| node.node_type == "blob")
             .collect();
 
-        if let Some(pattern) = include_patern.as_ref() {
+        if let Some(pattern) = include_pattern.as_ref() {
             tree.retain(|node| pattern.is_match(&node.path));
         }
 
