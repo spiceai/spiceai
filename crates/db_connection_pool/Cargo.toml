@@ -43,7 +43,7 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "dep:async-stream",
 ]
-duckdb = ["datafusion-table-providers/duckdb"]
+duckdb = ["datafusion-table-providers/duckdb", "datafusion-table-providers/duckdb-federation"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = [
   "dep:odbc-api",
@@ -59,4 +59,4 @@ postgres = [
   "datafusion-table-providers/postgres",
 ]
 snowflake = ["dep:snowflake-api", "dep:pkcs8"]
-sqlite = ["datafusion-table-providers/sqlite"]
+sqlite = ["datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]

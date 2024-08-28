@@ -67,8 +67,7 @@ func EnsureInstalled(flavor string) (bool, error) {
 }
 
 func Run(args []string) error {
-	fmt.Println("Spice.ai runtime starting...")
-
+	fmt.Println("Checking for latest Spice runtime release...")
 	rtcontext := context.NewContext()
 
 	err := rtcontext.Init()
@@ -90,6 +89,7 @@ func Run(args []string) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
+	fmt.Println("Spice.ai runtime starting...")
 	err = util.RunCommand(cmd)
 	if err != nil {
 		return err
