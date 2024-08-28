@@ -33,8 +33,6 @@ const (
 )
 
 func GetLatestRuntimeRelease() (*RepoRelease, error) {
-	fmt.Println("Checking for latest Spice runtime release...")
-
 	release, err := GetLatestRelease(githubClient, GetAssetName(constants.SpiceRuntimeFilename))
 	if err != nil {
 		return nil, err
