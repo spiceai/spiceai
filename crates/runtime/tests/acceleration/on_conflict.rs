@@ -171,7 +171,7 @@ async fn dataset_ready_check(rt: Arc<Runtime>, sql: &str) {
                 .build()
                 .run()
                 .await
-                .expect("result returned");
+                .unwrap_or_else(|_| panic!("Result should be returned"));
             let mut batches = vec![];
             while let Some(batch) = query_result.data.next().await {
                 batches.push(batch.unwrap_or_else(|_| panic!("Batch should be created")));
