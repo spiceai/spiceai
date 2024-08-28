@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
@@ -93,8 +96,18 @@ spice chat --model <model> --cloud
 			os.Exit(1)
 		}
 		if model == "" {
-			cmd.Println("model is required")
-			os.Exit(1)
+			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			if err != nil {
+				cmd.PrintErrln(err.Error())
+				os.Exit(1)
+			}
+			if len(models) == 0 {
+				cmd.Println("No models found")
+				os.Exit(1)
+			}
+			fmt.Println("Using model:", models[0].Name)
+			fmt.Println()
+			model = models[0].Name
 		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
@@ -110,23 +123,25 @@ spice chat --model <model> --cloud
 			}
 		}
 
-		reader := bufio.NewReader(os.Stdin)
-
 		apiKey := os.Getenv("SPICE_API_KEY")
 
 		client := &http.Client{}
 
 		var messages []Message = []Message{}
 
+		line := liner.NewLiner()
+		line.SetCtrlCAborts(true)
+		defer line.Close()
 		for {
-			cmd.Print("chat> ")
-
-			message, err := reader.ReadString('\n')
-			if err != nil {
-				cmd.Println(err.Error())
-				os.Exit(1)
+			message, err := line.Prompt("chat> ")
+			if err == liner.ErrPromptAborted {
+				break
+			} else if err != nil {
+				log.Print("Error reading line: ", err)
+				continue
 			}
 
+			line.AppendHistory(message)
 			messages = append(messages, Message{Role: "user", Content: message})
 
 			done := make(chan bool)
