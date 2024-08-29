@@ -28,7 +28,7 @@ impl Parameters {
             .filter_map(|(key, value)| {
                 let mut unprefixed_key = key.as_str();
                 let mut has_prefix = false;
-                if key.starts_with(&full_prefix) && !key.starts_with("file_") {
+                if key.starts_with(&full_prefix) {
                     has_prefix = true;
                     unprefixed_key = &key[full_prefix.len()..];
                 }

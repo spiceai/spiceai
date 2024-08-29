@@ -10,7 +10,7 @@
       "name": "[Rust] Debug spiced",
       "program": "${workspaceFolder}/target/debug/spiced",
       "args": [],
-      "cwd": "/Users/phillip/code/phillipleblanc/spicyrust",
+      "cwd": "${workspaceFolder}",
       "preLaunchTask": "rust: cargo build"
     },
     {
