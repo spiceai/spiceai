@@ -265,6 +265,7 @@ impl Github {
         owner: &str,
         repo: &str,
         tree_sha: Option<&str>,
+        dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
@@ -285,12 +286,19 @@ impl Github {
         };
 
         Ok(Arc::new(
-            GithubFilesTableProvider::new(client, owner, repo, tree_sha, include)
-                .await
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                })?,
+            GithubFilesTableProvider::new(
+                client,
+                owner,
+                repo,
+                tree_sha,
+                include,
+                dataset.is_accelerated(),
+            )
+            .await
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+            })?,
         ))
     }
 }
@@ -375,7 +383,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(table_args).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
-                self.create_files_table_provider(owner, repo, parts.next())
+                self.create_files_table_provider(owner, repo, parts.next(), dataset)
                     .await
             }
             (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {

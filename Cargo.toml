@@ -85,14 +85,14 @@ rusqlite = { version = "0.31.0", features = ["bundled"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.2"
 secrecy = "0.8.0"
-serde = { version = "1.0.195", features = ["derive"] }
+serde = { version = "1.0.209", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.0"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
-tokio = { version = "1.35.1", features = [
+tokio = { version = "1.39.3", features = [
   "rt-multi-thread",
   "signal",
   "macros",
