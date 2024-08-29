@@ -1326,9 +1326,21 @@ impl Runtime {
                 Key::from_static_str("source").string(source_str.clone()),
             ],
         );
-        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
-        let params = self.get_params_with_secrets(&m.params).await;
+        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        let p = m
+            .params
+            .clone()
+            .iter()
+            .map(|(k, v)| {
+                let k = k.clone();
+                match v.as_str() {
+                    Some(s) => (k, s.to_string()),
+                    None => (k, v.to_string()),
+                }
+            })
+            .collect::<HashMap<_, _>>();
+        let params = self.get_params_with_secrets(&p).await;
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());

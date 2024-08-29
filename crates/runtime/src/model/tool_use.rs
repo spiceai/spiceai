@@ -28,8 +28,8 @@ use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
 };
 
@@ -301,7 +301,7 @@ impl Chat for ToolUsingChat {
 
         let resp = self.inner_chat.chat_request(inner_req).await?;
         let usage = resp.usage.clone();
- 
+
         let tools_used = resp
             .choices
             .first()
@@ -317,30 +317,25 @@ impl Chat for ToolUsingChat {
                     .model(req.model)
                     .messages(messages)
                     .build()?;
-                let mut resp = self.chat_request(new_req).await;
-                resp.usage = usage;
+                let mut resp = self.chat_request(new_req).await?;
+                resp.usage = combine_usage(usage, resp.usage);
+                Ok(resp)
             }
             None => Ok(resp),
         }
     }
 }
 
-impl Add for CompletionUsage {
-    type Output = CompletionUsage;
-
-    fn add(self, other: CompletionUsage) -> CompletionUsage {
-        CompletionUsage {
-            prompt_tokens: self.prompt_tokens + other.prompt_tokens,
-            completion_tokens: self.completion_tokens + other.completion_tokens,
-            total_tokens: self.total_tokens + other.total_tokens,
-        }
-    }
-}
-
-/// 
-pub fn combine_usage(u1: Option<CompletionUsage>, u2: Option<CompletionUsage>) -> Option<CompletionUsage> {
+pub fn combine_usage(
+    u1: Option<CompletionUsage>,
+    u2: Option<CompletionUsage>,
+) -> Option<CompletionUsage> {
     match (u1, u2) {
-        (Some(u1), Some(u2)) => Some(u1 + u2),
+        (Some(u1), Some(u2)) => Some(CompletionUsage {
+            prompt_tokens: u1.prompt_tokens + u2.prompt_tokens,
+            completion_tokens: u1.completion_tokens + u2.completion_tokens,
+            total_tokens: u1.total_tokens + u2.total_tokens,
+        }),
         (Some(u1), None) => Some(u1),
         (None, Some(u2)) => Some(u2),
         (None, None) => None,
@@ -512,6 +507,7 @@ fn make_a_stream(
                         }
                     }
                 }
+
                 if let Some(choice) = finished_choices.first() {
                     if let Some(intermediate_chat_output) = &choice.delta.content {
                         chat_output.push_str(intermediate_chat_output);
