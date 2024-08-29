@@ -520,7 +520,7 @@ dependencies = [
  "arrow",
  "bigdecimal 0.4.5",
  "chrono",
- "chrono-tz 0.9.0",
+ "chrono-tz 0.8.6",
  "clickhouse-rs",
  "datafusion-table-providers",
  "snafu 0.8.4",
@@ -1963,27 +1963,6 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "311d8dbe293aa3b5c34f6a57727fafd67d17a74fa8b65276501237c233b34ffd"
-dependencies = [
- "byteorder",
- "gemm",
- "half",
- "memmap2",
- "num-traits",
- "num_cpus",
- "rand",
- "rand_distr",
- "rayon",
- "safetensors",
- "thiserror",
- "yoke",
- "zip",
-]
-
-[[package]]
-name = "candle-core"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5b18de020c2729dbf7ac390325312644808b6ba9b7962f1f724e9185b1d53c7"
@@ -2025,14 +2004,14 @@ dependencies = [
 
 [[package]]
 name = "candle-examples"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad18efc24d80564d1e695bc724ac7bf89c6a3addf1b51468fb8a89c6eaadc6ed"
+checksum = "23557997f798ace54fe11be15f147619c579e76d598085462f2b0ef63e4ea384"
 dependencies = [
  "anyhow",
- "candle-core 0.5.1",
- "candle-nn 0.5.1",
- "candle-transformers 0.5.1",
+ "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-transformers",
  "csv",
  "hf-hub",
  "image",
@@ -2041,22 +2020,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
- "tokenizers 0.19.1",
-]
-
-[[package]]
-name = "candle-nn"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1efb293365959fc5feacbd93fa918980df2d9f2fb89853af02e33a830c10b49b"
-dependencies = [
- "candle-core 0.5.1",
- "half",
- "num-traits",
- "rayon",
- "safetensors",
- "serde",
- "thiserror",
+ "tokenizers",
 ]
 
 [[package]]
@@ -2086,25 +2050,6 @@ dependencies = [
  "safetensors",
  "serde",
  "thiserror",
-]
-
-[[package]]
-name = "candle-transformers"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b28968e2643d21c259d045f5eb42de07b0a3b7fc86ec8571aeb852721f9c189e"
-dependencies = [
- "byteorder",
- "candle-core 0.5.1",
- "candle-nn 0.5.1",
- "fancy-regex",
- "num-traits",
- "rand",
- "rayon",
- "serde",
- "serde_json",
- "serde_plain",
- "tracing",
 ]
 
 [[package]]
@@ -2274,9 +2219,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.15"
+version = "4.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d8838454fda655dafd3accb2b6e2bea645b9e4078abe84a22ceb947235c5cc"
+checksum = "ed6719fffa43d0d87e5fd8caeab59be1554fb028cd30edc88fc4369b17971019"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -3838,10 +3783,10 @@ version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "futures",
- "rustls-native-certs 0.6.3",
+ "rustls-native-certs 0.7.1",
  "rustls-pemfile 1.0.4",
  "snafu 0.8.4",
  "tonic",
@@ -5627,9 +5572,9 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
- "candle-core 0.5.1",
+ "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-examples",
- "candle-transformers 0.5.1",
+ "candle-transformers",
  "futures",
  "hf-hub",
  "mistralrs",
@@ -5641,7 +5586,7 @@ dependencies = [
  "tempfile",
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
- "tokenizers 0.20.0",
+ "tokenizers",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -6013,7 +5958,7 @@ dependencies = [
  "serde_json",
  "strum 0.26.3",
  "thiserror",
- "tokenizers 0.19.1",
+ "tokenizers",
  "tokio",
  "tokio-rayon",
  "toml",
@@ -6041,7 +5986,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "dirs",
- "ndarray 0.16.1",
+ "ndarray",
  "regex",
  "reqwest 0.12.5",
  "secrecy",
@@ -6238,21 +6183,6 @@ dependencies = [
  "num-complex",
  "num-integer",
  "num-traits",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
  "rawpointer",
 ]
 
@@ -7441,15 +7371,6 @@ name = "portable-atomic"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da544ee218f0d287a911e9c99a39a8c9bc8fcad3cb8db5959940044ecfc67265"
-
-[[package]]
-name = "portable-atomic-util"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcdd8420072e66d54a407b3316991fe946ce3ab1083a7f575b2463866624704d"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "postgres-native-tls"
@@ -8946,9 +8867,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.124"
+version = "1.0.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ad62847a56b3dba58cc891acd13884b9c61138d330c0d7b6181713d4fce38d"
+checksum = "8043c06d9f82bd7271361ed64f415fe5e12a77fdb52e573e7f06a516dea329ad"
 dependencies = [
  "itoa",
  "memchr",
@@ -9773,7 +9694,7 @@ dependencies = [
  "anyhow",
  "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-transformers 0.6.0",
+ "candle-transformers",
  "memmap2",
  "nohash-hasher",
  "safetensors",
@@ -9781,7 +9702,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend-core",
  "thiserror",
- "tokenizers 0.19.1",
+ "tokenizers",
  "tracing",
 ]
 
@@ -9906,38 +9827,6 @@ name = "tokenizers"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e500fad1dd3af3d626327e6a3fe5050e664a6eaa4708b8ca92f1794aaf73e6fd"
-dependencies = [
- "aho-corasick",
- "derive_builder",
- "esaxx-rs",
- "getrandom",
- "indicatif",
- "itertools 0.12.1",
- "lazy_static",
- "log",
- "macro_rules_attribute",
- "monostate",
- "onig",
- "paste",
- "rand",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax 0.8.4",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
-
-[[package]]
-name = "tokenizers"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a24d7f7d6be5b9d1377418b893ab1808af0074f5d1bb2c64784452ddd2aa70"
 dependencies = [
  "aho-corasick",
  "derive_builder",
@@ -10393,7 +10282,7 @@ dependencies = [
  "lazy_static",
  "log",
  "maplit",
- "ndarray 0.15.6",
+ "ndarray",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -10418,7 +10307,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "maplit",
- "ndarray 0.15.6",
+ "ndarray",
  "nom",
  "num-integer",
  "num-traits",
