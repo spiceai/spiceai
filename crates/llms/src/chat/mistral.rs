@@ -26,10 +26,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mistralrs::{
-    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
-    GGMLSpecificConfig, GGUFLoaderBuilder, MistralRs, MistralRsBuilder, ModelDType,
-    NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage,
-    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType,
+    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, ModelDType, NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
@@ -119,13 +116,13 @@ impl MistralLlama {
             .clone()
             .map(|f| f.to_string_lossy().to_string());
 
-        let gguf_file = paths
+        let gguf_file: Vec<String> = paths
             .get_weight_filenames()
-            .first()
+            .into_iter()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+            .collect(); 
 
-        GGUFLoaderBuilder::new(chat_template, None, model_id.to_string(), gguf_file)
+        GGUFLoaderBuilder::new(chat_template, None, model_id.to_string(), gguf_file, GGUFSpecificConfig::default())
             .build()
             .load_model_from_path(
                 &paths,
@@ -226,16 +223,15 @@ impl MistralLlama {
         })?;
 
         let builder = NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig {
-                use_flash_attn: false,
-            },
-            None,
+            mistralrs::NormalSpecificConfig::default(),
+            Some("/Users/jeadie/Github/spiceai/tokenizer_config.json".to_string()),
             None,
             Some(model_parts[0].to_string()),
         );
         let device = Self::get_device();
         let pipeline = builder
             .build(loader_type)
+            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
                 TokenSource::CacheToken,
@@ -287,6 +283,7 @@ impl MistralLlama {
             adapters: None,
             tools,
             tool_choice,
+            logits_processors: None,
         })
     }
 
@@ -303,7 +300,7 @@ impl MistralLlama {
             .get_sender()
             .boxed()
             .context(FailedToRunModelSnafu)?
-            .send(self.to_mistralrs_request(message, false, snd, tools, tool_choice))
+            .send(self.to_mistralrs_request(message.clone(), false, snd, tools, tool_choice))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
@@ -316,7 +313,7 @@ impl MistralLlama {
                     Err(ChatError::FailedToRunModel { source: e.into() })
                 }
                 MistralResponse::InternalError(e) | MistralResponse::ValidationError(e) => {
-                    tracing::error!("Internal mistral.rs error: {e}");
+                    tracing::error!("Internal mistral.rs error: {e} for messages: {:#?}", message.clone());
                     Err(ChatError::FailedToRunModel { source: e })
                 }
 
