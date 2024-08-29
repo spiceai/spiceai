@@ -621,14 +621,14 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        let filter_schema = BaseSchema::get_schema(Arc::clone(&self.federated));
+        let filter_schema = BaseSchema::get_schema(&self.federated);
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
-                    let batch = filter_records(&batch?, &existing_records, filter_schema.clone());
+                    let batch = filter_records(&batch?, &existing_records, &filter_schema);
                     yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                 }
             }
@@ -754,7 +754,7 @@ impl RefreshTask {
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &Vec<RecordBatch>,
-    filter_schema: SchemaRef,
+    filter_schema: &SchemaRef,
 ) -> super::Result<RecordBatch> {
     let mut predicates = vec![];
     let mut comparators = vec![];
