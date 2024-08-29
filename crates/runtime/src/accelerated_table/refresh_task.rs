@@ -31,8 +31,8 @@ use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::schema::BaseSchema;
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
-use crate::embeddings::table::EmbeddingTable;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -826,16 +826,5 @@ fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
         }
-    }
-}
-
-pub struct BaseSchema {}
-
-impl BaseSchema {
-    fn get_schema(provider: Arc<dyn TableProvider>) -> SchemaRef {
-        if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
-            return embedding_table.get_base_table_schema();
-        }
-        provider.schema()
     }
 }

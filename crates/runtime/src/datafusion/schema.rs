@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
+use crate::embeddings::table::EmbeddingTable;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::{
@@ -106,5 +108,16 @@ pub(crate) fn ensure_schema_exists(
     match catalog_provider.register_schema(schema_name, schema_provider) {
         Ok(_) => Ok(()),
         Err(_) => unreachable!("register_schema will never fail"),
+    }
+}
+
+pub struct BaseSchema {}
+
+impl BaseSchema {
+    pub fn get_schema(provider: Arc<dyn TableProvider>) -> SchemaRef {
+        if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+            return embedding_table.get_base_table_schema();
+        }
+        provider.schema()
     }
 }
