@@ -81,6 +81,12 @@ impl EmbeddingTable {
         self.embedded_columns.keys().cloned().collect()
     }
 
+    // Get the schema of the base table.
+    #[must_use]
+    pub fn get_base_table_schema(&self) -> SchemaRef {
+        self.base_table.schema()
+    }
+
     async fn precompute_embedding_sizes(
         embedded_columns: &HashMap<String, String>,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
