@@ -5,12 +5,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/manifoldco/promptui"
+	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
@@ -93,8 +97,39 @@ spice chat --model <model> --cloud
 			os.Exit(1)
 		}
 		if model == "" {
-			cmd.Println("model is required")
-			os.Exit(1)
+			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			if err != nil {
+				cmd.PrintErrln(err.Error())
+				os.Exit(1)
+			}
+			if len(models) == 0 {
+				cmd.Println("No models found")
+				os.Exit(1)
+			}
+
+			modelsSelection := []string{}
+			selectedModel := models[0].Name
+			if len(models) > 1 {
+				for _, model := range models {
+					modelsSelection = append(modelsSelection, model.Name)
+				}
+
+				prompt := promptui.Select{
+					Label:        "Select the model to chat with",
+					Items:        modelsSelection,
+					HideSelected: true,
+				}
+
+				_, selectedModel, err = prompt.Run()
+				if err != nil {
+					fmt.Printf("Prompt failed %v\n", err)
+					return
+				}
+			}
+
+			fmt.Println("Using model:", selectedModel)
+			fmt.Println()
+			model = selectedModel
 		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
@@ -110,23 +145,25 @@ spice chat --model <model> --cloud
 			}
 		}
 
-		reader := bufio.NewReader(os.Stdin)
-
 		apiKey := os.Getenv("SPICE_API_KEY")
 
 		client := &http.Client{}
 
 		var messages []Message = []Message{}
 
+		line := liner.NewLiner()
+		line.SetCtrlCAborts(true)
+		defer line.Close()
 		for {
-			cmd.Print("chat> ")
-
-			message, err := reader.ReadString('\n')
-			if err != nil {
-				cmd.Println(err.Error())
-				os.Exit(1)
+			message, err := line.Prompt("chat> ")
+			if err == liner.ErrPromptAborted {
+				break
+			} else if err != nil {
+				log.Print("Error reading line: ", err)
+				continue
 			}
 
+			line.AppendHistory(message)
 			messages = append(messages, Message{Role: "user", Content: message})
 
 			done := make(chan bool)

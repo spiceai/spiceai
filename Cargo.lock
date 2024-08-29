@@ -1963,27 +1963,6 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "311d8dbe293aa3b5c34f6a57727fafd67d17a74fa8b65276501237c233b34ffd"
-dependencies = [
- "byteorder",
- "gemm",
- "half",
- "memmap2",
- "num-traits",
- "num_cpus",
- "rand",
- "rand_distr",
- "rayon",
- "safetensors",
- "thiserror",
- "yoke",
- "zip",
-]
-
-[[package]]
-name = "candle-core"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5b18de020c2729dbf7ac390325312644808b6ba9b7962f1f724e9185b1d53c7"
@@ -2025,14 +2004,14 @@ dependencies = [
 
 [[package]]
 name = "candle-examples"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad18efc24d80564d1e695bc724ac7bf89c6a3addf1b51468fb8a89c6eaadc6ed"
+checksum = "23557997f798ace54fe11be15f147619c579e76d598085462f2b0ef63e4ea384"
 dependencies = [
  "anyhow",
- "candle-core 0.5.1",
- "candle-nn 0.5.1",
- "candle-transformers 0.5.1",
+ "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-transformers",
  "csv",
  "hf-hub",
  "image",
@@ -2042,21 +2021,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
-]
-
-[[package]]
-name = "candle-nn"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1efb293365959fc5feacbd93fa918980df2d9f2fb89853af02e33a830c10b49b"
-dependencies = [
- "candle-core 0.5.1",
- "half",
- "num-traits",
- "rayon",
- "safetensors",
- "serde",
- "thiserror",
 ]
 
 [[package]]
@@ -2086,25 +2050,6 @@ dependencies = [
  "safetensors",
  "serde",
  "thiserror",
-]
-
-[[package]]
-name = "candle-transformers"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b28968e2643d21c259d045f5eb42de07b0a3b7fc86ec8571aeb852721f9c189e"
-dependencies = [
- "byteorder",
- "candle-core 0.5.1",
- "candle-nn 0.5.1",
- "fancy-regex",
- "num-traits",
- "rand",
- "rayon",
- "serde",
- "serde_json",
- "serde_plain",
- "tracing",
 ]
 
 [[package]]
@@ -2274,9 +2219,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.15"
+version = "4.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d8838454fda655dafd3accb2b6e2bea645b9e4078abe84a22ceb947235c5cc"
+checksum = "ed6719fffa43d0d87e5fd8caeab59be1554fb028cd30edc88fc4369b17971019"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -3171,7 +3116,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e75565b74364e9f1da20f80f4c029d18bfaf9812#e75565b74364e9f1da20f80f4c029d18bfaf9812"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b51003b01879adce3ede9d38ec1e07e43258c706#b51003b01879adce3ede9d38ec1e07e43258c706"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3838,10 +3783,10 @@ version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "futures",
- "rustls-native-certs 0.6.3",
+ "rustls-native-certs 0.7.1",
  "rustls-pemfile 1.0.4",
  "snafu 0.8.4",
  "tonic",
@@ -5467,7 +5412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -5627,9 +5572,9 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
- "candle-core 0.5.1",
+ "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-examples",
- "candle-transformers 0.5.1",
+ "candle-transformers",
  "either",
  "futures",
  "hf-hub",
@@ -8926,18 +8871,18 @@ checksum = "a3f0bf26fd526d2a95683cd0f87bf103b8539e2ca1ef48ce002d67aad59aa0b4"
 
 [[package]]
 name = "serde"
-version = "1.0.207"
+version = "1.0.209"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5665e14a49a4ea1b91029ba7d3bca9f299e1f7cfa194388ccc20f14743e784f2"
+checksum = "99fce0ffe7310761ca6bf9faf5115afbc19688edd00171d81b1bb1b116c63e09"
 dependencies = [
  "serde_derive",
 ]
 
 [[package]]
 name = "serde_derive"
-version = "1.0.207"
+version = "1.0.209"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aea2634c86b0e8ef2cfdc0c340baede54ec27b1e46febd7f80dffb2aa44a00e"
+checksum = "a5831b979fd7b5439637af1752d535ff49f4860c0f341d1baeb6faf0f4242170"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8957,9 +8902,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.124"
+version = "1.0.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ad62847a56b3dba58cc891acd13884b9c61138d330c0d7b6181713d4fce38d"
+checksum = "8043c06d9f82bd7271361ed64f415fe5e12a77fdb52e573e7f06a516dea329ad"
 dependencies = [
  "itoa",
  "memchr",
@@ -9799,7 +9744,7 @@ dependencies = [
  "anyhow",
  "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-transformers 0.6.0",
+ "candle-transformers",
  "memmap2",
  "nohash-hasher",
  "safetensors",
@@ -9961,9 +9906,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.39.2"
+version = "1.39.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daa4fb1bc778bd6f04cbfc4bb2d06a7396a8f299dc33ea1900cedaa316f467b1"
+checksum = "9babc99b9923bfa4804bd74722ff02c0381021eafa4db9949217e3be8e84fff5"
 dependencies = [
  "backtrace",
  "bytes",
