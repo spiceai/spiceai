@@ -401,11 +401,7 @@ fn make_a_stream(
                                             .as_ref()
                                             .and_then(|f| f.name.clone())
                                             .unwrap_or_default(),
-                                        arguments: tool_call_data
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.arguments.clone())
-                                            .unwrap_or_default(),
+                                        arguments: String::new(),
                                     },
                                 }
                             });
