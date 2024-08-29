@@ -22,7 +22,7 @@ tokio.workspace = true
 futures = { workspace = true }
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
-tokenizers = { version = "0.19.1" }
+tokenizers = { version = "0.20.0" }
 tracing.workspace = true
 tracing-futures.workspace = true
 
