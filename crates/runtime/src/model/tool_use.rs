@@ -300,7 +300,8 @@ impl Chat for ToolUsingChat {
         };
 
         let resp = self.inner_chat.chat_request(inner_req).await?;
-
+        let usage = resp.usage.clone();
+ 
         let tools_used = resp
             .choices
             .first()
@@ -316,10 +317,33 @@ impl Chat for ToolUsingChat {
                     .model(req.model)
                     .messages(messages)
                     .build()?;
-                self.chat_request(new_req).await
+                let mut resp = self.chat_request(new_req).await;
+                resp.usage = usage;
             }
             None => Ok(resp),
         }
+    }
+}
+
+impl Add for CompletionUsage {
+    type Output = CompletionUsage;
+
+    fn add(self, other: CompletionUsage) -> CompletionUsage {
+        CompletionUsage {
+            prompt_tokens: self.prompt_tokens + other.prompt_tokens,
+            completion_tokens: self.completion_tokens + other.completion_tokens,
+            total_tokens: self.total_tokens + other.total_tokens,
+        }
+    }
+}
+
+/// 
+pub fn combine_usage(u1: Option<CompletionUsage>, u2: Option<CompletionUsage>) -> Option<CompletionUsage> {
+    match (u1, u2) {
+        (Some(u1), Some(u2)) => Some(u1 + u2),
+        (Some(u1), None) => Some(u1),
+        (None, Some(u2)) => Some(u2),
+        (None, None) => None,
     }
 }
 
