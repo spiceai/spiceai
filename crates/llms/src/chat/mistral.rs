@@ -21,7 +21,7 @@ use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
         ChatCompletionNamedToolChoice, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        CreateChatCompletionRequest, CreateChatCompletionResponse,
+        CreateChatCompletionRequest, CreateChatCompletionResponse, Stop,
     },
 };
 use async_stream::stream;
@@ -282,10 +282,11 @@ impl MistralLlama {
         tx: Sender<MistralResponse>,
         tools: Option<Vec<Tool>>,
         tool_choice: Option<ToolChoice>,
+        sampling: Option<SamplingParams>,
     ) -> MistralRequest {
         MistralRequest::Normal(NormalRequest {
             messages: message,
-            sampling_params: SamplingParams::default(),
+            sampling_params: sampling.unwrap_or_default(),
             response: tx,
             return_logprobs: false,
             is_streaming,
@@ -304,6 +305,7 @@ impl MistralLlama {
         message: RequestMessage,
         tools: Option<Vec<Tool>>,
         tool_choice: Option<ToolChoice>,
+        sampling: Option<SamplingParams>,
     ) -> Result<ChatCompletionResponse> {
         let (snd, mut rcv) = channel::<MistralResponse>(10_000);
 
@@ -312,7 +314,14 @@ impl MistralLlama {
             .get_sender()
             .boxed()
             .context(FailedToRunModelSnafu)?
-            .send(self.to_mistralrs_request(message.clone(), false, snd, tools, tool_choice))
+            .send(self.to_mistralrs_request(
+                message.clone(),
+                false,
+                snd,
+                tools,
+                tool_choice,
+                sampling,
+            ))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
@@ -369,6 +378,7 @@ impl Chat for MistralLlama {
                 },
                 true,
                 snd,
+                None,
                 None,
                 None,
             ))
@@ -435,6 +445,7 @@ impl Chat for MistralLlama {
                 },
                 None,
                 None,
+                None,
             )
             .await?;
 
@@ -459,8 +470,28 @@ impl Chat for MistralLlama {
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
         let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
 
+        // TODO confirm this transformtion.
+        let p = SamplingParams {
+            temperature: req.temperature.map(f64::from),
+            top_k: None,
+            top_p: req.top_p.map(f64::from),
+            min_p: None,
+            top_n_logprobs: req.top_logprobs.unwrap_or_default().into(),
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
+            stop_toks: req.stop.map(|s| match s {
+                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
+                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
+            }),
+            max_len: req.max_tokens.map(|x| x as usize),
+            // logits_bias: req.logit_bias,
+            logits_bias: None,
+            n_choices: req.n.unwrap_or(1) as usize,
+            dry_params: None,
+        };
+
         let resp = self
-            .run_internal(messages, tools, tool_choice)
+            .run_internal(messages, tools, tool_choice, Some(p))
             .await
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {

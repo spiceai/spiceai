@@ -245,8 +245,18 @@ pub trait Chat: Sync + Send {
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
+
         if let Err(e) = self
-            .run("health".to_string())
+            .chat_request(CreateChatCompletionRequest {
+                max_tokens: Some(1),
+                messages: vec![ChatCompletionRequestMessage::System(
+                    ChatCompletionRequestSystemMessage {
+                        content: "health".to_string(),
+                        name: Some("health".to_string()),
+                    },
+                )],
+                ..Default::default()
+            })
             .instrument(span.clone())
             .await
         {
