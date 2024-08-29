@@ -216,7 +216,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "bigdecimal 0.4.5",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "snafu 0.8.4",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2766,7 +2766,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3834,7 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3849,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3862,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -5622,7 +5622,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "async-openai",
  "async-stream",
@@ -6035,7 +6035,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6340,7 +6340,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "snafu 0.8.4",
  "tracing",
@@ -7025,7 +7025,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -8333,7 +8333,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "anyhow",
  "app",
@@ -9315,7 +9315,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -9332,7 +9332,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "app",
  "clap",
@@ -9361,7 +9361,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "schemars",
  "serde",
@@ -9373,7 +9373,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "schemars",
  "serde_json",
@@ -9705,7 +9705,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -10755,7 +10755,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "0.17.2-beta"
+version = "0.17.2-beta.1"
 dependencies = [
  "backoff",
  "humantime",
