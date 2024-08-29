@@ -25,6 +25,8 @@ use spicepod::component::{
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::dataaccelerator::get_accelerator_engine;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -413,6 +415,19 @@ impl Dataset {
             }
 
             return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+        }
+
+        false
+    }
+
+    #[must_use]
+    pub async fn is_accelerator_initialized(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            let Some(accelerator) = get_accelerator_engine(acceleration.engine).await else {
+                return false; // if the accelerator engine is not found, it's impossible for it to be initialized
+            };
+
+            return accelerator.is_initialized(self);
         }
 
         false
