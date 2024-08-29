@@ -92,7 +92,7 @@ snafu = "0.8.0"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
-tokio = { version = "1.35.1", features = [
+tokio = { version = "1.39.3", features = [
   "rt-multi-thread",
   "signal",
   "macros",
