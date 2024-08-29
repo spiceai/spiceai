@@ -39,7 +39,8 @@ pub mod candle;
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
-use mistralrs::RequestMessage;
+use indexmap::IndexMap;
+use mistralrs::MessageContent;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -141,68 +142,99 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequesstMessage`] type.
 #[cfg(feature = "mistralrs")]
 #[must_use]
-pub fn messages_to_mistral(messages: &[ChatCompletionRequestMessage]) -> RequestMessage {
+pub fn message_to_mistral(
+    message: &ChatCompletionRequestMessage,
+) -> IndexMap<String, MessageContent> {
     use either::Either;
-    use indexmap::IndexMap;
-    use mistralrs::MessageContent;
 
-    let output = messages.iter().map(|message| {
-        match message {
-            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content, ..
-            }) => {
-                let body: MessageContent = match content {
-                    ChatCompletionRequestUserMessageContent::Text(text) => either::Either::Left(text.clone()),
-                    ChatCompletionRequestUserMessageContent::Array(array) => {
-
-                        let v = array.iter().map(|p| {
-                            match p {
-                                async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
-                                    ("text".to_string(), t.text.clone())
-                                }
-                                async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(i) => {
-                                    ("image_url".to_string(), i.image_url.url.clone())
-                                }
+    match message {
+        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content, ..
+        }) => {
+            let body: MessageContent = match content {
+                ChatCompletionRequestUserMessageContent::Text(text) => {
+                    either::Either::Left(text.clone())
+                }
+                ChatCompletionRequestUserMessageContent::Array(array) => {
+                    let v = array.iter().map(|p| {
+                        match p {
+                            async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
+                                ("content".to_string(), t.text.clone())
                             }
+                            async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(i) => {
+                                ("image_url".to_string(), i.image_url.url.clone())
+                            }
+                        }
 
-                        }).collect::<Vec<_>>();
-                        let index_map: IndexMap<String, String> = v.into_iter().collect();
-                        either::Either::Right(vec![index_map])
-                    }
-                };
-                (String::from("user"), body)
-            },
-            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content,
-                ..
-            }) => ("system".to_string(), Either::Left(content.clone())),
-            | ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-                content, tool_call_id
-            }) => ("tool".to_string(), Either::Right(vec![IndexMap::from([
-                ("content".to_string(), content.clone()),
-                ("tool_call_id".to_string(), tool_call_id.clone())
-            ])])),
-            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                content,
-                name,
-                tool_calls,
-                ..
-            }) => ("assistant".to_string(), Either::Right(vec![IndexMap::from([
-                ("content".to_string(), content.clone().unwrap_or_default()),
-                ("name".to_string(), name.clone().unwrap_or_default()),
-                ("tool_calls".to_string(), tool_calls.clone().map(|m| serde_json::to_string(&m).unwrap_or_default()).unwrap_or_default())
-            ])])),
-            | ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
-                content,
-                name
-            }) => ("function".to_string(), Either::Right(vec![IndexMap::from([
-                ("content".to_string(), content.clone().unwrap_or_default().clone()),
-                ("name".to_string(), name.clone())
-            ])])),
+                    }).collect::<Vec<_>>();
+                    let index_map: IndexMap<String, String> = v.into_iter().collect();
+                    either::Either::Right(vec![index_map])
+                }
+            };
+            IndexMap::from([
+                (String::from("role"), Either::Left(String::from("user"))),
+                (String::from("content"), body),
+            ])
         }
-    }).collect::<IndexMap<_, _>>();
-
-    RequestMessage::Chat(vec![output])
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content,
+            ..
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("system"))),
+            (String::from("content"), Either::Left(content.clone())),
+        ]),
+        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+            content,
+            tool_call_id,
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("tool"))),
+            (String::from("content"), Either::Left(content.clone())),
+            (
+                String::from("tool_call_id"),
+                Either::Left(tool_call_id.clone()),
+            ),
+        ]),
+        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content,
+            name,
+            tool_calls,
+            ..
+        }) => IndexMap::from([
+            (
+                String::from("role"),
+                Either::Left(String::from("assistant")),
+            ),
+            // TODO: don't include if None
+            (
+                "content".to_string(),
+                Either::Left(content.clone().unwrap_or_default()),
+            ),
+            (
+                "name".to_string(),
+                Either::Left(name.clone().unwrap_or_default()),
+            ),
+            (
+                "tool_calls".to_string(),
+                Either::Left(
+                    tool_calls
+                        .clone()
+                        .map(|m| serde_json::to_string(&m).unwrap_or_default())
+                        .unwrap_or_default(),
+                ),
+            ),
+        ]),
+        ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
+            content,
+            name,
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("function"))),
+            (
+                "content".to_string(),
+                Either::Left(content.clone().unwrap_or_default().clone()),
+            ),
+            ("name".to_string(), Either::Left(name.clone())),
+        ]),
+    }
 }
 
 #[async_trait]
@@ -212,17 +244,17 @@ pub trait Chat: Sync + Send {
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
-        // let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
-        // if let Err(e) = self
-        //     .run("health".to_string())
-        //     .instrument(span.clone())
-        //     .await
-        // {
-        //     tracing::error!(target: "task_history", parent: &span, "{e}");
-        //     return Err(Error::HealthCheckError {
-        //         source: Box::new(e),
-        //     });
-        // }
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
+        if let Err(e) = self
+            .run("health".to_string())
+            .instrument(span.clone())
+            .await
+        {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(Error::HealthCheckError {
+                source: Box::new(e),
+            });
+        }
         Ok(())
     }
 

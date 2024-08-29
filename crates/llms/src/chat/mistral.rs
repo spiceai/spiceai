@@ -14,7 +14,9 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use super::{messages_to_mistral, Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use crate::chat::message_to_mistral;
+
+use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -26,7 +28,10 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mistralrs::{
-    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, ModelDType, NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType
+    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder,
+    ModelDType, NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage,
+    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType,
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
@@ -118,22 +123,28 @@ impl MistralLlama {
 
         let gguf_file: Vec<String> = paths
             .get_weight_filenames()
-            .into_iter()
+            .iter()
             .map(|p| p.to_string_lossy().to_string())
-            .collect(); 
+            .collect();
 
-        GGUFLoaderBuilder::new(chat_template, None, model_id.to_string(), gguf_file, GGUFSpecificConfig::default())
-            .build()
-            .load_model_from_path(
-                &paths,
-                &ModelDType::Auto,
-                device,
-                false,
-                DeviceMapMetadata::dummy(),
-                None,
-                None,
-            )
-            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        GGUFLoaderBuilder::new(
+            chat_template,
+            None,
+            model_id.to_string(),
+            gguf_file,
+            GGUFSpecificConfig::default(),
+        )
+        .build()
+        .load_model_from_path(
+            &paths,
+            &ModelDType::Auto,
+            device,
+            false,
+            DeviceMapMetadata::dummy(),
+            None,
+            None,
+        )
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_ggml_pipeline(
@@ -263,6 +274,7 @@ impl MistralLlama {
         }
     }
 
+    // TODO: handle passing in [`SamplingParams`] from request.
     fn to_mistralrs_request(
         &self,
         message: RequestMessage,
@@ -313,7 +325,10 @@ impl MistralLlama {
                     Err(ChatError::FailedToRunModel { source: e.into() })
                 }
                 MistralResponse::InternalError(e) | MistralResponse::ValidationError(e) => {
-                    tracing::error!("Internal mistral.rs error: {e} for messages: {:#?}", message.clone());
+                    tracing::error!(
+                        "Internal mistral.rs error: {e} for messages: {:#?}",
+                        message.clone()
+                    );
                     Err(ChatError::FailedToRunModel { source: e })
                 }
 
@@ -434,7 +449,13 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let messages = messages_to_mistral(&req.messages);
+        let messages = RequestMessage::Chat(
+            req.messages
+                .iter()
+                .map(message_to_mistral)
+                .collect::<Vec<_>>(),
+        );
+
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
         let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
 
