@@ -14,7 +14,7 @@ version.workspace = true
 arrow.workspace = true
 bigdecimal = "0.4.3"
 chrono.workspace = true
-chrono-tz = "0.8.6"
+chrono-tz = "0.9.0"
 datafusion-table-providers.workspace = true
 snafu.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
