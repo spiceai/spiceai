@@ -16,7 +16,7 @@ require (
 	github.com/spf13/viper v1.12.0
 	github.com/stretchr/testify v1.8.1
 	go.uber.org/zap v1.27.0
-	golang.org/x/mod v0.14.0
+	golang.org/x/mod v0.20.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
