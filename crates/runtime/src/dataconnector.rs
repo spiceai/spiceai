@@ -219,6 +219,12 @@ pub enum DataConnectorError {
         dataconnector: String,
         message: String,
     },
+
+    #[snafu(display("Invalid glob pattern {pattern}: {source}"))]
+    InvalidGlobPattern {
+        pattern: String,
+        source: globset::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -20,12 +20,14 @@ use datafusion::{
     logical_expr::{binary_expr, cast, col, lit, Expr, Operator},
     scalar::ScalarValue,
 };
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum ExprTimeFormat {
     ISO8601,
     UnixTimestamp(ExprUnixTimestamp),
     Timestamp,
+    Timestamptz(Option<Arc<str>>),
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +71,10 @@ impl TimestampFilterConvert {
                 }
                 ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
             }
-            DataType::Timestamp(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_) => ExprTimeFormat::Timestamp,
+            DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => {
+                ExprTimeFormat::Timestamp
+            }
+            DataType::Timestamp(_, tz) => ExprTimeFormat::Timestamptz(tz.to_owned()),
             DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
             _ => {
                 tracing::warn!("Date type is not handled yet: {}", field.data_type());
@@ -92,28 +93,33 @@ impl TimestampFilterConvert {
     pub(crate) fn convert(&self, timestamp_in_nanos: u128, op: Operator) -> Expr {
         let time_column: &str = &format!(r#""{}""#, &self.time_column);
         match &self.time_format {
-            ExprTimeFormat::ISO8601 => binary_expr(
-                cast(
-                    col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-                ),
-                op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp_in_nanos / 1_000_000) as i64),
-                    None,
-                )),
-            ),
             ExprTimeFormat::UnixTimestamp(format) => binary_expr(
                 col(time_column),
                 op,
                 lit((timestamp_in_nanos / format.scale) as u64),
             ),
-            ExprTimeFormat::Timestamp => binary_expr(
-                col(time_column),
+            ExprTimeFormat::Timestamp | ExprTimeFormat::ISO8601 => binary_expr(
+                // The time unit of timestamp is unknown before filtering
+                // Convert the left and right expr to same unit for safe comparison
+                cast(
+                    col(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
                 op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp_in_nanos / 1_000_000) as i64),
+                Expr::Literal(ScalarValue::TimestampNanosecond(
+                    Some(timestamp_in_nanos as i64),
                     None,
+                )),
+            ),
+            ExprTimeFormat::Timestamptz(tz) => binary_expr(
+                cast(
+                    col(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
+                op,
+                Expr::Literal(ScalarValue::TimestampNanosecond(
+                    Some(timestamp_in_nanos as i64),
+                    tz.to_owned(),
                 )),
             ),
         }
@@ -147,7 +153,7 @@ mod test {
             ),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "timestamp > TimestampMillisecond(1620000000000, None)",
+            "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
         );
         test(
             Field::new(
@@ -157,7 +163,7 @@ mod test {
             ),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(Millisecond, None)) > TimestampMillisecond(1620000000000, None)",
+            "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 

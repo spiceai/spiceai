@@ -38,13 +38,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///     - `rustls_native_certs` could not load native certificates.
 ///     - It couldn't convert the PEMs to a string.
 pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
-    // Load root certificates found in the platform’s native certificate store.
+    // Load root certificates found in the platform's native certificate store.
     let certs = rustls_native_certs::load_native_certs().context(FailedToLoadCertsSnafu)?;
 
     let concatenated_pems = certs
         .iter()
         .filter_map(|cert| {
-            let mut buf = &cert.0[..];
+            let mut buf = cert.as_ref();
             rustls_pemfile::certs(&mut buf).ok()?.pop()
         })
         .map(String::from_utf8)
