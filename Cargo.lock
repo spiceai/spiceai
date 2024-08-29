@@ -2219,9 +2219,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.15"
+version = "4.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d8838454fda655dafd3accb2b6e2bea645b9e4078abe84a22ceb947235c5cc"
+checksum = "ed6719fffa43d0d87e5fd8caeab59be1554fb028cd30edc88fc4369b17971019"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -3116,7 +3116,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e75565b74364e9f1da20f80f4c029d18bfaf9812#e75565b74364e9f1da20f80f4c029d18bfaf9812"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b51003b01879adce3ede9d38ec1e07e43258c706#b51003b01879adce3ede9d38ec1e07e43258c706"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3783,10 +3783,10 @@ version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "futures",
- "rustls-native-certs 0.6.3",
+ "rustls-native-certs 0.7.1",
  "rustls-pemfile 1.0.4",
  "snafu 0.8.4",
  "tonic",
@@ -5412,7 +5412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -8867,9 +8867,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.124"
+version = "1.0.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ad62847a56b3dba58cc891acd13884b9c61138d330c0d7b6181713d4fce38d"
+checksum = "8043c06d9f82bd7271361ed64f415fe5e12a77fdb52e573e7f06a516dea329ad"
 dependencies = [
  "itoa",
  "memchr",

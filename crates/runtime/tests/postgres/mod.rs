@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::{
-    array::TimestampMillisecondArray,
+    array::TimestampNanosecondArray,
     datatypes::{DataType, TimeUnit},
 };
 use datafusion::execution::context::SessionContext;
@@ -83,7 +83,7 @@ CREATE TABLE test (
         *record_batch.schema().fields()[0].data_type()
     );
     assert_eq!(
-        DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
         *record_batch.schema().fields()[1].data_type()
     );
 
@@ -96,10 +96,10 @@ CREATE TABLE test (
             .value(0)
     );
     assert_eq!(
-        1_683_037_800_000,
+        1_683_037_800_000_000_000,
         record_batch.columns()[1]
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .expect("array can be cast")
             .value(0)
     );

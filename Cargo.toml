@@ -49,7 +49,7 @@ base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
 chrono = "0.4.38"
-clap = { version = "4.4.14", features = ["derive"] }
+clap = { version = "4.5.16", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
   "tokio_io",
   "tls",
@@ -61,7 +61,7 @@ datafusion-execution = "41"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "21f07bec7284bcbff2bf4e570008290b66e3dc6f" }
 datafusion-functions-json = "0.41"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "e75565b74364e9f1da20f80f4c029d18bfaf9812" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b51003b01879adce3ede9d38ec1e07e43258c706" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.0"
