@@ -136,7 +136,7 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         // otherwise, we're initialized if the file exists
-        self.is_existing_file(dataset)
+        self.has_existing_file(dataset)
     }
 
     async fn init(

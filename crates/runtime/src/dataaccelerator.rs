@@ -165,7 +165,7 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// Check if the file path exists
-    fn is_existing_file(&self, dataset: &Dataset) -> bool {
+    fn has_existing_file(&self, dataset: &Dataset) -> bool {
         if let Some(path) = self.file_path(dataset) {
             let path = std::path::Path::new(&path);
             path.is_file()

@@ -131,7 +131,7 @@ impl DataAccelerator for SqliteAccelerator {
         }
 
         // otherwise, we're initialized if the file exists
-        self.is_existing_file(dataset)
+        self.has_existing_file(dataset)
     }
 
     /// Initializes an SQLite database for the dataset
