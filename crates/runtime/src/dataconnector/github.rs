@@ -21,6 +21,7 @@ use data_components::{
     graphql::{client::GraphQLClient, provider::GraphQLTableProvider},
 };
 use datafusion::datasource::TableProvider;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
@@ -264,6 +265,7 @@ impl Github {
         owner: &str,
         repo: &str,
         tree_sha: Option<&str>,
+        dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
@@ -278,13 +280,25 @@ impl Github {
                 dataconnector: "github".to_string(),
             })?;
 
+        let include = match self.params.get("include").expose().ok() {
+            Some(pattern) => Some(parse_globs(pattern)?),
+            None => None,
+        };
+
         Ok(Arc::new(
-            GithubFilesTableProvider::new(client, owner, repo, tree_sha)
-                .await
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                })?,
+            GithubFilesTableProvider::new(
+                client,
+                owner,
+                repo,
+                tree_sha,
+                include,
+                dataset.is_accelerated(),
+            )
+            .await
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+            })?,
         ))
     }
 }
@@ -311,6 +325,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
+    ParameterSpec::runtime("include")
+        .description("Include only files matching the pattern.")
+        .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
 ];
 
 impl DataConnectorFactory for GithubFactory {
@@ -366,7 +383,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(table_args).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
-                self.create_files_table_provider(owner, repo, parts.next())
+                self.create_files_table_provider(owner, repo, parts.next(), dataset)
                     .await
             }
             (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
@@ -385,4 +402,23 @@ impl DataConnector for Github {
             }),
         }
     }
+}
+
+pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
+    let patterns: Vec<&str> = input.split(&[',', ';'][..]).collect();
+    let mut builder = GlobSetBuilder::new();
+
+    for pattern in patterns {
+        let trimmed_pattern = pattern.trim();
+        if !trimmed_pattern.is_empty() {
+            builder.add(
+                Glob::new(trimmed_pattern).context(super::InvalidGlobPatternSnafu { pattern })?,
+            );
+        }
+    }
+
+    let glob_set = builder
+        .build()
+        .context(super::InvalidGlobPatternSnafu { pattern: input })?;
+    Ok(Arc::new(glob_set))
 }

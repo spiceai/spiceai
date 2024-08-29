@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use futures::future;
+use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
 
 use crate::arrow::write::MemTable;
 use arrow::{
-    array::{RecordBatch, StringBuilder, UInt64Builder},
+    array::{ArrayRef, RecordBatch, StringBuilder, UInt64Builder},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use datafusion::{
@@ -52,6 +54,8 @@ pub struct GithubFilesTableProvider {
     repo: Arc<str>,
     tree_sha: Arc<str>,
     schema: SchemaRef,
+    include: Option<Arc<GlobSet>>,
+    fetch_content: bool,
 }
 
 impl GithubFilesTableProvider {
@@ -60,19 +64,36 @@ impl GithubFilesTableProvider {
         owner: &str,
         repo: &str,
         tree_sha: &str,
+        include: Option<Arc<GlobSet>>,
+        fetch_content: bool,
     ) -> Result<Self> {
-        let schema = Arc::new(Schema::new(vec![
+        let mut fields = vec![
             Field::new("name", DataType::Utf8, true),
             Field::new("path", DataType::Utf8, true),
             Field::new("size", DataType::UInt64, true),
             Field::new("sha", DataType::Utf8, true),
             Field::new("mode", DataType::Utf8, true),
             Field::new("url", DataType::Utf8, true),
-        ]));
+            Field::new("download_url", DataType::Utf8, true),
+        ];
+
+        if fetch_content {
+            fields.push(Field::new("content", DataType::Utf8, true));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
 
         // ensure configuration is correct
         client
-            .fetch_files(owner, repo, tree_sha, Some(1), Arc::clone(&schema))
+            .fetch_files(
+                owner,
+                repo,
+                tree_sha,
+                Some(1),
+                None,
+                fetch_content,
+                Arc::clone(&schema),
+            )
             .await?;
 
         Ok(Self {
@@ -81,6 +102,8 @@ impl GithubFilesTableProvider {
             repo: repo.into(),
             tree_sha: tree_sha.into(),
             schema,
+            include,
+            fetch_content,
         })
     }
 }
@@ -122,7 +145,9 @@ impl TableProvider for GithubFilesTableProvider {
                 &self.owner,
                 &self.repo,
                 &self.tree_sha,
-                limit,
+                None,
+                self.include.clone(),
+                self.fetch_content,
                 Arc::clone(&self.schema),
             )
             .await
@@ -139,6 +164,7 @@ pub struct GithubRestClient {
 }
 
 static SPICE_USER_AGENT: &str = "spice";
+const NUM_FILE_CONTENT_DOWNLOAD_WORKERS: usize = 10;
 
 impl GithubRestClient {
     #[must_use]
@@ -150,23 +176,31 @@ impl GithubRestClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_files(
         &self,
         owner: &str,
         repo: &str,
         tree_sha: &str,
         limit: Option<usize>,
+        include_pattern: Option<Arc<GlobSet>>,
+        fetch_content: bool,
         schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
         let git_tree = self
             .fetch_git_tree(owner, repo, tree_sha)
             .await
             .context(GithubApiSnafu)?;
+
         let mut tree: Vec<GitTreeNode> = git_tree
             .tree
             .into_iter()
             .filter(|node| node.node_type == "blob")
             .collect();
+
+        if let Some(pattern) = include_pattern.as_ref() {
+            tree.retain(|node| pattern.is_match(&node.path));
+        }
 
         if let Some(limit) = limit {
             tree.truncate(limit);
@@ -178,27 +212,46 @@ impl GithubRestClient {
         let mut sha_builder = StringBuilder::new();
         let mut mode_builder = StringBuilder::new();
         let mut url_builder = StringBuilder::new();
-        for node in tree {
+        let mut download_url_builder = StringBuilder::new();
+        for node in &tree {
             name_builder.append_value(extract_name_from_path(&node.path).unwrap_or_default());
             path_builder.append_value(&node.path);
             size_builder.append_value(node.size.unwrap_or(0));
             sha_builder.append_value(&node.sha);
             mode_builder.append_value(&node.mode);
             url_builder.append_value(&node.url);
+            download_url_builder.append_value(get_download_url(owner, repo, tree_sha, &node.path));
         }
 
-        let record_batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(name_builder.finish()),
-                Arc::new(path_builder.finish()),
-                Arc::new(size_builder.finish()),
-                Arc::new(sha_builder.finish()),
-                Arc::new(mode_builder.finish()),
-                Arc::new(url_builder.finish()),
-            ],
-        )
-        .context(UnableToConstructRecordBatchSnafu)?;
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(name_builder.finish()),
+            Arc::new(path_builder.finish()),
+            Arc::new(size_builder.finish()),
+            Arc::new(sha_builder.finish()),
+            Arc::new(mode_builder.finish()),
+            Arc::new(url_builder.finish()),
+            Arc::new(download_url_builder.finish()),
+        ];
+
+        if fetch_content {
+            let mut content_builder = StringBuilder::new();
+
+            // download content in parallel
+            for chunk in tree.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
+                let content_fetch_futures = chunk
+                    .iter()
+                    .map(|node| self.fetch_file_content(owner, repo, tree_sha, &node.path))
+                    .collect::<Vec<_>>();
+
+                for res in future::join_all(content_fetch_futures).await {
+                    content_builder.append_value(res.context(GithubApiSnafu)?);
+                }
+            }
+            columns.push(Arc::new(content_builder.finish()));
+        }
+
+        let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+            .context(UnableToConstructRecordBatchSnafu)?;
 
         Ok(vec![record_batch])
     }
@@ -266,10 +319,44 @@ impl GithubRestClient {
             }
         }
     }
+
+    async fn fetch_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        tree_sha: &str,
+        path: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let download_url = get_download_url(owner, repo, tree_sha, path);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token)) {
+            headers.insert(AUTHORIZATION, header);
+        }
+
+        let response = self
+            .client
+            .get(&download_url)
+            .headers(headers)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            let content = response.text().await?;
+            Ok(content)
+        } else {
+            let err_msg = format!("Failed to download file content: {}", response.status());
+            Err(err_msg.into())
+        }
+    }
 }
 
 fn extract_name_from_path(path: &str) -> Option<&str> {
     Path::new(path).file_name().and_then(|name| name.to_str())
+}
+
+fn get_download_url(owner: &str, repo: &str, tree_sha: &str, path: &str) -> String {
+    format!("https://raw.githubusercontent.com/{owner}/{repo}/{tree_sha}/{path}")
 }
 
 #[derive(Debug, Deserialize)]
