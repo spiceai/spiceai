@@ -520,7 +520,7 @@ dependencies = [
  "arrow",
  "bigdecimal 0.4.5",
  "chrono",
- "chrono-tz 0.9.0",
+ "chrono-tz 0.8.6",
  "clickhouse-rs",
  "datafusion-table-providers",
  "snafu 0.8.4",
@@ -1963,27 +1963,6 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "311d8dbe293aa3b5c34f6a57727fafd67d17a74fa8b65276501237c233b34ffd"
-dependencies = [
- "byteorder",
- "gemm",
- "half",
- "memmap2",
- "num-traits",
- "num_cpus",
- "rand",
- "rand_distr",
- "rayon",
- "safetensors",
- "thiserror",
- "yoke",
- "zip",
-]
-
-[[package]]
-name = "candle-core"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5b18de020c2729dbf7ac390325312644808b6ba9b7962f1f724e9185b1d53c7"
@@ -2025,14 +2004,14 @@ dependencies = [
 
 [[package]]
 name = "candle-examples"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad18efc24d80564d1e695bc724ac7bf89c6a3addf1b51468fb8a89c6eaadc6ed"
+checksum = "23557997f798ace54fe11be15f147619c579e76d598085462f2b0ef63e4ea384"
 dependencies = [
  "anyhow",
- "candle-core 0.5.1",
- "candle-nn 0.5.1",
- "candle-transformers 0.5.1",
+ "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-transformers",
  "csv",
  "hf-hub",
  "image",
@@ -2041,22 +2020,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
- "tokenizers 0.19.1",
-]
-
-[[package]]
-name = "candle-nn"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1efb293365959fc5feacbd93fa918980df2d9f2fb89853af02e33a830c10b49b"
-dependencies = [
- "candle-core 0.5.1",
- "half",
- "num-traits",
- "rayon",
- "safetensors",
- "serde",
- "thiserror",
+ "tokenizers",
 ]
 
 [[package]]
@@ -2086,25 +2050,6 @@ dependencies = [
  "safetensors",
  "serde",
  "thiserror",
-]
-
-[[package]]
-name = "candle-transformers"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b28968e2643d21c259d045f5eb42de07b0a3b7fc86ec8571aeb852721f9c189e"
-dependencies = [
- "byteorder",
- "candle-core 0.5.1",
- "candle-nn 0.5.1",
- "fancy-regex",
- "num-traits",
- "rand",
- "rayon",
- "serde",
- "serde_json",
- "serde_plain",
- "tracing",
 ]
 
 [[package]]
@@ -5467,7 +5412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -5627,9 +5572,9 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
- "candle-core 0.5.1",
+ "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-examples",
- "candle-transformers 0.5.1",
+ "candle-transformers",
  "futures",
  "hf-hub",
  "mistralrs",
@@ -5641,7 +5586,7 @@ dependencies = [
  "tempfile",
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
- "tokenizers 0.20.0",
+ "tokenizers",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -6013,7 +5958,7 @@ dependencies = [
  "serde_json",
  "strum 0.26.3",
  "thiserror",
- "tokenizers 0.19.1",
+ "tokenizers",
  "tokio",
  "tokio-rayon",
  "toml",
@@ -9773,7 +9718,7 @@ dependencies = [
  "anyhow",
  "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-transformers 0.6.0",
+ "candle-transformers",
  "memmap2",
  "nohash-hasher",
  "safetensors",
@@ -9781,7 +9726,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend-core",
  "thiserror",
- "tokenizers 0.19.1",
+ "tokenizers",
  "tracing",
 ]
 
@@ -9906,38 +9851,6 @@ name = "tokenizers"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e500fad1dd3af3d626327e6a3fe5050e664a6eaa4708b8ca92f1794aaf73e6fd"
-dependencies = [
- "aho-corasick",
- "derive_builder",
- "esaxx-rs",
- "getrandom",
- "indicatif",
- "itertools 0.12.1",
- "lazy_static",
- "log",
- "macro_rules_attribute",
- "monostate",
- "onig",
- "paste",
- "rand",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax 0.8.4",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
-
-[[package]]
-name = "tokenizers"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a24d7f7d6be5b9d1377418b893ab1808af0074f5d1bb2c64784452ddd2aa70"
 dependencies = [
  "aho-corasick",
  "derive_builder",
