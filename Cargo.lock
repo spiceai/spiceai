@@ -3783,7 +3783,7 @@ version = "0.17.3-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "rustls-native-certs 0.6.3",
