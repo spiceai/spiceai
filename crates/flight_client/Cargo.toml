@@ -16,7 +16,7 @@ arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 base64 = "0.21.7"
 bytes = "1.5.0"
 futures.workspace = true
-rustls-native-certs = "0.6.3"
+rustls-native-certs = "0.7.1"
 rustls-pemfile = "1.0.3"
 snafu.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
