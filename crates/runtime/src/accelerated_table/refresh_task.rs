@@ -621,21 +621,14 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        // Get the base table schema when table is EmbeddingTable
-        // The base table schema will be used as filter in filter_records
-        let base_table_schema: Option<SchemaRef> = self
-            .federated
-            .as_any()
-            .downcast_ref::<EmbeddingTable>()
-            .map(EmbeddingTable::get_base_table_schema);
-
+        let filter_schema = BaseSchema::get_schema(Arc::clone(&self.federated));
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
-                    let batch = filter_records(&batch?, &existing_records, base_table_schema.clone());
+                    let batch = filter_records(&batch?, &existing_records, filter_schema.clone());
                     yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                 }
             }
@@ -761,16 +754,13 @@ impl RefreshTask {
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &Vec<RecordBatch>,
-    filter_schema: Option<SchemaRef>,
+    filter_schema: SchemaRef,
 ) -> super::Result<RecordBatch> {
     let mut predicates = vec![];
     let mut comparators = vec![];
 
-    // Only use columns existing in the base table for filtering
-    let schema = filter_schema.unwrap_or_else(|| update_data.schema());
-
     let update_struct_array = StructArray::from(
-        schema
+        filter_schema
             .fields()
             .iter()
             .map(|field| {
@@ -785,7 +775,7 @@ fn filter_records(
 
     for existing in existing_records {
         let existing_struct_array = StructArray::from(
-            schema
+            filter_schema
                 .fields()
                 .iter()
                 .map(|field| {
@@ -836,5 +826,16 @@ fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
         }
+    }
+}
+
+pub struct BaseSchema {}
+
+impl BaseSchema {
+    fn get_schema(provider: Arc<dyn TableProvider>) -> SchemaRef {
+        if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+            return embedding_table.get_base_table_schema();
+        }
+        provider.schema()
     }
 }
