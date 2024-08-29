@@ -235,7 +235,7 @@ impl MistralLlama {
 
         let builder = NormalLoaderBuilder::new(
             mistralrs::NormalSpecificConfig::default(),
-            Some("/Users/jeadie/Github/spiceai/tokenizer_config.json".to_string()),
+            None,
             None,
             Some(model_parts[0].to_string()),
         );
