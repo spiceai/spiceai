@@ -27,9 +27,6 @@ tracing.workspace = true
 tracing-futures.workspace = true
 
 ## `candle` feature packages
-candle-core = { version = "0.6.0", optional = true }
-candle-examples = { version = "0.6.0", optional = true }
-candle-transformers = { version = "0.6.0", optional = true }
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "6258d473ec76c19b7794d3d30993f485fa37060b", optional = true }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "6258d473ec76c19b7794d3d30993f485fa37060b", optional = true, package = "mistralrs-core" }
 rand = "0.8.5"
@@ -38,7 +35,6 @@ tei_candle = { package = "text-embeddings-backend-candle", git = "https://github
 tempfile = "3.10.1"
 
 [features]
-candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers"]
-default = ["candle", "mistralrs"]
+default = ["mistralrs"]
 metal = []
 mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]

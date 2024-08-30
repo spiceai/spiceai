@@ -19,7 +19,6 @@ use async_openai::{
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
 
-#[cfg(feature = "candle")]
 pub mod candle;
 
 #[derive(Debug, Snafu)]

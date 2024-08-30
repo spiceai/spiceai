@@ -2003,27 +2003,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-examples"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23557997f798ace54fe11be15f147619c579e76d598085462f2b0ef63e4ea384"
-dependencies = [
- "anyhow",
- "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-transformers",
- "csv",
- "hf-hub",
- "image",
- "num-traits",
- "rayon",
- "safetensors",
- "serde",
- "serde_json",
- "tokenizers",
-]
-
-[[package]]
 name = "candle-nn"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5572,9 +5551,6 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
- "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-examples",
- "candle-transformers",
  "futures",
  "hf-hub",
  "mistralrs",
