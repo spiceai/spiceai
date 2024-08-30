@@ -34,9 +34,6 @@ use async_openai::{
     },
 };
 
-#[cfg(feature = "candle")]
-pub mod candle;
-
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
 
