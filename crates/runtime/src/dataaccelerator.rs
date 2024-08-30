@@ -117,16 +117,16 @@ pub trait DataAccelerator: Send + Sync {
         dataset: Option<&Dataset>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
-    // The name of the accelerator
+    /// The name of the accelerator
     fn name(&self) -> &'static str;
 
-    // The prefix of the table name
+    /// The prefix of the table name
     fn prefix(&self) -> &'static str;
 
-    // The parameters of the accelerator
+    /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
-    // Initialize the accelerator for a dataset
+    /// Initialize the accelerator for a dataset
     async fn init(
         &self,
         _dataset: &Dataset,
@@ -134,17 +134,44 @@ pub trait DataAccelerator: Send + Sync {
         Ok(())
     }
 
+    /// Check if the accelerator is initialized for a dataset
+    fn is_initialized(&self, _dataset: &Dataset) -> bool {
+        true
+    }
+
+    /// For file-based accelerators, return the valid file extensions for the file path
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         vec![]
     }
 
-    fn is_valid_file(&self, file_path: &String) -> bool {
-        let path = std::path::Path::new(file_path);
+    /// For file-based accelerators, return the file path
+    /// For any other accelerator, return None
+    fn file_path(&self, _dataset: &Dataset) -> Option<String> {
+        None
+    }
 
-        !path.is_dir()
-            && path.extension().map_or(false, |ext| {
-                self.valid_file_extensions().iter().any(|&e| e == ext)
-            })
+    /// Check if the file path is valid
+    fn is_valid_file(&self, dataset: &Dataset) -> bool {
+        if let Some(path) = self.file_path(dataset) {
+            let path = std::path::Path::new(&path);
+
+            !path.is_dir()
+                && path.extension().map_or(false, |ext| {
+                    self.valid_file_extensions().iter().any(|&e| e == ext)
+                })
+        } else {
+            false
+        }
+    }
+
+    /// Check if the file path exists
+    fn has_existing_file(&self, dataset: &Dataset) -> bool {
+        if let Some(path) = self.file_path(dataset) {
+            let path = std::path::Path::new(&path);
+            path.is_file()
+        } else {
+            false
+        }
     }
 }
 

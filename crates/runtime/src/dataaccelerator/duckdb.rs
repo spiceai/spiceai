@@ -29,7 +29,10 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc};
 
 use crate::{
-    component::dataset::{acceleration::Engine, Dataset},
+    component::dataset::{
+        acceleration::{Engine, Mode},
+        Dataset,
+    },
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path, Runtime,
@@ -123,6 +126,19 @@ impl DataAccelerator for DuckDBAccelerator {
         vec!["db", "ddb", "duckdb"]
     }
 
+    fn file_path(&self, dataset: &Dataset) -> Option<String> {
+        self.duckdb_file_path(dataset)
+    }
+
+    fn is_initialized(&self, dataset: &Dataset) -> bool {
+        if !dataset.is_file_accelerated() {
+            return true; // memory mode DuckDB is always initialized
+        }
+
+        // otherwise, we're initialized if the file exists
+        self.has_existing_file(dataset)
+    }
+
     async fn init(
         &self,
         dataset: &Dataset,
@@ -131,14 +147,14 @@ impl DataAccelerator for DuckDBAccelerator {
             return Ok(());
         }
 
-        let path = self.duckdb_file_path(dataset);
+        let path = self.file_path(dataset);
 
         if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
-            } else if !self.is_valid_file(path) {
+            } else if !self.is_valid_file(dataset) {
                 if std::path::Path::new(path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
@@ -174,29 +190,31 @@ impl DataAccelerator for DuckDBAccelerator {
                 .insert("open".to_string(), duckdb_file.to_string());
         }
 
-        if let Some(Some(attach_databases)) = dataset.map(|this_dataset: &Dataset| {
-            this_dataset.app.as_ref().map(|a| {
-                let datasets = Runtime::get_valid_datasets(a, crate::LogErrors(false));
-                datasets
+        if let Some(this_dataset) = dataset {
+            if let Some(app) = &this_dataset.app {
+                let datasets =
+                    Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                let attach_databases = datasets
                     .iter()
-                    .filter(|d| {
-                        d.acceleration
-                            .as_ref()
-                            .map_or(false, |a| a.engine == Engine::DuckDB)
-                    })
                     .filter_map(|other_dataset| {
-                        if **other_dataset == *this_dataset {
-                            None
+                        if other_dataset.acceleration.as_ref().map_or(false, |a| {
+                            a.engine == Engine::DuckDB && a.mode == Mode::File
+                        }) {
+                            if **other_dataset == *this_dataset {
+                                None
+                            } else {
+                                self.file_path(other_dataset)
+                            }
                         } else {
-                            self.duckdb_file_path(other_dataset)
+                            None
                         }
                     })
-                    .collect::<Vec<String>>()
-            })
-        }) {
-            if !attach_databases.is_empty() {
-                cmd.options
-                    .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    .collect::<Vec<_>>();
+
+                if !attach_databases.is_empty() {
+                    cmd.options
+                        .insert("attach_databases".to_string(), attach_databases.join(";"));
+                }
             }
         }
 
@@ -249,6 +267,9 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
 
+    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::acceleration::{Engine, Mode};
+    use crate::component::dataset::Dataset;
     use crate::dataaccelerator::{duckdb::DuckDBAccelerator, DataAccelerator};
 
     #[tokio::test]
@@ -446,5 +467,37 @@ mod tests {
             .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_file_initialization() {
+        let mut dataset = Dataset::try_new(
+            "duckdb_file_accelerator_init".to_string(),
+            "duckdb_file_accelerator_init",
+        )
+        .expect("dataset should be created");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::DuckDB,
+            mode: Mode::File,
+            ..Default::default()
+        });
+
+        let accelerator = DuckDBAccelerator::new();
+        assert!(!accelerator.is_initialized(&dataset));
+
+        accelerator
+            .init(&dataset)
+            .await
+            .expect("initialization should be successful");
+
+        assert!(accelerator.is_initialized(&dataset));
+        assert!(accelerator.file_path(&dataset).is_some());
+
+        let path = accelerator.file_path(&dataset).expect("path should exist");
+        assert!(std::path::Path::new(&path).exists());
+
+        // cleanup
+        std::fs::remove_file(&path).expect("file should be removed");
     }
 }
