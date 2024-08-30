@@ -301,8 +301,8 @@ fn create_duckdb_test_dataset(
         .unwrap_or_default();
 
     dataset.acceleration = Some(Acceleration {
-        params: get_duckdb_params(mode.clone(), duckdb_file),
-        mode: mode,
+        params: get_duckdb_params(&mode, duckdb_file),
+        mode,
         enabled: true,
         engine: Some("duckdb".to_string()),
         refresh_mode: Some(RefreshMode::Append),
@@ -331,8 +331,8 @@ fn get_pg_params(port: usize) -> Params {
     )
 }
 
-fn get_duckdb_params(mode: Mode, duckdb_file: Option<String>) -> Option<Params> {
-    if mode == Mode::File {
+fn get_duckdb_params(mode: &Mode, duckdb_file: Option<String>) -> Option<Params> {
+    if mode == &Mode::File {
         return Some(Params::from_string_map(
             vec![("duckdb_file".to_string(), duckdb_file.unwrap_or_default())]
                 .into_iter()
