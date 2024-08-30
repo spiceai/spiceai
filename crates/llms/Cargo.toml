@@ -36,5 +36,5 @@ tempfile = "3.10.1"
 
 [features]
 default = ["mistralrs"]
-metal = ["mistralrs/metal"]
+metal = []
 mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]
