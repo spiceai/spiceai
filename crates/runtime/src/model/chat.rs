@@ -314,6 +314,10 @@ impl ChatWrapper {
 
 #[async_trait]
 impl Chat for ChatWrapper {
+    /// Expect `truncated_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
+    /// ```rust
+    /// tracing::info!(target: "task_history", truncated_output = %chat_output)
+    /// ```
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -327,7 +331,7 @@ impl Chat for ChatWrapper {
                     if let Ok(item) = item {
                         // not incremental; should only be returned on last stream chunk.
                         if let Some(usage) = item.usage.clone() {
-                            tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens);
+                            tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                         }
                     }
                 });
@@ -351,7 +355,7 @@ impl Chat for ChatWrapper {
         match self.chat.chat_request(req).instrument(span).await {
             Ok(resp) => {
                 if let Some(usage) = resp.usage.clone() {
-                    tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens);
+                    tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                 };
                 let truncated_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&truncated_output) {
