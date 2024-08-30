@@ -51,7 +51,7 @@ pub(crate) async fn post(
                             create_sse_response(strm, time::Duration::from_secs(30), span_clone)
                         }
                         Err(e) => {
-                            tracing::error!(target: "task_history", "{e}");
+                            tracing::error!(target: "task_history", parent: &span_clone, "{e}");
                             tracing::debug!("Error from v1/chat: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
@@ -65,11 +65,11 @@ pub(crate) async fn post(
                                 .map(|s| serde_json::to_string(s).unwrap_or_default())
                                 .unwrap_or_default();
 
-                            tracing::info!(target: "task_history", truncated_output = %preview);
+                            tracing::info!(target: "task_history", parent: &span_clone, truncated_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
-                            tracing::error!(target: "task_history", "{e}");
+                            tracing::error!(target: "task_history", parent: &span_clone, "{e}");
                             tracing::debug!("Error from v1/chat: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
