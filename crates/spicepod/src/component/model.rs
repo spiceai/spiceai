@@ -207,7 +207,6 @@ impl Model {
         if source == ModelSource::HuggingFace && self.params.contains_key("model_type") {
             return Some(ModelType::Llm);
         }
-
         let mut files = self.files.clone();
 
         // For [`ModelSource::File`], The model id is a weights file.

@@ -36,6 +36,8 @@ use async_openai::{
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
+use indexmap::IndexMap;
+use mistralrs::MessageContent;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -134,6 +136,104 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
     }
 }
 
+/// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequesstMessage`] type.
+#[cfg(feature = "mistralrs")]
+#[must_use]
+pub fn message_to_mistral(
+    message: &ChatCompletionRequestMessage,
+) -> IndexMap<String, MessageContent> {
+    use either::Either;
+
+    match message {
+        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content, ..
+        }) => {
+            let body: MessageContent = match content {
+                ChatCompletionRequestUserMessageContent::Text(text) => {
+                    either::Either::Left(text.clone())
+                }
+                ChatCompletionRequestUserMessageContent::Array(array) => {
+                    let v = array.iter().map(|p| {
+                        match p {
+                            async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
+                                ("content".to_string(), t.text.clone())
+                            }
+                            async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(i) => {
+                                ("image_url".to_string(), i.image_url.url.clone())
+                            }
+                        }
+
+                    }).collect::<Vec<_>>();
+                    let index_map: IndexMap<String, String> = v.into_iter().collect();
+                    either::Either::Right(vec![index_map])
+                }
+            };
+            IndexMap::from([
+                (String::from("role"), Either::Left(String::from("user"))),
+                (String::from("content"), body),
+            ])
+        }
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content,
+            ..
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("system"))),
+            (String::from("content"), Either::Left(content.clone())),
+        ]),
+        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+            content,
+            tool_call_id,
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("tool"))),
+            (String::from("content"), Either::Left(content.clone())),
+            (
+                String::from("tool_call_id"),
+                Either::Left(tool_call_id.clone()),
+            ),
+        ]),
+        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content,
+            name,
+            tool_calls,
+            ..
+        }) => IndexMap::from([
+            (
+                String::from("role"),
+                Either::Left(String::from("assistant")),
+            ),
+            // TODO: don't include if None
+            (
+                "content".to_string(),
+                Either::Left(content.clone().unwrap_or_default()),
+            ),
+            (
+                "name".to_string(),
+                Either::Left(name.clone().unwrap_or_default()),
+            ),
+            (
+                "tool_calls".to_string(),
+                Either::Left(
+                    tool_calls
+                        .clone()
+                        .map(|m| serde_json::to_string(&m).unwrap_or_default())
+                        .unwrap_or_default(),
+                ),
+            ),
+        ]),
+        ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
+            content,
+            name,
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("function"))),
+            (
+                "content".to_string(),
+                Either::Left(content.clone().unwrap_or_default().clone()),
+            ),
+            ("name".to_string(), Either::Left(name.clone())),
+        ]),
+    }
+}
+
 #[async_trait]
 pub trait Chat: Sync + Send {
     async fn run(&self, prompt: String) -> Result<Option<String>>;
@@ -142,8 +242,18 @@ pub trait Chat: Sync + Send {
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
+
         if let Err(e) = self
-            .run("health".to_string())
+            .chat_request(CreateChatCompletionRequest {
+                max_tokens: Some(1),
+                messages: vec![ChatCompletionRequestMessage::System(
+                    ChatCompletionRequestSystemMessage {
+                        content: "health".to_string(),
+                        name: Some("health".to_string()),
+                    },
+                )],
+                ..Default::default()
+            })
             .instrument(span.clone())
             .await
         {
