@@ -329,7 +329,7 @@ impl Chat for ChatWrapper {
             Ok(resp) => {
                 let logged_stream = resp.instrument(span).inspect(|item| {
                     if let Ok(item) = item {
-                        // not incremental; should only be returned on last stream chunk.
+                        // not incremental; provider only emits usage on last chunk.
                         if let Some(usage) = item.usage.clone() {
                             tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                         }
