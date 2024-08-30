@@ -606,6 +606,30 @@ impl Runtime {
         let _ = join_all(futures).await;
     }
 
+    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
+    async fn get_initialized_datasets(app: &Arc<App>, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
+        let valid_datasets = Self::get_valid_datasets(app, log_errors);
+        futures::stream::iter(valid_datasets)
+            .filter_map(|ds| async move {
+                match (ds.is_accelerated(), ds.is_accelerator_initialized().await) {
+                    (true, true) | (false, _) => Some(Arc::clone(&ds)),
+                    (true, false) => {
+                        if log_errors.0 {
+                            status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                            metrics::datasets::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                dataset = &ds.name.to_string(),
+                                "Dataset is accelerated but the accelerator failed to initialize."
+                            );
+                        }
+                        None
+                    }
+                }
+            })
+            .collect()
+            .await
+    }
+
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
