@@ -17,10 +17,12 @@ use async_openai::{
     error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+        CreateChatCompletionResponse,
     },
 };
 use async_trait::async_trait;
+use futures::stream::StreamExt;
 use futures::Stream;
 use llms::chat::{Chat, Error as LlmError, Result as ChatResult};
 use llms::openai::DEFAULT_LLM_MODEL;
@@ -159,7 +161,16 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
     }?;
 
     // Handle runtime wrapping
-    let wrapper = ChatWrapper::new(model, component.params.get("system_prompt").cloned());
+    let system_prompt = component
+        .params
+        .get("system_prompt")
+        .cloned()
+        .map(|s| s.to_string());
+    let wrapper = ChatWrapper::new(
+        model,
+        system_prompt,
+        component.get_openai_request_overrides(),
+    );
     Ok(Box::new(wrapper))
 }
 
@@ -167,32 +178,137 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
 pub struct ChatWrapper {
     pub chat: Box<dyn Chat>,
     pub system_prompt: Option<String>,
+    pub defaults: Vec<(String, serde_json::Value)>,
 }
 impl ChatWrapper {
-    pub fn new(chat: Box<dyn Chat>, system_prompt: Option<String>) -> Self {
+    pub fn new(
+        chat: Box<dyn Chat>,
+        system_prompt: Option<String>,
+        defaults: Vec<(String, serde_json::Value)>,
+    ) -> Self {
         Self {
             chat,
             system_prompt,
+            defaults,
         }
     }
 
-    /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message, if it exists.
     fn prepare_req(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        match &self.system_prompt {
-            Some(prompt) => {
-                let system_message = ChatCompletionRequestSystemMessageArgs::default()
-                    .content(prompt)
-                    .build()?;
-                let mut req = req.clone();
-                req.messages
-                    .insert(0, ChatCompletionRequestMessage::System(system_message));
-                Ok(req)
-            }
-            None => Ok(req),
+        let mut prepared_req = self.with_system_prompt(req)?;
+
+        prepared_req = self.with_model_defaults(prepared_req);
+        prepared_req = Self::with_stream_usage(prepared_req);
+        Ok(prepared_req)
+    }
+
+    /// Injects a system prompt as the first message in the request, if it exists.
+    fn with_system_prompt(
+        &self,
+        mut req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
+        if let Some(prompt) = self.system_prompt.clone() {
+            let system_message = ChatCompletionRequestSystemMessageArgs::default()
+                .content(prompt)
+                .build()?;
+            req.messages
+                .insert(0, ChatCompletionRequestMessage::System(system_message));
         }
+        Ok(req)
+    }
+
+    /// Ensure that streaming requests have `stream_options: {"include_usage": true}` internally.
+    fn with_stream_usage(mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+        if req.stream.is_some_and(|s| s) {
+            req.stream_options = match req.stream_options {
+                Some(mut opts) => {
+                    opts.include_usage = true;
+                    Some(opts)
+                }
+                None => Some(ChatCompletionStreamOptions {
+                    include_usage: true,
+                }),
+            };
+        }
+        req
+    }
+
+    /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
+    fn with_model_defaults(
+        &self,
+        mut req: CreateChatCompletionRequest,
+    ) -> CreateChatCompletionRequest {
+        for (key, v) in &self.defaults {
+            let value = v.clone();
+            match key.as_str() {
+                "frequency_penalty" => {
+                    req.frequency_penalty = req
+                        .frequency_penalty
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "logit_bias" => {
+                    req.logit_bias = req
+                        .logit_bias
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "logprobs" => {
+                    req.logprobs = req.logprobs.or_else(|| serde_json::from_value(value).ok());
+                }
+                "top_logprobs" => {
+                    req.top_logprobs = req
+                        .top_logprobs
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "max_tokens" => {
+                    req.max_tokens = req
+                        .max_tokens
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "n" => req.n = req.n.or_else(|| serde_json::from_value(value).ok()),
+                "presence_penalty" => {
+                    req.presence_penalty = req
+                        .presence_penalty
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "response_format" => {
+                    req.response_format = req
+                        .response_format
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "seed" => req.seed = req.seed.or_else(|| serde_json::from_value(value).ok()),
+                "stop" => req.stop = req.stop.or_else(|| serde_json::from_value(value).ok()),
+                "stream" => req.stream = req.stream.or_else(|| serde_json::from_value(value).ok()),
+                "stream_options" => {
+                    req.stream_options = req
+                        .stream_options
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "temperature" => {
+                    req.temperature = req
+                        .temperature
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "top_p" => req.top_p = req.top_p.or_else(|| serde_json::from_value(value).ok()),
+                "tools" => req.tools = req.tools.or_else(|| serde_json::from_value(value).ok()),
+                "tool_choice" => {
+                    req.tool_choice = req
+                        .tool_choice
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "parallel_tool_calls" => {
+                    req.parallel_tool_calls = req
+                        .parallel_tool_calls
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
+                "user" => req.user = req.user.or_else(|| serde_json::from_value(value).ok()),
+                _ => {
+                    tracing::debug!("Ignoring unknown default key: {}", key);
+                }
+            };
+        }
+        req
     }
 }
 
@@ -210,7 +326,17 @@ impl Chat for ChatWrapper {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(),  "labels");
 
         match self.chat.chat_stream(req).instrument(span.clone()).await {
-            Ok(resp) => Ok(Box::pin(resp.instrument(span))),
+            Ok(resp) => {
+                let logged_stream = resp.instrument(span).inspect(|item| {
+                    if let Ok(item) = item {
+                        // not incremental; provider only emits usage on last chunk.
+                        if let Some(usage) = item.usage.clone() {
+                            tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
+                        }
+                    }
+                });
+                Ok(Box::pin(logged_stream))
+            }
             Err(e) => {
                 tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
                 Err(e)
@@ -228,6 +354,9 @@ impl Chat for ChatWrapper {
 
         match self.chat.chat_request(req).instrument(span).await {
             Ok(resp) => {
+                if let Some(usage) = resp.usage.clone() {
+                    tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
+                };
                 let truncated_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&truncated_output) {
                     Ok(output) => {

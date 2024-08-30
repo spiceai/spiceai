@@ -34,7 +34,6 @@ use std::os::unix::fs::symlink;
 
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
-use candle_core::DType;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
@@ -56,6 +55,8 @@ pub struct ModelConfig {
     pub hidden_size: i32,
 }
 
+static F32_DTYPE: &str = "float32";
+
 impl CandleEmbedding {
     pub fn from_local(
         model_path: &Path,
@@ -72,21 +73,21 @@ impl CandleEmbedding {
         .collect();
 
         let model_root = link_files_into_tmp_dir(files)?;
-        Self::try_new(&model_root, DType::F32)
+        Self::try_new(&model_root, F32_DTYPE)
     }
 
     pub fn from_hf(model_id: &str, revision: Option<&str>) -> Result<Self> {
         let model_root = download_hf_artifacts(model_id, revision)?;
-        Self::try_new(&model_root, DType::F32)
+        Self::try_new(&model_root, F32_DTYPE)
     }
 
     /// Attempt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
-    pub fn try_new(model_root: &Path, dtype: DType) -> Result<Self> {
+    pub fn try_new(model_root: &Path, dtype: &str) -> Result<Self> {
         Ok(Self {
             backend: Arc::new(Mutex::new(
                 CandleBackend::new(
                     model_root.to_path_buf(),
-                    Self::convert_dtype(dtype),
+                    dtype.to_string(),
                     ModelType::Embedding(Pool::Cls),
                 )
                 .boxed()
@@ -96,17 +97,6 @@ impl CandleEmbedding {
                 .context(FailedToInstantiateEmbeddingModelSnafu)?,
             model_cfg: Self::model_config(model_root)?,
         })
-    }
-
-    fn convert_dtype(dtype: DType) -> String {
-        let dtype_str = if dtype == DType::F32 {
-            "float32"
-        } else if dtype == DType::F16 {
-            "float16"
-        } else {
-            dtype.as_str()
-        };
-        dtype_str.to_string()
     }
 
     fn model_config(model_root: &Path) -> Result<ModelConfig> {

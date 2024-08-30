@@ -27,18 +27,16 @@ tracing.workspace = true
 tracing-futures.workspace = true
 
 ## `candle` feature packages
-candle-core = { version = "0.6.0", optional = true }
-candle-examples = { version = "0.6.0", optional = true }
-candle-transformers = { version = "0.6.0", optional = true }
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "6258d473ec76c19b7794d3d30993f485fa37060b", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "6258d473ec76c19b7794d3d30993f485fa37060b", optional = true, package = "mistralrs-core" }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8", optional = true }
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8", optional = true, package = "mistralrs-core" }
 rand = "0.8.5"
 tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "dde326b330ecb609201110d4725928a6e977f0dd" }
 tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "dde326b330ecb609201110d4725928a6e977f0dd" }
 tempfile = "3.10.1"
+indexmap = "2.3.0"
+either = "1.13.0"
 
 [features]
-candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers"]
-default = ["candle", "mistralrs"]
+default = ["mistralrs"]
 metal = []
 mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]
