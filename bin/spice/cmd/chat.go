@@ -70,7 +70,8 @@ spice chat --model <model>
 spice chat --model <model> --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
+		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
+		rtcontext := context.NewContext().WithCloud(cloud)
 
 		if !rtcontext.ModelsFlavorInstalled() {
 			cmd.Print("This feature requires a runtime version with models enabled. Install (y/n)? ")
@@ -88,8 +89,6 @@ spice chat --model <model> --cloud
 				os.Exit(1)
 			}
 		}
-
-		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
@@ -137,17 +136,9 @@ spice chat --model <model> --cloud
 			cmd.Println(err)
 			os.Exit(1)
 		}
-		if httpEndpoint == "" {
-			if cloud {
-				httpEndpoint = "https://data.spiceai.io"
-			} else {
-				httpEndpoint = "http://localhost:8090"
-			}
+		if httpEndpoint != "" {
+			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
-
-		apiKey := os.Getenv("SPICE_API_KEY")
-
-		client := &http.Client{}
 
 		var messages []Message = []Message{}
 
@@ -177,20 +168,10 @@ spice chat --model <model> --cloud
 				Stream:   true,
 			}
 
-			var response *http.Response
-
-			if cloud {
-				response, err = callCloudChat(httpEndpoint, apiKey, client, body)
-				if err != nil {
-					cmd.Println(err)
-					os.Exit(1)
-				}
-			} else {
-				response, err = callLocalChat(httpEndpoint, client, body)
-				if err != nil {
-					cmd.Println(err)
-					os.Exit(1)
-				}
+			response, err := sendChatRequest(rtcontext, body)
+			if err != nil {
+				cmd.Printf("Error: %v\n", err)
+				continue
 			}
 
 			scanner := bufio.NewScanner(response.Body)
@@ -237,6 +218,28 @@ spice chat --model <model> --cloud
 	},
 }
 
+func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling request body: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/chat/completions", rtcontext.HttpEndpoint())
+	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	request.Header = rtcontext.GetHeaders()
+
+	response, err := rtcontext.Client().Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("error sending request: %w", err)
+	}
+
+	return response, nil
+}
+
 func spinner(done chan bool) {
 	chars := []rune{'⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'}
 	for {
@@ -251,49 +254,6 @@ func spinner(done chan bool) {
 			}
 		}
 	}
-}
-
-func callLocalChat(baseUrl string, client *http.Client, body *ChatRequestBody) (response *http.Response, err error) {
-	url := fmt.Sprintf("%s/v1/chat/completions", baseUrl)
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-
-	request.Header.Set("Content-Type", "application/json")
-	response, err = client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-
-	return response, nil
-}
-
-func callCloudChat(baseUrl string, apiKey string, client *http.Client, body *ChatRequestBody) (response *http.Response, err error) {
-	url := fmt.Sprintf("%s/v1/chat/completions", baseUrl)
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-API-Key", apiKey)
-	response, err = client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-
-	return response, nil
 }
 
 func init() {
