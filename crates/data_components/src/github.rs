@@ -291,28 +291,28 @@ impl GithubRestClient {
         match response.status().as_u16() {
             404 => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}; Is org `{owner}`, repo `{repo}` and git tree `{tree_sha}` correct?",
+                    "The Github API ({endpoint}) failed with status code {}; Please check that org `{owner}`, repo `{repo}` and git tree `{tree_sha}`are correct.",
                     response.status()
                 );
                 Err(err_msg.into())
             }
             401 => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}; Is the token correct?",
+                    "The Github API ({endpoint}) failed with status code {}; Please check if the token is correct.",
                     response.status()
                 );
                 Err(err_msg.into())
             }
             403 => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}; Does the token have the right permissions?",
+                    "The Github API ({endpoint}) failed with status code {}; Please check if the token has the necessary permissions.",
                     response.status()
                 );
                 Err(err_msg.into())
             }
             _ => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}",
+                    "The Github API ({endpoint}) failed with status code {}",
                     response.status()
                 );
                 Err(err_msg.into())
