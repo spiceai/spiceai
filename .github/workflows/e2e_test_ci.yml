@@ -361,7 +361,7 @@ jobs:
             {},
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
-            # { engine: sqlite, mode: file },
+            { engine: sqlite, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
