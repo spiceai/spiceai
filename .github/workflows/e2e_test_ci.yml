@@ -68,7 +68,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -203,7 +203,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_spiceai:
@@ -267,7 +267,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_data_postgres:
@@ -344,18 +344,25 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_data_mysql:
-    name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
       - setup-matrix
 
     strategy:
+      fail-fast: false
       matrix:
+        acceleration: [
+            {},
+            { engine: arrow, mode: memory },
+            { engine: duckdb, mode: file },
+            { engine: sqlite, mode: file },
+          ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
@@ -375,8 +382,9 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          brew install mysql
-          brew services start mysql
+          brew install mysql@8.4
+          brew link mysql@8.4 --force --overwrite
+          brew services start mysql@8.4
           sleep 5
           mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
           mysql -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
@@ -412,9 +420,28 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "test_mysql_table\neth recent blocks\nmysql:test_mysql_table\ny" | spice dataset configure
-          # configure mysql credentials
-          echo -e "params:\n  mysql_host: localhost\n  mysql_tcp_port: 3306\n  mysql_db: testdb\n  mysql_user: test_user\n  mysql_sslmode: disabled" >> ./datasets/test_mysql_table/dataset.yaml
+          echo "datasets:" >> spicepod.yaml
+          echo "  - name: test_mysql_table" >> spicepod.yaml
+          echo "    from: mysql:test_mysql_table" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      mysql_host: localhost" >> spicepod.yaml
+          echo "      mysql_tcp_port: 3306" >> spicepod.yaml
+          echo "      mysql_db: testdb" >> spicepod.yaml
+          echo "      mysql_user: test_user" >> spicepod.yaml
+          echo "      mysql_sslmode: disabled" >> spicepod.yaml
+
+          ENGINE=$(echo '${{ matrix.acceleration.engine }}')
+          MODE=$(echo '${{ matrix.acceleration.mode }}')
+
+          if [[ -n "$ENGINE" ]]; then
+            echo "    acceleration:" >> spicepod.yaml
+            echo "      enabled: true" >> spicepod.yaml
+            echo "      engine: $ENGINE" >> spicepod.yaml
+            if [[ -n "$MODE" ]]; then
+              echo "      mode: $MODE" >> spicepod.yaml
+           fi
+          fi
+
           cat spicepod.yaml
 
       - name: Start spice runtime
@@ -441,7 +468,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_clickhouse:
@@ -539,7 +566,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_quickstart_duckdb:
@@ -621,7 +648,7 @@ jobs:
         if: always()
         working-directory: duckdb-app
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_local_acceleration:
@@ -713,7 +740,6 @@ jobs:
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
-          HOME=$GITHUB_WORKSPACE
           spice run &> spice.log &
           # time to initialize added dataset
           sleep 10
@@ -747,7 +773,7 @@ jobs:
         working-directory: test_app
         if: always()
         run: |
-          killall spice
+          killall spice || true
           cat spice.log
 
   test_results_caching:
@@ -865,5 +891,5 @@ jobs:
           working-directory: test_app
           if: always()
           run: |
-            killall spice
+            killall spice || true
             cat spice.log

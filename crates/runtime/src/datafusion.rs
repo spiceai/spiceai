@@ -30,7 +30,7 @@ use crate::dataupdate::{
 };
 use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
-use crate::{embeddings, get_dependent_table_names};
+use crate::{embeddings, view};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -254,12 +254,16 @@ impl DataFusion {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let state = SessionStateBuilder::new()
+        let mut state = SessionStateBuilder::new()
             .with_config(df_config)
             .with_default_features()
             .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
             .with_runtime_env(default_runtime_env())
             .build();
+
+        if let Err(e) = datafusion_functions_json::register_all(&mut state) {
+            panic!("Unable to register JSON functions: {e}");
+        };
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
@@ -948,7 +952,7 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
-            let dependent_table_names = get_dependent_table_names(&statements[0]);
+            let dependent_table_names = view::get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
 

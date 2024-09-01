@@ -41,11 +41,11 @@ nextest:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake -- --nocapture --skip spiceai_integration_test
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb -- --nocapture --skip spiceai_integration_test
 
 .PHONY: test-bench
 test-bench:

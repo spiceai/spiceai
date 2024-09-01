@@ -17,9 +17,11 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -35,6 +37,8 @@ spice install ai
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("Checking for latest Spice runtime release...")
+
 		err := checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
@@ -45,10 +49,32 @@ spice install ai
 			flavor = args[0]
 		}
 
-		installed, err := runtime.EnsureInstalled(flavor)
+		var installed bool
+		force, err := cmd.Flags().GetBool("force")
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			os.Exit(1)
+		}
+
+		if force {
+			rtcontext := context.NewContext()
+			err := rtcontext.Init()
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			err = rtcontext.InstallOrUpgradeRuntime(flavor)
+			if err != nil {
+				cmd.PrintErrln(err.Error())
+				os.Exit(1)
+			}
+			installed = true
+		} else {
+			installed, err = runtime.EnsureInstalled(flavor)
+			if err != nil {
+				cmd.PrintErrln(err.Error())
+				os.Exit(1)
+			}
 		}
 
 		if !installed {
@@ -59,5 +85,6 @@ spice install ai
 
 func init() {
 	installCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	installCmd.Flags().BoolP("force", "f", false, "Force installation of the latest released runtime")
 	RootCmd.AddCommand(installCmd)
 }

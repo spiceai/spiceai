@@ -48,7 +48,7 @@ reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "d937df525d7c237c717b42e6146494c524dbf267", features = [
@@ -69,12 +69,13 @@ rdkafka = { version = "0.36.2", features = ["cmake-build"], optional = true }
 [features]
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
-debezium = ["dep:serde_json", "dep:rdkafka"]
+debezium = ["dep:rdkafka"]
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
   "dep:duckdb",
   "db_connection_pool/duckdb",
   "datafusion-table-providers/duckdb",
+  "datafusion-table-providers/duckdb-federation"
 ]
 flightsql = ["dep:tonic"]
 mysql = ["datafusion-table-providers/mysql"]
@@ -82,9 +83,8 @@ odbc = []
 postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite"]
+sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]
 sharepoint = ["dep:graph-rs-sdk", "dep:http"]
-default=["sharepoint"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

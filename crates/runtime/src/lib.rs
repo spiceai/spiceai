@@ -15,7 +15,6 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -24,11 +23,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::parser::{self, DFParser};
-use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
-use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use ::datafusion::sql::sqlparser::{self, ast};
-use ::datafusion::sql::TableReference;
+use ::datafusion::sql::{sqlparser, TableReference};
 use ::opentelemetry::Key;
 use accelerated_table::AcceleratedTable;
 use app::App;
@@ -104,6 +99,7 @@ pub mod tls;
 pub mod tools;
 pub(crate) mod tracers;
 mod tracing_util;
+mod view;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -610,6 +606,30 @@ impl Runtime {
         let _ = join_all(futures).await;
     }
 
+    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
+    async fn get_initialized_datasets(app: &Arc<App>, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
+        let valid_datasets = Self::get_valid_datasets(app, log_errors);
+        futures::stream::iter(valid_datasets)
+            .filter_map(|ds| async move {
+                match (ds.is_accelerated(), ds.is_accelerator_initialized().await) {
+                    (true, true) | (false, _) => Some(Arc::clone(&ds)),
+                    (true, false) => {
+                        if log_errors.0 {
+                            status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                            metrics::datasets::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                dataset = &ds.name.to_string(),
+                                "Dataset is accelerated but the accelerator failed to initialize."
+                            );
+                        }
+                        None
+                    }
+                }
+            })
+            .collect()
+            .await
+    }
+
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
@@ -682,14 +702,14 @@ impl Runtime {
         let _ = join_all(futures).await;
 
         // After all datasets have loaded, load the views.
-        self.load_views(app, &valid_datasets);
+        self.load_views(app);
     }
 
-    fn load_views(&self, app: &Arc<App>, valid_datasets: &[Arc<Dataset>]) {
+    fn load_views(&self, app: &Arc<App>) {
         let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
 
         for view in &views {
-            if let Err(e) = self.load_view(view, valid_datasets) {
+            if let Err(e) = self.load_view(view) {
                 tracing::error!("Unable to load view: {e}");
             };
         }
@@ -756,19 +776,7 @@ impl Runtime {
         .await;
     }
 
-    fn load_view(&self, view: &View, all_datasets: &[Arc<Dataset>]) -> Result<()> {
-        let existing_tables = all_datasets
-            .iter()
-            .map(|d| d.name.clone())
-            .collect::<Vec<TableReference>>();
-
-        if !verify_dependent_tables(view, &existing_tables) {
-            return UnableToCreateViewSnafu {
-                reason: "One or more tables in the view's SQL statement do not exist.".to_string(),
-            }
-            .fail();
-        }
-
+    fn load_view(&self, view: &View) -> Result<()> {
         let df = Arc::clone(&self.df);
         df.register_view(view.name.clone(), view.sql.clone())
             .context(UnableToAttachViewSnafu)?;
@@ -1342,9 +1350,24 @@ impl Runtime {
                 Key::from_static_str("source").string(source_str.clone()),
             ],
         );
+
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
-        let params = self.get_params_with_secrets(&m.params).await;
+        // TODO: Have downstream code using model parameters to accept `Hashmap<String, Value>`.
+        // This will require handling secrets with `Value` type.
+        let p = m
+            .params
+            .clone()
+            .iter()
+            .map(|(k, v)| {
+                let k = k.clone();
+                match v.as_str() {
+                    Some(s) => (k, s.to_string()),
+                    None => (k, v.to_string()),
+                }
+            })
+            .collect::<HashMap<_, _>>();
+        let params = self.get_params_with_secrets(&p).await;
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
@@ -1598,106 +1621,6 @@ impl Runtime {
     }
 }
 
-fn verify_dependent_tables(view: &View, existing_tables: &[TableReference]) -> bool {
-    let dependent_tables = match get_view_dependent_tables(view) {
-        Ok(tables) => tables,
-        Err(err) => {
-            tracing::error!(
-                "Failed to get dependent tables for view {}: {}",
-                &view.name,
-                err
-            );
-            return false;
-        }
-    };
-
-    for tbl in &dependent_tables {
-        if !existing_tables.contains(tbl) {
-            tracing::error!(
-                "Failed to load view {}. Dependent table {} not found",
-                &view.name,
-                &tbl
-            );
-            return false;
-        }
-    }
-
-    true
-}
-
-fn get_view_dependent_tables(view: impl Borrow<View>) -> Result<Vec<TableReference>> {
-    let view = view.borrow();
-
-    let statements = DFParser::parse_sql_with_dialect(view.sql.as_str(), &PostgreSqlDialect {})
-        .context(UnableToParseSqlSnafu)?;
-
-    if statements.len() != 1 {
-        return UnableToCreateViewSnafu {
-            reason: format!(
-                "Expected 1 statement to create view from, received {}",
-                statements.len()
-            )
-            .to_string(),
-        }
-        .fail();
-    }
-
-    Ok(get_dependent_table_names(&statements[0]))
-}
-
-fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
-    let mut table_names = Vec::new();
-    let mut cte_names = HashSet::new();
-
-    if let parser::Statement::Statement(statement) = statement.clone() {
-        if let ast::Statement::Query(statement) = *statement {
-            // Collect names of CTEs
-            if let Some(with) = statement.with {
-                for table in with.cte_tables {
-                    cte_names.insert(TableReference::bare(table.alias.name.to_string()));
-                    let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
-                        Box::new(ast::Statement::Query(table.query)),
-                    ));
-                    // Extend table_names with names found in CTEs if they reference actual tables
-                    table_names.extend(cte_table_names);
-                }
-            }
-            // Process the main query body
-            if let SetExpr::Select(select_statement) = *statement.body {
-                for from in select_statement.from {
-                    let mut relations = vec![];
-                    relations.push(from.relation.clone());
-                    for join in from.joins {
-                        relations.push(join.relation.clone());
-                    }
-
-                    for relation in relations {
-                        match relation {
-                            TableFactor::Table { name, .. } => {
-                                table_names.push(name.to_string().into());
-                            }
-                            TableFactor::Derived { subquery, .. } => {
-                                table_names.extend(get_dependent_table_names(
-                                    &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                        subquery,
-                                    ))),
-                                ));
-                            }
-                            _ => (),
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Filter out CTEs and temporary views (aliases of subqueries)
-    table_names
-        .into_iter()
-        .filter(|name| !cte_names.contains(name))
-        .collect()
-}
-
 pub struct RegisterDatasetContext {
     data_connector: Arc<dyn DataConnector>,
     federated_read_table: Arc<dyn TableProvider>,
@@ -1706,11 +1629,11 @@ pub struct RegisterDatasetContext {
 }
 
 pub(crate) fn spice_data_base_path() -> String {
-    let Some(home_dir) = dirs::home_dir() else {
+    let Ok(working_dir) = std::env::current_dir() else {
         return ".".to_string();
     };
 
-    let base_folder = home_dir.join(".spice/data");
+    let base_folder = working_dir.join(".spice/data");
     base_folder.to_str().unwrap_or(".").to_string()
 }
 

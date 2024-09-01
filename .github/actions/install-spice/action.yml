@@ -23,7 +23,8 @@ runs:
 
         echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
-        echo "Spice binaries installed successfully."
+        echo "Spice binaries installed successfully into $HOME/.spice/bin."
+        ls -la "$HOME/.spice/bin"
 
     - name: Verify Spice installation
       shell: bash

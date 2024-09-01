@@ -19,6 +19,7 @@ use arrow::{
     array::{make_comparator, RecordBatch, StructArray, TimestampNanosecondArray},
     datatypes::DataType,
 };
+use arrow_schema::SchemaRef;
 use async_stream::stream;
 use cache::QueryResultsCacheProvider;
 use datafusion_table_providers::util::retriable_error::{
@@ -30,6 +31,7 @@ use snafu::{OptionExt, ResultExt};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::schema::BaseSchema;
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use crate::{
     component::dataset::acceleration::RefreshMode,
@@ -619,13 +621,14 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
+        let filter_schema = BaseSchema::get_schema(&self.federated);
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
-                    let batch = filter_records(&batch?, &existing_records);
+                    let batch = filter_records(&batch?, &existing_records, &filter_schema);
                     yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                 }
             }
@@ -751,18 +754,45 @@ impl RefreshTask {
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &Vec<RecordBatch>,
+    filter_schema: &SchemaRef,
 ) -> super::Result<RecordBatch> {
     let mut predicates = vec![];
     let mut comparators = vec![];
 
-    let update_struct_array = StructArray::from(update_data.clone());
+    let update_struct_array = StructArray::from(
+        filter_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let column_idx = update_data
+                    .schema()
+                    .index_of(field.name())
+                    .context(super::FailedToFilterUpdatesSnafu)?;
+                Ok((Arc::clone(field), update_data.column(column_idx).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
     for existing in existing_records {
-        let existing_array = StructArray::from(existing.clone());
+        let existing_struct_array = StructArray::from(
+            filter_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let column_idx = existing
+                        .schema()
+                        .index_of(field.name())
+                        .context(super::FailedToFilterUpdatesSnafu)?;
+                    Ok((Arc::clone(field), existing.column(column_idx).to_owned()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+
         comparators.push((
             existing.num_rows(),
             make_comparator(
                 &update_struct_array,
-                &existing_array,
+                &existing_struct_array,
                 SortOptions::default(),
             )
             .context(super::FailedToFilterUpdatesSnafu)?,
