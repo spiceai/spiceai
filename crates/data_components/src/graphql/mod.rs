@@ -37,6 +37,9 @@ pub enum Error {
     #[snafu(display("Invalid object access. {message}"))]
     InvalidObjectAccess { message: String },
 
+    #[snafu(display("{message}"))]
+    InvalidCredentialsOrPermissions { message: String },
+
     #[snafu(display(
         r#"GraphQL Query Error:
 Details:
