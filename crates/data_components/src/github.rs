@@ -20,7 +20,7 @@ use snafu::{ResultExt, Snafu};
 
 use crate::arrow::write::MemTable;
 use arrow::{
-    array::{ArrayRef, RecordBatch, StringBuilder, UInt64Builder},
+    array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use datafusion::{
@@ -70,7 +70,7 @@ impl GithubFilesTableProvider {
         let mut fields = vec![
             Field::new("name", DataType::Utf8, true),
             Field::new("path", DataType::Utf8, true),
-            Field::new("size", DataType::UInt64, true),
+            Field::new("size", DataType::Int64, true),
             Field::new("sha", DataType::Utf8, true),
             Field::new("mode", DataType::Utf8, true),
             Field::new("url", DataType::Utf8, true),
@@ -208,7 +208,7 @@ impl GithubRestClient {
 
         let mut name_builder = StringBuilder::new();
         let mut path_builder = StringBuilder::new();
-        let mut size_builder = UInt64Builder::new();
+        let mut size_builder = Int64Builder::new();
         let mut sha_builder = StringBuilder::new();
         let mut mode_builder = StringBuilder::new();
         let mut url_builder = StringBuilder::new();
@@ -371,6 +371,6 @@ struct GitTreeNode {
     #[serde(rename = "type")]
     node_type: String,
     sha: String,
-    size: Option<u64>,
+    size: Option<i64>,
     url: String,
 }
