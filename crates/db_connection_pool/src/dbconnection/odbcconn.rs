@@ -160,6 +160,7 @@ where
         &self,
         sql: &str,
         params: &[ODBCParameter],
+        _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
         // prepare some tokio channels to communicate query results back from the thread
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
