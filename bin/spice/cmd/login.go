@@ -50,6 +50,8 @@ const (
 	azureAccountName      = "azure-storage-account-name"
 	azureAccessKey        = "azure-storage-access-key"
 	gcpServiceAccountPath = "google-service-account-path"
+	m365TenantId          = "tenant-id"
+	m365ClientId          = "client-id"
 	charset               = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
@@ -225,6 +227,49 @@ spice login snowflake --account <account-identifier> --username <username> --pri
 		}, []string{})(cmd, args)
 
 	},
+}
+
+/*
+*
+#### Resource Owner Password Credential
+
+Environment Variables:
+
+- AZURE_TENANT_ID (Optional - puts the tenant id in the authorization url)
+- AZURE_CLIENT_ID (Required)
+- AZURE_USERNAME (Required)
+- AZURE_PASSWORD (Required)
+
+```rust
+
+Ok(EnvironmentCredential::username_password_env(
+
+	azure_tenant_id,
+	azure_client_id,
+	azure_username,
+	azure_password,
+
+))
+*/
+var m365Cmd = &cobra.Command{
+	Use:   "m365",
+	Short: "Login to a Microsoft 365 account",
+	Example: `
+	spice login m365 --username <username> --password <password> --tenant-id <tenant-id> --client-id <client-id>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_M365, map[string]string{
+		m365TenantId: "No tenant id provided, use --tenant-id to provide",
+		m365ClientId: "No client id provided, use --client-id to provide",
+		usernameFlag: "No username provided, use --username to provide",
+		passwordFlag: "No password provided, use --password to provide",
+	}, map[string]string{
+		m365TenantId: api.AUTH_PARAM_TENANT_ID,
+		m365ClientId: api.AUTH_PARAM_CLIENT_ID,
+		usernameFlag: api.AUTH_PARAM_USERNAME,
+		passwordFlag: api.AUTH_PARAM_PASSWORD,
+	}, []string{}),
 }
 
 var sparkCmd = &cobra.Command{
@@ -507,6 +552,13 @@ func init() {
 	deltaLakeCmd.Flags().String(azureAccessKey, "", "Azure Storage Access Key")
 	deltaLakeCmd.Flags().String(gcpServiceAccountPath, "", "Google Service Account Path")
 	loginCmd.AddCommand(deltaLakeCmd)
+
+	m365Cmd.Flags().BoolP("help", "h", false, "Print this help message")
+	m365Cmd.Flags().StringP(usernameFlag, "u", "", "Username")
+	m365Cmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	m365Cmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
+	m365Cmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
+	loginCmd.AddCommand(m365Cmd)
 
 	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
