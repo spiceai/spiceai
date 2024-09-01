@@ -229,28 +229,6 @@ spice login snowflake --account <account-identifier> --username <username> --pri
 	},
 }
 
-/*
-*
-#### Resource Owner Password Credential
-
-Environment Variables:
-
-- AZURE_TENANT_ID (Optional - puts the tenant id in the authorization url)
-- AZURE_CLIENT_ID (Required)
-- AZURE_USERNAME (Required)
-- AZURE_PASSWORD (Required)
-
-```rust
-
-Ok(EnvironmentCredential::username_password_env(
-
-	azure_tenant_id,
-	azure_client_id,
-	azure_username,
-	azure_password,
-
-))
-*/
 var m365Cmd = &cobra.Command{
 	Use:   "m365",
 	Short: "Login to a Microsoft 365 account",
