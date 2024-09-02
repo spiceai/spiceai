@@ -15,10 +15,12 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use arrow::array::{Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
-    graphql::{client::GraphQLClient, provider::GraphQLTableProvider},
+    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
 };
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -245,11 +247,14 @@ impl Github {
         )?;
 
         Ok(Arc::new(
-            GraphQLTableProvider::new(client).await.boxed().context(
-                super::UnableToGetReadProviderSnafu {
+            GraphQLTableProviderBuilder::new(client)
+                .with_schema_transform(github_gql_raw_schema_cast)
+                .build()
+                .await
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
-                },
-            )?,
+                })?,
         ))
     }
 
@@ -304,6 +309,34 @@ impl Github {
             })?,
         ))
     }
+}
+
+fn github_gql_raw_schema_cast(
+    record_batch: &RecordBatch,
+) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+    let mut fields: Vec<Arc<Field>> = Vec::new();
+    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+
+    for (idx, field) in record_batch.schema().fields().iter().enumerate() {
+        let column = record_batch.column(idx);
+        if let DataType::List(inner_field) = field.data_type() {
+            if let DataType::Struct(struct_fields) = inner_field.data_type() {
+                if struct_fields.len() == 1 {
+                    let (new_column, new_field) =
+                        arrow_tools::record_batch::to_primitive_type_list(column, field)?;
+                    fields.push(new_field);
+                    columns.push(new_column);
+                    continue;
+                }
+            }
+        }
+
+        fields.push(Arc::clone(field));
+        columns.push(Arc::clone(column));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(std::convert::Into::into)
 }
 
 #[derive(Default, Copy, Clone)]
