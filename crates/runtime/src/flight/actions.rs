@@ -31,7 +31,7 @@ use arrow_flight::{
     Action, ActionType as FlightActionType,
 };
 
-pub mod datasets;
+mod datasets;
 
 enum ActionType {
     CreatePreparedStatement,
@@ -138,15 +138,14 @@ pub(crate) async fn do_action(
         }
         ActionType::AcceleratedDatasetRefresh => {
             tracing::trace!("do_action: AcceleratedDatasetRefresh");
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
 
-            let cmd = datasets::ActionAcceleratedDatasetRefreshRequest::decode(
-                request.get_ref().body.as_ref(),
-            )
-            .map_err(|e| {
-                Status::invalid_argument(format!(
-                    "Unable to decode ActionAcceleratedDatasetRefreshRequest: {e}"
-                ))
-            })?;
+            let cmd = datasets::ActionAcceleratedDatasetRefreshRequest::decode(any.value.as_ref())
+                .map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "Unable to decode ActionAcceleratedDatasetRefreshRequest: {e}"
+                    ))
+                })?;
 
             datasets::do_action_accelerated_dataset_refresh(flight_svc, cmd).await?;
 
