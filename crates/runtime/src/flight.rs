@@ -42,7 +42,7 @@ use tokio::sync::RwLock;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
-pub mod actions;
+mod actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
