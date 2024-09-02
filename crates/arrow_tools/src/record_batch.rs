@@ -84,6 +84,7 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
 
 /// Flattens a list of struct types with a single field into a list of primitive types.
 /// The struct field must be a primitive type.
+/// If the struct has multiple fields, all except the first field will be ignored.
 ///
 /// # Errors
 ///
@@ -205,7 +206,8 @@ mod test {
             {"labels": null}
             {"labels": null}
             {"labels": null}
-            {"labels": [{"id": 3}{"id": null}]}
+            {"labels": [{"id": 3}, {"id": null}]}
+            {"labels": [{"id": 4,"name":"test"}, {"id": null,"name":null}]}
             {"labels": null}
             "#;
 
@@ -228,6 +230,7 @@ mod test {
             {"labels": null}
             {"labels": null}
             {"labels": [3, null]}
+            {"labels": [4, null]}
             {"labels": null}
             "#;
 
