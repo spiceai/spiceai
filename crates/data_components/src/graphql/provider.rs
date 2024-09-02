@@ -17,10 +17,7 @@ use async_trait::async_trait;
 use snafu::ResultExt;
 
 use crate::arrow::write::MemTable;
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
@@ -80,18 +77,6 @@ pub struct GraphQLTableProvider {
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
     transform_fn: Option<TransformFn>,
-}
-
-impl GraphQLTableProvider {
-    #[must_use]
-    pub fn new(client: GraphQLClient) -> Self {
-        Self {
-            client,
-            gql_schema: Arc::new(Schema::empty()),
-            table_schema: Arc::new(Schema::empty()),
-            transform_fn: None,
-        }
-    }
 }
 
 #[async_trait]
