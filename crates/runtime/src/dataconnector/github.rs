@@ -77,7 +77,6 @@ impl GithubTableArgs for PullRequestTableArgs {
                             created_at: createdAt
                             merged_at: mergedAt
                             closed_at: closedAt
-                            updated_at: updated_at
                             number
                             reviews {{reviews_count: totalCount}}
                             
