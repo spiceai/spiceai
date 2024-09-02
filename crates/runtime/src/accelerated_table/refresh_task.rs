@@ -28,6 +28,7 @@ use datafusion_table_providers::util::retriable_error::{
 use futures::{stream, Stream, StreamExt};
 use opentelemetry::Key;
 use snafu::{OptionExt, ResultExt};
+use tracing::Instrument;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
@@ -168,6 +169,8 @@ impl RefreshTask {
 
         let dataset_name = self.dataset_name.clone();
 
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+
         retry(retry_strategy, || async {
             self.run_once().await.map_err(|err| {
                 let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
@@ -175,9 +178,11 @@ impl RefreshTask {
                 err
             })
         })
+        .instrument(span.clone())
         .await
         .map_err(|e| {
             tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
+            tracing::error!(target: "task_history", parent: &span, "{e}");
             e
         })
     }
