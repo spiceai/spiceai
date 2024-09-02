@@ -69,22 +69,23 @@ impl GithubTableArgs for PullRequestTableArgs {
                         }}
                         nodes {{
                             title
+                            number
+                            id
                             url
                             body
                             state
-                            createdAt
-                            mergedAt
-                            closedAt
+                            created_at: createdAt
+                            merged_at: mergedAt
+                            closed_at: closedAt
                             number
-                            num_of_reviews: reviews {{totalCount}}
-                            ref: headRef {{ id }}
+                            reviews {{num_of_reviews: totalCount}}
                             
                             author {{
                                 login
                             }}
                             additions
                             deletions
-                            changedFiles
+                            changed_files: changedFiles
                             comments(first: 100) {{num_of_comments: totalCount}}
                             commits(first: 100) {{num_of_commits: totalCount, hashes: nodes{{ id }} }}
                         }}
@@ -133,18 +134,18 @@ impl GithubTableArgs for CommitTableArgs {
                                     }}
                                     nodes {{
                                         message
-                                        messageHeadline
-                                        messageBody
-                                        oid
+                                        message_head_line: messageHeadline
+                                        message_body: messageBody
+                                        sha: oid
                                         additions
                                         deletions
                                         id
-                                        committedDate
+                                        committed_date: committedDate
                                         authorName: author {{
-                                            name
+                                            author_name: name
                                         }}
                                         authorEmail: author {{
-                                            email
+                                            author_email: email
                                         }}
                                     }}
                                 }}
@@ -182,16 +183,18 @@ impl GithubTableArgs for IssueTableArgs {
                         }}
                         nodes {{
                             id
+                            number
                             title
                             url
                             author: author {{ login }}
                             body
                             number
-                            createdAt
-                            updatedAt
-                            closedAt
+                            created_at: createdAt
+                            updated_at: updatedAt
+                            closed_at: closedAt
                             state
-                            milestone {{ milestone_id: id, milestone_title: title }}
+                            milestoneId: milestone {{ milestone_id: id}}
+                            milestoneTitle: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
                             comments(first:100) {{ num_of_comments: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                         }}

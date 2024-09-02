@@ -129,6 +129,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
         &self,
         sql: &str,
         _: &[&'a (dyn Sync)],
+        _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let sql = sql.to_string();
 

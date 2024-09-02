@@ -20,7 +20,7 @@ use snafu::{ResultExt, Snafu};
 
 use crate::arrow::write::MemTable;
 use arrow::{
-    array::{ArrayRef, RecordBatch, StringBuilder, UInt64Builder},
+    array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use datafusion::{
@@ -70,7 +70,7 @@ impl GithubFilesTableProvider {
         let mut fields = vec![
             Field::new("name", DataType::Utf8, true),
             Field::new("path", DataType::Utf8, true),
-            Field::new("size", DataType::UInt64, true),
+            Field::new("size", DataType::Int64, true),
             Field::new("sha", DataType::Utf8, true),
             Field::new("mode", DataType::Utf8, true),
             Field::new("url", DataType::Utf8, true),
@@ -208,7 +208,7 @@ impl GithubRestClient {
 
         let mut name_builder = StringBuilder::new();
         let mut path_builder = StringBuilder::new();
-        let mut size_builder = UInt64Builder::new();
+        let mut size_builder = Int64Builder::new();
         let mut sha_builder = StringBuilder::new();
         let mut mode_builder = StringBuilder::new();
         let mut url_builder = StringBuilder::new();
@@ -291,28 +291,28 @@ impl GithubRestClient {
         match response.status().as_u16() {
             404 => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}; Is org `{owner}`, repo `{repo}` and git tree `{tree_sha}` correct?",
+                    "The Github API ({endpoint}) failed with status code {}; Please check that org `{owner}`, repo `{repo}` and git tree `{tree_sha}`are correct.",
                     response.status()
                 );
                 Err(err_msg.into())
             }
             401 => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}; Is the token correct?",
+                    "The Github API ({endpoint}) failed with status code {}; Please check if the token is correct.",
                     response.status()
                 );
                 Err(err_msg.into())
             }
             403 => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}; Does the token have the right permissions?",
+                    "The Github API ({endpoint}) failed with status code {}; Please check if the token has the necessary permissions.",
                     response.status()
                 );
                 Err(err_msg.into())
             }
             _ => {
                 let err_msg = format!(
-                    "Github API ({endpoint}) failed with status code {}",
+                    "The Github API ({endpoint}) failed with status code {}",
                     response.status()
                 );
                 Err(err_msg.into())
@@ -371,6 +371,6 @@ struct GitTreeNode {
     #[serde(rename = "type")]
     node_type: String,
     sha: String,
-    size: Option<u64>,
+    size: Option<i64>,
     url: String,
 }

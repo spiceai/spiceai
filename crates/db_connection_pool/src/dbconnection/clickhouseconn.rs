@@ -117,6 +117,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         &self,
         sql: &str,
         _: &[&'a (dyn Sync)],
+        _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
         let mut block_stream = conn.query_owned(sql).stream_blocks();

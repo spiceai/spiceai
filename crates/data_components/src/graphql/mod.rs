@@ -37,6 +37,9 @@ pub enum Error {
     #[snafu(display("Invalid object access. {message}"))]
     InvalidObjectAccess { message: String },
 
+    #[snafu(display("{message}"))]
+    InvalidCredentialsOrPermissions { message: String },
+
     #[snafu(display("Query response transformation failed: {source}"))]
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
