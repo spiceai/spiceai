@@ -54,9 +54,7 @@ pub(crate) async fn post(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {
-            span.in_scope(|| {
-                tracing::error!(target: "task_history", "{e}");
-            });
+            tracing::error!(target: "task_history", parent: &span, "{e}");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
