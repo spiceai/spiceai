@@ -40,8 +40,8 @@ type RuntimeContext struct {
 	podsDir         string
 	httpEndpoint    string
 	metricsEndpoint string
-
-	httpClient *http.Client
+	isCloud         bool
+	httpClient      *http.Client
 }
 
 func NewContext() *RuntimeContext {
@@ -276,4 +276,36 @@ func (c *RuntimeContext) prepareInstallDir() error {
 
 func (c *RuntimeContext) binaryFilePath(binaryFilePrefix string) string {
 	return filepath.Join(c.spiceBinDir, binaryFilePrefix)
+}
+
+func (c *RuntimeContext) WithCloud(isCloud bool) *RuntimeContext {
+	if isCloud {
+		c.httpEndpoint = "https://data.spiceai.io"
+	} else {
+		c.httpEndpoint = "http://localhost:8090"
+	}
+	c.isCloud = isCloud
+	return c
+}
+
+func (c *RuntimeContext) GetHeaders() http.Header {
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+
+	if c.isCloud {
+		apiKey := os.Getenv("SPICE_API_KEY")
+		if apiKey != "" {
+			headers.Set("X-API-Key", apiKey)
+		}
+	}
+
+	return headers
+}
+
+func (c *RuntimeContext) IsCloud() bool {
+	return c.isCloud
+}
+
+func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
+	c.httpEndpoint = endpoint
 }
