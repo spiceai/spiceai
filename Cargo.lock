@@ -3795,7 +3795,7 @@ dependencies = [
  "datafusion",
  "futures",
  "llms",
- "prost 0.12.6",
+ "prost 0.13.2",
  "reqwest 0.12.5",
  "rustyline",
  "serde_json",
@@ -7569,6 +7569,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b2ecbe40f08db5c006b5764a2645f7f3f141ce756412ac9e1dd6087e6d32995"
+dependencies = [
+ "bytes",
+ "prost-derive 0.13.2",
+]
+
+[[package]]
 name = "prost-build"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7610,6 +7620,19 @@ checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
  "itertools 0.12.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.74",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acf0c195eebb4af52c752bec4f52f645da98b6e92077a04110c7f349477ae5ac"
+dependencies = [
+ "anyhow",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.74",
