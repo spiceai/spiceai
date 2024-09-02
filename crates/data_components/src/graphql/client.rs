@@ -399,7 +399,15 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         .unwrap_or("No message provided")
         .to_string();
 
-        return Err(Error::InvalidReqwestStatus { status, message });
+        return match status {
+            StatusCode::UNAUTHORIZED => {
+                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}; Please check if provided credentials are correct.") })
+            },
+            StatusCode::FORBIDDEN => {
+                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}; Please check if provided credentials have the necessary permissions.") })
+            },
+            _ => Err(Error::InvalidReqwestStatus { status, message })
+        };
     }
     Ok(())
 }
@@ -410,6 +418,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     if !graphql_error.is_null() {
         let line = graphql_error["locations"][0]["line"].as_u64();
         let column = graphql_error["locations"][0]["column"].as_u64();
+        let error_type = graphql_error["type"].as_str();
 
         let location = match (line, column) {
             (Some(line), Some(column)) => Some((
@@ -426,6 +435,12 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             .next()
             .unwrap_or_default()
             .to_string();
+
+        if let Some(error_type) = error_type {
+            if error_type.to_lowercase() == "forbidden" {
+                return Err(Error::InvalidCredentialsOrPermissions { message: format!("The API returned a 'FORBIDDEN' error. Please check if the credentials have the necessary permissions. {message}") });
+            }
+        }
 
         return match location {
             Some((line, column)) => Err(Error::InvalidGraphQLQuery {
