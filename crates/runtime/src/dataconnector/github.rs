@@ -88,7 +88,7 @@ impl GithubTableArgs for PullRequestTableArgs {
                             changed_files: changedFiles
                             comments(first: 100) {{num_of_comments: totalCount}}
                             commits(first: 100) {{num_of_commits: totalCount, hashes: nodes{{ id }} }}
-                            assignees(first: 100) {{ assignees: edges {{ node {{ login }} }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
                     }}
                 }}
@@ -198,7 +198,7 @@ impl GithubTableArgs for IssueTableArgs {
                             milestoneTitle: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
                             comments(first: 100) {{ num_of_comments: totalCount, comments: nodes {{ body, author {{ login }} }} }}
-                            assignees(first: 100) {{ assignees: edges {{ node {{ login }} }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
                     }}
                 }}
