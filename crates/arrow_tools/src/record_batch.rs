@@ -143,6 +143,7 @@ mod test {
     use arrow::{
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
+        json::ReaderBuilder,
     };
 
     use super::*;
@@ -183,5 +184,74 @@ mod test {
     fn test_string_to_timestamp_conversion() {
         let result = try_cast_to(batch_input(), to_schema()).expect("converted");
         assert_eq!(3, result.num_rows());
+    }
+
+    fn parse_json_to_batch(json_data: &str, schema: SchemaRef) -> RecordBatch {
+        let reader = ReaderBuilder::new(schema)
+            .build(std::io::Cursor::new(json_data))
+            .expect("Failed to create JSON reader");
+
+        reader
+            .into_iter()
+            .next()
+            .expect("Expected a record batch")
+            .expect("Failed to read record batch")
+    }
+
+    #[test]
+    fn test_to_primitive_type_list() {
+        let input_batch_json_data = r#"
+            {"labels": [{"id": 1}, {"id": 2}]}
+            {"labels": null}
+            {"labels": null}
+            {"labels": null}
+            {"labels": [{"id": 3}{"id": null}]}
+            {"labels": null}
+            "#;
+
+        let input_batch = parse_json_to_batch(
+            input_batch_json_data,
+            Arc::new(Schema::new(vec![Field::new(
+                "labels",
+                DataType::List(Arc::new(Field::new(
+                    "struct",
+                    DataType::Struct(vec![Field::new("id", DataType::Int32, true)].into()),
+                    true,
+                ))),
+                true,
+            )])),
+        );
+
+        let expected_list_json_data = r#"
+            {"labels": [1, 2]}
+            {"labels": null}
+            {"labels": null}
+            {"labels": null}
+            {"labels": [3, null]}
+            {"labels": null}
+            "#;
+
+        let expected_list_batch = parse_json_to_batch(
+            expected_list_json_data,
+            Arc::new(Schema::new(vec![Field::new(
+                "labels",
+                DataType::List(Arc::new(Field::new("id", DataType::Int32, true))),
+                true,
+            )])),
+        );
+
+        let (processed_array, processed_field) = to_primitive_type_list(
+            input_batch.column(0),
+            &Arc::new(input_batch.schema().field(0).clone()),
+        )
+        .expect("to_primitive_type_list should succeed");
+
+        let processed_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![processed_field])),
+            vec![processed_array],
+        )
+        .expect("should create new record batch");
+
+        assert_eq!(expected_list_batch, processed_batch);
     }
 }
