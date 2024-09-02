@@ -247,7 +247,9 @@ impl Github {
         )?;
 
         Ok(Arc::new(
-            GraphQLTableProvider::new(client, Some(Arc::new(github_gql_raw_schema_cast)))
+            GraphQLTableProvider::new(client)
+                .with_schema_transform(github_gql_raw_schema_cast)
+                .build()
                 .await
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {

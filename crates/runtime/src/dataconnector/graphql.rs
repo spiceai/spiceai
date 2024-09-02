@@ -191,7 +191,8 @@ impl DataConnector for GraphQL {
         let client = self.get_client(dataset)?;
 
         Ok(Arc::new(
-            GraphQLTableProvider::new(client, None)
+            GraphQLTableProvider::new(client)
+                .build()
                 .await
                 .map_err(Into::into)
                 .context(super::InternalWithSourceSnafu {

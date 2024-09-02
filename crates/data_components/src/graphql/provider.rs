@@ -17,7 +17,10 @@ use async_trait::async_trait;
 use snafu::ResultExt;
 
 use crate::arrow::write::MemTable;
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Schema, SchemaRef},
+};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
@@ -36,30 +39,43 @@ pub type TransformFn = Arc<
         + Sync,
 >;
 
+pub type TransformFnPointer =
+    fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
+
 pub struct GraphQLTableProvider {
     client: GraphQLClient,
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
-    transform_fn: Option<TransformFn>,
+    transform_fn: Option<TransformFnPointer>,
 }
 
 impl GraphQLTableProvider {
-    pub async fn new(client: GraphQLClient, transform_fn: Option<TransformFn>) -> Result<Self> {
-        let (res, gql_schema, _) = client.execute(None, None, None).await?;
+    pub fn new(client: GraphQLClient) -> Self {
+        Self {
+            client,
+            gql_schema: Arc::new(Schema::empty()),
+            table_schema: Arc::new(Schema::empty()),
+            transform_fn: None,
+        }
+    }
 
-        let table_schema = match (&transform_fn, res.first()) {
+    pub fn with_schema_transform(mut self, transform_fn: TransformFnPointer) -> Self {
+        self.transform_fn = Some(transform_fn);
+        self
+    }
+
+    pub async fn build(mut self) -> Result<Self> {
+        let (res, gql_schema, _) = self.client.execute(None, None, None).await?;
+
+        self.gql_schema = Arc::clone(&gql_schema);
+        self.table_schema = match (self.transform_fn, res.first()) {
             (Some(transform_fn), Some(record_batch)) => transform_fn(record_batch)
                 .context(ResultTransformSnafu)?
                 .schema(),
             _ => Arc::clone(&gql_schema),
         };
 
-        Ok(Self {
-            client,
-            gql_schema,
-            table_schema,
-            transform_fn,
-        })
+        Ok(self)
     }
 }
 
