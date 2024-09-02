@@ -77,8 +77,9 @@ impl GithubTableArgs for PullRequestTableArgs {
                             created_at: createdAt
                             merged_at: mergedAt
                             closed_at: closedAt
+                            updated_at: updated_at
                             number
-                            reviews {{num_of_reviews: totalCount}}
+                            reviews {{reviews_count: totalCount}}
                             
                             author {{
                                 login
@@ -86,10 +87,9 @@ impl GithubTableArgs for PullRequestTableArgs {
                             additions
                             deletions
                             changed_files: changedFiles
-                            comments(first: 100) {{num_of_comments: totalCount}}
-                            commits(first: 100) {{num_of_commits: totalCount, hashes: nodes{{ id }} }}
+                            comments(first: 100) {{comments_count: totalCount}}
+                            commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
-                            updatedAt
                         }}
                     }}
                 }}
@@ -198,9 +198,8 @@ impl GithubTableArgs for IssueTableArgs {
                             milestoneId: milestone {{ milestone_id: id}}
                             milestoneTitle: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{ num_of_comments: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
-                            updatedAt
                         }}
                     }}
                 }}
