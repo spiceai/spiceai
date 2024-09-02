@@ -20,7 +20,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
-    graphql::{client::GraphQLClient, provider::GraphQLTableProvider},
+    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
 };
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -247,7 +247,7 @@ impl Github {
         )?;
 
         Ok(Arc::new(
-            GraphQLTableProvider::new(client)
+            GraphQLTableProviderBuilder::new(client)
                 .with_schema_transform(github_gql_raw_schema_cast)
                 .build()
                 .await

@@ -33,20 +33,53 @@ use std::{any::Any, sync::Arc};
 use super::Result;
 use super::{client::GraphQLClient, ResultTransformSnafu};
 
-pub type TransformFn = Arc<
-    dyn Fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>
-        + Send
-        + Sync,
->;
-
-pub type TransformFnPointer =
+pub type TransformFn =
     fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
+
+pub struct GraphQLTableProviderBuilder {
+    client: GraphQLClient,
+    transform_fn: Option<TransformFn>,
+}
+
+impl GraphQLTableProviderBuilder {
+    #[must_use]
+    pub fn new(client: GraphQLClient) -> Self {
+        Self {
+            client,
+            transform_fn: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_schema_transform(mut self, transform_fn: TransformFn) -> Self {
+        self.transform_fn = Some(transform_fn);
+        self
+    }
+
+    pub async fn build(self) -> Result<GraphQLTableProvider> {
+        let (res, gql_schema, _) = self.client.execute(None, None, None).await?;
+
+        let table_schema = match (self.transform_fn, res.first()) {
+            (Some(transform_fn), Some(record_batch)) => transform_fn(record_batch)
+                .context(ResultTransformSnafu)?
+                .schema(),
+            _ => Arc::clone(&gql_schema),
+        };
+
+        Ok(GraphQLTableProvider {
+            client: self.client,
+            gql_schema: Arc::clone(&gql_schema),
+            table_schema,
+            transform_fn: self.transform_fn,
+        })
+    }
+}
 
 pub struct GraphQLTableProvider {
     client: GraphQLClient,
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
-    transform_fn: Option<TransformFnPointer>,
+    transform_fn: Option<TransformFn>,
 }
 
 impl GraphQLTableProvider {
@@ -58,26 +91,6 @@ impl GraphQLTableProvider {
             table_schema: Arc::new(Schema::empty()),
             transform_fn: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_schema_transform(mut self, transform_fn: TransformFnPointer) -> Self {
-        self.transform_fn = Some(transform_fn);
-        self
-    }
-
-    pub async fn build(mut self) -> Result<Self> {
-        let (res, gql_schema, _) = self.client.execute(None, None, None).await?;
-
-        self.gql_schema = Arc::clone(&gql_schema);
-        self.table_schema = match (self.transform_fn, res.first()) {
-            (Some(transform_fn), Some(record_batch)) => transform_fn(record_batch)
-                .context(ResultTransformSnafu)?
-                .schema(),
-            _ => Arc::clone(&gql_schema),
-        };
-
-        Ok(self)
     }
 }
 
