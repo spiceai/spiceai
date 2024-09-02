@@ -159,6 +159,14 @@ impl Parameters {
             UserParam(format!("{}_{}", self.prefix, spec.name))
         }
     }
+
+    pub fn insert(&mut self, key: String, value: SecretString) {
+        if let Some(param) = self.params.iter_mut().find(|p| p.0 == key) {
+            param.1 = value;
+        } else {
+            self.params.push((key, value));
+        }
+    }
 }
 
 #[derive(Clone)]

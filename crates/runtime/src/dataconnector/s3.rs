@@ -89,8 +89,18 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for S3Factory {
     fn create(
         &self,
-        params: Parameters,
+        mut params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        if let Some(endpoint) = params.get("endpoint").expose().ok() {
+            if endpoint.ends_with('/') {
+                tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
+                params.insert(
+                    "endpoint".to_string(),
+                    endpoint.trim_end_matches('/').to_string().into(),
+                );
+            }
+        }
+
         Box::pin(async move {
             let s3 = S3 { params };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
