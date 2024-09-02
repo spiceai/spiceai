@@ -75,6 +75,7 @@ impl GithubTableArgs for PullRequestTableArgs {
                             body
                             state
                             created_at: createdAt
+                            updated_at: updatedAt
                             merged_at: mergedAt
                             closed_at: closedAt
                             number
