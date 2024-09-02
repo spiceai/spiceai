@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"math/big"
@@ -24,6 +25,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/joho/godotenv"
 	"github.com/logrusorgru/aurora"
 	"github.com/pkg/browser"
@@ -229,6 +231,15 @@ spice login snowflake --account <account-identifier> --username <username> --pri
 	},
 }
 
+/*
+*
+AuthorizationCodeCredential::authorization_url_builder(client_id)
+
+	.with_redirect_uri(redirect_uri)
+	.with_scope(scope)
+	.with_tenant(tenant_id)
+	.url()
+*/
 var m365Cmd = &cobra.Command{
 	Use:   "m365",
 	Short: "Login to a Microsoft 365 account",
@@ -237,17 +248,35 @@ var m365Cmd = &cobra.Command{
 
 # See more at: https://docs.spiceai.org/
 `,
-	Run: CreateLoginRunFunc(api.AUTH_TYPE_M365, map[string]string{
-		m365TenantId: "No tenant id provided, use --tenant-id to provide",
-		m365ClientId: "No client id provided, use --client-id to provide",
-		usernameFlag: "No username provided, use --username to provide",
-		passwordFlag: "No password provided, use --password to provide",
-	}, map[string]string{
-		m365TenantId: api.AUTH_PARAM_TENANT_ID,
-		m365ClientId: api.AUTH_PARAM_CLIENT_ID,
-		usernameFlag: api.AUTH_PARAM_USERNAME,
-		passwordFlag: api.AUTH_PARAM_PASSWORD,
-	}, []string{}),
+	Run: func(cmd *cobra.Command, args []string) {
+		tenant_id, err := cmd.Flags().GetString(m365TenantId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		client_id, err := cmd.Flags().GetString(m365ClientId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		cred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
+			TenantID:    tenant_id,
+			ClientID:    client_id,
+			RedirectURL: "http://localhost:8090/refresh/sharepoint",
+		})
+		cred.Authorize(context.Background()) // At some point they just stopped allowing `Authorize`.
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		// tok, err := cred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{"User.Read", "Files.Read"}})
+		// if err != nil {
+		// 	cmd.Println(err.Error())
+		// 	os.Exit(1)
+		// }
+		cmd.Println(cred)
+	},
 }
 
 var sparkCmd = &cobra.Command{

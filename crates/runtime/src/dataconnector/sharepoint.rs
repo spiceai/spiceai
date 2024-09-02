@@ -65,16 +65,16 @@ pub struct Sharepoint {
 pub fn auth_code_grant_secret(
     authorization_code: &str,
     client_id: &str,
-    client_secret: &str,
+    // client_secret: &str,
     scope: Vec<String>,
-    redirect_uri: Url,
+    // redirect_uri: Url,
 ) -> GraphClient {
     GraphClient::from(
         &ConfidentialClientApplication::builder(client_id)
             .with_auth_code(authorization_code)
-            .with_client_secret(client_secret)
+            // .with_client_secret(client_secret)
             .with_scope(scope)
-            .with_redirect_uri(redirect_uri)
+            // .with_redirect_uri(redirect_uri)
             .build(),
     )
 }
@@ -82,7 +82,6 @@ pub fn auth_code_grant_secret(
 /// [`Url`] for users to sign in to the application. Returns state + authorization URL.
 pub fn authorization_sign_in_url(
     client_id: &str,
-    state: &str,
     tenant_id: &str,
     redirect_uri: Url,
     scope: Vec<String>,
@@ -91,12 +90,10 @@ pub fn authorization_sign_in_url(
         .with_redirect_uri(redirect_uri)
         .with_scope(scope)
         .with_tenant(tenant_id)
-        .with_state(state)
         .url()
 }
 
 static NEEDED_SCOPE: [&str; 2] = ["User.Read", "Files.Read"];
-static REDIRECT_URL: &str = "http://localhost:8090/redirect/sharepoint";
 
 impl Sharepoint {
     fn new(params: &Parameters) -> Result<Self> {
@@ -104,49 +101,26 @@ impl Sharepoint {
             .get("client_id")
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        let client_secret = params
-            .get("client_secret")
+        // let client_secret = params
+        //     .get("client_secret")
+        //     .expose()
+        //     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+        // let tenant_id = params
+        //     .get("tenant_id")
+        //     .expose()
+        //     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+        let authorization_code = params
+            .get("authorization_code")
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        let tenant_id = params
-            .get("tenant_id")
-            .expose()
-            .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        let redirect_url_str = params
-            .get("redirect_url")
-            .expose()
-            .ok()
-            .unwrap_or(REDIRECT_URL);
-        let redirect_url = Url::parse(redirect_url_str).map_err(|_| {
-            InvalidRedirectUrlSnafu {
-                url: redirect_url_str.to_string(),
-            }
-            .build()
-        })?;
 
-        let graph_client =
-            if let Some(authorization_code) = params.get("authorization_code").expose().ok() {
-                Ok(auth_code_grant_secret(
-                    authorization_code,
-                    client_id,
-                    client_secret,
-                    NEEDED_SCOPE.map(ToString::to_string).to_vec(),
-                    redirect_url,
-                ))
-            } else {
-                let authorization_url = authorization_sign_in_url(
-                    client_id,
-                    "",
-                    tenant_id,
-                    redirect_url,
-                    NEEDED_SCOPE.map(ToString::to_string).to_vec(),
-                )
-                .context(AuthorizationUrlSnafu)?;
-                println!("Please sign in to the following URL: {authorization_url}");
-
-                Err(AuthorizationCodeSnafu {}.build())?
-            }?;
-
+        let graph_client = auth_code_grant_secret(
+            authorization_code,
+            client_id,
+            // client_secret,
+            NEEDED_SCOPE.map(ToString::to_string).to_vec(),
+            // redirect_url,
+        );
         Ok(Sharepoint {
             client: Arc::new(graph_client),
         })
@@ -173,18 +147,22 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("")
         .required(),
-    ParameterSpec::runtime("client_secret")
-        .secret()
-        .description("")
-        .required(),
-    ParameterSpec::runtime("tenant_id")
-        .secret()
-        .description("")
-        .required(),
-    ParameterSpec::runtime("redirect_url").description(""),
     ParameterSpec::runtime("authorization_code")
         .secret()
-        .description(""),
+        .description("")
+        .required(),
+    // ParameterSpec::runtime("client_secret")
+    //     .secret()
+    //     .description("")
+    //     .required(),
+    // ParameterSpec::runtime("tenant_id")
+    //     .secret()
+    //     .description("")
+    //     .required(),
+    // ParameterSpec::runtime("redirect_url").description(""),
+    // ParameterSpec::runtime("authorization_code")
+    //     .secret()
+    //     .description(""),
 ];
 
 impl DataConnectorFactory for SharepointFactory {

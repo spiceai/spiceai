@@ -4388,8 +4388,7 @@ dependencies = [
 [[package]]
 name = "graph-core"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03f8e0eee60c9378a19ec6a35ace2c688240e2a231d0c6b7ee910537f2b7b22a"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb#37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb"
 dependencies = [
  "Inflector",
  "async-stream",
@@ -4414,8 +4413,7 @@ dependencies = [
 [[package]]
 name = "graph-error"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa062503c065f3d590dc356e7161f3fe48218c3bca98a5786ce6ab6dc4289f3"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb#37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -4438,8 +4436,7 @@ dependencies = [
 [[package]]
 name = "graph-http"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "effd188edac3a5c2c48723f8651d5b5eb5e06c10f28d3594f7cb055b859d2935"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb#37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4462,8 +4459,7 @@ dependencies = [
 [[package]]
 name = "graph-oauth"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea15906f3093716a361f059110d2b06cc8c549a07c10f1de6e4a558f9fa3b9b"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb#37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4491,8 +4487,7 @@ dependencies = [
 [[package]]
 name = "graph-rs-sdk"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f7abcfe1e1e57b5aeae29a45bf5589e3ab2b8cd2ebba66e6e48adf9a12e1ea4"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb#37e4eeff568b46caaf37b7591ce5e0f71fc7c4cb"
 dependencies = [
  "graph-core",
  "graph-error",
