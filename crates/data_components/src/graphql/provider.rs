@@ -50,6 +50,7 @@ pub struct GraphQLTableProvider {
 }
 
 impl GraphQLTableProvider {
+    #[must_use]
     pub fn new(client: GraphQLClient) -> Self {
         Self {
             client,
@@ -59,6 +60,7 @@ impl GraphQLTableProvider {
         }
     }
 
+    #[must_use]
     pub fn with_schema_transform(mut self, transform_fn: TransformFnPointer) -> Self {
         self.transform_fn = Some(transform_fn);
         self
