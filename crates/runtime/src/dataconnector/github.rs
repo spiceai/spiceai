@@ -218,7 +218,7 @@ impl Github {
         &self,
         tbl: &Arc<dyn GithubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
-        let access_token = self.params.get("access_token").expose().ok();
+        let access_token = self.params.get("token").expose().ok();
 
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err("Github 'endpoint' not provided".into());
@@ -265,8 +265,8 @@ impl Github {
     pub(crate) fn create_rest_client(
         &self,
     ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(access_token) = self.params.get("access_token").expose().ok() else {
-            return Err("Github 'access_token' not provided".into());
+        let Some(access_token) = self.params.get("token").expose().ok() else {
+            return Err("Github token not provided".into());
         };
 
         Ok(GithubRestClient::new(access_token))
@@ -359,8 +359,8 @@ impl GithubFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("access_token")
-        .description("A Github access token.")
+    ParameterSpec::connector("token")
+        .description("A Github token.")
         .secret(),
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
