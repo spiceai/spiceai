@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use snafu::ResultExt;
 
 use crate::arrow::write::MemTable;
-use arrow::datatypes::SchemaRef;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
@@ -27,19 +27,39 @@ use datafusion::{
 };
 use std::{any::Any, sync::Arc};
 
-use super::client::GraphQLClient;
 use super::Result;
+use super::{client::GraphQLClient, ResultTransformSnafu};
+
+pub type TransformFn = Arc<
+    dyn Fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + Sync,
+>;
 
 pub struct GraphQLTableProvider {
     client: GraphQLClient,
-    schema: SchemaRef,
+    gql_schema: SchemaRef,
+    table_schema: SchemaRef,
+    transform_fn: Option<TransformFn>,
 }
 
 impl GraphQLTableProvider {
-    pub async fn new(client: GraphQLClient) -> Result<Self> {
-        let (_, schema, _) = client.execute(None, None, None).await?;
+    pub async fn new(client: GraphQLClient, transform_fn: Option<TransformFn>) -> Result<Self> {
+        let (res, gql_schema, _) = client.execute(None, None, None).await?;
 
-        Ok(Self { client, schema })
+        let table_schema = match (&transform_fn, res.first()) {
+            (Some(transform_fn), Some(record_batch)) => transform_fn(record_batch)
+                .context(ResultTransformSnafu)?
+                .schema(),
+            _ => Arc::clone(&gql_schema),
+        };
+
+        Ok(Self {
+            client,
+            gql_schema,
+            table_schema,
+            transform_fn,
+        })
     }
 }
 
@@ -50,7 +70,7 @@ impl TableProvider for GraphQLTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&self.table_schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -64,14 +84,26 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let res = self
+        let mut res = self
             .client
-            .execute_paginated(Arc::clone(&self.schema), limit)
+            .execute_paginated(Arc::clone(&self.gql_schema), limit)
             .await
             .boxed()
             .map_err(DataFusionError::External)?;
 
-        let table = MemTable::try_new(Arc::clone(&self.schema), res)?;
+        if let Some(transform_fn) = &self.transform_fn {
+            res = res
+                .into_iter()
+                .map(|inner_vec| {
+                    inner_vec
+                        .into_iter()
+                        .map(|batch| transform_fn(&batch).map_err(DataFusionError::External))
+                        .collect::<Result<Vec<_>, DataFusionError>>()
+                })
+                .collect::<Result<Vec<Vec<_>>, DataFusionError>>()?;
+        }
+
+        let table = MemTable::try_new(Arc::clone(&self.table_schema), res)?;
 
         table.scan(state, projection, filters, limit).await
     }
