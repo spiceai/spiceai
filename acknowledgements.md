@@ -6,41 +6,37 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Go Modules
 
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.5.4/LICENSE, BSD-3-Clause
+github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
+github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.7.0/LICENSE, BSD-3-Clause
 github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/b87c2d0e983a/LICENSE, MIT
-github.com/golang/protobuf/proto, https://github.com/golang/protobuf/blob/v1.5.3/LICENSE, BSD-3-Clause
 github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/v0.5.2/LICENSE, MPL-2.0
 github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/v0.7.7/LICENSE, MPL-2.0
 github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/v1.0.0/LICENSE, MPL-2.0
 github.com/joho/godotenv, https://github.com/joho/godotenv/blob/v1.5.1/LICENCE, MIT
 github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/v1.8.6/LICENSE.md, BSD-2-Clause
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/v1.8.7/LICENSE.md, BSD-2-Clause
+github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9.0/LICENSE.md, BSD-3-Clause
 github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.15/LICENSE, MIT
-github.com/matttproud/golang_protobuf_extensions/pbutil, https://github.com/matttproud/golang_protobuf_extensions/blob/v1.0.4/LICENSE, Apache-2.0
 github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/v1.5.0/LICENSE, MIT
 github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v0.0.5/LICENSE.md, MIT
-github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.0.2/LICENSE, MIT
+github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.2.2/LICENSE, MIT
+github.com/peterh/liner, https://github.com/peterh/liner/blob/v1.2.2/COPYING, MIT
 github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
-github.com/prometheus/client_model/go, https://github.com/prometheus/client_model/blob/v0.6.0/LICENSE, Apache-2.0
-github.com/prometheus/common, https://github.com/prometheus/common/blob/v0.50.0/LICENSE, Apache-2.0
-github.com/prometheus/common/internal/bitbucket.org/ww/goautoneg, https://github.com/prometheus/common/blob/v0.50.0/internal/bitbucket.org/ww/goautoneg/README.txt, BSD-3-Clause
 github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/v0.4.6/LICENSE.txt, MIT
-github.com/spf13/afero, https://github.com/spf13/afero/blob/v1.8.2/LICENSE.txt, Apache-2.0
-github.com/spf13/cast, https://github.com/spf13/cast/blob/v1.5.0/LICENSE, MIT
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.6.0/LICENSE.txt, Apache-2.0
-github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/v1.1.0/LICENSE, MIT
+github.com/sagikazarmark/slog-shim, https://github.com/sagikazarmark/slog-shim/blob/v0.1.0/LICENSE, BSD-3-Clause
+github.com/spf13/afero, https://github.com/spf13/afero/blob/v1.11.0/LICENSE.txt, Apache-2.0
+github.com/spf13/cast, https://github.com/spf13/cast/blob/v1.6.0/LICENSE, MIT
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.8.1/LICENSE.txt, Apache-2.0
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.5/LICENSE, BSD-3-Clause
-github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.12.0/LICENSE, MIT
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.4.0/LICENSE, MIT
-go.uber.org/atomic, https://github.com/uber-go/atomic/blob/v1.9.0/LICENSE.txt, MIT
-go.uber.org/multierr, https://github.com/uber-go/multierr/blob/v1.8.0/LICENSE.txt, MIT
-go.uber.org/zap, https://github.com/uber-go/zap/blob/v1.21.0/LICENSE.txt, MIT
-golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.14.0:LICENSE, BSD-3-Clause
+github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.19.0/LICENSE, MIT
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
+go.uber.org/multierr, https://github.com/uber-go/multierr/blob/v1.10.0/LICENSE.txt, MIT
+go.uber.org/zap, https://github.com/uber-go/zap/blob/v1.27.0/LICENSE, MIT
+golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.20.0:LICENSE, BSD-3-Clause
 golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.20.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.14.0:LICENSE, BSD-3-Clause
-google.golang.org/protobuf, https://github.com/protocolbuffers/protobuf-go/blob/v1.33.0/LICENSE, BSD-3-Clause
-gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.66.6/LICENSE, Apache-2.0
-gopkg.in/natefinch/lumberjack.v2, https://github.com/natefinch/lumberjack/blob/v2.0.0/LICENSE, MIT
+gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.67.0/LICENSE, Apache-2.0
+gopkg.in/natefinch/lumberjack.v2, https://github.com/natefinch/lumberjack/blob/v2.2.1/LICENSE, MIT
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
@@ -132,24 +128,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - bytes 1.7.1, MIT 
   <br/>https://github.com/tokio-rs/bytes
 
-- candle-core 0.5.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-core 0.6.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-core 0.6.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-examples 0.5.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-transformers 0.5.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-transformers 0.6.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
 - chrono 0.4.38, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono
 
@@ -159,7 +137,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.9.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.15, Apache-2.0 OR MIT 
+- clap 4.5.16, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
@@ -189,7 +167,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-table-providers 0.1.0,  
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
-- delta_kernel 0.2.0, Apache-2.0 
+- delta_kernel 0.3.0, Apache-2.0 
   <br/>https://github.com/delta-incubator/delta-kernel-rs
 
 - dirs 5.0.1, Apache-2.0 OR MIT 
@@ -203,6 +181,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - dyn-clone 1.0.17, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/dyn-clone
+
+- either 1.13.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rayon-rs/either
 
 - fundu 2.0.0, MIT 
   <br/>https://github.com/fundu-rs/fundu
@@ -273,10 +254,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - mediatype 0.19.18, MIT 
   <br/>https://github.com/picoHz/mediatype
 
-- mistralrs 0.1.24, MIT 
+- mistralrs 0.2.5, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
-- mistralrs-core 0.1.24, MIT 
+- mistralrs-core 0.2.5, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
 - moka 0.12.8, Apache-2.0 OR MIT 
@@ -393,10 +374,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.207, Apache-2.0 OR MIT 
+- serde 1.0.209, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
-- serde_json 1.0.124, Apache-2.0 OR MIT 
+- serde_json 1.0.127, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
 - serde_yaml 0.9.34+deprecated, Apache-2.0 OR MIT 
@@ -438,7 +419,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokenizers 0.19.1, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
 
-- tokio 1.39.2, MIT 
+- tokio 1.39.3, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
 - tokio-postgres 0.7.11, Apache-2.0 OR MIT 
