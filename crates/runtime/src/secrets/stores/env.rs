@@ -98,6 +98,11 @@ impl SecretStore for EnvSecretStore {
 
         // First try looking for `SPICE_MY_KEY` and then `MY_KEY`
         let prefixed_key = format!("{ENV_SECRET_PREFIX}{upper_key}");
+        println!(
+            "looking for key: {key}, with: {}. Got: {:#?}",
+            prefixed_key.clone(),
+            std::env::var(prefixed_key.clone())
+        );
         match std::env::var(prefixed_key) {
             Ok(value) => Ok(Some(SecretString::new(value))),
             // If the prefixed key is not found, try the original key
