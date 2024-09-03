@@ -224,8 +224,8 @@ Time: 0.022671708 seconds. 3 rows.
 
 Enter a query to display the longest taxi trips:
 
-```bash
-sql> SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
+```sql
+SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
 ```
 
 Output:
