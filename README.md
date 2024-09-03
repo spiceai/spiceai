@@ -1,16 +1,16 @@
 <p align="center">
   <img src="https://github.com/user-attachments/assets/13ff4c9d-d6a7-4c20-9408-45573c508c41" alt="spice oss logo" width="600"/>
 </p>
-<p align-"center">
+<p align="center">
   <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml">
     <img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/>
-  </a>
+  </a> 
   <a href="https://opensource.org/licenses/Apache-2.0">
     <img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/>
-  </a>
+  </a> 
   <a href="https://discord.gg/kZnTfneP5u">
     <img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/>
-  </a>
+  </a> 
   <a href="https://x.com/intent/follow?screen_name=spice_ai">
     <img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/>
   </a>
