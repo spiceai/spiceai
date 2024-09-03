@@ -213,6 +213,46 @@ impl GithubTableArgs for IssueTableArgs {
     }
 }
 
+// TODO: implement filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for stargazers`
+pub struct StargazersTableArgs {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl GithubTableArgs for StargazersTableArgs {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
+        let query = format!(
+            r#"{{
+                repository(owner: "{owner}", name: "{name}") {{
+                    stargazers(first: 100) {{
+                        edges {{
+                            starred_at: starredAt
+                            node {{
+                                login
+                                name
+                                avatar_url: avatarUrl
+                                bio
+                                location
+                                company
+                                email
+                                x_username: twitterUsername
+                            }}
+                        }}
+                        pageInfo {{
+                            hasNextPage
+                            endCursor
+                        }}
+                    }}
+                }}
+            }}"#,
+            owner = self.owner,
+            name = self.repo
+        );
+
+        (query.into(), "/data/repository/stargazers/edges".into(), 1)
+    }
+}
+
 impl Github {
     pub(crate) fn create_graphql_client(
         &self,
@@ -417,6 +457,13 @@ impl DataConnector for Github {
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
                 let table_args = Arc::new(IssueTableArgs {
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                });
+                self.create_gql_table_provider(table_args).await
+            }
+            (Some("github.com"), Some(owner), Some(repo), Some("stargazers")) => {
+                let table_args = Arc::new(StargazersTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                 });
