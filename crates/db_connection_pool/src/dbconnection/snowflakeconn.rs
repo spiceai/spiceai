@@ -112,59 +112,11 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
 
         match res {
             snowflake_api::QueryResult::Json(resp) => {
-                let columns: Vec<Vec<serde_json::Value>> = resp
-                    .value
-                    .as_array()
-                    .ok_or_else(|| dbconnection::Error::UnableToGetSchema {
-                        source: "Response is not an array".to_string().into(),
-                    })?
-                    .iter()
-                    .map(|column| {
-                        column
-                            .as_array()
-                            .ok_or_else(|| dbconnection::Error::UnableToGetSchema {
-                                source: "Column data is not an array".to_string().into(),
-                            })
-                            .cloned()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let mut fields = Vec::new();
-
-                for column in columns {
-                    if column.len() < 5 {
-                        return Err(dbconnection::Error::UnableToGetSchema {
-                            source: "Invalid column data format".to_string().into(),
-                        });
+                parse_schema_from_json(&resp.value).map_err(|e| {
+                    dbconnection::Error::UnableToGetSchema {
+                        source: e.to_string().into(),
                     }
-
-                    let column_name = column[2].as_str().ok_or_else(|| {
-                        dbconnection::Error::UnableToGetSchema {
-                            source: "Invalid column name".to_string().into(),
-                        }
-                    })?;
-
-                    let data_type_str = column[3].as_str().ok_or_else(|| {
-                        dbconnection::Error::UnableToGetSchema {
-                            source: "Invalid data type".to_string().into(),
-                        }
-                    })?;
-
-                    let data_type: DataType =
-                        parse_snowflake_data_type(data_type_str).map_err(|e| {
-                            dbconnection::Error::UnableToGetSchema {
-                                source: e.to_string().into(),
-                            }
-                        })?;
-
-                    let is_nullable = column[4]
-                        .as_str()
-                        .map_or(true, |s| s.to_uppercase() == "TRUE");
-
-                    fields.push(Field::new(column_name, data_type, is_nullable));
-                }
-
-                Ok(Arc::new(Schema::new(fields)))
+                })
             }
             snowflake_api::QueryResult::Arrow(_) => Err(dbconnection::Error::UnableToGetSchema {
                 source: "Unexpected Arrow response".to_string().into(),
@@ -191,7 +143,6 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
 
         let mut transformed_stream = stream.map(|batch| {
             batch.and_then(|batch| {
-                println!("batch schema: {:?}", batch.schema());
                 snowflake_schema_cast(&batch)
                     .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
             })
@@ -441,6 +392,56 @@ fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
             reason: "Missing data type".to_string(),
         }),
     }
+}
+
+fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> {
+    let columns: Vec<Vec<serde_json::Value>> = resp
+        .as_array()
+        .ok_or_else(|| Error::UnableToRetrieveSchema {
+            reason: "Response is not an array".to_string(),
+        })?
+        .iter()
+        .map(|column| {
+            column
+                .as_array()
+                .ok_or_else(|| Error::UnableToRetrieveSchema {
+                    reason: "Column data is not an array".to_string(),
+                })
+                .cloned()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut fields = Vec::new();
+
+    for column in columns {
+        if column.len() < 5 {
+            return Err(Error::UnableToRetrieveSchema {
+                reason: "Invalid column data format".to_string(),
+            });
+        }
+
+        let column_name = column[2]
+            .as_str()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: "Invalid column name".to_string(),
+            })?;
+
+        let data_type_str = column[3]
+            .as_str()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: "Invalid data type".to_string(),
+            })?;
+
+        let data_type: DataType = parse_snowflake_data_type(data_type_str)?;
+
+        let is_nullable = column[4]
+            .as_str()
+            .map_or(true, |s| s.to_uppercase() == "TRUE");
+
+        fields.push(Field::new(column_name, data_type, is_nullable));
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 #[cfg(test)]
