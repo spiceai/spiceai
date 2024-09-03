@@ -216,7 +216,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "bigdecimal 0.4.5",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "snafu 0.8.4",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2696,7 +2696,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3144,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3812,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -5433,8 +5433,7 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+source = "git+https://github.com/spiceai/rusqlite.git?rev=23e964bb37ef2bec9329783f67ab0393d89af9bd#23e964bb37ef2bec9329783f67ab0393d89af9bd"
 dependencies = [
  "cc",
  "pkg-config",
@@ -5554,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "async-openai",
  "async-stream",
@@ -5995,7 +5994,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6301,7 +6300,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "tracing",
@@ -6995,7 +6994,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -8298,7 +8297,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "anyhow",
  "app",
@@ -8370,6 +8369,7 @@ dependencies = [
  "rand",
  "regex",
  "reqwest 0.12.5",
+ "rusqlite",
  "rustls 0.23.12",
  "rustls-pemfile 2.1.3",
  "schemars",
@@ -8401,8 +8401,7 @@ dependencies = [
 [[package]]
 name = "rusqlite"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+source = "git+https://github.com/spiceai/rusqlite.git?rev=23e964bb37ef2bec9329783f67ab0393d89af9bd#23e964bb37ef2bec9329783f67ab0393d89af9bd"
 dependencies = [
  "bitflags 2.6.0",
  "fallible-iterator 0.3.0",
@@ -9280,7 +9279,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -9297,7 +9296,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "app",
  "clap",
@@ -9326,7 +9325,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "schemars",
  "serde",
@@ -9338,7 +9337,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "schemars",
  "serde_json",
@@ -9685,7 +9684,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "async-trait",
@@ -10735,7 +10734,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "0.17.3-beta"
+version = "0.18.0-beta"
 dependencies = [
  "backoff",
  "humantime",
