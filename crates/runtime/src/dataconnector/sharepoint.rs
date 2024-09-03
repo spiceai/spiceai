@@ -91,7 +91,7 @@ impl Sharepoint {
                 let redirect_url = Url::parse("http://localhost:8091")
                     .boxed()
                     .context(InvalidParametersSnafu)?;
-                GraphClient::from(&PublicClientApplication::credential(
+                GraphClient::from(&PublicClientApplication::from(
                     AuthorizationCodeCredential::new_with_redirect_uri(
                         tenant_id,
                         client_id,
