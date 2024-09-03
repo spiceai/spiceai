@@ -26,6 +26,7 @@ use axum::{
 };
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
+use spicepod::component::dataset::acceleration::RefreshMode;
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
@@ -121,10 +122,17 @@ pub struct AccelerationRequest {
     pub refresh_sql: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_sql: Option<String>,
+    pub refresh_mode: Option<RefreshMode>,
+}
+
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
+    Json(payload): Json<RefreshRequest>,
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
