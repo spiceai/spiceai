@@ -17,7 +17,6 @@ limitations under the License.
 package cmd
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"math/big"
@@ -25,12 +24,12 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/joho/godotenv"
 	"github.com/logrusorgru/aurora"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/msal"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v3"
 )
@@ -253,29 +252,29 @@ var m365Cmd = &cobra.Command{
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
+		} else if tenant_id == "" {
+			cmd.Println("No tenant_id provided, use --tenant-id")
+			os.Exit(1)
 		}
+
 		client_id, err := cmd.Flags().GetString(m365ClientId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		} else if client_id == "" {
+			cmd.Println("No client_id provided, use --client-id")
+			os.Exit(1)
+		}
+
+		auth_code, err := msal.GetAuthCode(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read"})
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		cred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
-			TenantID:    tenant_id,
-			ClientID:    client_id,
-			RedirectURL: "http://localhost:8090/refresh/sharepoint",
+		mergeAuthConfig(cmd, api.AUTH_TYPE_SHAREPOINT, map[string]string{
+			api.AUTH_PARAM_AUTHORISATION_CODE: auth_code,
 		})
-		cred.Authorize(context.Background()) // At some point they just stopped allowing `Authorize`.
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-		// tok, err := cred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{"User.Read", "Files.Read"}})
-		// if err != nil {
-		// 	cmd.Println(err.Error())
-		// 	os.Exit(1)
-		// }
-		cmd.Println(cred)
 	},
 }
 
@@ -561,8 +560,6 @@ func init() {
 	loginCmd.AddCommand(deltaLakeCmd)
 
 	m365Cmd.Flags().BoolP("help", "h", false, "Print this help message")
-	m365Cmd.Flags().StringP(usernameFlag, "u", "", "Username")
-	m365Cmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	m365Cmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
 	m365Cmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
 	loginCmd.AddCommand(m365Cmd)
