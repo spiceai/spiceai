@@ -18,12 +18,18 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::sharepoint::client::SharepointClient;
 use datafusion::datasource::TableProvider;
-use graph_rs_sdk::{identity::ConfidentialClientApplication, GraphClient};
+use graph_rs_sdk::{
+    identity::{
+        AuthorizationCodeCredential, ConfidentialClientApplication, PublicClientApplication,
+    },
+    GraphClient,
+};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use url::Url;
 
 use super::{
     DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
@@ -35,8 +41,10 @@ pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Invalid Sharepoint parameters: {error}"))]
-    InvalidParameters { error: String },
+    #[snafu(display("Invalid Sharepoint parameters: {source}"))]
+    InvalidParameters {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Missing redirect url parameter: {url}"))]
     InvalidRedirectUrlError { url: String },
@@ -55,25 +63,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Sharepoint {
     client: Arc<GraphClient>,
-}
-
-/// Create a [`GraphClient`] from a client authorization code (i.e. OAuth 2.0 authorization code flow).
-/// `<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>`
-#[must_use]
-pub fn auth_code_grant_secret(
-    authorization_code: &str,
-    client_id: &str,
-    // client_secret: &str,
-    scope: Vec<String>,
-) -> GraphClient {
-    GraphClient::from(
-        &ConfidentialClientApplication::builder(client_id)
-            .with_auth_code(authorization_code)
-            // .with_client_secret(client_secret)
-            .with_scope(scope)
-            // .with_redirect_uri(redirect_uri)
-            .build(),
-    )
 }
 
 impl Sharepoint {
@@ -95,24 +84,32 @@ impl Sharepoint {
                 &ConfidentialClientApplication::builder(client_id)
                     .with_client_secret(client_secret)
                     .with_tenant(tenant_id)
-                    .with_scope(["User.Read", "Files.Read"])
+                    .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(authorization_code)) => GraphClient::from(
-                &ConfidentialClientApplication::builder(client_id)
-                    .with_auth_code(authorization_code)
-                    .with_tenant(tenant_id)
-                    .with_scope(["User.Read", "Files.Read"])
-                    .build(),
-            ),
+            (None, Some(authorization_code)) => {
+                let redirect_url = Url::parse("http://localhost:8091")
+                    .boxed()
+                    .context(InvalidParametersSnafu)?;
+                GraphClient::from(&PublicClientApplication::credential(
+                    AuthorizationCodeCredential::new_with_redirect_uri(
+                        tenant_id,
+                        client_id,
+                        "",
+                        authorization_code,
+                        redirect_url,
+                    ),
+                ))
+            }
             (None, None) => {
                 return Err(Error::InvalidParameters {
-                    error: "either 'client_secret' or 'authorization_code' must be provided".into(),
+                    source: "either 'client_secret' or 'authorization_code' must be provided"
+                        .into(),
                 })
             }
             (Some(_), Some(_)) => {
                 return Err(Error::InvalidParameters {
-                    error: "both 'client_secret' and 'authorization_code' cannot be provided"
+                    source: "both 'client_secret' and 'authorization_code' cannot be provided"
                         .into(),
                 })
             }
@@ -121,6 +118,22 @@ impl Sharepoint {
         Ok(Sharepoint {
             client: Arc::new(graph_client),
         })
+    }
+
+    pub async fn health(&self) -> std::result::Result<String, String> {
+        let u = self
+            .client
+            .me()
+            .get_user()
+            .send()
+            .await
+            .map_err(|e| format!("{e:#?}").to_string())?;
+
+        let resp = u
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(resp.to_string())
     }
 }
 
@@ -151,7 +164,11 @@ impl DataConnectorFactory for SharepointFactory {
         &self,
         params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Sharepoint::new(&params)?) as Arc<dyn DataConnector>) })
+        Box::pin(async move {
+            let s = Sharepoint::new(&params)?;
+            println!("Sharepoint health: {:#?}", s.health().await);
+            Ok(Arc::new(s) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {

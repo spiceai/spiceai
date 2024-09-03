@@ -106,11 +106,17 @@ impl SecretStore for EnvSecretStore {
         match std::env::var(prefixed_key) {
             Ok(value) => Ok(Some(SecretString::new(value))),
             // If the prefixed key is not found, try the original key
-            Err(std::env::VarError::NotPresent) => match std::env::var(upper_key) {
-                Ok(value) => Ok(Some(SecretString::new(value))),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(err) => Err(Box::new(err)),
-            },
+            Err(std::env::VarError::NotPresent) => {
+                println!(
+                    "Now trying with: {upper_key}. Value: {:#?}",
+                    std::env::var(upper_key.clone())
+                );
+                match std::env::var(upper_key.clone()) {
+                    Ok(value) => Ok(Some(SecretString::new(value))),
+                    Err(std::env::VarError::NotPresent) => Ok(None),
+                    Err(err) => Err(Box::new(err)),
+                }
+            }
             Err(err) => Err(Box::new(err)),
         }
     }
