@@ -32,6 +32,9 @@ func GetAuthCode(ctx context.Context, tenantId string, clientId string, scopes [
 		return "", fmt.Errorf("error creating public client: %w", err)
 	}
 	auth_url, err := publicClient.AuthCodeURL(ctx, clientId, "http://localhost:8091", scopes, public.WithTenantID(tenantId))
+	if err != nil {
+		return "", fmt.Errorf("error creating auth code URL: %w", err)
+	}
 
 	auth_code := make(chan string, 1)
 	server_shutdown := make(chan struct{})
@@ -62,9 +65,13 @@ func run_redirect_server(output_chan chan string, shutdown_chan chan struct{}) {
 
 	go func() {
 		<-shutdown_chan
-		server.Shutdown(context.Background())
+		if err := server.Shutdown(context.Background()); err != nil {
+			log.Fatal(err)
+		}
 	}()
-	server.ListenAndServe()
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func construct_get_token(output chan string) func(http.ResponseWriter, *http.Request) {
