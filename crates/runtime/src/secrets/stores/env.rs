@@ -93,6 +93,7 @@ impl SecretStore for EnvSecretStore {
     /// looking up the environment variable.
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
+        println!("looking for key: {key}");
         let upper_key = key.to_uppercase();
 
         // First try looking for `SPICE_MY_KEY` and then `MY_KEY`

@@ -239,11 +239,11 @@ AuthorizationCodeCredential::authorization_url_builder(client_id)
 	.with_tenant(tenant_id)
 	.url()
 */
-var m365Cmd = &cobra.Command{
-	Use:   "m365",
-	Short: "Login to a Microsoft 365 account",
+var sharepointCmd = &cobra.Command{
+	Use:   "sharepoint",
+	Short: "Login to a Microsoft 365 sharepoint account",
 	Example: `
-	spice login m365 --username <username> --password <password> --tenant-id <tenant-id> --client-id <client-id>
+	spice login sharepoint --tenant-id <tenant-id> --client-id <client-id>
 
 # See more at: https://docs.spiceai.org/
 `,
@@ -273,7 +273,9 @@ var m365Cmd = &cobra.Command{
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SHAREPOINT, map[string]string{
-			api.AUTH_PARAM_AUTHORISATION_CODE: auth_code,
+			api.AUTH_PARAM_AUTHORIZATION_CODE: auth_code,
+			api.AUTH_PARAM_TENANT_ID:          tenant_id,
+			api.AUTH_PARAM_CLIENT_ID:          client_id,
 		})
 	},
 }
@@ -559,10 +561,10 @@ func init() {
 	deltaLakeCmd.Flags().String(gcpServiceAccountPath, "", "Google Service Account Path")
 	loginCmd.AddCommand(deltaLakeCmd)
 
-	m365Cmd.Flags().BoolP("help", "h", false, "Print this help message")
-	m365Cmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
-	m365Cmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
-	loginCmd.AddCommand(m365Cmd)
+	sharepointCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	sharepointCmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
+	sharepointCmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
+	loginCmd.AddCommand(sharepointCmd)
 
 	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")

@@ -18,17 +18,12 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::sharepoint::client::SharepointClient;
 use datafusion::datasource::TableProvider;
-use graph_rs_sdk::{
-    error::AuthorizationFailure,
-    identity::{AuthorizationCodeCredential, ConfidentialClientApplication},
-    GraphClient,
-};
+use graph_rs_sdk::{identity::ConfidentialClientApplication, GraphClient};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use url::Url;
 
 use super::{
     DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
@@ -39,6 +34,9 @@ use super::{
 pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}"))]
     MissingParameter { parameter: String },
+
+    #[snafu(display("Invalid Sharepoint parameters: {error}"))]
+    InvalidParameters { error: String },
 
     #[snafu(display("Missing redirect url parameter: {url}"))]
     InvalidRedirectUrlError { url: String },
@@ -67,7 +65,6 @@ pub fn auth_code_grant_secret(
     client_id: &str,
     // client_secret: &str,
     scope: Vec<String>,
-    // redirect_uri: Url,
 ) -> GraphClient {
     GraphClient::from(
         &ConfidentialClientApplication::builder(client_id)
@@ -79,48 +76,48 @@ pub fn auth_code_grant_secret(
     )
 }
 
-/// [`Url`] for users to sign in to the application. Returns state + authorization URL.
-pub fn authorization_sign_in_url(
-    client_id: &str,
-    tenant_id: &str,
-    redirect_uri: Url,
-    scope: Vec<String>,
-) -> std::result::Result<Url, AuthorizationFailure> {
-    AuthorizationCodeCredential::authorization_url_builder(client_id)
-        .with_redirect_uri(redirect_uri)
-        .with_scope(scope)
-        .with_tenant(tenant_id)
-        .url()
-}
-
-static NEEDED_SCOPE: [&str; 2] = ["User.Read", "Files.Read"];
-
 impl Sharepoint {
     fn new(params: &Parameters) -> Result<Self> {
         let client_id = params
             .get("client_id")
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        // let client_secret = params
-        //     .get("client_secret")
-        //     .expose()
-        //     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        // let tenant_id = params
-        //     .get("tenant_id")
-        //     .expose()
-        //     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        let authorization_code = params
-            .get("authorization_code")
+        let tenant_id = params
+            .get("tenant_id")
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-        let graph_client = auth_code_grant_secret(
-            authorization_code,
-            client_id,
-            // client_secret,
-            NEEDED_SCOPE.map(ToString::to_string).to_vec(),
-            // redirect_url,
-        );
+        let client_secret = params.get("client_secret").expose().ok();
+        let authorization_code = params.get("authorization_code").expose().ok();
+
+        let graph_client = match (client_secret, authorization_code) {
+            (Some(client_secret), None) => GraphClient::from(
+                &ConfidentialClientApplication::builder(client_id)
+                    .with_client_secret(client_secret)
+                    .with_tenant(tenant_id)
+                    .with_scope(["User.Read", "Files.Read"])
+                    .build(),
+            ),
+            (None, Some(authorization_code)) => GraphClient::from(
+                &ConfidentialClientApplication::builder(client_id)
+                    .with_auth_code(authorization_code)
+                    .with_tenant(tenant_id)
+                    .with_scope(["User.Read", "Files.Read"])
+                    .build(),
+            ),
+            (None, None) => {
+                return Err(Error::InvalidParameters {
+                    error: "either 'client_secret' or 'authorization_code' must be provided".into(),
+                })
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidParameters {
+                    error: "both 'client_secret' and 'authorization_code' cannot be provided"
+                        .into(),
+                })
+            }
+        };
+
         Ok(Sharepoint {
             client: Arc::new(graph_client),
         })
@@ -143,26 +140,10 @@ impl SharepointFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::runtime("client_id")
-        .secret()
-        .description("")
-        .required(),
-    ParameterSpec::runtime("authorization_code")
-        .secret()
-        .description("")
-        .required(),
-    // ParameterSpec::runtime("client_secret")
-    //     .secret()
-    //     .description("")
-    //     .required(),
-    // ParameterSpec::runtime("tenant_id")
-    //     .secret()
-    //     .description("")
-    //     .required(),
-    // ParameterSpec::runtime("redirect_url").description(""),
-    // ParameterSpec::runtime("authorization_code")
-    //     .secret()
-    //     .description(""),
+    ParameterSpec::connector("client_id").secret().required(),
+    ParameterSpec::connector("authorization_code").secret(),
+    ParameterSpec::connector("tenant_id").secret().required(),
+    ParameterSpec::connector("client_secret").secret(),
 ];
 
 impl DataConnectorFactory for SharepointFactory {
