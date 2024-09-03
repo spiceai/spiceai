@@ -61,6 +61,7 @@ assignees: ''
   - [ ] [Clickhouse Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/clickhouse/README.md)
   - [ ] [Snowflake Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/snowflake/README.md)
   - [ ] [GraphQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/graphql/README.md)
+  - [ ] [GitHub Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/github/README.md)
   - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
   - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/databricks/README.md)
   - [ ] [Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/unity_catalog/README.md)
@@ -73,6 +74,7 @@ assignees: ''
   - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
   - [ ] [Securing data in transit via TLS](https://github.com/spiceai/quickstarts/blob/trunk/tls/README.md)
 - [ ] Merge [Docs PRs](https://github.com/spiceai/docs/pulls)
+  - [ ] Update spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docusaurus.config.ts#L60)
 - [ ] Merge [Samples PRs](https://github.com/spiceai/samples/pulls)
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/quickstarts/pulls)
 - [ ] Update release notes
