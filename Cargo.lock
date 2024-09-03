@@ -3159,6 +3159,7 @@ dependencies = [
  "odbc-api",
  "pkcs8",
  "secrecy",
+ "serde_json",
  "sha2",
  "snafu 0.8.4",
  "snowflake-api",
