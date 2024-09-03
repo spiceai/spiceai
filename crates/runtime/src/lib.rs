@@ -79,7 +79,7 @@ pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
-pub mod flight;
+mod flight;
 mod http;
 pub mod internal_table;
 mod metrics;

@@ -25,7 +25,7 @@ datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 datafusion.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { version = "0.2.0", features = [
+delta_kernel = { version = "0.3.0", features = [
   "default-engine",
   "cloud",
 ], optional = true }
@@ -74,8 +74,7 @@ delta_lake = ["dep:delta_kernel"]
 duckdb = [
   "dep:duckdb",
   "db_connection_pool/duckdb",
-  "datafusion-table-providers/duckdb",
-  "datafusion-table-providers/duckdb-federation"
+  "datafusion-table-providers/duckdb"
 ]
 flightsql = ["dep:tonic"]
 mysql = ["datafusion-table-providers/mysql"]
@@ -83,8 +82,8 @@ odbc = []
 postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]
 sharepoint = ["dep:graph-rs-sdk", "dep:http"]
+sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

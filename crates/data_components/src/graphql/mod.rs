@@ -40,6 +40,11 @@ pub enum Error {
     #[snafu(display("{message}"))]
     InvalidCredentialsOrPermissions { message: String },
 
+    #[snafu(display("Query response transformation failed: {source}"))]
+    ResultTransformError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         r#"GraphQL Query Error:
 Details:

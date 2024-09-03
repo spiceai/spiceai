@@ -16,10 +16,10 @@ limitations under the License.
 
 use std::any::Any;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_sql_gen::clickhouse::block_to_arrow;
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
@@ -80,6 +80,9 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
     }
 }
 
+static DEFAULT_DATABASE: &str = "default";
+static DEFAULT_DATABASE_ARC: LazyLock<Arc<str>> = LazyLock::new(|| DEFAULT_DATABASE.into());
+
 // Clickhouse doesn't have a params in signature. So just setting to `dyn Sync`.
 // Looks like we don't actually pass any params to query_arrow.
 // But keep it in mind.
@@ -96,21 +99,37 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
     ) -> Result<SchemaRef, dbconnection::Error> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
+
+        let (database, table) = match table_reference {
+            TableReference::Full { schema, table, .. }
+            | TableReference::Partial { schema, table } => (schema, table),
+            TableReference::Bare { table } => (&DEFAULT_DATABASE_ARC as &Arc<_>, table),
+        };
+
+        let query = format!(
+            "SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{table}'",
+        );
+
         let block = conn
-            .query(&format!(
-                "SELECT * FROM {} LIMIT 1",
-                table_reference.to_quoted_string()
-            ))
+            .query(&query)
             .fetch_all()
             .await
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
-        let rec = block_to_arrow(&block)
+        let fields = block
+            .rows()
+            .map(|row| {
+                let name: String = row.get("name")?;
+                let type_str: String = row.get("type")?;
+                let data_type = map_clickhouse_type_to_arrow(&type_str)?;
+                Ok(Field::new(name, data_type, true))
+            })
+            .collect::<Result<Vec<Field>, clickhouse_rs::errors::Error>>()
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
-        Ok(rec.schema())
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     async fn query_arrow(
@@ -180,5 +199,113 @@ fn query_to_stream(
                 }
             }
        }
+    }
+}
+
+fn map_clickhouse_type_to_arrow(type_str: &str) -> Result<DataType, clickhouse_rs::errors::Error> {
+    match type_str {
+        "UUID" | "String" => Ok(DataType::Utf8),
+        "Bool" => Ok(DataType::Boolean),
+        "Int8" => Ok(DataType::Int8),
+        "Int16" => Ok(DataType::Int16),
+        "Int32" => Ok(DataType::Int32),
+        "Int64" => Ok(DataType::Int64),
+        "UInt8" => Ok(DataType::UInt8),
+        "UInt16" => Ok(DataType::UInt16),
+        "UInt32" => Ok(DataType::UInt32),
+        "UInt64" => Ok(DataType::UInt64),
+        "Float32" => Ok(DataType::Float32),
+        "Float64" => Ok(DataType::Float64),
+        s if s.starts_with("FixedString") => Ok(DataType::Utf8),
+        "Date" => Ok(DataType::Date32),
+        "DateTime" => Ok(DataType::Timestamp(TimeUnit::Second, None)),
+        s if s.starts_with("Decimal") => {
+            let parts: Vec<&str> = s
+                .trim_start_matches("Decimal(")
+                .trim_end_matches(')')
+                .split(',')
+                .collect();
+            let (precision, scale) = match parts.len() {
+                1 => (parts[0].trim().parse().unwrap_or(10), 0),
+                2 => (
+                    parts[0].trim().parse().unwrap_or(38),
+                    parts[1].trim().parse().unwrap_or(0),
+                ),
+                _ => {
+                    return Err(clickhouse_rs::errors::Error::Other(
+                        format!("Invalid Decimal type: {type_str}").into(),
+                    ))
+                }
+            };
+            if precision <= 38 {
+                Ok(DataType::Decimal128(precision, scale))
+            } else if precision <= 76 {
+                Ok(DataType::Decimal256(precision, scale))
+            } else {
+                Err(clickhouse_rs::errors::Error::Other(
+                    format!("Unsupported Decimal precision: {precision}").into(),
+                ))
+            }
+        }
+        s if s.starts_with("Nullable") => {
+            let inner_type = s.trim_start_matches("Nullable(").trim_end_matches(')');
+            map_clickhouse_type_to_arrow(inner_type)
+        }
+        _ => Err(clickhouse_rs::errors::Error::Other(
+            format!("Unsupported Clickhouse type: {type_str}").into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn test_map_clickhouse_type_to_arrow() {
+        let cases = vec![
+            ("UUID", DataType::Utf8),
+            ("Bool", DataType::Boolean),
+            ("Int8", DataType::Int8),
+            ("Int16", DataType::Int16),
+            ("Int32", DataType::Int32),
+            ("Int64", DataType::Int64),
+            ("UInt8", DataType::UInt8),
+            ("UInt16", DataType::UInt16),
+            ("UInt32", DataType::UInt32),
+            ("UInt64", DataType::UInt64),
+            ("Float32", DataType::Float32),
+            ("Float64", DataType::Float64),
+            ("String", DataType::Utf8),
+            ("FixedString(10)", DataType::Utf8),
+            ("Date", DataType::Date32),
+            ("DateTime", DataType::Timestamp(TimeUnit::Second, None)),
+            ("Decimal(18, 4)", DataType::Decimal128(18, 4)),
+            ("Decimal(18)", DataType::Decimal128(18, 0)),
+            ("Decimal", DataType::Decimal128(10, 0)),
+            ("Decimal(40, 10)", DataType::Decimal256(40, 10)),
+            ("Nullable(Int32)", DataType::Int32),
+        ];
+
+        for (input, expected) in cases {
+            let result = map_clickhouse_type_to_arrow(input).expect("valid for input");
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_map_clickhouse_type_to_arrow_invalid() {
+        let invalid_cases = vec![
+            "UnknownType",
+            "Decimal(18, 4, 2)",
+            "Nullable(UnknownType)",
+            "Decimal(80)",
+        ];
+
+        for input in invalid_cases {
+            let result = map_clickhouse_type_to_arrow(input);
+            assert!(result.is_err(), "Expected error for input: {input}");
+        }
     }
 }

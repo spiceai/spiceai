@@ -338,7 +338,7 @@ impl Chat for ChatWrapper {
                 Ok(Box::pin(logged_stream))
             }
             Err(e) => {
-                tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
+                tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
                 Err(e)
             }
         }
@@ -352,7 +352,7 @@ impl Chat for ChatWrapper {
         let req = self.prepare_req(req)?;
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
 
-        match self.chat.chat_request(req).instrument(span).await {
+        match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
@@ -367,7 +367,7 @@ impl Chat for ChatWrapper {
                 Ok(resp)
             }
             Err(e) => {
-                tracing::error!(target: "task_history", "Failed to run chat model: {}", e);
+                tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
                 Err(e)
             }
         }

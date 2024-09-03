@@ -59,9 +59,9 @@ datafusion-common = "41"
 datafusion-expr = "41"
 datafusion-execution = "41"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "21f07bec7284bcbff2bf4e570008290b66e3dc6f" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 datafusion-functions-json = "0.41"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1a1ad2dfad85507cfb41175e7deee4f2488dba54" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "55875c2f83e7886f3cbcd37a301c81cb3cd4aa20" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.0"
@@ -113,11 +113,11 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4fa3dbc3a0f12202b9f700740069cb9e0dc2dc2a" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "4fa3dbc3a0f12202b9f700740069cb9e0dc2dc2a" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "4fa3dbc3a0f12202b9f700740069cb9e0dc2dc2a" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "4fa3dbc3a0f12202b9f700740069cb9e0dc2dc2a" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "21f07bec7284bcbff2bf4e570008290b66e3dc6f" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f2ca47d094a5636df8b9f3792b2f474a7b210dc1" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }

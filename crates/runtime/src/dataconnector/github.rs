@@ -15,10 +15,12 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use arrow::array::{Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
-    graphql::{client::GraphQLClient, provider::GraphQLTableProvider},
+    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
 };
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -73,10 +75,11 @@ impl GithubTableArgs for PullRequestTableArgs {
                             body
                             state
                             created_at: createdAt
+                            updated_at: updatedAt
                             merged_at: mergedAt
                             closed_at: closedAt
                             number
-                            reviews {{num_of_reviews: totalCount}}
+                            reviews {{reviews_count: totalCount}}
                             
                             author {{
                                 login
@@ -84,8 +87,10 @@ impl GithubTableArgs for PullRequestTableArgs {
                             additions
                             deletions
                             changed_files: changedFiles
-                            comments(first: 100) {{num_of_comments: totalCount}}
-                            commits(first: 100) {{num_of_commits: totalCount, hashes: nodes{{ id }} }}
+                            labels(first: 100) {{ labels: nodes {{ name }} }}
+                            comments(first: 100) {{comments_count: totalCount}}
+                            commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
                     }}
                 }}
@@ -191,10 +196,11 @@ impl GithubTableArgs for IssueTableArgs {
                             updated_at: updatedAt
                             closed_at: closedAt
                             state
-                            milestoneId: milestone {{ milestone_id: id}}
-                            milestoneTitle: milestone {{ milestone_title: title }}
+                            milestone_id: milestone {{ milestone_id: id}}
+                            milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first:100) {{ num_of_comments: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
                     }}
                 }}
@@ -212,7 +218,7 @@ impl Github {
         &self,
         tbl: &Arc<dyn GithubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
-        let access_token = self.params.get("access_token").expose().ok();
+        let access_token = self.params.get("token").expose().ok();
 
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err("Github 'endpoint' not provided".into());
@@ -245,19 +251,22 @@ impl Github {
         )?;
 
         Ok(Arc::new(
-            GraphQLTableProvider::new(client).await.boxed().context(
-                super::UnableToGetReadProviderSnafu {
+            GraphQLTableProviderBuilder::new(client)
+                .with_schema_transform(github_gql_raw_schema_cast)
+                .build()
+                .await
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
-                },
-            )?,
+                })?,
         ))
     }
 
     pub(crate) fn create_rest_client(
         &self,
     ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(access_token) = self.params.get("access_token").expose().ok() else {
-            return Err("Github 'access_token' not provided".into());
+        let Some(access_token) = self.params.get("token").expose().ok() else {
+            return Err("Github token not provided".into());
         };
 
         Ok(GithubRestClient::new(access_token))
@@ -306,6 +315,34 @@ impl Github {
     }
 }
 
+fn github_gql_raw_schema_cast(
+    record_batch: &RecordBatch,
+) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+    let mut fields: Vec<Arc<Field>> = Vec::new();
+    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+
+    for (idx, field) in record_batch.schema().fields().iter().enumerate() {
+        let column = record_batch.column(idx);
+        if let DataType::List(inner_field) = field.data_type() {
+            if let DataType::Struct(struct_fields) = inner_field.data_type() {
+                if struct_fields.len() == 1 {
+                    let (new_column, new_field) =
+                        arrow_tools::record_batch::to_primitive_type_list(column, field)?;
+                    fields.push(new_field);
+                    columns.push(new_column);
+                    continue;
+                }
+            }
+        }
+
+        fields.push(Arc::clone(field));
+        columns.push(Arc::clone(column));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(std::convert::Into::into)
+}
+
 #[derive(Default, Copy, Clone)]
 pub struct GithubFactory {}
 
@@ -322,8 +359,8 @@ impl GithubFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("access_token")
-        .description("A Github access token.")
+    ParameterSpec::connector("token")
+        .description("A Github token.")
         .secret(),
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
