@@ -6,6 +6,7 @@ failed_queries=()
 
 # Read queries from queries.sql using input redirection
 while read -r query; do
+    # Clean system cache if running on linux
     # sync
     # echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
