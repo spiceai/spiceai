@@ -24,6 +24,7 @@ use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
     sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory},
 };
+use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc};
 
@@ -75,6 +76,12 @@ pub struct SqliteAccelerator {
 impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
+        // Initialize the decimal extension for SQLite
+        //
+        // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
+        unsafe {
+            sqlite3_auto_extension(Some(sqlite3_decimal_init));
+        }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new(),
         }

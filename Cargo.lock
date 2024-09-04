@@ -5433,8 +5433,7 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+source = "git+https://github.com/spiceai/rusqlite.git?rev=97054b6af725caf5d3e952e349746706e00d0ea5#97054b6af725caf5d3e952e349746706e00d0ea5"
 dependencies = [
  "cc",
  "pkg-config",
@@ -8370,6 +8369,7 @@ dependencies = [
  "rand",
  "regex",
  "reqwest 0.12.5",
+ "rusqlite",
  "rustls 0.23.12",
  "rustls-pemfile 2.1.3",
  "schemars",
@@ -8401,8 +8401,7 @@ dependencies = [
 [[package]]
 name = "rusqlite"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+source = "git+https://github.com/spiceai/rusqlite.git?rev=97054b6af725caf5d3e952e349746706e00d0ea5#97054b6af725caf5d3e952e349746706e00d0ea5"
 dependencies = [
  "bitflags 2.6.0",
  "fallible-iterator 0.3.0",
