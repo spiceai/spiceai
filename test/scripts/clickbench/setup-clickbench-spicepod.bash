@@ -8,48 +8,59 @@ pg_port=5432
 pg_user=postgres
 pg_pass=postgres
 pg_sslmode=disable
-engine=postgres
+pg_db=postgres
+engine=arrow
 
 # Function to display usage
 usage() {
-    echo "Usage: [-engine acceleration_engine] [-pg_host pg_host] [-pg_port pg_port] [-pg_user pg_user] [-pg_pass pg_pass] [-pg_sslmode pg_sslmode]"
-    echo "  -engine Acceleration Engine (default: arrow)"
-    echo "  -pg_host Acceleration parameter: pg_host (default: localhost)"
-    echo "  -pg_port Acceleration parameter: pg_port (default: 5432)"
-    echo "  -pg_user Acceleration parameter: pg_user (default: postgres)"
-    echo "  -pg_pass Acceleration parameter: pg_pass (default: postgres)"
-    echo "  -pg_sslmode Acceleration parameter: pg_sslmode (default: disabled)"
-    exit 1
+    echo "Usage: $0 [-engine acceleration_engine] [-pg_host pg_host] [-pg_port pg_port] [-pg_user pg_user] [-pg_pass pg_pass] [-pg_sslmode pg_sslmode]"
+    echo "  --engine Acceleration Engine (default: arrow)"
+    echo "  --pg_host Acceleration parameter: pg_host (default: localhost)"
+    echo "  --pg_port Acceleration parameter: pg_port (default: 5432)"
+    echo "  --pg_user Acceleration parameter: pg_user (default: postgres)"
+    echo "  --pg_pass Acceleration parameter: pg_pass (default: postgres)"
+    echo "  --pg_sslmode Acceleration parameter: pg_sslmode (default: disabled)"
+    echo "  --pg_db Acceleration parameter: pg_db (default: postgres)"
 }
 
 # Parse command-line options
 while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        engine )
-            engine=$OPTARG
+    case "${1#--}" in
+        engine)
+            engine="$2"
+            shift 2
             ;;
-        pg_port )
-            pg_port=$OPTARG
+        pg_host)
+            pg_host="$2"
+            shift 2
             ;;
-        pg_host )
-            pg_host=$OPTARG
+        pg_port)
+            pg_port="$2"
+            shift 2
             ;;
-        pg_user )
-            pg_user=$OPTARG
+        pg_user)
+            pg_user="$2"
+            shift 2
             ;;
-        pg_pass )
-            pg_pass=$OPTARG
+        pg_pass)
+            pg_pass="$2"
+            shift 2
             ;;
-        pg_sslmode )
-            pg_sslmode=$OPTARG
+        pg_sslmode)
+            pg_sslmode="$2"
+            shift 2
+            ;;
+        pg_db)
+            pg_db="$2"
+            shift 2
             ;;
         *)
+            echo "error: Invalid option: $1" 1>&2
             usage
+            exit 1
             ;;
     esac
-    shift
 done
-
 
 # test if duckdb command exists
 if ! type "duckdb" 1> /dev/null 2>&1; then
@@ -115,9 +126,7 @@ echo "        pg_port: $pg_port" >> spicepod.yaml
 echo "        pg_user: $pg_user" >> spicepod.yaml
 echo "        pg_pass: $pg_pass" >> spicepod.yaml
 echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
+echo "        pg_db: $pg_db" >> spicepod.yaml
 fi
 
 spiced
-
-
-# TODO: Arguments to load into Postgres
