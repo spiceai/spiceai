@@ -15,7 +15,9 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use crate::{component::dataset::Dataset, LogErrors, Runtime};
+use crate::{
+    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset, LogErrors, Runtime,
+};
 use app::App;
 use axum::{
     extract::Path,
@@ -26,7 +28,6 @@ use axum::{
 };
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
-use spicepod::component::dataset::acceleration::RefreshMode;
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
@@ -122,17 +123,11 @@ pub struct AccelerationRequest {
     pub refresh_sql: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct RefreshRequest {
-    pub refresh_sql: Option<String>,
-    pub refresh_mode: Option<RefreshMode>,
-}
-
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
-    Json(payload): Json<RefreshRequest>,
+    Json(overrides_opt): Json<Option<RefreshOverrides>>,
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
@@ -165,7 +160,7 @@ pub(crate) async fn refresh(
             .into_response();
     };
 
-    match df.refresh_table(&dataset.name).await {
+    match df.refresh_table(&dataset.name, overrides_opt).await {
         Ok(()) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {

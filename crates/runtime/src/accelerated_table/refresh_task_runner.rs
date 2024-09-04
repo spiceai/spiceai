@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::refresh_task::RefreshTask;
+use super::{refresh::RefreshOverrides, refresh_task::RefreshTask};
 use futures::future::BoxFuture;
 use tokio::{
     select,
@@ -29,6 +29,9 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 
 use super::refresh::Refresh;
 
+/// `RefreshTaskRunner` is responsible for running the refresh task for a dataset. It is expected
+/// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
+/// refreshing an `accelerator`.
 pub struct RefreshTaskRunner {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
@@ -54,10 +57,16 @@ impl RefreshTaskRunner {
         }
     }
 
-    pub fn start(&mut self) -> (Sender<()>, Receiver<super::Result<()>>) {
+    /// This is the meat and potatoes of refreshing a dataset.
+    pub fn start(
+        &mut self,
+    ) -> (
+        Sender<Option<RefreshOverrides>>,
+        Receiver<super::Result<()>>,
+    ) {
         assert!(self.task.is_none());
 
-        let (start_refresh, mut on_start_refresh) = mpsc::channel::<()>(1);
+        let (start_refresh, mut on_start_refresh) = mpsc::channel::<Option<RefreshOverrides>>(1);
 
         let (notify_refresh_complete, on_refresh_complete) = mpsc::channel::<super::Result<()>>(1);
 
@@ -93,14 +102,21 @@ impl RefreshTaskRunner {
                                 }
                             }
                         },
-                        _ = on_start_refresh.recv() => {
-                            task_completion = Some(Box::pin(refresh_task.run()));
+
+                        overrides_opt = on_start_refresh.recv() => {
+                            // if overrides_opt.is_none(), channel was closed
+                            if let Some(overrides) = overrides_opt {
+                                task_completion = Some(Box::pin(refresh_task.run(overrides)));
+                            }
                         }
                     }
                 } else {
                     select! {
-                        _ = on_start_refresh.recv() => {
-                            task_completion = Some(Box::pin(refresh_task.run()));
+                        overrides_opt = on_start_refresh.recv() => {
+                            // if overrides_opt.is_none(), channel was closed
+                            if let Some(overrides) = overrides_opt {
+                                task_completion = Some(Box::pin(refresh_task.run(overrides)));
+                            }
                         }
                     }
                 }

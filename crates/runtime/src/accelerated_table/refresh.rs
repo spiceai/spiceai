@@ -28,6 +28,7 @@ use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
 use opentelemetry::Key;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
@@ -66,6 +67,16 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) refresh_retry_enabled: bool,
     pub(crate) refresh_retry_max_attempts: Option<usize>,
+}
+
+/// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefreshOverrides {
+    #[serde(default, rename = "refresh_sql")]
+    pub sql: Option<String>,
+
+    #[serde(rename = "refresh_mode")]
+    pub mode: Option<RefreshMode>,
 }
 
 impl Refresh {
@@ -209,8 +220,8 @@ impl Default for Refresh {
 
 pub(crate) enum AccelerationRefreshMode {
     Disabled,
-    Full(Receiver<()>),
-    Append(Option<Receiver<()>>),
+    Full(Receiver<Option<RefreshOverrides>>),
+    Append(Option<Receiver<Option<RefreshOverrides>>>),
     Changes(ChangesStream),
 }
 
@@ -287,6 +298,15 @@ impl Refresher {
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
 
+        // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
+        // The `select!` block handle waiting on both
+        //   1. The manual refresh [`Reciever`] channel `on_start_refresh_external`
+        //   2. The sleep [`future`] `scheduled_refresh_future`.
+        //
+        // Doing it in this way stops
+        //   1. Periodic and manual refreshes happening at the same time
+        //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
+        //        refresh (the sleep future is reset when a manual refresh completes).
         Some(tokio::spawn(async move {
             // first refresh is on start, thus duration is 0
             let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
@@ -301,14 +321,14 @@ impl Refresher {
                 select! {
                     () = scheduled_refresh_future => {
                         tracing::debug!("Starting scheduled refresh");
-                        if let Err(err) = start_refresh.send(()).await {
+                        if let Err(err) = start_refresh.send(None).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
-                    _ = on_start_refresh_external.recv() => {
+                    Some(overrides_opt) = on_start_refresh_external.recv() => {
                         tracing::debug!("Received external trigger to start refresh");
 
-                        if let Err(err) = start_refresh.send(()).await {
+                        if let Err(err) = start_refresh.send(overrides_opt).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
@@ -328,6 +348,8 @@ impl Refresher {
                             }
                         }
 
+                        // Restart periodic refresh timer (after either cron or manual dataset refresh).
+                        // For datasets with no periodic refresh, this will be a no-op.
                         if let Some(refresh_check_interval) = refresh_check_interval {
                             next_scheduled_refresh_timer = Some(sleep(refresh_check_interval));
                         }

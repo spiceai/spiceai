@@ -38,6 +38,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
+use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
 
@@ -76,7 +77,7 @@ pub enum Error {
 
     #[snafu(display("Failed to trigger table refresh: {source}"))]
     FailedToTriggerRefresh {
-        source: tokio::sync::mpsc::error::SendError<()>,
+        source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
 
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
@@ -133,7 +134,9 @@ pub struct AcceleratedTable {
     dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
-    refresh_trigger: Option<mpsc::Sender<()>>,
+    refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>, // Option<Refresh>
+
+    // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
@@ -261,7 +264,8 @@ impl Builder {
                         None,
                     )
                 } else {
-                    let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                    let (start_refresh, on_start_refresh) =
+                        mpsc::channel::<Option<RefreshOverrides>>(1);
                     (
                         refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
                         Some(start_refresh),
@@ -269,7 +273,8 @@ impl Builder {
                 }
             }
             RefreshMode::Full => {
-                let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
                 (
                     refresh::AccelerationRefreshMode::Full(on_start_refresh),
                     Some(start_refresh),
@@ -296,6 +301,7 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
 
+        // Due to `acceleration_refresh_mode`, this is where we fix the refresher to full vs append.
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
             .await;
@@ -352,11 +358,11 @@ impl AcceleratedTable {
         Arc::clone(&self.refresh_params)
     }
 
-    pub async fn trigger_refresh(&self) -> Result<()> {
+    pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         match &self.refresh_trigger {
             Some(refresh_trigger) => {
                 refresh_trigger
-                    .send(())
+                    .send(overrides)
                     .await
                     .context(FailedToTriggerRefreshSnafu)?;
             }

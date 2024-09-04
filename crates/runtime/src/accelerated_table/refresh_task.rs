@@ -45,7 +45,7 @@ use crate::{
     timing::TimeMeasurement,
 };
 
-use super::refresh::get_timestamp;
+use super::refresh::{get_timestamp, RefreshOverrides};
 use super::{metrics, UnableToCreateMemTableFromUpdateSnafu};
 
 use crate::component::dataset::TimeFormat;
@@ -148,7 +148,10 @@ impl RefreshTask {
         Ok(())
     }
 
-    pub async fn run(&self) -> super::Result<()> {
+    pub async fn run(&self, overrides: Option<RefreshOverrides>) -> super::Result<()> {
+        if let Some(overrides) = overrides {
+            println!("Hello there! Here were your overrides: {:#?}", overrides);
+        }
         let (refresh_retry_enabled, refresh_retry_max_attempts) = {
             let refresh = self.refresh.read().await;
             (
