@@ -1358,7 +1358,7 @@ mod tests {
     fn test_validate_time_column_when_timestamptz_match() {
         let refresh = Refresh::new(RefreshMode::Full)
             .time_column("time".to_string())
-            .time_format(TimeFormat::Timestamp);
+            .time_format(TimeFormat::Timestamptz);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
