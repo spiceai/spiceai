@@ -71,7 +71,7 @@ pub struct Refresh {
 }
 
 impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         time_column: Option<String>,
@@ -1392,6 +1392,7 @@ mod tests {
         let refresh = Refresh::new(
             Some("time".to_string()),
             Some(TimeFormat::Timestamptz),
+            None,
             None,
             None,
             RefreshMode::Full,

@@ -301,7 +301,7 @@ impl Dataset {
     #[must_use]
     pub fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_check_interval.clone();
+            return acceleration.refresh_check_interval;
         }
         None
     }
