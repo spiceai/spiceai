@@ -10,13 +10,24 @@ pg_user=postgres
 pg_pass=postgres
 pg_sslmode=disable
 pg_db=postgres
-engine=postgres
+engine=arrow
 
+# Function to display flag usage
+usage() {
+    echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor> [-engine acceleration_engine] [-pg_host pg_host] [-pg_port pg_port] [-pg_user pg_user] [-pg_pass pg_pass] [-pg_sslmode pg_sslmode]"
+    echo "  --engine Acceleration Engine (default: arrow)"
+    echo "  --pg_host Acceleration parameter: pg_host (default: localhost)"
+    echo "  --pg_port Acceleration parameter: pg_port (default: 5432)"
+    echo "  --pg_user Acceleration parameter: pg_user (default: postgres)"
+    echo "  --pg_pass Acceleration parameter: pg_pass (default: postgres)"
+    echo "  --pg_sslmode Acceleration parameter: pg_sslmode (default: disabled)"
+    echo "  --pg_db Acceleration parameter: pg_db (default: postgres)"
+}
 
 # two arguments, one is tpch or tpcds, the other one is the scale factor
 
 if [ "$#" -lt 2 ]; then
-  echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor>"
+  usage
   echo "Example: ./setup-tpc-spicepod.bash tpcds 1"
   exit 1
 fi
@@ -24,65 +35,60 @@ fi
 # verify the scale factor is an integer
 re='^[0-9]+$'
 if ! [[ $2 =~ $re ]] ; then
-  echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor>"
+  usage
   echo "error: scale factor must be an integer"
   exit 1
 fi
 
 # verify tpch or tpcds
 if [ "$1" != "tpch" ] && [ "$1" != "tpcds" ]; then
-  echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor>"
+  usage
   echo "Example: ./setup-tpc-spicepod.bash tpcds 1"
   exit 1
 fi
-
-# Function to display flag usage
-usage() {
-    echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor> [-engine acceleration_engine] [-pg_host pg_host] [-pg_port pg_port] [-pg_user pg_user] [-pg_pass pg_pass] [-pg_sslmode pg_sslmode]"
-    echo "  -engine Acceleration Engine (default: arrow)"
-    echo "  -pg_host Acceleration parameter: pg_host (default: localhost)"
-    echo "  -pg_port Acceleration parameter: pg_port (default: 5432)"
-    echo "  -pg_user Acceleration parameter: pg_user (default: postgres)"
-    echo "  -pg_pass Acceleration parameter: pg_pass (default: postgres)"
-    echo "  -pg_sslmode Acceleration parameter: pg_sslmode (default: disabled)"
-    exit 1
-}
 
 bench=$1
 sf=$2
 shift 2
 
 # Parse command-line options
-while getopts ":engine:pg_port:pg_host:pg_user:pg_pass:pg_sslmode:pg_db:" opt; do
-    case $1 in
+while [[ "$#" -gt 0 ]]; do
+    case "${1#--}" in
         engine )
-            engine=$OPTARG
+            engine="$2"
+            shift 2
             ;;
         pg_port )
-            pg_port=$OPTARG
+            pg_port="$2"
+            shift 2
             ;;
         pg_host )
-            pg_host=$OPTARG
+            pg_host="$2"
+            shift 2
             ;;
         pg_user )
-            pg_user=$OPTARG
+            pg_user="$2"
+            shift 2
             ;;
         pg_pass )
-            pg_pass=$OPTARG
+            pg_pass="$2"
+            shift 2
             ;;
         pg_sslmode )
-            pg_sslmode=$OPTARG
+            pg_sslmode="$2"
+            shift 2
             ;;
         pg_db )
-            pg_db=$OPTARG
+            pg_db="$2"
+            shift 2
             ;;
-        \? )
+        * )
+            echo "error: Invalid option: $1" 1>&2
             usage
+            exit 1
             ;;
     esac
-    shift
 done
-shift $((OPTIND -1))
 
 # test if duckdb command exists
 if ! type "duckdb" 1> /dev/null 2>&1; then
@@ -173,6 +179,7 @@ if [ "$bench" = "tpcds" ]; then
       echo "        pg_user: $pg_user" >> spicepod.yaml
       echo "        pg_pass: $pg_pass" >> spicepod.yaml
       echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
+      echo "        pg_db: $pg_db" >> spicepod.yaml
     done
   fi
 fi
