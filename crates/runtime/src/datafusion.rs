@@ -702,6 +702,7 @@ impl DataFusion {
             dataset.time_column.clone(),
             dataset.time_format,
             dataset.refresh_check_interval(),
+            dataset.refresh_max_jitter(),
             refresh_sql.clone(),
             refresh_mode,
             dataset.refresh_data_window(),

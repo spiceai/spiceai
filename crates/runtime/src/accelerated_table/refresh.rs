@@ -28,6 +28,7 @@ use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
 use opentelemetry::Key;
+use rand::Rng;
 use snafu::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
@@ -60,6 +61,7 @@ pub struct Refresh {
     pub(crate) time_column: Option<String>,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
+    pub(crate) max_jitter: Option<Duration>,
     pub(crate) sql: Option<String>,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
@@ -75,6 +77,7 @@ impl Refresh {
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
         check_interval: Option<Duration>,
+        max_jitter: Option<Duration>,
         sql: Option<String>,
         mode: RefreshMode,
         period: Option<Duration>,
@@ -84,6 +87,7 @@ impl Refresh {
             time_column,
             time_format,
             check_interval,
+            max_jitter,
             sql,
             mode,
             period,
@@ -197,6 +201,7 @@ impl Default for Refresh {
             time_column: None,
             time_format: None,
             check_interval: None,
+            max_jitter: None,
             sql: None,
             mode: RefreshMode::Full,
             period: None,
@@ -255,6 +260,16 @@ impl Refresher {
         self
     }
 
+    fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
+        match max_jitter {
+            Some(max_jitter) => {
+                let jitter = rand::thread_rng().gen_range(Duration::from_secs(0)..max_jitter);
+                period + jitter
+            }
+            None => period,
+        }
+    }
+
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -286,10 +301,14 @@ impl Refresher {
         let cache_provider = self.cache_provider.clone();
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
+        let max_jitter = self.refresh.read().await.max_jitter;
 
         Some(tokio::spawn(async move {
             // first refresh is on start, thus duration is 0
-            let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
+            let mut next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
+                Duration::from_secs(0),
+                max_jitter,
+            )));
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
@@ -329,7 +348,10 @@ impl Refresher {
                         }
 
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(sleep(refresh_check_interval));
+                            next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
+                                refresh_check_interval,
+                                max_jitter,
+                            )));
                         }
                     }
                 }
@@ -466,7 +488,7 @@ mod tests {
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         ) as Arc<dyn TableProvider>;
 
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
+        let refresh = Refresh::new(None, None, None, None, None, RefreshMode::Full, None, None);
 
         let mut refresher = Refresher::new(
             TableReference::bare("test"),
@@ -658,6 +680,7 @@ mod tests {
                 Some(TimeFormat::ISO8601),
                 None,
                 None,
+                None,
                 RefreshMode::Append,
                 None,
                 None,
@@ -806,6 +829,7 @@ mod tests {
             let refresh = Refresh::new(
                 Some("time".to_string()),
                 time_format,
+                None,
                 None,
                 None,
                 RefreshMode::Append,
@@ -1008,6 +1032,7 @@ mod tests {
                 time_format,
                 None,
                 None,
+                None,
                 RefreshMode::Append,
                 None,
                 append_overlap,
@@ -1157,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_no_time_column() {
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
+        let refresh = Refresh::new(None, None, None, None, None, RefreshMode::Full, None, None);
         let schema = Arc::new(Schema::empty());
         assert!(refresh
             .validate_time_format("dataset_name".to_string(), &schema)
@@ -1168,6 +1193,7 @@ mod tests {
     fn test_validate_time_column_when_time_column_not_found() {
         let refresh = Refresh::new(
             Some("time".to_string()),
+            None,
             None,
             None,
             None,
@@ -1195,6 +1221,7 @@ mod tests {
                 Some(format),
                 None,
                 None,
+                None,
                 RefreshMode::Full,
                 None,
                 None,
@@ -1217,6 +1244,7 @@ mod tests {
             let refresh = Refresh::new(
                 Some("time".to_string()),
                 Some(format),
+                None,
                 None,
                 None,
                 RefreshMode::Full,
@@ -1248,6 +1276,7 @@ mod tests {
                 Some(format),
                 None,
                 None,
+                None,
                 RefreshMode::Full,
                 None,
                 None,
@@ -1277,6 +1306,7 @@ mod tests {
                 Some(format),
                 None,
                 None,
+                None,
                 RefreshMode::Full,
                 None,
                 None,
@@ -1300,6 +1330,7 @@ mod tests {
             Some(TimeFormat::ISO8601),
             None,
             None,
+            None,
             RefreshMode::Full,
             None,
             None,
@@ -1316,6 +1347,7 @@ mod tests {
             let refresh = Refresh::new(
                 Some("time".to_string()),
                 Some(format),
+                None,
                 None,
                 None,
                 RefreshMode::Full,
@@ -1338,6 +1370,7 @@ mod tests {
         let refresh = Refresh::new(
             Some("time".to_string()),
             Some(TimeFormat::Timestamp),
+            None,
             None,
             None,
             RefreshMode::Full,

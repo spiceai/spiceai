@@ -177,6 +177,7 @@ impl SpiceExtension {
             Some(TimeFormat::UnixSeconds),
             Some(Duration::from_secs(10)),
             None,
+            None,
             RefreshMode::Full,
             Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
             None,

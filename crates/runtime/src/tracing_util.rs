@@ -69,7 +69,7 @@ fn dataset_acceleration_info(
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
-        info.push_str(&format!(", {refresh_interval} refresh"));
+        info.push_str(&format!(", {refresh_interval:#?} refresh"));
     }
     if let Some(retention_check_interval) = &acceleration.retention_check_interval {
         if acceleration.retention_check_enabled {

@@ -83,6 +83,7 @@ prometheus-parse = "0.2.5"
 prost = { version = "0.12.1", default-features = false, features = [
   "prost-derive",
 ] }
+rand = "0.8.5"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -115,7 +116,6 @@ anyhow = "1.0.86"
 async-graphql = "7.0.5"
 async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
-rand = "0.8.5"
 spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
 

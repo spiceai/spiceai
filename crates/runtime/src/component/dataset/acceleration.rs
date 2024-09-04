@@ -216,7 +216,7 @@ pub struct Acceleration {
 
     pub refresh_mode: Option<RefreshMode>,
 
-    pub refresh_check_interval: Option<String>,
+    pub refresh_check_interval: Option<Duration>,
 
     pub refresh_sql: Option<String>,
 
@@ -227,6 +227,10 @@ pub struct Acceleration {
     pub refresh_retry_enabled: bool,
 
     pub refresh_retry_max_attempts: Option<usize>,
+
+    pub refresh_jitter_enabled: bool,
+
+    pub refresh_jitter_max: Option<Duration>,
 
     pub params: HashMap<String, String>,
 
@@ -322,12 +326,20 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             _ => false,
         };
 
+        let refresh_check_interval = try_parse_duration(
+            "refresh_check_interval",
+            acceleration.refresh_check_interval,
+        )?;
+
+        let refresh_jitter_max =
+            try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
+
         Ok(Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
             engine,
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
-            refresh_check_interval: acceleration.refresh_check_interval,
+            refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
             refresh_append_overlap: try_parse_duration(
@@ -336,6 +348,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             )?,
             refresh_retry_enabled: acceleration.refresh_retry_enabled,
             refresh_retry_max_attempts: acceleration.refresh_retry_max_attempts,
+            refresh_jitter_max,
+            refresh_jitter_enabled: acceleration.refresh_jitter_enabled,
             params: params
                 .as_ref()
                 .map(Params::as_string_map)
@@ -365,6 +379,8 @@ impl Default for Acceleration {
             refresh_append_overlap: None,
             refresh_retry_enabled: true,
             refresh_retry_max_attempts: None,
+            refresh_jitter_enabled: false,
+            refresh_jitter_max: None,
             params: HashMap::default(),
             retention_period: None,
             retention_check_interval: None,
