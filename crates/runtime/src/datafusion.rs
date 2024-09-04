@@ -648,6 +648,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -698,21 +699,29 @@ impl DataFusion {
         }
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
-        let refresh = Refresh::new(
-            dataset.time_column.clone(),
-            dataset.time_format,
-            dataset.refresh_check_interval(),
-            dataset.refresh_max_jitter(),
-            refresh_sql.clone(),
-            refresh_mode,
-            dataset.refresh_data_window(),
-            acceleration_settings.refresh_append_overlap,
-        )
-        .with_retry(
+
+        let mut refresh = Refresh::new(refresh_mode).with_retry(
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-
+        if let Some(sql) = &refresh_sql {
+            refresh = refresh.sql(sql.clone());
+        }
+        if let Some(format) = dataset.time_format {
+            refresh = refresh.time_format(format);
+        }
+        if let Some(time_col) = &dataset.time_column {
+            refresh = refresh.time_column(time_col.clone());
+        }
+        if let Some(check_interval) = dataset.refresh_check_interval() {
+            refresh = refresh.check_interval(check_interval);
+        }
+        if let Some(max_jitter) = dataset.refresh_max_jitter() {
+            refresh = refresh.max_jitter(max_jitter);
+        }
+        if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
+            refresh = refresh.append_overlap(append_overlap);
+        }
         refresh
             .validate_time_format(dataset.name.to_string(), &source_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;

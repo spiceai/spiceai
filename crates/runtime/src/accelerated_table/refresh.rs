@@ -71,30 +71,57 @@ pub struct Refresh {
 }
 
 impl Refresh {
-    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
-    pub fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        check_interval: Option<Duration>,
-        max_jitter: Option<Duration>,
-        sql: Option<String>,
-        mode: RefreshMode,
-        period: Option<Duration>,
-        append_overlap: Option<Duration>,
-    ) -> Self {
+    pub fn new(mode: RefreshMode) -> Self {
         Self {
-            time_column,
-            time_format,
-            check_interval,
-            max_jitter,
-            sql,
             mode,
-            period,
-            append_overlap,
             ..Default::default()
         }
     }
+
+    #[must_use]
+    pub fn time_column(mut self, time_column: String) -> Self {
+        self.time_column = Some(time_column);
+        self
+    }
+
+    #[must_use]
+    pub fn time_format(mut self, time_format: TimeFormat) -> Self {
+        self.time_format = Some(time_format);
+        self
+    }
+
+    #[must_use]
+    pub fn check_interval(mut self, check_interval: Duration) -> Self {
+        self.check_interval = Some(check_interval);
+        self
+    }
+
+    #[must_use]
+    pub fn max_jitter(mut self, max_jitter: Duration) -> Self {
+        self.max_jitter = Some(max_jitter);
+        self
+    }
+
+    #[must_use]
+    pub fn sql(mut self, sql: String) -> Self {
+        self.sql = Some(sql);
+        self
+    }
+
+    #[must_use]
+    pub fn period(mut self, period: Duration) -> Self {
+        self.period = Some(period);
+        self
+    }
+
+    #[must_use]
+    pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
+        self.append_overlap = Some(append_overlap);
+        self
+    }
+
     #[must_use]
     pub fn with_retry(mut self, enabled: bool, max_attempts: Option<usize>) -> Self {
         self.refresh_retry_enabled = enabled;
@@ -488,7 +515,7 @@ mod tests {
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         ) as Arc<dyn TableProvider>;
 
-        let refresh = Refresh::new(None, None, None, None, None, RefreshMode::Full, None, None);
+        let refresh = Refresh::new(RefreshMode::Full);
 
         let mut refresher = Refresher::new(
             TableReference::bare("test"),
@@ -675,16 +702,9 @@ mod tests {
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
             ) as Arc<dyn TableProvider>;
 
-            let refresh = Refresh::new(
-                Some("time_in_string".to_string()),
-                Some(TimeFormat::ISO8601),
-                None,
-                None,
-                None,
-                RefreshMode::Append,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Append)
+                .time_column("time_in_string".to_string())
+                .time_format(TimeFormat::ISO8601);
 
             let mut refresher = Refresher::new(
                 TableReference::bare("test"),
@@ -826,16 +846,15 @@ mod tests {
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
             ) as Arc<dyn TableProvider>;
 
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                time_format,
-                None,
-                None,
-                None,
-                RefreshMode::Append,
-                None,
-                append_overlap,
-            );
+            let mut refresh = Refresh::new(RefreshMode::Append).time_column("time".to_string());
+
+            if let Some(time_format) = time_format {
+                refresh = refresh.time_format(time_format);
+            }
+
+            if let Some(append_overlap) = append_overlap {
+                refresh = refresh.append_overlap(append_overlap);
+            }
 
             let mut refresher = Refresher::new(
                 TableReference::bare("test"),
@@ -1027,16 +1046,15 @@ mod tests {
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
             ) as Arc<dyn TableProvider>;
 
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                time_format,
-                None,
-                None,
-                None,
-                RefreshMode::Append,
-                None,
-                append_overlap,
-            );
+            let mut refresh = Refresh::new(RefreshMode::Append).time_column("time".to_string());
+
+            if let Some(time_format) = time_format {
+                refresh = refresh.time_format(time_format);
+            }
+
+            if let Some(append_overlap) = append_overlap {
+                refresh = refresh.append_overlap(append_overlap);
+            }
 
             let mut refresher = Refresher::new(
                 TableReference::bare("test"),
@@ -1182,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_no_time_column() {
-        let refresh = Refresh::new(None, None, None, None, None, RefreshMode::Full, None, None);
+        let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
         assert!(refresh
             .validate_time_format("dataset_name".to_string(), &schema)
@@ -1191,16 +1209,8 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_time_column_not_found() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            None,
-            None,
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Append).time_column("time".to_string());
+
         let schema = Arc::new(Schema::empty());
         assert!(matches!(
             refresh.validate_time_format("test_dataset".to_string(), &schema),
@@ -1216,16 +1226,9 @@ mod tests {
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
             let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
             assert!(matches!(
                 refresh.validate_time_format("test_dataset".to_string(), &schema),
@@ -1241,16 +1244,10 @@ mod tests {
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Int64,
@@ -1271,16 +1268,10 @@ mod tests {
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -1301,16 +1292,10 @@ mod tests {
             TimeFormat::Timestamp,
             TimeFormat::ISO8601,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
@@ -1325,16 +1310,10 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_iso8601_match() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            Some(TimeFormat::ISO8601),
-            None,
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::ISO8601);
+
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
         assert!(refresh
             .validate_time_format("dataset_name".to_string(), &schema)
@@ -1344,16 +1323,10 @@ mod tests {
     #[test]
     fn test_validate_time_column_when_unix_timestamp_match() {
         for format in [TimeFormat::UnixMillis, TimeFormat::UnixSeconds] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Int64,
@@ -1367,16 +1340,10 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_timestamp_match() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            Some(TimeFormat::Timestamp),
-            None,
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::Timestamp);
+
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -1389,16 +1356,10 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_timestamptz_match() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            Some(TimeFormat::Timestamptz),
-            None,
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::Timestamp);
+
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),

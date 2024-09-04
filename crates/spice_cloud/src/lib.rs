@@ -172,16 +172,11 @@ impl SpiceExtension {
             true,
         );
 
-        let refresh = Refresh::new(
-            Some("timestamp".to_string()),
-            Some(TimeFormat::UnixSeconds),
-            Some(Duration::from_secs(10)),
-            None,
-            None,
-            RefreshMode::Full,
-            Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("timestamp".to_string())
+            .time_format(TimeFormat::UnixSeconds)
+            .check_interval(Duration::from_secs(10))
+            .period(Duration::from_secs(1800)); // sync only last 30 minutes from cloud
 
         let metrics_table_reference = get_metrics_table_reference();
 
