@@ -72,7 +72,8 @@ delta_lake = ["dep:delta_kernel"]
 duckdb = [
   "dep:duckdb",
   "db_connection_pool/duckdb",
-  "datafusion-table-providers/duckdb"
+  "datafusion-table-providers/duckdb",
+  "datafusion-table-providers/duckdb-federation"
 ]
 flightsql = ["dep:tonic"]
 mysql = ["datafusion-table-providers/mysql"]
@@ -80,7 +81,7 @@ odbc = []
 postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite"]
+sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
