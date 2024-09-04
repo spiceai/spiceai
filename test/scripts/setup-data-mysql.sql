@@ -85,8 +85,7 @@ INSERT INTO test_mysql_table (
   col_unsigned_int,
   col_char,
   col_enum,
-  col_list_string,
-  col_list_int,
+  col_set,
   col_json
 ) VALUES (
   NULL,
