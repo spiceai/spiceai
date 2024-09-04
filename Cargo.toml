@@ -121,7 +121,7 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f2ca47d094a5
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
 
-rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "23e964bb37ef2bec9329783f67ab0393d89af9bd" }
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
