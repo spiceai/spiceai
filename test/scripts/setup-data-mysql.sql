@@ -9,11 +9,17 @@ CREATE TABLE test_mysql_table (
   col_double DOUBLE,
   col_timestamp TIMESTAMP,
   col_date DATE,
+  col_time TIME,
   col_blob BLOB,
   col_varchar VARCHAR(255),
   col_string TEXT,
   col_var_string VARCHAR(255),
-  col_decimal DECIMAL(10, 2)
+  col_decimal DECIMAL(10, 2),
+  col_unsigned_int INT UNSIGNED,
+  col_char CHAR(3),
+  col_enum ENUM('option1', 'option2', 'option3'),
+  col_set SET('apple', 'banana', 'cherry'),
+  col_json JSON
 );
 
 INSERT INTO test_mysql_table (
@@ -26,11 +32,17 @@ INSERT INTO test_mysql_table (
   col_double,
   col_timestamp,
   col_date,
+  col_time,
   col_blob,
   col_varchar,
   col_string,
   col_var_string,
-  col_decimal
+  col_decimal,
+  col_unsigned_int,
+  col_char,
+  col_enum,
+  col_set,
+  col_json
 ) VALUES (
   1,
   1,
@@ -41,11 +53,17 @@ INSERT INTO test_mysql_table (
   1.1,
   '2019-01-01 00:00:00',
   '2019-01-01',
+  '12:34:56',
   'blob',
   'varchar',
   'string',
   'var_string',
-  1.11
+  1.11,
+  10,
+  'USA',
+  'option1',
+  'apple,banana',
+  '{"name": "John", "age": 30, "is_active": true, "balance": 1234.56}'
 );
 
 INSERT INTO test_mysql_table (
@@ -58,12 +76,24 @@ INSERT INTO test_mysql_table (
   col_double,
   col_timestamp,
   col_date,
+  col_time,
   col_blob,
   col_varchar,
   col_string,
   col_var_string,
-  col_decimal
+  col_decimal,
+  col_unsigned_int,
+  col_char,
+  col_enum,
+  col_set,
+  col_json
 ) VALUES (
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
   NULL,
   NULL,
   NULL,
