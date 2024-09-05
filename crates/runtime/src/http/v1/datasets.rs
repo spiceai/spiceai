@@ -127,7 +127,7 @@ pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
-    Json(overrides_opt): Json<Option<RefreshOverrides>>,
+    overrides_opt: Option<Json<RefreshOverrides>>,
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
@@ -160,7 +160,13 @@ pub(crate) async fn refresh(
             .into_response();
     };
 
-    match df.refresh_table(&dataset.name, overrides_opt).await {
+    match df
+        .refresh_table(
+            &dataset.name,
+            overrides_opt.map(|Json(overrides)| overrides),
+        )
+        .await
+    {
         Ok(()) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {
