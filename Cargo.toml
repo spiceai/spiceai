@@ -61,7 +61,7 @@ datafusion-execution = "41"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 datafusion-functions-json = "0.41"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "55875c2f83e7886f3cbcd37a301c81cb3cd4aa20" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8a2610d13b5679ced583004207845156abc662e8" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.0"
@@ -82,7 +82,7 @@ prometheus = "0.13"
 r2d2 = "0.8.10"
 regex = "1.10.3"
 reqwest = {version = "0.12.5", features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+rusqlite = { version = "0.31.0", features = ["bundled-decimal"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.2"
 secrecy = "0.8.0"
@@ -113,14 +113,16 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "cca5e83559e0da1b628f66dc585875b9d1f82cc8" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f2ca47d094a5636df8b9f3792b2f474a7b210dc1" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "24ecbdfc2c482f1ce84c595ab1202530a37815d6" }
+
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }

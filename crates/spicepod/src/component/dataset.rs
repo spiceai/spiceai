@@ -234,6 +234,7 @@ pub mod acceleration {
         }
     }
 
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     pub struct Acceleration {
@@ -266,6 +267,12 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_retry_max_attempts: Option<usize>,
+
+        #[serde(default)]
+        pub refresh_jitter_enabled: bool,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_jitter_max: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
@@ -314,6 +321,8 @@ pub mod acceleration {
                 refresh_append_overlap: None,
                 refresh_retry_enabled: true,
                 refresh_retry_max_attempts: None,
+                refresh_jitter_enabled: false,
+                refresh_jitter_max: None,
                 params: None,
                 retention_period: None,
                 retention_check_interval: None,
