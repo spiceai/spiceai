@@ -77,7 +77,6 @@ struct RefreshStat {
 pub struct RefreshTask {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
-    refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
 }
 
@@ -86,13 +85,11 @@ impl RefreshTask {
     pub fn new(
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
-        refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
             dataset_name,
             federated,
-            refresh,
             accelerator,
         }
     }
@@ -101,13 +98,18 @@ impl RefreshTask {
         &self,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
+        refresh: Arc<RwLock<Refresh>>,
     ) -> super::Result<()> {
-        self.mark_dataset_status(status::ComponentStatus::Refreshing)
-            .await;
+        let dataset_name = self.dataset_name.clone();
+        let sql = refresh.read().await.sql.clone();
+
+        Self::mark_dataset_status(
+            &dataset_name,
+            sql.as_deref(),
+            status::ComponentStatus::Refreshing,
+        );
 
         let mut stream = Box::pin(self.get_append_stream());
-
-        let dataset_name = self.dataset_name.clone();
 
         let mut ready_sender = ready_sender;
 
@@ -115,8 +117,9 @@ impl RefreshTask {
             match update {
                 Ok((start_time, data_update)) => {
                     // write_data_update updates dataset status and logs errors so we don't do this here
+                    let sql = refresh.read().await.sql.clone();
                     if self
-                        .write_data_update(start_time, data_update)
+                        .write_data_update(sql, start_time, data_update)
                         .await
                         .is_ok()
                     {
@@ -139,8 +142,12 @@ impl RefreshTask {
                 }
                 Err(e) => {
                     tracing::error!("Error getting update for dataset {dataset_name}: {e}");
-                    self.mark_dataset_status(status::ComponentStatus::Error)
-                        .await;
+                    let sql = refresh.read().await.sql.clone();
+                    Self::mark_dataset_status(
+                        &dataset_name,
+                        sql.as_deref(),
+                        status::ComponentStatus::Error,
+                    );
                 }
             }
         }
@@ -148,17 +155,9 @@ impl RefreshTask {
         Ok(())
     }
 
-    pub async fn run(&self) -> super::Result<()> {
-        let (refresh_retry_enabled, refresh_retry_max_attempts) = {
-            let refresh = self.refresh.read().await;
-            (
-                refresh.refresh_retry_enabled,
-                refresh.refresh_retry_max_attempts,
-            )
-        };
-
-        let max_retries = if refresh_retry_enabled {
-            refresh_retry_max_attempts
+    pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
+        let max_retries = if refresh.refresh_retry_enabled {
+            refresh.refresh_retry_max_attempts
         } else {
             Some(0)
         };
@@ -170,9 +169,8 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
-
         retry(retry_strategy, || async {
-            self.run_once().await.map_err(|err| {
+            self.run_once(&refresh).await.map_err(|err| {
                 let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
                 err
@@ -187,16 +185,15 @@ impl RefreshTask {
         })
     }
 
-    async fn run_once(&self) -> Result<(), RetryError<super::Error>> {
-        self.mark_dataset_status(status::ComponentStatus::Refreshing)
-            .await;
-
-        let dataset_name = self.dataset_name.clone();
-
-        let mode = self.refresh.read().await.mode;
+    async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
+        Self::mark_dataset_status(
+            &self.dataset_name,
+            refresh.sql.as_deref(),
+            status::ComponentStatus::Refreshing,
+        );
 
         let _timer = TimeMeasurement::new(
-            match mode {
+            match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
@@ -204,38 +201,49 @@ impl RefreshTask {
                 RefreshMode::Append => &metrics::APPEND_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            vec![Key::from_static_str("dataset").string(dataset_name.to_string())],
+            vec![Key::from_static_str("dataset").string(self.dataset_name.to_string())],
         );
 
         let start_time = SystemTime::now();
 
-        let get_data_update_result = match mode {
+        let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
-            RefreshMode::Full => self.get_full_update().await,
-            RefreshMode::Append => self.get_incremental_append_update().await,
+            RefreshMode::Full => {
+                self.get_full_or_incremental_append_update(refresh, None)
+                    .await
+            }
+            RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
-                tracing::warn!("Failed to load data for dataset {dataset_name}: {e}");
-                self.mark_dataset_status(status::ComponentStatus::Error)
-                    .await;
+                tracing::warn!("Failed to load data for dataset {}: {e}", self.dataset_name);
+                Self::mark_dataset_status(
+                    &self.dataset_name,
+                    refresh.sql.as_deref(),
+                    status::ComponentStatus::Error,
+                );
                 return Err(e);
             }
         };
 
-        self.write_streaming_data_update(Some(start_time), streaming_data_update)
-            .await
+        self.write_streaming_data_update(
+            Some(start_time),
+            streaming_data_update,
+            refresh.sql.as_deref(),
+        )
+        .await
     }
 
     async fn write_streaming_data_update(
         &self,
         start_time: Option<SystemTime>,
         data_update: StreamingDataUpdate,
+        sql: Option<&str>,
     ) -> Result<(), RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
 
@@ -301,8 +309,7 @@ impl RefreshTask {
         {
             Ok(plan) => plan,
             Err(e) => {
-                self.mark_dataset_status(status::ComponentStatus::Error)
-                    .await;
+                Self::mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
                 // Should not retry if we are unable to create execution plan to insert data
                 return Err(RetryError::permanent(super::Error::FailedToWriteData {
                     source: e,
@@ -312,8 +319,7 @@ impl RefreshTask {
 
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
             tracing::warn!("Failed to update dataset {dataset_name}: {e}");
-            self.mark_dataset_status(status::ComponentStatus::Error)
-                .await;
+            Self::mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
             return Err(retry_from_df_error(e));
         }
 
@@ -323,19 +329,18 @@ impl RefreshTask {
             self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size);
         }
 
-        self.mark_dataset_status(status::ComponentStatus::Ready)
-            .await;
+        Self::mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Ready);
 
         Ok(())
     }
 
     pub async fn get_full_or_incremental_append_update(
         &self,
+        refresh: &Refresh,
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
-        let refresh = self.refresh.read().await;
-        let filter_converter = self.get_filter_converter(&refresh);
+        let filter_converter = self.get_filter_converter(refresh);
 
         if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
             tracing::debug!("Loading data for dataset {dataset_name}");
@@ -355,11 +360,12 @@ impl RefreshTask {
             }
         };
 
-        self.get_data_update(filters).await
+        self.get_data_update(filters, &refresh).await
     }
 
     async fn write_data_update(
         &self,
+        sql: Option<String>,
         start_time: Option<SystemTime>,
         data_update: DataUpdate,
     ) -> super::Result<()> {
@@ -373,8 +379,11 @@ impl RefreshTask {
                 self.trace_dataset_loaded(start_time, 0, 0);
             }
 
-            self.mark_dataset_status(status::ComponentStatus::Ready)
-                .await;
+            Self::mark_dataset_status(
+                &self.dataset_name,
+                sql.as_deref(),
+                status::ComponentStatus::Ready,
+            );
 
             return Ok(());
         };
@@ -382,28 +391,25 @@ impl RefreshTask {
         let streaming_update = StreamingDataUpdate::try_from(data_update)
             .context(UnableToCreateMemTableFromUpdateSnafu)?;
 
-        self.write_streaming_data_update(start_time, streaming_update)
+        self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
             .await
             .map_err(inner_err_from_retry)
     }
 
-    async fn get_full_update(&self) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        match self.get_full_or_incremental_append_update(None).await {
-            Ok(data) => Ok(data),
-            Err(e) => Err(e),
-        }
-    }
-
     async fn get_incremental_append_update(
         &self,
+        refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         match self
-            .timestamp_nanos_for_append_query()
+            .timestamp_nanos_for_append_query(refresh)
             .await
             .map_err(RetryError::permanent)
         {
-            Ok(timestamp) => match self.get_full_or_incremental_append_update(timestamp).await {
-                Ok(data) => match self.except_existing_records_from(data).await {
+            Ok(timestamp) => match self
+                .get_full_or_incremental_append_update(refresh, timestamp)
+                .await
+            {
+                Ok(data) => match self.except_existing_records_from(refresh, data).await {
                     Ok(data) => Ok(data),
                     Err(e) => Err(e),
                 },
@@ -488,33 +494,26 @@ impl RefreshTask {
     async fn get_data_update(
         &self,
         filters: Vec<Expr>,
+        refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let refresh = Arc::clone(&self.refresh);
-
         let mut ctx = self.refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
 
-        let (sql, update_type) = {
-            let refresh = refresh.read().await;
-            (
-                refresh.sql.clone(),
-                match refresh.mode {
-                    RefreshMode::Disabled => {
-                        unreachable!("Refresh cannot be called when acceleration is disabled")
-                    }
-                    RefreshMode::Full => UpdateType::Overwrite,
-                    RefreshMode::Append => UpdateType::Append,
-                    RefreshMode::Changes => unreachable!("changes are handled upstream"),
-                },
-            )
+        let update_type = match refresh.mode {
+            RefreshMode::Disabled => {
+                unreachable!("Refresh cannot be called when acceleration is disabled")
+            }
+            RefreshMode::Full => UpdateType::Overwrite,
+            RefreshMode::Append => UpdateType::Append,
+            RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
         let get_data_result = get_data(
             &mut ctx,
             dataset_name.clone(),
             Arc::clone(&federated),
-            sql,
+            refresh.sql.clone(),
             filters.clone(),
         )
         .await
@@ -581,6 +580,7 @@ impl RefreshTask {
         &self,
         ctx: SessionContext,
         column: &str,
+        sql: Option<&str>,
     ) -> Result<DataFrame, DataFusionError> {
         let expr = cast(
             col(format!(r#""{column}""#)),
@@ -588,16 +588,20 @@ impl RefreshTask {
         )
         .alias("a");
 
-        self.accelerator_df(ctx)
+        self.accelerator_df(ctx, sql)
             .await?
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
 
-    async fn accelerator_df(&self, ctx: SessionContext) -> Result<DataFrame, DataFusionError> {
-        if let Some(sql) = &self.refresh.read().await.sql {
-            ctx.sql(sql.as_str()).await
+    async fn accelerator_df(
+        &self,
+        ctx: SessionContext,
+        sql_opt: Option<&str>,
+    ) -> Result<DataFrame, DataFusionError> {
+        if let Some(sql) = sql_opt {
+            ctx.sql(sql).await
         } else {
             ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
         }
@@ -606,18 +610,18 @@ impl RefreshTask {
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records_from(
         &self,
+        refresh: &Refresh,
         mut update: StreamingDataUpdate,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let Some(value) = self.timestamp_nanos_for_append_query().await? else {
+        let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
             return Ok(update);
         };
-        let refresh = self.refresh.read().await;
-        let Some(filter_converter) = self.get_filter_converter(&refresh) else {
+        let Some(filter_converter) = self.get_filter_converter(refresh) else {
             return Ok(update);
         };
 
         let existing_records = self
-            .accelerator_df(self.refresh_df_context())
+            .accelerator_df(self.refresh_df_context(), refresh.sql.as_deref())
             .await
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
@@ -642,19 +646,12 @@ impl RefreshTask {
         Ok(StreamingDataUpdate::new(schema, filtered_data, update_type))
     }
 
-    async fn refresh_append_overlap_nanos(&self) -> u128 {
-        self.refresh
-            .read()
-            .await
-            .append_overlap
-            .map(|f| f.as_nanos())
-            .unwrap_or_default()
-    }
-
     #[allow(clippy::cast_sign_loss)]
-    async fn timestamp_nanos_for_append_query(&self) -> super::Result<Option<u128>> {
+    async fn timestamp_nanos_for_append_query(
+        &self,
+        refresh: &Refresh,
+    ) -> super::Result<Option<u128>> {
         let ctx = self.refresh_df_context();
-        let refresh = self.refresh.read().await;
 
         refresh
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
@@ -669,7 +666,7 @@ impl RefreshTask {
                 })?;
 
         let df = self
-            .max_timestamp_df(ctx, &column)
+            .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
@@ -723,7 +720,10 @@ impl RefreshTask {
             }
         };
 
-        let refresh_append_value = self.refresh_append_overlap_nanos().await;
+        let refresh_append_value = refresh
+            .append_overlap
+            .map(|f| f.as_nanos())
+            .unwrap_or_default();
 
         if refresh_append_value > value {
             Ok(Some(0))
@@ -732,11 +732,15 @@ impl RefreshTask {
         }
     }
 
-    async fn mark_dataset_status(&self, status: status::ComponentStatus) {
-        status::update_dataset(&self.dataset_name, status);
+    fn mark_dataset_status(
+        dataset_name: &TableReference,
+        sql: Option<&str>,
+        status: status::ComponentStatus,
+    ) {
+        status::update_dataset(dataset_name, status);
 
         if status == status::ComponentStatus::Error {
-            let labels = [Key::from_static_str("dataset").string(self.dataset_name.to_string())];
+            let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
             metrics::REFRESH_ERRORS.add(1, &labels);
         }
 
@@ -745,9 +749,8 @@ impl RefreshTask {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
 
-            let mut labels =
-                vec![Key::from_static_str("dataset").string(self.dataset_name.to_string())];
-            if let Some(sql) = &self.refresh.read().await.sql {
+            let mut labels = vec![Key::from_static_str("dataset").string(dataset_name.to_string())];
+            if let Some(sql) = sql {
                 labels.push(Key::from_static_str("sql").string(sql.to_string()));
             };
 

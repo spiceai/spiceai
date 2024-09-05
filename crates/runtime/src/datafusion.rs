@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use crate::accelerated_table::refresh;
+use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
@@ -809,10 +809,14 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
+    pub async fn refresh_table(
+        &self,
+        dataset_name: &str,
+        overrides: Option<RefreshOverrides>,
+    ) -> Result<()> {
         let table = self.get_accelerated_table_provider(dataset_name).await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
-            return accelerated_table.trigger_refresh().await.context(
+            return accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
                     table_name: dataset_name.to_string(),
                 },
