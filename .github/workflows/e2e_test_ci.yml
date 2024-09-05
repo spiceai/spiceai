@@ -905,12 +905,9 @@ jobs:
           matrix:
             target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
             # run only on "Linux x64"
-            include:
+            exclude:
               - target:
-                  name: "Linux x64"
-                  runner: "ubuntu-latest"
-                  target_os: "linux"
-                  target_arch: "x86_64"
+                  target_os: "darwin"
 
       steps:
         - uses: actions/checkout@v4
