@@ -184,8 +184,6 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         }
     };
 
-    let (refresh_task_retries, request) = create_refresh_task(&rt, "lineitem_retries").await?;
-
     let running_container_reference_copy = Arc::clone(&running_container);
 
     tokio::spawn(async move {
@@ -210,6 +208,10 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         )
         .await
         .map_err(|e| e.to_string())?;
+
+    // For this test, must create_refresh request after `rt.datafusion().update_refresh_sql` to avoid getting old `refresh_sql`.
+    let (refresh_task_retries, request) = create_refresh_task(&rt, "lineitem_retries").await?;
+    println!("Running request for 'lineitem_retries' table: {request:?}");
 
     // Refresh should do retries and succeed
     tokio::select! {
