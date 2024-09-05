@@ -230,15 +230,6 @@ spice login snowflake --account <account-identifier> --username <username> --pri
 	},
 }
 
-/*
-*
-AuthorizationCodeCredential::authorization_url_builder(client_id)
-
-	.with_redirect_uri(redirect_uri)
-	.with_scope(scope)
-	.with_tenant(tenant_id)
-	.url()
-*/
 var sharepointCmd = &cobra.Command{
 	Use:   "sharepoint",
 	Short: "Login to a Microsoft 365 sharepoint account",

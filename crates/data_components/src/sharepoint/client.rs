@@ -26,7 +26,7 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::Expr,
+    logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
@@ -187,6 +187,13 @@ impl TableProvider for SharepointClient {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -210,6 +217,7 @@ struct SharepointListExec {
     drive: DrivePtr,
     drive_item: DriveItemPtr,
 
+    /// If schema has `DRIVE_ITEM_FILE_CONTENT_COLUMN`, then we download the file content.
     schema: SchemaRef,
     properties: PlanProperties,
     limit: Option<usize>,
@@ -224,18 +232,19 @@ impl SharepointListExec {
         schema: &SchemaRef,
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
-        let schema = project_schema(schema, projections)?;
+        let projected_schema = project_schema(schema, projections)?;
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
+            EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             ExecutionMode::Bounded,
         );
+        println!("projectedschema: {projected_schema:#?}\nschema: {schema:#?}, but my projection: {projections:#?}");
 
         Ok(Self {
             client,
             drive: drive.clone(),
             drive_item: drive_item.clone(),
-            schema,
+            schema: projected_schema,
             properties,
             limit,
         })
@@ -372,9 +381,14 @@ impl ExecutionPlan for SharepointListExec {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Only retrieve file content if it is in projected schema.
-        let include_file_content: bool =
-            self.schema.index_of(DRIVE_ITEM_FILE_CONTENT_COLUMN).is_ok();
-
+        let include_file_content: bool = self
+            .schema()
+            .index_of(DRIVE_ITEM_FILE_CONTENT_COLUMN)
+            .is_ok();
+        println!(
+            "include_file_content={include_file_content}, but Schema={:#?}",
+            self.schema(),
+        );
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
             self.process_list_drive_items(include_file_content)?,
@@ -410,6 +424,7 @@ async fn response_to_record_with_file_content(
     resp: &DriveItemResponse,
     include_file_content: bool,
 ) -> Result<RecordBatch, ArrowError> {
+    println!("Am i going to download file content? include_file_content={include_file_content}");
     let item_content = if include_file_content {
         let mut content: Vec<String> = Vec::with_capacity(resp.value.len());
         for item in &resp.value {

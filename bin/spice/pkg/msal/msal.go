@@ -37,11 +37,10 @@ func GetAuthCode(ctx context.Context, tenantId string, clientId string, scopes [
 	}
 
 	auth_code := make(chan string, 1)
-	server_shutdown := make(chan struct{})
 
 	// Start a local server to listen for the redirect
 	go func() {
-		run_redirect_server(auth_code, server_shutdown)
+		run_redirect_server(auth_code)
 	}()
 
 	fmt.Println("Attempting to open Microsoft authorization page in your default browser")
@@ -52,23 +51,14 @@ func GetAuthCode(ctx context.Context, tenantId string, clientId string, scopes [
 	// Wait for the auth code
 	code := <-auth_code
 
-	// Signal the server to shutdown
-	close(server_shutdown)
-
 	return code, nil
 }
 
-func run_redirect_server(output_chan chan string, shutdown_chan chan struct{}) {
+func run_redirect_server(output_chan chan string) {
 	server := &http.Server{Addr: ":8091"}
 
 	http.HandleFunc("/", construct_get_token(output_chan))
 
-	go func() {
-		<-shutdown_chan
-		if err := server.Shutdown(context.Background()); err != nil {
-			log.Fatal(err)
-		}
-	}()
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
