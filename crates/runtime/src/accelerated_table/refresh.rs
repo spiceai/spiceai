@@ -287,11 +287,16 @@ impl Refresher {
         self
     }
 
+    /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
     fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
         match max_jitter {
             Some(max_jitter) => {
                 let jitter = rand::thread_rng().gen_range(Duration::from_secs(0)..max_jitter);
-                period + jitter
+                if rand::thread_rng().gen_bool(0.5) {
+                    period + jitter
+                } else {
+                    period.saturating_sub(jitter)
+                }
             }
             None => period,
         }
