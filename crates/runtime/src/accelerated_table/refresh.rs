@@ -29,6 +29,7 @@ use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
 use opentelemetry::Key;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
@@ -68,6 +69,16 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) refresh_retry_enabled: bool,
     pub(crate) refresh_retry_max_attempts: Option<usize>,
+}
+
+/// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefreshOverrides {
+    #[serde(default, rename = "refresh_sql")]
+    pub sql: Option<String>,
+
+    #[serde(rename = "refresh_mode")]
+    pub mode: Option<RefreshMode>,
 }
 
 impl Refresh {
@@ -126,6 +137,17 @@ impl Refresh {
     pub fn with_retry(mut self, enabled: bool, max_attempts: Option<usize>) -> Self {
         self.refresh_retry_enabled = enabled;
         self.refresh_retry_max_attempts = max_attempts;
+        self
+    }
+
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
+        if let Some(sql) = &overrides.sql {
+            self.sql = Some(sql.clone());
+        }
+        if let Some(mode) = overrides.mode {
+            self.mode = mode;
+        }
         self
     }
 
@@ -241,8 +263,8 @@ impl Default for Refresh {
 
 pub(crate) enum AccelerationRefreshMode {
     Disabled,
-    Full(Receiver<()>),
-    Append(Option<Receiver<()>>),
+    Full(Receiver<Option<RefreshOverrides>>),
+    Append(Option<Receiver<Option<RefreshOverrides>>>),
     Changes(ChangesStream),
 }
 
@@ -335,6 +357,15 @@ impl Refresher {
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
 
+        // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
+        // The `select!` block handle waiting on both
+        //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
+        //   2. The sleep [`future`] `scheduled_refresh_future`.
+        //
+        // Doing it in this way stops
+        //   1. Periodic and manual refreshes happening at the same time
+        //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
+        //        refresh (the sleep future is reset when a manual refresh completes).
         Some(tokio::spawn(async move {
             // first refresh is on start, thus duration is 0
             let mut next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
@@ -352,14 +383,14 @@ impl Refresher {
                 select! {
                     () = scheduled_refresh_future => {
                         tracing::debug!("Starting scheduled refresh");
-                        if let Err(err) = start_refresh.send(()).await {
+                        if let Err(err) = start_refresh.send(None).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
-                    _ = on_start_refresh_external.recv() => {
+                    Some(overrides_opt) = on_start_refresh_external.recv() => {
                         tracing::debug!("Received external trigger to start refresh");
 
-                        if let Err(err) = start_refresh.send(()).await {
+                        if let Err(err) = start_refresh.send(overrides_opt).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
@@ -379,6 +410,8 @@ impl Refresher {
                             }
                         }
 
+                        // Restart periodic refresh timer (after either cron or manual dataset refresh).
+                        // For datasets with no periodic refresh, this will be a no-op.
                         if let Some(refresh_check_interval) = refresh_check_interval {
                             next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
                                 refresh_check_interval,
@@ -398,15 +431,16 @@ impl Refresher {
         let refresh_task = Arc::new(RefreshTask::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
+
+        let refresh_defaults = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streaming_append(cache_provider, Some(ready_sender))
+                .start_streaming_append(cache_provider, Some(ready_sender), refresh_defaults)
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
@@ -422,15 +456,15 @@ impl Refresher {
         let refresh_task = Arc::new(RefreshTask::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
 
         let cache_provider = self.cache_provider.clone();
+        let refresh = Arc::clone(&self.refresh);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_changes_stream(changes_stream, cache_provider, Some(ready_sender))
+                .start_changes_stream(refresh, changes_stream, cache_provider, Some(ready_sender))
                 .await
             {
                 tracing::error!("Changes stream failed with error: {err}");
@@ -529,7 +563,7 @@ mod tests {
             Arc::clone(&accelerator),
         );
 
-        let (trigger, receiver) = mpsc::channel::<()>(1);
+        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let (ready_sender, is_ready) = oneshot::channel::<()>();
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
         let refresh_handle = refresher
@@ -537,7 +571,7 @@ mod tests {
             .await;
 
         trigger
-            .send(())
+            .send(None)
             .await
             .expect("trigger sent correctly to refresh");
 
@@ -718,7 +752,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
@@ -726,7 +760,7 @@ mod tests {
                 .await;
 
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -868,7 +902,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
@@ -876,7 +910,7 @@ mod tests {
                 .await;
 
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -1068,14 +1102,14 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
                 .start(acceleration_refresh_mode, ready_sender)
                 .await;
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 

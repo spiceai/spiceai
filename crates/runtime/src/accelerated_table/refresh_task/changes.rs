@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::RefreshTask;
+use crate::accelerated_table::refresh::Refresh;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
@@ -28,7 +29,7 @@ use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, RwLock};
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
@@ -60,14 +61,18 @@ macro_rules! extract_primary_key {
 impl RefreshTask {
     pub async fn start_changes_stream(
         &self,
+        refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
     ) -> crate::accelerated_table::Result<()> {
-        self.mark_dataset_status(status::ComponentStatus::Refreshing)
-            .await;
-
         let dataset_name = self.dataset_name.clone();
+        let sql = refresh.read().await.sql.clone();
+        Self::mark_dataset_status(
+            &dataset_name,
+            sql.as_deref(),
+            status::ComponentStatus::Refreshing,
+        );
 
         let mut ready_sender = ready_sender;
 
@@ -100,16 +105,22 @@ impl RefreshTask {
                             }
                         }
                         Err(e) => {
-                            self.mark_dataset_status(status::ComponentStatus::Error)
-                                .await;
+                            Self::mark_dataset_status(
+                                &dataset_name,
+                                refresh.read().await.sql.clone().as_deref(),
+                                status::ComponentStatus::Error,
+                            );
                             tracing::error!("Error writing change for {dataset_name}: {e}");
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!("Changes stream error for {dataset_name}: {e}");
-                    self.mark_dataset_status(status::ComponentStatus::Error)
-                        .await;
+                    Self::mark_dataset_status(
+                        &dataset_name,
+                        refresh.read().await.sql.clone().as_deref(),
+                        status::ComponentStatus::Error,
+                    );
                 }
             }
         }

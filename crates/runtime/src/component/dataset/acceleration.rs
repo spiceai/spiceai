@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use datafusion_table_providers::util::column_reference::ColumnReference;
+use serde::{Deserialize, Serialize};
 use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
 use std::{collections::HashMap, fmt::Display, time::Duration};
 
 pub mod constraints;
 pub mod on_conflict;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RefreshMode {
     Disabled,
     Full,
