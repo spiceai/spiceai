@@ -1375,7 +1375,7 @@ impl Runtime {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok(l) => {
                     let mut llm_map = self.llms.write().await;
-                    llm_map.insert(m.name.clone(), l.into());
+                    llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
                 Err(e) => Err(format!(
