@@ -96,6 +96,7 @@ if ! type "duckdb" 1> /dev/null 2>&1; then
 fi
 
 dbname="$bench-sf$sf.db"
+dbname_accelerated_prefix="$bench-sf$sf-accelerated-"
 generate_command() {
   if [ "$bench" = "tpch" ]; then
     echo "INSTALL tpch; LOAD tpch; CALL dbgen(sf = $sf)"
@@ -151,6 +152,20 @@ if [ "$bench" = "tpch" ]; then
       echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
     done
   fi
+  if [ "$engine" = "duckdb" ]; then
+    for i in customer lineitem nation orders part partsupp region supplier; do
+      echo "  - from: duckdb:$i" >> spicepod.yaml
+      echo "    name: $i" >> spicepod.yaml
+      echo "    params:" >> spicepod.yaml
+      echo "      duckdb_open: $dbname" >> spicepod.yaml
+      echo "    acceleration:" >> spicepod.yaml
+      echo "      enabled: true" >> spicepod.yaml
+      echo "      engine: duckdb" >> spicepod.yaml
+      echo "      mode: file" >> spicepod.yaml
+      echo "      params:" >> spicepod.yaml
+      echo "        duckdb_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
+    done
+  fi
 fi
 
 if [ "$bench" = "tpcds" ]; then
@@ -180,6 +195,20 @@ if [ "$bench" = "tpcds" ]; then
       echo "        pg_pass: $pg_pass" >> spicepod.yaml
       echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
       echo "        pg_db: $pg_db" >> spicepod.yaml
+    done
+  fi
+  if [ "$engine" = "duckdb" ]; then
+    for i in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do
+      echo "  - from: duckdb:$i" >> spicepod.yaml
+      echo "    name: $i" >> spicepod.yaml
+      echo "    params:" >> spicepod.yaml
+      echo "      duckdb_open: $dbname" >> spicepod.yaml
+      echo "    acceleration:" >> spicepod.yaml
+      echo "      enabled: true" >> spicepod.yaml
+      echo "      engine: duckdb" >> spicepod.yaml
+      echo "      mode: file" >> spicepod.yaml
+      echo "      params:" >> spicepod.yaml
+      echo "        duckdb_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
     done
   fi
 fi

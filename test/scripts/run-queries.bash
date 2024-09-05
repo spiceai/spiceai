@@ -30,7 +30,7 @@ for i in `ls -d $query_folder/**`; do
   result=`cat runqueries.tmp.txt`
   echo "$result"
   # if result contains error string, then it failed
-  if [[ $result == *"Query Error"* ]] || [[ $result == *"ERROR"* ]]; then
+  if [[ $result == *"Query Error"* ]] || [[ $result == *"Error"* ]]; then
     failed_queries+=($i)
   fi
 done
