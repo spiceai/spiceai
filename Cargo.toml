@@ -31,7 +31,7 @@ exclude = [".github/"]
 homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.81"
+rust-version = "1.80"
 version = "0.18.0-beta"
 
 [workspace.dependencies]
