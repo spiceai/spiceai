@@ -185,15 +185,15 @@ impl RefreshTask {
         })
     }
 
-    async fn run_once(&self, request: &Refresh) -> Result<(), RetryError<super::Error>> {
+    async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
         Self::mark_dataset_status(
             &self.dataset_name,
-            request.sql.as_deref(),
+            refresh.sql.as_deref(),
             status::ComponentStatus::Refreshing,
         );
 
         let _timer = TimeMeasurement::new(
-            match request.mode {
+            match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
@@ -206,15 +206,15 @@ impl RefreshTask {
 
         let start_time = SystemTime::now();
 
-        let get_data_update_result = match request.mode {
+        let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
             RefreshMode::Full => {
-                self.get_full_or_incremental_append_update(request, None)
+                self.get_full_or_incremental_append_update(refresh, None)
                     .await
             }
-            RefreshMode::Append => self.get_incremental_append_update(request).await,
+            RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
@@ -224,7 +224,7 @@ impl RefreshTask {
                 tracing::warn!("Failed to load data for dataset {}: {e}", self.dataset_name);
                 Self::mark_dataset_status(
                     &self.dataset_name,
-                    request.sql.as_deref(),
+                    refresh.sql.as_deref(),
                     status::ComponentStatus::Error,
                 );
                 return Err(e);
@@ -234,7 +234,7 @@ impl RefreshTask {
         self.write_streaming_data_update(
             Some(start_time),
             streaming_data_update,
-            request.sql.as_deref(),
+            refresh.sql.as_deref(),
         )
         .await
     }
