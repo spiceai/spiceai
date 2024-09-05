@@ -61,10 +61,16 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
         .downcast_ref::<AcceleratedTable>()
         .ok_or("traces table is not an AcceleratedTable")?;
 
+    let request = traces_accelerated_table
+        .refresh_params()
+        .read()
+        .await
+        .clone();
+
+    // traces_accelerated_table.refresh_params(),
     let refresh_task = Arc::new(RefreshTask::new(
         "traces".into(),
         Arc::clone(&traces_accelerated_table.get_federated_table()),
-        traces_accelerated_table.refresh_params(),
         traces_table,
     ));
 
@@ -73,7 +79,7 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        res = refresh_task.get_full_or_incremental_append_update(None) => {
+        res = refresh_task.get_full_or_incremental_append_update(&request, None) => {
             res.map_err(|e| e.to_string())?
         }
     };

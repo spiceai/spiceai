@@ -33,7 +33,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 };
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{
-    accelerated_table::{refresh_task::RefreshTask, AcceleratedTable},
+    accelerated_table::{refresh::Refresh, refresh_task::RefreshTask, AcceleratedTable},
     Runtime,
 };
 use spicepod::component::dataset::acceleration::Acceleration;
@@ -88,7 +88,10 @@ async fn prepare_test_environment() -> Result<RunningContainer<'static>, String>
     Ok(running_container)
 }
 
-async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTask, String> {
+async fn create_refresh_task(
+    rt: &Runtime,
+    table_name: &str,
+) -> Result<(RefreshTask, Refresh), String> {
     let table = rt
         .datafusion()
         .get_accelerated_table_provider(table_name)
@@ -100,11 +103,13 @@ async fn create_refresh_task(rt: &Runtime, table_name: &str) -> Result<RefreshTa
         .downcast_ref::<AcceleratedTable>()
         .ok_or("table is not an AcceleratedTable")?;
 
-    Ok(RefreshTask::new(
-        table_name.into(),
-        Arc::clone(&accelerated_table.get_federated_table()),
-        accelerated_table.refresh_params(),
-        accelerated_table.get_accelerator(),
+    Ok((
+        RefreshTask::new(
+            table_name.into(),
+            Arc::clone(&accelerated_table.get_federated_table()),
+            accelerated_table.get_accelerator(),
+        ),
+        accelerated_table.refresh_params().read().await.clone(),
     ))
 }
 
@@ -159,7 +164,8 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         () = rt.load_components() => {}
     }
 
-    let refresh_task_no_retries = create_refresh_task(&rt, "lineitem_no_retries").await?;
+    let (refresh_task_no_retries, request) =
+        create_refresh_task(&rt, "lineitem_no_retries").await?;
 
     tracing::debug!("Simulating connectivity issue...");
     running_container.stop().await.map_err(|e| {
@@ -172,13 +178,13 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
             return Err("Timed out waiting for dataset refresh result".to_string());
         },
-        res = refresh_task_no_retries.run() => {
+        res = refresh_task_no_retries.run(request) => {
             tracing::debug!("Refresh task completed. Is error={}", res.is_err());
             assert!(res.is_err(), "Expected refresh error but got {res:?}");
         }
     };
 
-    let refresh_task_retries = create_refresh_task(&rt, "lineitem_retries").await?;
+    let (refresh_task_retries, request) = create_refresh_task(&rt, "lineitem_retries").await?;
 
     let running_container_reference_copy = Arc::clone(&running_container);
 
@@ -210,7 +216,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
             return Err("Timed out waiting for dataset refresh result".to_string());
         },
-        res = refresh_task_retries.run() => {
+        res = refresh_task_retries.run(request) => {
             tracing::debug!("Refresh task completed. Is error={}", res.is_err());
             assert!(res.is_ok(), "Expected refresh succeed after retrying but got {res:?}");
         }

@@ -76,9 +76,9 @@ impl RefreshTaskRunner {
         let refresh_task = Arc::new(RefreshTask::new(
             dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
+        let base_refresh = Arc::clone(&self.refresh);
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<BoxFuture<super::Result<()>>> = None;
@@ -103,19 +103,25 @@ impl RefreshTaskRunner {
                             }
                         },
 
-                        overrides_opt = on_start_refresh.recv() => {
-                            // if overrides_opt.is_none(), channel was closed
-                            if let Some(overrides) = overrides_opt {
-                                task_completion = Some(Box::pin(refresh_task.run(overrides)));
+                        overrides_msg = on_start_refresh.recv() => {
+                            if let Some(overrides_opt) = overrides_msg {
+                                let mut r = base_refresh.read().await.clone();
+                                if let Some(overrides) = overrides_opt {
+                                    r = r.with_overrides(&overrides);
+                                }
+                                task_completion = Some(Box::pin(refresh_task.run(r)));
                             }
                         }
                     }
                 } else {
                     select! {
-                        overrides_opt = on_start_refresh.recv() => {
-                            // if overrides_opt.is_none(), channel was closed
-                            if let Some(overrides) = overrides_opt {
-                                task_completion = Some(Box::pin(refresh_task.run(overrides)));
+                        overrides_msg = on_start_refresh.recv() => {
+                            if let Some(overrides_opt) = overrides_msg {
+                                let mut r = base_refresh.read().await.clone();
+                                if let Some(overrides) = overrides_opt {
+                                    r = r.with_overrides(&overrides);
+                                }
+                                task_completion = Some(Box::pin(refresh_task.run(r)));
                             }
                         }
                     }

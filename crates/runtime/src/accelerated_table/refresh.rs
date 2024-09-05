@@ -109,6 +109,17 @@ impl Refresh {
         self
     }
 
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
+        if let Some(sql) = &overrides.sql {
+            self.sql = Some(sql.clone());
+        }
+        if let Some(mode) = overrides.mode {
+            self.mode = mode;
+        }
+        self
+    }
+
     pub(crate) fn validate_time_format(
         &self,
         dataset_name: String,
@@ -366,15 +377,16 @@ impl Refresher {
         let refresh_task = Arc::new(RefreshTask::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
+
+        let refresh_defaults = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streaming_append(cache_provider, Some(ready_sender))
+                .start_streaming_append(cache_provider, Some(ready_sender), refresh_defaults)
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
@@ -390,15 +402,16 @@ impl Refresher {
         let refresh_task = Arc::new(RefreshTask::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
+            // Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
 
         let cache_provider = self.cache_provider.clone();
+        let refresh = Arc::clone(&self.refresh);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_changes_stream(changes_stream, cache_provider, Some(ready_sender))
+                .start_changes_stream(refresh, changes_stream, cache_provider, Some(ready_sender))
                 .await
             {
                 tracing::error!("Changes stream failed with error: {err}");
@@ -497,7 +510,7 @@ mod tests {
             Arc::clone(&accelerator),
         );
 
-        let (trigger, receiver) = mpsc::channel::<()>(1);
+        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let (ready_sender, is_ready) = oneshot::channel::<()>();
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
         let refresh_handle = refresher
@@ -505,7 +518,7 @@ mod tests {
             .await;
 
         trigger
-            .send(())
+            .send(None)
             .await
             .expect("trigger sent correctly to refresh");
 
@@ -692,7 +705,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
@@ -700,7 +713,7 @@ mod tests {
                 .await;
 
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -842,7 +855,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
@@ -850,7 +863,7 @@ mod tests {
                 .await;
 
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -1042,14 +1055,14 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
                 .start(acceleration_refresh_mode, ready_sender)
                 .await;
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
