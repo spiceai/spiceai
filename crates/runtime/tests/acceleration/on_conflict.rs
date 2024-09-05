@@ -422,11 +422,11 @@ fn get_pg_params(port: usize) -> Params {
     )
 }
 
-fn get_params(mode: &Mode, sqlite_file: Option<String>, engine: &str) -> Option<Params> {
+fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);
     if mode == &Mode::File {
         return Some(Params::from_string_map(
-            vec![(param_name, sqlite_file.unwrap_or_default())]
+            vec![(param_name, file.unwrap_or_default())]
                 .into_iter()
                 .collect(),
         ));
