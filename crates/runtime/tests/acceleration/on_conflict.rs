@@ -69,42 +69,88 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         port,
     );
 
-    let duckdb_mem_on_conflict_upsert = create_duckdb_test_dataset(
+    let duckdb_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Upsert,
         "postgres:event_logs",
         "duckdb_mem_on_conflict_upsert",
         None,
         port,
         Mode::Memory,
+        "duckdb",
     );
 
-    let duckdb_mem_on_conflict_drop = create_duckdb_test_dataset(
+    let duckdb_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Drop,
         "postgres:event_logs",
         "duckdb_mem_on_conflict_drop",
         None,
         port,
         Mode::Memory,
+        "duckdb",
     );
 
     let duckdb_upsert_file_path = random_db_name();
-    let duckdb_file_on_conflict_upsert = create_duckdb_test_dataset(
+    let duckdb_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Upsert,
         "postgres:event_logs",
         "duckdb_file_on_conflict_upsert",
         Some(duckdb_upsert_file_path.clone()),
         port,
         Mode::File,
+        "duckdb",
     );
 
     let duckdb_drop_file_path = random_db_name();
-    let duckdb_file_on_conflict_drop = create_duckdb_test_dataset(
+    let duckdb_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Drop,
         "postgres:event_logs",
         "duckdb_file_on_conflict_drop",
         Some(duckdb_drop_file_path.clone()),
         port,
         Mode::File,
+        "duckdb",
+    );
+
+    let sqlite_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Upsert,
+        "postgres:event_logs",
+        "sql_mem_on_conflict_upsert",
+        None,
+        port,
+        Mode::Memory,
+        "sqlite",
+    );
+
+    let sqlite_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Drop,
+        "postgres:event_logs",
+        "sql_mem_on_conflict_drop",
+        None,
+        port,
+        Mode::Memory,
+        "sqlite",
+    );
+
+    let sqlite_upsert_file_path = random_db_name();
+    let sqlite_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Upsert,
+        "postgres:event_logs",
+        "sql_file_on_conflict_upsert",
+        Some(sqlite_upsert_file_path.clone()),
+        port,
+        Mode::File,
+        "sqlite",
+    );
+
+    let sqlite_drop_file_path = random_db_name();
+    let sqlite_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Drop,
+        "postgres:event_logs",
+        "sql_file_on_conflict_drop",
+        Some(sqlite_drop_file_path.clone()),
+        port,
+        Mode::File,
+        "sqlite",
     );
 
     let df = get_test_datafusion();
@@ -116,6 +162,10 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         .with_dataset(duckdb_mem_on_conflict_drop)
         .with_dataset(duckdb_file_on_conflict_upsert)
         .with_dataset(duckdb_file_on_conflict_drop)
+        .with_dataset(sqlite_mem_on_conflict_upsert)
+        .with_dataset(sqlite_mem_on_conflict_drop)
+        .with_dataset(sqlite_file_on_conflict_upsert)
+        .with_dataset(sqlite_file_on_conflict_drop)
         .build();
 
     let rt = Arc::new(
@@ -160,6 +210,26 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         "SELECT * FROM duckdb_file_on_conflict_drop LIMIT 1",
     )
     .await;
+    dataset_ready_check(
+        Arc::clone(&rt),
+        "SELECT * FROM sql_mem_on_conflict_drop LIMIT 1",
+    )
+    .await;
+    dataset_ready_check(
+        Arc::clone(&rt),
+        "SELECT * FROM sql_mem_on_conflict_upsert LIMIT 1",
+    )
+    .await;
+    dataset_ready_check(
+        Arc::clone(&rt),
+        "SELECT * FROM sql_file_on_conflict_upsert LIMIT 1",
+    )
+    .await;
+    dataset_ready_check(
+        Arc::clone(&rt),
+        "SELECT * FROM sql_file_on_conflict_drop LIMIT 1",
+    )
+    .await;
 
     db_conn
         .conn
@@ -189,6 +259,14 @@ WHERE event_name = 'File Download'
         get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert").await?;
     let duckdb_file_drop_data =
         get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_drop").await?;
+    let sqlite_mem_upsert_data =
+        get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_upsert").await?;
+    let sqlite_mem_drop_data =
+        get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_drop").await?;
+    let sqlite_file_upsert_data =
+        get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_upsert").await?;
+    let sqlite_file_drop_data =
+        get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_drop").await?;
 
     let upsert_expected_result = &[
         "+----------+-------------------+---------------------+",
@@ -220,10 +298,22 @@ WHERE event_name = 'File Download'
     assert_batches_eq!(drop_expected_result, &duckdb_mem_drop_data);
     assert_batches_eq!(upsert_expected_result, &duckdb_file_upsert_data);
     assert_batches_eq!(drop_expected_result, &duckdb_file_drop_data);
+    assert_batches_eq!(upsert_expected_result, &sqlite_mem_upsert_data);
+    assert_batches_eq!(drop_expected_result, &sqlite_mem_drop_data);
+    assert_batches_eq!(upsert_expected_result, &sqlite_file_upsert_data);
+    assert_batches_eq!(drop_expected_result, &sqlite_file_drop_data);
 
     running_container.remove().await?;
     std::fs::remove_file(&duckdb_upsert_file_path).expect("File should be removed");
     std::fs::remove_file(&duckdb_drop_file_path).expect("File should be removed");
+    std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
+    std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");
+    std::fs::remove_file(&format!("{sqlite_upsert_file_path}-shm"))
+        .expect("File should be removed");
+    std::fs::remove_file(&format!("{sqlite_upsert_file_path}-wal"))
+        .expect("File should be removed");
+    std::fs::remove_file(&format!("{sqlite_drop_file_path}-shm")).expect("File should be removed");
+    std::fs::remove_file(&format!("{sqlite_drop_file_path}-wal")).expect("File should be removed");
 
     Ok(())
 }
@@ -284,13 +374,14 @@ fn create_postgres_test_dataset(
     dataset
 }
 
-fn create_duckdb_test_dataset(
+fn create_sqlite_or_duckdb_test_dataset(
     on_conflict: OnConflictBehavior,
     from: &str,
     name: &str,
-    duckdb_file: Option<String>,
+    file: Option<String>,
     port: usize,
     mode: Mode,
+    engine: &str,
 ) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(get_pg_params(port));
@@ -301,10 +392,10 @@ fn create_duckdb_test_dataset(
         .unwrap_or_default();
 
     dataset.acceleration = Some(Acceleration {
-        params: get_duckdb_params(&mode, duckdb_file),
+        params: get_params(&mode, file, engine),
         mode,
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some(engine.to_string()),
         refresh_mode: Some(RefreshMode::Append),
         refresh_check_interval: Some("1s".to_string()),
         primary_key: Some("event_id".to_string()),
@@ -331,10 +422,11 @@ fn get_pg_params(port: usize) -> Params {
     )
 }
 
-fn get_duckdb_params(mode: &Mode, duckdb_file: Option<String>) -> Option<Params> {
+fn get_params(mode: &Mode, sqlite_file: Option<String>, engine: &str) -> Option<Params> {
+    let param_name = format!("{engine}_file",);
     if mode == &Mode::File {
         return Some(Params::from_string_map(
-            vec![("duckdb_file".to_string(), duckdb_file.unwrap_or_default())]
+            vec![(param_name, sqlite_file.unwrap_or_default())]
                 .into_iter()
                 .collect(),
         ));
@@ -350,5 +442,5 @@ fn random_db_name() -> String {
         name.push(rng.gen_range(b'a'..=b'z') as char);
     }
 
-    format!("./{name}.duckdb")
+    format!("./{name}.db")
 }
