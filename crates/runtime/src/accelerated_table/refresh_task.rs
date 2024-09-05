@@ -90,7 +90,6 @@ impl RefreshTask {
         Self {
             dataset_name,
             federated,
-            // refresh,
             accelerator,
         }
     }
@@ -156,9 +155,9 @@ impl RefreshTask {
         Ok(())
     }
 
-    pub async fn run(&self, request: Refresh) -> super::Result<()> {
-        let max_retries = if request.refresh_retry_enabled {
-            request.refresh_retry_max_attempts
+    pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
+        let max_retries = if refresh.refresh_retry_enabled {
+            refresh.refresh_retry_max_attempts
         } else {
             Some(0)
         };
@@ -171,7 +170,7 @@ impl RefreshTask {
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
         retry(retry_strategy, || async {
-            self.run_once(&request).await.map_err(|err| {
+            self.run_once(&refresh).await.map_err(|err| {
                 let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
                 err
