@@ -47,7 +47,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 |                            | Spice                              | Trino/Presto                     | Dremio                           | Clickhouse              |
 | -------------------------- | ---------------------------------- | -------------------------------- | -------------------------------- | ----------------------- |
-| Primary Use-Case           | Data & AI Applications             | Big Data Analytics               | Interative Analytics             | Real-Time Analytics     |
+| Primary Use-Case           | Data & AI Applications             | Big Data Analytics               | Interactive Analytics            | Real-Time Analytics     |
 | Typical Deployment         | Colocated with application         | Cloud Cluster                    | Cloud Cluster                    | On-Prem/Cloud Cluster   |
 | Application-to-Data System | One-to-One/Many                    | Many-to-One                      | Many-to-One                      | Many-to-One             |
 | Query Federation           | Native with query push-down        | Supported with push-down         | Supported with limited push-down | Limited                 |
