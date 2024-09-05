@@ -354,7 +354,7 @@ impl Refresher {
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
-        //   1. The manual refresh [`Reciever`] channel `on_start_refresh_external`
+        //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
         //   2. The sleep [`future`] `scheduled_refresh_future`.
         //
         // Doing it in this way stops
@@ -451,7 +451,6 @@ impl Refresher {
         let refresh_task = Arc::new(RefreshTask::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            // Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
 

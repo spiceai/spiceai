@@ -29,7 +29,7 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 
 use super::refresh::Refresh;
 
-/// `RefreshTaskRunner` is responsible for running the refresh task for a dataset. It is expected
+/// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
 /// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
 /// refreshing an `accelerator`.
 pub struct RefreshTaskRunner {
@@ -57,7 +57,6 @@ impl RefreshTaskRunner {
         }
     }
 
-    /// This is the meat and potatoes of refreshing a dataset.
     pub fn start(
         &mut self,
     ) -> (
@@ -105,11 +104,14 @@ impl RefreshTaskRunner {
 
                         overrides_msg = on_start_refresh.recv() => {
                             if let Some(overrides_opt) = overrides_msg {
-                                let mut r = base_refresh.read().await.clone();
-                                if let Some(overrides) = overrides_opt {
-                                    r = r.with_overrides(&overrides);
-                                }
-                                task_completion = Some(Box::pin(refresh_task.run(r)));
+                                let request = {
+                                    let mut r = base_refresh.read().await.clone();
+                                    if let Some(overrides) = overrides_opt {
+                                        r = r.with_overrides(&overrides);
+                                    }
+                                    r
+                                };
+                                task_completion = Some(Box::pin(refresh_task.run(request)));
                             }
                         }
                     }
@@ -117,11 +119,8 @@ impl RefreshTaskRunner {
                     select! {
                         overrides_msg = on_start_refresh.recv() => {
                             if let Some(overrides_opt) = overrides_msg {
-                                let mut r = base_refresh.read().await.clone();
-                                if let Some(overrides) = overrides_opt {
-                                    r = r.with_overrides(&overrides);
-                                }
-                                task_completion = Some(Box::pin(refresh_task.run(r)));
+                                let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                                task_completion = Some(Box::pin(refresh_task.run(request)));
                             }
                         }
                     }
@@ -130,6 +129,18 @@ impl RefreshTaskRunner {
         }));
 
         (start_refresh, on_refresh_complete)
+    }
+
+    /// Create a new [`Refresh`] based on defaults and overrides.
+    async fn create_refresh_from_overrides(
+        defaults: Arc<RwLock<Refresh>>,
+        overrides_opt: Option<RefreshOverrides>,
+    ) -> Refresh {
+        let mut r = defaults.read().await.clone();
+        if let Some(overrides) = overrides_opt {
+            r = r.with_overrides(&overrides);
+        }
+        r
     }
 
     pub fn abort(&mut self) {

@@ -134,7 +134,7 @@ pub struct AcceleratedTable {
     dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
-    refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>, // Option<Refresh>
+    refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     handlers: Vec<JoinHandle<()>>,
@@ -301,7 +301,6 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
 
-        // Due to `acceleration_refresh_mode`, this is where we fix the refresher to full vs append.
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
             .await;

@@ -67,7 +67,6 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
         .await
         .clone();
 
-    // traces_accelerated_table.refresh_params(),
     let refresh_task = Arc::new(RefreshTask::new(
         "traces".into(),
         Arc::clone(&traces_accelerated_table.get_federated_table()),
