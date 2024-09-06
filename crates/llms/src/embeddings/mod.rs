@@ -56,11 +56,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait Embed: Sync + Send {
-    async fn embed(&mut self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.
     /// Default implementation is a basic call to [`embed()`].
-    async fn health(&mut self) -> Result<()> {
+    async fn health(&self) -> Result<()> {
         self.embed(EmbeddingInput::String("health".to_string()))
             .await
             .boxed()
@@ -75,7 +75,7 @@ pub trait Embed: Sync + Send {
     /// implementation will be constructed based on the trait's [`embed`] method.
     #[allow(clippy::cast_possible_truncation)]
     async fn embed_request(
-        &mut self,
+        &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let result = self.embed(req.input).await.map_err(|e| {

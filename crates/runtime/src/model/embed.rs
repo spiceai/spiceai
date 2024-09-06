@@ -20,9 +20,8 @@ use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
 use std::collections::HashMap;
 use std::path::Path;
 use std::result::Result;
-use tokio::sync::RwLock;
 
-pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
+pub type EmbeddingModelStore = HashMap<String, Box<dyn Embed>>;
 
 pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::embeddings::Embeddings,
