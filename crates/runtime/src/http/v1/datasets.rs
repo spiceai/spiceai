@@ -15,7 +15,9 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use crate::{component::dataset::Dataset, LogErrors, Runtime};
+use crate::{
+    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset, LogErrors, Runtime,
+};
 use app::App;
 use axum::{
     extract::Path,
@@ -125,6 +127,7 @@ pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
+    overrides_opt: Option<Json<RefreshOverrides>>,
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
@@ -157,7 +160,13 @@ pub(crate) async fn refresh(
             .into_response();
     };
 
-    match df.refresh_table(&dataset.name).await {
+    match df
+        .refresh_table(
+            &dataset.name,
+            overrides_opt.map(|Json(overrides)| overrides),
+        )
+        .await
+    {
         Ok(()) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {
