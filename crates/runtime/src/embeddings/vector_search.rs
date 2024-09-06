@@ -500,8 +500,6 @@ impl VectorSearch {
             .ok_or(Error::EmbeddingModelNotFound {
                 model_name: embedding_model.to_string(),
             })?
-            .write()
-            .await
             .embed(EmbeddingInput::String(input.to_string()))
             .await
             .boxed()
