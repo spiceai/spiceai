@@ -308,12 +308,10 @@ WHERE event_name = 'File Download'
     std::fs::remove_file(&duckdb_drop_file_path).expect("File should be removed");
     std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
     std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");
-    std::fs::remove_file(&format!("{sqlite_upsert_file_path}-shm"))
-        .expect("File should be removed");
-    std::fs::remove_file(&format!("{sqlite_upsert_file_path}-wal"))
-        .expect("File should be removed");
-    std::fs::remove_file(&format!("{sqlite_drop_file_path}-shm")).expect("File should be removed");
-    std::fs::remove_file(&format!("{sqlite_drop_file_path}-wal")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_upsert_file_path}-shm")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_upsert_file_path}-wal")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_drop_file_path}-shm")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_drop_file_path}-wal")).expect("File should be removed");
 
     Ok(())
 }

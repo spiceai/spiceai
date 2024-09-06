@@ -170,10 +170,9 @@ impl RefreshTask {
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
         retry(retry_strategy, || async {
-            self.run_once(&refresh).await.map_err(|err| {
+            self.run_once(&refresh).await.inspect_err(|_err| {
                 let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
-                err
             })
         })
         .instrument(span.clone())
