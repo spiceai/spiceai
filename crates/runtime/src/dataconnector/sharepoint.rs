@@ -166,7 +166,6 @@ impl DataConnectorFactory for SharepointFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let s = Sharepoint::new(&params)?;
-            println!("Sharepoint health: {:#?}", s.health().await);
             Ok(Arc::new(s) as Arc<dyn DataConnector>)
         })
     }

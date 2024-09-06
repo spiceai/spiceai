@@ -36,7 +36,7 @@ use axum::{
 };
 use tokio::{sync::RwLock, time::Instant};
 
-use super::{metrics, redirect, v1};
+use super::{metrics, v1};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routes(
@@ -51,7 +51,6 @@ pub(crate) fn routes(
 ) -> Router {
     let mut router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
-        .route("/redirect/:service", get(redirect::get))
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))

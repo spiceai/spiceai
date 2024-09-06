@@ -41,7 +41,6 @@ use crate::{
 };
 
 mod metrics;
-mod redirect;
 mod routes;
 mod v1;
 

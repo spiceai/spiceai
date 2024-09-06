@@ -92,7 +92,6 @@ pub enum DriveItemPtr {
 /// the expected format or contains an unknown `drive_type` or `item_type`.
 ///
 /// # Example Formats
-///
 /// - `"sharepoint:drive:b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd/id:01KLLPFP5RRWHNEMUG75BKNGSRXGDRL5C4"`
 /// - `"sharepoint:me/root"`
 /// - `"sharepoint:user:48d31887-5fad-4d73-a9f5-3c356e68a038/path:/documents/reports"`
@@ -216,8 +215,6 @@ struct SharepointListExec {
     client: Arc<GraphClient>,
     drive: DrivePtr,
     drive_item: DriveItemPtr,
-
-    /// If schema has `DRIVE_ITEM_FILE_CONTENT_COLUMN`, then we download the file content.
     schema: SchemaRef,
     properties: PlanProperties,
     limit: Option<usize>,
@@ -238,7 +235,6 @@ impl SharepointListExec {
             Partitioning::UnknownPartitioning(1),
             ExecutionMode::Bounded,
         );
-        println!("projectedschema: {projected_schema:#?}\nschema: {schema:#?}, but my projection: {projections:#?}");
 
         Ok(Self {
             client,
@@ -263,8 +259,9 @@ impl SharepointListExec {
                 DriveItemPtr::ItemPath(path) => {
                     client.item_by_path(format!(":{path}:")).list_children()
                 }
-                DriveItemPtr::Root => client.item_by_path("").list_children(),
+                DriveItemPtr::Root => client.items().list_items(),
             },
+
             DriveApi::Default(client) => match &self.drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),
                 DriveItemPtr::ItemPath(path) => {
@@ -385,10 +382,6 @@ impl ExecutionPlan for SharepointListExec {
             .schema()
             .index_of(DRIVE_ITEM_FILE_CONTENT_COLUMN)
             .is_ok();
-        println!(
-            "include_file_content={include_file_content}, but Schema={:#?}",
-            self.schema(),
-        );
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
             self.process_list_drive_items(include_file_content)?,
@@ -424,7 +417,6 @@ async fn response_to_record_with_file_content(
     resp: &DriveItemResponse,
     include_file_content: bool,
 ) -> Result<RecordBatch, ArrowError> {
-    println!("Am i going to download file content? include_file_content={include_file_content}");
     let item_content = if include_file_content {
         let mut content: Vec<String> = Vec::with_capacity(resp.value.len());
         for item in &resp.value {
