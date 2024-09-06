@@ -79,6 +79,13 @@ pub struct RefreshOverrides {
 
     #[serde(rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
+
+    #[serde(default = "is_true")]
+    is_manual: bool,
+}
+
+fn is_true() -> bool {
+    true
 }
 
 impl Refresh {
@@ -147,6 +154,11 @@ impl Refresh {
         }
         if let Some(mode) = overrides.mode {
             self.mode = mode;
+        }
+
+        // If the refresh is manual, not incrementally adding the latest data. The refresh is adding a specific set of data into the dataset.
+        if overrides.is_manual {
+            self.time_column = None;
         }
         self
     }

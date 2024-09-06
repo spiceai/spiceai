@@ -348,6 +348,7 @@ impl RefreshTask {
         }
         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
+
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
             if let Some(timestamp) = overwrite_timestamp_in_nano {
@@ -508,6 +509,11 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
+        tracing::debug!(
+            "Getting data for update. dataset_name: {dataset_name:?}, sql={:#?}, filters={:#?}",
+            refresh.sql,
+            filters
+        );
         let get_data_result = get_data(
             &mut ctx,
             dataset_name.clone(),
@@ -656,13 +662,9 @@ impl RefreshTask {
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
             .context(super::InvalidTimeColumnTimeFormatSnafu)?;
 
-        let column =
-            refresh
-                .time_column
-                .clone()
-                .context(super::FailedToFindLatestTimestampSnafu {
-                    reason: "Failed to get latest timestamp due to time column not specified",
-                })?;
+        let Some(column) = refresh.time_column.clone() else {
+            return Ok(None);
+        };
 
         let df = self
             .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
