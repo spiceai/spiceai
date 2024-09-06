@@ -46,7 +46,7 @@ pub(crate) async fn post(
         match llms.read().await.get(&model_id) {
             Some(model) => {
                 if req.stream.unwrap_or_default() {
-                    match model.write().await.chat_stream(req).await {
+                    match model.chat_stream(req).await {
                         Ok(strm) => {
                             create_sse_response(strm, time::Duration::from_secs(30), span_clone)
                         }
@@ -57,7 +57,7 @@ pub(crate) async fn post(
                         }
                     }
                 } else {
-                    match model.write().await.chat_request(req).await {
+                    match model.chat_request(req).await {
                         Ok(response) => {
                             let preview = response
                                 .choices
