@@ -109,7 +109,7 @@ pub(crate) async fn post(
                 )
                     .into_response();
             };
-            match nql_model.write().await.chat_request(req).await {
+            match nql_model.chat_request(req).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Error running NQL model: {e}");

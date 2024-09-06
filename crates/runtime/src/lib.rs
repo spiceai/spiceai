@@ -1232,7 +1232,7 @@ impl Runtime {
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
 
-        let mut l = try_to_embedding(in_embed, &params_with_secrets)
+        let l = try_to_embedding(in_embed, &params_with_secrets)
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()
@@ -1253,7 +1253,7 @@ impl Runtime {
                         let mut embeds_map = self.embeds.write().await;
 
                         let m = Box::new(TaskEmbed::new(e)) as Box<dyn Embed>;
-                        embeds_map.insert(in_embed.name.clone(), m.into());
+                        embeds_map.insert(in_embed.name.clone(), m);
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
                         metrics::embeddings::COUNT.add(
@@ -1375,7 +1375,7 @@ impl Runtime {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok(l) => {
                     let mut llm_map = self.llms.write().await;
-                    llm_map.insert(m.name.clone(), l.into());
+                    llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
                 Err(e) => Err(format!(
