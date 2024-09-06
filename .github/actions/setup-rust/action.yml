@@ -34,10 +34,10 @@ runs:
       if: inputs.os != 'windows'
       shell: bash
       run: |
-        rustup toolchain install 1.81.0
+        rustup toolchain install stable
 
     - name: Install latest Rust stable toolchain (Windows)
       if: inputs.os == 'windows'
       shell: pwsh
       run: |
-        rustup toolchain install 1.81.0
+        rustup toolchain install stable
