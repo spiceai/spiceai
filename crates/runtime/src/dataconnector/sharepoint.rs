@@ -48,15 +48,6 @@ pub enum Error {
 
     #[snafu(display("Missing redirect url parameter: {url}"))]
     InvalidRedirectUrlError { url: String },
-
-    #[snafu(display("Could not construct authorization url for sharepoint OAuth2: {source}"))]
-    AuthorizationUrlError {
-        source: graph_rs_sdk::error::AuthorizationFailure,
-    },
-
-    /// Error when user hasn't clicked authorisation URL yet. If this error occurs, can still be valid on retry.
-    #[snafu(display("No authorisation code yet available to access sharepoint data"))]
-    AuthorizationCodeError {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -88,6 +79,7 @@ impl Sharepoint {
                     .build(),
             ),
             (None, Some(authorization_code)) => {
+                // Must match the redirect URL used in `spice login sharepoint...`.
                 let redirect_url = Url::parse("http://localhost:8091")
                     .boxed()
                     .context(InvalidParametersSnafu)?;
@@ -119,22 +111,6 @@ impl Sharepoint {
             client: Arc::new(graph_client),
         })
     }
-
-    pub async fn health(&self) -> std::result::Result<String, String> {
-        let u = self
-            .client
-            .me()
-            .get_user()
-            .send()
-            .await
-            .map_err(|e| format!("{e:#?}").to_string())?;
-
-        let resp = u
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(resp.to_string())
-    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -164,10 +140,7 @@ impl DataConnectorFactory for SharepointFactory {
         &self,
         params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            let s = Sharepoint::new(&params)?;
-            Ok(Arc::new(s) as Arc<dyn DataConnector>)
-        })
+        Box::pin(async move { Ok(Arc::new(Sharepoint::new(&params)?) as Arc<dyn DataConnector>) })
     }
 
     fn prefix(&self) -> &'static str {

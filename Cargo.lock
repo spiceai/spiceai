@@ -4440,7 +4440,7 @@ dependencies = [
  "parking_lot 0.12.3",
  "percent-encoding",
  "remain",
- "reqwest 0.12.5",
+ "reqwest 0.12.7",
  "ring",
  "serde",
  "serde_json",
@@ -4461,7 +4461,7 @@ dependencies = [
  "http 1.1.0",
  "http-serde",
  "jsonwebtoken",
- "reqwest 0.12.5",
+ "reqwest 0.12.7",
  "ring",
  "serde",
  "serde_json",
@@ -4486,7 +4486,7 @@ dependencies = [
  "handlebars 2.0.4",
  "http 1.1.0",
  "percent-encoding",
- "reqwest 0.12.5",
+ "reqwest 0.12.7",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -4510,7 +4510,7 @@ dependencies = [
  "http 1.1.0",
  "jsonwebtoken",
  "lazy_static",
- "reqwest 0.12.5",
+ "reqwest 0.12.7",
  "serde",
  "serde-aux",
  "serde_json",
@@ -4534,7 +4534,7 @@ dependencies = [
  "graph-oauth",
  "handlebars 2.0.4",
  "lazy_static",
- "reqwest 0.12.5",
+ "reqwest 0.12.7",
  "serde",
  "serde_json",
  "url",
@@ -8308,7 +8308,7 @@ checksum = "46aef80f842736de545ada6ec65b81ee91504efd6853f4b96de7414c42ae7443"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.74",
+ "syn 2.0.77",
 ]
 
 [[package]]
@@ -11852,7 +11852,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.77",
- "synstructure",
+ "synstructure 0.13.1",
 ]
 
 [[package]]
@@ -11966,7 +11966,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.77",
- "synstructure",
+ "synstructure 0.13.1",
 ]
 
 [[package]]

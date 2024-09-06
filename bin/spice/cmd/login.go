@@ -257,7 +257,7 @@ var sharepointCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		auth_code, err := msal.GetAuthCode(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read"})
+		auth_code, err := msal.InteractivelyGetAuthCode(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read"})
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)

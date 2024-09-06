@@ -46,7 +46,9 @@ use snafu::ResultExt;
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
 
 use super::{
-    drive_items::{drive_item_table_schema, DriveItemResponse, DRIVE_ITEM_FILE_CONTENT_COLUMN},
+    drive_items::{
+        drive_item_table_schema, DriveItem, DriveItemResponse, DRIVE_ITEM_FILE_CONTENT_COLUMN,
+    },
     error::Error,
 };
 
@@ -95,7 +97,6 @@ pub enum DriveItemPtr {
 /// - `"sharepoint:drive:b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd/id:01KLLPFP5RRWHNEMUG75BKNGSRXGDRL5C4"`
 /// - `"sharepoint:me/root"`
 /// - `"sharepoint:user:48d31887-5fad-4d73-a9f5-3c356e68a038/path:/documents/reports"`
-/// ```
 pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
     let (drive, item) = from
         .trim_start_matches("sharepoint:")
@@ -144,6 +145,7 @@ pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
     Ok((drive_ptr, item_ptr))
 }
 
+/// Possible Microsoft Graph API endpoints to retrieve drive items, determined by the `DrivePtr` variant.
 enum DriveApi {
     Id(DrivesIdApiClient),
     Default(DefaultDriveApiClient),
@@ -246,7 +248,8 @@ impl SharepointListExec {
         })
     }
 
-    fn list_from_path(
+    /// Streams [`DriveItemResponse`] from the Microsoft Graph API for the [`SharepointListExec`]'s selected drive and drive item.
+    fn stream_drive_items(
         &self,
     ) -> Result<
         impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,
@@ -284,12 +287,15 @@ impl SharepointListExec {
         req.paging().stream::<DriveItemResponse>()
     }
 
-    fn process_list_drive_items(
+    /// Returns the drive items, converted into a stream of [`RecordBatch`]s.
+    /// If `include_file_content`, the file content for each drive item is downloaded and included
+    /// under the `DRIVE_ITEM_FILE_CONTENT_COLUMN` column.
+    fn create_record_stream(
         &self,
         include_file_content: bool,
     ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>>> {
         let mut resp_stream = self
-            .list_from_path()
+            .stream_drive_items()
             .boxed()
             .map_err(DataFusionError::External)?;
 
@@ -307,8 +313,19 @@ impl SharepointListExec {
                 };
 
                 match response.body() {
-                    Ok(drive_item) => {
-                        match response_to_record_with_file_content(Arc::clone(&graph), &drive, drive_item, include_file_content).await {
+                    Ok(drive_items) => {
+                        let content = if include_file_content {
+                            match get_file_content(Arc::clone(&graph), &drive, &drive_items.value).await {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    yield Err(DataFusionError::External(Box::new(e)));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        match drive_items_to_record_batch(&drive_items.value, content) {
                             Ok(record_batch) => yield Ok(record_batch),
                             Err(e) => yield Err(DataFusionError::External(Box::new(e))),
                         }
@@ -319,7 +336,8 @@ impl SharepointListExec {
         })
     }
 
-    async fn get_file(
+    /// Returns the underlying content of a drive item.
+    async fn get_drive_item_content(
         graph: &Arc<GraphClient>,
         drive: &DrivePtr,
         item_id: &str,
@@ -334,6 +352,7 @@ impl SharepointListExec {
         resp.text().await.map_err(GraphFailure::ReqwestError)
     }
 
+    /// Returns the appropriate [`DriveApi`] for the given [`DrivePtr`].
     fn drive_client(graph: &Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
         match drive {
             DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
@@ -384,7 +403,7 @@ impl ExecutionPlan for SharepointListExec {
             .is_ok();
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
-            self.process_list_drive_items(include_file_content)?,
+            self.create_record_stream(include_file_content)?,
         );
 
         Ok(Box::pin(stream_adapter))
@@ -411,26 +430,20 @@ impl DisplayAs for SharepointListExec {
     }
 }
 
-async fn response_to_record_with_file_content(
+/// Downloads the file content for each drive item. Assumes that each fiel in `items` is in the `drive`.
+async fn get_file_content(
     graph: Arc<GraphClient>,
     drive: &DrivePtr,
-    resp: &DriveItemResponse,
-    include_file_content: bool,
-) -> Result<RecordBatch, ArrowError> {
-    let item_content = if include_file_content {
-        let mut content: Vec<String> = Vec::with_capacity(resp.value.len());
-        for item in &resp.value {
-            let file = SharepointListExec::get_file(&graph, drive, &item.id)
-                .await
-                .boxed()
-                .map_err(ArrowError::ExternalError)?;
+    items: &[DriveItem],
+) -> Result<Vec<String>, ArrowError> {
+    let mut content: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let file = SharepointListExec::get_drive_item_content(&graph, drive, &item.id)
+            .await
+            .boxed()
+            .map_err(ArrowError::ExternalError)?;
 
-            content.push(file);
-        }
-        Some(content)
-    } else {
-        None
-    };
-
-    drive_items_to_record_batch(&resp.value, item_content)
+        content.push(file);
+    }
+    Ok(content)
 }

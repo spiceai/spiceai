@@ -26,7 +26,12 @@ import (
 	"github.com/pkg/browser"
 )
 
-func GetAuthCode(ctx context.Context, tenantId string, clientId string, scopes []string) (string, error) {
+// A function that triggers the user's browser to be directed to an interactive OAuth2.0 authorization.
+// The user will be prompted to login and authorize the application to access the requested scopes.
+// The function will block until the user has completed the authorization and the authorization code has been received. It is intended to be used in a CLI environment where the user can be directed to a browser.
+//
+// This function will temporarily start a local server on `:8091`.
+func InteractivelyGetAuthCode(ctx context.Context, tenantId string, clientId string, scopes []string) (string, error) {
 	publicClient, err := public.New(clientId)
 	if err != nil {
 		return "", fmt.Errorf("error creating public client: %w", err)
