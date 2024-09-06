@@ -31,7 +31,6 @@ use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing_futures::Instrument;
 
 use super::tool_use::ToolUsingChat;
@@ -40,7 +39,7 @@ use crate::{
     Runtime,
 };
 
-pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Chat>>>;
+pub type LLMModelStore = HashMap<String, Box<dyn Chat>>;
 
 /// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
 pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
