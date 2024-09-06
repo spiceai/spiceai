@@ -113,7 +113,7 @@ impl CandleEmbedding {
 
 #[async_trait]
 impl Embed for CandleEmbedding {
-    async fn embed(&mut self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
         let add_special_tokens = true;
 
         let encodings: Vec<Encoding> = match input {
