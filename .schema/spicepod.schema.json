@@ -3,11 +3,7 @@
   "title": "Spicepod Definition",
   "description": "A Spicepod definition is a YAML file that describes a Spicepod.",
   "type": "object",
-  "required": [
-    "kind",
-    "name",
-    "version"
-  ],
+  "required": ["kind", "name", "version"],
   "properties": {
     "catalogs": {
       "type": "array",
@@ -120,10 +116,7 @@
           "type": "boolean"
         },
         "engine": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "indexes": {
           "type": "object",
@@ -164,28 +157,16 @@
           ]
         },
         "primary_key": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "refresh_append_overlap": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "refresh_check_interval": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "refresh_data_window": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "refresh_mode": {
           "anyOf": [
@@ -202,42 +183,27 @@
           "type": "boolean"
         },
         "refresh_retry_max_attempts": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "uint",
           "minimum": 0.0
         },
         "refresh_sql": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "retention_check_enabled": {
           "type": "boolean"
         },
         "retention_check_interval": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "retention_period": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       }
     },
     "Catalog": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
+      "required": ["from", "name"],
       "properties": {
         "dataset_params": {
           "anyOf": [
@@ -256,10 +222,7 @@
           }
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "from": {
           "type": "string"
@@ -292,18 +255,13 @@
     "ColumnEmbeddingConfig": {
       "description": "Configuration for if and how a dataset's column should be embedded.",
       "type": "object",
-      "required": [
-        "column"
-      ],
+      "required": ["column"],
       "properties": {
         "column": {
           "type": "string"
         },
         "column_pk": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
@@ -376,9 +334,7 @@
     },
     "ComponentReference": {
       "type": "object",
-      "required": [
-        "ref"
-      ],
+      "required": ["ref"],
       "properties": {
         "dependsOn": {
           "type": "array",
@@ -393,9 +349,7 @@
     },
     "Dataset": {
       "type": "object",
-      "required": [
-        "name"
-      ],
+      "required": ["name"],
       "properties": {
         "acceleration": {
           "anyOf": [
@@ -414,10 +368,7 @@
           }
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "embeddings": {
           "type": "array",
@@ -429,10 +380,7 @@
           "type": "string"
         },
         "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "metadata": {
           "type": "object",
@@ -470,10 +418,7 @@
           ]
         },
         "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "time_format": {
           "anyOf": [
@@ -489,10 +434,7 @@
     },
     "Embeddings": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
+      "required": ["from", "name"],
       "properties": {
         "datasets": {
           "type": "array",
@@ -543,31 +485,19 @@
     },
     "IndexType": {
       "type": "string",
-      "enum": [
-        "enabled",
-        "unique"
-      ]
+      "enum": ["enabled", "unique"]
     },
     "Mode": {
       "type": "string",
-      "enum": [
-        "read",
-        "read_write"
-      ]
+      "enum": ["read", "read_write"]
     },
     "Mode2": {
       "type": "string",
-      "enum": [
-        "memory",
-        "file"
-      ]
+      "enum": ["memory", "file"]
     },
     "Model": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
+      "required": ["from", "name"],
       "properties": {
         "datasets": {
           "type": "array",
@@ -582,10 +512,7 @@
           }
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "files": {
           "type": "array",
@@ -611,15 +538,10 @@
     },
     "ModelFile": {
       "type": "object",
-      "required": [
-        "path"
-      ],
+      "required": ["path"],
       "properties": {
         "name": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "path": {
           "type": "string"
@@ -639,19 +561,11 @@
     },
     "ModelFileType": {
       "type": "string",
-      "enum": [
-        "weights",
-        "config",
-        "tokenizer",
-        "tokenizerConfig"
-      ]
+      "enum": ["weights", "config", "tokenizer", "tokenizerConfig"]
     },
     "OnConflictBehavior": {
       "type": "string",
-      "enum": [
-        "drop",
-        "upsert"
-      ]
+      "enum": ["drop", "upsert"]
     },
     "ParamValue": {
       "anyOf": [
@@ -676,11 +590,7 @@
     },
     "RefreshMode": {
       "type": "string",
-      "enum": [
-        "full",
-        "append",
-        "changes"
-      ]
+      "enum": ["full", "append", "changes"]
     },
     "Replication": {
       "type": "object",
@@ -695,26 +605,17 @@
       "type": "object",
       "properties": {
         "cache_max_size": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "enabled": {
           "default": true,
           "type": "boolean"
         },
         "eviction_policy": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "item_ttl": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       }
     },
@@ -722,10 +623,7 @@
       "type": "object",
       "properties": {
         "num_of_parallel_loading_at_start_up": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "uint",
           "minimum": 0.0
         },
@@ -778,16 +676,10 @@
     "Secret": {
       "description": "The secrets configuration for a Spicepod.\n\nExample: ```yaml secrets: - from: env name: env - from: kubernetes:my_secret_name name: k8s ```",
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
+      "required": ["from", "name"],
       "properties": {
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "from": {
           "type": "string"
@@ -809,21 +701,15 @@
     },
     "SpicepodKind": {
       "type": "string",
-      "enum": [
-        "Spicepod"
-      ]
+      "enum": ["Spicepod"]
     },
     "SpicepodVersion": {
       "type": "string",
-      "enum": [
-        "v1beta1"
-      ]
+      "enum": ["v1beta1"]
     },
     "TelemetryConfig": {
       "type": "object",
-      "required": [
-        "enabled"
-      ],
+      "required": ["enabled"],
       "properties": {
         "enabled": {
           "type": "boolean"
@@ -838,28 +724,20 @@
         "timestamptz",
         "unix_seconds",
         "unix_millis",
-        "ISO8601"
+        "iso8601"
       ]
     },
     "TlsConfig": {
       "type": "object",
-      "required": [
-        "enabled"
-      ],
+      "required": ["enabled"],
       "properties": {
         "certificate": {
           "description": "A PEM encoded certificate",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "certificate_file": {
           "description": "A filesystem path to a file containing the PEM encoded certificate",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "enabled": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
@@ -867,27 +745,18 @@
         },
         "key": {
           "description": "A PEM encoded private key",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "key_file": {
           "description": "A filesystem path to a file containing the PEM encoded private key",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false
     },
     "Tool": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
+      "required": ["from", "name"],
       "properties": {
         "dependsOn": {
           "type": "array",
@@ -896,10 +765,7 @@
           }
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "from": {
           "type": "string"
@@ -917,27 +783,20 @@
     },
     "TracingConfig": {
       "type": "object",
-      "required": [
-        "zipkin_enabled"
-      ],
+      "required": ["zipkin_enabled"],
       "properties": {
         "zipkin_enabled": {
           "type": "boolean"
         },
         "zipkin_endpoint": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false
     },
     "View": {
       "type": "object",
-      "required": [
-        "name"
-      ],
+      "required": ["name"],
       "properties": {
         "dependsOn": {
           "type": "array",
@@ -946,10 +805,7 @@
           }
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "metadata": {
           "type": "object",
@@ -960,17 +816,11 @@
         },
         "sql": {
           "description": "Inline SQL that describes a view.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "sql_ref": {
           "description": "Reference to a SQL file that describes a view.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       }
     },
@@ -980,16 +830,12 @@
         {
           "description": "Return an empty result set. This is the default.",
           "type": "string",
-          "enum": [
-            "return_empty"
-          ]
+          "enum": ["return_empty"]
         },
         {
           "description": "Fallback to querying the source table.",
           "type": "string",
-          "enum": [
-            "use_source"
-          ]
+          "enum": ["use_source"]
         }
       ]
     }
