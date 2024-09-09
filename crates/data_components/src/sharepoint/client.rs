@@ -398,10 +398,13 @@ impl SharepointListExec {
                         };
                         match drive_items_to_record_batch(&drive_items.value, content) {
                             Ok(record_batch) => yield Ok(record_batch),
-                            Err(e) => yield Err(DataFusionError::External(Box::new(e))),
+                            Err(e) => yield Err(DataFusionError::ArrowError(e, None)),
                         }
                     },
-                    Err(e) => yield Err(DataFusionError::External(Box::new(e.clone()))),
+                    Err(e) => {
+                        tracing::debug!("Error fetching drive items. {:#?}", e);
+                        yield Err(DataFusionError::External(Box::new(e.clone())))
+                    },
                 }
             }
         })
