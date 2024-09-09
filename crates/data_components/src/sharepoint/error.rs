@@ -19,5 +19,19 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid drive format: {}", input))]
-    DriveFormatError { input: String },
+    InvalidDriveFormat { input: String },
+
+    #[snafu(display("Drive not found: {}", drive))]
+    DriveNotFound { drive: String },
+
+    #[snafu(display("Group not found: {}", group))]
+    GroupNotFound { group: String },
+
+    #[snafu(display("Site not found: {}", site))]
+    SiteNotFound { site: String },
+
+    #[snafu(display("Error interacting with Microsoft graph: {source}"))]
+    MicrosoftGraphFailure {
+        source: graph_rs_sdk::error::GraphFailure,
+    },
 }

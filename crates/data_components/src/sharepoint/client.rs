@@ -1,4 +1,3 @@
-use std::fmt;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -14,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
@@ -55,8 +54,13 @@ use super::{
 #[derive(Default, Debug, Clone, PartialEq)]
 pub enum DrivePtr {
     DriveId(String),
+    DriveName(String),
     UserId(String),
     GroupId(String),
+    GroupName(String),
+
+    SiteId(String),
+    SiteName(String),
 
     #[default]
     Me,
@@ -77,7 +81,7 @@ pub enum DriveItemPtr {
 /// The input string is expected to follow the format:
 /// `sharepoint:<drive_type>:<drive_id>/<item_type>:<item_value>`.
 ///
-/// - `<drive_type>` can be "me", "drive", "user", or "group".
+/// - `<drive_type>` can be "me", "drive", "driveId", "user", "group", "groupId", "site", or "siteId".
 /// - `<drive_id>` (optional) is a string identifier corresponding to the drive type. Only empty if `drive_type` is "me".
 /// - `<item_type>` can be "root", "item", or "path".
 /// - `<item_value>` is a string identifier or path corresponding to the item type. Only empty if `drive_type` is "root".
@@ -89,35 +93,41 @@ pub enum DriveItemPtr {
 ///
 /// # Errors
 ///
-/// This function will return an `Error::DriveFormatError` if the input string does not match
+/// This function will return an `Error::InvalidDriveFormat` if the input string does not match
 /// the expected format or contains an unknown `drive_type` or `item_type`.
 ///
 /// # Example Formats
-/// - `"sharepoint:drive:b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd/id:01KLLPFP5RRWHNEMUG75BKNGSRXGDRL5C4"`
+/// - `"sharepoint:driveId:b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd/id:01KLLPFP5RRWHNEMUG75BKNGSRXGDRL5C4"`
 /// - `"sharepoint:me/root"`
+/// - `"sharepoint:drive:Documents/path:/Documents"`
+/// - `"sharepoint:site:contoso.sharepoint.com/root"`
 /// - `"sharepoint:user:48d31887-5fad-4d73-a9f5-3c356e68a038/path:/documents/reports"`
 pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
     let (drive, item) = from
         .trim_start_matches("sharepoint:")
         .split_once('/')
-        .ok_or(Error::DriveFormatError {
+        .ok_or(Error::InvalidDriveFormat {
             input: from.to_string(),
         })?;
 
     let drive_ptr = match drive.split_once(':') {
         None => {
             if drive != "me" {
-                return Err(Error::DriveFormatError {
+                return Err(Error::InvalidDriveFormat {
                     input: drive.to_string(),
                 });
             };
             DrivePtr::Me
         }
-        Some(("drive", id)) => DrivePtr::DriveId(id.to_string()),
+        Some(("siteId", id)) => DrivePtr::SiteId(id.to_string()),
+        Some(("site", name)) => DrivePtr::SiteName(name.to_string()),
+        Some(("driveId", id)) => DrivePtr::DriveId(id.to_string()),
+        Some(("drive", name)) => DrivePtr::DriveName(name.to_string()),
         Some(("user", id)) => DrivePtr::UserId(id.to_string()),
-        Some(("group", id)) => DrivePtr::GroupId(id.to_string()),
+        Some(("groupId", id)) => DrivePtr::GroupId(id.to_string()),
+        Some(("group", name)) => DrivePtr::GroupName(name.to_string()),
         _ => {
-            return Err(Error::DriveFormatError {
+            return Err(Error::InvalidDriveFormat {
                 input: drive.to_string(),
             })
         }
@@ -126,7 +136,7 @@ pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
     let item_ptr = match item.split_once(':') {
         None => {
             if item != "root" {
-                return Err(Error::DriveFormatError {
+                return Err(Error::InvalidDriveFormat {
                     input: item.to_string(),
                 });
             };
@@ -135,7 +145,7 @@ pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
         Some(("id", id)) => DriveItemPtr::ItemId(id.to_string()),
         Some(("path", path)) => DriveItemPtr::ItemPath(path.to_string()),
         _ => {
-            return Err(Error::DriveFormatError {
+            return Err(Error::InvalidDriveFormat {
                 input: item.to_string(),
             })
         }
@@ -158,12 +168,74 @@ pub struct SharepointClient {
 }
 
 impl SharepointClient {
-    pub fn new(
+    pub async fn new(
         client: Arc<GraphClient>,
         from: &str,
         include_file_content: bool,
     ) -> Result<Self, Error> {
-        let (drive, drive_item) = parse_from(from)?;
+        let (mut drive, drive_item) = parse_from(from)?;
+
+        // Resolve Named `DrivePtr`s into their respective Id `DrivePtr`s.
+        if let DrivePtr::DriveName(d) = drive {
+            let drives = get_drive_items(Arc::clone(&client))
+                .await
+                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let Some(drive_id) = drives.get(&d) else {
+                tracing::warn!(
+                    "Drive with name '{}' is not found. Available drives: {}.",
+                    d,
+                    drives
+                        .keys()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                return Err(Error::DriveNotFound { drive: d });
+            };
+            tracing::debug!("drive_id: {:#?}.", drive_id);
+            drive = DrivePtr::DriveId(drive_id.to_string());
+        }
+
+        if let DrivePtr::GroupName(name) = drive {
+            let groups = get_group_items(Arc::clone(&client))
+                .await
+                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let Some(group_id) = groups.get(&name) else {
+                tracing::warn!(
+                    "Group with name '{}' is not found. Available groups: {}.",
+                    name,
+                    groups
+                        .keys()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                return Err(Error::GroupNotFound { group: name });
+            };
+            tracing::debug!("group_id: {:#?}.", group_id);
+            drive = DrivePtr::GroupId(group_id.to_string());
+        }
+
+        if let DrivePtr::SiteName(name) = drive {
+            let sites = get_site_items(Arc::clone(&client))
+                .await
+                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let Some(site_id) = sites.get(&name) else {
+                tracing::warn!(
+                    "Site with name '{}' is not found. Available sites: {}.",
+                    name,
+                    sites
+                        .keys()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                return Err(Error::SiteNotFound { site: name });
+            };
+            tracing::debug!("site_id: {:#?}.", site_id);
+            drive = DrivePtr::SiteId(site_id.to_string());
+        }
+
         Ok(Self {
             client,
             drive,
@@ -261,7 +333,8 @@ impl SharepointListExec {
                 DriveItemPtr::ItemPath(path) => {
                     client.item_by_path(format!(":{path}:")).list_children()
                 }
-                DriveItemPtr::Root => client.items().list_items(),
+                // "If this property [root] is non-null, it indicates that the driveItem is the top-most driveItem in the drive."
+                DriveItemPtr::Root => client.items().list_items().filter(&["root ne null"]),
             },
 
             DriveApi::Default(client) => match &self.drive_item {
@@ -310,7 +383,6 @@ impl SharepointListExec {
                         continue;
                     }
                 };
-
                 match response.body() {
                     Ok(drive_items) => {
                         let content = if include_file_content {
@@ -356,8 +428,12 @@ impl SharepointListExec {
         match drive {
             DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
             DrivePtr::UserId(user_id) => DriveApi::Default(graph.user(user_id).drive()),
-            DrivePtr::GroupId(_group_id) => unimplemented!("group id not supported"), // self.client.group(group_id).get_drive().url(),
+            DrivePtr::SiteId(site_id) => DriveApi::Default(graph.site(site_id).drive()),
             DrivePtr::Me => DriveApi::Default(graph.me().drive()),
+            DrivePtr::GroupId(_group_id) => unimplemented!("group id not supported"), // self.client.group(group_id).get_drive().url(),
+            DrivePtr::DriveName(_) => unimplemented!("drive names should be mapped to drive ids"),
+            DrivePtr::GroupName(_) => unimplemented!("group names should be mapped to group ids"),
+            DrivePtr::SiteName(_) => unimplemented!("site names should be mapped to site ids"),
         }
     }
 }
@@ -445,4 +521,92 @@ async fn get_file_content(
         content.push(file);
     }
     Ok(content)
+}
+
+/// Returns a mapping of drive ids to drive names.
+async fn get_drive_items(graph: Arc<GraphClient>) -> Result<HashMap<String, String>, GraphFailure> {
+    let resp = graph
+        .drives()
+        .list_drive()
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    process_list_objs(&resp)
+}
+
+/// Returns a mapping of group ids to group names.
+async fn get_group_items(graph: Arc<GraphClient>) -> Result<HashMap<String, String>, GraphFailure> {
+    let resp = graph
+        .groups()
+        .list_group()
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    process_list_objs(&resp)
+}
+
+/// Returns a mapping of drive ids to drive names.
+async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, String>, GraphFailure> {
+    let resp = graph
+        .sites()
+        .list_site()
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    process_list_objs(&resp)
+}
+
+/// Processes a list of objects returned by Microsoft Graph into a mapping of names to ids.
+/// Expected `resp` format (additional fields are ignored):
+/// ```json
+/// {
+///    "value": [
+///       { "name": "name1", "id": "id1" },
+///       { "name": "name2", "id": "id2" },
+///    ]
+/// }
+/// ```
+///
+/// Returns (success)
+/// ```rust
+/// Ok(HashMap<String, String> {
+///    "name1": "id1",
+///    "name2": "id2",
+/// })
+/// ```
+fn process_list_objs(resp: &serde_json::Value) -> Result<HashMap<String, String>, GraphFailure> {
+    if let Some(serde_json::Value::Array(objs)) = resp.get("value") {
+        let output = objs
+            .iter()
+            .filter_map(|v| {
+                let name = v.get("name").and_then(|n| n.as_str());
+                let id = v.get("id").and_then(|n| n.as_str());
+                if let (Some(name), Some(id)) = (name, id) {
+                    Some((name.to_string(), id.to_string()))
+                } else {
+                    tracing::debug!(
+                        "Unknown entry in list operation in Microsoft Graph. Response: {:#?}",
+                        v
+                    );
+                    None
+                }
+            })
+            .collect::<HashMap<String, String>>();
+        Ok(output)
+    } else {
+        tracing::debug!(
+            "Unknown entry in list operation in Microsoft Graph. Response: {:#?}",
+            resp
+        );
+        Err(GraphFailure::error_kind(
+            std::io::ErrorKind::InvalidData,
+            "Unexpected response from 'list operation in Microsoft Graph'",
+        ))
+    }
 }
