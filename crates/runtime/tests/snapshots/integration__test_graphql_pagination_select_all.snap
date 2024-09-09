@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT * FROM test_graphql"
+---
++---------------+--------------------------------------------------------+
+| plan_type     | plan                                                   |
++---------------+--------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                     |
+|               |   TableScan: test_graphql projection=[id, name, posts] |
+| physical_plan | BytesProcessedExec                                     |
+|               |   MemoryExec: partitions=2, partition_sizes=[2, 2]     |
+|               |                                                        |
++---------------+--------------------------------------------------------+
