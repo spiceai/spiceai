@@ -120,6 +120,7 @@ async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
 spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
+insta.workspace = true
 
 [features]
 aws-secrets-manager = [
