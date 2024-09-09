@@ -36,7 +36,7 @@ type DatasetRefreshApiResponse struct {
 }
 
 type DatasetRefreshApiRequest struct {
-	SQL  *string `json:"refresh_sql,omitempty"`
+	RefreshSQL  *string `json:"refresh_sql,omitempty"`
 	Mode *string `json:"refresh_mode,omitempty"`
 }
 
