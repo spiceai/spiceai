@@ -345,7 +345,7 @@ impl SharepointListExec {
             schema: projected_schema,
             properties,
             limit,
-            projections,
+            projections: projections.cloned(),
         })
     }
 
