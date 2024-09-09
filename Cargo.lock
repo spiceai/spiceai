@@ -524,7 +524,7 @@ name = "arrow_sql_gen"
 version = "0.18.0-beta"
 dependencies = [
  "arrow",
- "bigdecimal 0.4.5",
+ "bigdecimal",
  "chrono",
  "chrono-tz 0.8.6",
  "clickhouse-rs",
@@ -1547,17 +1547,6 @@ name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
-
-[[package]]
-name = "bigdecimal"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6773ddc0eafc0e509fb60e48dff7f450f8e674a0686ae8605e8d9901bd5eefa"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
-]
 
 [[package]]
 name = "bigdecimal"
@@ -2735,7 +2724,7 @@ dependencies = [
  "chrono",
  "clickhouse-rs",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.1.6",
  "datafusion-federation-sql",
  "datafusion-table-providers",
  "db_connection_pool",
@@ -2912,13 +2901,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-federation"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90ae6ae50c30b736bb18ab22f81841a9598d5acb248766027985dca299396c3d"
+dependencies = [
+ "arrow-json",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "futures",
+]
+
+[[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=b6682948d07cc3155edb3dfbf03f8b55570fc1d2#b6682948d07cc3155edb3dfbf03f8b55570fc1d2"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.1.6",
  "futures",
  "tokio",
  "tracing",
@@ -3128,7 +3130,6 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8a2610d13b5679ced583004207845156abc662e8#8a2610d13b5679ced583004207845156abc662e8"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3136,15 +3137,12 @@ dependencies = [
  "async-trait",
  "bb8",
  "bb8-postgres",
- "bigdecimal 0.3.1",
- "bigdecimal 0.4.5",
+ "bigdecimal",
  "byteorder",
  "chrono",
  "datafusion",
- "datafusion-federation",
- "datafusion-federation-sql",
+ "datafusion-federation 0.2.2",
  "duckdb",
- "dyn-clone",
  "fallible-iterator 0.3.0",
  "futures",
  "geo-types",
@@ -6178,7 +6176,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "478b0ff3f7d67b79da2b96f56f334431aef65e15ba4b29dd74a4236e29582bdc"
 dependencies = [
  "base64 0.21.7",
- "bigdecimal 0.4.5",
+ "bigdecimal",
  "bindgen 0.70.1",
  "bitflags 2.6.0",
  "bitvec",
@@ -8370,7 +8368,7 @@ dependencies = [
  "dashmap 5.5.3",
  "data_components",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.1.6",
  "datafusion-federation-sql",
  "datafusion-functions-json",
  "datafusion-table-providers",
@@ -8812,11 +8810,10 @@ dependencies = [
 
 [[package]]
 name = "sea-query"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e5073b2cfed767511a57d18115f3b3d8bcb5690bf8c89518caec6cb22c0cd74"
+version = "0.32.0-rc.1"
+source = "git+https://github.com/spiceai/sea-query.git?rev=9b3e42fb209a691c7bc09141f22ccc73cadef02a#9b3e42fb209a691c7bc09141f22ccc73cadef02a"
 dependencies = [
- "bigdecimal 0.3.1",
+ "bigdecimal",
  "chrono",
  "inherent",
  "rust_decimal",
@@ -8827,8 +8824,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25a82fcb49253abcb45cdcb2adf92956060ec0928635eb21b4f7a6d8f25ab0bc"
+source = "git+https://github.com/spiceai/sea-query.git?rev=9b3e42fb209a691c7bc09141f22ccc73cadef02a#9b3e42fb209a691c7bc09141f22ccc73cadef02a"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2",

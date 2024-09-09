@@ -267,7 +267,7 @@ impl DataFusion {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
-        ctx.add_analyzer_rule(Arc::new(BytesProcessedAnalyzerRule::new()));
+        //ctx.add_analyzer_rule(Arc::new(BytesProcessedAnalyzerRule::new()));
         ctx.register_udf(embeddings::array_distance::ArrayDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
         ctx.register_udf(crate::datafusion::udf::Least::new().into());
