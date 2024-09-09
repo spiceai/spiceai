@@ -18,7 +18,7 @@ use std::{sync::Arc, time::Duration};
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::{
-    assert_batches_eq, execution::context::SessionContext,
+    execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
 use futures::{Future, StreamExt};
@@ -103,8 +103,8 @@ type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
 
 async fn run_query_and_check_results<F>(
     rt: &mut Runtime,
+    snapshot_name: &str,
     query: &str,
-    expected_plan: &[&str],
     validate_result: Option<F>,
 ) -> Result<(), String>
 where
@@ -122,7 +122,16 @@ where
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
     println!("Query: {query}");
-    assert_batches_eq!(expected_plan, &plan_results);
+
+    let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
+        panic!("Failed to format plan");
+    };
+    insta::with_settings!({
+        description => format!("Query: {query}"),
+        omit_expression => true
+    }, {
+        insta::assert_snapshot!(snapshot_name, explain_plan);
+    });
 
     // Check the result
     if let Some(validate_result) = validate_result {
