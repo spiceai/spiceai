@@ -189,6 +189,7 @@ async fn run_query_and_record_result(
     // Additional round of query run before recording results.
     // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
     let _ = run_query(rt, connector, query_name, query).await;
+    record_explain_plan(rt, connector, query_name, query).await?;
 
     tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
@@ -262,6 +263,44 @@ async fn run_query(
         .await
         .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
+    Ok(())
+}
+
+const ENABLED_SNAPSHOT_CONNECTORS: &[&str] = &["spice.ai", "s3", "s3_arrow_memory"];
+
+async fn record_explain_plan(
+    rt: &mut Runtime,
+    connector: &str,
+    query_name: &str,
+    query: &str,
+) -> Result<(), String> {
+    if !ENABLED_SNAPSHOT_CONNECTORS.contains(&connector) {
+        return Ok(());
+    }
+
+    // Check the plan
+    let plan_results = rt
+        .datafusion()
+        .ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+    let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
+        panic!("Failed to format plan");
+    };
+    insta::with_settings!({
+        description => format!("Query: {query}"),
+        omit_expression => true,
+        filters => vec![
+            (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
+        ],
+    }, {
+        insta::assert_snapshot!(format!("{connector}_{query_name}_explain"), explain_plan);
+    });
     Ok(())
 }
 
