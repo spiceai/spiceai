@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: SELECT MAX(l_orderkey) FROM lineitem;"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                    |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                                                                      |
+|               |   Federated                                                                                                                                                                                                             |
+|               |  Projection: max(lineitem.l_orderkey)                                                                                                                                                                                   |
+|               |   Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                                                                                                                                                            |
+|               |     TableScan: lineitem                                                                                                                                                                                                 |
+| physical_plan | BytesProcessedExec                                                                                                                                                                                                      |
+|               |   SchemaCastScanExec                                                                                                                                                                                                    |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                                                                                                |
+|               |       VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT max(lineitem.l_orderkey) FROM lineitem rewritten_sql=SELECT max(tpch.lineitem.l_orderkey) FROM tpch.lineitem |
+|               |                                                                                                                                                                                                                         |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
