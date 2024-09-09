@@ -266,12 +266,18 @@ async fn run_query(
     Ok(())
 }
 
+const ENABLED_SNAPSHOT_CONNECTORS: &[&str] = &["spice.ai", "s3", "s3_arrow_memory"];
+
 async fn record_explain_plan(
     rt: &mut Runtime,
     connector: &str,
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
+    if !ENABLED_SNAPSHOT_CONNECTORS.contains(&connector) {
+        return Ok(());
+    }
+
     // Check the plan
     let plan_results = rt
         .datafusion()
