@@ -42,7 +42,7 @@ type DatasetRefreshApiRequest struct {
 
 func construct_request(sql string, mode string) (*string, error) {
 	r := DatasetRefreshApiRequest{}
-	if sql != "" && mode != "" {
+	if sql == "" && mode == "" {
 		return nil, nil
 	}
 	if sql != "" {
@@ -53,6 +53,7 @@ func construct_request(sql string, mode string) (*string, error) {
 	}
 	bytz, err := json.Marshal(r)
 	s := string(bytz)
+
 	return &s, err
 }
 
