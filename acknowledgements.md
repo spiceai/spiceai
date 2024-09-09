@@ -6,7 +6,7 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Go Modules
 
-github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.2.2/LICENSE, MIT
+ github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.2.2/LICENSE, MIT
 github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
 github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.7.0/LICENSE, BSD-3-Clause
 github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/b87c2d0e983a/LICENSE, MIT
