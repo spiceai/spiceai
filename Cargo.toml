@@ -69,7 +69,7 @@ futures = "0.3.30"
 globset = "0.4.14"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "55c8b8a28915c7ad782ae8468f7927567abd0f26" }
 insta = { version = "1.40.0", features = ["serde"] }
-itertools = "0.12"
+itertools = "0.13"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.10.2" }
 odbc-api = { version = "8.1.2" }
