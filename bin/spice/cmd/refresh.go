@@ -36,8 +36,8 @@ type DatasetRefreshApiResponse struct {
 }
 
 type DatasetRefreshApiRequest struct {
-	RefreshSQL  *string `json:"refresh_sql,omitempty"`
-	Mode *string `json:"refresh_mode,omitempty"`
+	RefreshSQL *string `json:"refresh_sql,omitempty"`
+	Mode       *string `json:"refresh_mode,omitempty"`
 }
 
 func constructRequest(sql string, mode string) (*string, error) {
@@ -87,7 +87,7 @@ spice refresh taxi_trips
 
 		url := fmt.Sprintf("/v1/datasets/%s/acceleration/refresh", dataset)
 
-		body, err := construct_request(sql, mode)
+		body, err := constructRequest(sql, mode)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			return
