@@ -16,15 +16,36 @@ limitations under the License.
 
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
-use runtime::{dataupdate::DataUpdate, Runtime};
+use datafusion::prelude::SessionContext;
+use runtime::{datafusion::DataFusion, dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::{
     acceleration::Acceleration, replication::Replication, Dataset, Mode,
 };
-use std::process::Command;
+use std::{process::Command, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
+
+/// Gets a test `DataFusion` to make test results reproducible across all machines.
+///
+/// 1) Sets the number of `target_partitions` to 4, by default its the number of CPU cores available.
+fn get_test_datafusion() -> Arc<DataFusion> {
+    let mut df = DataFusion::new();
+
+    // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
+    let mut new_state = df.ctx.state();
+    new_state
+        .config_mut()
+        .options_mut()
+        .execution
+        .target_partitions = 4;
+    let new_ctx = SessionContext::new_with_state(new_state);
+
+    // Replace the old context with the modified one
+    df.ctx = new_ctx.into();
+    Arc::new(df)
+}
 
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
@@ -35,7 +56,11 @@ pub(crate) async fn setup_benchmark(
 
     let app = build_app(upload_results_dataset, connector, acceleration);
 
-    let rt = Runtime::builder().with_app(app).build().await;
+    let rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(get_test_datafusion())
+        .build()
+        .await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(60*15)) => { // Databricks can take awhile to start up

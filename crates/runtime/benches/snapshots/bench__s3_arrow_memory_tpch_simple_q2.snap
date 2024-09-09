@@ -1,0 +1,32 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: SELECT l_linenumber FROM lineitem WHERE l_linenumber = (SELECT MAX(l_linenumber) FROM lineitem)"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: lineitem.l_linenumber                                                                                                   |
+|               |   Inner Join: lineitem.l_linenumber = __scalar_sq_1.max(lineitem.l_linenumber)                                                      |
+|               |     BytesProcessedNode                                                                                                              |
+|               |       TableScan: lineitem projection=[l_linenumber]                                                                                 |
+|               |     SubqueryAlias: __scalar_sq_1                                                                                                    |
+|               |       Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]                                                                  |
+|               |         TableScan: lineitem projection=[l_linenumber]                                                                               |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                         |
+|               |   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(l_linenumber@0, max(lineitem.l_linenumber)@0)], projection=[l_linenumber@0] |
+|               |     CoalesceBatchesExec: target_batch_size=8192                                                                                     |
+|               |       RepartitionExec: partitioning=Hash([l_linenumber@0], 4), input_partitions=4                                                   |
+|               |         BytesProcessedExec                                                                                                          |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                      |
+|               |             SchemaCastScanExec                                                                                                      |
+|               |               MemoryExec: partitions=1, partition_sizes=[0]                                                                         |
+|               |     CoalesceBatchesExec: target_batch_size=8192                                                                                     |
+|               |       RepartitionExec: partitioning=Hash([max(lineitem.l_linenumber)@0], 4), input_partitions=1                                     |
+|               |         AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]                                                        |
+|               |           CoalescePartitionsExec                                                                                                    |
+|               |             AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                  |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                  |
+|               |                 SchemaCastScanExec                                                                                                  |
+|               |                   MemoryExec: partitions=1, partition_sizes=[0]                                                                     |
+|               |                                                                                                                                     |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------+
