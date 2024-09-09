@@ -293,7 +293,7 @@ async fn record_explain_plan(
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
         ],
     }, {
-        insta::assert_snapshot!(format!("{connector}_{query_name}"), explain_plan);
+        insta::assert_snapshot!(format!("{connector}_{query_name}_explain"), explain_plan);
     });
     Ok(())
 }
