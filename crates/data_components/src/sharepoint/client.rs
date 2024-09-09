@@ -52,7 +52,7 @@ use super::{
 
 /// Represents all the ways a Sharepoint [Drive](https://learn.microsoft.com/en-us/graph/api/resources/drive?view=graph-rest-1.0) can be identified.
 #[derive(Default, Debug, Clone, PartialEq)]
-pub enum DrivePtr {
+pub enum PublicDrivePtr {
     DriveId(String),
     DriveName(String),
     UserId(String),
@@ -102,7 +102,7 @@ pub enum DriveItemPtr {
 /// - `"sharepoint:drive:Documents/path:/Documents"`
 /// - `"sharepoint:site:contoso.sharepoint.com/root"`
 /// - `"sharepoint:user:48d31887-5fad-4d73-a9f5-3c356e68a038/path:/documents/reports"`
-pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
+pub fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
     let (drive, item) = from
         .trim_start_matches("sharepoint:")
         .split_once('/')
@@ -117,15 +117,15 @@ pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
                     input: drive.to_string(),
                 });
             };
-            DrivePtr::Me
+            PublicDrivePtr::Me
         }
-        Some(("siteId", id)) => DrivePtr::SiteId(id.to_string()),
-        Some(("site", name)) => DrivePtr::SiteName(name.to_string()),
-        Some(("driveId", id)) => DrivePtr::DriveId(id.to_string()),
-        Some(("drive", name)) => DrivePtr::DriveName(name.to_string()),
-        Some(("user", id)) => DrivePtr::UserId(id.to_string()),
-        Some(("groupId", id)) => DrivePtr::GroupId(id.to_string()),
-        Some(("group", name)) => DrivePtr::GroupName(name.to_string()),
+        Some(("siteId", id)) => PublicDrivePtr::SiteId(id.to_string()),
+        Some(("site", name)) => PublicDrivePtr::SiteName(name.to_string()),
+        Some(("driveId", id)) => PublicDrivePtr::DriveId(id.to_string()),
+        Some(("drive", name)) => PublicDrivePtr::DriveName(name.to_string()),
+        Some(("user", id)) => PublicDrivePtr::UserId(id.to_string()),
+        Some(("groupId", id)) => PublicDrivePtr::GroupId(id.to_string()),
+        Some(("group", name)) => PublicDrivePtr::GroupName(name.to_string()),
         _ => {
             return Err(Error::InvalidDriveFormat {
                 input: drive.to_string(),
@@ -154,6 +154,92 @@ pub fn parse_from(from: &str) -> Result<(DrivePtr, DriveItemPtr), Error> {
     Ok((drive_ptr, item_ptr))
 }
 
+/// Unique identifier for a drive. This is a subset of the `DrivePtr` enum types that uniquely identify a drive.
+#[derive(Default, Debug, Clone, PartialEq)]
+enum DrivePtr {
+    DriveId(String),
+    UserId(String),
+    GroupId(String),
+    SiteId(String),
+
+    #[default]
+    Me,
+}
+
+/// Resolves a `DrivePtr` into a `DriveId`. This ensures that the `DriveId` is unique and can be used to fetch drive items.
+async fn resolve_drive_ptr(
+    client: Arc<GraphClient>,
+    drive: &PublicDrivePtr,
+) -> Result<DrivePtr, Error> {
+    match drive {
+        PublicDrivePtr::DriveId(id) => Ok(DrivePtr::DriveId(id.to_string())),
+        PublicDrivePtr::UserId(id) => Ok(DrivePtr::UserId(id.to_string())),
+        PublicDrivePtr::GroupId(id) => Ok(DrivePtr::GroupId(id.to_string())),
+        PublicDrivePtr::SiteId(id) => Ok(DrivePtr::SiteId(id.to_string())),
+        PublicDrivePtr::Me => Ok(DrivePtr::Me),
+        PublicDrivePtr::DriveName(name) => {
+            let drives = get_drive_items(Arc::clone(&client))
+                .await
+                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let Some(drive_id) = drives.get(name) else {
+                tracing::warn!(
+                    "Drive with name '{}' is not found. Available drives: {}.",
+                    name,
+                    drives
+                        .keys()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                return Err(Error::DriveNotFound {
+                    drive: name.to_string(),
+                });
+            };
+            Ok(DrivePtr::DriveId(drive_id.to_string()))
+        }
+        PublicDrivePtr::GroupName(name) => {
+            let groups = get_group_items(Arc::clone(&client))
+                .await
+                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let Some(group_id) = groups.get(name) else {
+                tracing::warn!(
+                    "Group with name '{}' is not found. Available groups: {}.",
+                    name,
+                    groups
+                        .keys()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                return Err(Error::GroupNotFound {
+                    group: name.to_string(),
+                });
+            };
+            Ok(DrivePtr::GroupId(group_id.to_string()))
+        }
+        PublicDrivePtr::SiteName(name) => {
+            let sites = get_site_items(Arc::clone(&client))
+                .await
+                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let Some(site_id) = sites.get(name) else {
+                tracing::warn!(
+                    "Site with name '{}' is not found. Available sites: {}.",
+                    name,
+                    sites
+                        .keys()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                return Err(Error::SiteNotFound {
+                    site: name.to_string(),
+                });
+            };
+            Ok(DrivePtr::SiteId(site_id.to_string()))
+        }
+    }
+}
+
 /// Possible Microsoft Graph API endpoints to retrieve drive items, determined by the `DrivePtr` variant.
 enum DriveApi {
     Id(DrivesIdApiClient),
@@ -173,68 +259,10 @@ impl SharepointClient {
         from: &str,
         include_file_content: bool,
     ) -> Result<Self, Error> {
-        let (mut drive, drive_item) = parse_from(from)?;
+        let (drive, drive_item) = parse_from(from)?;
 
-        // Resolve Named `DrivePtr`s into their respective Id `DrivePtr`s.
-        if let DrivePtr::DriveName(d) = drive {
-            let drives = get_drive_items(Arc::clone(&client))
-                .await
-                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
-            let Some(drive_id) = drives.get(&d) else {
-                tracing::warn!(
-                    "Drive with name '{}' is not found. Available drives: {}.",
-                    d,
-                    drives
-                        .keys()
-                        .map(|name| format!("'{name}'"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                );
-                return Err(Error::DriveNotFound { drive: d });
-            };
-            tracing::debug!("drive_id: {:#?}.", drive_id);
-            drive = DrivePtr::DriveId(drive_id.to_string());
-        }
-
-        if let DrivePtr::GroupName(name) = drive {
-            let groups = get_group_items(Arc::clone(&client))
-                .await
-                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
-            let Some(group_id) = groups.get(&name) else {
-                tracing::warn!(
-                    "Group with name '{}' is not found. Available groups: {}.",
-                    name,
-                    groups
-                        .keys()
-                        .map(|name| format!("'{name}'"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                );
-                return Err(Error::GroupNotFound { group: name });
-            };
-            tracing::debug!("group_id: {:#?}.", group_id);
-            drive = DrivePtr::GroupId(group_id.to_string());
-        }
-
-        if let DrivePtr::SiteName(name) = drive {
-            let sites = get_site_items(Arc::clone(&client))
-                .await
-                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
-            let Some(site_id) = sites.get(&name) else {
-                tracing::warn!(
-                    "Site with name '{}' is not found. Available sites: {}.",
-                    name,
-                    sites
-                        .keys()
-                        .map(|name| format!("'{name}'"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                );
-                return Err(Error::SiteNotFound { site: name });
-            };
-            tracing::debug!("site_id: {:#?}.", site_id);
-            drive = DrivePtr::SiteId(site_id.to_string());
-        }
+        // Resolve `DrivePtr`s into their respective Ids.
+        let drive = resolve_drive_ptr(Arc::clone(&client), &drive).await?;
 
         Ok(Self {
             client,
@@ -426,7 +454,7 @@ impl SharepointListExec {
         resp.text().await.map_err(GraphFailure::ReqwestError)
     }
 
-    /// Returns the appropriate [`DriveApi`] for the given [`DrivePtr`].
+    /// Returns the appropriate [`DriveApi`] for the given [`InternalDrivePtr`].
     fn drive_client(graph: &Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
         match drive {
             DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
@@ -434,9 +462,6 @@ impl SharepointListExec {
             DrivePtr::SiteId(site_id) => DriveApi::Default(graph.site(site_id).drive()),
             DrivePtr::Me => DriveApi::Default(graph.me().drive()),
             DrivePtr::GroupId(_group_id) => unimplemented!("group id not supported"), // self.client.group(group_id).get_drive().url(),
-            DrivePtr::DriveName(_) => unimplemented!("drive names should be mapped to drive ids"),
-            DrivePtr::GroupName(_) => unimplemented!("group names should be mapped to group ids"),
-            DrivePtr::SiteName(_) => unimplemented!("site names should be mapped to site ids"),
         }
     }
 }
