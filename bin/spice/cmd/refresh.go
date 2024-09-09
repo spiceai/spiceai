@@ -46,7 +46,7 @@ func constructRequest(sql string, mode string) (*string, error) {
 		return nil, nil
 	}
 	if sql != "" {
-		r.SQL = &sql
+		r.RefreshSQL = &sql
 	}
 	if mode != "" {
 		r.Mode = &mode
