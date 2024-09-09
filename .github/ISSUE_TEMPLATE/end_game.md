@@ -82,9 +82,10 @@ assignees: ''
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
   - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docs/acknowledgements/index.md)
 - [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
-- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the release branch.
+- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the trunk branch.
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
+- [ ] Create a new branch `release-v[semver]` for the next release version from the current release branch. E.g. `release-v0.17.0-beta`
 - [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.17.0-beta`
 - [ ] Release any docs updates by creating a `v[semver]` tag.
 - [ ] Trigger algolia search crawler [workflow](https://github.com/spiceai/docs/actions/workflows/trigger_search_reindex.yml), to reindex updated docs.
@@ -95,7 +96,6 @@ assignees: ''
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
 - [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
-- [ ] Create a new branch `release-v[semver]` for the next release version from the current release branch. E.g. `release-v0.17.0-beta`
 
 ## Announcement Checklist
 
