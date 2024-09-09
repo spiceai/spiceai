@@ -19,6 +19,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -31,7 +32,7 @@ const (
 	POST = "POST"
 )
 
-func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, method, path string) (T, error) {
+func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, method, path string, body *string) (T, error) {
 	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
 	var resp *http.Response
 	var err error
@@ -40,7 +41,11 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 	case GET:
 		resp, err = rtcontext.Client().Get(url)
 	case POST:
-		resp, err = rtcontext.Client().Post(url, "application/json", nil)
+		var reader io.Reader
+		if body != nil {
+			reader = strings.NewReader(*body)
+		}
+		resp, err = rtcontext.Client().Post(url, "application/json", reader)
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)
 	}
@@ -61,20 +66,20 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 }
 
 func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T, error) {
-	result, err := doRuntimeApiRequest[[]T](rtcontext, GET, path)
+	result, err := doRuntimeApiRequest[[]T](rtcontext, GET, path, nil)
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-func PostRuntime[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
-	return doRuntimeApiRequest[T](rtcontext, POST, path)
+func PostRuntime[T interface{}](rtcontext *context.RuntimeContext, path string, body *string) (T, error) {
+	return doRuntimeApiRequest[T](rtcontext, POST, path, body)
 }
 
 func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path string, t T) error {
 
-	items, err := doRuntimeApiRequest[[]T](rtcontext, GET, path)
+	items, err := doRuntimeApiRequest[[]T](rtcontext, GET, path, nil)
 
 	if err != nil {
 		return fmt.Errorf("error fetching runtime information: %w", err)
