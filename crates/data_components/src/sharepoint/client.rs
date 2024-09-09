@@ -318,6 +318,7 @@ struct SharepointListExec {
     drive_item: DriveItemPtr,
     schema: SchemaRef,
     properties: PlanProperties,
+    projections: Option<Vec<usize>>,
     limit: Option<usize>,
 }
 
@@ -344,6 +345,7 @@ impl SharepointListExec {
             schema: projected_schema,
             properties,
             limit,
+            projections,
         })
     }
 
@@ -401,6 +403,8 @@ impl SharepointListExec {
 
         let graph = Arc::clone(&self.client);
         let drive = self.drive.clone();
+        let projection = self.projections.clone();
+
         Ok(stream! {
 
             while let Some(s) = resp_stream.next().await {
@@ -425,7 +429,14 @@ impl SharepointListExec {
                             None
                         };
                         match drive_items_to_record_batch(&drive_items.value, content) {
-                            Ok(record_batch) => yield Ok(record_batch),
+                            Ok(record_batch) => {
+                                // Ensure that the record batch is projected to the required columns (since `select` on OData from Microsoft Graph isn't used).
+                                if let Some(projection) = &projection {
+                                    yield record_batch.project(projection).map_err(|e| DataFusionError::ArrowError(e, None))
+                                } else {
+                                    yield Ok(record_batch)
+                                }
+                            },
                             Err(e) => yield Err(DataFusionError::ArrowError(e, None)),
                         }
                     },
