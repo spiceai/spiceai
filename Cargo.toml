@@ -64,7 +64,7 @@ datafusion-functions-json = "0.41"
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "701f54ffe26210759134e7c033c53fd39bf3eee7" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
-fundu = "2.0.0"
+fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.14"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "55c8b8a28915c7ad782ae8468f7927567abd0f26" }
