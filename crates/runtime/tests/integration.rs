@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use arrow::array::RecordBatch;
+use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::{
     assert_batches_eq, execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
@@ -123,6 +123,81 @@ where
 
     println!("Query: {query}");
     assert_batches_eq!(expected_plan, &plan_results);
+
+    // Check the result
+    if let Some(validate_result) = validate_result {
+        let result_batches = rt
+            .datafusion()
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| format!("query `{query}` to plan: {e}"))?
+            .collect()
+            .await
+            .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+        validate_result(result_batches);
+    }
+
+    Ok(())
+}
+
+type PlanCheckFn = Box<dyn Fn(&str) -> bool>;
+
+async fn run_query_and_check_results_with_plan_checks<F>(
+    rt: &mut Runtime,
+    query: &str,
+    expected_plan_checks: Vec<(&str, PlanCheckFn)>,
+    validate_result: Option<F>,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<RecordBatch>),
+{
+    // Check the plan
+    let plan_results = rt
+        .datafusion()
+        .ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+    let Ok(formatted) = arrow::util::pretty::pretty_format_batches_with_options(
+        &plan_results,
+        &FormatOptions::default(),
+    ) else {
+        panic!("Failed to format plan");
+    };
+    let formatted = formatted.to_string();
+
+    let actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+    let mut matched_checks = vec![false; expected_plan_checks.len()];
+
+    for line in actual_lines {
+        for (i, (key, check_fn)) in expected_plan_checks.iter().enumerate() {
+            if line.contains(key) {
+                if matched_checks[i] {
+                    return Err(format!(
+                        "Check '{key}' matched multiple lines in plan:\n{formatted}",
+                    ));
+                }
+                matched_checks[i] = true;
+                if !check_fn(line) {
+                    return Err(format!("Check failed for line: {line}"));
+                }
+            }
+        }
+    }
+
+    if let Some(i) = matched_checks.iter().position(|&x| !x) {
+        return Err(format!(
+            "Expected check '{}' did not appear in plan:\n{formatted}",
+            expected_plan_checks[i].0,
+        ));
+    }
 
     // Check the result
     if let Some(validate_result) = validate_result {

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use app::AppBuilder;
+use arrow::array::ArrayRef;
 use arrow::datatypes::DecimalType;
 use arrow::{
     array::{Decimal128Array, RecordBatch},
@@ -27,7 +28,8 @@ use spicepod::component::dataset::{
 };
 
 use crate::{
-    dataset_ready_check, get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn,
+    dataset_ready_check, get_test_datafusion, init_tracing, run_query_and_check_results,
+    run_query_and_check_results_with_plan_checks, PlanCheckFn, ValidateFn,
 };
 
 fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {
@@ -41,63 +43,91 @@ fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {
     ds
 }
 
-type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
+enum CheckFunction {
+    ValidateFullPlan(Vec<&'static str>),
+    ValidateSubPlan(Vec<(&'static str, PlanCheckFn)>),
+}
 
-fn decimal_queries() -> QueryTests<'static> {
+type QueryTests<'a> = Vec<(&'a str, CheckFunction, Option<Box<ValidateFn>>)>;
+
+#[derive(Debug, Copy, Clone)]
+enum DecimalQuery {
+    Federated,
+    NonFederated,
+}
+
+fn decimal_queries(query_type: DecimalQuery) -> QueryTests<'static> {
+    let expected_plan: CheckFunction = match query_type {
+        DecimalQuery::Federated => {
+            CheckFunction::ValidateSubPlan(vec![
+                (
+                    "VirtualExecutionPlan",
+                    Box::new(|plan| plan.contains("sql=SELECT sum(\"decimal\".small_decimal), sum(\"decimal\".medium_decimal), sum(\"decimal\".large_decimal), sum(\"decimal\".precise_decimal) FROM \"decimal\" rewritten_sql=SELECT sum(`decimal`.`small_decimal`), sum(`decimal`.`medium_decimal`), sum(`decimal`.`large_decimal`), sum(`decimal`.`precise_decimal`) FROM `decimal`"))
+                )
+            ])},
+        DecimalQuery::NonFederated => CheckFunction::ValidateFullPlan(vec![
+            "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            "| plan_type     | plan                                                                                                                                                              |",
+            "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]]               |",
+            "|               |   BytesProcessedNode                                                                                                                                              |",
+            "|               |     TableScan: decimal projection=[small_decimal, medium_decimal, large_decimal, precise_decimal]                                                                 |",
+            "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]       |",
+            "|               |   CoalescePartitionsExec                                                                                                                                          |",
+            "|               |     AggregateExec: mode=Partial, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)] |",
+            "|               |       BytesProcessedExec                                                                                                                                          |",
+            "|               |         SchemaCastScanExec                                                                                                                                        |",
+            "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                    |",
+            "|               |             SQLiteSqlExec sql=SELECT \"small_decimal\", \"medium_decimal\", \"large_decimal\", \"precise_decimal\" FROM decimal                                           |",
+            "|               |                                                                                                                                                                   |",
+            "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        ])
+    };
     vec![
-    ("SELECT SUM(small_decimal), SUM(medium_decimal), SUM(large_decimal), SUM(precise_decimal) FROM decimal", vec![
-        "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                                                                                                              |",
-        "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]]               |",
-        "|               |   BytesProcessedNode                                                                                                                                              |",
-        "|               |     TableScan: decimal projection=[small_decimal, medium_decimal, large_decimal, precise_decimal]                                                                 |",
-        "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]       |",
-        "|               |   CoalescePartitionsExec                                                                                                                                          |",
-        "|               |     AggregateExec: mode=Partial, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)] |",
-        "|               |       BytesProcessedExec                                                                                                                                          |",
-        "|               |         SchemaCastScanExec                                                                                                                                        |",
-        "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                    |",
-        "|               |             SQLiteSqlExec sql=SELECT \"small_decimal\", \"medium_decimal\", \"large_decimal\", \"precise_decimal\" FROM decimal                                           |",
-        "|               |                                                                                                                                                                   |",
-        "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    ], Some(Box::new(
+    ("SELECT SUM(small_decimal), SUM(medium_decimal), SUM(large_decimal), SUM(precise_decimal) FROM decimal", expected_plan, Some(Box::new(
         |results: Vec<RecordBatch>| {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].num_columns(), 4);
             assert_eq!(results[0].num_rows(), 1);
-            assert_eq!(results[0].column(0).as_any().downcast_ref::<Decimal128Array>().expect("decimal array").value(0).to_string(), "22381");
+            assert_eq!(downcast_decimal_array(results[0].column(0)).value(0).to_string(), "22381");
             let schema = results[0].schema();
 
             // small_decimal
             let DataType::Decimal128(precision, scale) = schema.field(0).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = results[0].column(0).as_any().downcast_ref::<Decimal128Array>().expect("decimal array");
+            let decimal_array = downcast_decimal_array(results[0].column(0));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "223.81");
 
             // medium_decimal
             let DataType::Decimal128(precision, scale) = schema.field(1).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = results[0].column(1).as_any().downcast_ref::<Decimal128Array>().expect("decimal array");
+            let decimal_array = downcast_decimal_array(results[0].column(0));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "186109.5051");
 
             // large_decimal
             let DataType::Decimal128(precision, scale) = schema.field(2).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = results[0].column(2).as_any().downcast_ref::<Decimal128Array>().expect("decimal array");
+            let decimal_array = downcast_decimal_array(results[0].column(0));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "10866582.506250");
 
             // precise_decimal
             let DataType::Decimal128(precision, scale) = schema.field(3).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = results[0].column(3).as_any().downcast_ref::<Decimal128Array>().expect("decimal array");
+            let decimal_array = downcast_decimal_array(results[0].column(0));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "-1.7443152324");
         }
     )))]
+}
+
+fn downcast_decimal_array(array: &ArrayRef) -> &Decimal128Array {
+    match array.as_any().downcast_ref::<Decimal128Array>() {
+        Some(array) => array,
+        None => panic!("Expected decimal array"),
+    }
 }
 
 #[tokio::test]
@@ -126,10 +156,22 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
 
     dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
 
-    for (query, expected_plan, validate_result) in decimal_queries() {
-        run_query_and_check_results(&mut rt, query, &expected_plan, validate_result)
-            .await
-            .expect("query to succeed");
+    for (query, check_function, validate_result) in decimal_queries(DecimalQuery::NonFederated) {
+        match check_function {
+            CheckFunction::ValidateFullPlan(expected_plan) => {
+                run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await
+            }
+            CheckFunction::ValidateSubPlan(plan_checks) => {
+                run_query_and_check_results_with_plan_checks(
+                    &mut rt,
+                    query,
+                    plan_checks,
+                    validate_result,
+                )
+                .await
+            }
+        }
+        .expect("query to succeed");
     }
 
     Ok(())
@@ -161,10 +203,22 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
 
     dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
 
-    for (query, expected_plan, validate_result) in decimal_queries() {
-        run_query_and_check_results(&mut rt, query, &expected_plan, validate_result)
-            .await
-            .expect("query to succeed");
+    for (query, check_function, validate_result) in decimal_queries(DecimalQuery::Federated) {
+        match check_function {
+            CheckFunction::ValidateFullPlan(expected_plan) => {
+                run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await
+            }
+            CheckFunction::ValidateSubPlan(plan_checks) => {
+                run_query_and_check_results_with_plan_checks(
+                    &mut rt,
+                    query,
+                    plan_checks,
+                    validate_result,
+                )
+                .await
+            }
+        }
+        .expect("query to succeed");
     }
 
     // Clean up files
