@@ -71,7 +71,9 @@ spice refresh taxi_trips
 
 		sql, _ := cmd.Flags().GetString(refreshSqlFlag)
 		mode, _ := cmd.Flags().GetString(refreshModeFlag)
-		if mode != spec.REFRESH_MODE_FULL && mode != spec.REFRESH_MODE_APPEND {
+
+		// If the mode is not empty, it must be either 'full' or 'append'.
+		if mode != "" && mode != spec.REFRESH_MODE_FULL && mode != spec.REFRESH_MODE_APPEND {
 			cmd.PrintErrln("Invalid refresh mode. Must be 'full' or 'append'")
 			return
 		}
