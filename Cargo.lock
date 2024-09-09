@@ -2763,7 +2763,7 @@ dependencies = [
  "chrono",
  "clickhouse-rs",
  "datafusion",
- "datafusion-federation 0.1.6",
+ "datafusion-federation",
  "datafusion-federation-sql",
  "datafusion-table-providers",
  "db_connection_pool",
@@ -2942,26 +2942,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "datafusion-federation"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90ae6ae50c30b736bb18ab22f81841a9598d5acb248766027985dca299396c3d"
-dependencies = [
- "arrow-json",
- "async-stream",
- "async-trait",
- "datafusion",
- "futures",
-]
-
-[[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=b6682948d07cc3155edb3dfbf03f8b55570fc1d2#b6682948d07cc3155edb3dfbf03f8b55570fc1d2"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-federation 0.1.6",
+ "datafusion-federation",
  "futures",
  "tokio",
  "tracing",
@@ -3171,6 +3158,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=701f54ffe26210759134e7c033c53fd39bf3eee7#701f54ffe26210759134e7c033c53fd39bf3eee7"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3182,8 +3170,10 @@ dependencies = [
  "byteorder",
  "chrono",
  "datafusion",
- "datafusion-federation 0.2.2",
+ "datafusion-federation",
+ "datafusion-federation-sql",
  "duckdb",
+ "dyn-clone",
  "fallible-iterator 0.3.0",
  "futures",
  "geo-types",
@@ -8605,7 +8595,7 @@ dependencies = [
  "dashmap 5.5.3",
  "data_components",
  "datafusion",
- "datafusion-federation 0.1.6",
+ "datafusion-federation",
  "datafusion-federation-sql",
  "datafusion-functions-json",
  "datafusion-table-providers",
@@ -9058,7 +9048,7 @@ dependencies = [
 [[package]]
 name = "sea-query"
 version = "0.32.0-rc.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=9b3e42fb209a691c7bc09141f22ccc73cadef02a#9b3e42fb209a691c7bc09141f22ccc73cadef02a"
+source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -9071,7 +9061,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "0.4.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=9b3e42fb209a691c7bc09141f22ccc73cadef02a#9b3e42fb209a691c7bc09141f22ccc73cadef02a"
+source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2",
