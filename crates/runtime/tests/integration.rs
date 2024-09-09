@@ -21,8 +21,11 @@ use datafusion::{
     assert_batches_eq, execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
-use futures::Future;
-use runtime::{datafusion::DataFusion, Runtime};
+use futures::{Future, StreamExt};
+use runtime::{
+    datafusion::{query::Protocol, DataFusion},
+    Runtime,
+};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -137,6 +140,27 @@ where
     }
 
     Ok(())
+}
+
+async fn dataset_ready_check(rt: &Runtime, sql: &str) {
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(sql, Protocol::Internal)
+                .build()
+                .run()
+                .await
+                .unwrap_or_else(|_| panic!("Result should be returned"));
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.unwrap_or_else(|_| panic!("Batch should be created")));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
 }
 
 async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool

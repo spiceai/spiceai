@@ -1,9 +1,8 @@
-use crate::{get_test_datafusion, init_tracing, postgres::common, wait_until_true};
+use crate::{dataset_ready_check, get_test_datafusion, init_tracing, postgres::common};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
-use futures::StreamExt;
 use rand::Rng;
-use runtime::{datafusion::query::Protocol, Runtime};
+use runtime::Runtime;
 use spicepod::component::{
     dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
@@ -11,7 +10,7 @@ use spicepod::component::{
     },
     params::Params,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
@@ -183,52 +182,16 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM pg_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(Arc::clone(&rt), "SELECT * FROM pg_on_conflict_drop LIMIT 1").await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_mem_on_conflict_drop LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_mem_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_file_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_file_on_conflict_drop LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM sql_mem_on_conflict_drop LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM sql_mem_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM sql_file_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM sql_file_on_conflict_drop LIMIT 1",
-    )
-    .await;
+    dataset_ready_check(&rt, "SELECT * FROM pg_on_conflict_upsert LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM pg_on_conflict_drop LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM duckdb_mem_on_conflict_drop LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM duckdb_mem_on_conflict_upsert LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM duckdb_file_on_conflict_drop LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM sql_mem_on_conflict_drop LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM sql_mem_on_conflict_upsert LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM sql_file_on_conflict_upsert LIMIT 1").await;
+    dataset_ready_check(&rt, "SELECT * FROM sql_file_on_conflict_drop LIMIT 1").await;
 
     db_conn
         .conn
@@ -313,27 +276,6 @@ WHERE event_name = 'File Download'
     std::fs::remove_file(format!("{sqlite_drop_file_path}-wal")).expect("File should be removed");
 
     Ok(())
-}
-
-async fn dataset_ready_check(rt: Arc<Runtime>, sql: &str) {
-    assert!(
-        wait_until_true(Duration::from_secs(30), || async {
-            let mut query_result = rt
-                .datafusion()
-                .query_builder(sql, Protocol::Internal)
-                .build()
-                .run()
-                .await
-                .unwrap_or_else(|_| panic!("Result should be returned"));
-            let mut batches = vec![];
-            while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.unwrap_or_else(|_| panic!("Batch should be created")));
-            }
-            !batches.is_empty() && batches[0].num_rows() == 1
-        })
-        .await,
-        "Expected 1 rows returned"
-    );
 }
 
 async fn get_query_result(
