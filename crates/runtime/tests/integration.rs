@@ -16,13 +16,16 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use arrow::array::RecordBatch;
+use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::{
     assert_batches_eq, execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
-use futures::Future;
-use runtime::{datafusion::DataFusion, Runtime};
+use futures::{Future, StreamExt};
+use runtime::{
+    datafusion::{query::Protocol, DataFusion},
+    Runtime,
+};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +46,8 @@ mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
 mod s3;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 mod tls;
 
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
@@ -135,6 +140,102 @@ where
     }
 
     Ok(())
+}
+
+type PlanCheckFn = Box<dyn Fn(&str) -> bool>;
+
+async fn run_query_and_check_results_with_plan_checks<F>(
+    rt: &mut Runtime,
+    query: &str,
+    expected_plan_checks: Vec<(&str, PlanCheckFn)>,
+    validate_result: Option<F>,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<RecordBatch>),
+{
+    // Check the plan
+    let plan_results = rt
+        .datafusion()
+        .ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+    let Ok(formatted) = arrow::util::pretty::pretty_format_batches_with_options(
+        &plan_results,
+        &FormatOptions::default(),
+    ) else {
+        panic!("Failed to format plan");
+    };
+    let formatted = formatted.to_string();
+
+    let actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+    let mut matched_checks = vec![false; expected_plan_checks.len()];
+
+    for line in actual_lines {
+        for (i, (key, check_fn)) in expected_plan_checks.iter().enumerate() {
+            if line.contains(key) {
+                if matched_checks[i] {
+                    return Err(format!(
+                        "Check '{key}' matched multiple lines in plan:\n{formatted}",
+                    ));
+                }
+                matched_checks[i] = true;
+                if !check_fn(line) {
+                    return Err(format!("Check failed for line: {line}"));
+                }
+            }
+        }
+    }
+
+    if let Some(i) = matched_checks.iter().position(|&x| !x) {
+        return Err(format!(
+            "Expected check '{}' did not appear in plan:\n{formatted}",
+            expected_plan_checks[i].0,
+        ));
+    }
+
+    // Check the result
+    if let Some(validate_result) = validate_result {
+        let result_batches = rt
+            .datafusion()
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| format!("query `{query}` to plan: {e}"))?
+            .collect()
+            .await
+            .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+        validate_result(result_batches);
+    }
+
+    Ok(())
+}
+
+async fn dataset_ready_check(rt: &Runtime, sql: &str) {
+    assert!(
+        wait_until_true(Duration::from_secs(30), || async {
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(sql, Protocol::Internal)
+                .build()
+                .run()
+                .await
+                .unwrap_or_else(|_| panic!("Result should be returned"));
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.unwrap_or_else(|_| panic!("Batch should be created")));
+            }
+            !batches.is_empty() && batches[0].num_rows() == 1
+        })
+        .await,
+        "Expected 1 rows returned"
+    );
 }
 
 async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
