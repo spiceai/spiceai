@@ -40,7 +40,7 @@ type DatasetRefreshApiRequest struct {
 	Mode *string `json:"refresh_mode,omitempty"`
 }
 
-func construct_request(sql string, mode string) (*string, error) {
+func constructRequest(sql string, mode string) (*string, error) {
 	r := DatasetRefreshApiRequest{}
 	if sql == "" && mode == "" {
 		return nil, nil
