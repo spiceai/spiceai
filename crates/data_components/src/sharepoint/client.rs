@@ -361,7 +361,7 @@ impl SharepointListExec {
                 DriveItemPtr::ItemPath(path) => {
                     client.item_by_path(format!(":{path}:")).list_children()
                 }
-                // "If this property [root] is non-null, it indicates that the driveItem is the top-most driveItem in the drive."
+                // _"If this property [root] is non-null, it indicates that the driveItem is the top-most driveItem in the drive."_
                 DriveItemPtr::Root => client.items().list_items().filter(&["root ne null"]),
             },
 
