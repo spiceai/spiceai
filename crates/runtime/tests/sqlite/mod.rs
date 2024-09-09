@@ -103,21 +103,21 @@ fn decimal_queries(query_type: DecimalQuery) -> QueryTests<'static> {
             let DataType::Decimal128(precision, scale) = schema.field(1).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = downcast_decimal_array(results[0].column(0));
+            let decimal_array = downcast_decimal_array(results[0].column(1));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "186109.5051");
 
             // large_decimal
             let DataType::Decimal128(precision, scale) = schema.field(2).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = downcast_decimal_array(results[0].column(0));
+            let decimal_array = downcast_decimal_array(results[0].column(2));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "10866582.506250");
 
             // precise_decimal
             let DataType::Decimal128(precision, scale) = schema.field(3).data_type() else {
                 panic!("Expected decimal type");
             };
-            let decimal_array = downcast_decimal_array(results[0].column(0));
+            let decimal_array = downcast_decimal_array(results[0].column(3));
             assert_eq!(Decimal128Type::format_decimal(decimal_array.value(0), *precision, *scale), "-1.7443152324");
         }
     )))]
