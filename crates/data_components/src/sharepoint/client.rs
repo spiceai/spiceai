@@ -261,7 +261,7 @@ impl SharepointClient {
     ) -> Result<Self, Error> {
         let (drive, drive_item) = parse_from(from)?;
 
-        // Resolve `DrivePtr`s into their respective Ids.
+        // Resolve `PublicDrivePtr`s into internal `DrivePtr`.
         let drive = resolve_drive_ptr(Arc::clone(&client), &drive).await?;
 
         Ok(Self {
