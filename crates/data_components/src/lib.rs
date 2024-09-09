@@ -47,6 +47,8 @@ pub mod mysql;
 pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sharepoint")]
+pub mod sharepoint;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 #[cfg(feature = "spark_connect")]

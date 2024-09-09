@@ -87,6 +87,8 @@ pub mod postgres;
 pub mod s3;
 #[cfg(feature = "ftp")]
 pub mod sftp;
+#[cfg(feature = "sharepoint")]
+pub mod sharepoint;
 pub mod sink;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
@@ -311,6 +313,8 @@ pub async fn register_all() {
     register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
     #[cfg(feature = "odbc")]
     register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
+    #[cfg(feature = "sharepoint")]
+    register_connector_factory("sharepoint", sharepoint::SharepointFactory::new_arc()).await;
     #[cfg(feature = "spark")]
     register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
     #[cfg(feature = "snowflake")]

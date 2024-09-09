@@ -222,7 +222,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "snafu 0.8.4",
@@ -546,6 +546,45 @@ name = "ascii_utils"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71938f30533e4d95a6d17aa530939da3842c2ab6f4f84b9dae68447e4129f74a"
+
+[[package]]
+name = "asn1-rs"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f6fd5ddaf0351dff5b8da21b2fb4ff8e08ddd02857f0bf69c47639106c0fff0"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "726535892e8eae7e70657b4c8ea93d26b8553afb1ce617caee529ef96d7dee6c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+ "synstructure 0.12.6",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2777730b2039ac0f95f093556e61b6d26cebed5393ca6f152717777cec3a42ed"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
 
 [[package]]
 name = "async-broadcast"
@@ -664,7 +703,7 @@ dependencies = [
  "fnv",
  "futures-timer",
  "futures-util",
- "handlebars",
+ "handlebars 5.1.2",
  "http 1.1.0",
  "indexmap 2.5.0",
  "mime",
@@ -1945,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2712,7 +2751,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2733,6 +2772,8 @@ dependencies = [
  "flight_client",
  "futures",
  "globset",
+ "graph-rs-sdk",
+ "http 1.1.0",
  "object_store",
  "rdkafka",
  "regex",
@@ -3170,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3262,6 +3303,20 @@ dependencies = [
  "const-oid",
  "pem-rfc7468",
  "zeroize",
+]
+
+[[package]]
+name = "der-parser"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbd676fbbab537128ef0278adb5576cf363cff6aa22a7b24effe97347cfab61e"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -3792,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3807,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3820,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3838,7 +3893,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -4368,6 +4423,124 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-core"
+version = "2.0.1"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+dependencies = [
+ "Inflector",
+ "async-stream",
+ "async-trait",
+ "base64 0.21.7",
+ "dyn-clone",
+ "graph-error",
+ "http 1.1.0",
+ "jsonwebtoken",
+ "parking_lot 0.12.3",
+ "percent-encoding",
+ "remain",
+ "reqwest 0.12.7",
+ "ring",
+ "serde",
+ "serde_json",
+ "strum 0.25.0",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "graph-error"
+version = "0.3.1"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "futures",
+ "handlebars 2.0.4",
+ "http 1.1.0",
+ "http-serde",
+ "jsonwebtoken",
+ "reqwest 0.12.7",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+ "uuid 1.10.0",
+ "x509-parser",
+]
+
+[[package]]
+name = "graph-http"
+version = "2.0.1"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "futures",
+ "futures-util",
+ "graph-core",
+ "graph-error",
+ "handlebars 2.0.4",
+ "http 1.1.0",
+ "percent-encoding",
+ "reqwest 0.12.7",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror",
+ "tokio",
+ "tower",
+ "url",
+]
+
+[[package]]
+name = "graph-oauth"
+version = "2.0.1"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.21.7",
+ "dyn-clone",
+ "graph-core",
+ "graph-error",
+ "hex",
+ "http 1.1.0",
+ "jsonwebtoken",
+ "lazy_static",
+ "reqwest 0.12.7",
+ "serde",
+ "serde-aux",
+ "serde_json",
+ "serde_urlencoded",
+ "strum 0.25.0",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid 1.10.0",
+]
+
+[[package]]
+name = "graph-rs-sdk"
+version = "2.0.1"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+dependencies = [
+ "graph-core",
+ "graph-error",
+ "graph-http",
+ "graph-oauth",
+ "handlebars 2.0.4",
+ "lazy_static",
+ "reqwest 0.12.7",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4421,6 +4594,22 @@ dependencies = [
 
 [[package]]
 name = "handlebars"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af92141a22acceb515fb6b13ac59d6d0b3dd3437e13832573af8e0d3247f29d5"
+dependencies = [
+ "hashbrown 0.5.0",
+ "log",
+ "pest",
+ "pest_derive",
+ "quick-error 1.2.3",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "handlebars"
 version = "5.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d08485b96a0e6393e9e4d1b8d48cf74ad6c063cd905eb33f42c1ce3f0377539b"
@@ -4431,6 +4620,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1de41fb8dba9714efd92241565cdff73f78508c95697dd56787d3cba27e2353"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -4714,6 +4912,16 @@ dependencies = [
  "http 1.1.0",
  "http-body 1.0.1",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-serde"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f560b665ad9f1572cfcaf034f7fb84338a7ce945216d64a90fd81f046a3caee"
+dependencies = [
+ "http 0.2.12",
+ "serde",
 ]
 
 [[package]]
@@ -5583,7 +5791,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "async-openai",
  "async-stream",
@@ -6033,7 +6241,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6339,7 +6547,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "snafu 0.8.4",
  "tracing",
@@ -6514,6 +6722,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.77",
+]
+
+[[package]]
+name = "num_threads"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -6785,6 +7002,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c219b6a4cd9eb167239d921d7348132cdff2eca05abbf1094e7f7ec9b8936b6"
 
 [[package]]
+name = "oid-registry"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bedf36ffb6ba96c2eb7144ef6270557b52e54b20c0a8e1eb2ff99a6c6959bff"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7033,7 +7259,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -8075,6 +8301,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
+name = "remain"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46aef80f842736de545ada6ec65b81ee91504efd6853f4b96de7414c42ae7443"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.77",
+]
+
+[[package]]
 name = "rend"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8336,7 +8573,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "anyhow",
  "app",
@@ -8379,6 +8616,7 @@ dependencies = [
  "fundu",
  "futures",
  "globset",
+ "graph-rs-sdk",
  "headers-accept",
  "http 1.1.0",
  "http-body-util",
@@ -8506,6 +8744,15 @@ dependencies = [
  "strength_reduce",
  "transpose",
  "version_check",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -8910,6 +9157,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99fce0ffe7310761ca6bf9faf5115afbc19688edd00171d81b1bb1b116c63e09"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde-aux"
+version = "4.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d2e8bfba469d06512e11e3311d4d051a4a387a5b42d010404fecf3200321c95"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -9329,7 +9587,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -9346,7 +9604,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "app",
  "clap",
@@ -9375,7 +9633,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "schemars",
  "serde",
@@ -9387,7 +9645,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "schemars",
  "serde_json",
@@ -9653,6 +9911,18 @@ dependencies = [
 
 [[package]]
 name = "synstructure"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f36bdaa60a83aca3921b5259d5400cbf5e90fc51931376a9bd4a0eb79aa7210f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+ "unicode-xid",
+]
+
+[[package]]
+name = "synstructure"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8af7666ab7b6390ab78131fb5b0fce11d6b7a6951602017c35fa82800708971"
@@ -9758,7 +10028,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "arrow",
  "async-trait",
@@ -9883,7 +10153,9 @@ checksum = "5dfd88e563464686c916c7e46e623e520ddc6d79fa6641390f2e3fa86e83e885"
 dependencies = [
  "deranged",
  "itoa",
+ "libc",
  "num-conv",
+ "num_threads",
  "powerfmt",
  "serde",
  "time-core",
@@ -9977,6 +10249,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2 0.5.7",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.52.0",
 ]
 
@@ -10724,6 +10997,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0336d538f7abc86d282a4189614dfaa90810dfc2c6f6427eaf88e16311dd225d"
 
 [[package]]
+name = "unicode-xid"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f962df74c8c05a667b5ee8bcf162993134c104e96440b663c8daa176dc772d8c"
+
+[[package]]
 name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10769,6 +11048,7 @@ dependencies = [
  "form_urlencoded",
  "idna 0.5.0",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]
@@ -10797,7 +11077,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "0.18.0-beta"
+version = "0.17.4-beta"
 dependencies = [
  "backoff",
  "humantime",
@@ -10822,6 +11102,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81dfa00651efa65069b0b6b651f4aaa31ba9e3c3ce0137aaad053604ee7e0314"
 dependencies = [
  "getrandom",
+ "serde",
 ]
 
 [[package]]
@@ -11477,6 +11758,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "x509-parser"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7069fba5b66b9193bd2c5d3d4ff12b839118f6bcbef5328efafafb5395cf63da"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "xattr"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11552,7 +11850,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.77",
- "synstructure",
+ "synstructure 0.13.1",
 ]
 
 [[package]]
@@ -11666,7 +11964,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.77",
- "synstructure",
+ "synstructure 0.13.1",
 ]
 
 [[package]]

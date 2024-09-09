@@ -49,6 +49,7 @@ default = [
   "databricks",
   "dremio",
   "clickhouse",
+  "sharepoint",
   "spark",
   "snowflake",
   "ftp",
@@ -70,3 +71,4 @@ release = []
 snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
+sharepoint = ["runtime/sharepoint"]
