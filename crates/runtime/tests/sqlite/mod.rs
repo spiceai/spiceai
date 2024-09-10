@@ -52,7 +52,6 @@ type QueryTests<'a> = Vec<(&'a str, CheckFunction, Option<Box<ValidateFn>>)>;
 
 #[derive(Debug, Copy, Clone)]
 enum DecimalQuery {
-    #[allow(dead_code)]
     Federated,
     NonFederated,
 }
@@ -192,7 +191,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
     dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
 
     for (query, check_function, validate_result) in
-        decimal_queries("test_sqlite_decimal_file", DecimalQuery::NonFederated)
+        decimal_queries("test_sqlite_decimal_file", DecimalQuery::Federated)
     {
         match check_function {
             CheckFunction::ValidateFullPlan(snapshot_name) => {
