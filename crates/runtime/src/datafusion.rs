@@ -30,7 +30,7 @@ use crate::dataupdate::{
 };
 use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
-use crate::{embeddings, view};
+use crate::{embeddings, status, view};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -422,6 +422,7 @@ impl DataFusion {
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
+                    status::update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     self.pending_sink_tables
                         .write()
                         .await

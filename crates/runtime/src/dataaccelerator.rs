@@ -19,7 +19,7 @@ use crate::component::dataset::Dataset;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
-use crate::spice_data_base_path;
+use crate::{spice_data_base_path, status};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -322,6 +322,12 @@ pub async fn create_accelerator_table(
             .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
             })?;
+
+    // If we already have an existing file, it means there is data from a previous acceleration and we don't need
+    // to wait for the first refresh to complete to mark it ready.
+    if let Some(dataset) = dataset.filter(|d| accelerator.has_existing_file(d)) {
+        status::update_dataset(&dataset.name, status::ComponentStatus::Ready);
+    }
 
     if let Err(e) = acceleration_settings.validate_indexes(&schema) {
         InvalidConfigurationSnafu {
