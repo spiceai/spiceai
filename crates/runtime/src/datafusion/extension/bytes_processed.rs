@@ -35,6 +35,7 @@ use datafusion_federation::FederatedPlanNode;
 use futures::StreamExt;
 use std::{
     any::Any,
+    collections::HashSet,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     sync::Arc,
@@ -123,6 +124,33 @@ impl UserDefinedLogicalNodeCore for BytesProcessedNode {
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "BytesProcessedNode")
+    }
+
+    /// Returns the necessary input columns for this node required to compute
+    /// the columns in the output schema
+    ///
+    /// This is used for projection push-down when `DataFusion` has determined that
+    /// only a subset of the output columns of this node are needed by its parents.
+    /// This API is used to tell `DataFusion` which, if any, of the input columns are no longer
+    /// needed.
+    ///
+    /// Return `None`, the default, if this information can not be determined.
+    /// Returns `Some(_)` with the column indices for each child of this node that are
+    /// needed to compute `output_columns`
+    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        // Since the input & output schema is the same, output columns require their corresponding index in the input columns.
+        Some(vec![output_columns.to_vec()])
+    }
+
+    /// A list of output columns (e.g. the names of columns in
+    /// `self.schema()`) for which predicates can not be pushed below
+    /// this node without changing the output.
+    ///
+    /// By default, this returns all columns and thus prevents any
+    /// predicates from being pushed below this node.
+    fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
+        // Allow filters for all columns to be pushed down
+        HashSet::new()
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {

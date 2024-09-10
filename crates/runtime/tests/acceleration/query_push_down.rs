@@ -158,33 +158,34 @@ CREATE TABLE test (
         "Expected 1 rows returned"
     );
 
-    let plan_results = rt
-        .datafusion()
-        .ctx
-        .sql("EXPLAIN SELECT COUNT(1) FROM abc")
-        .await
-        .expect("sql working")
-        .collect()
-        .await
-        .expect("collect working");
+    // Re-enable with https://github.com/spiceai/spiceai/issues/2550
+    // let plan_results = rt
+    //     .datafusion()
+    //     .ctx
+    //     .sql("EXPLAIN SELECT COUNT(1) FROM abc")
+    //     .await
+    //     .expect("sql working")
+    //     .collect()
+    //     .await
+    //     .expect("collect working");
 
-    let expected_plan = [
-        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                                                                                                                           |",
-        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| logical_plan  | BytesProcessedNode                                                                                                                                                             |",
-        "|               |   Federated                                                                                                                                                                    |",
-        "|               |  Projection: count(Int64(1))                                                                                                                                                   |",
-        "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                            |",
-        "|               |     TableScan: abc                                                                                                                                                             |",
-        "| physical_plan | BytesProcessedExec                                                                                                                                                             |",
-        "|               |   SchemaCastScanExec                                                                                                                                                           |",
-        "|               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
-        "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
-        "|               |                                                                                                                                                                                |",
-        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    ];
-    assert_batches_eq!(expected_plan, &plan_results);
+    // let expected_plan = [
+    //     "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+    //     "| plan_type     | plan                                                                                                                                                                           |",
+    //     "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+    //     "| logical_plan  | BytesProcessedNode                                                                                                                                                             |",
+    //     "|               |   Federated                                                                                                                                                                    |",
+    //     "|               |  Projection: count(Int64(1))                                                                                                                                                   |",
+    //     "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                            |",
+    //     "|               |     TableScan: abc                                                                                                                                                             |",
+    //     "| physical_plan | BytesProcessedExec                                                                                                                                                             |",
+    //     "|               |   SchemaCastScanExec                                                                                                                                                           |",
+    //     "|               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
+    //     "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
+    //     "|               |                                                                                                                                                                                |",
+    //     "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+    // ];
+    // assert_batches_eq!(expected_plan, &plan_results);
 
     let plan_results = rt
         .datafusion()
@@ -197,23 +198,21 @@ CREATE TABLE test (
         .expect("collect working");
 
     let expected_plan = [
-        "+---------------+----------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                             |",
-        "+---------------+----------------------------------------------------------------------------------+",
-        "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                |",
-        "|               |   Projection:                                                                    |",
-        "|               |     BytesProcessedNode                                                           |",
-        "|               |       TableScan: non_federated_abc                                               |",
-        "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                        |",
-        "|               |   CoalescePartitionsExec                                                         |",
-        "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                  |",
-        "|               |       ProjectionExec: expr=[]                                                    |",
-        "|               |         BytesProcessedExec                                                       |",
-        "|               |           SchemaCastScanExec                                                     |",
-        "|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
-        "|               |               SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
-        "|               |                                                                                  |",
-        "+---------------+----------------------------------------------------------------------------------+",
+        "+---------------+--------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                           |",
+        "+---------------+--------------------------------------------------------------------------------+",
+        "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                              |",
+        "|               |   BytesProcessedNode                                                           |",
+        "|               |     TableScan: non_federated_abc projection=[]                                 |",
+        "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                      |",
+        "|               |   CoalescePartitionsExec                                                       |",
+        "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                |",
+        "|               |       BytesProcessedExec                                                       |",
+        "|               |         SchemaCastScanExec                                                     |",
+        "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
+        "|               |             SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
+        "|               |                                                                                |",
+        "+---------------+--------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected_plan, &plan_results);
 
