@@ -85,7 +85,7 @@ assignees: ''
 - [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the trunk branch.
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
-- [ ] Create a new branch `release-v[semver]` for the release version from the trunk. E.g. `release-v0.17.0-beta`
+- [ ] Create a new branch `release-v[semver]` for the release from trunk. E.g. `release-v0.17.0-beta`
 - [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.17.0-beta`
 - [ ] Release any docs updates by creating a `v[semver]` tag.
 - [ ] Trigger algolia search crawler [workflow](https://github.com/spiceai/docs/actions/workflows/trigger_search_reindex.yml), to reindex updated docs.
