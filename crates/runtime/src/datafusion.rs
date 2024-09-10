@@ -219,6 +219,7 @@ struct PendingSinkRegistration {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
+    runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
@@ -227,8 +228,8 @@ pub struct DataFusion {
 
 impl DataFusion {
     #[must_use]
-    pub fn new() -> Self {
-        Self::new_with_cache_provider(None)
+    pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
+        Self::new_with_cache_provider(status, None)
     }
 
     /// Create a new `DataFusion` instance.
@@ -237,7 +238,10 @@ impl DataFusion {
     ///
     /// Panics if the default schema cannot be registered.
     #[must_use]
-    pub fn new_with_cache_provider(cache_provider: Option<Arc<QueryResultsCacheProvider>>) -> Self {
+    pub fn new_with_cache_provider(
+        status: Arc<status::RuntimeStatus>,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    ) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -296,11 +300,17 @@ impl DataFusion {
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         DataFusion {
+            runtime_status: status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
         }
+    }
+
+    #[must_use]
+    pub fn runtime_status(&self) -> Arc<status::RuntimeStatus> {
+        Arc::clone(&self.runtime_status)
     }
 
     #[must_use]
@@ -422,7 +432,8 @@ impl DataFusion {
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
-                    status::update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     self.pending_sink_tables
                         .write()
                         .await
@@ -678,6 +689,7 @@ impl DataFusion {
                 })?;
 
         let accelerated_table_provider = create_accelerator_table(
+            Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_schema),
             source_table_provider.constraints(),
@@ -726,6 +738,7 @@ impl DataFusion {
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
+            Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
             accelerated_table_provider,
@@ -1044,11 +1057,5 @@ impl DataFusion {
         protocol: Protocol,
     ) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self), protocol)
-    }
-}
-
-impl Default for DataFusion {
-    fn default() -> Self {
-        Self::new()
     }
 }

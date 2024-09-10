@@ -307,6 +307,7 @@ impl AcceleratorExternalTableBuilder {
 }
 
 pub async fn create_accelerator_table(
+    runtime_status: Arc<status::RuntimeStatus>,
     table_name: TableReference,
     schema: SchemaRef,
     constraints: Option<&Constraints>,
@@ -326,7 +327,7 @@ pub async fn create_accelerator_table(
     // If we already have an existing file, it means there is data from a previous acceleration and we don't need
     // to wait for the first refresh to complete to mark it ready.
     if let Some(dataset) = dataset.filter(|d| accelerator.has_existing_file(d)) {
-        status::update_dataset(&dataset.name, status::ComponentStatus::Ready);
+        runtime_status.update_dataset(&dataset.name, status::ComponentStatus::Ready);
     }
 
     if let Err(e) = acceleration_settings.validate_indexes(&schema) {
@@ -453,6 +454,7 @@ mod test {
             ..Acceleration::default()
         };
         let _ = create_accelerator_table(
+            status::RuntimeStatus::new(),
             "abc".into(),
             schema,
             None,
@@ -489,6 +491,7 @@ mod test {
         };
 
         let _ = create_accelerator_table(
+            status::RuntimeStatus::new(),
             "abc".into(),
             schema,
             None,
@@ -525,6 +528,7 @@ mod test {
             ..Acceleration::default()
         };
         let _ = create_accelerator_table(
+            status::RuntimeStatus::new(),
             "abc".into(),
             schema,
             None,

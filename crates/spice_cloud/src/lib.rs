@@ -36,7 +36,7 @@ use runtime::{
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
-    Runtime,
+    status, Runtime,
 };
 use tokio::sync::RwLock;
 
@@ -181,6 +181,7 @@ impl SpiceExtension {
         let metrics_table_reference = get_metrics_table_reference();
 
         let table = create_synced_internal_accelerated_table(
+            runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
             Acceleration::default(),
@@ -327,6 +328,7 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
+    runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,
     from: &str,
     acceleration: Acceleration,
@@ -338,6 +340,7 @@ pub async fn create_synced_internal_accelerated_table(
         get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets)).await?;
 
     let accelerated_table_provider = create_accelerator_table(
+        Arc::clone(&runtime_status),
         table_reference.clone(),
         source_table_provider.schema(),
         None,
@@ -349,6 +352,7 @@ pub async fn create_synced_internal_accelerated_table(
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
+        runtime_status,
         table_reference.clone(),
         source_table_provider,
         accelerated_table_provider,
