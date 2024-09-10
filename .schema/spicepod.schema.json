@@ -848,7 +848,7 @@
         "timestamptz",
         "unix_seconds",
         "unix_millis",
-        "iso8601"
+        "ISO8601"
       ]
     },
     "TlsConfig": {
