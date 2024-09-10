@@ -767,8 +767,6 @@ impl Runtime {
                 return Err(RetryError::transient(err));
             };
 
-            status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-
             Ok(())
         })
         .await;
@@ -959,7 +957,6 @@ impl Runtime {
                     },
                 );
                 metrics::datasets::COUNT.add(1, &[Key::from_static_str("engine").string(engine)]);
-                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
 
                 Ok(())
             }
@@ -1027,12 +1024,11 @@ impl Runtime {
 
                 self.remove_dataset(&ds).await;
 
-                if let Ok(()) = self
+                if (self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
-                    .await
+                    .await)
+                    .is_err()
                 {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-                } else {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 }
             }
@@ -1156,8 +1152,8 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            return self
-                .df
+            let ds_name: TableReference = ds.name.clone();
+            self.df
                 .register_table(
                     ds,
                     datafusion::Table::Federated {
@@ -1168,7 +1164,10 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
-                });
+                })?;
+
+            status::update_dataset(&ds_name, status::ComponentStatus::Ready);
+            return Ok(());
         }
 
         // ACCELERATED TABLE
@@ -1191,6 +1190,8 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
+        // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
+        status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         self.df
             .register_table(
                 ds,
