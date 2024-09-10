@@ -23,8 +23,8 @@ Current supported data accelerators (DuckDB, Postgres, SQlite, Arrow) release st
 Index/constraint usage is determined by each specific benchmark test.
 
 - Clickhouse: Primary key constraint & index: <https://github.com/ClickHouse/ClickBench/#indexing>
-- TPCH: Primary/foreign key constraints & index: <https://github.com/duckdb/duckdb/tree/master/benchmark/tpch>
-- TPCDS: Primary/foreign key constraints & index: <https://github.com/duckdb/duckdb/tree/master/benchmark/tpcds>
+- TPCH: Primary/foreign key constraints & index
+- TPCDS: Primary/foreign key constraints & index
 
 - [ ] End-to-end test to cover accelerating TPCH-SF1 data from S3 and benchmarking TPCH queries (official and simple).
   - [ ] File mode
