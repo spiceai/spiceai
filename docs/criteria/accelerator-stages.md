@@ -20,10 +20,31 @@ Current supported data accelerators (DuckDB, Postgres, SQlite, Arrow) release st
 
 ### Test Coverage
 
+Index/constraint usage is determined by each specific benchmark test.
+
+- Clickhouse: Primary key constraint & index: <https://github.com/ClickHouse/ClickBench/#indexing>
+- TPCH: Primary/foreign key constraints & index: <https://github.com/duckdb/duckdb/tree/master/benchmark/tpch>
+- TPCDS: Primary/foreign key constraints & index: <https://github.com/duckdb/duckdb/tree/master/benchmark/tpcds>
+
 - [ ] End-to-end test to cover accelerating TPCH-SF1 data from S3 and benchmarking TPCH queries (official and simple).
   - [ ] File mode
   - [ ] In-Memory mode
-- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with arrow types: Null, all Int types, all Float types, Time32, Time64, Timestamp (with/without TZ), Date32, Date64, Duration, Interval, Binary/LargeBinary/FixedSizeBinary, Utf8/LargeUtf8, List/FixedSizeList/LargeList, Struct, Decimal128/Decimal256
+- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with arrow types:
+  - [ ] Null
+  - [ ] All Int types
+  - [ ] All Float types
+  - [ ] Time32
+  - [ ] Time64
+  - [ ] Timestamp (with/without TZ)
+  - [ ] Date32
+  - [ ] Date64
+  - [ ] Duration
+  - [ ] Interval
+  - [ ] Binary/LargeBinary/FixedSizeBinary
+  - [ ] Utf8/LargeUtf8
+  - [ ] List/FixedSizeList/LargeList
+  - [ ] Struct
+  - [ ] Decimal128/Decimal256
 - [ ] Integration tests to cover "On Conflict" behaviors.
 - [ ] A reproducible test script that can load a variety of datasets into accelerators in both file/embedded memory mode.
   - Loads and runs these benchmarks with no errors:
@@ -31,7 +52,9 @@ Current supported data accelerators (DuckDB, Postgres, SQlite, Arrow) release st
     - [ ] TPCH-SF100 (file)
     - [ ] TPCDS-SF10 (embedded memory/file)
     - [ ] TPCDS-SF100 (file)
-    - [ ] Clickbench
+    - [ ] Clickbench (memory/file)
+    - [ ] Spicebench (memory/file)
+    - [ ] Semi-structure/Blob based data with row size 1M, 10M, 100M
 
 ### Docs
 
