@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -60,7 +60,6 @@ pub mod query;
 
 mod extension;
 pub mod filter_converter;
-pub mod initial_load;
 pub mod refresh_sql;
 pub mod schema;
 pub mod udf;
@@ -224,9 +223,6 @@ pub struct DataFusion {
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
-
-    /// Has the initial load of the data been completed? It is the responsibility of the caller to call `mark_initial_load_complete` when the initial load is complete.
-    initial_load_complete: Mutex<bool>,
 }
 
 impl DataFusion {
@@ -303,7 +299,6 @@ impl DataFusion {
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
-            initial_load_complete: Mutex::new(false),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
         }
     }

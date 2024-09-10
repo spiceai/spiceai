@@ -465,8 +465,6 @@ impl Runtime {
         }
 
         join_all(futures).await;
-
-        self.df.mark_initial_load_complete();
     }
 
     pub async fn get_params_with_secrets(

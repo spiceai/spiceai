@@ -14,17 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use crate::datafusion::DataFusion;
 use axum::{
     http::status,
     response::{IntoResponse, Response},
-    Extension,
 };
 
-pub(crate) async fn get(Extension(df): Extension<Arc<DataFusion>>) -> Response {
-    if df.is_initial_load_complete() {
+pub(crate) async fn get() -> Response {
+    if crate::status::is_ready() {
         return (status::StatusCode::OK, "Ready").into_response();
     }
     (status::StatusCode::SERVICE_UNAVAILABLE, "Not Ready").into_response()
