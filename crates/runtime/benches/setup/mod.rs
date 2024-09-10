@@ -159,7 +159,7 @@ fn build_app(
             let mut accel = accel.clone();
             let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name);
             if let Some(indexes) = indexes {
-                accel.indexes = indexes
+                accel.indexes = indexes;
             }
             if ds.name != "oss_benchmarks" {
                 ds.acceleration = Some(accel);

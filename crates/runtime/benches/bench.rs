@@ -204,7 +204,7 @@ async fn run_query_and_record_result(
 
     let mut completed_iterations = 0;
 
-    for i in 0..benchmark_results.iterations() {
+    for _ in 0..benchmark_results.iterations() {
         completed_iterations += 1;
 
         let start_iter_time = get_current_unix_ms();
