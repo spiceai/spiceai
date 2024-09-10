@@ -58,6 +58,7 @@ postgres = [
   "dep:tokio",
   "dep:async-stream",
   "datafusion-table-providers/postgres",
+  "datafusion-table-providers/postgres-federation"
 ]
 snowflake = ["dep:snowflake-api", "dep:pkcs8", "dep:serde_json"]
 sqlite = ["datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]
