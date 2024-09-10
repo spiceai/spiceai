@@ -1,0 +1,21 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT * FROM test_graphql where id = '4' limit 1"
+---
++---------------+------------------------------------------------------------------------------+
+| plan_type     | plan                                                                         |
++---------------+------------------------------------------------------------------------------+
+| logical_plan  | Limit: skip=0, fetch=1                                                       |
+|               |   BytesProcessedNode                                                         |
+|               |     Filter: test_graphql.id = Utf8("4")                                      |
+|               |       TableScan: test_graphql projection=[id, name, posts]                   |
+| physical_plan | GlobalLimitExec: skip=0, fetch=1                                             |
+|               |   CoalescePartitionsExec                                                     |
+|               |     LocalLimitExec: fetch=1                                                  |
+|               |       BytesProcessedExec                                                     |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2 |
+|               |           CoalesceBatchesExec: target_batch_size=8192                        |
+|               |             FilterExec: id@0 = 4                                             |
+|               |               MemoryExec: partitions=2, partition_sizes=[2, 2]               |
+|               |                                                                              |
++---------------+------------------------------------------------------------------------------+

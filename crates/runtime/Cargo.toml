@@ -51,6 +51,7 @@ flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
+graph-rs-sdk = { workspace = true, optional = true }
 headers-accept = "0.1.3"
 http = "1.1.0"
 http-body-util = "0.1.2"
@@ -119,6 +120,7 @@ async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
 spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
+insta.workspace = true
 
 [features]
 aws-secrets-manager = [
@@ -134,7 +136,7 @@ clickhouse = [
 ]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
-default = ["keyring-secret-store", "aws-secrets-manager"]
+default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
 delta_lake = ["data_components/delta_lake"]
 dev = []
 dremio = []
@@ -150,6 +152,7 @@ postgres = [
   "data_components/postgres",
   "datafusion-table-providers/postgres",
 ]
+sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snowflake = [
   "dep:snowflake-api",
   "db_connection_pool/snowflake",

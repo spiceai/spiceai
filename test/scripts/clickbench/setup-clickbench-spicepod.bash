@@ -73,6 +73,7 @@ gzip -d hits.csv.gz
 
 # Command to load clickbench data into DuckDB
 dbname="clickbench.db"
+dbname_accelerated="clickbench-accelerated"
 read_command() {
     echo ".read 'create.sql'"
 }
@@ -127,6 +128,20 @@ echo "        pg_user: $pg_user" >> spicepod.yaml
 echo "        pg_pass: $pg_pass" >> spicepod.yaml
 echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
 echo "        pg_db: $pg_db" >> spicepod.yaml
+fi
+
+# Load clickbench data into SQLite Accelerator
+if [ "$engine" = "sqlite" ]; then
+echo "  - from: duckdb:hits" >> spicepod.yaml
+echo "    name: hits" >> spicepod.yaml
+echo "    params:" >> spicepod.yaml
+echo "      duckdb_open: $dbname" >> spicepod.yaml
+echo "    acceleration:" >> spicepod.yaml
+echo "      enabled: true" >> spicepod.yaml
+echo "      engine: sqlite" >> spicepod.yaml
+echo "      mode: file" >> spicepod.yaml
+echo "      params:" >> spicepod.yaml
+echo "        sqlite_file: $dbname_accelerated.db" >> spicepod.yaml
 fi
 
 spiced
