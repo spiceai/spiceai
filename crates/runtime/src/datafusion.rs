@@ -689,7 +689,6 @@ impl DataFusion {
                 })?;
 
         let accelerated_table_provider = create_accelerator_table(
-            Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_schema),
             source_table_provider.constraints(),

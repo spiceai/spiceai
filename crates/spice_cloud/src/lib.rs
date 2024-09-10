@@ -340,7 +340,6 @@ pub async fn create_synced_internal_accelerated_table(
         get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets)).await?;
 
     let accelerated_table_provider = create_accelerator_table(
-        Arc::clone(&runtime_status),
         table_reference.clone(),
         source_table_provider.schema(),
         None,

@@ -653,6 +653,13 @@ impl Runtime {
                     }
                 };
 
+                // If we already have an existing file, it means there is data from a previous acceleration and we don't need
+                // to wait for the first refresh to complete to mark it ready.
+                if accelerator.has_existing_file(ds) {
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Ready);
+                }
+
                 match accelerator
                     .init(ds)
                     .await
