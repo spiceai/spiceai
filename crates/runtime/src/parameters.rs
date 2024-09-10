@@ -26,14 +26,20 @@ impl Parameters {
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
             .filter_map(|(key, value)| {
-                let mut unprefixed_key = key.as_str();
+                let mut key_to_use = key.as_str();
                 let mut has_prefix = false;
                 if key.starts_with(&full_prefix) {
                     has_prefix = true;
-                    unprefixed_key = &key[full_prefix.len()..];
+                    key_to_use = &key[full_prefix.len()..];
                 }
 
-                let spec = all_params.iter().find(|p| p.name == unprefixed_key);
+                let mut spec = all_params.iter().find(|p| p.name == key_to_use);
+
+                // Try again with the full key if the unprefixed key was not found
+                if spec.is_none() {
+                    spec = all_params.iter().find(|p| p.name == key.as_str());
+                    key_to_use = key.as_str();
+                };
 
                 let Some(spec) = spec else {
                     tracing::warn!("Ignoring parameter {key}: not supported for {component_name}.");
@@ -47,14 +53,7 @@ impl Parameters {
                     return None;
                 }
 
-                if has_prefix && !spec.r#type.is_prefixed() {
-                    tracing::warn!(
-                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
-                );
-                    return None;
-                }
-
-                Some((unprefixed_key.to_string(), value))
+                Some((key_to_use.to_string(), value))
             })
             .collect();
         let secret_guard = secrets.read().await;
