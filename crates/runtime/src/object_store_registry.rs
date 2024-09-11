@@ -74,7 +74,7 @@ impl SpiceObjectStoreRegistry {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
         } else {
-            s3_builder = s3_builder.with_skip_signature(true);
+            s3_builder = s3_builder.with_skip_signature(false);
         };
         s3_builder = s3_builder.with_client_options(client_options);
 
