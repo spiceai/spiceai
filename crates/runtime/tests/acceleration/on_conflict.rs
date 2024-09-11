@@ -1,8 +1,8 @@
-use crate::{dataset_ready_check, get_test_datafusion, init_tracing, postgres::common};
+use crate::{get_test_datafusion, init_tracing, postgres::common, runtime_ready_check};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use rand::Rng;
-use runtime::Runtime;
+use runtime::{status, Runtime};
 use spicepod::component::{
     dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
@@ -151,7 +151,8 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         "sqlite",
     );
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let app = AppBuilder::new("on_conflict_behavior")
         .with_dataset(pg_on_conflict_upsert)
@@ -170,6 +171,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         Runtime::builder()
             .with_app(app)
             .with_datafusion(df)
+            .with_runtime_status(status)
             .build()
             .await,
     );
@@ -182,16 +184,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(&rt, "SELECT * FROM pg_on_conflict_upsert LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM pg_on_conflict_drop LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM duckdb_mem_on_conflict_drop LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM duckdb_mem_on_conflict_upsert LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM duckdb_file_on_conflict_drop LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM sql_mem_on_conflict_drop LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM sql_mem_on_conflict_upsert LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM sql_file_on_conflict_upsert LIMIT 1").await;
-    dataset_ready_check(&rt, "SELECT * FROM sql_file_on_conflict_drop LIMIT 1").await;
+    runtime_ready_check(&rt).await;
 
     db_conn
         .conn

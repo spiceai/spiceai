@@ -75,6 +75,7 @@ struct RefreshStat {
 }
 
 pub struct RefreshTask {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
@@ -83,11 +84,13 @@ pub struct RefreshTask {
 impl RefreshTask {
     #[must_use]
     pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
+            runtime_status,
             dataset_name,
             federated,
             accelerator,
@@ -103,7 +106,7 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
 
-        Self::mark_dataset_status(
+        self.mark_dataset_status(
             &dataset_name,
             sql.as_deref(),
             status::ComponentStatus::Refreshing,
@@ -143,7 +146,7 @@ impl RefreshTask {
                 Err(e) => {
                     tracing::error!("Error getting update for dataset {dataset_name}: {e}");
                     let sql = refresh.read().await.sql.clone();
-                    Self::mark_dataset_status(
+                    self.mark_dataset_status(
                         &dataset_name,
                         sql.as_deref(),
                         status::ComponentStatus::Error,
@@ -185,7 +188,7 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        Self::mark_dataset_status(
+        self.mark_dataset_status(
             &self.dataset_name,
             refresh.sql.as_deref(),
             status::ComponentStatus::Refreshing,
@@ -221,7 +224,7 @@ impl RefreshTask {
             Ok(data_update) => data_update,
             Err(e) => {
                 tracing::warn!("Failed to load data for dataset {}: {e}", self.dataset_name);
-                Self::mark_dataset_status(
+                self.mark_dataset_status(
                     &self.dataset_name,
                     refresh.sql.as_deref(),
                     status::ComponentStatus::Error,
@@ -308,7 +311,7 @@ impl RefreshTask {
         {
             Ok(plan) => plan,
             Err(e) => {
-                Self::mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
+                self.mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
                 // Should not retry if we are unable to create execution plan to insert data
                 return Err(RetryError::permanent(super::Error::FailedToWriteData {
                     source: e,
@@ -318,7 +321,7 @@ impl RefreshTask {
 
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
             tracing::warn!("Failed to update dataset {dataset_name}: {e}");
-            Self::mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
+            self.mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
             return Err(retry_from_df_error(e));
         }
 
@@ -328,7 +331,7 @@ impl RefreshTask {
             self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size);
         }
 
-        Self::mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Ready);
+        self.mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Ready);
 
         Ok(())
     }
@@ -346,7 +349,8 @@ impl RefreshTask {
         } else {
             tracing::info!("Loading data for dataset {dataset_name}");
         }
-        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
+        self.runtime_status
+            .update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
@@ -378,7 +382,7 @@ impl RefreshTask {
                 self.trace_dataset_loaded(start_time, 0, 0);
             }
 
-            Self::mark_dataset_status(
+            self.mark_dataset_status(
                 &self.dataset_name,
                 sql.as_deref(),
                 status::ComponentStatus::Ready,
@@ -743,11 +747,12 @@ impl RefreshTask {
     }
 
     fn mark_dataset_status(
+        &self,
         dataset_name: &TableReference,
         sql: Option<&str>,
         status: status::ComponentStatus,
     ) {
-        status::update_dataset(dataset_name, status);
+        self.runtime_status.update_dataset(dataset_name, status);
 
         if status == status::ComponentStatus::Error {
             let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];

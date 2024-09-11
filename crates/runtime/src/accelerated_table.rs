@@ -20,6 +20,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
+use crate::status;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -165,6 +166,7 @@ fn validate_refresh_data_window(
 }
 
 pub struct Builder {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
@@ -179,12 +181,14 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Self {
         Self {
+            runtime_status,
             dataset_name,
             federated,
             accelerator,
@@ -294,6 +298,7 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         let mut refresher = refresh::Refresher::new(
+            Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&refresh_params),
@@ -339,12 +344,19 @@ impl Builder {
 
 impl AcceleratedTable {
     pub fn builder(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Builder {
-        Builder::new(dataset_name, federated, accelerator, refresh)
+        Builder::new(
+            runtime_status,
+            dataset_name,
+            federated,
+            accelerator,
+            refresh,
+        )
     }
 
     #[must_use]
