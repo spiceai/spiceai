@@ -17,7 +17,7 @@ limitations under the License.
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
-use runtime::{datafusion::DataFusion, dataupdate::DataUpdate, Runtime};
+use runtime::{datafusion::DataFusion, dataupdate::DataUpdate, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::Acceleration, replication::Replication, Dataset, Mode,
 };
@@ -31,7 +31,8 @@ const ITERATIONS: i32 = 5;
 ///
 /// 1) Sets the number of `target_partitions` to 4, by default its the number of CPU cores available.
 fn get_test_datafusion() -> Arc<DataFusion> {
-    let mut df = DataFusion::new();
+    let status = status::RuntimeStatus::new();
+    let mut df = DataFusion::new(Arc::clone(&status));
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
