@@ -25,6 +25,8 @@ limitations under the License.
 // schema
 // run_id, started_at, finished_at, connector_name, query_name, status, min_duration, max_duration, iterations, commit_sha
 
+#![feature(test)]
+extern crate test;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -34,6 +36,7 @@ use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context:
 use results::BenchmarkResultsBuilder;
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration};
+use test::Bencher;
 
 use crate::results::Status;
 
@@ -56,111 +59,123 @@ mod bench_postgres;
 #[cfg(feature = "spark")]
 mod bench_spark;
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+// TODO: Add all connectors & accelerators
+
+#[bench]
+fn spiceai_benchmark(b: &mut Bencher) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        run_connector_bench("spice.ai").await.unwrap(); // Run the async function once
+    });
+
+    b.iter(|| {});
+}
+
+#[bench]
+fn s3_benchmark(b: &mut Bencher) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        run_connector_bench("s3").await.unwrap(); // Run the async function once
+    });
+
+    b.iter(|| {});
+}
+
+#[bench]
+#[cfg(feature = "spark")]
+fn spark_benchmark(b: &mut Bencher) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        run_connector_bench("spark").await.unwrap(); // Run the async function once
+    });
+
+    b.iter(|| {});
+}
+
+async fn run_connector_bench(connector: &str) -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");
         upload_results_dataset = Some(env_var);
     }
 
-    let connectors = vec![
-        "spice.ai",
-        "s3",
-        #[cfg(feature = "spark")]
-        "spark",
-        #[cfg(feature = "postgres")]
-        "postgres",
-        #[cfg(feature = "mysql")]
-        "mysql",
-        #[cfg(feature = "odbc")]
-        "odbc-databricks",
-        #[cfg(feature = "odbc")]
-        "odbc-athena",
-        #[cfg(feature = "delta_lake")]
-        "delta_lake",
-    ];
-
     let mut display_records = vec![];
 
-    for connector in connectors {
-        let (mut benchmark_results, mut rt) =
-            setup::setup_benchmark(&upload_results_dataset, connector, None).await;
+    let (mut benchmark_results, mut rt) =
+        setup::setup_benchmark(&upload_results_dataset, connector, None).await;
 
-        match connector {
-            "spice.ai" => {
-                bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
-            }
-            "s3" => {
-                bench_s3::run(&mut rt, &mut benchmark_results, None, None).await?;
-            }
-            #[cfg(feature = "spark")]
-            "spark" => {
-                bench_spark::run(&mut rt, &mut benchmark_results).await?;
-            }
-            #[cfg(feature = "postgres")]
-            "postgres" => {
-                bench_postgres::run(&mut rt, &mut benchmark_results).await?;
-            }
-            #[cfg(feature = "mysql")]
-            "mysql" => {
-                bench_mysql::run(&mut rt, &mut benchmark_results).await?;
-            }
-            #[cfg(feature = "odbc")]
-            "odbc-databricks" => {
-                bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
-            }
-            #[cfg(feature = "odbc")]
-            "odbc-athena" => {
-                bench_odbc_athena::run(&mut rt, &mut benchmark_results).await?;
-            }
-            #[cfg(feature = "delta_lake")]
-            "delta_lake" => {
-                bench_delta::run(&mut rt, &mut benchmark_results).await?;
-            }
-            _ => {}
+    match connector {
+        "spice.ai" => {
+            bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
-        let data_update: DataUpdate = benchmark_results.into();
-
-        let mut records = data_update.data.clone();
-        display_records.append(&mut records);
-
-        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
-            tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
-            setup::write_benchmark_results(data_update, &rt).await?;
+        "s3" => {
+            bench_s3::run(&mut rt, &mut benchmark_results, None, None).await?;
         }
+        #[cfg(feature = "spark")]
+        "spark" => {
+            bench_spark::run(&mut rt, &mut benchmark_results).await?;
+        }
+        #[cfg(feature = "postgres")]
+        "postgres" => {
+            bench_postgres::run(&mut rt, &mut benchmark_results).await?;
+        }
+        #[cfg(feature = "mysql")]
+        "mysql" => {
+            bench_mysql::run(&mut rt, &mut benchmark_results).await?;
+        }
+        #[cfg(feature = "odbc")]
+        "odbc-databricks" => {
+            bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
+        }
+        #[cfg(feature = "odbc")]
+        "odbc-athena" => {
+            bench_odbc_athena::run(&mut rt, &mut benchmark_results).await?;
+        }
+        #[cfg(feature = "delta_lake")]
+        "delta_lake" => {
+            bench_delta::run(&mut rt, &mut benchmark_results).await?;
+        }
+        _ => {}
+    }
+    let data_update: DataUpdate = benchmark_results.into();
+
+    let mut records = data_update.data.clone();
+    display_records.append(&mut records);
+
+    if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+        setup::write_benchmark_results(data_update, &rt).await?;
     }
 
-    let accelerators: Vec<Acceleration> = vec![
-        create_acceleration("arrow", acceleration::Mode::Memory),
-        #[cfg(feature = "duckdb")]
-        create_acceleration("duckdb", acceleration::Mode::Memory),
-        #[cfg(feature = "duckdb")]
-        create_acceleration("duckdb", acceleration::Mode::File),
-        #[cfg(feature = "sqlite")]
-        create_acceleration("sqlite", acceleration::Mode::Memory),
-        #[cfg(feature = "sqlite")]
-        create_acceleration("sqlite", acceleration::Mode::File),
-    ];
+    display_benchmark_records(display_records).await?;
+    Ok(())
+}
 
-    for accelerator in accelerators {
-        let engine = accelerator.engine.clone();
-        let mode = accelerator.mode.clone();
+async fn run_accelerator_bench(engine: &str, mode: acceleration::Mode) -> Result<(), String> {
+    let mut upload_results_dataset: Option<String> = None;
+    if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
+        println!("UPLOAD_RESULTS_DATASET: {env_var}");
+        upload_results_dataset = Some(env_var);
+    }
+    let mut display_records = vec![];
 
-        let (mut benchmark_results, mut rt) =
-            setup::setup_benchmark(&upload_results_dataset, "s3", Some(accelerator)).await;
+    let accelerator = create_acceleration(engine, mode);
+    let engine = accelerator.engine.clone();
+    let mode = accelerator.mode.clone();
 
-        bench_s3::run(&mut rt, &mut benchmark_results, engine, Some(mode)).await?;
+    let (mut benchmark_results, mut rt) =
+        setup::setup_benchmark(&upload_results_dataset, "s3", Some(accelerator)).await;
 
-        let data_update: DataUpdate = benchmark_results.into();
+    bench_s3::run(&mut rt, &mut benchmark_results, engine, Some(mode)).await?;
 
-        let mut records = data_update.data.clone();
-        display_records.append(&mut records);
+    let data_update: DataUpdate = benchmark_results.into();
 
-        if let Some(upload_results_dataset) = upload_results_dataset.clone() {
-            tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
-            setup::write_benchmark_results(data_update, &rt).await?;
-        }
+    let mut records = data_update.data.clone();
+    display_records.append(&mut records);
+
+    if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+        setup::write_benchmark_results(data_update, &rt).await?;
     }
 
     display_benchmark_records(display_records).await?;

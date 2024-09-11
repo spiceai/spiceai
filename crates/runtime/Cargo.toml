@@ -167,5 +167,5 @@ sqlite = [
 ]
 
 [[bench]]
-harness = false
+harness = true
 name = "bench"
