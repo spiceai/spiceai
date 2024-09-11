@@ -302,7 +302,7 @@ impl RefreshTask {
                 Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(
                     observed_record_batch_stream,
                 ))),
-                overwrite,
+                overwrite, // <--- This is where that update, not overwrite doesn't work.
             )
             .await
         {
@@ -504,7 +504,7 @@ impl RefreshTask {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
             RefreshMode::Full => UpdateType::Overwrite,
-            RefreshMode::Append => UpdateType::Append,
+            RefreshMode::Append => UpdateType::Changes, // ::Append. This is the issue.
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 

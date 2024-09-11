@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{ArrowInternalSnafu, Error, ReqwestInternalSnafu, Result};
+use super::{ArrowInternalSnafu, Error, InvalidJsonResponseSnafu, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -22,6 +22,7 @@ use arrow::{
 };
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
 use std::{
@@ -53,11 +54,41 @@ pub struct PaginationParameters {
     page_info_path: String,
 }
 
+/// A location within a GraphQL query.
+#[derive(Serialize, Deserialize, Debug)]
+struct Location {
+    line: u64,
+    column: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct GraphQLError {
+    message: Option<String>,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    locations: Option<Vec<Location>>,
+}
+
+impl GraphQLError {
+    fn inner_message(&self) -> Option<String> {
+        self.message.and_then(|m| m.split(" at [").next())
+    }
+}
+
+//  [GraphQL Cursor Connections Specification](https://relay.dev/graphql/connections.htm)
+
 static PAGINATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}").unwrap_or_else(|_| {
         unreachable!("Invalid regex pagination pattern defined at compile time")
     })
 });
+
+pub struct PageInfo {
+    pub has_next_page: bool,
+    pub has_previous_page: bool,
+    pub start_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+}
 
 impl PaginationParameters {
     fn parse(query: &str, pointer: &str) -> Option<Self> {
@@ -387,18 +418,6 @@ fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> Re
 
 fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
     if status.is_client_error() | status.is_server_error() {
-        let message = [
-            &response["message"],
-            &response["error"]["message"],
-            &response["errors"][0]["message"],
-        ]
-        .iter()
-        .map(|x| x.as_str())
-        .find(Option::is_some)
-        .flatten()
-        .unwrap_or("No message provided")
-        .to_string();
-
         return match status {
             StatusCode::UNAUTHORIZED => {
                 Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}; Please check if provided credentials are correct.") })
@@ -406,16 +425,35 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
             StatusCode::FORBIDDEN => {
                 Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}; Please check if provided credentials have the necessary permissions.") })
             },
-            _ => Err(Error::InvalidReqwestStatus { status, message })
+            _ => {
+                let message = [
+                    &response["message"],
+                    &response["error"]["message"],
+                    &response["errors"][0]["message"],
+                ]
+                .iter()
+                .map(|x| x.as_str())
+                .find(Option::is_some)
+                .flatten()
+                .unwrap_or("No message provided")
+                .to_string();
+                Err(Error::InvalidReqwestStatus { status, message })
+            }
         };
     }
     Ok(())
 }
 
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
-    let graphql_error = &response["errors"][0];
+    let Some(graphql_error) = response.get("errors").and_then(|e| e.get(0)) else {
+        return Ok(());
+    };
+
+    let error: GraphQLError = serde_json::from_value(graphql_error).context(InvalidJsonResponseSnafu)?;
+
 
     if !graphql_error.is_null() {
+        let error: GraphQLError = serde_json::from_value(graphql_error).unwrap()
         let line = graphql_error["locations"][0]["line"].as_u64();
         let column = graphql_error["locations"][0]["column"].as_u64();
         let error_type = graphql_error["type"].as_str();
@@ -441,6 +479,18 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                 return Err(Error::InvalidCredentialsOrPermissions { message: format!("The API returned a 'FORBIDDEN' error. Please check if the credentials have the necessary permissions. {message}") });
             }
         }
+
+        let z = match error.locations.as_deref() {
+            Some([Location{line, column},..]) => {
+                Err(Error::InvalidGraphQLQuery {
+                    message,
+                    line,
+                    column,
+                    query: format_query_with_context(query, line, column),
+                })
+            }
+            _ => None,
+        };
 
         return match location {
             Some((line, column)) => Err(Error::InvalidGraphQLQuery {

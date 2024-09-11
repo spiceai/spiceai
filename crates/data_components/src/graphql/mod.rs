@@ -31,6 +31,9 @@ pub enum Error {
         message: String,
     },
 
+    #[snafu(display("Invalid response format: {source}"))]
+    InvalidJsonResponseError { source: serde_json::Error },
+
     #[snafu(display("{source}"))]
     ArrowInternal { source: ArrowError },
 
