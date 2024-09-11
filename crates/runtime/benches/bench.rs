@@ -25,6 +25,7 @@ limitations under the License.
 // schema
 // run_id, started_at, finished_at, connector_name, query_name, status, min_duration, max_duration, iterations, commit_sha
 
+use std::panic;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -192,7 +193,9 @@ async fn run_query_and_record_result(
     // Additional round of query run before recording results.
     // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
     let _ = run_query(rt, connector, query_name, query).await;
-    record_explain_plan(rt, connector, query_name, query).await?;
+    let snapshot_err = record_explain_plan(rt, connector, query_name, query)
+        .await
+        .err();
 
     tracing::info!("Running query `{connector}` `{query_name}`...");
     let start_time = get_current_unix_ms();
@@ -228,12 +231,13 @@ async fn run_query_and_record_result(
 
     let end_time = get_current_unix_ms();
 
+    // Both query failure and snapshot test failure will cause the result to be written as Status::Failed
     benchmark_results.record_result(
         start_time,
         end_time,
         connector,
         query_name,
-        if query_err.is_some() {
+        if query_err.is_some() || snapshot_err.is_some() {
             Status::Failed
         } else {
             Status::Passed
@@ -243,8 +247,23 @@ async fn run_query_and_record_result(
         completed_iterations,
     );
 
-    if let Some(e) = query_err {
-        return Err(e);
+    if query_err.is_some() && snapshot_err.is_some() {
+        return Err(format!(
+            "Query Error: {}; Snapshot Test Error: {}",
+            query_err.unwrap_or_default(),
+            snapshot_err.unwrap_or_default()
+        ));
+    }
+
+    if query_err.is_some() {
+        return Err(format!("Query Error: {}", query_err.unwrap_or_default()));
+    }
+
+    if snapshot_err.is_some() {
+        return Err(format!(
+            "Snapshot Test Error: {}",
+            snapshot_err.unwrap_or_default()
+        ));
     }
 
     Ok(())
@@ -293,8 +312,11 @@ async fn record_explain_plan(
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
     let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
-        panic!("Failed to format plan");
+        return Err("Failed to format plan".to_string());
     };
+
+    let mut assertion_err: Option<String> = None;
+
     insta::with_settings!({
         description => format!("Query: {query}"),
         omit_expression => true,
@@ -302,8 +324,18 @@ async fn record_explain_plan(
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
         ],
     }, {
-        insta::assert_snapshot!(format!("{connector}_{query_name}_explain"), explain_plan);
+        let result = panic::catch_unwind(|| {
+            insta::assert_snapshot!(format!("{connector}_{query_name}_explain"), explain_plan);
+        });
+        if result.is_err() {
+            assertion_err = Some(format!("Snapshort assertion failed for {connector}, {query_name}"));
+        }
     });
+
+    if let Some(assertion_err) = assertion_err {
+        return Err(assertion_err);
+    }
+
     Ok(())
 }
 
