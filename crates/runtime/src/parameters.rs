@@ -27,9 +27,9 @@ impl Parameters {
             .into_iter()
             .filter_map(|(key, value)| {
                 let mut key_to_use = key.as_str();
-                let mut has_prefix = false;
+                let mut prefix_removed = false;
                 if key.starts_with(&full_prefix) {
-                    has_prefix = true;
+                    prefix_removed = true;
                     key_to_use = &key[full_prefix.len()..];
                 }
 
@@ -39,6 +39,7 @@ impl Parameters {
                 if spec.is_none() {
                     spec = all_params.iter().find(|p| p.name == key.as_str());
                     key_to_use = key.as_str();
+                    prefix_removed = false;
                 };
 
                 let Some(spec) = spec else {
@@ -46,11 +47,16 @@ impl Parameters {
                     return None;
                 };
 
-                if !has_prefix && spec.r#type.is_prefixed() {
+                if !prefix_removed && spec.r#type.is_prefixed() {
                     tracing::warn!(
                     "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
                 );
                     return None;
+                }
+                if prefix_removed && !spec.r#type.is_prefixed() {
+                    tracing::warn!(
+                        "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
+                    );
                 }
 
                 Some((key_to_use.to_string(), value))
