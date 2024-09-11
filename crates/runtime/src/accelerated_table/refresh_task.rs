@@ -399,6 +399,17 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        // If we've gotten to this point and we don't have a time column, skip trying to filter by timestamp.
+        //
+        // Normally we don't allow this configuration, but it's possible to get here with an accelerated dataset
+        // configured with `refresh_mode: full` and the user calls the `POST /v1/datasets/{dataset}/acceleration/refresh` API
+        // and overrides the `refresh_mode` to `append`.
+        if refresh.time_column.is_none() {
+            return self
+                .get_full_or_incremental_append_update(refresh, None)
+                .await;
+        }
+
         match self
             .timestamp_nanos_for_append_query(refresh)
             .await
