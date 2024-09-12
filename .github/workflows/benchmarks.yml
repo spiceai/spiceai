@@ -15,7 +15,7 @@ env:
   FEATURES: ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
 
 jobs:
-  run-database-bench:
+  build-database-bench:
     name: Benchmark Tests
     runs-on: ubuntu-latest
     services:
@@ -73,7 +73,39 @@ jobs:
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
-      - run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release
+      - name: Build benchmark binary
+        run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
+
+      - name: Find, move, and rename benchmark binary
+        run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
+
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v2
+        with:
+          name: spice_bench
+          path: ./spice_bench
+
+  run-database-bench:
+    name: Run Benchmark Variations
+    runs-on: ubuntu-latest
+    needs: build-binary
+
+    strategy:
+      matrix:
+        variation: ['-c spice.ai', '-c s3', '-a arrow']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Download benchmark binary
+        uses: actions/download-artifact@v2
+        with:
+          name: spice_bench
+
+      - name: Run benchmark with ${{ matrix.variation }}
+        run: ./spice_bench --${{ matrix.variation }}
+        continue-on-error: true
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
