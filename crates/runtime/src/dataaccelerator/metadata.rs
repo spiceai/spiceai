@@ -16,9 +16,10 @@ limitations under the License.
 
 //! Store and retrieve Spice metadata in durable accelerator tables
 //!
-//! The metadata table will be a new table `spice_sys_metadata` with two columns:
+//! The metadata table will be a new table `spice_sys_metadata` with three columns:
 //! - `dataset` (PRIMARY KEY, TEXT): The dataset the metadata entry corresponds to
-//! - `metadata` (TEXT): The metadata entry in JSON format
+//! - `key` (PRIMARY KEY, TEXT): The key of the metadata entry
+//! - `metadata` (TEXT): The metadata entry in JSON/string serialized format
 
 use serde::de::DeserializeOwned;
 
@@ -27,6 +28,7 @@ use crate::component::dataset::{acceleration::Engine, Dataset};
 pub const METADATA_TABLE_NAME: &str = "spice_sys_metadata";
 pub const METADATA_DATASET_COLUMN: &str = "dataset";
 pub const METADATA_METADATA_COLUMN: &str = "metadata";
+pub const METADATA_KEY_COLUMN: &str = "key";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
@@ -62,9 +64,9 @@ impl AcceleratedMetadata {
     }
 
     #[must_use]
-    pub async fn get_metadata<T: DeserializeOwned>(&self) -> Option<T> {
+    pub async fn get_metadata<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.metadata_provider
-            .get_metadata(&self.dataset_name)
+            .get_metadata(&self.dataset_name, key)
             .await
             .map(|metadata| serde_json::from_str(&metadata))?
             .ok()
@@ -72,21 +74,23 @@ impl AcceleratedMetadata {
 
     pub async fn set_metadata<T: serde::Serialize>(
         &self,
+        key: &str,
         metadata: &T,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let metadata = serde_json::to_string(metadata).map_err(|e| e.to_string())?;
         self.metadata_provider
-            .set_metadata(&self.dataset_name, &metadata)
+            .set_metadata(&self.dataset_name, key, &metadata)
             .await
     }
 }
 
 #[async_trait::async_trait]
 pub trait AcceleratedMetadataProvider {
-    async fn get_metadata(&self, dataset: &str) -> Option<String>;
+    async fn get_metadata(&self, dataset: &str, key: &str) -> Option<String>;
     async fn set_metadata(
         &self,
         dataset: &str,
+        key: &str,
         metadata: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }

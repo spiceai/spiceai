@@ -18,7 +18,9 @@ use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresC
 use datafusion_table_providers::util::secrets::to_secret_map;
 
 use super::AcceleratedMetadataProvider;
-use super::{METADATA_DATASET_COLUMN, METADATA_METADATA_COLUMN, METADATA_TABLE_NAME};
+use super::{
+    METADATA_DATASET_COLUMN, METADATA_KEY_COLUMN, METADATA_METADATA_COLUMN, METADATA_TABLE_NAME,
+};
 use crate::component::dataset::Dataset;
 
 pub struct AcceleratedMetadataPostgres {
@@ -45,15 +47,15 @@ impl AcceleratedMetadataPostgres {
 
 #[async_trait::async_trait]
 impl AcceleratedMetadataProvider for AcceleratedMetadataPostgres {
-    async fn get_metadata(&self, dataset: &str) -> Option<String> {
+    async fn get_metadata(&self, dataset: &str, key: &str) -> Option<String> {
         let query = format!(
-            "SELECT {METADATA_METADATA_COLUMN} FROM {METADATA_TABLE_NAME} WHERE {METADATA_DATASET_COLUMN} = $1",
+            "SELECT {METADATA_METADATA_COLUMN} FROM {METADATA_TABLE_NAME} WHERE {METADATA_DATASET_COLUMN} = $1 AND {METADATA_KEY_COLUMN} = $2",
         );
 
         let conn = self.pool.connect_direct().await.ok()?;
 
         let stmt = conn.conn.prepare(&query).await.ok()?;
-        let row = conn.conn.query_one(&stmt, &[&dataset]).await.ok()?;
+        let row = conn.conn.query_one(&stmt, &[&dataset, &key]).await.ok()?;
 
         row.get(0)
     }
@@ -61,23 +63,28 @@ impl AcceleratedMetadataProvider for AcceleratedMetadataPostgres {
     async fn set_metadata(
         &self,
         dataset: &str,
+        key: &str,
         metadata: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.connect_direct().await?;
         let create_if_not_exists = format!(
             "CREATE TABLE IF NOT EXISTS {METADATA_TABLE_NAME} (
-                {METADATA_DATASET_COLUMN} TEXT PRIMARY KEY,
-                {METADATA_METADATA_COLUMN} TEXT
+                {METADATA_DATASET_COLUMN} TEXT,
+                {METADATA_KEY_COLUMN} TEXT,
+                {METADATA_METADATA_COLUMN} TEXT,
+                PRIMARY KEY ({METADATA_DATASET_COLUMN}, {METADATA_KEY_COLUMN})
             );",
         );
 
         conn.conn.execute(&create_if_not_exists, &[]).await?;
 
         let query = format!(
-            "INSERT INTO {METADATA_TABLE_NAME} ({METADATA_DATASET_COLUMN}, {METADATA_METADATA_COLUMN}) VALUES ($1, $2) ON CONFLICT ({METADATA_DATASET_COLUMN}) DO UPDATE SET {METADATA_METADATA_COLUMN} = $2",
+            "INSERT INTO {METADATA_TABLE_NAME} ({METADATA_DATASET_COLUMN}, {METADATA_KEY_COLUMN}, {METADATA_METADATA_COLUMN}) VALUES ($1, $2, $3) ON CONFLICT ({METADATA_DATASET_COLUMN}, {METADATA_KEY_COLUMN}) DO UPDATE SET {METADATA_METADATA_COLUMN} = $3",
         );
 
-        conn.conn.execute(&query, &[&dataset, &metadata]).await?;
+        conn.conn
+            .execute(&query, &[&dataset, &key, &metadata])
+            .await?;
 
         Ok(())
     }
