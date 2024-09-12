@@ -87,74 +87,60 @@ async fn main() -> Result<(), String> {
 
     let args = BenchArgs::parse();
 
-    // If no arguments are specified for connector / accelerator, run all connector / accelerator benchmark test
-    if args.connector.is_none() && args.accelerator.is_none() {
-        let connectors = vec![
-            "spice.ai",
-            "s3",
-            #[cfg(feature = "spark")]
-            "spark",
-            #[cfg(feature = "postgres")]
-            "postgres",
-            #[cfg(feature = "mysql")]
-            "mysql",
-            #[cfg(feature = "odbc")]
-            "odbc-databricks",
-            #[cfg(feature = "odbc")]
-            "odbc-athena",
-            #[cfg(feature = "delta_lake")]
-            "delta_lake",
-        ];
-        for connector in connectors {
-            run_connector_bench(connector, &upload_results_dataset).await?;
-        }
-        let accelerators: Vec<Acceleration> = vec![
-            create_acceleration("arrow", acceleration::Mode::Memory),
-            #[cfg(feature = "duckdb")]
-            create_acceleration("duckdb", acceleration::Mode::Memory),
-            #[cfg(feature = "duckdb")]
-            create_acceleration("duckdb", acceleration::Mode::File),
-            #[cfg(feature = "sqlite")]
-            create_acceleration("sqlite", acceleration::Mode::Memory),
-            #[cfg(feature = "sqlite")]
-            create_acceleration("sqlite", acceleration::Mode::File),
-        ];
-        for accelerator in accelerators {
-            run_accelerator_bench(accelerator, &upload_results_dataset).await?;
-        }
-        return Ok(());
-    }
-
-    // Run connector benchmark test if connector is specified
-    if let Some(connector) = args.connector.as_deref() {
-        if args.accelerator.as_deref().is_some() || args.mode.as_deref().is_some() {
-            return Err(
-                "Invalid command line input: accelerator or mode parameter supplied for connector benchmark"
-            .to_string());
-        }
-        run_connector_bench(connector, &upload_results_dataset).await?;
-        return Ok(());
-    }
-
-    // Run accelerator benchmark test if accelerator is specified
-    if let Some(accelerator) = args.accelerator.as_deref() {
-        // Default to memory mode if no mode is specified in command line
-        let mut mode = Mode::Memory;
-        if let Some(acc_mode) = args.mode.as_deref() {
-            match acc_mode {
-                "file" => mode = Mode::File,
-                "memory" => {}
-                _ => {
-                    return Err(format!(
-                        "Benchmark test for {accelerator} accelerator failed to start: invalid mode parameter"
-                    ))
-                }
+    match (args.connector.as_deref(), args.accelerator.as_deref(), args.mode.as_deref()) {
+        (None, None, None) => {
+            // Run all connector / accelerator benchmark tests
+            let connectors = vec![
+                "spice.ai",
+                "s3",
+                #[cfg(feature = "spark")]
+                "spark",
+                #[cfg(feature = "postgres")]
+                "postgres",
+                #[cfg(feature = "mysql")]
+                "mysql",
+                #[cfg(feature = "odbc")]
+                "odbc-databricks",
+                #[cfg(feature = "odbc")]
+                "odbc-athena",
+                #[cfg(feature = "delta_lake")]
+                "delta_lake",
+            ];
+            for connector in connectors {
+                run_connector_bench(connector, &upload_results_dataset).await?;
             }
-        }
-        let acceleration = create_acceleration(accelerator, mode);
-        run_accelerator_bench(acceleration, &upload_results_dataset).await?;
-        return Ok(());
+            let accelerators: Vec<Acceleration> = vec![
+                create_acceleration("arrow", acceleration::Mode::Memory),
+                #[cfg(feature = "duckdb")]
+                create_acceleration("duckdb", acceleration::Mode::Memory),
+                #[cfg(feature = "duckdb")]
+                create_acceleration("duckdb", acceleration::Mode::File),
+                #[cfg(feature = "sqlite")]
+                create_acceleration("sqlite", acceleration::Mode::Memory),
+                #[cfg(feature = "sqlite")]
+                create_acceleration("sqlite", acceleration::Mode::File),
+            ];
+            for accelerator in accelerators {
+                run_accelerator_bench(accelerator, &upload_results_dataset).await?;
+            }
+        },
+        (Some(connector), None, None) => {
+            // Run connector benchmark test
+            run_connector_bench(connector, &upload_results_dataset).await?;
+        },
+        (None, Some(accelerator), mode) => {
+            // Run accelerator benchmark test
+            let mode = match mode {
+                Some("file") => Mode::File,
+                Some("memory") | None => Mode::Memory,
+                _ => return Err(format!("Invalid mode parameter for {accelerator} accelerator")),
+            };
+            let acceleration = create_acceleration(accelerator, mode);
+            run_accelerator_bench(acceleration, &upload_results_dataset).await?;
+        },
+        _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
     }
+
     Ok(())
 }
 
