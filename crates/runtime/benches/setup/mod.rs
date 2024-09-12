@@ -17,13 +17,19 @@ limitations under the License.
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
-use runtime::{datafusion::DataFusion, dataupdate::DataUpdate, status, Runtime};
+use futures::Future;
+use runtime::{
+    datafusion::DataFusion,
+    dataupdate::DataUpdate,
+    status::{self, RuntimeStatus},
+    Runtime,
+};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, IndexType},
     replication::Replication,
     Dataset, Mode,
 };
-use std::{collections::HashMap, process::Command, sync::Arc};
+use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
 use tracing_subscriber::EnvFilter;
 
 /// The number of times to run each query in the benchmark.
@@ -32,9 +38,8 @@ const ITERATIONS: i32 = 5;
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 4, by default its the number of CPU cores available.
-fn get_test_datafusion() -> Arc<DataFusion> {
-    let status = status::RuntimeStatus::new();
-    let mut df = DataFusion::new(Arc::clone(&status));
+fn get_test_datafusion(status: Arc<RuntimeStatus>) -> Arc<DataFusion> {
+    let mut df = DataFusion::new(status);
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -57,12 +62,13 @@ pub(crate) async fn setup_benchmark(
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let is_acc = acceleration.is_some();
     let app = build_app(upload_results_dataset, connector, acceleration);
 
+    let status = status::RuntimeStatus::new();
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(get_test_datafusion())
+        .with_datafusion(get_test_datafusion(Arc::clone(&status)))
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -73,15 +79,36 @@ pub(crate) async fn setup_benchmark(
         () = rt.load_components() => {}
     }
 
-    if is_acc {
-        // allow accelerated data to load
-        tokio::time::sleep(std::time::Duration::from_secs(150)).await;
-    }
+    runtime_ready_check(&rt).await;
 
     let benchmark_results =
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
 
     (benchmark_results, rt)
+}
+
+async fn runtime_ready_check(rt: &Runtime) {
+    assert!(
+        wait_until_true(Duration::from_secs(150), || async {
+            rt.status().is_ready()
+        })
+        .await
+    );
+}
+
+async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while start.elapsed() < max_wait {
+        if f().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    false
 }
 
 pub(crate) async fn write_benchmark_results(
