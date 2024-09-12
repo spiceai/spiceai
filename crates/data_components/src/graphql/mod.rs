@@ -31,6 +31,9 @@ pub enum Error {
         message: String,
     },
 
+    #[snafu(display("Could not find or infer JSON pointer. Input: {pointer:?}"))]
+    PointerNotFound { pointer: Option<String> },
+
     #[snafu(display("{source}"))]
     ArrowInternal { source: ArrowError },
 
