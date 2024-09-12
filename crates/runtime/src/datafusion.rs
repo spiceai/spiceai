@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -30,7 +30,7 @@ use crate::dataupdate::{
 };
 use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
-use crate::{embeddings, view};
+use crate::{embeddings, status, view};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -60,7 +60,6 @@ pub mod query;
 
 mod extension;
 pub mod filter_converter;
-pub mod initial_load;
 pub mod refresh_sql;
 pub mod schema;
 pub mod udf;
@@ -220,19 +219,17 @@ struct PendingSinkRegistration {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
+    runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
-
-    /// Has the initial load of the data been completed? It is the responsibility of the caller to call `mark_initial_load_complete` when the initial load is complete.
-    initial_load_complete: Mutex<bool>,
 }
 
 impl DataFusion {
     #[must_use]
-    pub fn new() -> Self {
-        Self::new_with_cache_provider(None)
+    pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
+        Self::new_with_cache_provider(status, None)
     }
 
     /// Create a new `DataFusion` instance.
@@ -241,7 +238,10 @@ impl DataFusion {
     ///
     /// Panics if the default schema cannot be registered.
     #[must_use]
-    pub fn new_with_cache_provider(cache_provider: Option<Arc<QueryResultsCacheProvider>>) -> Self {
+    pub fn new_with_cache_provider(
+        status: Arc<status::RuntimeStatus>,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    ) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -300,12 +300,17 @@ impl DataFusion {
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         DataFusion {
+            runtime_status: status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
-            initial_load_complete: Mutex::new(false),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
         }
+    }
+
+    #[must_use]
+    pub fn runtime_status(&self) -> Arc<status::RuntimeStatus> {
+        Arc::clone(&self.runtime_status)
     }
 
     #[must_use]
@@ -427,6 +432,8 @@ impl DataFusion {
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     self.pending_sink_tables
                         .write()
                         .await
@@ -730,6 +737,7 @@ impl DataFusion {
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
+            Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
             accelerated_table_provider,
@@ -1048,11 +1056,5 @@ impl DataFusion {
         protocol: Protocol,
     ) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self), protocol)
-    }
-}
-
-impl Default for DataFusion {
-    fn default() -> Self {
-        Self::new()
     }
 }
