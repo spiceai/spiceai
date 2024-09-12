@@ -11,7 +11,7 @@
     "diagrams": [
       {
         "id": 0,
-        "title": "SQL Query (Sidecar)",
+        "title": "SQL Query (Local Machine/Network)",
         "diagramType": "STRIDE",
         "placeholder": "New STRIDE diagram description",
         "thumbnail": "./public/content/images/thumbnail.stride.jpg",
@@ -54,14 +54,14 @@
             "shape": "trust-boundary-box",
             "attrs": {
               "headerText": {
-                "text": "Sidecar"
+                "text": "Local Machine/Network"
               }
             },
             "zIndex": -1,
             "id": "b2bbd52d-f20e-4d29-8246-5c24a7d84de6",
             "data": {
               "type": "tm.BoundaryBox",
-              "name": "Sidecar",
+              "name": "Local Machine/Network",
               "description": "",
               "isTrustBoundary": true,
               "hasOpenThreats": false
