@@ -80,7 +80,7 @@ jobs:
         run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
 
       - name: Upload benchmark binary
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: spice_bench
           path: ./spice_bench
@@ -96,10 +96,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Download benchmark binary
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: spice_bench
 
