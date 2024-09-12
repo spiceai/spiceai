@@ -29,7 +29,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
-use std::{io::Cursor, sync::Arc};
+use std::{cmp::min, io::Cursor, sync::Arc};
 use url::Url;
 
 pub enum Auth {
@@ -60,27 +60,96 @@ pub struct PageInfo {
     pub end_cursor: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PaginationArgument {
-    First(usize), // first, after
-    Last(usize),  // last, before
-}
-
-impl PaginationArgument {
-    fn arg_count(&self) -> usize {
-        match self {
-            PaginationArgument::First(z) | PaginationArgument::Last(z) => *z,
+impl PageInfo {
+    /// Based on the pagination, returns the appropriate cursor.
+    ///
+    /// Example:
+    /// ```rust
+    /// use serde_json;
+    /// use data_components::graphql::client::PageInfo;
+    ///
+    /// let info = serde_json::from_str(r#"{"hasNextPage": true, "endCursor": "cursor_abc"}"#).unwrap();
+    /// assert_eq!(
+    ///  info.cursor_from_pagination(&PaginationArgument::First(10)),
+    ///  Some("cursor_abc".to_string())
+    /// );
+    ///
+    /// assert_eq!(
+    ///  info.cursor_from_pagination(&PaginationArgument::Last(10)),
+    ///  None
+    /// );
+    /// ```
+    fn cursor_from_pagination(&self, arg: &PaginationArgument) -> Option<String> {
+        match arg {
+            PaginationArgument::First(_) => {
+                if self.has_next_page {
+                    self.end_cursor.clone()
+                } else {
+                    None
+                }
+            }
+            PaginationArgument::Last(_) => {
+                if self.has_previous_page {
+                    self.start_cursor.clone()
+                } else {
+                    None
+                }
+            }
         }
     }
 }
 
-/// For a pointer into a GraphQL query, return the corresponding pointer into the JSON response.
-/// For backwards compatibility, check for `/data`.
-fn pointer_into_response(ptr: &str) -> String {
-    if ptr.starts_with("/data") {
-        ptr.to_string()
-    } else {
-        format!("/data{ptr}")
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaginationArgument {
+    /// paginating via `fn(first: usize, after: String)`
+    First(usize),
+    /// paginating via `fn(last: usize, before: String)`
+    Last(usize),
+}
+
+impl PaginationArgument {
+    /// Formats the pagination arguments to be inserted into a Graphql variable.
+    ///
+    /// Example:
+    /// ```rust
+    /// use data_components::graphql::client::PaginationArgument;
+    /// assert_eq!(
+    ///   PaginationArgument::Last(10).format_arguments(None),
+    ///   "last: 10"
+    /// );
+    /// assert_eq!(
+    ///   PaginationArgument::First(10).format_arguments(Some("cursor_abc".to_string())),
+    ///   "first: 10, after: \"cursor_abc\""
+    /// );
+    /// ```
+    fn format_arguments(&self, cursor: Option<String>) -> String {
+        match (self, cursor) {
+            (PaginationArgument::First(z), Some(c)) => {
+                format!(r#"first: {z}, after: "{c}""#,)
+            }
+            (PaginationArgument::First(z), None) => {
+                format!(r#"first: {z}"#)
+            }
+            (PaginationArgument::Last(z), Some(c)) => {
+                format!(r#"last: {z}, before: "{c}""#)
+            }
+            (PaginationArgument::Last(z), None) => {
+                format!(r#"last: {z}"#)
+            }
+        }
+    }
+
+    fn with_limit(&self, limit: usize) -> Self {
+        match self {
+            PaginationArgument::First(z) => PaginationArgument::First(min(*z, limit)),
+            PaginationArgument::Last(z) => PaginationArgument::Last(min(*z, limit)),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            PaginationArgument::First(z) | PaginationArgument::Last(z) => *z,
+        }
     }
 }
 
@@ -118,11 +187,10 @@ pub struct PaginationParameters {
 
 impl PaginationParameters {
     fn reduce_limit(&self, l: usize) -> usize {
-        l.saturating_sub(self.count.arg_count())
+        l.saturating_sub(self.count.size())
     }
 
     fn parse(query: &str) -> Option<Self> {
-
         // Recursive function to traverse the AST and find the pageInfo field
         fn find_in_selection_set<'a, T: Text<'a> + std::fmt::Debug>(
             selections: &[Selection<'a, T>],
@@ -217,14 +285,11 @@ impl PaginationParameters {
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
         let mut limit_reached = false;
 
-        let mut count = match self.count {
-            PaginationArgument::First(z) |
-            PaginationArgument::Last(z) => z,
-        };
+        let mut count = self.count.clone();
 
         if let Some(limit) = limit {
-            if limit <= count {
-                count = limit;
+            if limit <= count.size() {
+                count = count.with_limit(limit);
                 limit_reached = true;
             }
         }
@@ -233,23 +298,14 @@ impl PaginationParameters {
         let regex =
             Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
 
-        // Don't use value from PaginationArgument, use `count` that has been 
-        let replace_query = match (cursor, self.count.clone()) {
-            (Some(c), PaginationArgument::First(_)) => {
-                format!(r#"(first: {count}, after: "{c}")"#,)
-            }
-            (None, PaginationArgument::First(_)) => {
-                format!(r#"(first: {count})"#)
-            }
-            (Some(c), PaginationArgument::Last(_)) => {
-                format!(r#"(last: {count}, before: "{c}")"#)
-            }
-            (None, PaginationArgument::Last(_)) => {
-                format!(r#"(last: {count})"#)
-            }
-        };
-
-        let new_query = regex.replace(query, format!(r#"{} {replace_query}"#, self.resource_name));
+        let new_query = regex.replace(
+            query,
+            format!(
+                r#"{} ({})"#,
+                self.resource_name,
+                count.format_arguments(cursor)
+            ),
+        );
         (new_query.to_string(), limit_reached)
     }
 
@@ -259,29 +315,14 @@ impl PaginationParameters {
         };
 
         let page_info: PageInfo = response
-            .pointer(&pointer_into_response(page_info_path))
+            .pointer(&format!("/data{page_info_path}"))
             .cloned()
             .map(serde_json::from_value)
             .transpose()
             .ok()
             .flatten()?;
 
-        match self.count {
-            PaginationArgument::First(_) => {
-                if page_info.has_next_page {
-                    page_info.end_cursor
-                } else {
-                    None
-                }
-            }
-            PaginationArgument::Last(_) => {
-                if page_info.has_previous_page {
-                    page_info.start_cursor
-                } else {
-                    None
-                }
-            }
-        }
+        page_info.cursor_from_pagination(&self.count)
     }
 }
 
@@ -512,7 +553,7 @@ impl GraphQLClient {
 
         while let Some(next_cursor_val) = next_cursor {
             if let (Some(l), Some(p)) = (limit, self.pagination_parameters.as_ref()) {
-                  limit = Some(p.reduce_limit(l));
+                limit = Some(p.reduce_limit(l));
             };
 
             let (next_batch, _, new_cursor) = self
