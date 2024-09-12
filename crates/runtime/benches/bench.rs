@@ -250,15 +250,14 @@ async fn run_query_and_record_result(
     match (query_err, snapshot_err) {
         (Some(query), Some(snapshot)) => {
             return Err(format!(
-                "Query Error: {}; Snapshot Test Error: {}",
-                query, snapshot
+                "Query Error: {query}; Snapshot Test Error: {snapshot}",
             ));
         }
         (Some(query), None) => {
-            return Err(format!("Query Error: {}", query));
+            return Err(format!("Query Error: {query}"));
         }
         (None, Some(snapshot)) => {
-            return Err(format!("Snapshot Test Error: {}", snapshot));
+            return Err(format!("Snapshot Test Error: {snapshot}"));
         }
         (None, None) => {}
     }
