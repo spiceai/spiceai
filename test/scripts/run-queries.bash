@@ -25,8 +25,10 @@ query_folder=$1;
 failed_queries=()
 for i in `ls -d $query_folder/**`; do
   echo "Running query in $i.."
-  tr '\n' ' ' <  $i | spice sql > runqueries.tmp.txt
+  sed '/^--/d' < $i > $i.tmp # remove comments because we compact the query into one line
+  tr '\n' ' ' <  $i.tmp | spice sql > runqueries.tmp.txt
 
+  rm $i.tmp
   result=`cat runqueries.tmp.txt`
   echo "$result"
   # if result contains error string, then it failed
