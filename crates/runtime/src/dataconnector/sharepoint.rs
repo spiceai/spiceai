@@ -68,9 +68,9 @@ impl Sharepoint {
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
         let client_secret = params.get("client_secret").expose().ok();
-        let authorization_code = params.get("authorization_code").expose().ok();
+        let auth_code = params.get("auth_code").expose().ok();
 
-        let graph_client = match (client_secret, authorization_code) {
+        let graph_client = match (client_secret, auth_code) {
             (Some(client_secret), None) => GraphClient::from(
                 &ConfidentialClientApplication::builder(client_id)
                     .with_client_secret(client_secret)
@@ -78,7 +78,7 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(authorization_code)) => {
+            (None, Some(auth_code)) => {
                 // Must match the redirect URL used in `spice login sharepoint...`.
                 let redirect_url = Url::parse("http://localhost:8091")
                     .boxed()
@@ -88,20 +88,20 @@ impl Sharepoint {
                         tenant_id,
                         client_id,
                         "",
-                        authorization_code,
+                        auth_code,
                         redirect_url,
                     ),
                 ))
             }
             (None, None) => {
                 return Err(Error::InvalidParameters {
-                    source: "either 'client_secret' or 'authorization_code' must be provided"
+                    source: "either 'client_secret' or 'auth_code' must be provided"
                         .into(),
                 })
             }
             (Some(_), Some(_)) => {
                 return Err(Error::InvalidParameters {
-                    source: "both 'client_secret' and 'authorization_code' cannot be provided"
+                    source: "both 'client_secret' and 'auth_code' cannot be provided"
                         .into(),
                 })
             }
@@ -130,7 +130,7 @@ impl SharepointFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("client_id").secret().required(),
-    ParameterSpec::connector("authorization_code").secret(),
+    ParameterSpec::connector("auth_code").secret(),
     ParameterSpec::connector("tenant_id").secret().required(),
     ParameterSpec::connector("client_secret").secret(),
 ];
