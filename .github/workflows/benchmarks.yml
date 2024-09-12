@@ -92,7 +92,33 @@ jobs:
 
     strategy:
       matrix:
-        variation: ['-c spice.ai', '-c s3', '-a arrow']
+        include:
+          - cmd: '-c spice.ai'
+            name: 'spice.ai connector'
+          - cmd: '-c s3'
+            name: 's3 connector'
+          - cmd: '-c spark'
+            name: 'spark connector'
+          - cmd: '-c postgres'
+            name: 'postgres connector'
+          - cmd: '-c mysql'
+            name: 'mysql connector'
+          - cmd: '-c odbc-databricks'
+            name: 'odbc-databricks connector'
+          - cmd: '-c odbc-athena'
+            name: 'odbc-athena connector'
+          - cmd: '-c delta_lake'
+            name: 'delta_lake connector'
+          - cmd: '-a arrow'
+            name: 'arrow accelerator (memory mode)'
+          - cmd: '-a duckdb -m memory'
+            name: 'duckdb accelerator (memory mode)'
+          - cmd: '-a duckdb -m file'
+            name: 'duckdb accelerator (memfileory mode)'
+          - cmd: '-a sqlite -m memory'
+            name: 'sqlite accelerator (memory mode)'
+          - cmd: '-a sqlite -m file'
+            name: 'sqlite accelerator (memory mode)'
 
     steps:
       - name: Checkout repository
@@ -103,8 +129,11 @@ jobs:
         with:
           name: spice_bench
 
-      - name: Run benchmark with ${{ matrix.variation }}
-        run: ./spice_bench --${{ matrix.variation }}
+      - name: Make benchmark binary executable
+        run: chmod +x ./spice_bench
+
+      - name: Run benchmark with ${{ matrix.name }}
+        run: ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
