@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::results::Status;
 use arrow::array::RecordBatch;
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::Parser;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
@@ -106,7 +106,7 @@ async fn main() -> Result<(), String> {
             "delta_lake",
         ];
         for connector in connectors {
-            run_connector_bench(connector, &upload_results_dataset).await?
+            run_connector_bench(connector, &upload_results_dataset).await?;
         }
         let accelerators: Vec<Acceleration> = vec![
             create_acceleration("arrow", acceleration::Mode::Memory),
@@ -120,7 +120,7 @@ async fn main() -> Result<(), String> {
             create_acceleration("sqlite", acceleration::Mode::File),
         ];
         for accelerator in accelerators {
-            run_accelerator_bench(accelerator, &upload_results_dataset).await?
+            run_accelerator_bench(accelerator, &upload_results_dataset).await?;
         }
         return Ok(());
     }
@@ -128,9 +128,9 @@ async fn main() -> Result<(), String> {
     // Run connector benchmark test if connector is specified
     if let Some(connector) = args.connector.as_deref() {
         if args.accelerator.as_deref().is_some() || args.mode.as_deref().is_some() {
-            return Err(format!(
+            return Err(
                 "Invalid command line input: accelerator or mode parameter supplied for connector benchmark"
-            ));
+            .to_string());
         }
         run_connector_bench(connector, &upload_results_dataset).await?;
         return Ok(());
@@ -224,7 +224,7 @@ async fn run_accelerator_bench(
     let mode = accelerator.mode.clone();
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(&upload_results_dataset, "s3", Some(accelerator)).await;
+        setup::setup_benchmark(upload_results_dataset, "s3", Some(accelerator)).await;
 
     bench_s3::run(&mut rt, &mut benchmark_results, engine, Some(mode)).await?;
 
