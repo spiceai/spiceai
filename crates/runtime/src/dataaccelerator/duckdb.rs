@@ -57,17 +57,17 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The \"duckdb_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    #[snafu(display(r#"The "duckdb_file" acceleration parameter has an invalid extension. Expected one of "{valid_extensions}" but got "{extension}"."#))]
     InvalidFileExtension {
         valid_extensions: String,
         extension: String,
     },
 
-    #[snafu(display("The \"duckdb_file\" acceleration parameter is a directory."))]
+    #[snafu(display(r#"The "duckdb_file" acceleration parameter is a directory."#))]
     InvalidFileIsDirectory,
 
     #[snafu(display(
-        "The \"duckdb_file\" acceleration parameter \"{path}\" is not unique and in use by another dataset."
+        r#"The "duckdb_file" acceleration parameter "{path}" is not unique and in use by another dataset."#
     ))]
     InvalidFileInUse { path: String },
 }
