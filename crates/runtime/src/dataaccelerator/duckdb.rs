@@ -65,6 +65,11 @@ pub enum Error {
 
     #[snafu(display("The \"duckdb_file\" acceleration parameter is a directory."))]
     InvalidFileIsDirectory,
+
+    #[snafu(display(
+        "The \"duckdb_file\" acceleration parameter \"{path}\" is not unique and in use by another dataset."
+    ))]
+    InvalidFileInUse { path: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -210,6 +215,13 @@ impl DataAccelerator for DuckDBAccelerator {
                         }
                     })
                     .collect::<Vec<_>>();
+
+                let self_path = self.file_path(this_dataset);
+                if let Some(self_path) = self_path {
+                    if attach_databases.contains(&self_path) {
+                        return Err(Error::InvalidFileInUse { path: self_path }.into());
+                    }
+                }
 
                 if !attach_databases.is_empty() {
                     cmd.options
