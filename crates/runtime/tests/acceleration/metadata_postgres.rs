@@ -14,159 +14,52 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::AppBuilder;
+use arrow::array::RecordBatch;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use futures::TryStreamExt;
+use runtime::{status, Runtime};
+use secrecy::ExposeSecret;
+use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
+use spicepod::component::params::Params;
+use std::{collections::HashMap, sync::Arc};
+
+use crate::{
+    get_test_datafusion, init_tracing,
+    postgres::common::{self, get_pg_params, get_random_port},
+    runtime_ready_check,
+    s3::get_s3_dataset,
+};
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
+async fn test_acceleration_postgres_metadata() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let port: usize = 20963;
+    let port: usize = get_random_port();
     let running_container = common::start_postgres_docker_container(port).await?;
 
     let pool = common::get_postgres_connection_pool(port).await?;
-    let db_conn = pool
-        .connect_direct()
-        .await
-        .expect("connection can be established");
-
-    db_conn
-        .conn
-        .execute(
-            "
-CREATE TABLE event_logs (
-    event_id SERIAL PRIMARY KEY,
-    event_name VARCHAR(100),
-    event_timestamp TIMESTAMP
-);",
-            &[],
-        )
-        .await
-        .expect("table is created");
-
-    db_conn
-        .conn
-        .execute(
-            "
-INSERT INTO event_logs (event_name, event_timestamp) VALUES
-('User Registration', '2023-05-16 10:00:00'),
-('Password Change', '2023-05-16 14:30:00'),
-('User Login', '2023-05-17 08:45:00'),
-('User Logout', '2023-05-17 18:00:00'),
-('File Download', '2023-05-17 13:20:00');",
-            &[],
-        )
-        .await
-        .expect("inserted data");
-
-    let pg_on_conflict_upsert = create_postgres_test_dataset(
-        OnConflictBehavior::Upsert,
-        "postgres:event_logs",
-        "pg_on_conflict_upsert",
-        port,
-    );
-    let pg_on_conflict_drop = create_postgres_test_dataset(
-        OnConflictBehavior::Drop,
-        "postgres:event_logs",
-        "pg_on_conflict_drop",
-        port,
-    );
-
-    let duckdb_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Upsert,
-        "postgres:event_logs",
-        "duckdb_mem_on_conflict_upsert",
-        None,
-        port,
-        Mode::Memory,
-        "duckdb",
-    );
-
-    let duckdb_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Drop,
-        "postgres:event_logs",
-        "duckdb_mem_on_conflict_drop",
-        None,
-        port,
-        Mode::Memory,
-        "duckdb",
-    );
-
-    let duckdb_upsert_file_path = random_db_name();
-    let duckdb_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Upsert,
-        "postgres:event_logs",
-        "duckdb_file_on_conflict_upsert",
-        Some(duckdb_upsert_file_path.clone()),
-        port,
-        Mode::File,
-        "duckdb",
-    );
-
-    let duckdb_drop_file_path = random_db_name();
-    let duckdb_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Drop,
-        "postgres:event_logs",
-        "duckdb_file_on_conflict_drop",
-        Some(duckdb_drop_file_path.clone()),
-        port,
-        Mode::File,
-        "duckdb",
-    );
-
-    let sqlite_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Upsert,
-        "postgres:event_logs",
-        "sql_mem_on_conflict_upsert",
-        None,
-        port,
-        Mode::Memory,
-        "sqlite",
-    );
-
-    let sqlite_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Drop,
-        "postgres:event_logs",
-        "sql_mem_on_conflict_drop",
-        None,
-        port,
-        Mode::Memory,
-        "sqlite",
-    );
-
-    let sqlite_upsert_file_path = random_db_name();
-    let sqlite_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Upsert,
-        "postgres:event_logs",
-        "sql_file_on_conflict_upsert",
-        Some(sqlite_upsert_file_path.clone()),
-        port,
-        Mode::File,
-        "sqlite",
-    );
-
-    let sqlite_drop_file_path = random_db_name();
-    let sqlite_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
-        OnConflictBehavior::Drop,
-        "postgres:event_logs",
-        "sql_file_on_conflict_drop",
-        Some(sqlite_drop_file_path.clone()),
-        port,
-        Mode::File,
-        "sqlite",
-    );
 
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
 
-    let app = AppBuilder::new("on_conflict_behavior")
-        .with_dataset(pg_on_conflict_upsert)
-        .with_dataset(pg_on_conflict_drop)
-        .with_dataset(duckdb_mem_on_conflict_upsert)
-        .with_dataset(duckdb_mem_on_conflict_drop)
-        .with_dataset(duckdb_file_on_conflict_upsert)
-        .with_dataset(duckdb_file_on_conflict_drop)
-        .with_dataset(sqlite_mem_on_conflict_upsert)
-        .with_dataset(sqlite_mem_on_conflict_drop)
-        .with_dataset(sqlite_file_on_conflict_upsert)
-        .with_dataset(sqlite_file_on_conflict_drop)
+    let mut dataset = get_s3_dataset();
+    dataset.acceleration = Some(Acceleration {
+        params: Some(Params::from_string_map(
+            get_pg_params(port)
+                .into_iter()
+                .map(|(k, v)| (k, v.expose_secret().to_string()))
+                .collect::<HashMap<String, String>>(),
+        )),
+        enabled: true,
+        engine: Some("postgres".to_string()),
+        refresh_mode: Some(RefreshMode::Full),
+        refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        ..Acceleration::default()
+    });
+
+    let app = AppBuilder::new("test_acceleration_postgres_metadata")
+        .with_dataset(dataset)
         .build();
 
     let rt = Arc::new(
@@ -188,193 +81,25 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
 
     runtime_ready_check(&rt).await;
 
-    db_conn
-        .conn
-        .execute(
-            "
-UPDATE event_logs
-SET event_name = 'File Accessed',
-    event_timestamp = '2024-08-24 15:45:00'
-WHERE event_name = 'File Download'
-  AND event_timestamp = '2023-05-17 13:20:00';
-",
+    let db_conn = pool.connect().await.expect("connection can be established");
+    let result = db_conn
+        .as_async()
+        .expect("async connection")
+        .query_arrow(
+            "SELECT dataset, key, metadata FROM spice_sys_metadata",
             &[],
+            None,
         )
         .await
-        .expect("inserted data");
+        .expect("query arrow")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("try collect");
 
-    // Wait for result to be refreshed
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-
-    let pg_upsert_data = get_query_result(&rt, "SELECT * FROM pg_on_conflict_upsert").await?;
-    let pg_drop_data = get_query_result(&rt, "SELECT * FROM pg_on_conflict_drop").await?;
-    let duckdb_mem_upsert_data =
-        get_query_result(&rt, "SELECT * FROM duckdb_mem_on_conflict_upsert").await?;
-    let duckdb_mem_drop_data =
-        get_query_result(&rt, "SELECT * FROM duckdb_mem_on_conflict_drop").await?;
-    let duckdb_file_upsert_data =
-        get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert").await?;
-    let duckdb_file_drop_data =
-        get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_drop").await?;
-    let sqlite_mem_upsert_data =
-        get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_upsert").await?;
-    let sqlite_mem_drop_data =
-        get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_drop").await?;
-    let sqlite_file_upsert_data =
-        get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_upsert").await?;
-    let sqlite_file_drop_data =
-        get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_drop").await?;
-
-    let upsert_expected_result = &[
-        "+----------+-------------------+---------------------+",
-        "| event_id | event_name        | event_timestamp     |",
-        "+----------+-------------------+---------------------+",
-        "| 1        | User Registration | 2023-05-16T10:00:00 |",
-        "| 2        | Password Change   | 2023-05-16T14:30:00 |",
-        "| 3        | User Login        | 2023-05-17T08:45:00 |",
-        "| 4        | User Logout       | 2023-05-17T18:00:00 |",
-        "| 5        | File Accessed     | 2024-08-24T15:45:00 |",
-        "+----------+-------------------+---------------------+",
-    ];
-
-    let drop_expected_result = &[
-        "+----------+-------------------+---------------------+",
-        "| event_id | event_name        | event_timestamp     |",
-        "+----------+-------------------+---------------------+",
-        "| 1        | User Registration | 2023-05-16T10:00:00 |",
-        "| 2        | Password Change   | 2023-05-16T14:30:00 |",
-        "| 3        | User Login        | 2023-05-17T08:45:00 |",
-        "| 4        | User Logout       | 2023-05-17T18:00:00 |",
-        "| 5        | File Download     | 2023-05-17T13:20:00 |",
-        "+----------+-------------------+---------------------+",
-    ];
-
-    assert_batches_eq!(upsert_expected_result, &pg_upsert_data);
-    assert_batches_eq!(drop_expected_result, &pg_drop_data);
-    assert_batches_eq!(upsert_expected_result, &duckdb_mem_upsert_data);
-    assert_batches_eq!(drop_expected_result, &duckdb_mem_drop_data);
-    assert_batches_eq!(upsert_expected_result, &duckdb_file_upsert_data);
-    assert_batches_eq!(drop_expected_result, &duckdb_file_drop_data);
-    assert_batches_eq!(upsert_expected_result, &sqlite_mem_upsert_data);
-    assert_batches_eq!(drop_expected_result, &sqlite_mem_drop_data);
-    assert_batches_eq!(upsert_expected_result, &sqlite_file_upsert_data);
-    assert_batches_eq!(drop_expected_result, &sqlite_file_drop_data);
+    let pretty = arrow::util::pretty::pretty_format_batches(&result).expect("pretty print");
+    insta::assert_snapshot!(pretty);
 
     running_container.remove().await?;
-    std::fs::remove_file(&duckdb_upsert_file_path).expect("File should be removed");
-    std::fs::remove_file(&duckdb_drop_file_path).expect("File should be removed");
-    std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
-    std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");
-    std::fs::remove_file(format!("{sqlite_upsert_file_path}-shm")).expect("File should be removed");
-    std::fs::remove_file(format!("{sqlite_upsert_file_path}-wal")).expect("File should be removed");
-    std::fs::remove_file(format!("{sqlite_drop_file_path}-shm")).expect("File should be removed");
-    std::fs::remove_file(format!("{sqlite_drop_file_path}-wal")).expect("File should be removed");
 
     Ok(())
-}
-
-async fn get_query_result(
-    rt: &Arc<Runtime>,
-    sql: &str,
-) -> Result<Vec<arrow::array::RecordBatch>, datafusion::error::DataFusionError> {
-    rt.datafusion().ctx.sql(sql).await?.collect().await
-}
-
-fn create_postgres_test_dataset(
-    on_conflict: OnConflictBehavior,
-    from: &str,
-    name: &str,
-    port: usize,
-) -> Dataset {
-    let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(get_pg_params(port));
-
-    let mut on_conflict_hashmap = HashMap::new();
-    on_conflict_hashmap
-        .insert("event_id".to_string(), on_conflict)
-        .unwrap_or_default();
-    dataset.acceleration = Some(Acceleration {
-        params: Some(get_pg_params(port)),
-        enabled: true,
-        engine: Some("postgres".to_string()),
-        refresh_mode: Some(RefreshMode::Append),
-        refresh_check_interval: Some("1s".to_string()),
-        primary_key: Some("event_id".to_string()),
-        on_conflict: on_conflict_hashmap,
-        ..Acceleration::default()
-    });
-    dataset.time_column = Some("event_timestamp".to_string());
-
-    dataset
-}
-
-fn create_sqlite_or_duckdb_test_dataset(
-    on_conflict: OnConflictBehavior,
-    from: &str,
-    name: &str,
-    file: Option<String>,
-    port: usize,
-    mode: Mode,
-    engine: &str,
-) -> Dataset {
-    let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(get_pg_params(port));
-
-    let mut on_conflict_hashmap = HashMap::new();
-    on_conflict_hashmap
-        .insert("event_id".to_string(), on_conflict)
-        .unwrap_or_default();
-
-    dataset.acceleration = Some(Acceleration {
-        params: get_params(&mode, file, engine),
-        mode,
-        enabled: true,
-        engine: Some(engine.to_string()),
-        refresh_mode: Some(RefreshMode::Append),
-        refresh_check_interval: Some("1s".to_string()),
-        primary_key: Some("event_id".to_string()),
-        on_conflict: on_conflict_hashmap,
-        ..Acceleration::default()
-    });
-
-    dataset.time_column = Some("event_timestamp".to_string());
-
-    dataset
-}
-
-fn get_pg_params(port: usize) -> Params {
-    Params::from_string_map(
-        vec![
-            ("pg_host".to_string(), "localhost".to_string()),
-            ("pg_port".to_string(), port.to_string()),
-            ("pg_user".to_string(), "postgres".to_string()),
-            ("pg_pass".to_string(), common::PG_PASSWORD.to_string()),
-            ("pg_sslmode".to_string(), "disable".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    )
-}
-
-fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = format!("{engine}_file",);
-    if mode == &Mode::File {
-        return Some(Params::from_string_map(
-            vec![(param_name, file.unwrap_or_default())]
-                .into_iter()
-                .collect(),
-        ));
-    }
-    None
-}
-
-fn random_db_name() -> String {
-    let mut rng = rand::thread_rng();
-    let mut name = String::new();
-
-    for _ in 0..10 {
-        name.push(rng.gen_range(b'a'..=b'z') as char);
-    }
-
-    format!("./{name}.db")
 }

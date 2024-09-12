@@ -21,19 +21,22 @@ use spicepod::component::{dataset::Dataset, params::Params};
 
 use crate::init_tracing;
 
-#[tokio::test]
-async fn s3_federation() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    let mut s3_dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
-    s3_dataset.params = Some(Params::from_string_map(
+pub fn get_s3_dataset() -> Dataset {
+    let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
+    dataset.params = Some(Params::from_string_map(
         vec![("file_format".to_string(), "parquet".to_string())]
             .into_iter()
             .collect(),
     ));
+    dataset
+}
+
+#[tokio::test]
+async fn s3_federation() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
 
     let app = AppBuilder::new("s3_federation")
-        .with_dataset(s3_dataset)
+        .with_dataset(get_s3_dataset())
         .build();
 
     let rt = Runtime::builder().with_app(app).build().await;
