@@ -96,10 +96,11 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `spark`       | Spark                                                                                          | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  |
 | `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
-| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       |
+| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV, Markdown                                                                             |
 | `graphql`     | GraphQL                                                                                        | Alpha  | JSON                                                                                               |
 | `github`      | GitHub                                                                                         | Alpha  |                                                                                                    |
 | `debezium`    | Debezium CDC                                                                                   | Alpha  | Kafka + JSON                                                                                       |
+| `sharepoint`  | Microsoft SharePoint                                                                           | Alpha  | Unstructured UTF-8 documents                                                                       |
 
 ### Supported Data Stores/Accelerators
 
@@ -182,7 +183,7 @@ version: v1beta1
 kind: Spicepod
 name: spice_qs
 dependencies:
-    - spiceai/quickstart
+  - spiceai/quickstart
 ```
 
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.

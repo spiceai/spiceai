@@ -19,24 +19,20 @@ use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
 use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
+    dataset::{acceleration::Mode, Dataset},
     params::Params,
 };
 
 pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
-    acceleration: Option<Acceleration>,
+    engine: Option<String>,
+    mode: Option<Mode>,
 ) -> Result<(), String> {
-    let test_queries = get_test_queries(&acceleration);
+    let test_queries = get_test_queries();
 
-    let bench_name = match acceleration {
-        Some(acceleration) => format!(
-            "s3_{}_{}",
-            acceleration.engine.unwrap_or_default(),
-            acceleration.mode
-        )
-        .to_lowercase(),
+    let bench_name = match mode {
+        Some(mode) => format!("s3_{}_{}", engine.unwrap_or_default(), mode).to_lowercase(),
         None => "s3".to_string(),
     };
 
@@ -97,7 +93,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-fn get_test_queries(_acceleration: &Option<Acceleration>) -> Vec<(&'static str, &'static str)> {
+fn get_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch_q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch_q2.sql")),

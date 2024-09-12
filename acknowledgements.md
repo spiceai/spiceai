@@ -6,13 +6,17 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Go Modules
 
+github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.2.2/LICENSE, MIT
 github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
 github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.7.0/LICENSE, BSD-3-Clause
 github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/b87c2d0e983a/LICENSE, MIT
+github.com/golang-jwt/jwt/v5, https://github.com/golang-jwt/jwt/blob/v5.2.1/LICENSE, MIT
+github.com/google/uuid, https://github.com/google/uuid/blob/v1.6.0/LICENSE, BSD-3-Clause
 github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/v0.5.2/LICENSE, MPL-2.0
 github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/v0.7.7/LICENSE, MPL-2.0
 github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/v1.0.0/LICENSE, MPL-2.0
 github.com/joho/godotenv, https://github.com/joho/godotenv/blob/v1.5.1/LICENCE, MIT
+github.com/kylelemons/godebug, https://github.com/kylelemons/godebug/blob/v1.1.0/LICENSE, Apache-2.0
 github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
 github.com/magiconair/properties, https://github.com/magiconair/properties/blob/v1.8.7/LICENSE.md, BSD-2-Clause
 github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9.0/LICENSE.md, BSD-3-Clause
@@ -33,8 +37,8 @@ github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICEN
 go.uber.org/multierr, https://github.com/uber-go/multierr/blob/v1.10.0/LICENSE.txt, MIT
 go.uber.org/zap, https://github.com/uber-go/zap/blob/v1.27.0/LICENSE, MIT
 golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.20.0:LICENSE, BSD-3-Clause
-golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.20.0:LICENSE, BSD-3-Clause
-golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.14.0:LICENSE, BSD-3-Clause
+golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.24.0:LICENSE, BSD-3-Clause
+golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.17.0:LICENSE, BSD-3-Clause
 gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.67.0/LICENSE, Apache-2.0
 gopkg.in/natefinch/lumberjack.v2, https://github.com/natefinch/lumberjack/blob/v2.2.1/LICENSE, MIT
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
@@ -68,10 +72,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-schema 52.2.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- async-graphql 7.0.7, Apache-2.0 OR MIT 
+- async-graphql 7.0.9, Apache-2.0 OR MIT 
   <br/>https://github.com/async-graphql/async-graphql
 
-- async-graphql-axum 7.0.7, Apache-2.0 OR MIT 
+- async-graphql-axum 7.0.9, Apache-2.0 OR MIT 
   <br/>https://github.com/async-graphql/async-graphql
 
 - async-openai 0.23.4, MIT 
@@ -80,16 +84,16 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-stream 0.3.5, MIT 
   <br/>https://github.com/tokio-rs/async-stream
 
-- async-trait 0.1.81, Apache-2.0 OR MIT 
+- async-trait 0.1.82, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
 - aws-config 1.5.5, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-sdk-secretsmanager 1.41.0, Apache-2.0 
+- aws-sdk-secretsmanager 1.45.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.37.0, Apache-2.0 
+- aws-sdk-sts 1.41.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.6.20, MIT 
@@ -113,9 +117,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - base64 0.22.1, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
 
-- bigdecimal 0.3.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/akubera/bigdecimal-rs
-
 - bigdecimal 0.4.5, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
 
@@ -137,7 +138,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.9.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.16, Apache-2.0 OR MIT 
+- clap 4.5.17, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
@@ -149,7 +150,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dashmap 5.5.3, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- dashmap 6.0.1, MIT 
+- dashmap 6.1.0, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
 - datafusion 41.0.0, Apache-2.0 
@@ -194,6 +195,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - globset 0.4.14, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 
+- graph-rs-sdk 2.0.1, MIT 
+  <br/>https://github.com/sreeise/graph-rs-sdk
+
 - headers-accept 0.1.3, MIT 
   <br/>https://github.com/maxcountryman/headers-accept
 
@@ -230,8 +234,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
-- indexmap 2.4.0, Apache-2.0 OR MIT 
+- indexmap 2.5.0, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
+
+- insta 1.40.0, Apache-2.0 
+  <br/>https://github.com/mitsuhiko/insta
 
 - itertools 0.10.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
@@ -338,7 +345,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - reqwest 0.11.27, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
-- reqwest 0.12.5, Apache-2.0 OR MIT 
+- reqwest 0.12.7, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
 - rusqlite 0.31.0, MIT 
@@ -356,7 +363,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/ctz/rustls-native-certs
 
-- rustls-native-certs 0.7.1, Apache-2.0 OR ISC OR MIT 
+- rustls-native-certs 0.7.3, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/rustls/rustls-native-certs
+
+- rustls-native-certs 0.8.0, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls-native-certs
 
 - rustls-pemfile 1.0.4, Apache-2.0 OR ISC OR MIT 
@@ -365,7 +375,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustls-pemfile 2.1.3, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/pemfile
 
-- rustyline 13.0.0, MIT 
+- rustyline 14.0.0, MIT 
   <br/>https://github.com/kkawakam/rustyline
 
 - schemars 0.8.21, MIT 
@@ -377,7 +387,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - serde 1.0.209, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
-- serde_json 1.0.127, Apache-2.0 OR MIT 
+- serde_json 1.0.128, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
 - serde_yaml 0.9.34+deprecated, Apache-2.0 OR MIT 
@@ -419,7 +429,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokenizers 0.19.1, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
 
-- tokio 1.39.3, MIT 
+- tokio 1.40.0, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
 - tokio-postgres 0.7.11, Apache-2.0 OR MIT 
@@ -437,7 +447,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokio-rustls 0.26.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rustls/tokio-rustls
 
-- tokio-util 0.7.11, MIT 
+- tokio-util 0.7.12, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
 - tonic 0.11.0, MIT 

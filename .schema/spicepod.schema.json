@@ -187,6 +187,16 @@
             "null"
           ]
         },
+        "refresh_jitter_enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "refresh_jitter_max": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "refresh_mode": {
           "anyOf": [
             {
