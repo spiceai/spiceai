@@ -15,7 +15,7 @@ env:
   FEATURES: ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
 
 jobs:
-  build-database-bench:
+  build-database-bench-binary:
     name: Benchmark Tests
     runs-on: ubuntu-latest
     services:
@@ -88,7 +88,7 @@ jobs:
   run-database-bench:
     name: Run Benchmark Variations
     runs-on: ubuntu-latest
-    needs: build-binary
+    needs: build-database-bench-binary
 
     strategy:
       matrix:
