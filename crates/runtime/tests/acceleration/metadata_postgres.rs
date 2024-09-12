@@ -80,6 +80,8 @@ async fn test_acceleration_postgres_metadata() -> Result<(), anyhow::Error> {
     }
 
     runtime_ready_check(&rt).await;
+    drop(rt);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let db_conn = pool.connect().await.expect("connection can be established");
     let result = db_conn

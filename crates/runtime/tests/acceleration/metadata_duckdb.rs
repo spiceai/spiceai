@@ -66,6 +66,7 @@ async fn test_acceleration_duckdb_metadata() -> Result<(), anyhow::Error> {
     runtime_ready_check(&rt).await;
 
     drop(rt);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let conn = DuckDbConnectionPool::new_file(".spice/data/taxi_trips.db", &AccessMode::ReadWrite)
         .expect("valid path");

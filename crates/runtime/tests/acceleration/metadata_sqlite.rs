@@ -67,6 +67,7 @@ async fn test_acceleration_sqlite_metadata() -> Result<(), anyhow::Error> {
     runtime_ready_check(&rt).await;
 
     drop(rt);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let results = SqliteConnectionPool::new(
         ".spice/data/taxi_trips_sqlite.db",
