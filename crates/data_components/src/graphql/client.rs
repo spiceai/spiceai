@@ -48,6 +48,8 @@ pub struct UnnestParameters {
     duplicate_behavior: DuplicateBehavior,
 }
 
+
+/// PageInfo for pagination, following the [GraphQL Cursor Connections Specification](https://relay.dev/graphql/connections.htm#sec-undefined.PageInfo).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PageInfo {
@@ -153,6 +155,8 @@ impl PaginationArgument {
     }
 }
 
+/// Try to convert a Field into a PaginationArgument. Assumes the field has a valid pagination 
+/// argument with one of the following arguments: `first`, `last`.
 impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
     type Error = String;
 
@@ -181,13 +185,13 @@ impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     resource_name: String,
-    pub count: PaginationArgument,
+    pub args: PaginationArgument,
     page_info_path: Option<String>,
 }
 
 impl PaginationParameters {
     fn reduce_limit(&self, l: usize) -> usize {
-        l.saturating_sub(self.count.size())
+        l.saturating_sub(self.args.size())
     }
 
     fn parse(query: &str) -> Option<Self> {
@@ -233,7 +237,7 @@ impl PaginationParameters {
                                     return Some(PaginationParameters {
                                         resource_name: format!("{:?}", parent_field.name)
                                             .replace('"', ""),
-                                        count: pag_arg,
+                                        args: pag_arg,
                                         page_info_path: Some(new_path),
                                     });
                                 }
@@ -285,7 +289,7 @@ impl PaginationParameters {
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
         let mut limit_reached = false;
 
-        let mut count = self.count.clone();
+        let mut count = self.args.clone();
 
         if let Some(limit) = limit {
             if limit <= count.size() {
@@ -322,7 +326,7 @@ impl PaginationParameters {
             .ok()
             .flatten()?;
 
-        page_info.cursor_from_pagination(&self.count)
+        page_info.cursor_from_pagination(&self.args)
     }
 }
 
@@ -700,7 +704,7 @@ mod tests {
                 "#,
                 expected: Some(PaginationParameters {
                     resource_name: "users".to_owned(),
-                    count: super::PaginationArgument::First(10),
+                    args: super::PaginationArgument::First(10),
                     page_info_path: Some("/users/pageInfo".into()),
                 }),
             },
@@ -718,7 +722,7 @@ mod tests {
                 "#,
                 expected: Some(PaginationParameters {
                     resource_name: "users".to_owned(),
-                    count: super::PaginationArgument::First(10),
+                    args: super::PaginationArgument::First(10),
                     page_info_path: Some("/users/pageInfo".into()),
                 }),
             },
@@ -756,7 +760,7 @@ mod tests {
                 "#,
                 expected: Some(PaginationParameters {
                     resource_name: "paginatedUsers".to_owned(),
-                    count: super::PaginationArgument::First(2),
+                    args: super::PaginationArgument::First(2),
                     page_info_path: Some("/paginatedUsers/pageInfo".to_owned()),
                 }),
             },
