@@ -87,7 +87,7 @@ async fn main() -> Result<(), String> {
 
     let args = BenchArgs::parse();
 
-    // If no arguments are specified for connector / accelerator, run all conenctor / accelerator benchmark test
+    // If no arguments are specified for connector / accelerator, run all connector / accelerator benchmark test
     if args.connector.is_none() && args.accelerator.is_none() {
         let connectors = vec![
             "spice.ai",
