@@ -25,6 +25,7 @@ use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use std::sync::Arc;
 
+use crate::acceleration::get_params;
 use crate::{get_test_datafusion, init_tracing, runtime_ready_check, s3::get_s3_dataset};
 
 #[tokio::test]
@@ -36,6 +37,11 @@ async fn test_acceleration_sqlite_metadata() -> Result<(), anyhow::Error> {
 
     let mut dataset = get_s3_dataset();
     dataset.acceleration = Some(Acceleration {
+        params: get_params(
+            &Mode::File,
+            Some("./taxi_trips_sqlite.db".to_string()),
+            "sqlite",
+        ),
         enabled: true,
         engine: Some("sqlite".to_string()),
         mode: Mode::File,
@@ -70,7 +76,7 @@ async fn test_acceleration_sqlite_metadata() -> Result<(), anyhow::Error> {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let results = SqliteConnectionPool::new(
-        ".spice/data/taxi_trips_sqlite.db",
+        "./taxi_trips_sqlite.db",
         datafusion_table_providers::sql::db_connection_pool::Mode::File,
         JoinPushDown::Disallow,
         vec![],
@@ -97,7 +103,7 @@ async fn test_acceleration_sqlite_metadata() -> Result<(), anyhow::Error> {
     insta::assert_snapshot!(pretty);
 
     // Remove the file
-    std::fs::remove_file(".spice/data/taxi_trips_sqlite.db").expect("remove file");
+    std::fs::remove_file("./taxi_trips_sqlite.db").expect("remove file");
 
     Ok(())
 }

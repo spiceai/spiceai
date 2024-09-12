@@ -24,7 +24,10 @@ use runtime::{status, Runtime};
 use spicepod::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
 use std::sync::Arc;
 
-use crate::{get_test_datafusion, init_tracing, runtime_ready_check, s3::get_s3_dataset};
+use crate::{
+    acceleration::get_params, get_test_datafusion, init_tracing, runtime_ready_check,
+    s3::get_s3_dataset,
+};
 
 #[tokio::test]
 async fn test_acceleration_duckdb_metadata() -> Result<(), anyhow::Error> {
@@ -35,6 +38,7 @@ async fn test_acceleration_duckdb_metadata() -> Result<(), anyhow::Error> {
 
     let mut dataset = get_s3_dataset();
     dataset.acceleration = Some(Acceleration {
+        params: get_params(&Mode::File, Some("./taxi_trips.db".to_string()), "duckdb"),
         enabled: true,
         engine: Some("duckdb".to_string()),
         mode: Mode::File,
@@ -68,7 +72,7 @@ async fn test_acceleration_duckdb_metadata() -> Result<(), anyhow::Error> {
     drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let conn = DuckDbConnectionPool::new_file(".spice/data/taxi_trips.db", &AccessMode::ReadWrite)
+    let conn = DuckDbConnectionPool::new_file("./taxi_trips.db", &AccessMode::ReadWrite)
         .expect("valid path");
     let result: Vec<RecordBatch> = conn
         .connect()
@@ -91,7 +95,7 @@ async fn test_acceleration_duckdb_metadata() -> Result<(), anyhow::Error> {
     insta::assert_snapshot!(pretty);
 
     // Remove the file
-    std::fs::remove_file(".spice/data/taxi_trips.db").expect("remove file");
+    std::fs::remove_file("./taxi_trips.db").expect("remove file");
 
     Ok(())
 }

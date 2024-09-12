@@ -28,6 +28,8 @@ use spicepod::component::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+use super::get_params;
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
@@ -368,18 +370,6 @@ fn get_pg_params(port: usize) -> Params {
         .into_iter()
         .collect(),
     )
-}
-
-fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = format!("{engine}_file",);
-    if mode == &Mode::File {
-        return Some(Params::from_string_map(
-            vec![(param_name, file.unwrap_or_default())]
-                .into_iter()
-                .collect(),
-        ));
-    }
-    None
 }
 
 fn random_db_name() -> String {
