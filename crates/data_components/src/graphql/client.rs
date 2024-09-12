@@ -49,7 +49,7 @@ pub struct UnnestParameters {
 }
 
 
-/// PageInfo for pagination, following the [GraphQL Cursor Connections Specification](https://relay.dev/graphql/connections.htm#sec-undefined.PageInfo).
+/// [`PageInfo`] for pagination, following the [GraphQL Cursor Connections Specification](https://relay.dev/graphql/connections.htm#sec-undefined.PageInfo).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PageInfo {
@@ -155,7 +155,7 @@ impl PaginationArgument {
     }
 }
 
-/// Try to convert a Field into a PaginationArgument. Assumes the field has a valid pagination 
+/// Try to convert a [`Field`] into a [`PaginationArgument`]. Assumes the field has a valid pagination 
 /// argument with one of the following arguments: `first`, `last`.
 impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
     type Error = String;

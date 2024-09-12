@@ -80,6 +80,7 @@ impl GithubTableArgs for PullRequestTableArgs {
                             closed_at: closedAt
                             number
                             reviews {{reviews_count: totalCount}}
+
                             author {{
                                 login
                             }}
