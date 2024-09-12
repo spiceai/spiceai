@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::status;
+
 use super::{refresh::RefreshOverrides, refresh_task::RefreshTask};
 use futures::future::BoxFuture;
 use tokio::{
@@ -33,6 +35,7 @@ use super::refresh::Refresh;
 /// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
 /// refreshing an `accelerator`.
 pub struct RefreshTaskRunner {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
@@ -43,12 +46,14 @@ pub struct RefreshTaskRunner {
 impl RefreshTaskRunner {
     #[must_use]
     pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
+            runtime_status,
             dataset_name,
             federated,
             refresh,
@@ -73,6 +78,7 @@ impl RefreshTaskRunner {
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
 
         let refresh_task = Arc::new(RefreshTask::new(
+            Arc::clone(&self.runtime_status),
             dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&self.accelerator),

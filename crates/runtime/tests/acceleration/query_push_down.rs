@@ -15,6 +15,10 @@ use crate::{init_tracing, wait_until_true};
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
+    use std::sync::Arc;
+
+    use runtime::status;
+
     use crate::get_test_datafusion;
     use crate::postgres::common;
 
@@ -97,7 +101,8 @@ CREATE TABLE test (
         ..Acceleration::default()
     });
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let app = AppBuilder::new("acceleration_federation")
         .with_dataset(federated_acc)
@@ -107,6 +112,7 @@ CREATE TABLE test (
     let rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 

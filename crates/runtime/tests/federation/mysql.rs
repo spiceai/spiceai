@@ -77,11 +77,13 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -160,11 +162,13 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
     // Set a timeout for the test
