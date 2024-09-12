@@ -247,24 +247,18 @@ async fn run_query_and_record_result(
         completed_iterations,
     );
 
-    if query_err.is_some() && snapshot_err.is_some() {
-        return Err(format!(
-            "Query Error: {}; Snapshot Test Error: {}",
-            query_err.unwrap_or_default(),
-            snapshot_err.unwrap_or_default()
-        ));
+    match (query_err, snapshot_err) {
+    (Some(query), Some(snapshot)) => {
+        return Err(format!("Query Error: {}; Snapshot Test Error: {}", query, snapshot));
     }
-
-    if query_err.is_some() {
-        return Err(format!("Query Error: {}", query_err.unwrap_or_default()));
+    (Some(query), None) => {
+        return Err(format!("Query Error: {}", query));
     }
-
-    if snapshot_err.is_some() {
-        return Err(format!(
-            "Snapshot Test Error: {}",
-            snapshot_err.unwrap_or_default()
-        ));
+    (None, Some(snapshot)) => {
+        return Err(format!("Snapshot Test Error: {}", snapshot));
     }
+    (None, None) => {}
+  }
 
     Ok(())
 }
