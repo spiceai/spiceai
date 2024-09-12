@@ -63,7 +63,7 @@ E.g. `explain select 1`
 - [ ] No
 
 **If possible, run `spiced` with DEBUG log level**
-By setting the environment variable `SPICED_LOG="task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO"`
+By setting the environment variable `SPICED_LOG="task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG"`
 
 ## Screenshots
 
