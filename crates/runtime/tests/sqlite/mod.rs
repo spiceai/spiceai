@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use app::AppBuilder;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DecimalType;
@@ -21,15 +23,15 @@ use arrow::{
     array::{Decimal128Array, RecordBatch},
     datatypes::{DataType, Decimal128Type},
 };
-use runtime::Runtime;
+use runtime::{status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode},
     Dataset,
 };
 
 use crate::{
-    dataset_ready_check, get_test_datafusion, init_tracing, run_query_and_check_results,
-    run_query_and_check_results_with_plan_checks, PlanCheckFn, ValidateFn,
+    get_test_datafusion, init_tracing, run_query_and_check_results,
+    run_query_and_check_results_with_plan_checks, runtime_ready_check, PlanCheckFn, ValidateFn,
 };
 
 fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {
@@ -123,11 +125,13 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
         .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -139,7 +143,7 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
+    runtime_ready_check(&rt).await;
 
     for (query, check_function, validate_result) in
         decimal_queries("test_sqlite_decimal_memory", DecimalQuery::NonFederated)
@@ -172,11 +176,13 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
         .with_dataset(make_sqlite_decimal_dataset(Mode::File))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -188,7 +194,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
+    runtime_ready_check(&rt).await;
 
     for (query, check_function, validate_result) in
         decimal_queries("test_sqlite_decimal_file", DecimalQuery::Federated)

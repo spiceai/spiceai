@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
-use runtime::Runtime;
+use runtime::{status, Runtime};
 use spicepod::component::dataset::Dataset;
 
 use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
@@ -41,11 +43,13 @@ async fn spiceai_integration_test_single_source_federation_push_down() -> Result
         .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 

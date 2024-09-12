@@ -26,6 +26,7 @@ use crate::accelerated_table::Retention;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
 use crate::secrets::Secrets;
+use crate::status;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},
@@ -81,6 +82,7 @@ async fn get_local_table_provider(
 }
 
 pub async fn create_internal_accelerated_table(
+    runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
     schema: Arc<Schema>,
     acceleration: Acceleration,
@@ -102,6 +104,7 @@ pub async fn create_internal_accelerated_table(
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
+        runtime_status,
         name.clone(),
         source_table_provider,
         accelerated_table_provider,

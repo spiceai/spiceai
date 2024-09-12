@@ -17,15 +17,44 @@ limitations under the License.
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
+)
+
+const (
+	refreshSqlFlag  = "refresh-sql"
+	refreshModeFlag = "refresh-mode"
 )
 
 type DatasetRefreshApiResponse struct {
 	Message string `json:"message,omitempty"`
+}
+
+type DatasetRefreshApiRequest struct {
+	RefreshSQL *string `json:"refresh_sql,omitempty"`
+	Mode       *string `json:"refresh_mode,omitempty"`
+}
+
+func constructRequest(sql string, mode string) (*string, error) {
+	r := DatasetRefreshApiRequest{}
+	if sql == "" && mode == "" {
+		return nil, nil
+	}
+	if sql != "" {
+		r.RefreshSQL = &sql
+	}
+	if mode != "" {
+		r.Mode = &mode
+	}
+	bytz, err := json.Marshal(r)
+	s := string(bytz)
+
+	return &s, err
 }
 
 var refreshCmd = &cobra.Command{
@@ -40,6 +69,15 @@ spice refresh taxi_trips
 	Run: func(cmd *cobra.Command, args []string) {
 		dataset := args[0]
 
+		sql, _ := cmd.Flags().GetString(refreshSqlFlag)
+		mode, _ := cmd.Flags().GetString(refreshModeFlag)
+
+		// If the mode is not empty, it must be either 'full' or 'append'.
+		if mode != "" && mode != spec.REFRESH_MODE_FULL && mode != spec.REFRESH_MODE_APPEND {
+			cmd.PrintErrln("Invalid refresh mode. Valid modes are 'full' or 'append'")
+			return
+		}
+
 		cmd.Printf("Refreshing dataset %s ...\n", dataset)
 
 		rtcontext := context.NewContext()
@@ -48,7 +86,13 @@ spice refresh taxi_trips
 		}
 
 		url := fmt.Sprintf("/v1/datasets/%s/acceleration/refresh", dataset)
-		res, err := api.PostRuntime[DatasetRefreshApiResponse](rtcontext, url)
+
+		body, err := constructRequest(sql, mode)
+		if err != nil {
+			cmd.PrintErrln(err.Error())
+			return
+		}
+		res, err := api.PostRuntime[DatasetRefreshApiResponse](rtcontext, url, body)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			return
@@ -61,5 +105,7 @@ spice refresh taxi_trips
 func init() {
 	refreshCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	refreshCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	refreshCmd.Flags().String(refreshSqlFlag, "", "'refresh_sql' to refresh a dataset.")
+	refreshCmd.Flags().String(refreshModeFlag, "", "'refresh_mode', one of: full, append")
 	RootCmd.AddCommand(refreshCmd)
 }
