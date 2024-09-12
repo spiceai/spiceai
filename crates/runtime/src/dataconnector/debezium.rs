@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
-use crate::dataaccelerator::metadata::AcceleratedMetadata;
+use crate::dataaccelerator::metadata::{self, AcceleratedMetadata};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -249,7 +249,7 @@ struct DebeziumKafkaMetadata {
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
     let accelerated_metadata = AcceleratedMetadata::new(dataset).await?;
     let metadata = accelerated_metadata
-        .get_metadata("debezium_kafka_metadata")
+        .get_metadata(metadata::DEBEZIUM_KAFKA_METADATA_KEY)
         .await?;
     Some(metadata)
 }
@@ -260,7 +260,7 @@ async fn set_metadata_to_accelerator(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let accelerated_metadata = AcceleratedMetadata::new_create_if_not_exists(dataset).await?;
     accelerated_metadata
-        .set_metadata("debezium_kafka_metadata", metadata)
+        .set_metadata(metadata::DEBEZIUM_KAFKA_METADATA_KEY, metadata)
         .await
 }
 

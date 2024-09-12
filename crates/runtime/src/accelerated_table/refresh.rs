@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
+use crate::dataaccelerator::metadata::{self, AcceleratedMetadata};
 use crate::status;
 use arrow::datatypes::Schema;
 use cache::QueryResultsCacheProvider;
@@ -277,6 +278,7 @@ pub struct Refresher {
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: RefreshTaskRunner,
+    metadata: Option<Arc<AcceleratedMetadata>>,
 }
 
 impl Refresher {
@@ -303,6 +305,7 @@ impl Refresher {
             accelerator,
             cache_provider: None,
             refresh_task_runner,
+            metadata: None,
         }
     }
 
@@ -311,6 +314,11 @@ impl Refresher {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
+        self
+    }
+
+    pub fn metadata(&mut self, metadata: Option<AcceleratedMetadata>) -> &mut Self {
+        self.metadata = metadata.map(Arc::new);
         self
     }
 
@@ -358,6 +366,7 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
+        let metadata = self.metadata.clone();
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
@@ -410,8 +419,14 @@ impl Refresher {
                                     .invalidate_for_table(dataset_name.clone())
                                     .await
                                 {
-                                    tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                    tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }
+                            }
+
+                            if let Some(metadata) = &metadata {
+                                if let Err(e) = metadata.set_metadata(metadata::INITIAL_REFRESH_COMPLETE_KEY, &true).await {
+                                    tracing::warn!("Failed to set metadata for dataset {}: {e}", &dataset_name.to_string());
+                                };
                             }
                         }
 
@@ -506,7 +521,8 @@ async fn notify_refresh_done(
         .unwrap_or_default();
 
     let mut labels = vec![Key::from_static_str("dataset").string(dataset_name.to_string())];
-    if let Some(sql) = &refresh.read().await.sql {
+    let refresh_guard = refresh.read().await;
+    if let Some(sql) = &refresh_guard.sql {
         labels.push(Key::from_static_str("sql").string(sql.to_string()));
     };
 

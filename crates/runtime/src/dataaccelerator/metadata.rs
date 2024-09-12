@@ -30,6 +30,10 @@ pub const METADATA_DATASET_COLUMN: &str = "dataset";
 pub const METADATA_METADATA_COLUMN: &str = "metadata";
 pub const METADATA_KEY_COLUMN: &str = "key";
 
+// Well-known keys
+pub const DEBEZIUM_KAFKA_METADATA_KEY: &str = "debezium_kafka_metadata";
+pub const INITIAL_REFRESH_COMPLETE_KEY: &str = "initial_refresh_complete";
+
 #[cfg(feature = "duckdb")]
 mod duckdb;
 #[cfg(feature = "postgres")]
