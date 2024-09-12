@@ -77,7 +77,12 @@ impl Parameters {
 
         // Try to autoload secrets that might be missing from params.
         for secret_key in all_params.iter().filter(|p| p.secret) {
-            let secret_key_with_prefix = format!("{prefix}_{}", secret_key.name);
+            let secret_key_with_prefix = if secret_key.name.starts_with(prefix) {
+                secret_key.name.to_string()
+            } else {
+                format!("{prefix}_{}", secret_key.name)
+            };
+
             tracing::debug!(
                 "Attempting to autoload secret for {component_name}: {secret_key_with_prefix}",
             );
