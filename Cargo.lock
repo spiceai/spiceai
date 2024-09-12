@@ -222,7 +222,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "spicepod",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "snafu 0.8.4",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2751,7 +2751,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3158,7 +3158,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=701f54ffe26210759134e7c033c53fd39bf3eee7#701f54ffe26210759134e7c033c53fd39bf3eee7"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=01bef67c63b91365e86a1c0895cb151cf1df77c1#01bef67c63b91365e86a1c0895cb151cf1df77c1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3852,7 +3852,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3865,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3883,7 +3883,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -4033,18 +4033,18 @@ dependencies = [
 
 [[package]]
 name = "fundu"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c04cb831a8dccadfe3774b07cba4574a1ec24974d761510e65d8a543c2d7cb4"
+checksum = "2ce12752fc64f35be3d53e0a57017cd30970f0cffd73f62c791837d8845badbd"
 dependencies = [
  "fundu-core",
 ]
 
 [[package]]
 name = "fundu-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a889e633afd839fb5b04fe53adfd588cefe518e71ec8d3c929698c6daf2acd"
+checksum = "e463452e2d8b7600d38dcea1ed819773a57f0d710691bfc78db3961bd3f4c3ba"
 
 [[package]]
 name = "funty"
@@ -5260,6 +5260,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "insta"
+version = "1.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6593a41c7a73841868772495db7dc1e8ecab43bb5c0b6da2059246c4b506ab60"
+dependencies = [
+ "console",
+ "lazy_static",
+ "linked-hash-map",
+ "regex",
+ "similar",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5781,7 +5794,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "async-openai",
  "async-stream",
@@ -6231,7 +6244,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6537,7 +6550,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "snafu 0.8.4",
  "tracing",
@@ -7249,7 +7262,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -8563,7 +8576,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "anyhow",
  "app",
@@ -8613,6 +8626,7 @@ dependencies = [
  "hyper 1.4.1",
  "hyper-util",
  "indexmap 2.5.0",
+ "insta",
  "itertools 0.12.1",
  "keyring",
  "llms",
@@ -9365,6 +9379,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27f6278552951f1f2b8cf9da965d10969b2efdea95a6ec47987ab46edfe263a"
 
 [[package]]
+name = "similar"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1de1d4f81173b03af4c0cbed3c898f6bff5b870e4a7f5d6f4057d62a7a4b686e"
+
+[[package]]
 name = "simple_asn1"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9577,7 +9597,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -9594,7 +9614,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "app",
  "clap",
@@ -9623,7 +9643,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "schemars",
  "serde",
@@ -9635,7 +9655,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "schemars",
  "serde_json",
@@ -10018,7 +10038,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "arrow",
  "async-trait",
@@ -11067,7 +11087,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "0.17.4-beta"
+version = "0.18.0-beta"
 dependencies = [
  "backoff",
  "humantime",

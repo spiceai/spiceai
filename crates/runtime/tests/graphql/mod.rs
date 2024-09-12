@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use app::AppBuilder;
 
@@ -23,7 +24,7 @@ use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{routing::post, Extension, Router};
-use runtime::Runtime;
+use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
 
@@ -219,7 +220,7 @@ fn make_graphql_dataset(path: &str, name: &str, query: &str, json_pointer: &str)
 
 #[tokio::test]
 async fn test_graphql() -> Result<(), String> {
-    type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
     let (tx, addr) = start_server().await?;
     tracing::debug!("Server started at {}", addr);
@@ -231,10 +232,12 @@ async fn test_graphql() -> Result<(), String> {
             "/data/users",
         ))
         .build();
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -248,17 +251,7 @@ async fn test_graphql() -> Result<(), String> {
     let queries: QueryTests = vec![
         (
             "SELECT * FROM test_graphql",
-            vec![
-                "+---------------+--------------------------------------------------------+",
-                "| plan_type     | plan                                                   |",
-                "+---------------+--------------------------------------------------------+",
-                "| logical_plan  | BytesProcessedNode                                     |",
-                "|               |   TableScan: test_graphql projection=[id, name, posts] |",
-                "| physical_plan | BytesProcessedExec                                     |",
-                "|               |   MemoryExec: partitions=1, partition_sizes=[4]        |",
-                "|               |                                                        |",
-                "+---------------+--------------------------------------------------------+",
-            ],
+            "select_all",
             Some(Box::new(|result_batches| {
                 for batch in result_batches {
                     assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
@@ -268,20 +261,7 @@ async fn test_graphql() -> Result<(), String> {
         ),
         (
             "SELECT posts[1]['title'] from test_graphql",
-            vec![
-                "+---------------+-----------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                      |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8(\"title\"))                         |",
-                "|               |   BytesProcessedNode                                                                                      |",
-                "|               |     TableScan: test_graphql projection=[posts]                                                            |",
-                "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]] |",
-                "|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                    |",
-                "|               |     BytesProcessedExec                                                                                    |",
-                "|               |       MemoryExec: partitions=1, partition_sizes=[4]                                                       |",
-                "|               |                                                                                                           |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------+",
-            ],
+            "select_posts_title",
             Some(Box::new(|result_batches| {
                 for batch in result_batches {
                     assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
@@ -291,8 +271,14 @@ async fn test_graphql() -> Result<(), String> {
         ),
     ];
 
-    for (query, expected_plan, validate_result) in queries {
-        run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
+    for (query, snapshot_suffix, validate_result) in queries {
+        run_query_and_check_results(
+            &mut rt,
+            &format!("test_graphql_{snapshot_suffix}"),
+            query,
+            validate_result,
+        )
+        .await?;
     }
 
     tx.send(()).map_err(|()| {
@@ -305,7 +291,7 @@ async fn test_graphql() -> Result<(), String> {
 
 #[tokio::test]
 async fn test_graphql_pagination() -> Result<(), String> {
-    type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
     let (tx, addr) = start_server().await?;
     tracing::debug!("Server started at {}", addr);
@@ -317,10 +303,12 @@ async fn test_graphql_pagination() -> Result<(), String> {
             "/data/paginatedUsers/users",
         ))
         .build();
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -334,17 +322,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
     let queries: QueryTests = vec![
         (
             "SELECT * FROM test_graphql",
-            vec![
-                "+---------------+--------------------------------------------------------+",
-                "| plan_type     | plan                                                   |",
-                "+---------------+--------------------------------------------------------+",
-                "| logical_plan  | BytesProcessedNode                                     |",
-                "|               |   TableScan: test_graphql projection=[id, name, posts] |",
-                "| physical_plan | BytesProcessedExec                                     |",
-                "|               |   MemoryExec: partitions=2, partition_sizes=[2, 2]     |",
-                "|               |                                                        |",
-                "+---------------+--------------------------------------------------------+",
-            ],
+            "select_all",
             Some(Box::new(|result_batches| {
                 let mut total = 0;
                 for batch in result_batches {
@@ -357,25 +335,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
         ),
         (
             "SELECT * FROM test_graphql where id = '4' limit 1",
-            vec![
-                "+---------------+------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                         |",
-                "+---------------+------------------------------------------------------------------------------+",
-                "| logical_plan  | Limit: skip=0, fetch=1                                                       |",
-                "|               |   BytesProcessedNode                                                         |",
-                "|               |     Filter: test_graphql.id = Utf8(\"4\")                                      |",
-                "|               |       TableScan: test_graphql projection=[id, name, posts]                   |",
-                "| physical_plan | GlobalLimitExec: skip=0, fetch=1                                             |",
-                "|               |   CoalescePartitionsExec                                                     |",
-                "|               |     LocalLimitExec: fetch=1                                                  |",
-                "|               |       BytesProcessedExec                                                     |",
-                "|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2 |",
-                "|               |           CoalesceBatchesExec: target_batch_size=8192                        |",
-                "|               |             FilterExec: id@0 = 4                                             |",
-                "|               |               MemoryExec: partitions=2, partition_sizes=[2, 2]               |",
-                "|               |                                                                              |",
-                "+---------------+------------------------------------------------------------------------------+",
-            ],
+            "select_limit_1_id_4",
             Some(Box::new(|result_batches| {
                 let mut total = 0;
                 for batch in result_batches {
@@ -388,8 +348,14 @@ async fn test_graphql_pagination() -> Result<(), String> {
         ),
     ];
 
-    for (query, expected_plan, validate_result) in queries {
-        run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
+    for (query, snapshot_suffix, validate_result) in queries {
+        run_query_and_check_results(
+            &mut rt,
+            &format!("test_graphql_pagination_{snapshot_suffix}"),
+            query,
+            validate_result,
+        )
+        .await?;
     }
 
     tx.send(()).map_err(|()| {

@@ -24,7 +24,7 @@ use axum::{
 };
 
 pub(crate) async fn get(Extension(df): Extension<Arc<DataFusion>>) -> Response {
-    if df.is_initial_load_complete() {
+    if df.runtime_status().is_ready() {
         return (status::StatusCode::OK, "Ready").into_response();
     }
     (status::StatusCode::SERVICE_UNAVAILABLE, "Not Ready").into_response()

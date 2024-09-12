@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use app::AppBuilder;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DecimalType;
@@ -21,15 +23,15 @@ use arrow::{
     array::{Decimal128Array, RecordBatch},
     datatypes::{DataType, Decimal128Type},
 };
-use runtime::Runtime;
+use runtime::{status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode},
     Dataset,
 };
 
 use crate::{
-    dataset_ready_check, get_test_datafusion, init_tracing, run_query_and_check_results,
-    run_query_and_check_results_with_plan_checks, PlanCheckFn, ValidateFn,
+    get_test_datafusion, init_tracing, run_query_and_check_results,
+    run_query_and_check_results_with_plan_checks, runtime_ready_check, PlanCheckFn, ValidateFn,
 };
 
 fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {
@@ -44,7 +46,7 @@ fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {
 }
 
 enum CheckFunction {
-    ValidateFullPlan(Vec<&'static str>),
+    ValidateFullPlan(String),
     ValidateSubPlan(Vec<(&'static str, PlanCheckFn)>),
 }
 
@@ -56,32 +58,17 @@ enum DecimalQuery {
     NonFederated,
 }
 
-fn decimal_queries(query_type: DecimalQuery) -> QueryTests<'static> {
+fn decimal_queries(snapshot_name: &str, query_type: DecimalQuery) -> QueryTests<'static> {
     let expected_plan: CheckFunction = match query_type {
-        DecimalQuery::Federated => {
-            CheckFunction::ValidateSubPlan(vec![
-                (
-                    "VirtualExecutionPlan",
-                    Box::new(|plan| plan.contains("sql=SELECT sum(\"decimal\".small_decimal), sum(\"decimal\".medium_decimal), sum(\"decimal\".large_decimal), sum(\"decimal\".precise_decimal) FROM \"decimal\" rewritten_sql=SELECT sum(`decimal`.`small_decimal`), sum(`decimal`.`medium_decimal`), sum(`decimal`.`large_decimal`), sum(`decimal`.`precise_decimal`) FROM `decimal`"))
-                )
-            ])},
-        DecimalQuery::NonFederated => CheckFunction::ValidateFullPlan(vec![
-            "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-            "| plan_type     | plan                                                                                                                                                              |",
-            "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-            "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]]               |",
-            "|               |   BytesProcessedNode                                                                                                                                              |",
-            "|               |     TableScan: decimal projection=[small_decimal, medium_decimal, large_decimal, precise_decimal]                                                                 |",
-            "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]       |",
-            "|               |   CoalescePartitionsExec                                                                                                                                          |",
-            "|               |     AggregateExec: mode=Partial, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)] |",
-            "|               |       BytesProcessedExec                                                                                                                                          |",
-            "|               |         SchemaCastScanExec                                                                                                                                        |",
-            "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                    |",
-            "|               |             SQLiteSqlExec sql=SELECT \"small_decimal\", \"medium_decimal\", \"large_decimal\", \"precise_decimal\" FROM decimal                                           |",
-            "|               |                                                                                                                                                                   |",
-            "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        ])
+        DecimalQuery::Federated => CheckFunction::ValidateSubPlan(vec![(
+            "VirtualExecutionPlan",
+            Box::new(|plan| {
+                plan.contains("sql=SELECT sum(\"decimal\".small_decimal), sum(\"decimal\".medium_decimal), sum(\"decimal\".large_decimal), sum(\"decimal\".precise_decimal) FROM \"decimal\" rewritten_sql=SELECT sum(`decimal`.`small_decimal`), sum(`decimal`.`medium_decimal`), sum(`decimal`.`large_decimal`), sum(`decimal`.`precise_decimal`) FROM `decimal`")
+            }),
+        )]),
+        DecimalQuery::NonFederated => {
+            CheckFunction::ValidateFullPlan(format!("{snapshot_name}_non_federated"))
+        }
     };
     vec![
     ("SELECT SUM(small_decimal), SUM(medium_decimal), SUM(large_decimal), SUM(precise_decimal) FROM decimal", expected_plan, Some(Box::new(
@@ -138,11 +125,13 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
         .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -154,12 +143,14 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
+    runtime_ready_check(&rt).await;
 
-    for (query, check_function, validate_result) in decimal_queries(DecimalQuery::NonFederated) {
+    for (query, check_function, validate_result) in
+        decimal_queries("test_sqlite_decimal_memory", DecimalQuery::NonFederated)
+    {
         match check_function {
-            CheckFunction::ValidateFullPlan(expected_plan) => {
-                run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await
+            CheckFunction::ValidateFullPlan(snapshot_name) => {
+                run_query_and_check_results(&mut rt, &snapshot_name, query, validate_result).await
             }
             CheckFunction::ValidateSubPlan(plan_checks) => {
                 run_query_and_check_results_with_plan_checks(
@@ -185,11 +176,13 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
         .with_dataset(make_sqlite_decimal_dataset(Mode::File))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let mut rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -201,12 +194,14 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(&rt, "SELECT * FROM decimal LIMIT 1").await;
+    runtime_ready_check(&rt).await;
 
-    for (query, check_function, validate_result) in decimal_queries(DecimalQuery::Federated) {
+    for (query, check_function, validate_result) in
+        decimal_queries("test_sqlite_decimal_file", DecimalQuery::Federated)
+    {
         match check_function {
-            CheckFunction::ValidateFullPlan(expected_plan) => {
-                run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await
+            CheckFunction::ValidateFullPlan(snapshot_name) => {
+                run_query_and_check_results(&mut rt, &snapshot_name, query, validate_result).await
             }
             CheckFunction::ValidateSubPlan(plan_checks) => {
                 run_query_and_check_results_with_plan_checks(

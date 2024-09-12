@@ -19,7 +19,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
+use crate::{
+    component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA, status,
+};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::{
     array::{
@@ -43,7 +45,9 @@ use super::tracker::QueryTracker;
 
 pub const DEFAULT_QUERY_HISTORY_TABLE: &str = "query_history";
 
-pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, Error> {
+pub async fn instantiate_query_history_table(
+    runtime_status: Arc<status::RuntimeStatus>,
+) -> Result<Arc<AcceleratedTable>, Error> {
     let time_column = Some("start_time".to_string());
     let time_format = Some(TimeFormat::UnixSeconds);
 
@@ -57,6 +61,7 @@ pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, 
     let query_history_table_reference =
         TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_QUERY_HISTORY_TABLE);
     create_internal_accelerated_table(
+        runtime_status,
         query_history_table_reference,
         Arc::new(table_schema()),
         Acceleration::default(),

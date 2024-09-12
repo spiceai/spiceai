@@ -18,14 +18,11 @@ use std::{sync::Arc, time::Duration};
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::{
-    assert_batches_eq, execution::context::SessionContext,
+    execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
-use futures::{Future, StreamExt};
-use runtime::{
-    datafusion::{query::Protocol, DataFusion},
-    Runtime,
-};
+use futures::Future;
+use runtime::{datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -53,8 +50,8 @@ mod tls;
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn get_test_datafusion() -> Arc<DataFusion> {
-    let mut df = DataFusion::new();
+fn get_test_datafusion(status: Arc<status::RuntimeStatus>) -> Arc<DataFusion> {
+    let mut df = DataFusion::new(status);
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -103,8 +100,8 @@ type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
 
 async fn run_query_and_check_results<F>(
     rt: &mut Runtime,
+    snapshot_name: &str,
     query: &str,
-    expected_plan: &[&str],
     validate_result: Option<F>,
 ) -> Result<(), String>
 where
@@ -122,7 +119,16 @@ where
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
     println!("Query: {query}");
-    assert_batches_eq!(expected_plan, &plan_results);
+
+    let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
+        panic!("Failed to format plan");
+    };
+    insta::with_settings!({
+        description => format!("Query: {query}"),
+        omit_expression => true
+    }, {
+        insta::assert_snapshot!(snapshot_name, explain_plan);
+    });
 
     // Check the result
     if let Some(validate_result) = validate_result {
@@ -217,25 +223,8 @@ where
     Ok(())
 }
 
-async fn dataset_ready_check(rt: &Runtime, sql: &str) {
-    assert!(
-        wait_until_true(Duration::from_secs(30), || async {
-            let mut query_result = rt
-                .datafusion()
-                .query_builder(sql, Protocol::Internal)
-                .build()
-                .run()
-                .await
-                .unwrap_or_else(|_| panic!("Result should be returned"));
-            let mut batches = vec![];
-            while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.unwrap_or_else(|_| panic!("Batch should be created")));
-            }
-            !batches.is_empty() && batches[0].num_rows() == 1
-        })
-        .await,
-        "Expected 1 rows returned"
-    );
+async fn runtime_ready_check(rt: &Runtime) {
+    assert!(wait_until_true(Duration::from_secs(30), || async { rt.status().is_ready() }).await);
 }
 
 async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool

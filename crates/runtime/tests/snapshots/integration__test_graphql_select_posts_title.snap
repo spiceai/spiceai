@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT posts[1]['title'] from test_graphql"
+---
++---------------+-----------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                      |
++---------------+-----------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8("title"))                         |
+|               |   BytesProcessedNode                                                                                      |
+|               |     TableScan: test_graphql projection=[posts]                                                            |
+| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]] |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                    |
+|               |     BytesProcessedExec                                                                                    |
+|               |       MemoryExec: partitions=1, partition_sizes=[4]                                                       |
+|               |                                                                                                           |
++---------------+-----------------------------------------------------------------------------------------------------------+

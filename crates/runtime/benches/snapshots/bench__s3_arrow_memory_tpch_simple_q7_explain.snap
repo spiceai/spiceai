@@ -1,0 +1,22 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: SELECT * FROM (SELECT o_orderkey FROM orders LIMIT 10) AS c(key) LIMIT 10\n"
+---
++---------------+----------------------------------------------------------------------------------+
+| plan_type     | plan                                                                             |
++---------------+----------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                 |
+|               |   Projection: orders.o_orderkey AS key                                           |
+|               |     Limit: skip=0, fetch=10                                                      |
+|               |       BytesProcessedNode                                                         |
+|               |         TableScan: orders projection=[o_orderkey]                                |
+| physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                                       |
+|               |   GlobalLimitExec: skip=0, fetch=10                                              |
+|               |     CoalescePartitionsExec                                                       |
+|               |       LocalLimitExec: fetch=10                                                   |
+|               |         BytesProcessedExec                                                       |
+|               |           SchemaCastScanExec                                                     |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1 |
+|               |               MemoryExec: partitions=1, partition_sizes=[184]                    |
+|               |                                                                                  |
++---------------+----------------------------------------------------------------------------------+
