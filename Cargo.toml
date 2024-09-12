@@ -61,10 +61,10 @@ datafusion-execution = "41"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 datafusion-functions-json = "0.41"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "701f54ffe26210759134e7c033c53fd39bf3eee7" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "01bef67c63b91365e86a1c0895cb151cf1df77c1" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
-fundu = "2.0.0"
+fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.14"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "55c8b8a28915c7ad782ae8468f7927567abd0f26" }

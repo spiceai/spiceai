@@ -92,7 +92,7 @@ async fn main() -> Result<(), String> {
                 bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
             }
             "s3" => {
-                bench_s3::run(&mut rt, &mut benchmark_results, None).await?;
+                bench_s3::run(&mut rt, &mut benchmark_results, None, None).await?;
             }
             #[cfg(feature = "spark")]
             "spark" => {
@@ -144,10 +144,13 @@ async fn main() -> Result<(), String> {
     ];
 
     for accelerator in accelerators {
-        let (mut benchmark_results, mut rt) =
-            setup::setup_benchmark(&upload_results_dataset, "s3", Some(&accelerator)).await;
+        let engine = accelerator.engine.clone();
+        let mode = accelerator.mode.clone();
 
-        bench_s3::run(&mut rt, &mut benchmark_results, Some(accelerator)).await?;
+        let (mut benchmark_results, mut rt) =
+            setup::setup_benchmark(&upload_results_dataset, "s3", Some(accelerator)).await;
+
+        bench_s3::run(&mut rt, &mut benchmark_results, engine, Some(mode)).await?;
 
         let data_update: DataUpdate = benchmark_results.into();
 

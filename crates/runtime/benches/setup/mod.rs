@@ -17,11 +17,13 @@ limitations under the License.
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
-use runtime::{datafusion::DataFusion, dataupdate::DataUpdate, Runtime};
+use runtime::{datafusion::DataFusion, dataupdate::DataUpdate, status, Runtime};
 use spicepod::component::dataset::{
-    acceleration::Acceleration, replication::Replication, Dataset, Mode,
+    acceleration::{Acceleration, IndexType},
+    replication::Replication,
+    Dataset, Mode,
 };
-use std::{process::Command, sync::Arc};
+use std::{collections::HashMap, process::Command, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 /// The number of times to run each query in the benchmark.
@@ -31,7 +33,8 @@ const ITERATIONS: i32 = 5;
 ///
 /// 1) Sets the number of `target_partitions` to 4, by default its the number of CPU cores available.
 fn get_test_datafusion() -> Arc<DataFusion> {
-    let mut df = DataFusion::new();
+    let status = status::RuntimeStatus::new();
+    let mut df = DataFusion::new(Arc::clone(&status));
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -50,10 +53,11 @@ fn get_test_datafusion() -> Arc<DataFusion> {
 pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
     connector: &str,
-    acceleration: Option<&Acceleration>,
+    acceleration: Option<Acceleration>,
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
+    let is_acc = acceleration.is_some();
     let app = build_app(upload_results_dataset, connector, acceleration);
 
     let rt = Runtime::builder()
@@ -69,9 +73,9 @@ pub(crate) async fn setup_benchmark(
         () = rt.load_components() => {}
     }
 
-    if acceleration.is_some() {
+    if is_acc {
         // allow accelerated data to load
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(150)).await;
     }
 
     let benchmark_results =
@@ -93,7 +97,7 @@ pub(crate) async fn write_benchmark_results(
 fn build_app(
     upload_results_dataset: &Option<String>,
     connector: &str,
-    acceleration: Option<&Acceleration>,
+    acceleration: Option<Acceleration>,
 ) -> App {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test");
 
@@ -153,13 +157,81 @@ fn build_app(
 
     if let Some(accel) = acceleration {
         app.datasets.iter_mut().for_each(|ds| {
+            let mut accel = accel.clone();
+            let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name);
+            if let Some(indexes) = indexes {
+                accel.indexes = indexes;
+            }
             if ds.name != "oss_benchmarks" {
-                ds.acceleration = Some(accel.clone());
+                ds.acceleration = Some(accel);
             }
         });
     }
 
     app
+}
+
+fn get_accelerator_indexes(
+    engine: Option<String>,
+    dataset: &str,
+) -> Option<HashMap<String, IndexType>> {
+    if let Some(engine) = engine {
+        match engine.as_str() {
+            "sqlite" => match dataset {
+                "orders" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("o_orderdate".to_string(), IndexType::Enabled);
+                    indexes.insert("o_orderkey".to_string(), IndexType::Enabled);
+                    indexes.insert("o_custkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "lineitem" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("l_orderkey".to_string(), IndexType::Enabled);
+                    indexes.insert("l_suppkey".to_string(), IndexType::Enabled);
+                    indexes.insert("l_discount".to_string(), IndexType::Enabled);
+                    indexes.insert("l_shipdate".to_string(), IndexType::Enabled);
+                    indexes.insert("l_partkey".to_string(), IndexType::Enabled);
+                    indexes.insert("l_quantity".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "partsupp" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("ps_suppkey".to_string(), IndexType::Enabled);
+                    indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "part" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("p_partkey".to_string(), IndexType::Enabled);
+                    indexes.insert("p_brand".to_string(), IndexType::Enabled);
+                    indexes.insert("p_container".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "nation" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("n_nationkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "supplier" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("s_suppkey".to_string(), IndexType::Enabled);
+                    indexes.insert("s_nationkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "customer" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("c_phone".to_string(), IndexType::Enabled);
+                    indexes.insert("c_acctbal".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 fn init_tracing() {
