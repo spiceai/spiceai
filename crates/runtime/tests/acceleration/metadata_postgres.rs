@@ -14,20 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{get_test_datafusion, init_tracing, postgres::common, runtime_ready_check};
-use app::AppBuilder;
-use datafusion::assert_batches_eq;
-use rand::Rng;
-use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
-        acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
-        Dataset,
-    },
-    params::Params,
-};
-use std::{collections::HashMap, sync::Arc};
-
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {

@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The metadata table will be a new table `spice_sys_metadata` with three columns:
 //! - `dataset` (PRIMARY KEY, TEXT): The dataset the metadata entry corresponds to
-//! - `key` (PRIMARY KEY, TEXT): The key of the metadata entry
+//! - `key` (PRIMARY KEY, TEXT): The key of the metadata entry, allowing multiple metadata values to be associated with a dataset
 //! - `metadata` (TEXT): The metadata entry in JSON/string serialized format
 
 use serde::de::DeserializeOwned;

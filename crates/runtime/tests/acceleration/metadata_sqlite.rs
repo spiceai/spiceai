@@ -13,13 +13,3 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-#[cfg(feature = "duckdb")]
-mod metadata_duckdb;
-#[cfg(feature = "postgres")]
-mod metadata_postgres;
-#[cfg(feature = "sqlite")]
-mod metadata_sqlite;
-#[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
-mod on_conflict;
-mod query_push_down;
