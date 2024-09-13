@@ -29,7 +29,7 @@ import (
 const (
 	refreshSqlFlag  = "refresh-sql"
 	refreshModeFlag = "refresh-mode"
-	maxJitterFlag   = "max-jitter"
+	maxJitterFlag   = "refresh-jitter-max"
 )
 
 type DatasetRefreshApiResponse struct {
@@ -39,7 +39,7 @@ type DatasetRefreshApiResponse struct {
 type DatasetRefreshApiRequest struct {
 	RefreshSQL *string `json:"refresh_sql,omitempty"`
 	Mode       *string `json:"refresh_mode,omitempty"`
-	MaxJitter  *string `json:"max_jitter,omitempty"`
+	MaxJitter  *string `json:"refresh_jitter_max,omitempty"`
 }
 
 func constructRequest(sql string, mode string, max_jitter string) (*string, error) {
@@ -113,6 +113,6 @@ func init() {
 	refreshCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	refreshCmd.Flags().String(refreshSqlFlag, "", "'refresh_sql' to refresh a dataset.")
 	refreshCmd.Flags().String(refreshModeFlag, "", "'refresh_mode', one of: full, append")
-	refreshCmd.Flags().String(maxJitterFlag, "", "'max_jitter', a duration string (e.g. '1m') to specify the maximum jitter allowed for the refresh operation")
+	refreshCmd.Flags().String(maxJitterFlag, "", "'refresh_jitter_max', a duration string (e.g. '1m') to specify the maximum jitter allowed for the refresh operation")
 	RootCmd.AddCommand(refreshCmd)
 }

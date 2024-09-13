@@ -82,7 +82,7 @@ pub struct RefreshOverrides {
     #[serde(rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
 
-    #[serde(deserialize_with = "parse_max_jitter")]
+    #[serde(rename="refresh_jitter_max", deserialize_with = "parse_max_jitter")]
     pub max_jitter: Option<Duration>,
 }
 
