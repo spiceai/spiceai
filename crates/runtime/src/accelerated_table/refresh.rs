@@ -27,6 +27,7 @@ use cache::QueryResultsCacheProvider;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use fundu::DurationParser;
 use futures::future::BoxFuture;
 use opentelemetry::Key;
 use rand::Rng;
@@ -81,7 +82,19 @@ pub struct RefreshOverrides {
     #[serde(rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
 
+    #[serde(deserialize_with = "parse_max_jitter")]
     pub max_jitter: Option<Duration>,
+}
+
+fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) => fundu::parse_duration(&s).map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
 }
 
 impl Refresh {
@@ -322,7 +335,7 @@ impl Refresher {
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
     fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
         match max_jitter {
-            Some(max_jitter) => {
+            Some(max_jitter) if !max_jitter.is_zero() => {
                 let jitter = rand::thread_rng().gen_range(Duration::from_secs(0)..max_jitter);
                 if rand::thread_rng().gen_bool(0.5) {
                     period + jitter
@@ -330,7 +343,7 @@ impl Refresher {
                     period.saturating_sub(jitter)
                 }
             }
-            None => period,
+            Some(_) | None => period,
         }
     }
 
@@ -403,7 +416,6 @@ impl Refresher {
                         // Apply jitter on manual refreshes. For periodic refreshes, jitter
                         // is added to the timer, `next_scheduled_refresh_timer`.
                         let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
-
                         if let Some(max_jitter) = override_jitter.or(max_jitter) {
                             sleep(Self::compute_delay(Duration::from_secs(0), Some(max_jitter))).await;
                         }
