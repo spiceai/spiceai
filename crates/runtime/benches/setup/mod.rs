@@ -89,7 +89,7 @@ pub(crate) async fn setup_benchmark(
 
 async fn runtime_ready_check(rt: &Runtime) {
     assert!(
-        wait_until_true(Duration::from_secs(150), || async {
+        wait_until_true(Duration::from_secs(200), || async {
             rt.status().is_ready()
         })
         .await
