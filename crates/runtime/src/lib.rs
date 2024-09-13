@@ -34,7 +34,7 @@ use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
-use dataaccelerator::metadata::{self, AcceleratedMetadata};
+use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -654,15 +654,11 @@ impl Runtime {
                     }
                 };
 
-                // If we already have an existing metadata table that has marked the initial refresh complete,
+                // If we already have an existing dataset checkpoint table that has been checkpointed,
                 // it means there is data from a previous acceleration and we don't need
                 // to wait for the first refresh to complete to mark it ready.
-                if let Some(metadata) = AcceleratedMetadata::new(ds).await {
-                    if metadata
-                        .get_metadata::<bool>(metadata::INITIAL_REFRESH_COMPLETE_KEY)
-                        .await
-                        .unwrap_or(false)
-                    {
+                if let Ok(checkpoint) = DatasetCheckpoint::try_new(ds).await {
+                    if checkpoint.exists().await {
                         self.status
                             .update_dataset(&ds.name, status::ComponentStatus::Ready);
                     }

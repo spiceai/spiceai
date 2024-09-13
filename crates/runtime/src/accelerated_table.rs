@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
-use crate::dataaccelerator::metadata::AcceleratedMetadata;
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::status;
 use arrow::array::UInt64Array;
@@ -178,7 +178,7 @@ pub struct Builder {
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
-    metadata: Option<AcceleratedMetadata>,
+    checkpointer: Option<DatasetCheckpoint>,
 }
 
 impl Builder {
@@ -200,7 +200,7 @@ impl Builder {
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
-            metadata: None,
+            checkpointer: None,
             disable_query_push_down: false,
         }
     }
@@ -251,14 +251,14 @@ impl Builder {
     }
 
     /// Set the metadata provider for the accelerated table
-    pub fn metadata(&mut self, metadata: AcceleratedMetadata) -> &mut Self {
-        self.metadata = Some(metadata);
+    pub fn checkpointer(&mut self, checkpointer: DatasetCheckpoint) -> &mut Self {
+        self.checkpointer = Some(checkpointer);
         self
     }
 
     /// Set the metadata provider for the accelerated table
-    pub fn metadata_opt(&mut self, metadata: Option<AcceleratedMetadata>) -> &mut Self {
-        self.metadata = metadata;
+    pub fn checkpointer_opt(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
+        self.checkpointer = checkpointer;
         self
     }
 
@@ -320,7 +320,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
-        refresher.metadata(self.metadata);
+        refresher.checkpointer(self.checkpointer);
 
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)

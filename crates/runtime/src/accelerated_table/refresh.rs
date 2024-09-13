@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
-use crate::dataaccelerator::metadata::{self, AcceleratedMetadata};
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::status;
 use arrow::datatypes::Schema;
 use cache::QueryResultsCacheProvider;
@@ -278,7 +278,7 @@ pub struct Refresher {
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: RefreshTaskRunner,
-    metadata: Option<Arc<AcceleratedMetadata>>,
+    checkpointer: Option<Arc<DatasetCheckpoint>>,
 }
 
 impl Refresher {
@@ -305,7 +305,7 @@ impl Refresher {
             accelerator,
             cache_provider: None,
             refresh_task_runner,
-            metadata: None,
+            checkpointer: None,
         }
     }
 
@@ -317,8 +317,8 @@ impl Refresher {
         self
     }
 
-    pub fn metadata(&mut self, metadata: Option<AcceleratedMetadata>) -> &mut Self {
-        self.metadata = metadata.map(Arc::new);
+    pub fn checkpointer(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
+        self.checkpointer = checkpointer.map(Arc::new);
         self
     }
 
@@ -366,7 +366,7 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
-        let metadata = self.metadata.clone();
+        let checkpointer = self.checkpointer.clone();
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
@@ -423,9 +423,9 @@ impl Refresher {
                                 }
                             }
 
-                            if let Some(metadata) = &metadata {
-                                if let Err(e) = metadata.set_metadata(metadata::INITIAL_REFRESH_COMPLETE_KEY, &true).await {
-                                    tracing::warn!("Failed to set metadata for dataset {}: {e}", &dataset_name.to_string());
+                            if let Some(checkpointer) = &checkpointer {
+                                if let Err(e) = checkpointer.checkpoint().await {
+                                    tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
                                 };
                             }
                         }
