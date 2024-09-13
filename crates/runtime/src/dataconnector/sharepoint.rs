@@ -95,14 +95,12 @@ impl Sharepoint {
             }
             (None, None) => {
                 return Err(Error::InvalidParameters {
-                    source: "either 'client_secret' or 'auth_code' must be provided"
-                        .into(),
+                    source: "either 'client_secret' or 'auth_code' must be provided".into(),
                 })
             }
             (Some(_), Some(_)) => {
                 return Err(Error::InvalidParameters {
-                    source: "both 'client_secret' and 'auth_code' cannot be provided"
-                        .into(),
+                    source: "both 'client_secret' and 'auth_code' cannot be provided".into(),
                 })
             }
         };
