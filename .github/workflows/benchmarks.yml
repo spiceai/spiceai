@@ -40,7 +40,7 @@ env:
 
 jobs:
   build-database-bench-binary:
-    name: Benchmark Tests
+    name: Build Benchmark Test Binary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
