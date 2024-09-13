@@ -20,14 +20,16 @@ use arrow::{
     datatypes::SchemaRef,
     json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
 };
+use graphql_parser::query::{
+    parse_query, Definition, Document, Field, InlineFragment, OperationDefinition, Query,
+    Selection, SelectionSet, Text,
+};
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
-use std::{
-    io::Cursor,
-    sync::{Arc, LazyLock},
-};
+use std::{cmp::min, io::Cursor, sync::Arc};
 use url::Url;
 
 pub enum Auth {
@@ -46,94 +48,281 @@ pub struct UnnestParameters {
     duplicate_behavior: DuplicateBehavior,
 }
 
+/// [`PageInfo`] for pagination, following the [GraphQL Cursor Connections Specification](https://relay.dev/graphql/connections.htm#sec-undefined.PageInfo).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageInfo {
+    #[serde(default)]
+    pub has_next_page: bool,
+
+    #[serde(default)]
+    pub has_previous_page: bool,
+    pub start_cursor: Option<String>,
+    pub end_cursor: Option<String>,
+}
+
+impl PageInfo {
+    /// Based on the pagination, returns the appropriate cursor.
+    ///
+    /// Example:
+    /// ```rust
+    /// use serde_json;
+    /// use data_components::graphql::client::PageInfo;
+    ///
+    /// let info = serde_json::from_str(r#"{"hasNextPage": true, "endCursor": "cursor_abc"}"#).unwrap();
+    /// assert_eq!(
+    ///  info.cursor_from_pagination(&PaginationArgument::First(10)),
+    ///  Some("cursor_abc".to_string())
+    /// );
+    ///
+    /// assert_eq!(
+    ///  info.cursor_from_pagination(&PaginationArgument::Last(10)),
+    ///  None
+    /// );
+    /// ```
+    fn cursor_from_pagination(&self, arg: &PaginationArgument) -> Option<String> {
+        match arg {
+            PaginationArgument::First(_) => {
+                if self.has_next_page {
+                    self.end_cursor.clone()
+                } else {
+                    None
+                }
+            }
+            PaginationArgument::Last(_) => {
+                if self.has_previous_page {
+                    self.start_cursor.clone()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaginationArgument {
+    /// paginating via `fn(first: usize, after: String)`
+    First(usize),
+    /// paginating via `fn(last: usize, before: String)`
+    Last(usize),
+}
+
+impl PaginationArgument {
+    /// Formats the pagination arguments to be inserted into a Graphql variable.
+    ///
+    /// Example:
+    /// ```rust
+    /// use data_components::graphql::client::PaginationArgument;
+    /// assert_eq!(
+    ///   PaginationArgument::Last(10).format_arguments(None),
+    ///   "last: 10"
+    /// );
+    /// assert_eq!(
+    ///   PaginationArgument::First(10).format_arguments(Some("cursor_abc".to_string())),
+    ///   "first: 10, after: \"cursor_abc\""
+    /// );
+    /// ```
+    fn format_arguments(&self, cursor: Option<String>) -> String {
+        match (self, cursor) {
+            (PaginationArgument::First(z), Some(c)) => {
+                format!(r#"first: {z}, after: "{c}""#,)
+            }
+            (PaginationArgument::First(z), None) => {
+                format!(r#"first: {z}"#)
+            }
+            (PaginationArgument::Last(z), Some(c)) => {
+                format!(r#"last: {z}, before: "{c}""#)
+            }
+            (PaginationArgument::Last(z), None) => {
+                format!(r#"last: {z}"#)
+            }
+        }
+    }
+
+    fn with_limit(&self, limit: usize) -> Self {
+        match self {
+            PaginationArgument::First(z) => PaginationArgument::First(min(*z, limit)),
+            PaginationArgument::Last(z) => PaginationArgument::Last(min(*z, limit)),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            PaginationArgument::First(z) | PaginationArgument::Last(z) => *z,
+        }
+    }
+}
+
+/// Try to convert a [`Field`] into a [`PaginationArgument`]. Assumes the field has a valid pagination
+/// argument with one of the following arguments: `first`, `last`.
+impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
+    type Error = String;
+
+    fn try_into(self) -> std::result::Result<PaginationArgument, Self::Error> {
+        let pag_arg_opt = self.arguments.iter().find_map(|(arg, v)| {
+            let z = match v {
+                graphql_parser::query::Value::Int(z) => z.as_i64(),
+                _ => None,
+            }?;
+
+            let n: usize = z.try_into().ok()?;
+
+            match format!("{arg:?}").as_str() {
+                "\"first\"" => Some(PaginationArgument::First(n)),
+                "\"last\"" => Some(PaginationArgument::Last(n)),
+                _ => None,
+            }
+        });
+        match pag_arg_opt {
+            Some(page_arg) => Ok(page_arg),
+            None => Err("Invalid pagination argument".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     resource_name: String,
-    count: usize,
-    page_info_path: String,
+    pub args: PaginationArgument,
+    page_info_path: Option<String>,
 }
 
-static PAGINATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?xsm)(\w+)\s*\([^)]*first:\s*(\d+)[^)]*\)\s*\{.*pageInfo\s*\{.*(?:hasNextPage.*endCursor|endCursor.*hasNextPage).*\}.*\}").unwrap_or_else(|_| {
-        unreachable!("Invalid regex pagination pattern defined at compile time")
-    })
-});
-
 impl PaginationParameters {
-    fn parse(query: &str, pointer: &str) -> Option<Self> {
-        match PAGINATION_REGEX.captures(query) {
-            Some(captures) => {
-                let resource_name = captures.get(1).map(|m| m.as_str().to_owned());
-                let count = captures
-                    .get(2)
-                    .map(|m| m.as_str().parse::<usize>())
-                    .transpose()
-                    .unwrap_or(None);
+    fn reduce_limit(&self, l: usize) -> usize {
+        l.saturating_sub(self.args.size())
+    }
 
-                match (resource_name, count) {
-                    (Some(resource_name), Some(count)) => {
-                        let pattern = format!(r"^(.*?{resource_name})");
-                        let regex = Regex::new(pattern.as_str())
-                            .unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
-
-                        let captures = regex.captures(pointer);
-
-                        let page_info_path = captures
-                            .and_then(|c| c.get(1).map(|m| m.as_str().to_owned() + "/pageInfo"));
-
-                        page_info_path.map(|page_info_path| Self {
-                            resource_name,
-                            count,
-                            page_info_path,
-                        })
+    fn parse(query: &str) -> Option<Self> {
+        // Recursive function to traverse the AST and find the pageInfo field
+        fn find_in_selection_set<'a, T: Text<'a> + std::fmt::Debug>(
+            selections: &[Selection<'a, T>],
+            current_path: &str,
+            parent_field: Option<&Field<'a, T>>,
+        ) -> Option<PaginationParameters> {
+            tracing::debug!(
+                "For PaginationParameters, searching json_pointer path: {current_path}"
+            );
+            for selection in selections {
+                match selection {
+                    graphql_parser::query::Selection::FragmentSpread(_) => continue,
+                    graphql_parser::query::Selection::InlineFragment(InlineFragment {
+                        selection_set,
+                        ..
+                    }) => {
+                        if let Some(solution) =
+                            find_in_selection_set(&selection_set.items, current_path, parent_field)
+                        {
+                            return Some(solution);
+                        }
                     }
-                    _ => None,
+                    graphql_parser::query::Selection::Field(field) => {
+                        let field_name = format!("{:?}", field.name).replace('"', "");
+                        let new_path = format!("{current_path}/{field_name}");
+
+                        // End of recursion, `pageInfo` field found
+                        if field_name == "pageInfo" {
+                            tracing::debug!(
+                                "For PaginationParameters, found `pageInfo` at {new_path}"
+                            );
+                            let Some(parent_field) = parent_field else {
+                                tracing::warn!("Invalid parent field");
+                                return None;
+                            };
+
+                            match parent_field.try_into() {
+                                Ok(pag_arg) => {
+                                    return Some(PaginationParameters {
+                                        resource_name: format!("{:?}", parent_field.name)
+                                            .replace('"', ""),
+                                        args: pag_arg,
+                                        page_info_path: Some(new_path),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Invalid pagination argument: {e}");
+                                    return None;
+                                }
+                            }
+                        }
+
+                        // Recurse into nested selection sets
+                        if let Some(solution) = find_in_selection_set(
+                            &field.selection_set.items,
+                            &new_path,
+                            Some(field),
+                        ) {
+                            return Some(solution);
+                        }
+                    }
                 }
             }
-            None => None,
+            None
         }
+
+        let ast: Document<String> = parse_query(query).ok()?;
+
+        // Start traversing the query's operation definitions
+        for def in ast.definitions {
+            let selections = match def {
+                Definition::Operation(OperationDefinition::Query(Query {
+                    selection_set, ..
+                })) => selection_set.items,
+                Definition::Operation(OperationDefinition::SelectionSet(SelectionSet {
+                    items,
+                    ..
+                })) => items,
+                _ => continue,
+            };
+
+            if let Some(found_path) = find_in_selection_set(&selections, "", None) {
+                return Some(found_path);
+            }
+        }
+        None
     }
 
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
         let mut limit_reached = false;
 
-        let mut count = self.count;
+        let mut count = self.args.clone();
 
         if let Some(limit) = limit {
-            if limit <= count {
-                count = limit;
+            if limit <= count.size() {
+                count = count.with_limit(limit);
                 limit_reached = true;
             }
         }
+
         let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
         let regex =
             Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
 
-        let replace_query = if let Some(cursor) = cursor {
+        let new_query = regex.replace(
+            query,
             format!(
-                r#"{} (first: {count}, after: "{cursor}")"#,
-                self.resource_name
-            )
-        } else {
-            format!(r#"{} (first: {count})"#, self.resource_name)
-        };
-
-        let new_query = regex.replace(query, replace_query.as_str());
+                r#"{} ({})"#,
+                self.resource_name,
+                count.format_arguments(cursor)
+            ),
+        );
         (new_query.to_string(), limit_reached)
     }
 
     fn get_next_cursor_from_response(&self, response: &Value) -> Option<String> {
-        let page_info = response
-            .pointer(&self.page_info_path)
-            .unwrap_or(&Value::Null);
-        let end_cursor = page_info["endCursor"].as_str().map(ToString::to_string);
-        let has_next_page = page_info["hasNextPage"].as_bool().unwrap_or(false);
+        let Some(page_info_path) = &self.page_info_path else {
+            return None;
+        };
 
-        if has_next_page {
-            end_cursor
-        } else {
-            None
-        }
+        let page_info: PageInfo = response
+            .pointer(&format!("/data{page_info_path}"))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .ok()
+            .flatten()?;
+
+        page_info.cursor_from_pagination(&self.args)
     }
 }
 
@@ -251,7 +440,7 @@ impl GraphQLClient {
         pass: Option<String>,
         unnest_depth: usize,
     ) -> Self {
-        let pagination_parameters = PaginationParameters::parse(&query, &json_pointer);
+        let pagination_parameters = PaginationParameters::parse(&query);
         tracing::debug!(
             "Parsed pagination parameters for {:?}: {pagination_parameters:?}",
             endpoint.to_string()
@@ -363,9 +552,10 @@ impl GraphQLClient {
         let mut limit = limit;
 
         while let Some(next_cursor_val) = next_cursor {
-            limit = limit.map(|l| {
-                l.saturating_sub(self.pagination_parameters.as_ref().map_or(0, |x| x.count))
-            });
+            if let (Some(l), Some(p)) = (limit, self.pagination_parameters.as_ref()) {
+                limit = Some(p.reduce_limit(l));
+            };
+
             let (next_batch, _, new_cursor) = self
                 .execute(Some(Arc::clone(&schema)), limit, Some(next_cursor_val))
                 .await?;
@@ -489,7 +679,6 @@ mod tests {
     struct TestPaginationParseCase {
         name: &'static str,
         query: &'static str,
-        pointer: &'static str,
         expected: Option<PaginationParameters>,
     }
 
@@ -509,11 +698,10 @@ mod tests {
                         }
                     }
                 "#,
-                pointer: "/data/users",
                 expected: Some(PaginationParameters {
                     resource_name: "users".to_owned(),
-                    count: 10,
-                    page_info_path: "/data/users/pageInfo".to_owned(),
+                    args: super::PaginationArgument::First(10),
+                    page_info_path: Some("/users/pageInfo".into()),
                 }),
             },
             TestPaginationParseCase {
@@ -528,11 +716,10 @@ mod tests {
                         }
                     }
                 "#,
-                pointer: "/data/users",
                 expected: Some(PaginationParameters {
                     resource_name: "users".to_owned(),
-                    count: 10,
-                    page_info_path: "/data/users/pageInfo".to_owned(),
+                    args: super::PaginationArgument::First(10),
+                    page_info_path: Some("/users/pageInfo".into()),
                 }),
             },
             TestPaginationParseCase {
@@ -544,7 +731,6 @@ mod tests {
                         }
                     }
                 "#,
-                pointer: "/data/users",
                 expected: None,
             },
             TestPaginationParseCase {
@@ -568,17 +754,16 @@ mod tests {
                         }
                     }
                 "#,
-                pointer: "/data/paginatedUsers/users",
                 expected: Some(PaginationParameters {
                     resource_name: "paginatedUsers".to_owned(),
-                    count: 2,
-                    page_info_path: "/data/paginatedUsers/pageInfo".to_owned(),
+                    args: super::PaginationArgument::First(2),
+                    page_info_path: Some("/paginatedUsers/pageInfo".to_owned()),
                 }),
             },
         ];
 
         for case in test_cases {
-            let result = PaginationParameters::parse(case.query, case.pointer);
+            let result = PaginationParameters::parse(case.query);
             assert_eq!(result, case.expected, "Failed test case: {}", case.name);
         }
     }
@@ -594,9 +779,8 @@ mod tests {
                 }
             }
         }";
-        let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query).expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -620,9 +804,8 @@ mod tests {
                 }
             }
         }"#;
-        let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query).expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -646,9 +829,8 @@ mod tests {
                 }
             }
         }";
-        let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query).expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, Some(5), Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -666,6 +848,7 @@ mod tests {
 
     #[test]
     fn test_pagination_get_next_cursor_from_response() {
+        // Forward cursor, with next page
         let query = r"query {
             users(first: 10) {
                 name
@@ -675,9 +858,8 @@ mod tests {
                 }
             }
         }";
-        let pointer = r"/data/users";
         let pagination_parameters =
-            PaginationParameters::parse(query, pointer).expect("Failed to get pagination params");
+            PaginationParameters::parse(query).expect("Failed to get pagination params");
 
         let response = serde_json::from_str(
             r#"{
@@ -700,6 +882,41 @@ mod tests {
             "Expected next cursor to be new_cursor"
         );
 
+        // Backwards cursor, with previous page
+        let query = r"query {
+            users(last: 10) {
+                name
+                pageInfo {
+                    hasPreviousPage
+                    startCursor
+                }
+            }
+        }";
+        let pagination_parameters =
+            PaginationParameters::parse(query).expect("Failed to get pagination params");
+
+        let response = serde_json::from_str(
+            r#"{
+            "data": {
+                "users": {
+                    "pageInfo": {
+                        "hasPreviousPage": true,
+                        "startCursor": "new_cursor"
+                    }
+                }
+            }
+        }"#,
+        )
+        .expect("Invalid json");
+
+        let next_cursor = pagination_parameters.get_next_cursor_from_response(&response);
+        assert_eq!(
+            next_cursor,
+            Some("new_cursor".to_string()),
+            "Expected next cursor to be new_cursor"
+        );
+
+        // Backwards cursor, no pagination left
         let response = serde_json::from_str(
             r#"{
             "data": {
