@@ -17,11 +17,11 @@ limitations under the License.
 use spicepod::component::{dataset::acceleration::Mode, params::Params};
 
 #[cfg(feature = "duckdb")]
-mod metadata_duckdb;
+mod checkpoint_duckdb;
 #[cfg(feature = "postgres")]
-mod metadata_postgres;
+mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
-mod metadata_sqlite;
+mod checkpoint_sqlite;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
 mod query_push_down;

@@ -33,7 +33,7 @@ use crate::{
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn test_acceleration_postgres_metadata() -> Result<(), anyhow::Error> {
+async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = get_random_port();
     let running_container = common::start_postgres_docker_container(port).await?;
@@ -88,7 +88,7 @@ async fn test_acceleration_postgres_metadata() -> Result<(), anyhow::Error> {
         .as_async()
         .expect("async connection")
         .query_arrow(
-            "SELECT dataset, key, metadata FROM spice_sys_metadata",
+            "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
             &[],
             None,
         )

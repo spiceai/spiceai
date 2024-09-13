@@ -1,9 +1,0 @@
----
-source: crates/runtime/tests/acceleration/metadata_duckdb.rs
-expression: pretty
----
-+------------+--------------------------+----------+
-| dataset    | key                      | metadata |
-+------------+--------------------------+----------+
-| taxi_trips | initial_refresh_complete | true     |
-+------------+--------------------------+----------+
