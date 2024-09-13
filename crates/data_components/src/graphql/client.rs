@@ -227,7 +227,6 @@ impl PaginationParameters {
                             );
                             let Some(parent_field) = parent_field else {
                                 tracing::warn!("Invalid parent field");
-                                println!("Invalid parent field");
                                 return None;
                             };
 
@@ -242,7 +241,6 @@ impl PaginationParameters {
                                 }
                                 Err(e) => {
                                     tracing::warn!("Invalid pagination argument: {e}");
-                                    println!("Invalid pagination argument: {e}");
                                     return None;
                                 }
                             }
@@ -254,7 +252,6 @@ impl PaginationParameters {
                             &new_path,
                             Some(field),
                         ) {
-                            println!("Found {solution:#?}");
                             return Some(solution);
                         }
                     }
