@@ -114,10 +114,10 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a913e1aa45a610980983b8a1d10b26e5a4f99810" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f2ca47d094a5636df8b9f3792b2f474a7b210dc1" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
