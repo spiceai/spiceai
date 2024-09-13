@@ -67,7 +67,7 @@ duckdb = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.14"
-graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "55c8b8a28915c7ad782ae8468f7927567abd0f26" }
+graph-rs-sdk = { git = "https://github.com/Jeadie/graph-rs-sdk", rev = "bdfa222f3a317f7fb3bd9970888c02bafeff59c3" }
 insta = { version = "1.40.0", features = ["filters"] }
 itertools = "0.13"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }

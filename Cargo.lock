@@ -4415,7 +4415,7 @@ dependencies = [
 [[package]]
 name = "graph-core"
 version = "2.0.1"
-source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=bdfa222f3a317f7fb3bd9970888c02bafeff59c3#bdfa222f3a317f7fb3bd9970888c02bafeff59c3"
 dependencies = [
  "Inflector",
  "async-stream",
@@ -4440,7 +4440,7 @@ dependencies = [
 [[package]]
 name = "graph-error"
 version = "0.3.1"
-source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=bdfa222f3a317f7fb3bd9970888c02bafeff59c3#bdfa222f3a317f7fb3bd9970888c02bafeff59c3"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -4463,7 +4463,7 @@ dependencies = [
 [[package]]
 name = "graph-http"
 version = "2.0.1"
-source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=bdfa222f3a317f7fb3bd9970888c02bafeff59c3#bdfa222f3a317f7fb3bd9970888c02bafeff59c3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4488,7 +4488,7 @@ dependencies = [
 [[package]]
 name = "graph-oauth"
 version = "2.0.1"
-source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=bdfa222f3a317f7fb3bd9970888c02bafeff59c3#bdfa222f3a317f7fb3bd9970888c02bafeff59c3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4516,7 +4516,7 @@ dependencies = [
 [[package]]
 name = "graph-rs-sdk"
 version = "2.0.1"
-source = "git+https://github.com/spiceai/graph-rs-sdk?rev=55c8b8a28915c7ad782ae8468f7927567abd0f26#55c8b8a28915c7ad782ae8468f7927567abd0f26"
+source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=bdfa222f3a317f7fb3bd9970888c02bafeff59c3#bdfa222f3a317f7fb3bd9970888c02bafeff59c3"
 dependencies = [
  "graph-core",
  "graph-error",
