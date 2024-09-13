@@ -32,6 +32,7 @@ use crate::component::dataset::{acceleration::Engine, Dataset};
 use super::{duckdb::DuckDBAccelerator, get_accelerator_engine, sqlite::SqliteAccelerator};
 
 pub mod dataset_checkpoint;
+#[cfg(feature = "debezium")]
 pub mod debezium_kafka;
 
 enum AccelerationConnection {
