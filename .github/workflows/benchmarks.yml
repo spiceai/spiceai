@@ -15,7 +15,7 @@ on:
           - 'true'
           - 'false'
       selected_benchmark:
-        description: 'Individual connector/acelerator benchmarks to run'
+        description: 'Individual connector/accelerator benchmarks to run'
         required: false
         default: ''
         type: choice
