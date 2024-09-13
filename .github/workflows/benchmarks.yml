@@ -116,7 +116,7 @@ jobs:
           name: spice_bench
 
       - name: Install Databricks ODBC driver
-        if: contains(env.FEATURES, 'odbc') && matrix.cmd = '-c odbc-databricks'
+        if: contains(env.FEATURES, 'odbc') && matrix.cmd == '-c odbc-databricks'
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
@@ -124,7 +124,7 @@ jobs:
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
 
       - name: Install Athena ODBC driver
-        if: contains(env.FEATURES, 'odbc') && matrix.cmd = '-c odbc-athena'
+        if: contains(env.FEATURES, 'odbc') && matrix.cmd == '-c odbc-athena'
         run: |
           sudo apt-get install alien -y
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
