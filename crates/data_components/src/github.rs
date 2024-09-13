@@ -219,7 +219,10 @@ impl GithubRestClient {
             size_builder.append_value(node.size.unwrap_or(0));
             sha_builder.append_value(&node.sha);
             mode_builder.append_value(&node.mode);
-            url_builder.append_value(&node.url);
+            match &node.url {
+                Some(url) => url_builder.append_value(url),
+                None => url_builder.append_null(),
+            }
             download_url_builder.append_value(get_download_url(owner, repo, tree_sha, &node.path));
         }
 
@@ -372,5 +375,5 @@ struct GitTreeNode {
     node_type: String,
     sha: String,
     size: Option<i64>,
-    url: String,
+    url: Option<String>,
 }
