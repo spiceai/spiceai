@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
+use crate::status;
 use arrow::datatypes::Schema;
 use cache::QueryResultsCacheProvider;
 use data_components::cdc::ChangesStream;
@@ -269,6 +270,7 @@ pub(crate) enum AccelerationRefreshMode {
 }
 
 pub struct Refresher {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
@@ -279,12 +281,14 @@ pub struct Refresher {
 
 impl Refresher {
     pub(crate) fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         let refresh_task_runner = RefreshTaskRunner::new(
+            Arc::clone(&runtime_status),
             dataset_name.clone(),
             Arc::clone(&federated),
             Arc::clone(&refresh),
@@ -292,6 +296,7 @@ impl Refresher {
         );
 
         Self {
+            runtime_status,
             dataset_name,
             federated,
             refresh,
@@ -429,6 +434,7 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(RefreshTask::new(
+            Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&self.accelerator),
@@ -454,6 +460,7 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(RefreshTask::new(
+            Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&self.accelerator),
@@ -526,6 +533,7 @@ mod tests {
     use super::*;
 
     async fn setup_and_test(
+        status: Arc<status::RuntimeStatus>,
         source_data: Vec<&str>,
         existing_data: Vec<&str>,
         expected_size: usize,
@@ -557,6 +565,7 @@ mod tests {
         let refresh = Refresh::new(RefreshMode::Full);
 
         let mut refresher = Refresher::new(
+            status,
             TableReference::bare("test"),
             federated,
             Arc::new(RwLock::new(refresh)),
@@ -600,13 +609,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_full() {
+        let status = status::RuntimeStatus::new();
         setup_and_test(
+            Arc::clone(&status),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
         )
         .await;
         setup_and_test(
+            Arc::clone(&status),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![
                 "1970-01-01",
@@ -618,6 +630,7 @@ mod tests {
         )
         .await;
         setup_and_test(
+            Arc::clone(&status),
             vec![],
             vec![
                 "1970-01-01",
@@ -678,12 +691,14 @@ mod tests {
             .build();
         global::set_meter_provider(provider);
 
-        status::update_dataset(
+        let status = status::RuntimeStatus::new();
+        status.update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
         setup_and_test(
+            Arc::clone(&status),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
@@ -695,12 +710,12 @@ mod tests {
             status::ComponentStatus::Ready
         ));
 
-        status::update_dataset(
+        status.update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
-        setup_and_test(vec![], vec![], 0).await;
+        setup_and_test(Arc::clone(&status), vec![], vec![], 0).await;
 
         assert!(wait_until_ready_status(
             &registry,
@@ -746,6 +761,7 @@ mod tests {
                 .time_format(TimeFormat::ISO8601);
 
             let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
@@ -896,6 +912,7 @@ mod tests {
             }
 
             let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
@@ -1096,6 +1113,7 @@ mod tests {
             }
 
             let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),

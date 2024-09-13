@@ -20,8 +20,8 @@ description: "Query: select AVG(l_tax), l_linenumber, l_quantity from lineitem g
 |               |             RepartitionExec: partitioning=Hash([l_linenumber@0, l_quantity@1], 4), input_partitions=4                                      |
 |               |               AggregateExec: mode=Partial, gby=[l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity], aggr=[avg(lineitem.l_tax)]    |
 |               |                 BytesProcessedExec                                                                                                         |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                     |
-|               |                     SchemaCastScanExec                                                                                                     |
-|               |                       MemoryExec: partitions=1, partition_sizes=[0]                                                                        |
+|               |                   SchemaCastScanExec                                                                                                       |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                   |
+|               |                       MemoryExec: partitions=1, partition_sizes=[733]                                                                      |
 |               |                                                                                                                                            |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------+
