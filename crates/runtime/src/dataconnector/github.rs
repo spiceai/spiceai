@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
@@ -47,7 +47,8 @@ pub trait GithubTableArgs: Send + Sync {
     ///   1. The GraphQL query string
     ///   2. The JSON pointer to the data in the response
     ///   3. The depth to unnest the data
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth);
+    ///   4. The GraphQL schema of the response data
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth, Option<SchemaRef>);
 }
 
 // TODO: implement PR filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for pullRequests`.
@@ -57,7 +58,7 @@ pub struct PullRequestTableArgs {
 }
 
 impl GithubTableArgs for PullRequestTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth, Option<SchemaRef>) {
         let query = format!(
             r#"
             {{
@@ -104,6 +105,7 @@ impl GithubTableArgs for PullRequestTableArgs {
             query.into(),
             "/data/repository/pullRequests/nodes".into(),
             1,
+            None,
         )
     }
 }
@@ -123,7 +125,7 @@ pub struct CommitTableArgs {
 }
 
 impl GithubTableArgs for CommitTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth, Option<SchemaRef>) {
         let query = format!(
             r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
@@ -164,6 +166,7 @@ impl GithubTableArgs for CommitTableArgs {
             query.into(),
             "/data/repository/defaultBranchRef/target/history/nodes".into(),
             1,
+            None,
         )
     }
 }
@@ -175,7 +178,7 @@ pub struct IssueTableArgs {
 }
 
 impl GithubTableArgs for IssueTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth, Option<SchemaRef>) {
         let query = format!(
             r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
@@ -189,9 +192,8 @@ impl GithubTableArgs for IssueTableArgs {
                             number
                             title
                             url
-                            author: author {{ login }}
+                            author: author {{ author: login }}
                             body
-                            number
                             created_at: createdAt
                             updated_at: updatedAt
                             closed_at: closedAt
@@ -199,7 +201,7 @@ impl GithubTableArgs for IssueTableArgs {
                             milestone_id: milestone {{ milestone_id: id}}
                             milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ author: login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
                     }}
@@ -209,7 +211,70 @@ impl GithubTableArgs for IssueTableArgs {
             name = self.repo
         );
 
-        (query.into(), "/data/repository/issues/nodes".into(), 1)
+        let gql_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("number", DataType::Int64, true),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("url", DataType::Utf8, true),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "closed_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("state", DataType::Utf8, true),
+            Field::new("milestone_id", DataType::Utf8, true),
+            Field::new("milestone_title", DataType::Utf8, true),
+            Field::new(
+                "labels",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(vec![Field::new("name", DataType::Utf8, true)].into()),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new("comments_count", DataType::Int64, true),
+            // Field::new(
+            //     "comments",
+            //     DataType::List(Arc::new(Field::new(
+            //         "item",
+            //         DataType::Struct(vec![
+            //             Field::new("author", DataType::Utf8, true),
+            //             Field::new("body", DataType::Utf8, true),
+            //         ].into()),
+            //         true,
+            //     ))),
+            //     true,
+            // ),
+            Field::new(
+                "assignees",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(vec![Field::new("login", DataType::Utf8, true)].into()),
+                    true,
+                ))),
+                true,
+            ),
+        ]));
+
+        (
+            query.into(),
+            "/data/repository/issues/nodes".into(),
+            1,
+            Some(gql_schema),
+        )
     }
 }
 
@@ -220,7 +285,7 @@ pub struct StargazersTableArgs {
 }
 
 impl GithubTableArgs for StargazersTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
+    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth, Option<SchemaRef>) {
         let query = format!(
             r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
@@ -249,7 +314,12 @@ impl GithubTableArgs for StargazersTableArgs {
             name = self.repo
         );
 
-        (query.into(), "/data/repository/stargazers/edges".into(), 1)
+        (
+            query.into(),
+            "/data/repository/stargazers/edges".into(),
+            1,
+            None,
+        )
     }
 }
 
@@ -266,7 +336,7 @@ impl Github {
 
         let client = default_spice_client("application/json").boxed()?;
 
-        let (query, json_pointer, unnest_depth) = tbl.get_graphql_values();
+        let (query, json_pointer, unnest_depth, schema) = tbl.get_graphql_values();
 
         Ok(GraphQLClient::new(
             client,
@@ -277,6 +347,7 @@ impl Github {
             None,
             None,
             unnest_depth,
+            schema,
         ))
     }
 
