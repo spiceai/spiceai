@@ -178,6 +178,7 @@ pub struct IssueTableArgs {
 }
 
 impl GithubTableArgs for IssueTableArgs {
+    #[allow(clippy::too_many_lines)]
     fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth, Option<SchemaRef>) {
         let query = format!(
             r#"{{
@@ -201,7 +202,8 @@ impl GithubTableArgs for IssueTableArgs {
                             milestone_id: milestone {{ milestone_id: id}}
                             milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ author: login }} }} }}
+                            milestone_title: milestone {{ milestone_title: title }}
+                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
                     }}
@@ -246,18 +248,27 @@ impl GithubTableArgs for IssueTableArgs {
                 true,
             ),
             Field::new("comments_count", DataType::Int64, true),
-            // Field::new(
-            //     "comments",
-            //     DataType::List(Arc::new(Field::new(
-            //         "item",
-            //         DataType::Struct(vec![
-            //             Field::new("author", DataType::Utf8, true),
-            //             Field::new("body", DataType::Utf8, true),
-            //         ].into()),
-            //         true,
-            //     ))),
-            //     true,
-            // ),
+            Field::new(
+                "comments",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new(
+                                "author",
+                                DataType::Struct(
+                                    vec![Field::new("login", DataType::Utf8, true)].into(),
+                                ),
+                                true,
+                            ),
+                            Field::new("body", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ))),
+                true,
+            ),
             Field::new(
                 "assignees",
                 DataType::List(Arc::new(Field::new(
@@ -272,7 +283,8 @@ impl GithubTableArgs for IssueTableArgs {
         (
             query.into(),
             "/data/repository/issues/nodes".into(),
-            1,
+            2,
+            //None,
             Some(gql_schema),
         )
     }
