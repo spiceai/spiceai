@@ -20,6 +20,7 @@ on:
         default: ''
         type: choice
         options:
+          - ''
           - 'spice.ai connector'
           - 's3 connector'
           - 'spark connector'
