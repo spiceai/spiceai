@@ -5,14 +5,9 @@ on:
   schedule:
     - cron: '0 10 * * 3,0'
   workflow_dispatch:
-    inputs:
-      features:
-        description: 'included features for bench'
-        required: true
-        default: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 env:
-  FEATURES: ${{ github.event_name == 'schedule' && 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite' || inputs.features }}
+  FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 jobs:
   build-database-bench-binary:
@@ -27,7 +22,6 @@ jobs:
           os: 'linux'
 
       - name: Install Protoc
-        if: contains(env.FEATURES, 'spark')
         uses: arduino/setup-protoc@v3
 
       - name: Build benchmark binary
@@ -49,7 +43,7 @@ jobs:
 
     services:
       mysql:
-        image: ${{ matrix.cmd == '-c mysql' && ((contains(inputs.features, 'mysql') || github.event_name == 'schedule')) && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
+        image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
           --health-cmd="mysqladmin ping -uroot -proot --silent"
           --health-interval 10s
@@ -60,7 +54,7 @@ jobs:
         env:
           MYSQL_ROOT_PASSWORD: root
       postgres:
-        image: ${{ matrix.cmd == '-c postgres' && ((contains(inputs.features, 'postgres') || github.event_name == 'schedule')) && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
+        image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="pg_isready -U postgres"
@@ -116,7 +110,7 @@ jobs:
           name: spice_bench
 
       - name: Install Databricks ODBC driver
-        if: contains(env.FEATURES, 'odbc') && matrix.cmd == '-c odbc-databricks'
+        if: matrix.cmd == '-c odbc-databricks'
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
@@ -124,7 +118,7 @@ jobs:
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
 
       - name: Install Athena ODBC driver
-        if: contains(env.FEATURES, 'odbc') && matrix.cmd == '-c odbc-athena'
+        if: matrix.cmd == '-c odbc-athena'
         run: |
           sudo apt-get install alien -y
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
