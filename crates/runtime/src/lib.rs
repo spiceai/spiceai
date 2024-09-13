@@ -34,6 +34,7 @@ use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
+use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -653,11 +654,14 @@ impl Runtime {
                     }
                 };
 
-                // If we already have an existing file, it means there is data from a previous acceleration and we don't need
+                // If we already have an existing dataset checkpoint table that has been checkpointed,
+                // it means there is data from a previous acceleration and we don't need
                 // to wait for the first refresh to complete to mark it ready.
-                if accelerator.has_existing_file(ds) {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Ready);
+                if let Ok(checkpoint) = DatasetCheckpoint::try_new(ds).await {
+                    if checkpoint.exists().await {
+                        self.status
+                            .update_dataset(&ds.name, status::ComponentStatus::Ready);
+                    }
                 }
 
                 match accelerator

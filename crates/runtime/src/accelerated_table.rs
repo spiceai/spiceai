@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::status;
 use arrow::array::UInt64Array;
@@ -177,6 +178,7 @@ pub struct Builder {
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
+    checkpointer: Option<DatasetCheckpoint>,
 }
 
 impl Builder {
@@ -198,6 +200,7 @@ impl Builder {
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
+            checkpointer: None,
             disable_query_push_down: false,
         }
     }
@@ -244,6 +247,18 @@ impl Builder {
     pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
         assert!(self.refresh.mode == RefreshMode::Append);
         self.append_stream = Some(append_stream);
+        self
+    }
+
+    /// Set the checkpointer for the accelerated table
+    pub fn checkpointer(&mut self, checkpointer: DatasetCheckpoint) -> &mut Self {
+        self.checkpointer = Some(checkpointer);
+        self
+    }
+
+    /// Set the checkpointer for the accelerated table
+    pub fn checkpointer_opt(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
+        self.checkpointer = checkpointer;
         self
     }
 
@@ -305,6 +320,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
+        refresher.checkpointer(self.checkpointer);
 
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
