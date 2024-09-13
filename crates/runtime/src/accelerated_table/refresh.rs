@@ -80,6 +80,8 @@ pub struct RefreshOverrides {
 
     #[serde(rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
+
+    pub max_jitter: Option<Duration>,
 }
 
 impl Refresh {
@@ -148,6 +150,9 @@ impl Refresh {
         }
         if let Some(mode) = overrides.mode {
             self.mode = mode;
+        }
+        if let Some(max_jitter) = overrides.max_jitter {
+            self.max_jitter = Some(max_jitter);
         }
         self
     }
@@ -394,6 +399,14 @@ impl Refresher {
                     },
                     Some(overrides_opt) = on_start_refresh_external.recv() => {
                         tracing::debug!("Received external trigger to start refresh");
+
+                        // Apply jitter on manual refreshes. For periodic refreshes, jitter
+                        // is added to the timer, `next_scheduled_refresh_timer`.
+                        let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
+
+                        if let Some(max_jitter) = override_jitter.or(max_jitter) {
+                            sleep(Self::compute_delay(Duration::from_secs(0), Some(max_jitter))).await;
+                        }
 
                         if let Err(err) = start_refresh.send(overrides_opt).await {
                             tracing::error!("Failed to execute refresh: {err}");
