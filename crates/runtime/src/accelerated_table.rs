@@ -250,13 +250,13 @@ impl Builder {
         self
     }
 
-    /// Set the metadata provider for the accelerated table
+    /// Set the checkpointer for the accelerated table
     pub fn checkpointer(&mut self, checkpointer: DatasetCheckpoint) -> &mut Self {
         self.checkpointer = Some(checkpointer);
         self
     }
 
-    /// Set the metadata provider for the accelerated table
+    /// Set the checkpointer for the accelerated table
     pub fn checkpointer_opt(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
         self.checkpointer = checkpointer;
         self
