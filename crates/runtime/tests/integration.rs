@@ -47,6 +47,10 @@ mod s3;
 mod sqlite;
 mod tls;
 
+// MySQL is required for the rehydration tests
+#[cfg(feature = "mysql")]
+mod rehydration;
+
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
