@@ -28,6 +28,8 @@ limitations under the License.
 use std::panic;
 use std::sync::Arc;
 
+#[cfg(feature = "postgres")]
+use crate::bench_postgres::get_postgres_params;
 use crate::results::Status;
 use arrow::array::RecordBatch;
 use clap::Parser;
@@ -37,6 +39,7 @@ use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context:
 use results::BenchmarkResultsBuilder;
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode};
+use spicepod::component::params::Params;
 
 mod results;
 mod setup;
@@ -111,15 +114,17 @@ async fn main() -> Result<(), String> {
                 run_connector_bench(connector, &upload_results_dataset).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
-                create_acceleration("arrow", acceleration::Mode::Memory),
+                create_acceleration("arrow", acceleration::Mode::Memory, None),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory),
+                create_acceleration("duckdb", acceleration::Mode::Memory, None),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File),
+                create_acceleration("duckdb", acceleration::Mode::File, None),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory),
+                create_acceleration("sqlite", acceleration::Mode::Memory, None),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File),
+                create_acceleration("sqlite", acceleration::Mode::File, None),
+                #[cfg(feature = "postgres")]
+                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
             ];
             for accelerator in accelerators {
                 run_accelerator_bench(accelerator, &upload_results_dataset).await?;
@@ -136,7 +141,19 @@ async fn main() -> Result<(), String> {
                 Some("memory") | None => Mode::Memory,
                 _ => return Err(format!("Invalid mode parameter for {accelerator} accelerator")),
             };
-            let acceleration = create_acceleration(accelerator, mode);
+
+            let params: Option<Params> = {
+                #[cfg(feature = "postgres")]
+                {
+                    Some(get_postgres_params(true))
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    None
+                }
+            };
+
+            let acceleration = create_acceleration(accelerator, mode, params);
             run_accelerator_bench(acceleration, &upload_results_dataset).await?;
         },
         _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
@@ -229,10 +246,15 @@ async fn run_accelerator_bench(
     Ok(())
 }
 
-fn create_acceleration(engine: &str, mode: acceleration::Mode) -> Acceleration {
+fn create_acceleration(
+    engine: &str,
+    mode: acceleration::Mode,
+    params: Option<Params>,
+) -> Acceleration {
     Acceleration {
         engine: Some(engine.to_string()),
         mode,
+        params,
         ..Default::default()
     }
 }

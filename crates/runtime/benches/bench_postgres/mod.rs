@@ -52,11 +52,15 @@ pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
         .with_dataset(make_dataset("supplier", "supplier"))
 }
 
-fn get_postgres_params() -> Params {
+pub(crate) fn get_postgres_params(is_acc: bool) -> Params {
     let pg_host = std::env::var("PG_BENCHMARK_PG_HOST").unwrap_or_default();
     let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap_or_default();
     let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap_or_default();
-    let pg_db = std::env::var("PG_BENCHMARK_PG_DBNAME").unwrap_or_default();
+    let pg_db = if is_acc {
+        std::env::var("PG_BENCHMARK_PG_DBNAME").unwrap_or_default()
+    } else {
+        std::env::var("PG_BENCHMARK_ACC_PG_DBNAME").unwrap_or_default()
+    };
     let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap_or_default();
     Params::from_string_map(
         vec![
@@ -73,7 +77,7 @@ fn get_postgres_params() -> Params {
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("postgres:{path}"), name.to_string());
-    dataset.params = Some(get_postgres_params());
+    dataset.params = Some(get_postgres_params(false));
     dataset
 }
 
