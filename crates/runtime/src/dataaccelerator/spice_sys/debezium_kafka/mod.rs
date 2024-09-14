@@ -27,10 +27,12 @@ limitations under the License.
 use super::{acceleration_connection, AccelerationConnection, Result};
 use crate::{component::dataset::Dataset, dataconnector::debezium::DebeziumKafkaMetadata};
 use data_components::debezium::change_event;
-use datafusion_table_providers::sql::db_connection_pool::{
-    duckdbpool::DuckDbConnectionPool, postgrespool::PostgresConnectionPool,
-};
+#[cfg(feature = "duckdb")]
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+#[cfg(feature = "postgres")]
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use std::sync::Arc;
+#[cfg(feature = "sqlite")]
 use tokio_rusqlite::Connection;
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
@@ -57,20 +59,29 @@ impl DebeziumKafkaSys {
 
     pub(crate) async fn get(&self) -> Option<DebeziumKafkaMetadata> {
         match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
+            _ => unreachable!(),
         }
     }
 
     pub(crate) async fn upsert(&self, metadata: &DebeziumKafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
+            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
+            _ => unreachable!(),
         }
     }
 
+    #[cfg(feature = "duckdb")]
     fn upsert_duckdb(
         &self,
         pool: &Arc<DuckDbConnectionPool>,
@@ -128,6 +139,7 @@ impl DebeziumKafkaSys {
         Ok(())
     }
 
+    #[cfg(feature = "postgres")]
     async fn upsert_postgres(
         &self,
         pool: &PostgresConnectionPool,
@@ -185,6 +197,7 @@ impl DebeziumKafkaSys {
         Ok(())
     }
 
+    #[cfg(feature = "sqlite")]
     async fn upsert_sqlite(
         &self,
         conn: &Connection,
@@ -241,6 +254,7 @@ impl DebeziumKafkaSys {
         .map_err(|e| e.to_string().into())
     }
 
+    #[cfg(feature = "duckdb")]
     fn get_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Option<DebeziumKafkaMetadata> {
         let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -274,6 +288,7 @@ impl DebeziumKafkaSys {
         }
     }
 
+    #[cfg(feature = "postgres")]
     async fn get_postgres(&self, pool: &PostgresConnectionPool) -> Option<DebeziumKafkaMetadata> {
         let conn = pool.connect_direct().await.ok()?;
         let query = format!(
@@ -302,6 +317,7 @@ impl DebeziumKafkaSys {
         })
     }
 
+    #[cfg(feature = "sqlite")]
     async fn get_sqlite(&self, conn: &Connection) -> Option<DebeziumKafkaMetadata> {
         let dataset_name = self.dataset_name.clone();
         conn.call(move |conn| {
