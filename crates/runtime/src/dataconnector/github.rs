@@ -284,7 +284,6 @@ impl GithubTableArgs for IssueTableArgs {
             query.into(),
             "/data/repository/issues/nodes".into(),
             2,
-            //None,
             Some(gql_schema),
         )
     }
