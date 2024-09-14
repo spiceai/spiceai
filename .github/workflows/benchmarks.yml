@@ -96,7 +96,7 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
       postgres_acc:
-        image: ${{ matrix.cmd == '-a postgres' && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        image: ${{ matrix.cmd == '-a postgres' && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm -c shared_buffers=1GB -c work_mem=256MB -c max_wal_size=6GB' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="pg_isready -U postgres"
