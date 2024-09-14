@@ -43,9 +43,9 @@ use tracing::instrument;
 /// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
 /// and checking data consistency.
 ///
-/// 1. Retrieve num of rows using a native MySQL connection to use as a baseline
-/// 2. Start Spice, retrieve row count and top 100 items after acceleration is completed, compare with baseline
-/// 3. Restart runtime, ensure the row count and top 100 items remain consistent
+/// 1. Retrieve the number of rows using a native MySQL connection to use as a baseline.
+/// 2. Start Spice, retrieve row count and loaded items after acceleration is completed, and compare with the baseline.
+/// 3. Restart the runtime and ensure the loaded items remain consistent immediately after the runtime is loaded.
 ///
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
