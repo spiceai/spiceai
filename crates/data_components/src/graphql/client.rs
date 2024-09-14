@@ -425,6 +425,7 @@ pub struct GraphQLClient {
     unnest_parameters: UnnestParameters,
     pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
+    schema: Option<SchemaRef>,
 }
 
 impl GraphQLClient {
@@ -439,6 +440,7 @@ impl GraphQLClient {
         user: Option<String>,
         pass: Option<String>,
         unnest_depth: usize,
+        schema: Option<SchemaRef>,
     ) -> Self {
         let pagination_parameters = PaginationParameters::parse(&query);
         tracing::debug!(
@@ -465,6 +467,7 @@ impl GraphQLClient {
             unnest_parameters,
             pagination_parameters,
             auth,
+            schema,
         }
     }
 
@@ -520,10 +523,7 @@ impl GraphQLClient {
             unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped)?;
         }
 
-        let schema = schema.unwrap_or(Arc::new(
-            infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
-                .context(ArrowInternalSnafu)?,
-        ));
+        let schema = get_json_schema(&self.schema, &schema, &unwrapped)?;
 
         let mut res = vec![];
         for v in unwrapped {
@@ -565,6 +565,25 @@ impl GraphQLClient {
 
         Ok(res)
     }
+}
+
+fn get_json_schema(
+    client_schema: &Option<SchemaRef>,
+    schema_override: &Option<SchemaRef>,
+    json_iter: &[Value],
+) -> Result<SchemaRef> {
+    if let Some(schema) = schema_override {
+        return Ok(Arc::clone(schema));
+    }
+
+    if let Some(schema) = client_schema {
+        return Ok(Arc::clone(schema));
+    }
+
+    let schema = infer_json_schema_from_iterator(json_iter.iter().map(Result::Ok))
+        .context(ArrowInternalSnafu)?;
+
+    Ok(Arc::new(schema))
 }
 
 fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> RequestBuilder {
