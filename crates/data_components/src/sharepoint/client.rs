@@ -618,7 +618,10 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
 ///    "name2": "id2",
 /// })
 /// ```
-fn process_list_objs(resp: &serde_json::Value, name_key: &str) -> Result<HashMap<String, String>, GraphFailure> {
+fn process_list_objs(
+    resp: &serde_json::Value,
+    name_key: &str,
+) -> Result<HashMap<String, String>, GraphFailure> {
     if let Some(serde_json::Value::Array(objs)) = resp.get("value") {
         let output = objs
             .iter()
