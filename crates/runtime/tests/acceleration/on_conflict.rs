@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::{get_test_datafusion, init_tracing, postgres::common, runtime_ready_check};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
@@ -11,6 +27,8 @@ use spicepod::component::{
     params::Params,
 };
 use std::{collections::HashMap, sync::Arc};
+
+use super::get_params;
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
@@ -352,18 +370,6 @@ fn get_pg_params(port: usize) -> Params {
         .into_iter()
         .collect(),
     )
-}
-
-fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = format!("{engine}_file",);
-    if mode == &Mode::File {
-        return Some(Params::from_string_map(
-            vec![(param_name, file.unwrap_or_default())]
-                .into_iter()
-                .collect(),
-        ));
-    }
-    None
 }
 
 fn random_db_name() -> String {

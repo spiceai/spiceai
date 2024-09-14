@@ -86,7 +86,7 @@ jobs:
         image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -119,11 +119,11 @@ jobs:
           - cmd: '-a duckdb -m memory'
             name: 'duckdb accelerator (memory mode)'
           - cmd: '-a duckdb -m file'
-            name: 'duckdb accelerator (memfileory mode)'
+            name: 'duckdb accelerator (file mode)'
           - cmd: '-a sqlite -m memory'
             name: 'sqlite accelerator (memory mode)'
           - cmd: '-a sqlite -m file'
-            name: 'sqlite accelerator (memory mode)'
+            name: 'sqlite accelerator (file mode)'
 
     steps:
       - name: Checkout repository
