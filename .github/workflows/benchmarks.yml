@@ -82,7 +82,7 @@ jobs:
           - 3306:3306
         env:
           MYSQL_ROOT_PASSWORD: root
-      postgres:
+      postgres_conn:
         image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
@@ -90,6 +90,21 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+      postgres_acc:
+        image: ${{ matrix.cmd == '-a postgres' && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          -c shared_buffers=1GB
+          -c work_mem=256MB
+          -c max_wal_size=6GB
         ports:
           - 5432:5432
         env:
@@ -124,6 +139,8 @@ jobs:
             name: 'sqlite accelerator (memory mode)'
           - cmd: '-a sqlite -m file'
             name: 'sqlite accelerator (memory mode)'
+          - cmd: '-a postgres'
+            name: 'postgres accelerator'
 
     steps:
       - name: Checkout repository
@@ -171,6 +188,7 @@ jobs:
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
           PG_BENCHMARK_PG_DBNAME: tpch_sf1
+          PG_BENCHMARK_ACC_PG_DBNAME: postgres
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root
