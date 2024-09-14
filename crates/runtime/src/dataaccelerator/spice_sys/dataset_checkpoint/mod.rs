@@ -22,9 +22,12 @@ limitations under the License.
 
 use super::{acceleration_connection, AccelerationConnection, Result};
 use crate::component::dataset::Dataset;
+#[cfg(feature = "duckdb")]
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+#[cfg(feature = "postgres")]
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use std::sync::Arc;
+#[cfg(feature = "sqlite")]
 use tokio_rusqlite::Connection;
 
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
@@ -49,26 +52,37 @@ impl DatasetCheckpoint {
         })
     }
 
+    #[allow(unreachable_patterns)]
     pub async fn exists(&self) -> bool {
         match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
+            #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => {
                 self.exists_postgres(pool).await.ok().unwrap_or(false)
             }
+            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => {
                 self.exists_sqlite(conn).await.ok().unwrap_or(false)
             }
+            _ => unreachable!(),
         }
     }
 
+    #[allow(unreachable_patterns)]
     pub async fn checkpoint(&self) -> Result<()> {
         match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool),
+            #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn).await,
+            _ => unreachable!(),
         }
     }
 
+    #[cfg(feature = "duckdb")]
     fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -84,6 +98,7 @@ impl DatasetCheckpoint {
         Ok(rows.next().map_err(|e| e.to_string())?.is_some())
     }
 
+    #[cfg(feature = "postgres")]
     async fn exists_postgres(&self, pool: &PostgresConnectionPool) -> Result<bool> {
         let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
         let query =
@@ -97,6 +112,7 @@ impl DatasetCheckpoint {
         Ok(row.is_some())
     }
 
+    #[cfg(feature = "sqlite")]
     async fn exists_sqlite(&self, conn: &Connection) -> Result<bool> {
         let dataset_name = self.dataset_name.clone();
         conn.call(move |conn| {
@@ -110,6 +126,7 @@ impl DatasetCheckpoint {
         .map_err(|e| e.to_string().into())
     }
 
+    #[cfg(feature = "duckdb")]
     fn checkpoint_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -139,6 +156,7 @@ impl DatasetCheckpoint {
         Ok(())
     }
 
+    #[cfg(feature = "postgres")]
     async fn checkpoint_postgres(&self, pool: &PostgresConnectionPool) -> Result<()> {
         let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
 
@@ -167,6 +185,7 @@ impl DatasetCheckpoint {
         Ok(())
     }
 
+    #[cfg(feature = "sqlite")]
     async fn checkpoint_sqlite(&self, conn: &Connection) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
         conn.call(move |conn| {
@@ -198,6 +217,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(feature = "duckdb")]
     fn create_in_memory_duckdb_checkpoint() -> DatasetCheckpoint {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
@@ -208,6 +228,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
         let conn = Connection::open_in_memory()
             .await
@@ -219,6 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "duckdb")]
     async fn test_duckdb_checkpoint_exists() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 
@@ -236,6 +258,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "duckdb")]
     async fn test_duckdb_checkpoint_update() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 
@@ -297,6 +320,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn test_sqlite_checkpoint_exists() {
         let checkpoint = create_in_memory_sqlite_checkpoint().await;
 
@@ -314,6 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn test_sqlite_checkpoint_update() {
         let checkpoint = create_in_memory_sqlite_checkpoint().await;
 
