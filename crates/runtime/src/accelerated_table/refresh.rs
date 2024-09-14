@@ -83,7 +83,7 @@ pub struct RefreshOverrides {
     #[serde(rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
 
-    #[serde(rename="refresh_jitter_max", deserialize_with = "parse_max_jitter")]
+    #[serde(rename = "refresh_jitter_max", deserialize_with = "parse_max_jitter")]
     pub max_jitter: Option<Duration>,
 }
 
@@ -93,7 +93,9 @@ where
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
-        Some(s) => fundu::parse_duration(&s).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => fundu::parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
