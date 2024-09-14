@@ -18,26 +18,34 @@ limitations under the License.
 
 use std::{path::Path, sync::Arc};
 
-use datafusion_table_providers::{
-    sql::db_connection_pool::{
-        duckdbpool::DuckDbConnectionPool, postgrespool::PostgresConnectionPool,
-    },
-    util::secrets::to_secret_map,
+#[cfg(feature = "postgres")]
+use {
+    datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool,
+    datafusion_table_providers::util::secrets::to_secret_map,
 };
-use duckdb::AccessMode;
-use tokio_rusqlite::Connection;
 
+#[cfg(feature = "duckdb")]
+use {
+    super::duckdb::DuckDBAccelerator,
+    datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
+    duckdb::AccessMode,
+};
+#[cfg(feature = "sqlite")]
+use {super::sqlite::SqliteAccelerator, tokio_rusqlite::Connection};
+
+use super::get_accelerator_engine;
 use crate::component::dataset::{acceleration::Engine, Dataset};
-
-use super::{duckdb::DuckDBAccelerator, get_accelerator_engine, sqlite::SqliteAccelerator};
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
 pub mod debezium_kafka;
 
 enum AccelerationConnection {
+    #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
+    #[cfg(feature = "postgres")]
     Postgres(PostgresConnectionPool),
+    #[cfg(feature = "sqlite")]
     SQLite(Connection),
 }
 
