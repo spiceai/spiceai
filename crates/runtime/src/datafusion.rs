@@ -22,6 +22,7 @@ use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -754,6 +755,8 @@ impl DataFusion {
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
+
+        accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
         if acceleration_settings.disable_query_push_down {
             accelerated_table_builder.disable_query_push_down();

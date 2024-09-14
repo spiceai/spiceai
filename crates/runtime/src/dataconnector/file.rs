@@ -16,10 +16,10 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use snafu::prelude::*;
-use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{any::Any, env};
 use url::Url;
 
 use super::{
@@ -94,10 +94,38 @@ impl ListingTableConnector for File {
         &self.params
     }
 
+    /// Creates a valid file [`url::Url`], from the dataset, supporting both
+    ///   1. Relative paths
+    ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
         let clean_from = dataset.from.replace("file://", "file:/");
 
-        Url::parse(&clean_from)
+        let Some(path) = clean_from.strip_prefix("file:") else {
+            // Should be unreachable
+            return Err(super::DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "File".to_string(),
+                message: "'dataset.from' must start with 'file:'".to_string(),
+            });
+        };
+
+        // Convert relative path to absolute path
+        let url_str = if path.starts_with('/') {
+            format!("file:{path}")
+        } else {
+            let absolute_path = env::current_dir()
+                .boxed()
+                .context(InvalidConfigurationSnafu {
+                    dataconnector: "File".to_string(),
+                    message: "could not determine directory for relative file".to_string(),
+                })?
+                .join(path)
+                .to_string_lossy()
+                .to_string();
+
+            format!("file:{absolute_path}")
+        };
+
+        Url::parse(&url_str)
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "File".to_string(),

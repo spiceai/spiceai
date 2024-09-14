@@ -54,7 +54,7 @@ pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
-pub mod metadata;
+pub mod spice_sys;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -174,6 +174,7 @@ impl GraphQL {
             user,
             pass,
             unnest_depth,
+            None,
         ))
     }
 }
