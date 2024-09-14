@@ -64,6 +64,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => {
                 self.exists_sqlite(conn).await.ok().unwrap_or(false)
             }
+            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            _ => false,
         }
     }
 
@@ -75,6 +77,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn).await,
+            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            _ => Err("No acceleration connection available".into()),
         }
     }
 }
