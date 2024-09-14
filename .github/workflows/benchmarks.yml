@@ -34,6 +34,7 @@ on:
           - 'duckdb accelerator (file mode)'
           - 'sqlite accelerator (memory mode)'
           - 'sqlite accelerator (file mode)'
+          - 'postgres accelerator'
 
 env:
   FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
