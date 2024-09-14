@@ -57,6 +57,7 @@ impl DebeziumKafkaSys {
         })
     }
 
+    #[allow(unreachable_patterns)]
     pub(crate) async fn get(&self) -> Option<DebeziumKafkaMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -69,6 +70,7 @@ impl DebeziumKafkaSys {
         }
     }
 
+    #[allow(unreachable_patterns)]
     pub(crate) async fn upsert(&self, metadata: &DebeziumKafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
