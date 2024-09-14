@@ -28,7 +28,6 @@ use cache::QueryResultsCacheProvider;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use fundu::DurationParser;
 use futures::future::BoxFuture;
 use opentelemetry::Key;
 use rand::Rng;
