@@ -45,7 +45,10 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
         .iter()
         .filter_map(|cert| {
             let mut buf = cert.as_ref();
-            rustls_pemfile::certs(&mut buf).ok()?.pop()
+            rustls_pemfile::certs(&mut buf)
+                .filter_map(Result::ok)
+                .last()
+                .map(|cert| cert.to_vec())
         })
         .map(String::from_utf8)
         .collect::<Result<String, _>>()
