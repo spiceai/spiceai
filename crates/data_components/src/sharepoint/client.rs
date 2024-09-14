@@ -472,7 +472,7 @@ impl SharepointListExec {
             DrivePtr::UserId(user_id) => DriveApi::Default(graph.user(user_id).drive()),
             DrivePtr::SiteId(site_id) => DriveApi::Default(graph.site(site_id).drive()),
             DrivePtr::Me => DriveApi::Default(graph.me().drive()),
-            DrivePtr::GroupId(_group_id) => unimplemented!("group id not supported"), // self.client.group(group_id).get_drive().url(),
+            DrivePtr::GroupId(group_id) => DriveApi::Default(graph.group(group_id).drive()),
         }
     }
 }
@@ -572,7 +572,7 @@ async fn get_drive_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Stri
         .json::<serde_json::Value>()
         .await?;
 
-    process_list_objs(&resp)
+    process_list_objs(&resp, "name")
 }
 
 /// Returns a mapping of group ids to group names.
@@ -585,7 +585,7 @@ async fn get_group_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Stri
         .json::<serde_json::Value>()
         .await?;
 
-    process_list_objs(&resp)
+    process_list_objs(&resp, "displayName")
 }
 
 /// Returns a mapping of drive ids to drive names.
@@ -597,8 +597,7 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
         .await?
         .json::<serde_json::Value>()
         .await?;
-
-    process_list_objs(&resp)
+    process_list_objs(&resp, "name")
 }
 
 /// Processes a list of objects returned by Microsoft Graph into a mapping of names to ids.
@@ -619,12 +618,15 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
 ///    "name2": "id2",
 /// })
 /// ```
-fn process_list_objs(resp: &serde_json::Value) -> Result<HashMap<String, String>, GraphFailure> {
+fn process_list_objs(
+    resp: &serde_json::Value,
+    name_key: &str,
+) -> Result<HashMap<String, String>, GraphFailure> {
     if let Some(serde_json::Value::Array(objs)) = resp.get("value") {
         let output = objs
             .iter()
             .filter_map(|v| {
-                let name = v.get("name").and_then(|n| n.as_str());
+                let name = v.get(name_key).and_then(|n| n.as_str());
                 let id = v.get("id").and_then(|n| n.as_str());
                 if let (Some(name), Some(id)) = (name, id) {
                     Some((name.to_string(), id.to_string()))
@@ -645,7 +647,7 @@ fn process_list_objs(resp: &serde_json::Value) -> Result<HashMap<String, String>
         );
         Err(GraphFailure::error_kind(
             std::io::ErrorKind::InvalidData,
-            "Unexpected response from 'list operation in Microsoft Graph'",
+            "Unexpected response from list operation in Microsoft Graph",
         ))
     }
 }
