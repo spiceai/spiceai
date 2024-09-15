@@ -18,7 +18,7 @@ use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
-// TODO: implement filters from https://docs.github.com/en/graphql/reference/objects#commit `Arguments for history`.
+// https://docs.github.com/en/graphql/reference/objects#commit
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
@@ -66,7 +66,26 @@ impl GitHubTableArgs for CommitsTableArgs {
             query.into(),
             "/data/repository/defaultBranchRef/target/history/nodes".into(),
             1,
-            None,
+            Some(gql_schema()),
         )
     }
+}
+
+fn gql_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("sha", DataType::Utf8, true),
+        Field::new("id", DataType::Utf8, true),
+        Field::new("author_name", DataType::Utf8, true),
+        Field::new("author_email", DataType::Utf8, true),
+        Field::new(
+            "committed_date",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("message", DataType::Utf8, true),
+        Field::new("message_body", DataType::Utf8, true),
+        Field::new("message_head_line", DataType::Utf8, true),
+        Field::new("additions", DataType::Int64, true),
+        Field::new("deletions", DataType::Int64, true),
+    ]))
 }

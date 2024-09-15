@@ -18,7 +18,7 @@ use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
-// TODO: implement PR filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for issues`
+// https://docs.github.com/en/graphql/reference/objects#repository
 pub struct IssuesTableArgs {
     pub owner: String,
     pub repo: String,
