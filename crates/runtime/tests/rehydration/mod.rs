@@ -96,7 +96,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
 /// 4. Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
 ///
 async fn execute_spill_to_disk_and_rehydration(
-    _federated_dataset_container: Arc<RunningContainer<'static>>,
+    federated_dataset_container: Arc<RunningContainer<'static>>,
     engine: &str,
     db_file_path: Option<&str>,
 ) -> Result<(), anyhow::Error> {
@@ -110,17 +110,17 @@ async fn execute_spill_to_disk_and_rehydration(
         .await?;
     let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
 
-    let accelrated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
+    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
     tracing::debug!(
         "Expected accelerated database location: {}",
-        &accelrated_db_file_path
+        &accelerated_db_file_path
     );
 
     // clean up: delete local database file if exists before running the test
     for file_path in [
-        accelrated_db_file_path.clone(),
-        format!("{accelrated_db_file_path}-wal"),
-        format!("{accelrated_db_file_path}-shm"),
+        accelerated_db_file_path.clone(),
+        format!("{accelerated_db_file_path}-wal"),
+        format!("{accelerated_db_file_path}-shm"),
     ] {
         if std::fs::metadata(&file_path).is_ok() {
             std::fs::remove_file(&file_path).context("should remove local database")?;
@@ -130,9 +130,9 @@ async fn execute_spill_to_disk_and_rehydration(
     let rt = init_spice_app(engine, db_file_path).await?;
     runtime_ready_check(&rt).await;
 
-    if std::fs::metadata(&accelrated_db_file_path).is_err() {
+    if std::fs::metadata(&accelerated_db_file_path).is_err() {
         return Err(anyhow::anyhow!(
-            "Accelerated database file not found at path: {accelrated_db_file_path}"
+            "Accelerated database file not found at path: {accelerated_db_file_path}"
         ));
     }
 
@@ -152,7 +152,7 @@ async fn execute_spill_to_disk_and_rehydration(
 
     // Restart the runtime and ensure the loaded items remain consistent
     let rt = init_spice_app(engine, db_file_path).await?;
-    // Do request immediatly after restart w/o waiting for ready status (dataset is refreshed)
+    // Do request immediately after restart w/o waiting for ready status (dataset is refreshed)
     let restart1_items = run_query(test_query, &rt).await?;
     assert_eq!(original_items, restart1_items);
 
@@ -160,8 +160,7 @@ async fn execute_spill_to_disk_and_rehydration(
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
     let rt = init_spice_app(engine, db_file_path).await?;
-    // TODO: temporary disabled due to issue: https://github.com/datafusion-contrib/datafusion-table-providers/pull/98
-    //federated_dataset_container.stop().await?;
+    federated_dataset_container.stop().await?;
     let restart2_items = run_query(test_query, &rt).await?;
     assert_eq!(original_items, restart2_items);
 
