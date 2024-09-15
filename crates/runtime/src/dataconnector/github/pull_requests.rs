@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
 pub struct PullRequestTableArgs {
@@ -91,10 +91,18 @@ fn gql_schema() -> SchemaRef {
         ),
         Field::new("body", DataType::Utf8, true),
         Field::new("changed_files", DataType::Int64, true),
-        Field::new("closed_at", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), true),
+        Field::new(
+            "closed_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
         Field::new("comments_count", DataType::Int64, true),
         Field::new("commits_count", DataType::Int64, true),
-        Field::new("created_at", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), true),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
         Field::new("deletions", DataType::Int64, true),
         Field::new(
             "hashes",
@@ -116,12 +124,20 @@ fn gql_schema() -> SchemaRef {
             true,
         ),
         Field::new("login", DataType::Utf8, true),
-        Field::new("merged_at", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), true),
+        Field::new(
+            "merged_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
         Field::new("number", DataType::Int64, true),
         Field::new("reviews_count", DataType::Int64, true),
         Field::new("state", DataType::Utf8, true),
         Field::new("title", DataType::Utf8, true),
-        Field::new("updated_at", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), true),
+        Field::new(
+            "updated_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
         Field::new("url", DataType::Utf8, true),
     ]))
 }

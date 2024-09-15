@@ -37,8 +37,8 @@ use super::{
     ParameterSpec, Parameters,
 };
 
-mod issues;
 mod commits;
+mod issues;
 mod pull_requests;
 mod stargazers;
 
@@ -62,6 +62,7 @@ pub struct GitHubTableGraphQLParams {
 }
 
 impl GitHubTableGraphQLParams {
+    #[must_use]
     pub fn new(
         query: GraphQLQuery,
         json_pointer: JSONPointer,

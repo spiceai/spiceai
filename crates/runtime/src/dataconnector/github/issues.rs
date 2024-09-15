@@ -69,7 +69,7 @@ impl GitHubTableArgs for IssuesTableArgs {
 }
 
 fn gql_schema() -> SchemaRef {
-    let gql_schema = Arc::new(Schema::new(vec![
+    Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, true),
         Field::new("number", DataType::Int64, true),
         Field::new("title", DataType::Utf8, true),
@@ -134,7 +134,5 @@ fn gql_schema() -> SchemaRef {
             ))),
             true,
         ),
-    ]));
-
-    gql_schema
+    ]))
 }

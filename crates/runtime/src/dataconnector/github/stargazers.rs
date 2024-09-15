@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
 pub struct StargazersTableArgs {
