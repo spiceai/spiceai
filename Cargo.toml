@@ -61,7 +61,7 @@ datafusion-execution = "41"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 datafusion-functions-json = "0.41"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "01bef67c63b91365e86a1c0895cb151cf1df77c1" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "80af165dcb8c5b51c0ed24e5231d9bf6607bca8c" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.1"
@@ -114,10 +114,10 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "6a81dc4fade862ec6b8467b0ba1aa7c73d1d57b0" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "89730a72945ca65371eddd54be9324af0cb9a102" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "89730a72945ca65371eddd54be9324af0cb9a102" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "89730a72945ca65371eddd54be9324af0cb9a102" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "89730a72945ca65371eddd54be9324af0cb9a102" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f2ca47d094a5636df8b9f3792b2f474a7b210dc1" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
