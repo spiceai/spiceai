@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::init_tracing;
 
+use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
@@ -38,15 +39,11 @@ use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode},
     Dataset,
 };
+
+use spicepod::component::params::Params as SpicepodParams;
+
 use tracing::instrument;
 
-/// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
-/// and checking data consistency.
-///
-/// 1. Retrieve the number of rows using a native MySQL connection to use as a baseline.
-/// 2. Start Spice, retrieve row count and loaded items after acceleration is completed, and compare with the baseline.
-/// 3. Restart the runtime and ensure the loaded items remain consistent immediately after the runtime is loaded.
-///
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let running_container = prepare_test_environment()
@@ -54,26 +51,95 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!(e))?;
     let running_container = Arc::new(running_container);
 
+    let config = vec![
+        // #[cfg(feature = "duckdb")]
+        // ("duckdb", None),
+        // #[cfg(feature = "duckdb")]
+        // ("duckdb", Some("./.spice/my_duckdb.db")),
+        #[cfg(feature = "sqlite")]
+        ("sqlite", None),
+        #[cfg(feature = "sqlite")]
+        ("sqlite", Some("./.spice/my_sqlite.db")),
+    ];
+
+    for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
+        tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
+
+        if idx > 0 {
+            // Ensure the container is running as the tests manipulate the container
+            running_container
+                .start()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+        }
+        execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
+            .await?;
+    }
+
+    running_container
+        .remove()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    tracing::info!("Spill-to-disk and rehydration tests passed!");
+
+    Ok(())
+}
+
+/// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
+/// and checking data consistency.
+///
+/// 1. Retrieve the number of rows using a native `MySQL` connection to use as a baseline.
+/// 2. Start Spice, retrieve row count and loaded items after acceleration is completed, and compare with the baseline.
+/// 3. Restart the runtime and ensure the loaded items remain consistent immediately after the runtime is loaded.
+/// 4. Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
+///
+async fn execute_spill_to_disk_and_rehydration(
+    _federated_dataset_container: Arc<RunningContainer<'static>>,
+    engine: &str,
+    db_file_path: Option<&str>,
+) -> Result<(), anyhow::Error> {
     // retrieve number of rows using native mysql connection
+    // this also ensures that federated dataset is available
     let pool = get_mysql_conn(MYSQL_PORT)?;
     let res: Vec<Row> = pool
         .get_conn()
         .await?
         .exec("SELECT COUNT(*) FROM lineitem", Params::Empty)
         .await?;
-    let num_rows: u64 = res[0].get(0).expect("should retrieve number of rows");
+    let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
 
-    // clean up: delete local database file if exists
-    let spice_data_dir = spice_data_base_path();
-    let local_db_path = format!("{spice_data_dir}/lineitem_sqlite.db");
-    if std::fs::metadata(&local_db_path).is_ok() {
-        std::fs::remove_file(&local_db_path).expect("should remove local database file");
+    let accelrated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
+    tracing::debug!(
+        "Expected accelerated database location: {}",
+        &accelrated_db_file_path
+    );
+
+    // clean up: delete local database file if exists before running the test
+    for file_path in [
+        accelrated_db_file_path.clone(),
+        format!("{accelrated_db_file_path}-wal"),
+        format!("{accelrated_db_file_path}-shm"),
+    ] {
+        if std::fs::metadata(&file_path).is_ok() {
+            std::fs::remove_file(&file_path).context("should remove local database")?;
+        }
     }
 
-    let rt = init_spice_app().await?;
+    let rt = init_spice_app(engine, db_file_path).await?;
     runtime_ready_check(&rt).await;
 
-    let original_items = run_query("SELECT * FROM lineitem", &rt).await?;
+    if std::fs::metadata(&accelrated_db_file_path).is_err() {
+        return Err(anyhow::anyhow!(
+            "Accelerated database file not found at path: {accelrated_db_file_path}"
+        ));
+    }
+
+    let test_query =
+        "SELECT l_orderkey, l_linenumber  FROM lineitem ORDER BY l_orderkey, l_linenumber";
+
+    let original_items = run_query(test_query, &rt).await?;
     let num_rows_loaded: usize = original_items
         .iter()
         .map(arrow::array::RecordBatch::num_rows)
@@ -84,14 +150,40 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
 
     drop(rt);
 
-    let rt = init_spice_app().await?;
+    // Restart the runtime and ensure the loaded items remain consistent
+    let rt = init_spice_app(engine, db_file_path).await?;
     // Do request immediatly after restart w/o waiting for ready status (dataset is refreshed)
-    let restart1_items = run_query("SELECT * FROM lineitem", &rt).await?;
+    let restart1_items = run_query(test_query, &rt).await?;
     assert_eq!(original_items, restart1_items);
 
-    let _ = running_container.remove().await;
+    drop(rt);
+
+    // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
+    let rt = init_spice_app(engine, db_file_path).await?;
+    // TODO: temporary disabled due to issue: https://github.com/datafusion-contrib/datafusion-table-providers/pull/98
+    //federated_dataset_container.stop().await?;
+    let restart2_items = run_query(test_query, &rt).await?;
+    assert_eq!(original_items, restart2_items);
 
     Ok(())
+}
+
+fn resolve_local_db_file_path(
+    engine: &str,
+    db_file_path: Option<&str>,
+) -> Result<String, anyhow::Error> {
+    if let Some(db_file_path) = db_file_path {
+        let working_dir = std::env::current_dir().unwrap_or(".".into());
+        return Ok(format!(
+            "{}/{db_file_path}",
+            working_dir.to_str().context("Unable to get current dir")?
+        ));
+    }
+
+    match engine {
+        "duckdb" => Ok(format!("{}/lineitem.db", spice_data_base_path())),
+        _ => Ok(format!("{}/lineitem_{engine}.db", spice_data_base_path())),
+    }
 }
 
 async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -112,8 +204,11 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
     Ok(collected_data)
 }
 
-async fn init_spice_app() -> Result<Runtime, anyhow::Error> {
-    let ds = create_test_dataset("sqlite".to_string());
+async fn init_spice_app(
+    acceleration_engine: &str,
+    db_file_path: Option<&str>,
+) -> Result<Runtime, anyhow::Error> {
+    let ds = create_test_dataset(acceleration_engine, db_file_path);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
@@ -137,15 +232,29 @@ async fn init_spice_app() -> Result<Runtime, anyhow::Error> {
     Ok(rt)
 }
 
-fn create_test_dataset(acceleration_engine: String) -> Dataset {
+fn create_test_dataset(acceleration_engine: &str, db_file_path: Option<&str>) -> Dataset {
     let mut ds = make_mysql_dataset("lineitem", "lineitem", MYSQL_PORT, false);
 
-    ds.acceleration = Some(Acceleration {
+    let mut acceleration = Acceleration {
         enabled: true,
-        engine: Some(acceleration_engine),
+        engine: Some(acceleration_engine.to_string()),
         mode: Mode::File,
         ..Default::default()
-    });
+    };
+
+    if let Some(db_file_path) = db_file_path {
+        let params = SpicepodParams::from_string_map(
+            vec![(
+                format!("{acceleration_engine}_file",),
+                db_file_path.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        acceleration.params = Some(params);
+    }
+
+    ds.acceleration = Some(acceleration);
 
     ds
 }
