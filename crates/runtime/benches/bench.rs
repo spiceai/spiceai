@@ -286,8 +286,10 @@ async fn run_query_and_record_result(
 
         match res {
             Ok(records) => {
-
-                let num_rows = records.iter().map(|x| x.num_rows()).sum::<usize>();
+                let num_rows = records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>();
 
                 // Show the first 30 records of the result
                 let limited_records = records
