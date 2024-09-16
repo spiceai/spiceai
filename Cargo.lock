@@ -9675,6 +9675,7 @@ dependencies = [
 name = "spicepod"
 version = "0.18.0-beta"
 dependencies = [
+ "regex",
  "schemars",
  "serde",
  "serde_json",

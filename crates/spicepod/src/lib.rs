@@ -27,6 +27,7 @@ use component::{
     runtime::Runtime, secret::Secret, view::View,
 };
 
+use regex::Regex;
 use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
@@ -35,8 +36,8 @@ pub mod spec;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse spicepod.yaml: {source}"))]
-    UnableToParseSpicepod { source: serde_yaml::Error },
+    #[snafu(display("Unable to parse spicepod.yaml: {message}"))]
+    UnableToParseSpicepod { message: String },
 
     #[snafu(display("Unable to resolve spicepod components {}: {source}", path.display()))]
     UnableToResolveSpicepodComponents {
@@ -113,8 +114,14 @@ impl Spicepod {
             .open_yaml(&path_str, "spicepod")
             .ok_or_else(|| Error::SpicepodNotFound { path: path.clone() })?;
 
-        let spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+        let spicepod_definition: SpicepodDefinition = match serde_yaml::from_reader(spicepod_rdr) {
+            Ok(spicepod_definition) => spicepod_definition,
+            Err(e) => {
+                return Err(Error::UnableToParseSpicepod {
+                    message: map_spicepod_parsing_error(&e),
+                })
+            }
+        };
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -189,11 +196,37 @@ impl Spicepod {
             .open_yaml(&path_str, "spicepod")
             .ok_or_else(|| Error::SpicepodNotFound { path: path.clone() })?;
 
-        let spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+        let spicepod_definition: SpicepodDefinition = match serde_yaml::from_reader(spicepod_rdr) {
+            Ok(spicepod_definition) => spicepod_definition,
+            Err(e) => {
+                return Err(Error::UnableToParseSpicepod {
+                    message: map_spicepod_parsing_error(&e),
+                })
+            }
+        };
 
         Ok(spicepod_definition)
     }
+}
+
+fn map_spicepod_parsing_error(source: &serde_yaml::Error) -> String {
+    let err_str = source.to_string();
+    let Ok(re) = Regex::new(r"at line (\d+) column (\d+)") else {
+        unreachable!()
+    };
+    if let Some(captures) = re.captures(&err_str) {
+        let line: Option<&str> = captures.get(1).map(|m| m.as_str());
+        let column: Option<&str> = captures.get(2).map(|m| m.as_str());
+        match (line, column) {
+            (Some(line), Some(column)) => {
+                return format!("Invalid definition at line {line} column {column}");
+            }
+            _ => {
+                return err_str;
+            }
+        }
+    }
+    err_str
 }
 
 #[must_use]
