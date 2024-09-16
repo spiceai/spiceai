@@ -28,7 +28,6 @@ use {
 use {
     super::duckdb::DuckDBAccelerator,
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-    duckdb::AccessMode,
 };
 #[cfg(feature = "sqlite")]
 use {super::sqlite::SqliteAccelerator, tokio_rusqlite::Connection};
@@ -77,7 +76,9 @@ async fn acceleration_connection(
                 return Err("DuckDB file does not exist.".into());
             }
 
-            let pool = DuckDbConnectionPool::new_file(&duckdb_file, &AccessMode::ReadWrite)
+            let pool = duckdb_accelerator
+                .get_shared_pool(dataset)
+                .await
                 .map_err(|e| e.to_string())?;
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
