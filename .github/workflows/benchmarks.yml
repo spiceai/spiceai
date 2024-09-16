@@ -136,10 +136,9 @@ jobs:
           - cmd: '-a sqlite -m memory'
             name: 'sqlite accelerator (memory mode)'
           - cmd: '-a sqlite -m file'
-            name: 'sqlite accelerator (memory mode)'
+            name: 'sqlite accelerator (file mode)'
           - cmd: '-a postgres'
             name: 'postgres accelerator'
-            name: 'sqlite accelerator (file mode)'
 
     steps:
       - name: Checkout repository
