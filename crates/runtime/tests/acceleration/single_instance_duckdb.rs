@@ -20,7 +20,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{spice_data_base_path, status, Runtime};
+use runtime::{status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
@@ -29,10 +29,12 @@ use std::sync::Arc;
 
 use crate::{get_test_datafusion, init_tracing, runtime_ready_check};
 
-fn get_dataset(from: &str, name: &str) -> Dataset {
+use super::get_params;
+
+fn get_dataset(from: &str, name: &str, path: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.acceleration = Some(Acceleration {
-        params: None,
+        params: get_params(&Mode::File, Some(path.to_string()), "duckdb"),
         enabled: true,
         engine: Some("duckdb".to_string()),
         mode: Mode::File,
@@ -50,14 +52,17 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
 
+    let expected_path = "./single_duckdb.db";
     let app = AppBuilder::new("test_acceleration_duckdb_single_instance")
         .with_dataset(get_dataset(
             "https://public-data.spiceai.org/decimal.parquet",
             "decimal",
+            expected_path,
         ))
         .with_dataset(get_dataset(
             "https://public-data.spiceai.org/eth.recent_logs.parquet",
             "logs",
+            expected_path,
         ))
         .build();
 
@@ -82,7 +87,6 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let expected_path = format!("{}/accelerated_duckdb.db", spice_data_base_path());
     let pool =
         DuckDbConnectionPool::new_file(&expected_path, &AccessMode::ReadWrite).expect("valid path");
     let conn_dyn = pool.connect().await.expect("valid connection");
