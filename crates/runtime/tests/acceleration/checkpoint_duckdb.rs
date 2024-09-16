@@ -94,6 +94,27 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
     insta::assert_snapshot!(pretty);
 
+    let persisted_records: Vec<RecordBatch> = conn
+        .connect()
+        .await
+        .expect("valid connection")
+        .as_sync()
+        .expect("sync connection")
+        .query_arrow("SELECT * FROM taxi_trips", &[], None)
+        .expect("query executes")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("collects results");
+
+    // num records in local database after refresh must be 10
+    assert_eq!(
+        persisted_records
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>(),
+        10
+    );
+
     // Remove the file
     std::fs::remove_file("./taxi_trips.db").expect("remove file");
 

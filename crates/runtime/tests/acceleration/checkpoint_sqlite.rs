@@ -75,32 +75,56 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let results = SqliteConnectionPool::new(
+    let conn_pool = SqliteConnectionPool::new(
         "./taxi_trips_sqlite.db",
         datafusion_table_providers::sql::db_connection_pool::Mode::File,
         JoinPushDown::Disallow,
         vec![],
     )
     .await
-    .expect("connection pool")
-    .connect()
-    .await
-    .expect("connection")
-    .as_async()
-    .expect("async connection")
-    .query_arrow(
-        "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
-        &[],
-        None,
-    )
-    .await
-    .expect("query")
-    .try_collect::<Vec<RecordBatch>>()
-    .await
-    .expect("valid results");
+    .expect("connection pool");
+
+    let results = conn_pool
+        .connect()
+        .await
+        .expect("connection")
+        .as_async()
+        .expect("async connection")
+        .query_arrow(
+            "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
+            &[],
+            None,
+        )
+        .await
+        .expect("query")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("valid results");
 
     let pretty = arrow::util::pretty::pretty_format_batches(&results).expect("pretty");
     insta::assert_snapshot!(pretty);
+
+    let persisted_records: Vec<RecordBatch> = conn_pool
+        .connect()
+        .await
+        .expect("connection")
+        .as_async()
+        .expect("async connection")
+        .query_arrow("SELECT * FROM taxi_trips", &[], None)
+        .await
+        .expect("query")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("valid results");
+
+    // num records in local database after refresh must be 10
+    assert_eq!(
+        persisted_records
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>(),
+        10
+    );
 
     // Remove the file
     std::fs::remove_file("./taxi_trips_sqlite.db").expect("remove file");
