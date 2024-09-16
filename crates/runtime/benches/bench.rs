@@ -286,11 +286,21 @@ async fn run_query_and_record_result(
 
         match res {
             Ok(records) => {
-                let records_pretty = arrow::util::pretty::pretty_format_batches(&records)
+
+                let num_rows = records.iter().map(|x| x.num_rows()).sum::<usize>();
+
+                // Show the first 30 records of the result
+                let limited_records = records
+                    .iter()
+                    .take(1)
+                    .map(|x| x.slice(0, x.num_rows().min(30)))
+                    .collect::<Vec<_>>();
+
+                let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)
                     .map_err(|e| e.to_string())?;
 
                 tracing::info!(
-                    "Query `{connector}` `{query_name}` iteration {idx} completed in {iter_duration_ms} ms with\n{records_pretty}",
+                    "Query `{connector}` `{query_name}` iteration {idx} returned {num_rows} rows:\n{records_pretty}",
                 );
             }
             Err(e) => {
