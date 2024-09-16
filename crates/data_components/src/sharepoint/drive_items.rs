@@ -63,13 +63,17 @@ pub(crate) struct DriveItemResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DriveItem {
     created_by: CreatedBy,
-    created_date_time: String,
+
+    #[serde(rename = "createdDateTime")]
+    created_at: String,
     c_tag: String,
     e_tag: String,
     folder: Option<Folder>,
     pub(crate) id: String,
     last_modified_by: LastModifiedBy,
-    last_modified_date_time: String,
+
+    #[serde(rename = "lastModifiedDateTime")]
+    last_modified_at: String,
     name: String,
     size: i64,
     web_url: String,
@@ -83,7 +87,7 @@ pub fn drive_item_table_schema(include_file_content: bool) -> arrow::datatypes::
         arrow::datatypes::Field::new("created_by_id", arrow::datatypes::DataType::Utf8, false),
         arrow::datatypes::Field::new("created_by_name", arrow::datatypes::DataType::Utf8, true),
         arrow::datatypes::Field::new(
-            "created_date_time",
+            "created_at",
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
             false,
         ),
@@ -106,7 +110,7 @@ pub fn drive_item_table_schema(include_file_content: bool) -> arrow::datatypes::
             true,
         ),
         arrow::datatypes::Field::new(
-            "last_modified_date_time",
+            "last_modified_at",
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
             false,
         ),
@@ -149,7 +153,7 @@ pub(crate) fn drive_items_to_record_batch(
         .collect();
     let created_date_time: Vec<i64> = drive_items
         .iter()
-        .map(|item| parse_timestamp(&item.created_date_time))
+        .map(|item| parse_timestamp(&item.created_at))
         .collect::<ArrowResult<Vec<i64>>>()?;
     let c_tag: Vec<&str> = drive_items.iter().map(|item| item.c_tag.as_str()).collect();
     let e_tag: Vec<&str> = drive_items.iter().map(|item| item.e_tag.as_str()).collect();
@@ -168,7 +172,7 @@ pub(crate) fn drive_items_to_record_batch(
         .collect();
     let last_modified_date_time: Vec<i64> = drive_items
         .iter()
-        .map(|item| parse_timestamp(&item.last_modified_date_time))
+        .map(|item| parse_timestamp(&item.last_modified_at))
         .collect::<ArrowResult<Vec<i64>>>()?;
     let name: Vec<&str> = drive_items.iter().map(|item| item.name.as_str()).collect();
     let size: Vec<i64> = drive_items.iter().map(|item| item.size).collect();

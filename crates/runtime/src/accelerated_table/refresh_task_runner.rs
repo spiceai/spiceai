@@ -107,27 +107,16 @@ impl RefreshTaskRunner {
                                 }
                             }
                         },
-
-                        overrides_msg = on_start_refresh.recv() => {
-                            if let Some(overrides_opt) = overrides_msg {
-                                let request = {
-                                    let mut r = base_refresh.read().await.clone();
-                                    if let Some(overrides) = overrides_opt {
-                                        r = r.with_overrides(&overrides);
-                                    }
-                                    r
-                                };
-                                task_completion = Some(Box::pin(refresh_task.run(request)));
-                            }
+                        Some(overrides_opt) = on_start_refresh.recv() => {
+                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            task_completion = Some(Box::pin(refresh_task.run(request)));
                         }
                     }
                 } else {
                     select! {
-                        overrides_msg = on_start_refresh.recv() => {
-                            if let Some(overrides_opt) = overrides_msg {
-                                let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
-                                task_completion = Some(Box::pin(refresh_task.run(request)));
-                            }
+                        Some(overrides_opt) = on_start_refresh.recv() => {
+                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            task_completion = Some(Box::pin(refresh_task.run(request)));
                         }
                     }
                 }
