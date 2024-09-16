@@ -109,6 +109,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[expect(clippy::expect_used)]
 async fn query(conn_pool: &SqliteConnectionPool, query: &str) -> Vec<RecordBatch> {
     conn_pool
         .connect()
