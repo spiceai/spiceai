@@ -88,7 +88,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let pool =
-        DuckDbConnectionPool::new_file(&expected_path, &AccessMode::ReadWrite).expect("valid path");
+        DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite).expect("valid path");
     let conn_dyn = pool.connect().await.expect("valid connection");
     let conn = conn_dyn.as_sync().expect("sync connection");
     let result: Vec<RecordBatch> = conn
