@@ -72,14 +72,11 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let conn = DuckDbConnectionPool::new_file("./taxi_trips.db", &AccessMode::ReadWrite)
+    let pool = DuckDbConnectionPool::new_file("./taxi_trips.db", &AccessMode::ReadWrite)
         .expect("valid path");
+    let conn_dyn = pool.connect().await.expect("valid connection");
+    let conn = conn_dyn.as_sync().expect("sync connection");
     let result: Vec<RecordBatch> = conn
-        .connect()
-        .await
-        .expect("valid connection")
-        .as_sync()
-        .expect("sync connection")
         .query_arrow(
             "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
             &[],
@@ -95,25 +92,15 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     insta::assert_snapshot!(pretty);
 
     let persisted_records: Vec<RecordBatch> = conn
-        .connect()
-        .await
-        .expect("valid connection")
-        .as_sync()
-        .expect("sync connection")
-        .query_arrow("SELECT * FROM taxi_trips", &[], None)
+        .query_arrow("SELECT * FROM taxi_trips ORDER BY fare_amount", &[], None)
         .expect("query executes")
         .try_collect::<Vec<RecordBatch>>()
         .await
         .expect("collects results");
 
-    // num records in local database after refresh must be 10
-    assert_eq!(
-        persisted_records
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum::<usize>(),
-        10
-    );
+    let persisted_records_pretty = arrow::util::pretty::pretty_format_batches(&persisted_records)
+        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    insta::assert_snapshot!(persisted_records_pretty);
 
     // Remove the file
     std::fs::remove_file("./taxi_trips.db").expect("remove file");
