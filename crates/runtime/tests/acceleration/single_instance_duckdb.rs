@@ -20,7 +20,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{spice_data_base_path, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
@@ -82,11 +82,9 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let pool = DuckDbConnectionPool::new_file(
-        "./.spice/data/accelerated_duckdb.db",
-        &AccessMode::ReadWrite,
-    )
-    .expect("valid path");
+    let expected_path = format!("{}/accelerated_duckdb.db", spice_data_base_path());
+    let pool =
+        DuckDbConnectionPool::new_file(&expected_path, &AccessMode::ReadWrite).expect("valid path");
     let conn_dyn = pool.connect().await.expect("valid connection");
     let conn = conn_dyn.as_sync().expect("sync connection");
     let result: Vec<RecordBatch> = conn
@@ -133,7 +131,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     insta::assert_snapshot!(persisted_records_logs_pretty);
 
     // Remove the file
-    std::fs::remove_file("./.spice/data/accelerated_duckdb.db").expect("remove file");
+    std::fs::remove_file(expected_path).expect("remove file");
 
     Ok(())
 }
