@@ -20,7 +20,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{dataaccelerator::reset_registry, status, Runtime};
+use runtime::{status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
@@ -86,7 +86,8 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     runtime_ready_check(&rt).await;
 
     drop(rt);
-    reset_registry().await;
+    runtime::dataaccelerator::clear_registry().await;
+    runtime::dataaccelerator::register_all().await;
 
     let pool =
         DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite).expect("valid path");

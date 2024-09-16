@@ -18,7 +18,6 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::dataaccelerator::reset_registry;
 use runtime::{status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
@@ -83,7 +82,8 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
     drop(rt);
-    reset_registry().await;
+    runtime::dataaccelerator::clear_registry().await;
+    runtime::dataaccelerator::register_all().await;
 
     let db_conn = pool.connect().await.expect("connection can be established");
     let result = db_conn

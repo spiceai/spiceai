@@ -20,7 +20,6 @@ use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use futures::TryStreamExt;
-use runtime::dataaccelerator::reset_registry;
 use runtime::{status, Runtime};
 use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
@@ -75,7 +74,8 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     runtime_ready_check(&rt).await;
 
     drop(rt);
-    reset_registry().await;
+    runtime::dataaccelerator::clear_registry().await;
+    runtime::dataaccelerator::register_all().await;
 
     let conn_pool = SqliteConnectionPool::new(
         "./taxi_trips_sqlite.db",
