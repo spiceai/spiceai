@@ -29,7 +29,9 @@ use crate::{
     s3::get_s3_dataset,
 };
 
+// Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
 #[tokio::test]
+#[ignore]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
