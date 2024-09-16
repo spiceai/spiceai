@@ -57,9 +57,9 @@ pub(crate) fn get_postgres_params(is_acc: bool) -> Params {
     let pg_user = std::env::var("PG_BENCHMARK_PG_USER").unwrap_or_default();
     let pg_pass = std::env::var("PG_BENCHMARK_PG_PASS").unwrap_or_default();
     let pg_db = if is_acc {
-        std::env::var("PG_BENCHMARK_PG_DBNAME").unwrap_or_default()
-    } else {
         std::env::var("PG_BENCHMARK_ACC_PG_DBNAME").unwrap_or_default()
+    } else {
+        std::env::var("PG_BENCHMARK_PG_DBNAME").unwrap_or_default()
     };
     let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap_or_default();
     Params::from_string_map(
