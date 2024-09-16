@@ -84,7 +84,9 @@ mod tests {
         }
     }
 
+    // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
     #[tokio::test]
+    #[ignore]
     async fn test_duckdb_checkpoint_exists() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 
@@ -101,7 +103,9 @@ mod tests {
         assert!(checkpoint.exists().await);
     }
 
+    // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
     #[tokio::test]
+    #[ignore]
     async fn test_duckdb_checkpoint_update() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 
