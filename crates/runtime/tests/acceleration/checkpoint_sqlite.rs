@@ -28,7 +28,9 @@ use std::sync::Arc;
 use crate::acceleration::get_params;
 use crate::{get_test_datafusion, init_tracing, runtime_ready_check, s3::get_s3_dataset};
 
+// Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
 #[tokio::test]
+#[ignore]
 async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _guard = super::ACCELERATION_MUTEX.lock().await;
