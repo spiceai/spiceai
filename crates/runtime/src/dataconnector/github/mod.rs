@@ -16,16 +16,19 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
     graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
 };
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use serde::{Deserialize, Serialize};
+use issues::IssuesTableArgs;
+use pull_requests::PullRequestTableArgs;
 use snafu::ResultExt;
+use stargazers::StargazersTableArgs;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
@@ -33,6 +36,11 @@ use super::{
     graphql::default_spice_client, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters,
 };
+
+mod commits;
+mod issues;
+mod pull_requests;
+mod stargazers;
 
 pub struct Github {
     params: Parameters,
@@ -42,221 +50,42 @@ pub type GraphQLQuery = Arc<str>;
 pub type JSONPointer = Arc<str>;
 pub type UnnestDepth = usize;
 
-pub trait GithubTableArgs: Send + Sync {
-    /// Converts the arguments for a Github table into a tuple of:
-    ///   1. The GraphQL query string
-    ///   2. The JSON pointer to the data in the response
-    ///   3. The depth to unnest the data
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth);
+pub struct GitHubTableGraphQLParams {
+    /// The GraphQL query string
+    query: GraphQLQuery,
+    /// The JSON pointer to the data in the response
+    json_pointer: JSONPointer,
+    /// The depth to unnest the data
+    unnest_depth: UnnestDepth,
+    /// The GraphQL schema of the response data, if available
+    schema: Option<SchemaRef>,
 }
 
-// TODO: implement PR filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for pullRequests`.
-pub struct PullRequestTableArgs {
-    pub owner: String,
-    pub repo: String,
-}
-
-impl GithubTableArgs for PullRequestTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
-        let query = format!(
-            r#"
-            {{
-                repository(owner: "{owner}", name: "{name}") {{
-                    pullRequests(first: 100) {{
-                        pageInfo {{
-                            hasNextPage
-                            endCursor
-                        }}
-                        nodes {{
-                            title
-                            number
-                            id
-                            url
-                            body
-                            state
-                            created_at: createdAt
-                            updated_at: updatedAt
-                            merged_at: mergedAt
-                            closed_at: closedAt
-                            number
-                            reviews {{reviews_count: totalCount}}
-                            
-                            author {{
-                                login
-                            }}
-                            additions
-                            deletions
-                            changed_files: changedFiles
-                            labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{comments_count: totalCount}}
-                            commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
-                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
-                        }}
-                    }}
-                }}
-            }}
-            "#,
-            owner = self.owner,
-            name = self.repo,
-        );
-
-        (
-            query.into(),
-            "/data/repository/pullRequests/nodes".into(),
-            1,
-        )
+impl GitHubTableGraphQLParams {
+    #[must_use]
+    pub fn new(
+        query: GraphQLQuery,
+        json_pointer: JSONPointer,
+        unnest_depth: UnnestDepth,
+        schema: Option<SchemaRef>,
+    ) -> Self {
+        Self {
+            query,
+            json_pointer,
+            unnest_depth,
+            schema,
+        }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PullRequestState {
-    Open,
-    Closed,
-    Merged,
-}
-
-// TODO: implement filters from https://docs.github.com/en/graphql/reference/objects#commit `Arguments for history`.
-pub struct CommitTableArgs {
-    pub owner: String,
-    pub repo: String,
-}
-
-impl GithubTableArgs for CommitTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
-        let query = format!(
-            r#"{{
-                repository(owner: "{owner}", name: "{name}") {{
-                    defaultBranchRef {{
-                        target {{
-                            ... on Commit {{
-                                history(first: 100) {{
-                                    pageInfo {{
-                                        hasNextPage
-                                        endCursor
-                                    }}
-                                    nodes {{
-                                        message
-                                        message_head_line: messageHeadline
-                                        message_body: messageBody
-                                        sha: oid
-                                        additions
-                                        deletions
-                                        id
-                                        committed_date: committedDate
-                                        authorName: author {{
-                                            author_name: name
-                                        }}
-                                        authorEmail: author {{
-                                            author_email: email
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
-                }}
-            }}"#,
-            owner = self.owner,
-            name = self.repo
-        );
-        (
-            query.into(),
-            "/data/repository/defaultBranchRef/target/history/nodes".into(),
-            1,
-        )
-    }
-}
-
-// TODO: implement PR filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for issues`
-pub struct IssueTableArgs {
-    pub owner: String,
-    pub repo: String,
-}
-
-impl GithubTableArgs for IssueTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
-        let query = format!(
-            r#"{{
-                repository(owner: "{owner}", name: "{name}") {{
-                    issues(first: 100) {{
-                        pageInfo {{
-                            hasNextPage
-                            endCursor
-                        }}
-                        nodes {{
-                            id
-                            number
-                            title
-                            url
-                            author: author {{ login }}
-                            body
-                            number
-                            created_at: createdAt
-                            updated_at: updatedAt
-                            closed_at: closedAt
-                            state
-                            milestone_id: milestone {{ milestone_id: id}}
-                            milestone_title: milestone {{ milestone_title: title }}
-                            labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
-                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
-                        }}
-                    }}
-                }}
-            }}"#,
-            owner = self.owner,
-            name = self.repo
-        );
-
-        (query.into(), "/data/repository/issues/nodes".into(), 1)
-    }
-}
-
-// TODO: implement filters from https://docs.github.com/en/graphql/reference/objects#repository `Arguments for stargazers`
-pub struct StargazersTableArgs {
-    pub owner: String,
-    pub repo: String,
-}
-
-impl GithubTableArgs for StargazersTableArgs {
-    fn get_graphql_values(&self) -> (GraphQLQuery, JSONPointer, UnnestDepth) {
-        let query = format!(
-            r#"{{
-                repository(owner: "{owner}", name: "{name}") {{
-                    stargazers(first: 100) {{
-                        edges {{
-                            starred_at: starredAt
-                            node {{
-                                login
-                                name
-                                avatar_url: avatarUrl
-                                bio
-                                location
-                                company
-                                email
-                                x_username: twitterUsername
-                            }}
-                        }}
-                        pageInfo {{
-                            hasNextPage
-                            endCursor
-                        }}
-                    }}
-                }}
-            }}"#,
-            owner = self.owner,
-            name = self.repo
-        );
-
-        (query.into(), "/data/repository/stargazers/edges".into(), 1)
-    }
+pub trait GitHubTableArgs: Send + Sync {
+    fn get_graphql_values(&self) -> GitHubTableGraphQLParams;
 }
 
 impl Github {
     pub(crate) fn create_graphql_client(
         &self,
-        tbl: &Arc<dyn GithubTableArgs>,
+        tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
         let access_token = self.params.get("token").expose().ok();
 
@@ -266,23 +95,24 @@ impl Github {
 
         let client = default_spice_client("application/json").boxed()?;
 
-        let (query, json_pointer, unnest_depth) = tbl.get_graphql_values();
+        let gql_client_params = tbl.get_graphql_values();
 
         Ok(GraphQLClient::new(
             client,
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
-            query,
-            json_pointer,
+            gql_client_params.query,
+            gql_client_params.json_pointer,
             access_token,
             None,
             None,
-            unnest_depth,
+            gql_client_params.unnest_depth,
+            gql_client_params.schema,
         ))
     }
 
     async fn create_gql_table_provider(
         &self,
-        table_args: Arc<dyn GithubTableArgs>,
+        table_args: Arc<dyn GitHubTableArgs>,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
@@ -449,14 +279,14 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(table_args).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
-                let table_args = Arc::new(CommitTableArgs {
+                let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                 });
                 self.create_gql_table_provider(table_args).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
-                let table_args = Arc::new(IssueTableArgs {
+                let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                 });

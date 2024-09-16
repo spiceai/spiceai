@@ -29,6 +29,7 @@ import (
 const (
 	refreshSqlFlag  = "refresh-sql"
 	refreshModeFlag = "refresh-mode"
+	maxJitterFlag   = "refresh-jitter-max"
 )
 
 type DatasetRefreshApiResponse struct {
@@ -38,11 +39,12 @@ type DatasetRefreshApiResponse struct {
 type DatasetRefreshApiRequest struct {
 	RefreshSQL *string `json:"refresh_sql,omitempty"`
 	Mode       *string `json:"refresh_mode,omitempty"`
+	MaxJitter  *string `json:"refresh_jitter_max,omitempty"`
 }
 
-func constructRequest(sql string, mode string) (*string, error) {
+func constructRequest(sql string, mode string, max_jitter string) (*string, error) {
 	r := DatasetRefreshApiRequest{}
-	if sql == "" && mode == "" {
+	if sql == "" && mode == "" && max_jitter == "" {
 		return nil, nil
 	}
 	if sql != "" {
@@ -50,6 +52,9 @@ func constructRequest(sql string, mode string) (*string, error) {
 	}
 	if mode != "" {
 		r.Mode = &mode
+	}
+	if max_jitter != "" {
+		r.MaxJitter = &max_jitter
 	}
 	bytz, err := json.Marshal(r)
 	s := string(bytz)
@@ -71,6 +76,7 @@ spice refresh taxi_trips
 
 		sql, _ := cmd.Flags().GetString(refreshSqlFlag)
 		mode, _ := cmd.Flags().GetString(refreshModeFlag)
+		maxJitter, _ := cmd.Flags().GetString(maxJitterFlag)
 
 		// If the mode is not empty, it must be either 'full' or 'append'.
 		if mode != "" && mode != spec.REFRESH_MODE_FULL && mode != spec.REFRESH_MODE_APPEND {
@@ -87,7 +93,7 @@ spice refresh taxi_trips
 
 		url := fmt.Sprintf("/v1/datasets/%s/acceleration/refresh", dataset)
 
-		body, err := constructRequest(sql, mode)
+		body, err := constructRequest(sql, mode, maxJitter)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			return
@@ -107,5 +113,6 @@ func init() {
 	refreshCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	refreshCmd.Flags().String(refreshSqlFlag, "", "'refresh_sql' to refresh a dataset.")
 	refreshCmd.Flags().String(refreshModeFlag, "", "'refresh_mode', one of: full, append")
+	refreshCmd.Flags().String(maxJitterFlag, "", "'refresh_jitter_max', a duration string (e.g. '1m') to specify the maximum jitter allowed for the refresh operation")
 	RootCmd.AddCommand(refreshCmd)
 }

@@ -1666,7 +1666,8 @@ pub struct RegisterDatasetContext {
     accelerated_table: Option<AcceleratedTable>,
 }
 
-pub(crate) fn spice_data_base_path() -> String {
+#[must_use]
+pub fn spice_data_base_path() -> String {
     let Ok(working_dir) = std::env::current_dir() else {
         return ".".to_string();
     };
