@@ -84,39 +84,16 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     .await
     .expect("connection pool");
 
-    let results = conn_pool
-        .connect()
-        .await
-        .expect("connection")
-        .as_async()
-        .expect("async connection")
-        .query_arrow(
-            "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
-            &[],
-            None,
-        )
-        .await
-        .expect("query")
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .expect("valid results");
+    let results = query(
+        &conn_pool,
+        "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
+    )
+    .await;
 
     let pretty = arrow::util::pretty::pretty_format_batches(&results).expect("pretty");
     insta::assert_snapshot!(pretty);
 
-    let persisted_records: Vec<RecordBatch> = conn_pool
-        .connect()
-        .await
-        .expect("connection")
-        .as_async()
-        .expect("async connection")
-        .query_arrow("SELECT * FROM taxi_trips", &[], None)
-        .await
-        .expect("query")
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .expect("valid results");
-
+    let persisted_records: Vec<RecordBatch> = query(&conn_pool, "SELECT * FROM taxi_trips").await;
     // num records in local database after refresh must be 10
     assert_eq!(
         persisted_records
@@ -130,4 +107,19 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     std::fs::remove_file("./taxi_trips_sqlite.db").expect("remove file");
 
     Ok(())
+}
+
+async fn query(conn_pool: &SqliteConnectionPool, query: &str) -> Vec<RecordBatch> {
+    conn_pool
+        .connect()
+        .await
+        .expect("connection")
+        .as_async()
+        .expect("async connection")
+        .query_arrow(query, &[], None)
+        .await
+        .expect("query")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("valid results")
 }
