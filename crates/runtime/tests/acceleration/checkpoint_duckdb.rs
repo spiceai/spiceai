@@ -21,13 +21,17 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::component::dataset::{
+    acceleration::{Acceleration, Mode, RefreshMode},
+    Dataset,
+};
 use std::sync::Arc;
 
-use crate::{
-    acceleration::get_params, get_test_datafusion, init_tracing, runtime_ready_check,
-    s3::get_s3_dataset,
-};
+use crate::{acceleration::get_params, get_test_datafusion, init_tracing, runtime_ready_check};
+
+fn get_dataset() -> Dataset {
+    Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal")
+}
 
 #[tokio::test]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
@@ -36,14 +40,14 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut dataset = get_s3_dataset();
+    let mut dataset = get_dataset();
     dataset.acceleration = Some(Acceleration {
-        params: get_params(&Mode::File, Some("./taxi_trips.db".to_string()), "duckdb"),
+        params: get_params(&Mode::File, Some("./decimal.db".to_string()), "duckdb"),
         enabled: true,
         engine: Some("duckdb".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
-        refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        refresh_sql: None,
         ..Acceleration::default()
     });
 
@@ -72,8 +76,8 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let pool = DuckDbConnectionPool::new_file("./taxi_trips.db", &AccessMode::ReadWrite)
-        .expect("valid path");
+    let pool =
+        DuckDbConnectionPool::new_file("./decimal.db", &AccessMode::ReadWrite).expect("valid path");
     let conn_dyn = pool.connect().await.expect("valid connection");
     let conn = conn_dyn.as_sync().expect("sync connection");
     let result: Vec<RecordBatch> = conn
@@ -92,7 +96,7 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     insta::assert_snapshot!(pretty);
 
     let persisted_records: Vec<RecordBatch> = conn
-        .query_arrow("SELECT * FROM taxi_trips ORDER BY fare_amount", &[], None)
+        .query_arrow("SELECT * FROM decimal ORDER BY id", &[], None)
         .expect("query executes")
         .try_collect::<Vec<RecordBatch>>()
         .await
@@ -103,7 +107,7 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     insta::assert_snapshot!(persisted_records_pretty);
 
     // Remove the file
-    std::fs::remove_file("./taxi_trips.db").expect("remove file");
+    std::fs::remove_file("./decimal.db").expect("remove file");
 
     Ok(())
 }
