@@ -66,11 +66,6 @@ pub enum Error {
     #[snafu(display(r#"The "duckdb_file" acceleration parameter is a directory."#))]
     InvalidFileIsDirectory,
 
-    #[snafu(display(
-        r#"The "duckdb_file" acceleration parameter "{path}" is not unique and in use by another dataset."#
-    ))]
-    InvalidFileInUse { path: String },
-
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
     AccelerationNotEnabled { dataset: Arc<str> },
 
@@ -110,7 +105,7 @@ impl DuckDBAccelerator {
 
         Some(
             self.duckdb_factory
-                .duckdb_file_path(&dataset.name.to_string(), &mut params),
+                .duckdb_file_path("accelerated_duckdb", &mut params),
         )
     }
 
@@ -242,9 +237,19 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
+            // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
+            // then use the shared DuckDB file `accelerated_duckdb.db`
+            if !cmd.options.contains_key("open") && this_dataset.is_file_accelerated() {
+                let duckdb_file = self.duckdb_file_path(this_dataset);
+                if let Some(duckdb_file) = duckdb_file {
+                    cmd.options.insert("open".to_string(), duckdb_file);
+                }
+            }
+
             if let Some(app) = &this_dataset.app {
                 let datasets =
                     Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                let self_path = self.file_path(this_dataset);
                 let attach_databases = datasets
                     .iter()
                     .filter_map(|other_dataset| {
@@ -254,20 +259,18 @@ impl DataAccelerator for DuckDBAccelerator {
                             if **other_dataset == *this_dataset {
                                 None
                             } else {
-                                self.file_path(other_dataset)
+                                let other_path = self.file_path(other_dataset);
+                                if other_path == self_path {
+                                    None
+                                } else {
+                                    other_path
+                                }
                             }
                         } else {
                             None
                         }
                     })
                     .collect::<Vec<_>>();
-
-                let self_path = self.file_path(this_dataset);
-                if let Some(self_path) = self_path {
-                    if attach_databases.contains(&self_path) {
-                        return Err(Error::InvalidFileInUse { path: self_path }.into());
-                    }
-                }
 
                 if !attach_databases.is_empty() {
                     cmd.options

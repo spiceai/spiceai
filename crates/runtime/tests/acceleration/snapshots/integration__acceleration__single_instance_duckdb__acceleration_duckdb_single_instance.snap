@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/acceleration/single_instance_duckdb.rs
+expression: pretty
+---
++--------------+
+| dataset_name |
++--------------+
+| decimal      |
+| logs         |
++--------------+
