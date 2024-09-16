@@ -54,8 +54,10 @@ impl DatasetCheckpoint {
 
     pub async fn exists(&self) -> bool {
         match &self.acceleration_connection {
+            // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
+            // AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
+            AccelerationConnection::DuckDB(_) => false,
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => {
                 self.exists_postgres(pool).await.ok().unwrap_or(false)
@@ -71,8 +73,10 @@ impl DatasetCheckpoint {
 
     pub async fn checkpoint(&self) -> Result<()> {
         match &self.acceleration_connection {
+            // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
+            // AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool),
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool),
+            AccelerationConnection::DuckDB(_) => Ok(()),
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool).await,
             #[cfg(feature = "sqlite")]
