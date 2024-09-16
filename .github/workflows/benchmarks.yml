@@ -159,7 +159,6 @@ jobs:
       - name: 'Restart accelerator service container with customize configurations'
         if: matrix.cmd == '-a postgres' && (github.event.inputs.selected_benchmark == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
-          docker exec ${{ job.services.postgres_acc.id }} sh -c 'cat /var/lib/postgresql/data/postgresql.conf'
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "shared_buffers=1GB" >> /var/lib/postgresql/data/postgresql.conf'
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "work_mem=256MB" >> /var/lib/postgresql/data/postgresql.conf'
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "max_wal_size=6GB" >> /var/lib/postgresql/data/postgresql.conf'
