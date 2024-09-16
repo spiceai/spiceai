@@ -20,6 +20,7 @@ use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::reset_registry;
 use runtime::{status, Runtime};
 use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
@@ -31,6 +32,7 @@ use crate::{get_test_datafusion, init_tracing, runtime_ready_check, s3::get_s3_d
 #[tokio::test]
 async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
@@ -73,7 +75,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     runtime_ready_check(&rt).await;
 
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    reset_registry().await;
 
     let conn_pool = SqliteConnectionPool::new(
         "./taxi_trips_sqlite.db",

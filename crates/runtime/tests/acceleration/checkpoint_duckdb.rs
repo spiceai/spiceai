@@ -20,7 +20,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{dataaccelerator::reset_registry, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
@@ -36,6 +36,7 @@ fn get_dataset() -> Dataset {
 #[tokio::test]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
@@ -74,7 +75,7 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     runtime_ready_check(&rt).await;
 
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    reset_registry().await;
 
     let pool =
         DuckDbConnectionPool::new_file("./decimal.db", &AccessMode::ReadWrite).expect("valid path");

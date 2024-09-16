@@ -18,6 +18,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::reset_registry;
 use runtime::{status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
@@ -35,6 +36,7 @@ use crate::{
 #[tokio::test]
 async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let port: usize = get_random_port();
     let running_container = common::start_postgres_docker_container(port).await?;
 
@@ -80,8 +82,8 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     }
 
     runtime_ready_check(&rt).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     drop(rt);
+    reset_registry().await;
 
     let db_conn = pool.connect().await.expect("connection can be established");
     let result = db_conn
