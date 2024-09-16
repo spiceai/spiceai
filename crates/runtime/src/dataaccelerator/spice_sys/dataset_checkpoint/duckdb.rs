@@ -61,6 +61,8 @@ impl DatasetCheckpoint {
             .execute(&upsert, [&self.dataset_name])
             .map_err(|e| e.to_string())?;
 
+        duckdb_conn.execute("CHECKPOINT", []).map_err(|e| e.to_string())?;
+
         Ok(())
     }
 }
