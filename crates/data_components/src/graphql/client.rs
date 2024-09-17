@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
 use std::{cmp::min, io::Cursor, sync::Arc};
+
 use url::Url;
 
 pub enum Auth {
@@ -108,6 +109,15 @@ pub enum PaginationArgument {
     Last(usize),
 }
 
+impl std::fmt::Display for PaginationArgument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaginationArgument::First(z) => write!(f, "first: {z}"),
+            PaginationArgument::Last(z) => write!(f, "last: {z}"),
+        }
+    }
+}
+
 impl PaginationArgument {
     /// Formats the pagination arguments to be inserted into a Graphql variable.
     ///
@@ -150,6 +160,42 @@ impl PaginationArgument {
     fn size(&self) -> usize {
         match self {
             PaginationArgument::First(z) | PaginationArgument::Last(z) => *z,
+        }
+    }
+
+    /// Validates that a `pageInfo` field is valid for [`PaginationArgument`].
+    fn validate_page_info<'a, T: Text<'a>>(&self, f: &Field<'a, T>) -> Result<(), String> {
+        let mut has_next_page = false;
+        let mut has_previous_page = false;
+        let mut start_cursor = false;
+        let mut end_cursor = false;
+
+        // Find which values are present in the pageInfo field
+        f.selection_set.items.iter().for_each(|s| if let Selection::Field(f) = s {
+            let field_name = format!("{:?}", f.name).replace('"', "");
+            match field_name.as_str() {
+                "hasNextPage" => has_next_page = true,
+                "hasPreviousPage" => has_previous_page = true,
+                "startCursor" => start_cursor = true,
+                "endCursor" => end_cursor = true,
+                _ => (),
+            }
+        });
+
+        // Check present fields are consistent with the pagination argument.
+        match &self {
+            PaginationArgument::First(_) => {
+                if !has_next_page || !end_cursor {
+                    return Err("'pageInfo' field needs both 'hasNextPage' and 'endCursor' for forward pagination.".to_string());
+                }
+                Ok(())
+            }
+            PaginationArgument::Last(_) => {
+                if !has_previous_page || !start_cursor {
+                    return Err("'pageInfo' field needs both 'hasPreviousPage' and 'startCursor' for backward pagination.".to_string());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -327,23 +373,28 @@ impl PaginationParameters {
                         let json_pointer = data_field
                             .map(|f| format!("/data{current_path}/{:?}", f.name).replace('"', ""));
 
-                        match parent_field.try_into() {
-                            Ok(pag_arg) => {
-                                return (
-                                    Some(PaginationParameters {
-                                        resource_name: format!("{:?}", parent_field.name)
-                                            .replace('"', ""),
-                                        args: pag_arg,
-                                        page_info_path: Some(new_path),
-                                    }),
-                                    json_pointer,
-                                );
-                            }
+                        let pag_args = match TryInto::<PaginationArgument>::try_into(parent_field) {
+                            Ok(pag_args) => pag_args,
                             Err(e) => {
-                                tracing::warn!("Invalid pagination argument: {e}");
+                                tracing::warn!("Invalid pagination argument from field: {e}");
                                 return (None, None);
                             }
+                        };
+
+                        // Check [`PaginationArgument`] and `pageInfo` fields are consistent.
+                        if let Err(e) = pag_args.validate_page_info(field) {
+                            tracing::warn!("GraphQL query has pagination specified ({pag_args}), but invalid pagination fields: {e}");
+                            return (None, None);
                         }
+
+                        return (
+                            Some(PaginationParameters {
+                                resource_name: format!("{:?}", parent_field.name).replace('"', ""),
+                                args: pag_args,
+                                page_info_path: Some(new_path),
+                            }),
+                            json_pointer,
+                        );
                     }
 
                     // Recurse into nested selection sets
