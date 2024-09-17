@@ -23,10 +23,11 @@ use futures::TryStreamExt;
 use runtime::{status, Runtime};
 use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
+use spicepod::component::dataset::Dataset;
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
-use crate::{get_test_datafusion, init_tracing, runtime_ready_check, s3::get_s3_dataset};
+use crate::{get_test_datafusion, init_tracing, runtime_ready_check};
 
 #[tokio::test]
 async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
@@ -36,22 +37,22 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut dataset = get_s3_dataset();
+    let mut dataset = Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal");
     dataset.acceleration = Some(Acceleration {
         params: get_params(
             &Mode::File,
-            Some("./taxi_trips_sqlite.db".to_string()),
+            Some("./decimal_sqlite.db".to_string()),
             "sqlite",
         ),
         enabled: true,
         engine: Some("sqlite".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
-        refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        refresh_sql: Some("SELECT * FROM decimal".to_string()),
         ..Acceleration::default()
     });
 
-    let app = AppBuilder::new("test_acceleration_sqlite_metadata")
+    let app = AppBuilder::new("test_acceleration_sqlite_checkpoint")
         .with_dataset(dataset)
         .build();
 
@@ -78,7 +79,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     runtime::dataaccelerator::register_all().await;
 
     let conn_pool = SqliteConnectionPool::new(
-        "./taxi_trips_sqlite.db",
+        "./decimal_sqlite.db",
         datafusion_table_providers::sql::db_connection_pool::Mode::File,
         JoinPushDown::Disallow,
         vec![],
@@ -95,18 +96,15 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(&results).expect("pretty");
     insta::assert_snapshot!(pretty);
 
-    let persisted_records: Vec<RecordBatch> = query(&conn_pool, "SELECT * FROM taxi_trips").await;
-    // num records in local database after refresh must be 10
-    assert_eq!(
-        persisted_records
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum::<usize>(),
-        10
-    );
+    let persisted_records: Vec<RecordBatch> =
+        query(&conn_pool, "SELECT * FROM decimal ORDER BY id").await;
+
+    let pretty_decimal =
+        arrow::util::pretty::pretty_format_batches(&persisted_records).expect("pretty print");
+    insta::assert_snapshot!(pretty_decimal);
 
     // Remove the file
-    std::fs::remove_file("./taxi_trips_sqlite.db").expect("remove file");
+    std::fs::remove_file("./decimal_sqlite.db").expect("remove file");
 
     Ok(())
 }
