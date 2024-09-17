@@ -254,6 +254,24 @@ fn get_accelerator_indexes(
                 }
                 _ => None,
             },
+            "postgres" => match dataset {
+                "partsupp" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "part" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("p_partkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "lineitem" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("l_partkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                _ => None,
+            },
             _ => None,
         }
     } else {

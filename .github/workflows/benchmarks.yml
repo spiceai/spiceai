@@ -34,6 +34,7 @@ on:
           - 'duckdb accelerator (file mode)'
           - 'sqlite accelerator (memory mode)'
           - 'sqlite accelerator (file mode)'
+          - 'postgres accelerator'
 
 env:
   FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
@@ -82,11 +83,23 @@ jobs:
           - 3306:3306
         env:
           MYSQL_ROOT_PASSWORD: root
-      postgres:
+      postgres_conn:
         image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+      postgres_acc:
+        image: ${{ matrix.cmd == '-a postgres' && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -124,6 +137,8 @@ jobs:
             name: 'sqlite accelerator (memory mode)'
           - cmd: '-a sqlite -m file'
             name: 'sqlite accelerator (file mode)'
+          - cmd: '-a postgres'
+            name: 'postgres accelerator'
 
     steps:
       - name: Checkout repository
@@ -140,6 +155,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: spice_bench
+
+      - name: 'Restart accelerator service container with customize configurations'
+        if: matrix.cmd == '-a postgres' && (github.event.inputs.selected_benchmark == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        run: |
+          docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "shared_buffers=1GB" >> /var/lib/postgresql/data/postgresql.conf'
+          docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "work_mem=256MB" >> /var/lib/postgresql/data/postgresql.conf'
+          docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "max_wal_size=6GB" >> /var/lib/postgresql/data/postgresql.conf'
+          docker kill --signal=SIGHUP ${{ job.services.postgres_acc.id }}
 
       - name: Install Databricks ODBC driver
         if: matrix.cmd == '-c odbc-databricks' && (github.event.inputs.selected_benchmark == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
@@ -171,6 +194,7 @@ jobs:
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
           PG_BENCHMARK_PG_DBNAME: tpch_sf1
+          PG_BENCHMARK_ACC_PG_DBNAME: postgres
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root

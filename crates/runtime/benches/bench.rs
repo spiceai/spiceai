@@ -28,6 +28,8 @@ limitations under the License.
 use std::panic;
 use std::sync::Arc;
 
+#[cfg(feature = "postgres")]
+use crate::bench_postgres::get_postgres_params;
 use crate::results::Status;
 use arrow::array::RecordBatch;
 use clap::Parser;
@@ -37,6 +39,7 @@ use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context:
 use results::BenchmarkResultsBuilder;
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode};
+use spicepod::component::params::Params;
 
 mod results;
 mod setup;
@@ -111,15 +114,17 @@ async fn main() -> Result<(), String> {
                 run_connector_bench(connector, &upload_results_dataset).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
-                create_acceleration("arrow", acceleration::Mode::Memory),
+                create_acceleration("arrow", acceleration::Mode::Memory, None),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory),
+                create_acceleration("duckdb", acceleration::Mode::Memory, None),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File),
+                create_acceleration("duckdb", acceleration::Mode::File, None),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory),
+                create_acceleration("sqlite", acceleration::Mode::Memory, None),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File),
+                create_acceleration("sqlite", acceleration::Mode::File, None),
+                #[cfg(feature = "postgres")]
+                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
             ];
             for accelerator in accelerators {
                 run_accelerator_bench(accelerator, &upload_results_dataset).await?;
@@ -136,7 +141,19 @@ async fn main() -> Result<(), String> {
                 Some("memory") | None => Mode::Memory,
                 _ => return Err(format!("Invalid mode parameter for {accelerator} accelerator")),
             };
-            let acceleration = create_acceleration(accelerator, mode);
+
+            let params: Option<Params> = {
+                #[cfg(feature = "postgres")]
+                {
+                    Some(get_postgres_params(true))
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    None
+                }
+            };
+
+            let acceleration = create_acceleration(accelerator, mode, params);
             run_accelerator_bench(acceleration, &upload_results_dataset).await?;
         },
         _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
@@ -229,10 +246,15 @@ async fn run_accelerator_bench(
     Ok(())
 }
 
-fn create_acceleration(engine: &str, mode: acceleration::Mode) -> Acceleration {
+fn create_acceleration(
+    engine: &str,
+    mode: acceleration::Mode,
+    params: Option<Params>,
+) -> Acceleration {
     Acceleration {
         engine: Some(engine.to_string()),
         mode,
+        params,
         ..Default::default()
     }
 }
@@ -268,7 +290,7 @@ async fn run_query_and_record_result(
 
     let mut completed_iterations = 0;
 
-    for _ in 0..benchmark_results.iterations() {
+    for idx in 0..benchmark_results.iterations() {
         completed_iterations += 1;
 
         let start_iter_time = get_current_unix_ms();
@@ -284,9 +306,36 @@ async fn run_query_and_record_result(
             max_iter_duration_ms = iter_duration_ms;
         }
 
-        if let Err(e) = res {
-            query_err = Some(e);
-            break;
+        match res {
+            Ok(records) => {
+                // Show the first 10 records of the result from the first iteration
+                if idx == 0 {
+                    let num_rows = records
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum::<usize>();
+                    let limited_records = records
+                        .iter()
+                        .take(1)
+                        .map(|x| x.slice(0, x.num_rows().min(10)))
+                        .collect::<Vec<_>>();
+
+                    let records_pretty =
+                        arrow::util::pretty::pretty_format_batches(&limited_records)
+                            .map_err(|e| e.to_string())?;
+
+                    tracing::info!(
+                    "Query `{connector}` `{query_name}` iteration {idx} returned {num_rows} rows:\n{records_pretty}",
+                );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Query `{connector}` `{query_name}` iteration {idx} failed with error: \n{e}",
+                );
+                query_err = Some(e);
+                break;
+            }
         }
     }
 
@@ -331,8 +380,8 @@ async fn run_query(
     connector: &str,
     query_name: &str,
     query: &str,
-) -> Result<(), String> {
-    let _ = rt
+) -> Result<Vec<RecordBatch>, String> {
+    let res = rt
         .datafusion()
         .ctx
         .sql(query)
@@ -342,7 +391,7 @@ async fn run_query(
         .await
         .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
-    Ok(())
+    Ok(res)
 }
 
 const ENABLED_SNAPSHOT_CONNECTORS: &[&str] = &["spice.ai", "s3", "s3_arrow_memory"];
