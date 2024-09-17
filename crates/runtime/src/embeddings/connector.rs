@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::component::dataset::Dataset;
+use crate::dataconnector::DataConnectorError;
 use crate::model::EmbeddingModelStore;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -60,6 +61,18 @@ impl EmbeddingConnector {
             .iter()
             .map(|e| (e.column.clone(), e.model.clone()))
             .collect::<HashMap<_, _>>();
+
+        // Early check if embedding models are available.
+        for (column, model) in &embed_columns {
+            if !self.embedding_models.read().await.contains_key(model) {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "File".to_string(),
+                    message: format!(
+                    "Dataset '{}' expects to use embedding model '{model}' to embed column '{column}', but the model is not found.\nEither '{model}' is not defined in Spicepod (as an 'embeddings'), or the runtime does not have model support. For the latter, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.",
+                    dataset.name
+                )});
+            }
+        }
 
         Ok(Arc::new(
             EmbeddingTable::new(
