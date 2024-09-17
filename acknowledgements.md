@@ -36,7 +36,7 @@ github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.19.0/LICENSE, MIT
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
 go.uber.org/multierr, https://github.com/uber-go/multierr/blob/v1.10.0/LICENSE.txt, MIT
 go.uber.org/zap, https://github.com/uber-go/zap/blob/v1.27.0/LICENSE, MIT
-golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.20.0:LICENSE, BSD-3-Clause
+golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.21.0:LICENSE, BSD-3-Clause
 golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.24.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.17.0:LICENSE, BSD-3-Clause
 gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.67.0/LICENSE, Apache-2.0
@@ -48,7 +48,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ansi_term 0.12.1, MIT 
   <br/>https://github.com/ogham/rust-ansi-term
 
-- anyhow 1.0.86, Apache-2.0 OR MIT 
+- anyhow 1.0.87, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/anyhow
 
 - arrow 52.2.0, Apache-2.0 
@@ -186,7 +186,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - either 1.13.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- fundu 2.0.0, MIT 
+- fundu 2.0.1, MIT 
   <br/>https://github.com/fundu-rs/fundu
 
 - futures 0.3.30, Apache-2.0 OR MIT 
@@ -197,6 +197,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - graph-rs-sdk 2.0.1, MIT 
   <br/>https://github.com/sreeise/graph-rs-sdk
+
+- graphql-parser 0.4.0, Apache-2.0 OR MIT 
+  <br/>
 
 - headers-accept 0.1.3, MIT 
   <br/>https://github.com/maxcountryman/headers-accept
