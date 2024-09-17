@@ -286,24 +286,26 @@ async fn run_query_and_record_result(
 
         match res {
             Ok(records) => {
-                let num_rows = records
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>();
+                // Show the first 10 records of the result from the first iteration
+                if idx == 0 {
+                    let num_rows = records
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum::<usize>();
+                    let limited_records = records
+                        .iter()
+                        .take(1)
+                        .map(|x| x.slice(0, x.num_rows().min(10)))
+                        .collect::<Vec<_>>();
 
-                // Show the first 30 records of the result
-                let limited_records = records
-                    .iter()
-                    .take(1)
-                    .map(|x| x.slice(0, x.num_rows().min(30)))
-                    .collect::<Vec<_>>();
+                    let records_pretty =
+                        arrow::util::pretty::pretty_format_batches(&limited_records)
+                            .map_err(|e| e.to_string())?;
 
-                let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)
-                    .map_err(|e| e.to_string())?;
-
-                tracing::info!(
+                    tracing::info!(
                     "Query `{connector}` `{query_name}` iteration {idx} returned {num_rows} rows:\n{records_pretty}",
                 );
+                }
             }
             Err(e) => {
                 tracing::error!(
