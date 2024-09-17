@@ -137,13 +137,7 @@ impl GraphQL {
         )?;
 
         // If json_pointer isn't provided, default to the root of the response
-        let json_pointer: Arc<str> = self
-            .params
-            .get("json_pointer")
-            .expose()
-            .ok()
-            .unwrap_or_default()
-            .into();
+        let json_pointer: Option<&str> = self.params.get("json_pointer").expose().ok();
 
         let unnest_depth = self
             .params
@@ -165,7 +159,7 @@ impl GraphQL {
                 source: e,
             })?;
 
-        Ok(GraphQLClient::new(
+        GraphQLClient::new(
             client,
             endpoint,
             query,
@@ -175,7 +169,11 @@ impl GraphQL {
             pass,
             unnest_depth,
             None,
-        ))
+        )
+        .boxed()
+        .context(super::InternalWithSourceSnafu {
+            dataconnector: "graphql".to_string(),
+        })
     }
 }
 

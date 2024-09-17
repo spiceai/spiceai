@@ -21,6 +21,7 @@ use futures::TryStreamExt;
 use runtime::{status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
+use spicepod::component::dataset::Dataset;
 use spicepod::component::params::Params;
 use std::{collections::HashMap, sync::Arc};
 
@@ -28,13 +29,12 @@ use crate::{
     get_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params, get_random_port},
     runtime_ready_check,
-    s3::get_s3_dataset,
 };
 
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let port: usize = get_random_port();
     let running_container = common::start_postgres_docker_container(port).await?;
 
@@ -43,7 +43,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut dataset = get_s3_dataset();
+    let mut dataset = Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal");
     dataset.acceleration = Some(Acceleration {
         params: Some(Params::from_string_map(
             get_pg_params(port)
@@ -54,7 +54,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
         enabled: true,
         engine: Some("postgres".to_string()),
         refresh_mode: Some(RefreshMode::Full),
-        refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        refresh_sql: Some("SELECT * FROM decimal".to_string()),
         ..Acceleration::default()
     });
 
@@ -80,8 +80,9 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     }
 
     runtime_ready_check(&rt).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     drop(rt);
+    runtime::dataaccelerator::clear_registry().await;
+    runtime::dataaccelerator::register_all().await;
 
     let db_conn = pool.connect().await.expect("connection can be established");
     let result = db_conn
@@ -100,6 +101,20 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
     let pretty = arrow::util::pretty::pretty_format_batches(&result).expect("pretty print");
     insta::assert_snapshot!(pretty);
+
+    let decimal_result = db_conn
+        .as_async()
+        .expect("async connection")
+        .query_arrow("SELECT * FROM decimal ORDER BY id", &[], None)
+        .await
+        .expect("query arrow")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("try collect");
+
+    let pretty_decimal =
+        arrow::util::pretty::pretty_format_batches(&decimal_result).expect("pretty print");
+    insta::assert_snapshot!(pretty_decimal);
 
     running_container.remove().await?;
 

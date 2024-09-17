@@ -46,17 +46,14 @@ pub struct Github {
     params: Parameters,
 }
 
-pub type GraphQLQuery = Arc<str>;
-pub type JSONPointer = Arc<str>;
-pub type UnnestDepth = usize;
-
 pub struct GitHubTableGraphQLParams {
     /// The GraphQL query string
-    query: GraphQLQuery,
-    /// The JSON pointer to the data in the response
-    json_pointer: JSONPointer,
+    query: Arc<str>,
+
+    /// The JSON pointer to the data in the response. If not provided, it will be inferred from the query.
+    json_pointer: Option<&'static str>,
     /// The depth to unnest the data
-    unnest_depth: UnnestDepth,
+    unnest_depth: usize,
     /// The GraphQL schema of the response data, if available
     schema: Option<SchemaRef>,
 }
@@ -64,9 +61,9 @@ pub struct GitHubTableGraphQLParams {
 impl GitHubTableGraphQLParams {
     #[must_use]
     pub fn new(
-        query: GraphQLQuery,
-        json_pointer: JSONPointer,
-        unnest_depth: UnnestDepth,
+        query: Arc<str>,
+        json_pointer: Option<&'static str>,
+        unnest_depth: usize,
         schema: Option<SchemaRef>,
     ) -> Self {
         Self {
@@ -97,7 +94,7 @@ impl Github {
 
         let gql_client_params = tbl.get_graphql_values();
 
-        Ok(GraphQLClient::new(
+        GraphQLClient::new(
             client,
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
             gql_client_params.query,
@@ -107,7 +104,8 @@ impl Github {
             None,
             gql_client_params.unnest_depth,
             gql_client_params.schema,
-        ))
+        )
+        .boxed()
     }
 
     async fn create_gql_table_provider(

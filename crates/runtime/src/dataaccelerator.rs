@@ -94,6 +94,11 @@ pub async fn register_all() {
     register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new())).await;
 }
 
+pub async fn clear_registry() {
+    let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
+    registry.clear();
+}
+
 pub async fn get_accelerator_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
     let guard = DATA_ACCELERATOR_ENGINES.lock().await;
 

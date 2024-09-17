@@ -1,13 +1,19 @@
 use super::{DebeziumKafkaMetadata, DebeziumKafkaSys, Result, DEBEZIUM_KAFKA_TABLE_NAME};
 use data_components::debezium::change_event;
-use tokio_rusqlite::Connection;
+use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
+};
 
 impl DebeziumKafkaSys {
     pub(super) async fn upsert_sqlite(
         &self,
-        conn: &Connection,
+        pool: &SqliteConnectionPool,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
@@ -16,9 +22,10 @@ impl DebeziumKafkaSys {
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(|e| e.to_string())?;
 
-        conn.call(move |conn| {
-            let create_table = format!(
-                "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
+        conn.conn
+            .call(move |conn| {
+                let create_table = format!(
+                    "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
                     dataset_name TEXT PRIMARY KEY,
                     consumer_group_id TEXT,
                     topic TEXT,
@@ -27,11 +34,11 @@ impl DebeziumKafkaSys {
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )"
-            );
-            conn.execute(&create_table, [])?;
+                );
+                conn.execute(&create_table, [])?;
 
-            let upsert = format!(
-                "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
+                let upsert = format!(
+                    "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
                  (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
                  ON CONFLICT (dataset_name) DO UPDATE SET
@@ -40,28 +47,34 @@ impl DebeziumKafkaSys {
                     primary_keys = ?4,
                     schema_fields = ?5,
                     updated_at = CURRENT_TIMESTAMP"
-            );
+                );
 
-            conn.execute(
-                &upsert,
-                [
-                    dataset_name,
-                    consumer_group_id,
-                    topic,
-                    primary_keys,
-                    schema_fields,
-                ],
-            )?;
+                conn.execute(
+                    &upsert,
+                    [
+                        dataset_name,
+                        consumer_group_id,
+                        topic,
+                        primary_keys,
+                        schema_fields,
+                    ],
+                )?;
 
-            Ok(())
-        })
-        .await
-        .map_err(|e| e.to_string().into())
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string().into())
     }
 
-    pub(super) async fn get_sqlite(&self, conn: &Connection) -> Option<DebeziumKafkaMetadata> {
+    pub(super) async fn get_sqlite(
+        &self,
+        pool: &SqliteConnectionPool,
+    ) -> Option<DebeziumKafkaMetadata> {
         let dataset_name = self.dataset_name.clone();
-        conn.call(move |conn| {
+        let conn_sync = pool.connect_sync();
+        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        conn.conn
+            .call(move |conn| {
             let query = format!(
                 "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
             );

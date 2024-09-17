@@ -20,7 +20,6 @@ use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 impl DatasetCheckpoint {
-    #[expect(dead_code)]
     pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -36,7 +35,6 @@ impl DatasetCheckpoint {
         Ok(rows.next().map_err(|e| e.to_string())?.is_some())
     }
 
-    #[expect(dead_code)]
     pub(super) fn checkpoint_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -84,9 +82,7 @@ mod tests {
         }
     }
 
-    // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
     #[tokio::test]
-    #[ignore]
     async fn test_duckdb_checkpoint_exists() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 
@@ -103,9 +99,7 @@ mod tests {
         assert!(checkpoint.exists().await);
     }
 
-    // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
     #[tokio::test]
-    #[ignore]
     async fn test_duckdb_checkpoint_update() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 

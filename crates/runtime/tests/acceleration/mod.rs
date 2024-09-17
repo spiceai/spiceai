@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::LazyLock;
+
 use spicepod::component::{dataset::acceleration::Mode, params::Params};
+use tokio::sync::Mutex;
 
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
@@ -25,6 +28,12 @@ mod checkpoint_sqlite;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
 mod query_push_down;
+#[cfg(feature = "duckdb")]
+mod single_instance_duckdb;
+
+// Several acceleration tests need to use shared state from the acceleration registry.
+// To avoid race conditions, use a mutex to ensure that the acceleration tests are run serially.
+static ACCELERATION_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);

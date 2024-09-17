@@ -34,6 +34,7 @@ use super::get_params;
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let port: usize = 20963;
     let running_container = common::start_postgres_docker_container(port).await?;
 
