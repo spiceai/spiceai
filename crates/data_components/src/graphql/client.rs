@@ -21,8 +21,8 @@ use arrow::{
     json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
 };
 use graphql_parser::query::{
-    parse_query, Definition, Document, Field, InlineFragment, OperationDefinition, Query,
-    Selection, SelectionSet, Text,
+    parse_query, Definition, Field, InlineFragment, OperationDefinition, Query, Selection,
+    SelectionSet, Text,
 };
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
@@ -193,74 +193,62 @@ impl PaginationParameters {
         l.saturating_sub(self.args.size())
     }
 
-    fn parse(query: &str) -> Option<Self> {
-        // Recursive function to traverse the AST and find the pageInfo field
-        fn find_in_selection_set<'a, T: Text<'a> + std::fmt::Debug>(
-            selections: &[Selection<'a, T>],
-            current_path: &str,
-            parent_field: Option<&Field<'a, T>>,
-        ) -> Option<PaginationParameters> {
-            tracing::debug!(
-                "For PaginationParameters, searching json_pointer path: {current_path}"
-            );
-            for selection in selections {
-                match selection {
-                    graphql_parser::query::Selection::FragmentSpread(_) => continue,
-                    graphql_parser::query::Selection::InlineFragment(InlineFragment {
-                        selection_set,
-                        ..
-                    }) => {
-                        if let Some(solution) =
-                            find_in_selection_set(&selection_set.items, current_path, parent_field)
-                        {
-                            return Some(solution);
-                        }
-                    }
-                    graphql_parser::query::Selection::Field(field) => {
-                        let field_name = format!("{:?}", field.name).replace('"', "");
-                        let new_path = format!("{current_path}/{field_name}");
-
-                        // End of recursion, `pageInfo` field found
-                        if field_name == "pageInfo" {
-                            tracing::debug!(
-                                "For PaginationParameters, found `pageInfo` at {new_path}"
-                            );
-                            let Some(parent_field) = parent_field else {
-                                tracing::warn!("Invalid parent field");
-                                return None;
-                            };
-
-                            match parent_field.try_into() {
-                                Ok(pag_arg) => {
-                                    return Some(PaginationParameters {
-                                        resource_name: format!("{:?}", parent_field.name)
-                                            .replace('"', ""),
-                                        args: pag_arg,
-                                        page_info_path: Some(new_path),
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Invalid pagination argument: {e}");
-                                    return None;
-                                }
-                            }
-                        }
-
-                        // Recurse into nested selection sets
-                        if let Some(solution) = find_in_selection_set(
-                            &field.selection_set.items,
-                            &new_path,
-                            Some(field),
-                        ) {
-                            return Some(solution);
-                        }
-                    }
-                }
-            }
-            None
-        }
-
-        let ast: Document<String> = parse_query(query).ok()?;
+    /// Parses the GraphQL query and returns the appropriate [`PaginationParameters`] if the query
+    /// contains a `pageInfo` field (and therefore involved pagination). Alongside the parameters,
+    /// it also infers the standard JSON pointer to the paginated data as expected when
+    /// [streaming over HTTP](https://graphql.org/learn/serving-over-http/#response).
+    ///
+    /// If the query does not contain a `pageInfo` field, it returns `None` and cannot infer the JSON pointer.
+    ///
+    /// The GraphQL query should be the only other field at the depth of the `pageInfo` field.
+    ///
+    /// ### Example:
+    ///
+    /// **Valid**:
+    /// ```graphql
+    /// query {
+    ///    users(first: 10) {
+    ///      node {
+    ///        id
+    ///        name
+    ///        email   
+    ///      }
+    ///      pageInfo {
+    ///        hasNextPage
+    ///        endCursor
+    ///      }
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// **Invalid**:
+    /// ```graphql
+    /// query {
+    ///    users(first: 10) {
+    ///      node {
+    ///        id
+    ///        name
+    ///        email   
+    ///      }
+    ///      edges {
+    ///        friends {
+    ///          id
+    ///          name
+    ///      }
+    ///      pageInfo {
+    ///        hasNextPage
+    ///        endCursor
+    ///      }
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// A user must explicitly provider the JSON pointer for the latter example (e.g. when calling [`GraphQLClient::new`]).
+    ///
+    fn parse(query: &str) -> (Option<Self>, Option<String>) {
+        let Some(ast) = parse_query::<String>(query).ok() else {
+            return (None, None);
+        };
 
         // Start traversing the query's operation definitions
         for def in ast.definitions {
@@ -275,11 +263,101 @@ impl PaginationParameters {
                 _ => continue,
             };
 
-            if let Some(found_path) = find_in_selection_set(&selections, "", None) {
-                return Some(found_path);
+            if let (Some(found_path), inferred_json_pointer) =
+                Self::find_in_selection_set(&selections, "", None)
+            {
+                return (Some(found_path), inferred_json_pointer);
             }
         }
-        None
+        (None, None)
+    }
+
+    // Recursive function to traverse the AST and find the pageInfo field
+    fn find_in_selection_set<'a, T: Text<'a> + std::fmt::Debug>(
+        selections: &[Selection<'a, T>],
+        current_path: &str,
+        parent_field: Option<&Field<'a, T>>,
+    ) -> (Option<PaginationParameters>, Option<String>) {
+        tracing::trace!("For PaginationParameters, searching json_pointer path: {current_path}");
+        for selection in selections {
+            match selection {
+                graphql_parser::query::Selection::FragmentSpread(_) => continue,
+                graphql_parser::query::Selection::InlineFragment(InlineFragment {
+                    selection_set,
+                    ..
+                }) => {
+                    if let (Some(solution), inferred_json_pointer) = Self::find_in_selection_set(
+                        &selection_set.items,
+                        current_path,
+                        parent_field,
+                    ) {
+                        return (Some(solution), inferred_json_pointer);
+                    }
+                }
+                graphql_parser::query::Selection::Field(field) => {
+                    let field_name = format!("{:?}", field.name).replace('"', "");
+                    let new_path = format!("{current_path}/{field_name}");
+
+                    // End of recursion, `pageInfo` field found
+                    if field_name == "pageInfo" {
+                        tracing::debug!("For PaginationParameters, found `pageInfo` at {new_path}");
+                        let Some(parent_field) = parent_field else {
+                            tracing::warn!("Invalid parent field");
+                            return (None, None);
+                        };
+
+                        // Find the JSON pointer to the data field next to the `pageInfo` field.
+                        let data_field = selections.iter().find_map(|s| match s {
+                            Selection::Field(f) => {
+                                if f.name == "pageInfo".into() {
+                                    None
+                                } else {
+                                    Some(f)
+                                }
+                            }
+                            _ => None,
+                        });
+
+                        if data_field.is_none() {
+                            tracing::debug!(
+                                "No appropriate data field found next to pageInfo field."
+                            );
+                        }
+
+                        let json_pointer = data_field
+                            .map(|f| format!("/data{current_path}/{:?}", f.name).replace('"', ""));
+
+                        match parent_field.try_into() {
+                            Ok(pag_arg) => {
+                                return (
+                                    Some(PaginationParameters {
+                                        resource_name: format!("{:?}", parent_field.name)
+                                            .replace('"', ""),
+                                        args: pag_arg,
+                                        page_info_path: Some(new_path),
+                                    }),
+                                    json_pointer,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("Invalid pagination argument: {e}");
+                                return (None, None);
+                            }
+                        }
+                    }
+
+                    // Recurse into nested selection sets
+                    if let (Some(solution), inferred_json_pointer) = Self::find_in_selection_set(
+                        &field.selection_set.items,
+                        &new_path,
+                        Some(field),
+                    ) {
+                        return (Some(solution), inferred_json_pointer);
+                    }
+                }
+            }
+        }
+        (None, None)
     }
 
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
@@ -430,21 +508,20 @@ pub struct GraphQLClient {
 
 impl GraphQLClient {
     #[allow(clippy::too_many_arguments)]
-    #[must_use]
     pub fn new(
         client: reqwest::Client,
         endpoint: Url,
         query: Arc<str>,
-        json_pointer: Arc<str>,
+        json_pointer: Option<&str>,
         token: Option<&str>,
         user: Option<String>,
         pass: Option<String>,
         unnest_depth: usize,
         schema: Option<SchemaRef>,
-    ) -> Self {
-        let pagination_parameters = PaginationParameters::parse(&query);
+    ) -> Result<Self> {
+        let (pagination_parameters, inferred_json_pointer) = PaginationParameters::parse(&query);
         tracing::debug!(
-            "Parsed pagination parameters for {:?}: {pagination_parameters:?}",
+            "Parsed pagination parameters for {:?}: {pagination_parameters:?}. Inferred JSON pointer: {inferred_json_pointer:?}",
             endpoint.to_string()
         );
 
@@ -459,16 +536,20 @@ impl GraphQLClient {
             duplicate_behavior: DuplicateBehavior::Error,
         };
 
-        Self {
+        let Some(pointer) = json_pointer.or(inferred_json_pointer.as_deref()) else {
+            return Err(Error::NoJsonPointerFound {});
+        };
+
+        Ok(Self {
             client,
             endpoint,
             query,
-            pointer: json_pointer,
+            pointer: pointer.into(),
             unnest_parameters,
             pagination_parameters,
             auth,
             schema,
-        }
+        })
     }
 
     pub(crate) async fn execute(
@@ -698,7 +779,7 @@ mod tests {
     struct TestPaginationParseCase {
         name: &'static str,
         query: &'static str,
-        expected: Option<PaginationParameters>,
+        expected: (Option<PaginationParameters>, Option<String>),
     }
 
     #[test]
@@ -717,11 +798,14 @@ mod tests {
                         }
                     }
                 "#,
-                expected: Some(PaginationParameters {
-                    resource_name: "users".to_owned(),
-                    args: super::PaginationArgument::First(10),
-                    page_info_path: Some("/users/pageInfo".into()),
-                }),
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "users".to_owned(),
+                        args: super::PaginationArgument::First(10),
+                        page_info_path: Some("/users/pageInfo".into()),
+                    }),
+                    None,
+                ),
             },
             TestPaginationParseCase {
                 name: "Query with reversed pageInfo fields",
@@ -735,11 +819,14 @@ mod tests {
                         }
                     }
                 "#,
-                expected: Some(PaginationParameters {
-                    resource_name: "users".to_owned(),
-                    args: super::PaginationArgument::First(10),
-                    page_info_path: Some("/users/pageInfo".into()),
-                }),
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "users".to_owned(),
+                        args: super::PaginationArgument::First(10),
+                        page_info_path: Some("/users/pageInfo".into()),
+                    }),
+                    None,
+                ),
             },
             TestPaginationParseCase {
                 name: "Query without pageInfo",
@@ -750,7 +837,7 @@ mod tests {
                         }
                     }
                 "#,
-                expected: None,
+                expected: (None, None),
             },
             TestPaginationParseCase {
                 name: "Nested query with pageInfo",
@@ -773,11 +860,14 @@ mod tests {
                         }
                     }
                 "#,
-                expected: Some(PaginationParameters {
-                    resource_name: "paginatedUsers".to_owned(),
-                    args: super::PaginationArgument::First(2),
-                    page_info_path: Some("/paginatedUsers/pageInfo".to_owned()),
-                }),
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "paginatedUsers".to_owned(),
+                        args: super::PaginationArgument::First(2),
+                        page_info_path: Some("/paginatedUsers/pageInfo".to_owned()),
+                    }),
+                    Some("/data/paginatedUsers/users".into()),
+                ),
             },
         ];
 
@@ -798,8 +888,9 @@ mod tests {
                 }
             }
         }";
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
         let pagination_parameters =
-            PaginationParameters::parse(query).expect("Failed to get pagination params");
+            pagination_parameters_opt.expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -823,8 +914,9 @@ mod tests {
                 }
             }
         }"#;
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
         let pagination_parameters =
-            PaginationParameters::parse(query).expect("Failed to get pagination params");
+            pagination_parameters_opt.expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -848,8 +940,9 @@ mod tests {
                 }
             }
         }";
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
         let pagination_parameters =
-            PaginationParameters::parse(query).expect("Failed to get pagination params");
+            pagination_parameters_opt.expect("Failed to get pagination params");
         let (new_query, limit_reached) =
             pagination_parameters.apply(query, Some(5), Some("new_cursor".to_string()));
         let expected_query = r#"query {
@@ -877,8 +970,9 @@ mod tests {
                 }
             }
         }";
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
         let pagination_parameters =
-            PaginationParameters::parse(query).expect("Failed to get pagination params");
+            pagination_parameters_opt.expect("Failed to get pagination params");
 
         let response = serde_json::from_str(
             r#"{
@@ -911,8 +1005,9 @@ mod tests {
                 }
             }
         }";
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
         let pagination_parameters =
-            PaginationParameters::parse(query).expect("Failed to get pagination params");
+            pagination_parameters_opt.expect("Failed to get pagination params");
 
         let response = serde_json::from_str(
             r#"{
