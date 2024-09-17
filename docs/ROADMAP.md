@@ -50,17 +50,19 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `s3`            | Stable |
 | `odbc`          | Stable |
 | `mysql`         | Stable |
+| `file`          | Stable |
 | `duckdb`        | Beta   |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |
 | `http`, `https` | Beta   |
 | `graphql`       | Beta   |
+| `github`        | Beta   |
 | `clickhouse`    | Alpha  |
 | `dremio`        | Alpha  |
 | `flightsql`     | Alpha  |
 | `debezium`      | Alpha  |
-| `github`        | Alpha  |
+| `sharepoint`    | Alpha  |
 
 ## v1.1 (Nov 2024)
 
