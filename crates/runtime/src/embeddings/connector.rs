@@ -56,6 +56,16 @@ impl EmbeddingConnector {
             return Ok(inner_table_provider);
         }
 
+        // Runtime isn't built with model support, but user specified a dataset to use embeddings.
+        if !cfg!(feature = "models") {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: dataset.source(),
+                message: format!(
+                "Dataset '{}' expects to use an embedding model, but the runtime is not built with model support. Either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.",
+                dataset.name
+            )});
+        }
+
         let embed_columns: HashMap<String, String, _> = dataset
             .embeddings
             .iter()
@@ -66,9 +76,9 @@ impl EmbeddingConnector {
         for (column, model) in &embed_columns {
             if !self.embedding_models.read().await.contains_key(model) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "File".to_string(),
+                    dataconnector: "EmbeddingConnector".to_string(),
                     message: format!(
-                    "Dataset '{}' expects to use embedding model '{model}' to embed column '{column}', but the model is not found.\nEither '{model}' is not defined in Spicepod (as an 'embeddings'), or the runtime does not have model support. For the latter, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.",
+                    "Dataset '{}' expects to use embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').",
                     dataset.name
                 )});
             }
