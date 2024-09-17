@@ -61,12 +61,12 @@ datafusion-execution = "41"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b6682948d07cc3155edb3dfbf03f8b55570fc1d2" }
 datafusion-functions-json = "0.41"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "54dbc188992b2093de11efe18c68e3e295cdecf3" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "d43347c873e0239302acc8614ccbe322ca8094a0" }
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
-globset = "0.4.14"
+globset = "0.4.15"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 insta = { version = "1.40.0", features = ["filters"] }
 itertools = "0.13"
@@ -99,7 +99,7 @@ tokio = { version = "1.39.3", features = [
   "signal",
   "macros",
 ] }
-tokio-postgres = { version = "0.7.10", features = [
+tokio-postgres = { version = "0.7.12", features = [
   "with-chrono-0_4",
   "with-uuid-1",
 ] }

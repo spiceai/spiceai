@@ -31,13 +31,12 @@ use crate::{init_tracing, wait_until_true};
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
-    use std::sync::Arc;
-
-    use runtime::status;
-
     use crate::get_test_datafusion;
     use crate::postgres::common;
+    use runtime::status;
+    use std::sync::Arc;
 
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = 20962;
     let running_container = common::start_postgres_docker_container(port).await?;

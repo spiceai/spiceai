@@ -20,8 +20,10 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load system TLS certificate: {source}"))]
-    FailedToLoadCerts { source: std::io::Error },
+    #[snafu(display("Unable to load all system TLS certificates: {errors:?}"))]
+    FailedToLoadCerts {
+        errors: Vec<rustls_native_certs::Error>,
+    },
 
     #[snafu(display("Unable to convert PEMs to string: {source}"))]
     FailedToConvertPems { source: std::string::FromUtf8Error },
@@ -39,9 +41,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///     - It couldn't convert the PEMs to a string.
 pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     // Load root certificates found in the platform's native certificate store.
-    let certs = rustls_native_certs::load_native_certs().context(FailedToLoadCertsSnafu)?;
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        return Err(Error::FailedToLoadCerts {
+            errors: cert_result.errors,
+        });
+    }
 
-    let concatenated_pems = certs
+    let concatenated_pems = cert_result
+        .certs
         .iter()
         .filter_map(|cert| {
             let mut buf = cert.as_ref();
