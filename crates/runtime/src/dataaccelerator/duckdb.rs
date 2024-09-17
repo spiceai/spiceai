@@ -109,6 +109,7 @@ impl DuckDBAccelerator {
         )
     }
 
+    /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
     pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<DuckDbConnectionPool> {
         let duckdb_file = self.duckdb_file_path(dataset);
 
