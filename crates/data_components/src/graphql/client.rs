@@ -171,14 +171,16 @@ impl PaginationArgument {
         let mut end_cursor = false;
 
         // Find which values are present in the pageInfo field
-        f.selection_set.items.iter().for_each(|s| if let Selection::Field(f) = s {
-            let field_name = format!("{:?}", f.name).replace('"', "");
-            match field_name.as_str() {
-                "hasNextPage" => has_next_page = true,
-                "hasPreviousPage" => has_previous_page = true,
-                "startCursor" => start_cursor = true,
-                "endCursor" => end_cursor = true,
-                _ => (),
+        f.selection_set.items.iter().for_each(|s| {
+            if let Selection::Field(f) = s {
+                let field_name = format!("{:?}", f.name).replace('"', "");
+                match field_name.as_str() {
+                    "hasNextPage" => has_next_page = true,
+                    "hasPreviousPage" => has_previous_page = true,
+                    "startCursor" => start_cursor = true,
+                    "endCursor" => end_cursor = true,
+                    _ => (),
+                }
             }
         });
 
