@@ -179,10 +179,10 @@ fn resolve_local_db_file_path(
         ));
     }
 
-    match engine {
-        "duckdb" => Ok(format!("{}/lineitem.db", spice_data_base_path())),
-        _ => Ok(format!("{}/lineitem_{engine}.db", spice_data_base_path())),
-    }
+    Ok(format!(
+        "{}/accelerated_{engine}.db",
+        spice_data_base_path()
+    ))
 }
 
 async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow::Error> {
