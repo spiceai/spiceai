@@ -33,9 +33,7 @@ fn get_dataset() -> Dataset {
     Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal")
 }
 
-// Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
 #[tokio::test]
-#[ignore]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _guard = super::ACCELERATION_MUTEX.lock().await;
