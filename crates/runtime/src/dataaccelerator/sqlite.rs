@@ -63,8 +63,11 @@ pub enum Error {
         extension: String,
     },
 
-    #[snafu(display("The \"duckdb_file\" acceleration parameter is a directory."))]
+    #[snafu(display("The \"sqlite_file\" acceleration parameter is a directory."))]
     InvalidFileIsDirectory,
+
+    #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
+    AccelerationNotEnabled { dataset: Arc<str> },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -101,8 +104,35 @@ impl SqliteAccelerator {
 
         Some(
             self.sqlite_factory
-                .sqlite_file_path(&dataset.name.to_string(), &acceleration_params),
+                .sqlite_file_path("accelerated", &acceleration_params),
         )
+    }
+
+    /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
+    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
+        let sqlite_file = self.sqlite_file_path(dataset);
+
+        let acceleration = dataset
+            .acceleration
+            .as_ref()
+            .context(AccelerationNotEnabledSnafu {
+                dataset: dataset.name.to_string(),
+            })?;
+
+        let mode = match acceleration.mode {
+            Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
+            Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
+        };
+        let file_path: Arc<str> = sqlite_file.map_or_else(|| "".into(), Arc::from);
+
+        let pool = self
+            .sqlite_factory
+            .get_or_init_instance(file_path, mode)
+            .await
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)?;
+
+        Ok(pool)
     }
 }
 
@@ -193,6 +223,15 @@ impl DataAccelerator for SqliteAccelerator {
         let mut cmd = cmd.clone();
 
         if let Some(this_dataset) = dataset {
+            // If the user didn't specify a SQLite file and this is a file-mode SQLite,
+            // then use the shared SQLite file `accelerated_sqlite.db`
+            if !cmd.options.contains_key("file") && this_dataset.is_file_accelerated() {
+                let sqlite_file = self.sqlite_file_path(this_dataset);
+                if let Some(sqlite_file) = sqlite_file {
+                    cmd.options.insert("file".to_string(), sqlite_file);
+                }
+            }
+
             if let Some(app) = &this_dataset.app {
                 let datasets =
                     Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
