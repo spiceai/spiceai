@@ -34,6 +34,9 @@ pub enum Error {
     #[snafu(display("JSON pointer could not be inferred, and none provided"))]
     NoJsonPointerFound {},
 
+    #[snafu(display("Invalid GraphQL 'json_pointer': '{pointer}'"))]
+    InvalidJsonPointer { pointer: String },
+
     #[snafu(display("{source}"))]
     ArrowInternal { source: ArrowError },
 

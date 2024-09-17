@@ -578,7 +578,9 @@ impl GraphQLClient {
 
         let extracted_data = response
             .pointer(&self.pointer)
-            .unwrap_or(&Value::Null)
+            .ok_or(Error::InvalidJsonPointer {
+                pointer: self.pointer.to_string(),
+            })?
             .to_owned();
 
         let next_cursor = if limit_reached {
@@ -592,11 +594,8 @@ impl GraphQLClient {
         let mut unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
             obj @ Value::Object(_) => Ok(vec![obj]),
-            Value::Null => Err(Error::InvalidObjectAccess {
-                message: "Null value access.".to_string(),
-            }),
             _ => Err(Error::InvalidObjectAccess {
-                message: "Primitive value access.".to_string(),
+                message: format!("GraphQL response has unexpected format. Response {response:?}"),
             }),
         }?;
 
