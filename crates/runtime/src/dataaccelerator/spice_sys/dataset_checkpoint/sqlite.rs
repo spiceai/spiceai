@@ -15,58 +15,75 @@ limitations under the License.
 */
 
 use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
-use tokio_rusqlite::Connection;
+use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
+};
 
 impl DatasetCheckpoint {
-    pub(super) async fn exists_sqlite(&self, conn: &Connection) -> Result<bool> {
+    pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
         let dataset_name = self.dataset_name.clone();
-        conn.call(move |conn| {
-            let query =
-                format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
-            let mut stmt = conn.prepare(&query)?;
-            let mut rows = stmt.query([dataset_name])?;
-            Ok(rows.next()?.is_some())
-        })
-        .await
-        .map_err(|e| e.to_string().into())
+        conn.conn
+            .call(move |conn| {
+                let query =
+                    format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([dataset_name])?;
+                Ok(rows.next()?.is_some())
+            })
+            .await
+            .map_err(|e| e.to_string().into())
     }
 
-    pub(super) async fn checkpoint_sqlite(&self, conn: &Connection) -> Result<()> {
+    pub(super) async fn checkpoint_sqlite(&self, pool: &SqliteConnectionPool) -> Result<()> {
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
         let dataset_name = self.dataset_name.clone();
-        conn.call(move |conn| {
-            let create_table = format!(
-                "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
+        conn.conn
+            .call(move |conn| {
+                let create_table = format!(
+                    "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
                     dataset_name TEXT PRIMARY KEY,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )"
-            );
-            conn.execute(&create_table, [])?;
+                );
+                conn.execute(&create_table, [])?;
 
-            let upsert = format!(
-                "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at)
+                let upsert = format!(
+                    "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at)
                  VALUES (?1, CURRENT_TIMESTAMP)
                  ON CONFLICT (dataset_name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP"
-            );
-            conn.execute(&upsert, [dataset_name])?;
+                );
+                conn.execute(&upsert, [dataset_name])?;
 
-            Ok(())
-        })
-        .await
-        .map_err(|e| e.to_string().into())
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string().into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use datafusion_table_providers::sql::db_connection_pool::{
+        sqlitepool::SqliteConnectionPoolFactory, Mode,
+    };
+
     use crate::dataaccelerator::spice_sys::AccelerationConnection;
 
     use super::*;
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
-        let conn = Connection::open_in_memory()
+        let conn = SqliteConnectionPoolFactory::new("", Mode::Memory)
+            .build()
             .await
-            .expect("Failed to open in-memory SQLite database");
+            .expect("to build in-memory sqlite connection pool");
         DatasetCheckpoint {
             dataset_name: "test_dataset".to_string(),
             acceleration_connection: AccelerationConnection::SQLite(conn),
@@ -110,10 +127,15 @@ mod tests {
             .expect("Failed to update checkpoint");
 
         // Verify that the updated_at timestamp has changed
-        let AccelerationConnection::SQLite(conn) = &checkpoint.acceleration_connection else {
+        let AccelerationConnection::SQLite(pool) = &checkpoint.acceleration_connection else {
             panic!("Unexpected acceleration connection type");
         };
-        let result = conn
+        let conn_sync = pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        let result = conn.conn
             .call(move |conn| {
                 let query = format!(
                     "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
