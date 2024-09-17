@@ -290,7 +290,7 @@ async fn run_query_and_record_result(
 
     let mut completed_iterations = 0;
 
-    for _ in 0..benchmark_results.iterations() {
+    for idx in 0..benchmark_results.iterations() {
         completed_iterations += 1;
 
         let start_iter_time = get_current_unix_ms();
@@ -306,9 +306,36 @@ async fn run_query_and_record_result(
             max_iter_duration_ms = iter_duration_ms;
         }
 
-        if let Err(e) = res {
-            query_err = Some(e);
-            break;
+        match res {
+            Ok(records) => {
+                // Show the first 10 records of the result from the first iteration
+                if idx == 0 {
+                    let num_rows = records
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum::<usize>();
+                    let limited_records = records
+                        .iter()
+                        .take(1)
+                        .map(|x| x.slice(0, x.num_rows().min(10)))
+                        .collect::<Vec<_>>();
+
+                    let records_pretty =
+                        arrow::util::pretty::pretty_format_batches(&limited_records)
+                            .map_err(|e| e.to_string())?;
+
+                    tracing::info!(
+                    "Query `{connector}` `{query_name}` iteration {idx} returned {num_rows} rows:\n{records_pretty}",
+                );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Query `{connector}` `{query_name}` iteration {idx} failed with error: \n{e}",
+                );
+                query_err = Some(e);
+                break;
+            }
         }
     }
 
@@ -353,8 +380,8 @@ async fn run_query(
     connector: &str,
     query_name: &str,
     query: &str,
-) -> Result<(), String> {
-    let _ = rt
+) -> Result<Vec<RecordBatch>, String> {
+    let res = rt
         .datafusion()
         .ctx
         .sql(query)
@@ -364,7 +391,7 @@ async fn run_query(
         .await
         .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
-    Ok(())
+    Ok(res)
 }
 
 const ENABLED_SNAPSHOT_CONNECTORS: &[&str] = &["spice.ai", "s3", "s3_arrow_memory"];
