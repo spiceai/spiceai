@@ -44,6 +44,12 @@ use spicepod::component::params::Params as SpicepodParams;
 
 use tracing::instrument;
 
+#[cfg(feature = "duckdb")]
+mod duckdb;
+
+#[cfg(feature = "sqlite")]
+mod sqlite;
+
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let running_container = prepare_test_environment()
@@ -52,10 +58,10 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let running_container = Arc::new(running_container);
 
     let config = vec![
-        // #[cfg(feature = "duckdb")]
-        // ("duckdb", None),
-        // #[cfg(feature = "duckdb")]
-        // ("duckdb", Some("./.spice/my_duckdb.db")),
+        #[cfg(feature = "duckdb")]
+        ("duckdb", None),
+        #[cfg(feature = "duckdb")]
+        ("duckdb", Some("./.spice/my_duckdb.db")),
         #[cfg(feature = "sqlite")]
         ("sqlite", None),
         #[cfg(feature = "sqlite")]
@@ -66,7 +72,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
         tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
 
         if idx > 0 {
-            // Ensure the container is running as the tests manipulate the container
+            // Ensure the container is running as the tests manipulate it
             running_container
                 .start()
                 .await
@@ -150,6 +156,15 @@ async fn execute_spill_to_disk_and_rehydration(
 
     drop(rt);
 
+    let num_persisted_records: usize =
+        get_locally_persisted_records(engine, &accelerated_db_file_path, test_query)
+            .await?
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+
+    assert_eq!(num_rows_loaded, num_persisted_records);
+
     // Restart the runtime and ensure the loaded items remain consistent
     let rt = init_spice_app(engine, db_file_path).await?;
     // Do request immediately after restart w/o waiting for ready status (dataset is refreshed)
@@ -165,6 +180,23 @@ async fn execute_spill_to_disk_and_rehydration(
     assert_eq!(original_items, restart2_items);
 
     Ok(())
+}
+
+async fn get_locally_persisted_records(
+    engine: &str,
+    db_file_path: &str,
+    query: &str,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let query_result = match engine {
+        "duckdb" => duckdb::query_local_db(db_file_path, query).await?,
+        "sqlite" => sqlite::query_local_db(db_file_path, query).await?,
+        _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
+    };
+
+    query_result
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
 }
 
 fn resolve_local_db_file_path(
