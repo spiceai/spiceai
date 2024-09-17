@@ -66,10 +66,11 @@ pub enum Error {
     #[snafu(display(r#"The "duckdb_file" acceleration parameter is a directory."#))]
     InvalidFileIsDirectory,
 
-    #[snafu(display(
-        r#"The "duckdb_file" acceleration parameter "{path}" is not unique and in use by another dataset."#
-    ))]
-    InvalidFileInUse { path: String },
+    #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
+    AccelerationNotEnabled { dataset: Arc<str> },
+
+    #[snafu(display("Invalid DuckDB acceleration configuration: {detail}"))]
+    InvalidConfiguration { detail: Arc<str> },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -83,7 +84,7 @@ impl DuckDBAccelerator {
     pub fn new() -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new().access_mode(AccessMode::ReadWrite),
+            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite),
         }
     }
 
@@ -104,8 +105,49 @@ impl DuckDBAccelerator {
 
         Some(
             self.duckdb_factory
-                .duckdb_file_path(&dataset.name.to_string(), &mut params),
+                .duckdb_file_path("accelerated_duckdb", &mut params),
         )
+    }
+
+    /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
+    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<DuckDbConnectionPool> {
+        let duckdb_file = self.duckdb_file_path(dataset);
+
+        let acceleration = dataset
+            .acceleration
+            .as_ref()
+            .context(AccelerationNotEnabledSnafu {
+                dataset: dataset.name.to_string(),
+            })?;
+
+        let pool = match (acceleration.mode, duckdb_file) {
+            (Mode::File, Some(duckdb_file)) => self
+                .duckdb_factory
+                .get_or_init_file_instance(duckdb_file)
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?,
+            (Mode::Memory, None) => self
+                .duckdb_factory
+                .get_or_init_memory_instance()
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?,
+            (Mode::File, None) => {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from("duckdb_file parameter is required for file acceleration"),
+                })
+            }
+            (Mode::Memory, Some(_)) => {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "memory acceleration mode does not accept a duckdb_file parameter",
+                    ),
+                })
+            }
+        };
+
+        Ok(pool)
     }
 }
 
@@ -196,9 +238,19 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
+            // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
+            // then use the shared DuckDB file `accelerated_duckdb.db`
+            if !cmd.options.contains_key("open") && this_dataset.is_file_accelerated() {
+                let duckdb_file = self.duckdb_file_path(this_dataset);
+                if let Some(duckdb_file) = duckdb_file {
+                    cmd.options.insert("open".to_string(), duckdb_file);
+                }
+            }
+
             if let Some(app) = &this_dataset.app {
                 let datasets =
                     Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                let self_path = self.file_path(this_dataset);
                 let attach_databases = datasets
                     .iter()
                     .filter_map(|other_dataset| {
@@ -208,20 +260,18 @@ impl DataAccelerator for DuckDBAccelerator {
                             if **other_dataset == *this_dataset {
                                 None
                             } else {
-                                self.file_path(other_dataset)
+                                let other_path = self.file_path(other_dataset);
+                                if other_path == self_path {
+                                    None
+                                } else {
+                                    other_path
+                                }
                             }
                         } else {
                             None
                         }
                     })
                     .collect::<Vec<_>>();
-
-                let self_path = self.file_path(this_dataset);
-                if let Some(self_path) = self_path {
-                    if attach_databases.contains(&self_path) {
-                        return Err(Error::InvalidFileInUse { path: self_path }.into());
-                    }
-                }
 
                 if !attach_databases.is_empty() {
                     cmd.options
