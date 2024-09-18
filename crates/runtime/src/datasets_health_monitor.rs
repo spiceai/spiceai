@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -130,7 +130,7 @@ impl DatasetsHealthMonitor {
     // returns a list of dataset names that had successful queries against them in the last 10 minutes
     pub async fn get_recently_accessed_datasets(
         df_ctx: Arc<SessionContext>,
-    ) -> Result<Arc<Vec<String>>> {
+    ) -> Result<Arc<HashSet<String>>> {
         let query = format!(
             "
 SELECT labels.datasets AS datasets
@@ -179,9 +179,7 @@ AND labels.tags NOT LIKE '%error%'"
         let datasets_with_recent_activity = datasets_with_recent_activity
             .iter()
             .cloned()
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
 
         Ok(Arc::new(datasets_with_recent_activity))
     }
@@ -207,7 +205,7 @@ AND labels.tags NOT LIKE '%error%'"
                         Ok(datasets) => datasets,
                         Err(e) => {
                             tracing::warn!("{e}");
-                            Arc::new(vec![])
+                            Arc::new(HashSet::new())
                         }
                     };
 
