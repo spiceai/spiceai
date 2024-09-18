@@ -85,6 +85,7 @@ pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
+pub mod salesforce;
 #[cfg(feature = "ftp")]
 pub mod sftp;
 #[cfg(feature = "sharepoint")]
