@@ -206,9 +206,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            SqliteConnectionPool::init(path, acceleration.mode.to_string().as_str().into())
-                .await
-                .context(AccelerationInitializationFailedSnafu)?;
+            self.get_shared_pool(dataset).await?;
         }
 
         Ok(())
