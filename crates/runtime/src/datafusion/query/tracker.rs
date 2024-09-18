@@ -97,7 +97,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        trace_query(&self, &truncated_output.replace('\n', " "), &tags);
+        trace_query(&self, truncated_output, &tags);
     }
 
     #[must_use]
