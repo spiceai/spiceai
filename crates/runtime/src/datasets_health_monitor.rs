@@ -168,7 +168,7 @@ AND labels.tags NOT LIKE '%error%'"
                     .flatten()
                     .collect::<Vec<_>>(),
                 _ => {
-                    unreachable!("Unexpected data type from SHOW DATABASES");
+                    unreachable!("Unexpected data type from task_history query result");
                 }
             })
             .flat_map(|datasets| datasets.split(',').collect::<Vec<_>>())
