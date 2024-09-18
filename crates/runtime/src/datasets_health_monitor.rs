@@ -152,7 +152,7 @@ AND labels.tags NOT LIKE '%error%'"
             .await
             .context(UnableToGetRecentlyAccessedDatasetsSnafu)?;
 
-        let datasets_with_recent_activity: Vec<String> = datasets_with_recent_activity
+        let datasets_with_recent_activity = datasets_with_recent_activity
             .iter()
             .flat_map(|r| match r.column(0).data_type() {
                 arrow::datatypes::DataType::Utf8 => r
@@ -173,12 +173,6 @@ AND labels.tags NOT LIKE '%error%'"
             })
             .flat_map(|datasets| datasets.split(',').collect::<Vec<_>>())
             .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>();
-
-        // make a unique set of datasets, because the same dataset can be accessed by multiple tasks
-        let datasets_with_recent_activity = datasets_with_recent_activity
-            .iter()
-            .cloned()
             .collect::<HashSet<_>>();
 
         Ok(Arc::new(datasets_with_recent_activity))
