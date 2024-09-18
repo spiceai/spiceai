@@ -135,7 +135,6 @@ fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
 
     tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
 
-
     if let Some(true) = query_tracker.results_cache_hit {
         tracing::info!(target: "task_history", results_cache_hit = true, "labels");
     }
