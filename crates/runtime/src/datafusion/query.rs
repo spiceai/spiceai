@@ -39,7 +39,6 @@ use tracing_futures::Instrument;
 pub(crate) use tracker::QueryTracker;
 
 pub mod builder;
-pub mod query_history;
 pub use builder::QueryBuilder;
 pub mod error_code;
 mod metrics;
@@ -126,9 +125,7 @@ pub struct Query {
 macro_rules! handle_error {
     ($self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-        $self
-            .finish_with_error(snafu_error.to_string(), $error_code)
-            .await;
+        $self.finish_with_error(snafu_error.to_string(), $error_code);
         return Err(snafu_error);
     }};
 }
@@ -142,7 +139,7 @@ impl Query {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
             }
             None => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
+                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql.replace('\n', " "), runtime_query = false)
             }
         };
 
@@ -282,16 +279,14 @@ impl Query {
         match query_result {
             Ok(result) => Ok(result),
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
+                tracing::error!(target: "task_history", parent: &span, "{}", e.to_string().replace('\n', " "));
                 Err(e)
             }
         }
     }
 
-    pub async fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
-        self.tracker
-            .finish_with_error(error_message, error_code)
-            .await;
+    pub fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
+        self.tracker.finish_with_error(error_message, error_code);
     }
 
     pub async fn get_schema(&self) -> Result<Schema, DataFusionError> {
@@ -341,8 +336,8 @@ fn attach_query_tracker_to_stream(
                     ctx
                         .schema(schema_copy)
                         .rows_produced(num_records)
-                        .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError).await;
-                    tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                        .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError);
+                    tracing::error!(target: "task_history", parent: &inner_span, "{}", e.to_string().replace('\n', " "));
                     yield batch_result;
                     return;
                 }
@@ -354,8 +349,7 @@ fn attach_query_tracker_to_stream(
         ctx
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish(Arc::from(truncated_output))
-            .await;
+            .finish(&Arc::from(truncated_output));
     };
 
     Box::pin(RecordBatchStreamAdapter::new(

@@ -35,7 +35,6 @@ use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
 use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
@@ -245,9 +244,6 @@ pub enum Error {
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
-
-    #[snafu(display("Unable to track query history: {source}"))]
-    UnableToTrackQueryHistory { source: query_history::Error },
 
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
@@ -459,8 +455,8 @@ impl Runtime {
 
         let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
             Box::pin(async {
-                if let Err(err) = self.init_query_history().await {
-                    tracing::warn!("Creating internal query history table: {err}");
+                if let Err(err) = self.init_task_history().await {
+                    tracing::warn!("Creating internal task history table: {err}");
                 };
             }),
             Box::pin(self.init_results_cache()),
@@ -1627,22 +1623,7 @@ impl Runtime {
         };
     }
 
-    pub async fn init_query_history(&self) -> Result<()> {
-        let query_history_table_reference = TableReference::partial(
-            SPICE_RUNTIME_SCHEMA,
-            query_history::DEFAULT_QUERY_HISTORY_TABLE,
-        );
-
-        match query_history::instantiate_query_history_table(self.status()).await {
-            Ok(table) => {
-                let _ = self
-                    .df
-                    .register_runtime_table(query_history_table_reference, table)
-                    .context(UnableToCreateBackendSnafu);
-            }
-            Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
-        };
-
+    pub async fn init_task_history(&self) -> Result<()> {
         match task_history::TaskSpan::instantiate_table(self.status()).await {
             Ok(table) => self
                 .df

@@ -44,7 +44,7 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "dep:async-stream",
 ]
-duckdb = ["datafusion-table-providers/duckdb"]
+duckdb = ["datafusion-table-providers/duckdb", "datafusion-table-providers/duckdb-federation"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = [
   "dep:odbc-api",

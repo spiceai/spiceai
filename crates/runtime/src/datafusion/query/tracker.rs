@@ -45,14 +45,14 @@ pub(crate) struct QueryTracker {
 }
 
 impl QueryTracker {
-    pub async fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
+    pub fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish(Arc::from("")).await;
+        self.finish(&Arc::from(""));
     }
 
-    pub async fn finish(mut self, truncated_output: Arc<str>) {
+    pub fn finish(mut self, truncated_output: &Arc<str>) {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -107,9 +107,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        if let Err(err) = self.write_query_history(truncated_output).await {
-            tracing::error!("Error writing query history: {err}");
-        };
+        trace_query(&self, &truncated_output.replace('\n', " "), &tags);
     }
 
     #[must_use]
@@ -135,4 +133,27 @@ impl QueryTracker {
         self.datasets = datasets;
         self
     }
+}
+
+fn trace_query(query_tracker: &QueryTracker, truncated_output: &str, tags: &[&str]) {
+    if let Some(error_code) = &query_tracker.error_code {
+        tracing::info!(target: "task_history", error_code = %error_code, "labels");
+    }
+    if let Some(query_execution_duration_secs) = &query_tracker.query_execution_duration_secs {
+        tracing::info!(target: "task_history", query_execution_duration_ms = %query_execution_duration_secs * 1000.0, "labels");
+    }
+
+    tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
+
+    let tags_str = tags.join(",");
+    tracing::info!(target: "task_history", tags=%tags_str, "labels");
+
+    let datasets_str = query_tracker
+        .datasets
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join(",");
+    tracing::info!(target: "task_history", protocol = ?query_tracker.protocol, datasets = datasets_str, "labels");
+    tracing::info!(target: "task_history", truncated_output = %truncated_output);
 }
