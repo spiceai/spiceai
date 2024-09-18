@@ -72,8 +72,7 @@ delta_lake = ["dep:delta_kernel"]
 duckdb = [
   "dep:duckdb",
   "db_connection_pool/duckdb",
-  "datafusion-table-providers/duckdb",
-  "datafusion-table-providers/duckdb-federation"
+  "datafusion-table-providers/duckdb"
 ]
 flightsql = ["dep:tonic"]
 mysql = ["datafusion-table-providers/mysql"]
