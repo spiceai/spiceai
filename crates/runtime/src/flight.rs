@@ -168,7 +168,7 @@ impl Service {
             Ok(schema) => schema,
             Err(err) => {
                 let error_code = ErrorCode::from(&err);
-                query.finish_with_error(err.to_string(), error_code).await;
+                query.finish_with_error(err.to_string(), error_code);
 
                 return Err(handle_datafusion_error(err));
             }
