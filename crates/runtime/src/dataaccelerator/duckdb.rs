@@ -218,8 +218,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
-                .context(AccelerationInitializationFailedSnafu)?;
+            self.get_shared_pool(dataset).await?;
         }
 
         Ok(())
