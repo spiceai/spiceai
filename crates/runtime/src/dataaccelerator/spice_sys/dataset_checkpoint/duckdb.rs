@@ -85,6 +85,7 @@ mod tests {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
         );
+        DatasetCheckpoint::init_duckdb(&pool).expect("Failed to initialize DuckDB");
         DatasetCheckpoint {
             dataset_name: "test_dataset".to_string(),
             acceleration_connection: AccelerationConnection::DuckDB(pool),
