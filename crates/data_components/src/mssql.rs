@@ -15,21 +15,16 @@ limitations under the License.
 */
 use async_trait::async_trait;
 use bb8::Pool;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 
 use crate::arrow::write::MemTable;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::{array::RecordBatch, datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}};
 use datafusion::{
-    catalog::Session,
-    datasource::{TableProvider, TableType},
-    error::DataFusionError,
-    logical_expr::{Expr, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
-    sql::TableReference,
+    catalog::Session, datasource::{TableProvider, TableType}, error::DataFusionError, execution::SendableRecordBatchStream, logical_expr::{Expr, TableProviderFilterPushDown}, physical_plan::{EmptyRecordBatchStream, ExecutionPlan}, sql::{sqlparser::ast::Table, TableReference}
 };
 use std::{any::Any, sync::Arc};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -60,13 +55,14 @@ pub struct SqlServerTableProvider {
     #[allow(dead_code)]
     conn: Arc<SqlServerConnectionPool>,
     schema: SchemaRef,
+    table: TableReference,
 }
 
 impl SqlServerTableProvider {
     pub async fn new(conn: Arc<SqlServerConnectionPool>, table: &TableReference) -> Result<Self> {
         let schema = Self::get_schema(Arc::clone(&conn), table).await?;
 
-        Ok(Self { conn, schema })
+        Ok(Self { conn, schema, table: table.clone() })
     }
 
     pub async fn get_schema(
@@ -104,6 +100,15 @@ impl SqlServerTableProvider {
 
         Ok(Arc::new(Schema::new(fields)))
     }
+
+    async fn query_arrow(
+        &self,
+        _sql: &str,
+        projected_schema: SchemaRef,
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
+        let empty_stream = EmptyRecordBatchStream::new(Arc::clone(&projected_schema));
+        Ok(Box::pin(empty_stream))
+    }
 }
 
 fn map_mssql_type_to_arrow(
@@ -124,7 +129,7 @@ fn map_mssql_type_to_arrow(
             let scale = numeric_scale.unwrap_or(0) as i8;
             DataType::Decimal128(precision, scale)
         }
-        "char" | "varchar" | "text" | "uniqueidentifier" | "xml" => DataType::Utf8,
+        "char" | "varchar" | "text" | "uniqueidentifier" | "xml" | "money" => DataType::Utf8,
         "nchar" | "nvarchar" | "ntext" => DataType::LargeUtf8,
         "binary" => DataType::FixedSizeBinary(numeric_precision.unwrap_or(1) as i32),
         "varbinary" | "image" => DataType::Binary,
@@ -177,7 +182,15 @@ impl TableProvider for SqlServerTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let table = MemTable::try_new(Arc::clone(&self.schema), vec![])?;
+
+        let sql = format!("SELECT * from {table_name}", table_name = self.table.to_string());
+
+        let records_batch_stream = self.query_arrow(&sql, Arc::clone(&self.schema)).await?;
+
+        let records: Vec<RecordBatch> = records_batch_stream
+            .try_collect().await.unwrap();
+
+        let table = MemTable::try_new(Arc::clone(&self.schema), vec![records])?;
         table.scan(state, projection, filters, limit).await
     }
 }
