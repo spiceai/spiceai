@@ -19,6 +19,24 @@ use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresC
 use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
 
 impl DatasetCheckpoint {
+    pub(super) async fn init_postgres(pool: &PostgresConnectionPool) -> Result<()> {
+        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+
+        let create_table = format!(
+            "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
+                dataset_name TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"
+        );
+        conn.conn
+            .execute(&create_table, &[])
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
     pub(super) async fn exists_postgres(&self, pool: &PostgresConnectionPool) -> Result<bool> {
         let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
         let query =
@@ -34,18 +52,6 @@ impl DatasetCheckpoint {
 
     pub(super) async fn checkpoint_postgres(&self, pool: &PostgresConnectionPool) -> Result<()> {
         let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
-
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        conn.conn
-            .execute(&create_table, &[])
-            .await
-            .map_err(|e| e.to_string())?;
 
         let upsert = format!(
             "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at)
