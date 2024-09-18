@@ -173,8 +173,7 @@ impl PaginationArgument {
         // Find which values are present in the pageInfo field
         f.selection_set.items.iter().for_each(|s| {
             if let Selection::Field(f) = s {
-                let field_name = format!("{:?}", f.name).replace('"', "");
-                match field_name.as_str() {
+                match f.name.as_ref() {
                     "hasNextPage" => has_next_page = true,
                     "hasPreviousPage" => has_previous_page = true,
                     "startCursor" => start_cursor = true,
@@ -216,9 +215,9 @@ impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
 
             let n: usize = z.try_into().ok()?;
 
-            match format!("{arg:?}").as_str() {
-                "\"first\"" => Some(PaginationArgument::First(n)),
-                "\"last\"" => Some(PaginationArgument::Last(n)),
+            match arg.as_ref() {
+                "first" => Some(PaginationArgument::First(n)),
+                "last" => Some(PaginationArgument::Last(n)),
                 _ => None,
             }
         });
@@ -343,7 +342,7 @@ impl PaginationParameters {
                     }
                 }
                 graphql_parser::query::Selection::Field(field) => {
-                    let field_name = format!("{:?}", field.name).replace('"', "");
+                    let field_name = field.name.as_ref();
                     let new_path = format!("{current_path}/{field_name}");
 
                     // End of recursion, `pageInfo` field found
@@ -372,8 +371,8 @@ impl PaginationParameters {
                             );
                         }
 
-                        let json_pointer = data_field
-                            .map(|f| format!("/data{current_path}/{:?}", f.name).replace('"', ""));
+                        let json_pointer =
+                            data_field.map(|f| format!("/data{current_path}/{}", f.name.as_ref()));
 
                         let pag_args = match TryInto::<PaginationArgument>::try_into(parent_field) {
                             Ok(pag_args) => pag_args,
@@ -391,7 +390,7 @@ impl PaginationParameters {
 
                         return (
                             Some(PaginationParameters {
-                                resource_name: format!("{:?}", parent_field.name).replace('"', ""),
+                                resource_name: parent_field.name.as_ref().to_string(),
                                 args: pag_args,
                                 page_info_path: Some(new_path),
                             }),
