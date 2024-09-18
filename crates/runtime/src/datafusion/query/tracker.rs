@@ -97,7 +97,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        trace_query(&self, &truncated_output.replace('\n', " "), &tags);
+        trace_query(&self, truncated_output);
     }
 
     #[must_use]
@@ -125,7 +125,7 @@ impl QueryTracker {
     }
 }
 
-fn trace_query(query_tracker: &QueryTracker, truncated_output: &str, tags: &[&str]) {
+fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
     if let Some(error_code) = &query_tracker.error_code {
         tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
@@ -135,8 +135,9 @@ fn trace_query(query_tracker: &QueryTracker, truncated_output: &str, tags: &[&st
 
     tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
 
-    let tags_str = tags.join(",");
-    tracing::info!(target: "task_history", tags=%tags_str, "labels");
+    if let Some(true) = query_tracker.results_cache_hit {
+        tracing::info!(target: "task_history", results_cache_hit = true, "labels");
+    }
 
     let datasets_str = query_tracker
         .datasets

@@ -139,7 +139,7 @@ impl Query {
                 tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
             }
             None => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql.replace('\n', " "), runtime_query = false)
+                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
             }
         };
 
@@ -279,7 +279,7 @@ impl Query {
         match query_result {
             Ok(result) => Ok(result),
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{}", e.to_string().replace('\n', " "));
+                tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
             }
         }
@@ -337,7 +337,7 @@ fn attach_query_tracker_to_stream(
                         .schema(schema_copy)
                         .rows_produced(num_records)
                         .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError);
-                    tracing::error!(target: "task_history", parent: &inner_span, "{}", e.to_string().replace('\n', " "));
+                    tracing::error!(target: "task_history", parent: &inner_span, "{e}");
                     yield batch_result;
                     return;
                 }
