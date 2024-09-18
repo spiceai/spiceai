@@ -17,6 +17,7 @@ arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+bb8 = {workspace = true, optional = true }
 bytes = "1.6.0"
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
@@ -77,7 +78,7 @@ duckdb = [
   "datafusion-table-providers/duckdb"
 ]
 flightsql = ["dep:tonic"]
-mssql = ["dep:tiberius", "dep:tokio-util"]
+mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
 postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres"]

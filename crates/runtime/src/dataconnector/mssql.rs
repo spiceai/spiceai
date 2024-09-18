@@ -16,17 +16,14 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::mssql::{SqlServerTableProvider, SqlServerTcpClient};
+use data_components::mssql::{
+    self, SqlServerConnectionPool, SqlServerTableProvider, TiberiusConnectionManager,
+};
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use snafu::{ResultExt, Snafu};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{any::Any, future::Future};
-use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
-
-use tiberius::{Client, Config};
 
 use super::{
     DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
@@ -38,17 +35,8 @@ pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Unable to parse connection string: {source}"))]
-    InvalidConnectionString { source: tiberius::error::Error },
-
-    #[snafu(display("Unable to connect: {source}"))]
-    SqlServerAccessError { source: tiberius::error::Error },
-
-    #[snafu(display("Error executing query: {source}"))]
-    QueryError { source: tiberius::error::Error },
-
-    #[snafu(display("Unable to connect: {source}"))]
-    UnableToEstablishTcpConnection { source: std::io::Error },
+    #[snafu(display("Unable to create MS SQL Server connection pool: {source}"))]
+    UnableToCreateConnectionPool { source: mssql::Error },
 }
 
 const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("connection_string")
@@ -58,7 +46,7 @@ const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("connection_stri
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqlServer {
-    client: Arc<SqlServerTcpClient>,
+    conn: Arc<SqlServerConnectionPool>,
 }
 
 impl SqlServer {
@@ -68,26 +56,12 @@ impl SqlServer {
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-        let config = Config::from_ado_string(conn_string).context(InvalidConnectionStringSnafu)?;
-
-        let tcp = TcpStream::connect(config.get_addr())
+        let conn = TiberiusConnectionManager::create_connection_pool(conn_string)
             .await
-            .context(UnableToEstablishTcpConnectionSnafu)?;
-        tcp.set_nodelay(true)
-            .context(UnableToEstablishTcpConnectionSnafu)?;
-
-        let mut client = Client::connect(config, tcp.compat_write())
-            .await
-            .context(SqlServerAccessSnafu)?;
-
-        // Test connection
-        client
-            .query("SELECT 1", &[])
-            .await
-            .context(QueryFailedSnafu)?;
+            .context(UnableToCreateConnectionPoolSnafu)?;
 
         return Ok(Self {
-            client: Arc::new(client),
+            conn: Arc::new(conn),
         });
     }
 }
@@ -136,7 +110,7 @@ impl DataConnector for SqlServer {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let provider = SqlServerTableProvider::new(Arc::clone(&self.client))
+        let provider = SqlServerTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
