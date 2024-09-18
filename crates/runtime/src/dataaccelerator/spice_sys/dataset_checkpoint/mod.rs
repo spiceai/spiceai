@@ -39,17 +39,25 @@ pub struct DatasetCheckpoint {
 
 impl DatasetCheckpoint {
     pub async fn try_new(dataset: &Dataset) -> Result<Self> {
+        let acceleration_connection = acceleration_connection(dataset, true).await?;
+        Self::init(&acceleration_connection).await?;
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, false).await?,
+            acceleration_connection,
         })
     }
 
-    pub async fn try_new_create_if_not_exists(dataset: &Dataset) -> Result<Self> {
-        Ok(Self {
-            dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, true).await?,
-        })
+    async fn init(connection: &AccelerationConnection) -> Result<()> {
+        match connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool),
+            #[cfg(feature = "postgres")]
+            AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await,
+            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            _ => Err("No acceleration connection available".into()),
+        }
     }
 
     pub async fn exists(&self) -> bool {

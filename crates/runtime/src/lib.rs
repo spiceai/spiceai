@@ -469,7 +469,6 @@ impl Runtime {
         ];
 
         if cfg!(feature = "models") {
-            self.load_tools().await; // Load tools before loading models.
             futures.push(Box::pin(self.load_models()));
         }
 
@@ -1314,6 +1313,9 @@ impl Runtime {
     }
 
     async fn load_models(&self) {
+        // Load tools before loading models.
+        self.load_tools().await;
+
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
