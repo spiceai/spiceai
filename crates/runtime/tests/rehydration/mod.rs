@@ -101,7 +101,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
 /// 2. Start Spice, retrieve row count and loaded items after acceleration is completed, and compare with the baseline.
 /// 3. Restart the runtime and ensure the loaded items remain consistent immediately after the runtime is loaded.
 /// 4. Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
-///
+#[expect(clippy::expect_used)]
 async fn execute_spill_to_disk_and_rehydration(
     federated_dataset_container: Arc<RunningContainer<'static>>,
     engine: &str,
