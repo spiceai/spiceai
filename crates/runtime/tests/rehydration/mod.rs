@@ -44,18 +44,25 @@ use spicepod::component::params::Params as SpicepodParams;
 
 use tracing::instrument;
 
+#[cfg(feature = "duckdb")]
+mod duckdb;
+
+#[cfg(feature = "sqlite")]
+mod sqlite;
+
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
     let running_container = prepare_test_environment()
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     let running_container = Arc::new(running_container);
 
     let config = vec![
-        // #[cfg(feature = "duckdb")]
-        // ("duckdb", None),
-        // #[cfg(feature = "duckdb")]
-        // ("duckdb", Some("./.spice/my_duckdb.db")),
+        #[cfg(feature = "duckdb")]
+        ("duckdb", None),
+        #[cfg(feature = "duckdb")]
+        ("duckdb", Some("./.spice/my_duckdb.db")),
         #[cfg(feature = "sqlite")]
         ("sqlite", None),
         #[cfg(feature = "sqlite")]
@@ -66,7 +73,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
         tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
 
         if idx > 0 {
-            // Ensure the container is running as the tests manipulate the container
+            // Ensure the container is running as the tests manipulate it
             running_container
                 .start()
                 .await
@@ -94,7 +101,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
 /// 2. Start Spice, retrieve row count and loaded items after acceleration is completed, and compare with the baseline.
 /// 3. Restart the runtime and ensure the loaded items remain consistent immediately after the runtime is loaded.
 /// 4. Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
-///
+#[expect(clippy::expect_used)]
 async fn execute_spill_to_disk_and_rehydration(
     federated_dataset_container: Arc<RunningContainer<'static>>,
     engine: &str,
@@ -109,6 +116,7 @@ async fn execute_spill_to_disk_and_rehydration(
         .exec("SELECT COUNT(*) FROM lineitem", Params::Empty)
         .await?;
     let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
+    assert!(num_rows > 0);
 
     let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
     tracing::debug!(
@@ -137,7 +145,7 @@ async fn execute_spill_to_disk_and_rehydration(
     }
 
     let test_query =
-        "SELECT l_orderkey, l_linenumber  FROM lineitem ORDER BY l_orderkey, l_linenumber";
+        "SELECT l_orderkey, l_linenumber  FROM lineitem ORDER BY l_orderkey, l_linenumber LIMIT 10";
 
     let original_items = run_query(test_query, &rt).await?;
     let num_rows_loaded: usize = original_items
@@ -146,15 +154,26 @@ async fn execute_spill_to_disk_and_rehydration(
         .sum();
 
     // ensure data has been loaded correctly
-    assert_eq!(num_rows_loaded as u64, num_rows);
+    assert_eq!(num_rows_loaded as u64, 10);
 
     drop(rt);
+
+    let num_persisted_records: usize =
+        get_locally_persisted_records(engine, &accelerated_db_file_path, test_query)
+            .await?
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+
+    assert_eq!(num_rows_loaded, num_persisted_records);
 
     // Restart the runtime and ensure the loaded items remain consistent
     let rt = init_spice_app(engine, db_file_path).await?;
     // Do request immediately after restart w/o waiting for ready status (dataset is refreshed)
     let restart1_items = run_query(test_query, &rt).await?;
-    assert_eq!(original_items, restart1_items);
+    let restart1_items_pretty =
+        arrow::util::pretty::pretty_format_batches(&restart1_items).expect("pretty format");
+    insta::assert_snapshot!(restart1_items_pretty);
 
     drop(rt);
 
@@ -162,9 +181,28 @@ async fn execute_spill_to_disk_and_rehydration(
     let rt = init_spice_app(engine, db_file_path).await?;
     federated_dataset_container.stop().await?;
     let restart2_items = run_query(test_query, &rt).await?;
-    assert_eq!(original_items, restart2_items);
+    let restart2_items_pretty =
+        arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
+    insta::assert_snapshot!(restart2_items_pretty);
 
     Ok(())
+}
+
+async fn get_locally_persisted_records(
+    engine: &str,
+    db_file_path: &str,
+    query: &str,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let query_result = match engine {
+        "duckdb" => duckdb::query_local_db(db_file_path, query).await?,
+        "sqlite" => sqlite::query_local_db(db_file_path, query).await?,
+        _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
+    };
+
+    query_result
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
 }
 
 fn resolve_local_db_file_path(
@@ -290,7 +328,6 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 
 #[instrument]
 async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
     let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
         .await
         .map_err(|e| {
