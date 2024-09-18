@@ -20,7 +20,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use arrow::array::RecordBatch;
+use arrow::array::{AsArray, RecordBatch};
 use datafusion::{
     datasource::TableProvider, error::DataFusionError, execution::context::SessionContext,
     sql::TableReference,
@@ -33,7 +33,8 @@ use tokio::sync::Mutex;
 use crate::{component::dataset::Dataset, metrics};
 
 const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
-const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 10 * 60; // 10 minutes
+const DATASET_UNAVAILABLE_THRESHOLD_MINUTES: u64 = 10;
+const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = DATASET_UNAVAILABLE_THRESHOLD_MINUTES * 60; // 10 minutes
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -41,6 +42,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Error {
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
+
+    #[snafu(display("Unable to get recently access datasets: {source}"))]
+    UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 }
 
 #[derive(Clone)]
@@ -65,7 +69,7 @@ enum AvailabilityVerificationResult {
     Unavailable(SystemTime, String),
 }
 
-pub(crate) struct DatasetsHealthMonitor {
+pub struct DatasetsHealthMonitor {
     df_ctx: Arc<SessionContext>,
     monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
 }
@@ -123,6 +127,65 @@ impl DatasetsHealthMonitor {
         Ok(table)
     }
 
+    // returns a list of dataset names that had successful queries against them in the last 10 minutes
+    pub async fn get_recently_accessed_datasets(
+        df_ctx: Arc<SessionContext>,
+    ) -> Result<Arc<Vec<String>>> {
+        let query = format!(
+            "
+SELECT labels.datasets AS datasets
+FROM runtime.task_history
+WHERE labels.datasets IS NOT NULL
+AND NOW() < end_time + INTERVAL '{DATASET_UNAVAILABLE_THRESHOLD_MINUTES}' MINUTE
+AND labels.tags NOT LIKE '%error%'"
+        );
+        let plan = df_ctx
+            .sql(&query)
+            .await
+            .context(UnableToGetRecentlyAccessedDatasetsSnafu)?;
+        let stream = plan
+            .execute_stream()
+            .await
+            .context(UnableToGetRecentlyAccessedDatasetsSnafu)?;
+        let datasets_with_recent_activity = stream
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .context(UnableToGetRecentlyAccessedDatasetsSnafu)?;
+
+        let datasets_with_recent_activity: Vec<String> = datasets_with_recent_activity
+            .iter()
+            .flat_map(|r| match r.column(0).data_type() {
+                arrow::datatypes::DataType::Utf8 => r
+                    .column(0)
+                    .as_string::<i32>()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+                arrow::datatypes::DataType::LargeUtf8 => r
+                    .column(0)
+                    .as_string::<i64>()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+                _ => {
+                    unreachable!("Unexpected data type from SHOW DATABASES");
+                }
+            })
+            .flat_map(|datasets| datasets.split(',').collect::<Vec<_>>())
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>();
+
+        // make a unique set of datasets, because the same dataset can be accessed by multiple tasks
+        let datasets_with_recent_activity = datasets_with_recent_activity
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        Ok(Arc::new(datasets_with_recent_activity))
+    }
+
     pub fn start(&self) {
         tracing::debug!("Starting datasets availability monitoring");
         let monitored_datasets = Arc::clone(&self.monitored_datasets);
@@ -137,6 +200,24 @@ impl DatasetsHealthMonitor {
             loop {
                 // Only datasets without recent activity/availability
                 let datasets_to_check = datasets_for_availability_check(&monitored_datasets).await;
+
+                // check `task_history` first to exlude anything that had a successful query in the last 10 minutes
+                let recently_accessed_datasets =
+                    match Self::get_recently_accessed_datasets(Arc::clone(&df_ctx)).await {
+                        Ok(datasets) => datasets,
+                        Err(e) => {
+                            tracing::warn!("{e}");
+                            Arc::new(vec![])
+                        }
+                    };
+
+                tracing::debug!("Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}");
+
+                // subset them from the datasets to check
+                let datasets_to_check: Vec<_> = datasets_to_check
+                    .into_iter()
+                    .filter(|item| !recently_accessed_datasets.contains(&item.name))
+                    .collect();
 
                 let tasks: Vec<_> = datasets_to_check
                     .into_iter()
