@@ -20,6 +20,26 @@ use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 impl DatasetCheckpoint {
+    pub(super) fn init_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(|e| e.to_string())?
+            .get_underlying_conn_mut();
+
+        let create_table = format!(
+            "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
+                dataset_name TEXT PRIMARY KEY,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )"
+        );
+        duckdb_conn
+            .execute(&create_table, [])
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
     pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -40,17 +60,6 @@ impl DatasetCheckpoint {
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(|e| e.to_string())?
             .get_underlying_conn_mut();
-
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
-            )"
-        );
-        duckdb_conn
-            .execute(&create_table, [])
-            .map_err(|e| e.to_string())?;
 
         let upsert = format!(
             "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at)
