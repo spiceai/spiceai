@@ -94,6 +94,7 @@ snafu = "0.8.0"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "2991d97548b0cd7a721704165ed07f7b2818cf7b" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls"] }
 tokio = { version = "1.39.3", features = [
   "rt-multi-thread",
   "signal",
@@ -104,6 +105,7 @@ tokio-postgres = { version = "0.7.12", features = [
   "with-uuid-1",
 ] }
 tokio-rusqlite = "0.5.1"
+tokio-util = { version = "0.7.11", features = ["compat"] }
 tonic = { version = "0.11", features = ["gzip", "tls"] }
 tonic-health = { version = "0.11" }
 tracing = "0.1.40"

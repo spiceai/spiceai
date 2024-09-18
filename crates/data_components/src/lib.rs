@@ -41,6 +41,8 @@ pub mod flight;
 pub mod flightsql;
 #[cfg(feature = "debezium")]
 pub mod kafka;
+#[cfg(feature = "mssql")]
+pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]

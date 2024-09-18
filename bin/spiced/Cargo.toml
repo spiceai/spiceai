@@ -55,6 +55,7 @@ default = [
   "ftp",
   "debezium",
   "anonymous_telemetry",
+  "mssql",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -64,6 +65,7 @@ flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 models = ["runtime/models"]
+mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
 odbc = ["runtime/odbc"]
 postgres = ["runtime/postgres"]

@@ -64,6 +64,7 @@ llms = { path = "../llms" }
 logos = "0.14.0"
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
+tiberius ={ workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
@@ -103,6 +104,7 @@ telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
 tonic-health.workspace = true
 tonic.workspace = true
 tracing.workspace = true
@@ -145,6 +147,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
 models = ["model_components/full", "llms/mistralrs"]
+mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 postgres = [

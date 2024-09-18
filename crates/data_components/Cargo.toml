@@ -52,10 +52,12 @@ snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "d937df525d7c237c717b42e6146494c524dbf267", features = [
   "tls",
 ], optional = true }
+tiberius = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, features = [
   "with-chrono-0_4",
 ], optional = true }
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tracing.workspace = true
 url = "2.5.0"
@@ -75,6 +77,7 @@ duckdb = [
   "datafusion-table-providers/duckdb"
 ]
 flightsql = ["dep:tonic"]
+mssql = ["dep:tiberius", "dep:tokio-util"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
 postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres"]
