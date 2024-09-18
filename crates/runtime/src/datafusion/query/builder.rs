@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc, time::SystemTime};
+use std::{collections::HashSet, sync::Arc};
 
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -76,13 +76,8 @@ impl<'a> QueryBuilder<'a> {
             sql: Arc::clone(&sql),
             restricted_sql_options: self.restricted_sql_options,
             tracker: QueryTracker {
-                df: self.df,
                 schema: None,
-                sql,
                 nsql: self.nsql.map(Into::into),
-                query_id: self.query_id,
-                start_time: SystemTime::now(),
-                end_time: None,
                 query_duration_secs: None,
                 query_execution_duration_secs: None,
                 rows_produced: 0,

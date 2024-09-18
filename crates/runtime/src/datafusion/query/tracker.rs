@@ -14,24 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc, time::SystemTime};
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use opentelemetry::Key;
 use tokio::time::Instant;
-use uuid::Uuid;
 
 use super::{error_code::ErrorCode, metrics, Protocol};
 
 pub(crate) struct QueryTracker {
-    pub(crate) df: Arc<crate::datafusion::DataFusion>,
     pub(crate) schema: Option<SchemaRef>,
-    pub(crate) query_id: Uuid,
-    pub(crate) sql: Arc<str>,
     pub(crate) nsql: Option<Arc<str>>,
-    pub(crate) start_time: SystemTime,
-    pub(crate) end_time: Option<SystemTime>,
     pub(crate) query_duration_secs: Option<f32>,
     pub(crate) query_execution_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
@@ -53,10 +47,6 @@ impl QueryTracker {
     }
 
     pub fn finish(mut self, truncated_output: &Arc<str>) {
-        if self.end_time.is_none() {
-            self.end_time = Some(SystemTime::now());
-        }
-
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
