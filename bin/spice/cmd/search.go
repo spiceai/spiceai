@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manifoldco/promptui"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -59,47 +58,6 @@ spice search --model <model> --cloud
 		rtcontext := context.NewContext().WithCloud(cloud)
 
 		rtcontext.RequireModelsFlavor(cmd)
-
-		model, err := cmd.Flags().GetString(modelKeyFlag)
-		if err != nil {
-			cmd.Println(err)
-			os.Exit(1)
-		}
-		if model == "" {
-			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
-			if err != nil {
-				cmd.PrintErrln(err.Error())
-				os.Exit(1)
-			}
-			if len(models) == 0 {
-				cmd.Println("No models found")
-				os.Exit(1)
-			}
-
-			modelsSelection := []string{}
-			selectedModel := models[0].Name
-			if len(models) > 1 {
-				for _, model := range models {
-					modelsSelection = append(modelsSelection, model.Name)
-				}
-
-				prompt := promptui.Select{
-					Label:        "Select model",
-					Items:        modelsSelection,
-					HideSelected: true,
-				}
-
-				_, selectedModel, err = prompt.Run()
-				if err != nil {
-					fmt.Printf("Prompt failed %v\n", err)
-					return
-				}
-			}
-
-			fmt.Println("Using model:", selectedModel)
-			fmt.Println()
-			model = selectedModel
-		}
 
 		datasets, err := api.GetData[api.Dataset](rtcontext, "/v1/datasets?status=true")
 		if err != nil {
