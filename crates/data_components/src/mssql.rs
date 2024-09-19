@@ -67,8 +67,8 @@ pub enum Error {
     #[snafu(display("Failed to retrieve table schema"))]
     SchemaRetrieval,
 
-    #[snafu(display("Unable to retrieve table schema: dataset not found"))]
-    SchemaRetrievalTableNotFound,
+    #[snafu(display("Unable to retrieve schema: table '{table}' doesn't exist"))]
+    SchemaRetrievalTableNotFound { table: String },
 
     #[snafu(display("Unsupported data type: {data_type}"))]
     UnsupportedType { data_type: String },
@@ -147,7 +147,9 @@ impl SqlServerTableProvider {
         }
 
         if fields.is_empty() {
-            return Err(Error::SchemaRetrievalTableNotFound {});
+            return Err(Error::SchemaRetrievalTableNotFound {
+                table: table.to_string(),
+            });
         }
 
         tracing::trace!("Retrieved dataset {table_name} schema: {fields:?}");
