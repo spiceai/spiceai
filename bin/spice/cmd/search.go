@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/manifoldco/promptui"
 	"github.com/peterh/liner"
@@ -19,55 +20,39 @@ import (
 )
 
 const (
-	cloudKeyFlag        = "cloud"
-	modelKeyFlag        = "model"
-	httpEndpointKeyFlag = "http-endpoint"
+	limitKeyFlag = "limit"
 )
 
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+type SearchRequest struct {
+	Text              string   `json:"text"`
+	Datasets          []string `json:"datasets"`
+	Limit             uint     `json:"limit"`
+	AdditionalColumns []string `json:"additional_columns,omitempty"`
+	Where             string   `json:"where,omitempty"`
 }
 
-type ChatRequestBody struct {
-	Messages []Message `json:"messages"`
-	Model    string    `json:"model"`
-	Stream   bool      `json:"stream"`
+type SearchMatch struct {
+	Value      string                 `json:"value"`
+	Score      float64                `json:"score"`
+	Dataset    string                 `json:"dataset"`
+	PrimaryKey map[string]interface{} `json:"primary_key"`
+	Metadata   map[string]interface{} `json:"metadata"`
 }
 
-type Delta struct {
-	Content      string      `json:"content"`
-	FunctionCall interface{} `json:"function_call"`
-	ToolCalls    interface{} `json:"tool_calls"`
-	Role         interface{} `json:"role"`
+type SearchResponse struct {
+	Matches    []SearchMatch `json:"matches"`
+	DurationMs uint64        `json:"duration_ms"`
 }
 
-type Choice struct {
-	Index        int         `json:"index"`
-	Delta        Delta       `json:"delta"`
-	FinishReason interface{} `json:"finish_reason"`
-	Logprobs     interface{} `json:"logprobs"`
-}
-
-type ChatCompletion struct {
-	ID                string      `json:"id"`
-	Choices           []Choice    `json:"choices"`
-	Created           int64       `json:"created"`
-	Model             string      `json:"model"`
-	SystemFingerprint string      `json:"system_fingerprint"`
-	Object            string      `json:"object"`
-	Usage             interface{} `json:"usage"`
-}
-
-var chatCmd = &cobra.Command{
-	Use:   "chat",
-	Short: "Chat with the Spice.ai LLM agent",
+var searchCmd = &cobra.Command{
+	Use:   "search",
+	Short: "Search datasets with embeddings",
 	Example: `
-# Start a chat session with local spiced instance
-spice chat --model <model>
+# Start a search session with local spiced instance
+spice search --model <model>
 
-# Start a chat session with spiced instance in spice.ai cloud
-spice chat --model <model> --cloud
+# Start a search session with spiced instance in spice.ai cloud
+spice search --model <model> --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
@@ -116,6 +101,18 @@ spice chat --model <model> --cloud
 			model = selectedModel
 		}
 
+		datasets, err := api.GetData[api.Dataset](rtcontext, "/v1/datasets?status=true")
+		if err != nil {
+			cmd.PrintErrln(err.Error())
+		}
+		var searchDatasets []string
+		for _, dataset := range datasets {
+			if strings.HasSuffix(dataset.Name, ".docs") {
+				continue
+			}
+			searchDatasets = append(searchDatasets, dataset.Name)
+		}
+
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {
 			cmd.Println(err)
@@ -125,13 +122,19 @@ spice chat --model <model> --cloud
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
-		var messages []Message = []Message{}
+		matches := map[string][]SearchMatch{}
+
+		limit, err := cmd.Flags().GetUint(limitKeyFlag)
+		if err != nil {
+			cmd.Println(err)
+			os.Exit(1)
+		}
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer line.Close()
 		for {
-			message, err := line.Prompt("chat> ")
+			message, err := line.Prompt("search> ")
 			if err == liner.ErrPromptAborted {
 				break
 			} else if err != nil {
@@ -140,39 +143,33 @@ spice chat --model <model> --cloud
 			}
 
 			line.AppendHistory(message)
-			messages = append(messages, Message{Role: "user", Content: message})
 
 			done := make(chan bool)
 			go func() {
 				util.ShowSpinner(done)
 			}()
 
-			body := &ChatRequestBody{
-				Messages: messages,
-				Model:    model,
-				Stream:   true,
+			body := &SearchRequest{
+				Text:     message,
+				Datasets: searchDatasets,
+				Limit:    limit,
 			}
 
-			response, err := sendChatRequest(rtcontext, body)
+			response, err := sendSearchRequest(rtcontext, body)
 			if err != nil {
 				cmd.Printf("Error: %v\n", err)
 				continue
 			}
 
 			scanner := bufio.NewScanner(response.Body)
-			var responseMessage = ""
 
 			doneLoading := false
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
-				if !strings.HasPrefix(chunk, "data: ") {
-					continue
-				}
-				chunk = strings.TrimPrefix(chunk, "data: ")
 
-				var chatResponse ChatCompletion = ChatCompletion{}
-				err = json.Unmarshal([]byte(chunk), &chatResponse)
+				var searchResponse SearchResponse = SearchResponse{}
+				err = json.Unmarshal([]byte(chunk), &searchResponse)
 				if err != nil {
 					cmd.Printf("Error: %v\n\n", err)
 					continue
@@ -183,13 +180,11 @@ spice chat --model <model> --cloud
 					doneLoading = true
 				}
 
-				if len(chatResponse.Choices) == 0 {
-					continue
+				for i, match := range searchResponse.Matches {
+					cmd.Printf("%d. %s\n\n", i+1, match.Value)
 				}
-
-				token := chatResponse.Choices[0].Delta.Content
-				cmd.Printf("%s", token)
-				responseMessage = responseMessage + token
+				matches[message] = append(matches[message], searchResponse.Matches...)
+				cmd.Printf("Time: %s. %d results.", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
 			}
 
 			if !doneLoading {
@@ -197,22 +192,21 @@ spice chat --model <model> --cloud
 				doneLoading = true
 			}
 
-			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			cmd.Print("\n\n")
 		}
 	},
 }
 
-func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
+func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("error marshaling request body: %w", err)
+		return nil, fmt.Errorf("error marshaling search request body: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1/chat/completions", rtcontext.HttpEndpoint())
+	url := fmt.Sprintf("%s/v1/search", rtcontext.HttpEndpoint())
 	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
+		return nil, fmt.Errorf("error creating search request: %w", err)
 	}
 
 	request.Header = rtcontext.GetHeaders()
@@ -226,9 +220,10 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 }
 
 func init() {
-	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
-	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
-	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
+	searchCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for search (default: false)")
+	searchCmd.Flags().String(modelKeyFlag, "", "Model to use for search")
+	searchCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for search (default: http://localhost:8090)")
+	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
 
-	RootCmd.AddCommand(chatCmd)
+	RootCmd.AddCommand(searchCmd)
 }

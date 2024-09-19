@@ -27,10 +27,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"golang.org/x/mod/semver"
+)
+
+const (
+	GET  = "GET"
+	POST = "POST"
 )
 
 type RuntimeContext struct {
@@ -42,6 +48,7 @@ type RuntimeContext struct {
 	metricsEndpoint string
 	isCloud         bool
 	httpClient      *http.Client
+	selectedModel   string
 }
 
 func NewContext() *RuntimeContext {
@@ -145,6 +152,25 @@ func (c *RuntimeContext) Version() (string, error) {
 	}
 
 	return strings.TrimSpace(string(version)), nil
+}
+
+func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
+	if c.ModelsFlavorInstalled() {
+		return
+	}
+	cmd.Print("This feature requires a runtime version with models enabled. Install (y/n)? ")
+	var confirm string
+	_, _ = fmt.Scanf("%s", &confirm)
+	if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+		cmd.Println("Models runtime not installed, exiting...")
+		os.Exit(0)
+	}
+	cmd.Println("Installing models runtime...")
+	err := c.InstallOrUpgradeRuntime("models")
+	if err != nil {
+		cmd.Println("Error installing models runtime", err)
+		os.Exit(1)
+	}
 }
 
 func (c *RuntimeContext) ModelsFlavorInstalled() bool {

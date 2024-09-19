@@ -17,13 +17,33 @@ limitations under the License.
 package util
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strings"
+	"time"
 
+	"github.com/gocarina/gocsv"
 	"github.com/olekukonko/tablewriter"
 )
+
+func ShowSpinner(done chan bool) {
+	chars := []rune{'⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'}
+	for {
+		for _, char := range chars {
+			select {
+			case <-done:
+				fmt.Print("\r") // Clear the spinner
+				return
+			default:
+				fmt.Printf("\r%c ", char)
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}
+}
 
 func WriteTable(items []interface{}) {
 	if len(items) == 0 {
@@ -60,4 +80,37 @@ func WriteTable(items []interface{}) {
 	}
 
 	table.Render()
+}
+
+func MarshalAndPrintTable(writer io.Writer, in interface{}) error {
+	csvContent, err := gocsv.MarshalString(in)
+	if err != nil {
+		return err
+	}
+
+	table := tablewriter.NewWriter(writer)
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetBorder(false)
+	table.SetHeaderLine(false)
+	table.SetRowLine(false)
+	table.SetCenterSeparator("")
+	table.SetRowSeparator("")
+	table.SetColumnSeparator("")
+	scanner := bufio.NewScanner(strings.NewReader(csvContent))
+	header := true
+
+	for scanner.Scan() {
+		text := strings.Split(scanner.Text(), ",")
+
+		if header {
+			table.SetHeader(text)
+			header = false
+		} else {
+			table.Append(text)
+		}
+	}
+
+	table.Render()
+	return nil
 }
