@@ -48,7 +48,6 @@ type RuntimeContext struct {
 	metricsEndpoint string
 	isCloud         bool
 	httpClient      *http.Client
-	selectedModel   string
 }
 
 func NewContext() *RuntimeContext {
