@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::mssql::{
-    self, SqlServerConnectionPool, SqlServerTableProvider, TiberiusConnectionManager,
+    self, SqlServerConnectionManager, SqlServerConnectionPool, SqlServerTableProvider,
 };
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
@@ -56,7 +56,7 @@ impl SqlServer {
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-        let conn = TiberiusConnectionManager::create_connection_pool(conn_string)
+        let conn = SqlServerConnectionManager::create_connection_pool(conn_string)
             .await
             .context(UnableToCreateConnectionPoolSnafu)?;
 

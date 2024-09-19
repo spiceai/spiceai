@@ -83,7 +83,7 @@ pub enum Error {
     FailedToDowncastBuilder { mssql_type: String },
 }
 
-pub type SqlServerConnectionPool = Pool<TiberiusConnectionManager>;
+pub type SqlServerConnectionPool = Pool<SqlServerConnectionManager>;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -112,8 +112,10 @@ impl SqlServerTableProvider {
         let table_name = table.table();
         let table_schema = table.schema().unwrap_or("dbo");
 
-        let columns_meta_query: String = format!("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'");
-
+        let columns_meta_query: String = format!(
+            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS \
+            WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'"
+        );
         tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
 
         let mut conn = conn.get().await.boxed().context(ConnectionPoolSnafu)?;
@@ -363,23 +365,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-                // ColumnType::Money | ColumnType::Money4 => {
-                //     let Some(builder) = builder else {
-                //         return NoBuilderForIndexSnafu { index: i }.fail();
-                //     };
-                //     let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>()
-                //     else {
-                //         return FailedToDowncastBuilderSnafu {
-                //             mssql_type: format!("{mssql_type:?}"),
-                //         }
-                //         .fail();
-                //     };
-                //     let v = row.get::<f64, usize>(i);
-                //     match v {
-                //         Some(v) => builder.append_value(v),
-                //         None => builder.append_null(),
-                //     }
-                // }
                 ColumnType::Decimaln | ColumnType::Numericn => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -437,7 +422,12 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-                _ => unimplemented!("Unsupported column type {:?}", mssql_type),
+                _ => {
+                    return UnsupportedTypeSnafu {
+                        data_type: format!("{mssql_type:?}"),
+                    }
+                    .fail();
+                }
             }
         }
     }
@@ -585,12 +575,12 @@ fn get_column_precision_and_scale(
 }
 
 #[derive(Clone, Debug)]
-pub struct TiberiusConnectionManager {
+pub struct SqlServerConnectionManager {
     config: Config,
 }
 
-impl TiberiusConnectionManager {
-    fn new(config: Config) -> TiberiusConnectionManager {
+impl SqlServerConnectionManager {
+    fn new(config: Config) -> SqlServerConnectionManager {
         Self { config }
     }
 
@@ -599,7 +589,7 @@ impl TiberiusConnectionManager {
     ) -> Result<SqlServerConnectionPool> {
         let config =
             Config::from_ado_string(connection_string).context(InvalidConnectionStringSnafu)?;
-        let manager = TiberiusConnectionManager::new(config);
+        let manager = SqlServerConnectionManager::new(config);
         let pool = bb8::Pool::builder()
             .build(manager)
             .await
@@ -609,7 +599,7 @@ impl TiberiusConnectionManager {
 }
 
 #[async_trait]
-impl bb8::ManageConnection for TiberiusConnectionManager {
+impl bb8::ManageConnection for SqlServerConnectionManager {
     type Connection = Client<Compat<TcpStream>>;
     type Error = tiberius::error::Error;
 
