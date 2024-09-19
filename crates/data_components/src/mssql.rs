@@ -23,6 +23,7 @@ use graphql_parser::schema;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tiberius::{numeric::Numeric, Client, ColumnType, Config, Row};
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 use crate::arrow::write::MemTable;
 
@@ -30,7 +31,7 @@ use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions, StringBuilder, Time64NanosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder, UInt8Builder
     },
-    datatypes::{DataType, Date32Type, Field, Schema, SchemaRef, TimeUnit},
+    datatypes::{DataType, Date32Type, Field, Schema, SchemaRef, TimeUnit}, ipc::Utf8,
 };
 use datafusion::{
     catalog::Session,
@@ -399,6 +400,22 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
+                ColumnType::Guid => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            mssql_type: format!("{mssql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<Uuid, usize>(i);
+                    match v {
+                        Some(v) => builder.append_value(v.to_string()),
+                        None => builder.append_null(),
+                    }
+                },
                 ColumnType::BigVarChar
                 | ColumnType::BigChar
                 | ColumnType::NVarchar
