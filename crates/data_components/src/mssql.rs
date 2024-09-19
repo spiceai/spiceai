@@ -103,7 +103,7 @@ impl SqlServerTableProvider {
         let table_name = table.to_string();
         let columns_meta_query: String = format!("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}'");
 
-        tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
+        tracing::info!("Executing schema query for dataset {table_name}: {columns_meta_query}");
 
         let mut conn = conn.get().await.unwrap();
 
@@ -139,7 +139,7 @@ impl SqlServerTableProvider {
         sql: &str,
         projected_schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::trace!("Executing sql: {sql}");
+        tracing::info!("Executing sql: {sql}");
 
         let conn_pool = Arc::clone(&self.conn);
         let schema = Arc::clone(&projected_schema);
