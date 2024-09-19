@@ -9,8 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-docx-rs = "0.4.17"
+docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="ccea202918e005b805c874149c2e6d3a00784007"}
 lopdf = "0.34.0"
 snafu.workspace = true
 bytes = "1.6.0"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }

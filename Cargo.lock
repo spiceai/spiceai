@@ -3514,8 +3514,7 @@ dependencies = [
 [[package]]
 name = "docx-rs"
 version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e593b51d4fe95d69d70fd40da4b314b029736302c986c3c760826e842fd27dc3"
+source = "git+https://github.com/spiceai/docx-rs?rev=ccea202918e005b805c874149c2e6d3a00784007#ccea202918e005b805c874149c2e6d3a00784007"
 dependencies = [
  "base64 0.13.1",
  "image 0.24.9",

@@ -17,7 +17,7 @@ limitations under the License.
 use bytes::Bytes;
 use snafu::ResultExt;
 use std::{any::Any, collections::HashMap, sync::Arc};
-
+use docx_rs::Render;
 use docx_rs::{read_docx, Docx};
 
 use crate::{
@@ -63,7 +63,8 @@ struct DocxDocument {
 
 impl Document for DocxDocument {
     fn as_flat_utf8(&self) -> String {
-        self.doc.json()
+        let ascii = self.doc.document.render_ascii();
+        String::from_utf8_lossy(&ascii).to_string()
     }
 
     fn type_(&self) -> DocumentType {
