@@ -151,8 +151,15 @@ spice search --model <model> --cloud
 				}
 
 				for i, match := range searchResponse.Matches {
-					cmd.Printf("%d. [%s] %s\n\n", i+1, match.Dataset, match.Value)
+					cmd.Printf("%d. [%s]", i+1, match.Dataset)
+					if len(match.PrimaryKey) > 0 {
+						for key, value := range match.PrimaryKey {
+							cmd.Printf(" %s=%v", key, value)
+						}
+					}
+					cmd.Printf("\n%s\n\n", match.Value)
 				}
+
 				matches[message] = append(matches[message], searchResponse.Matches...)
 				cmd.Printf("Time: %s. %d results.", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
 			}
