@@ -181,7 +181,7 @@ spice search --model <model> --cloud
 				}
 
 				for i, match := range searchResponse.Matches {
-					cmd.Printf("%d. %s\n\n", i+1, match.Value)
+					cmd.Printf("%d. [%s] %s\n\n", i+1, match.Dataset, match.Value)
 				}
 				matches[message] = append(matches[message], searchResponse.Matches...)
 				cmd.Printf("Time: %s. %d results.", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
