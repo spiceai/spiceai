@@ -137,7 +137,7 @@ SELECT labels.datasets AS datasets
 FROM runtime.task_history
 WHERE labels.datasets IS NOT NULL
 AND NOW() < end_time + INTERVAL '{DATASET_UNAVAILABLE_THRESHOLD_MINUTES}' MINUTE
-AND labels.tags NOT LIKE '%error%'"
+AND labels.error_code IS NULL"
         );
         let plan = df_ctx
             .sql(&query)
