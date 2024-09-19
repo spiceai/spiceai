@@ -101,8 +101,10 @@ impl SqlServerTableProvider {
         conn: Arc<SqlServerConnectionPool>,
         table: &TableReference,
     ) -> Result<SchemaRef> {
-        let table_name = table.to_string();
-        let columns_meta_query: String = format!("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}'");
+        let table_name = table.table();
+        let table_schema = table.schema().unwrap_or("dbo");
+
+        let columns_meta_query: String = format!("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'");
 
         tracing::info!("Executing schema query for dataset {table_name}: {columns_meta_query}");
 
