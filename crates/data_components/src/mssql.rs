@@ -233,7 +233,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
             let data_type =
                 map_column_type_to_arrow_type(column_type, decimal_precision, decimal_scale);
 
-            // arrow_fields.push(Field::new(column_name.clone(), data_type.clone(), true));
             arrow_columns_builders.push(map_data_type_to_array_builder_optional(Some(&data_type)));
             mssql_types.push(column_type);
             column_names.push(column_name.to_string());
