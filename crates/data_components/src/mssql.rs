@@ -67,7 +67,7 @@ pub enum Error {
     #[snafu(display("Failed to retrieve table schema"))]
     SchemaRetrieval,
 
-    #[snafu(display("Unable to retrieve schema: table '{table}' doesn't exist"))]
+    #[snafu(display("Unable to retrieve schema: table '{table}' does not exist"))]
     SchemaRetrievalTableNotFound { table: String },
 
     #[snafu(display("Unsupported data type: {data_type}"))]
