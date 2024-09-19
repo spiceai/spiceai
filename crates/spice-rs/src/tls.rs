@@ -1,9 +1,10 @@
-use std::error::Error;
 use std::str::FromStr;
 use tonic::transport::channel::{ClientTlsConfig, Endpoint};
 use tonic::transport::Channel;
 
-pub fn system_tls_certificate() -> Result<tonic::transport::Certificate, Box<dyn Error>> {
+use crate::config::GenericError;
+
+pub fn system_tls_certificate() -> Result<tonic::transport::Certificate, GenericError> {
     // Load root certificates found in the platform’s native certificate store.
     let certs = rustls_native_certs::load_native_certs()?;
 
@@ -19,7 +20,7 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate, Box<dyn
     Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
 }
 
-pub async fn new_tls_flight_channel(https_url: &str) -> Result<Channel, Box<dyn Error>> {
+pub async fn new_tls_flight_channel(https_url: &str) -> Result<Channel, GenericError> {
     let mut endpoint = Endpoint::from_str(https_url)?;
 
     if https_url.starts_with("https://") {

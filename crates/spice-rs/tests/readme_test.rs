@@ -11,13 +11,17 @@ mod tests {
         dotenv::from_path(Path::new(".env.local")).ok();
         let api_key = env::var("API_KEY").expect("API_KEY not found");
 
-        let mut client = Client::new(&api_key).await.unwrap();
+        let mut client = Client::new(&api_key)
+            .await
+            .expect("SpiceClient should be created");
         let data = client
             .query("SELECT * FROM eth.recent_blocks LIMIT 10;")
             .await;
-        if data.is_err() {
-            panic!("failed to query: {:#?}", data.expect_err(""))
-        }
+        assert!(
+            data.is_ok(),
+            "failed to query: {:#?}",
+            data.expect_err("should be an error")
+        );
     }
 
     #[tokio::test]
@@ -31,24 +35,31 @@ mod tests {
             .use_spiceai_cloud()
             .build()
             .await
-            .unwrap();
+            .expect("SpiceClient should be created");
 
         let data = client
             .query("SELECT * FROM eth.recent_blocks LIMIT 10;")
             .await;
-        if data.is_err() {
-            panic!("failed to query: {:#?}", data.expect_err(""))
-        }
+        assert!(
+            data.is_ok(),
+            "failed to query: {:#?}",
+            data.expect_err("should be an error")
+        );
     }
 
     #[tokio::test]
     async fn test_readme_builder_local() {
         // NOTE: If you're changing the code below, make sure you update the README.md.
-        let mut client = ClientBuilder::new().build().await.unwrap();
+        let mut client = ClientBuilder::new()
+            .build()
+            .await
+            .expect("SpiceClient should be created");
 
         let data = client.query("select * from taxi_trips limit 3;").await;
-        if data.is_err() {
-            panic!("failed to query: {:#?}", data.expect_err(""))
-        }
+        assert!(
+            data.is_ok(),
+            "failed to query: {:#?}",
+            data.expect_err("should be an error")
+        );
     }
 }

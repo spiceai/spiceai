@@ -1,3 +1,5 @@
+use crate::config::get_user_agent;
+use crate::config::GenericError;
 use arrow::error::ArrowError;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
@@ -11,7 +13,6 @@ use bytes::Bytes;
 use futures::stream;
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use std::error::Error;
 use std::str::FromStr;
 use tonic::metadata::AsciiMetadataKey;
 use tonic::transport::Channel;
@@ -24,16 +25,20 @@ pub struct SqlFlightClient {
     api_key: Option<String>,
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn status_to_arrow_error(status: tonic::Status) -> ArrowError {
     ArrowError::IpcError(format!("{status:?}"))
 }
 
 impl SqlFlightClient {
     pub fn new(chan: Channel, api_key: Option<String>) -> Self {
+        let mut headers = HashMap::new();
+        headers.insert("x-spice-user-agent".to_string(), get_user_agent());
+
         SqlFlightClient {
             api_key,
+            headers,
             client: FlightServiceClient::new(chan),
-            headers: HashMap::default(),
             token: None,
         }
     }
@@ -41,7 +46,7 @@ impl SqlFlightClient {
     async fn handshake(&mut self, username: &str, password: &str) -> Result<Bytes, ArrowError> {
         let cmd = HandshakeRequest {
             protocol_version: 0,
-            payload: Default::default(),
+            payload: Bytes::default(),
         };
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
         let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
@@ -81,7 +86,7 @@ impl SqlFlightClient {
         Ok(resp)
     }
 
-    async fn authenticate(&mut self, api_key: &str) -> std::result::Result<(), Box<dyn Error>> {
+    async fn authenticate(&mut self, api_key: &str) -> std::result::Result<(), GenericError> {
         if api_key.split('|').collect::<String>().len() < 2 {
             return Err("Invalid API key format".into());
         }
@@ -114,7 +119,7 @@ impl SqlFlightClient {
     pub async fn query(
         &mut self,
         query: &str,
-    ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
+    ) -> std::result::Result<FlightRecordBatchStream, GenericError> {
         let api_key = self.api_key.clone();
         if let Some(api_key) = api_key {
             self.authenticate(&api_key).await?;

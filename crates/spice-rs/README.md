@@ -33,7 +33,7 @@ async fn main() {
 }
 ```
 
-### New client with https://spice.ai cloud
+### New client with <https://spice.ai> cloud
 
 ```rust
 use spiceai::ClientBuilder;

@@ -41,13 +41,13 @@ mod tests {
                             assert_eq!(batch.num_rows(), 10);
                         },
                         Err(e) => {
-                            panic!("Error: {}", e)
+                            panic!("Error: {e}")
                         },
                     };
                     }
                 }
                 Err(e) => {
-                    panic!("Error: {}", e);
+                    panic!("Error: {e}");
                 }
             };
     }
@@ -67,13 +67,13 @@ mod tests {
                             assert_eq!(batch.num_rows(), 10);
                         },
                         Err(e) => {
-                            panic!("Error: {}", e)
+                            panic!("Error: {e}")
                         }
                     };
                 }
             }
             Err(e) => {
-                panic!("Error: {}", e);
+                panic!("Error: {e}");
             }
         };
     }
@@ -95,7 +95,7 @@ mod tests {
                             total_rows += batch.num_rows();
                         },
                         Err(e) => {
-                            panic!("Error: {}", e)
+                            panic!("Error: {e}")
                         },
                     };
                     }
@@ -103,7 +103,7 @@ mod tests {
                     assert_ne!(num_batches, 1);
                 }
                 Err(e) => {
-                    panic!("Error: {}", e);
+                    panic!("Error: {e}");
                 }
             };
     }
