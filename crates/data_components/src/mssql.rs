@@ -16,10 +16,8 @@ limitations under the License.
 use async_trait::async_trait;
 use bb8::Pool;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use clickhouse_rs::types::Column;
 use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
-use futures::{StreamExt, TryStreamExt};
-use graphql_parser::schema;
+use futures::StreamExt;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tiberius::{numeric::Numeric, Client, ColumnType, Config, Row};
 use tokio::net::TcpStream;
@@ -29,21 +27,23 @@ use crate::arrow::write::MemTable;
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions, StringBuilder, Time64NanosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder, UInt8Builder
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int16Builder, Int32Builder, Int64Builder, NullBuilder, RecordBatch,
+        RecordBatchOptions, StringBuilder, Time64NanosecondBuilder, TimestampMillisecondBuilder,
+        TimestampNanosecondBuilder, UInt8Builder,
     },
-    datatypes::{DataType, Date32Type, Field, Schema, SchemaRef, TimeUnit}, ipc::Utf8,
+    datatypes::{DataType, Date32Type, Field, Schema, SchemaRef, TimeUnit},
 };
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    execution::SendableRecordBatchStream,
     logical_expr::{Expr, TableProviderFilterPushDown},
-    physical_plan::{stream::RecordBatchStreamAdapter, EmptyRecordBatchStream, ExecutionPlan},
-    sql::{sqlparser::ast::Table, TableReference},
+    physical_plan::ExecutionPlan,
+    sql::TableReference,
 };
 
-use chrono::{DateTime, Offset, Timelike, Utc};
+use chrono::Timelike;
 
 use std::{any::Any, sync::Arc};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -53,16 +53,24 @@ pub enum Error {
     #[snafu(display("Error executing query: {source}"))]
     QueryError { source: tiberius::error::Error },
 
-    #[snafu(display("Unable to parse connection string: {source}"))]
+    #[snafu(display("Invalid connection string: {source}"))]
     InvalidConnectionStringError { source: tiberius::error::Error },
 
     #[snafu(display("Unable to connect: {source}"))]
     SqlServerAccessError { source: tiberius::error::Error },
 
-    #[snafu(display("Failed to retrieve the schema"))]
+    #[snafu(display("Unable to connect: {source}"))]
+    ConnectionPoolError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to retrieve table schema"))]
     SchemaRetrieval,
 
-    #[snafu(display("Unsupported MS SQL data type: {data_type}"))]
+    #[snafu(display("Unable to retrieve table schema: dataset not found"))]
+    SchemaRetrievalTableNotFound,
+
+    #[snafu(display("Unsupported data type: {data_type}"))]
     UnsupportedType { data_type: String },
 
     #[snafu(display("Failed to build record batch: {source}"))]
@@ -106,9 +114,9 @@ impl SqlServerTableProvider {
 
         let columns_meta_query: String = format!("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'");
 
-        tracing::info!("Executing schema query for dataset {table_name}: {columns_meta_query}");
+        tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
 
-        let mut conn = conn.get().await.unwrap();
+        let mut conn = conn.get().await.boxed().context(ConnectionPoolSnafu)?;
 
         let mut query_res = conn
             .simple_query(columns_meta_query)
@@ -127,12 +135,20 @@ impl SqlServerTableProvider {
             let numeric_scale: Option<i32> = row.get(3);
 
             let column_type = map_type_name_to_column_type(data_type)?;
-            let arrow_data_type =
-                map_column_type_to_arrow_type(column_type, numeric_precision, numeric_scale.map(|v| v as i8));
+            let arrow_data_type = map_column_type_to_arrow_type(
+                column_type,
+                numeric_precision,
+                numeric_scale.map(|v| i8::try_from(v).unwrap_or_default()),
+            );
 
             fields.push(Field::new(column_name, arrow_data_type, true));
         }
-        tracing::trace!("Retrieved dataset {table_name}: {fields:?}");
+
+        if fields.is_empty() {
+            return Err(Error::SchemaRetrievalTableNotFound {});
+        }
+
+        tracing::trace!("Retrieved dataset {table_name} schema: {fields:?}");
 
         Ok(Arc::new(Schema::new(fields)))
     }
@@ -142,17 +158,17 @@ impl SqlServerTableProvider {
         sql: &str,
         projected_schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!("Executing sql: {sql}");
+        tracing::debug!("Executing sql: {sql}");
 
-        let conn_pool = Arc::clone(&self.conn);
         let schema = Arc::clone(&projected_schema);
 
-        let mut conn = conn_pool.get().await.unwrap();
+        let mut conn = self.conn.get().await.boxed().context(ConnectionPoolSnafu)?;
 
         let query_res = conn
             .simple_query(sql)
             .await
-            .context(QuerySnafu)?
+            .boxed()
+            .context(ConnectionPoolSnafu)?
             .into_row_stream();
 
         let mut chunked_stream = query_res.chunks(4_000).boxed();
@@ -171,10 +187,6 @@ impl SqlServerTableProvider {
 
         Ok(records)
     }
-}
-
-fn to_datafusion_err(e: Error) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::External(Box::new(e))
 }
 
 macro_rules! handle_primitive_type {
@@ -196,36 +208,28 @@ macro_rules! handle_primitive_type {
     }};
 }
 
-fn get_column_precision_and_scale(column_name: &str, projected_schema: &SchemaRef) -> Option<(u8, i8)> {
-    let field = projected_schema.field_with_name(column_name).ok()?;
-    match field.data_type() {
-        DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
-        _ => None,
-    }
-}
-
-pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
-    // let mut arrow_fields: Vec<Field> = Vec::new();
+#[allow(clippy::too_many_lines)]
+fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
     let mut mssql_types: Vec<ColumnType> = Vec::new();
     let mut column_names: Vec<String> = Vec::new();
 
     if !rows.is_empty() {
         let row = &rows[0];
-        for column in row.columns().iter() {
+        for column in row.columns() {
             let column_name = column.name();
             let column_type = column.column_type();
-
             let (decimal_precision, decimal_scale) = match column_type {
                 ColumnType::Decimaln | ColumnType::Numericn => {
                     // use 38, 10 as default precision and scale for decimal types
-                    let (precision, scale) = get_column_precision_and_scale(&column_name, schema).unwrap_or((38, 10));
-                    
+                    let (precision, scale) =
+                        get_column_precision_and_scale(column_name, schema).unwrap_or((38, 10));
                     (Some(precision), Some(scale))
                 }
                 _ => (None, None),
             };
-            let data_type = map_column_type_to_arrow_type(column_type, decimal_precision, decimal_scale);
+            let data_type =
+                map_column_type_to_arrow_type(column_type, decimal_precision, decimal_scale);
 
             // arrow_fields.push(Field::new(column_name.clone(), data_type.clone(), true));
             arrow_columns_builders.push(map_data_type_to_array_builder_optional(Some(&data_type)));
@@ -239,7 +243,6 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
                 return NoBuilderForIndexSnafu { index: i }.fail();
             };
-
             match *mssql_type {
                 ColumnType::Null => {
                     let Some(builder) = builder else {
@@ -275,18 +278,11 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         i
                     );
                 }
-                ColumnType::Float8 => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::Float8,
-                        Float64Builder,
-                        f64,
-                        row,
-                        i
-                    );
+                ColumnType::Float8 | ColumnType::Money | ColumnType::Money4 => {
+                    handle_primitive_type!(builder, *mssql_type, Float64Builder, f64, row, i);
                 }
                 ColumnType::Bit | ColumnType::Bitn => {
-                    handle_primitive_type!(builder, ColumnType::Bit, BooleanBuilder, bool, row, i);
+                    handle_primitive_type!(builder, *mssql_type, BooleanBuilder, bool, row, i);
                 }
                 ColumnType::Datetime | ColumnType::Datetimen | ColumnType::Datetime4 => {
                     let Some(builder) = builder else {
@@ -307,7 +303,6 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-
                 ColumnType::Datetime2 => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -323,11 +318,11 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     };
                     let v = row.get::<NaiveDateTime, usize>(i);
                     match v {
-                        Some(v) => builder.append_value(v.and_utc().timestamp_nanos()),
+                        Some(v) => builder
+                            .append_value(v.and_utc().timestamp_nanos_opt().unwrap_or_default()),
                         None => builder.append_null(),
                     }
                 }
-
                 ColumnType::Daten => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -344,7 +339,6 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-
                 ColumnType::Timen => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -369,28 +363,29 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-                ColumnType::Money | ColumnType::Money4 => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            mssql_type: format!("{mssql_type:?}"),
-                        }
-                        .fail();
-                    };
-                    let v = row.get::<f64, usize>(i);
-                    match v {
-                        Some(v) => builder.append_value(v),
-                        None => builder.append_null(),
-                    }
-                }
+                // ColumnType::Money | ColumnType::Money4 => {
+                //     let Some(builder) = builder else {
+                //         return NoBuilderForIndexSnafu { index: i }.fail();
+                //     };
+                //     let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>()
+                //     else {
+                //         return FailedToDowncastBuilderSnafu {
+                //             mssql_type: format!("{mssql_type:?}"),
+                //         }
+                //         .fail();
+                //     };
+                //     let v = row.get::<f64, usize>(i);
+                //     match v {
+                //         Some(v) => builder.append_value(v),
+                //         None => builder.append_null(),
+                //     }
+                // }
                 ColumnType::Decimaln | ColumnType::Numericn => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<Decimal128Builder>() else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Decimal128Builder>()
+                    else {
                         return FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
@@ -417,7 +412,7 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         Some(v) => builder.append_value(v.to_string()),
                         None => builder.append_null(),
                     }
-                },
+                }
                 ColumnType::BigVarChar
                 | ColumnType::BigChar
                 | ColumnType::NVarchar
@@ -451,13 +446,13 @@ pub fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
         .into_iter()
         .filter_map(|builder| builder.map(|mut b| b.finish()))
         .collect::<Vec<ArrayRef>>();
-    //let arrow_fields = arrow_fields.into_iter().flatten().collect::<Vec<Field>>();
+
     let options = &RecordBatchOptions::new().with_row_count(Some(rows.len()));
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, options)
         .map_err(|err| Error::FailedToBuildRecordBatch { source: err })
 }
 
-pub fn map_column_type_to_arrow_type(
+fn map_column_type_to_arrow_type(
     column_type: ColumnType,
     decimal_precision: Option<u8>,
     decimal_scale: Option<i8>,
@@ -468,40 +463,40 @@ pub fn map_column_type_to_arrow_type(
         ColumnType::Int1 => DataType::UInt8,
         ColumnType::Int2 => DataType::Int16,
         ColumnType::Int4 => DataType::Int32,
-        ColumnType::Int8 => DataType::Int64,
-        ColumnType::Intn => DataType::Int64,
+        ColumnType::Int8 | ColumnType::Intn => DataType::Int64,
         ColumnType::Float4 => DataType::Float32,
-        ColumnType::Float8 => DataType::Float64,
-        ColumnType::Floatn => DataType::Float64,
-        ColumnType::Money | ColumnType::Money4 => DataType::Float64,
-        // ColumnType::Money => DataType::Decimal128(19, 4),
-        // ColumnType::Money4 => DataType::Decimal128(10, 4),
+        ColumnType::Float8 | ColumnType::Floatn | ColumnType::Money | ColumnType::Money4 => {
+            DataType::Float64
+        }
         ColumnType::Datetime4 | ColumnType::Datetime | ColumnType::Datetimen => {
             DataType::Timestamp(TimeUnit::Millisecond, None)
         }
-        ColumnType::Datetime2 => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        ColumnType::DatetimeOffsetn => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        ColumnType::Guid => DataType::Utf8,
+        ColumnType::Datetime2 | ColumnType::DatetimeOffsetn => {
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        }
         ColumnType::Decimaln | ColumnType::Numericn => {
-            let precision = decimal_precision.unwrap_or(38) as u8; // MSSQL max precision
-            let scale = decimal_scale.unwrap_or(10) as i8;
+            let precision = decimal_precision.unwrap_or(38);
+            let scale = decimal_scale.unwrap_or(10);
             DataType::Decimal128(precision, scale)
         }
         ColumnType::Daten => DataType::Date32,
         ColumnType::Timen => DataType::Time64(TimeUnit::Nanosecond),
-        ColumnType::BigVarBin | ColumnType::BigBinary => DataType::Binary,
-        ColumnType::Image => DataType::Binary,
-        ColumnType::BigVarChar | ColumnType::BigChar => DataType::Utf8,
-        ColumnType::NVarchar | ColumnType::NChar => DataType::Utf8,
-        ColumnType::Xml => DataType::Utf8,
-        ColumnType::Udt => DataType::Utf8,
-        ColumnType::Text | ColumnType::NText => DataType::Utf8,
-        ColumnType::SSVariant => DataType::Utf8,
+        ColumnType::Image | ColumnType::BigVarBin | ColumnType::BigBinary => DataType::Binary,
+        ColumnType::Guid
+        | ColumnType::BigVarChar
+        | ColumnType::BigChar
+        | ColumnType::NVarchar
+        | ColumnType::NChar
+        | ColumnType::Xml
+        | ColumnType::Udt
+        | ColumnType::Text
+        | ColumnType::NText
+        | ColumnType::SSVariant => DataType::Utf8,
         ColumnType::Bit | ColumnType::Bitn => DataType::Boolean,
     }
 }
 
-pub fn map_type_name_to_column_type(data_type: &str) -> Result<ColumnType> {
+fn map_type_name_to_column_type(data_type: &str) -> Result<ColumnType> {
     // https://github.com/prisma/tiberius/blob/51f0cbb3e430db74ba0ea4830b236e89f1b1e03f/src/tds/codec/token/token_col_metadata.rs#L26
     let column_type = match data_type.to_lowercase().as_str() {
         "int" => ColumnType::Int4,
@@ -566,14 +561,26 @@ impl TableProvider for SqlServerTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let sql = format!(
-            "SELECT * from {table_name}",
-            table_name = self.table.to_string()
-        );
+        let sql = format!("SELECT * from {dataset}", dataset = self.table);
         let records = self.query_arrow(&sql, Arc::clone(&self.schema)).await?;
 
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![records])?;
         table.scan(state, projection, filters, limit).await
+    }
+}
+
+fn to_datafusion_err(e: Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
+}
+
+fn get_column_precision_and_scale(
+    column_name: &str,
+    projected_schema: &SchemaRef,
+) -> Option<(u8, i8)> {
+    let field = projected_schema.field_with_name(column_name).ok()?;
+    match field.data_type() {
+        DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
+        _ => None,
     }
 }
 
@@ -583,8 +590,8 @@ pub struct TiberiusConnectionManager {
 }
 
 impl TiberiusConnectionManager {
-    fn new(config: Config) -> tiberius::Result<TiberiusConnectionManager> {
-        Ok(TiberiusConnectionManager { config })
+    fn new(config: Config) -> TiberiusConnectionManager {
+        Self { config }
     }
 
     pub async fn create_connection_pool(
@@ -592,7 +599,7 @@ impl TiberiusConnectionManager {
     ) -> Result<SqlServerConnectionPool> {
         let config =
             Config::from_ado_string(connection_string).context(InvalidConnectionStringSnafu)?;
-        let manager = TiberiusConnectionManager::new(config).unwrap();
+        let manager = TiberiusConnectionManager::new(config);
         let pool = bb8::Pool::builder()
             .build(manager)
             .await

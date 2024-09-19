@@ -60,9 +60,9 @@ impl SqlServer {
             .await
             .context(UnableToCreateConnectionPoolSnafu)?;
 
-        return Ok(Self {
+        Ok(Self {
             conn: Arc::new(conn),
-        });
+        })
     }
 }
 
@@ -115,8 +115,8 @@ impl DataConnector for SqlServer {
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mssql",
-            });
+            })?;
 
-        Ok(Arc::new(provider.unwrap()))
+        Ok(Arc::new(provider))
     }
 }
