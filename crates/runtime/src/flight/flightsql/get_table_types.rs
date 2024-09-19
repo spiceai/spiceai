@@ -33,7 +33,7 @@ use crate::{
 };
 
 pub(crate) fn get_flight_info(
-    query: &sql::CommandGetTableTypes,
+    query: sql::CommandGetTableTypes,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
     let fd = request.into_inner();
@@ -49,7 +49,7 @@ pub(crate) fn get_flight_info(
 }
 
 pub(crate) fn do_get(
-    query: &sql::CommandGetTableTypes,
+    query: sql::CommandGetTableTypes,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_TABLE_TYPES_DURATION_MS, vec![]);
     tracing::trace!("do_get_table_types: {query:?}");

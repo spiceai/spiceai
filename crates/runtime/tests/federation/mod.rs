@@ -35,6 +35,9 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
 #[allow(clippy::too_many_lines)]
 async fn spiceai_integration_test_single_source_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("basic_federation_push_down")
         .with_dataset(make_spiceai_dataset("eth.recent_blocks", "blocks"))
@@ -53,7 +56,12 @@ async fn spiceai_integration_test_single_source_federation_push_down() -> Result
         .build()
         .await;
 
-    rt.load_components().await;
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            panic!("Timeout waiting for components to load");
+        }
+        () = rt.load_components() => {}
+    }
 
     let has_one_int_val = |result_batches: Vec<RecordBatch>| {
         for batch in result_batches {

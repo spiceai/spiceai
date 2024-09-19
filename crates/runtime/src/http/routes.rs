@@ -21,7 +21,7 @@ use crate::{config, datafusion::DataFusion};
 use app::App;
 use axum::routing::patch;
 use model_components::model::Model;
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
@@ -105,9 +105,9 @@ async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
     let status = response.status().as_u16().to_string();
 
     let labels = [
-        Key::from_static_str("method").string(method.to_string()),
-        Key::from_static_str("path").string(path),
-        Key::from_static_str("status").string(status),
+        KeyValue::new("method", method.to_string()),
+        KeyValue::new("path", path),
+        KeyValue::new("status", status),
     ];
 
     metrics::REQUESTS_TOTAL.add(1, &labels);

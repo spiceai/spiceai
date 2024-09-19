@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::fmt::{self, Display, Formatter};
 
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -98,7 +98,7 @@ pub(crate) async fn do_action(
     let action_type_str = action_type.as_str().to_string();
     let start = TimeMeasurement::new(
         &metrics::DO_ACTION_DURATION_MS,
-        vec![Key::from_static_str("action_type").string(action_type_str)],
+        vec![KeyValue::new("action_type", action_type_str)],
     );
 
     let stream = match action_type {
