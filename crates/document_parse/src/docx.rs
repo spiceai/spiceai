@@ -20,7 +20,9 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use docx_rs::{read_docx, Docx};
 
-use crate::{Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result};
+use crate::{
+    Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+};
 
 pub struct DocxParserFactory {}
 
@@ -43,7 +45,7 @@ pub struct DocxParser {}
 impl DocxParser {
     pub fn new(_parser_options: &HashMap<String, String>) -> Self {
         DocxParser::default()
-    }    
+    }
 }
 
 impl DocumentParser for DocxParser {
