@@ -16,7 +16,7 @@ limitations under the License.
 use async_trait::async_trait;
 use bb8::Pool;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
+use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
 use futures::StreamExt;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tiberius::{numeric::Numeric, Client, ColumnType, Config, Row};
@@ -193,10 +193,7 @@ impl SqlServerTableProvider {
 
 macro_rules! handle_primitive_type {
     ($builder:expr, $type:expr, $builder_ty:ty, $value_ty:ty, $row:expr, $index:expr) => {{
-        let Some(builder) = $builder else {
-            return NoBuilderForIndexSnafu { index: $index }.fail();
-        };
-        let Some(builder) = builder.as_any_mut().downcast_mut::<$builder_ty>() else {
+        let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_ty>() else {
             return FailedToDowncastBuilderSnafu {
                 mssql_type: format!("{:?}", $type),
             }
@@ -212,7 +209,7 @@ macro_rules! handle_primitive_type {
 
 #[allow(clippy::too_many_lines)]
 fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
-    let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
+    let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut mssql_types: Vec<ColumnType> = Vec::new();
     let mut column_names: Vec<String> = Vec::new();
 
@@ -233,7 +230,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
             let data_type =
                 map_column_type_to_arrow_type(column_type, decimal_precision, decimal_scale);
 
-            arrow_columns_builders.push(map_data_type_to_array_builder_optional(Some(&data_type)));
+            arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
             mssql_types.push(column_type);
             column_names.push(column_name.to_string());
         }
@@ -246,9 +243,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
             };
             match *mssql_type {
                 ColumnType::Null => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
@@ -286,9 +280,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     handle_primitive_type!(builder, *mssql_type, BooleanBuilder, bool, row, i);
                 }
                 ColumnType::Datetime | ColumnType::Datetimen | ColumnType::Datetime4 => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<TimestampMillisecondBuilder>()
@@ -305,9 +296,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     }
                 }
                 ColumnType::Datetime2 => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<TimestampNanosecondBuilder>()
@@ -325,9 +313,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     }
                 }
                 ColumnType::Daten => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
                         return FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
@@ -341,9 +326,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     }
                 }
                 ColumnType::Timen => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<Time64NanosecondBuilder>()
@@ -365,9 +347,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     }
                 }
                 ColumnType::Decimaln | ColumnType::Numericn => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<Decimal128Builder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
@@ -382,9 +361,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     }
                 }
                 ColumnType::Guid => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
@@ -406,9 +382,6 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                 | ColumnType::Text
                 | ColumnType::NText
                 | ColumnType::SSVariant => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
@@ -432,8 +405,8 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
     }
 
     let columns = arrow_columns_builders
-        .into_iter()
-        .filter_map(|builder| builder.map(|mut b| b.finish()))
+        .iter_mut()
+        .map(arrow::array::ArrayBuilder::finish)
         .collect::<Vec<ArrayRef>>();
 
     let options = &RecordBatchOptions::new().with_row_count(Some(rows.len()));
