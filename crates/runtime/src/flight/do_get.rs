@@ -63,7 +63,7 @@ pub(crate) async fn handle(
         Command::CommandGetPrimaryKeys(command) => {
             flightsql::get_primary_keys::do_get(flight_svc, &command)
         }
-        Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(&command),
+        Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command),
         Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command),
         _ => Err(Status::unimplemented("Not yet implemented")),
     }
