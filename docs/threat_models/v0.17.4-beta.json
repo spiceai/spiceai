@@ -134,7 +134,7 @@
                   "severity": "Medium",
                   "type": "Information disclosure",
                   "description": "Users with access to the Spice runtime APIs can access information from the data source either via federated SQL query or through queries on a configured accelerator, potentially getting access to data they don't normally have access to.",
-                  "mitigation": "This is an expected behavior of the system. Spice can be used by design to provide access to data without needing to divulge the underlying connection information.",
+                  "mitigation": "This is an expected behavior of the system. Spice can be used by design to provide access to data without needing to divulge the underlying connection information.\n\nThe current supported deployment model is that endpoints aren't exposed to untrusted entities.",
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 4,
@@ -229,6 +229,19 @@
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 16,
+                  "score": ""
+                },
+                {
+                  "id": "b2f796eb-4409-446f-8888-61d46a165b49",
+                  "title": "Malicious compressed small payload has unbounded/very large size",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Denial of service",
+                  "description": "If an attacker is able to send a payload to a Spice endpoint that is compressed, and the decompression of that payload causes Spice to run out of memory due to the payload itself having a very large/potentially unbounded size - then it could cause a denial of service. (i.e. Zipbomb)",
+                  "mitigation": "- No known Gzip attack vector and the HTTP endpoints only accept Gzip compression\n- For connecting to data sources, we rely on object_store's implementation which should protect against this.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 18,
                   "score": ""
                 }
               ]
@@ -694,7 +707,7 @@
             },
             "attrs": {
               "text": {
-                "text": "Sidecar Filesystem"
+                "text": "Local Machine Filesystem"
               },
               "topLine": {
                 "stroke": "red",
@@ -713,7 +726,7 @@
             "id": "03fb0ac1-ff87-46cc-8c51-f75357f8d350",
             "data": {
               "type": "tm.Store",
-              "name": "Sidecar Filesystem",
+              "name": "Local Machine Filesystem",
               "description": "",
               "outOfScope": false,
               "reasonOutOfScope": "",
@@ -736,6 +749,19 @@
                   "new": false,
                   "number": 1,
                   "score": ""
+                },
+                {
+                  "id": "1dd96996-2703-4cc7-9e02-9dee68efc22d",
+                  "title": "Bypass underlying data source AuthN/AuthZ by reading accelerator files",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "When Spice is configured to accelerate data from a data source to a file (i.e. DuckDB/SQLite) then its possible to bypass all AuthN/AuthZ measures if the attacker has access to the file.",
+                  "mitigation": "- Limit the file permissions to only the user running the Spice instance\n  - [Action]: Change default file permission to 600\n  - [Action]: Configuration to allow changing permission\n- Instead of running Spice on the same machine, run it in a separate machine in the trusted network.\n- chroot the Spice instance AND chroot the application",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 17,
+                  "score": ""
                 }
               ]
             }
@@ -746,6 +772,6 @@
     ],
     "diagramTop": 2,
     "reviewer": "Spice AI Engineering Team",
-    "threatTop": 16
+    "threatTop": 18
   }
 }
