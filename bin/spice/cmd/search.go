@@ -48,10 +48,10 @@ var searchCmd = &cobra.Command{
 	Short: "Search datasets with embeddings",
 	Example: `
 # Start a search session with local spiced instance
-spice search --model <model>
+spice search
 
 # Start a search session with spiced instance in spice.ai cloud
-spice search --model <model> --cloud
+spice search --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
