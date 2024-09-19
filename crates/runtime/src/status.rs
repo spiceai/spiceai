@@ -21,7 +21,7 @@ use std::{
 };
 
 use datafusion::sql::TableReference;
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
@@ -84,55 +84,37 @@ impl RuntimeStatus {
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
         let catalog_name = catalog_name.into();
         self.update_component_status(format!("catalog:{catalog_name}"), status);
-        metrics::catalogs::STATUS.record(
-            status as u64,
-            &[Key::from_static_str("catalog").string(catalog_name)],
-        );
+        metrics::catalogs::STATUS.record(status as u64, &[KeyValue::new("catalog", catalog_name)]);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
         let ds_name = dataset.to_string();
         self.update_component_status(format!("dataset:{ds_name}"), status);
-        metrics::datasets::STATUS.record(
-            status as u64,
-            &[Key::from_static_str("dataset").string(ds_name)],
-        );
+        metrics::datasets::STATUS.record(status as u64, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         self.update_component_status(format!("model:{model_name}"), status);
-        metrics::models::STATUS.record(
-            status as u64,
-            &[Key::from_static_str("model").string(model_name)],
-        );
+        metrics::models::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
         let tool_name = tool_name.to_string();
         self.update_component_status(format!("tool:{tool_name}"), status);
-        metrics::tools::STATUS.record(
-            status as u64,
-            &[Key::from_static_str("tool").string(tool_name)],
-        );
+        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool", tool_name)]);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         self.update_component_status(format!("llm:{model_name}"), status);
-        metrics::llms::STATUS.record(
-            status as u64,
-            &[Key::from_static_str("model").string(model_name)],
-        );
+        metrics::llms::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         self.update_component_status(format!("embedding:{model_name}"), status);
-        metrics::embeddings::STATUS.record(
-            status as u64,
-            &[Key::from_static_str("model").string(model_name)],
-        );
+        metrics::embeddings::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
     }
 
     /// Checks if all registered components have been ready at least once.

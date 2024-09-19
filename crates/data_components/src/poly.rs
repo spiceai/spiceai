@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -91,7 +91,7 @@ impl TableProvider for PolyTableProvider {
     fn table_type(&self) -> TableType {
         self.write.table_type()
     }
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
         self.write.get_logical_plan()
     }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {

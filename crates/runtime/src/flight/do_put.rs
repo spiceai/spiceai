@@ -20,7 +20,7 @@ use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use datafusion::sql::TableReference;
 use futures::stream;
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use tokio::sync::{broadcast::Sender, RwLock};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -63,7 +63,7 @@ pub(crate) async fn handle(
 
     let path = TableReference::parse_str(&fd.path.join("."));
 
-    duration_metric.with_labels(vec![Key::from_static_str("path").string(path.to_string())]);
+    duration_metric.with_labels(vec![KeyValue::new("path", path.to_string())]);
 
     if !flight_svc.datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
