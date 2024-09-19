@@ -28,7 +28,6 @@ use arrow_flight::{
 use prost::Message;
 use rand::Rng;
 use runtime::{config::Config, tls::TlsConfig, Runtime};
-use rustls::crypto::{self, CryptoProvider};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 
