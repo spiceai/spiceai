@@ -20,6 +20,28 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 
 impl DatasetCheckpoint {
+    pub(super) async fn init_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
+        conn.conn
+            .call(move |conn| {
+                let create_table = format!(
+                    "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
+                        dataset_name TEXT PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )"
+                );
+                conn.execute(&create_table, [])?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string().into())
+    }
+
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -46,15 +68,6 @@ impl DatasetCheckpoint {
         let dataset_name = self.dataset_name.clone();
         conn.conn
             .call(move |conn| {
-                let create_table = format!(
-                    "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
-                    dataset_name TEXT PRIMARY KEY,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"
-                );
-                conn.execute(&create_table, [])?;
-
                 let upsert = format!(
                     "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at)
                  VALUES (?1, CURRENT_TIMESTAMP)
@@ -80,13 +93,16 @@ mod tests {
     use super::*;
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
-        let conn = SqliteConnectionPoolFactory::new("", Mode::Memory)
+        let pool = SqliteConnectionPoolFactory::new("", Mode::Memory)
             .build()
             .await
             .expect("to build in-memory sqlite connection pool");
+        DatasetCheckpoint::init_sqlite(&pool)
+            .await
+            .expect("Failed to initialize SQLite");
         DatasetCheckpoint {
             dataset_name: "test_dataset".to_string(),
-            acceleration_connection: AccelerationConnection::SQLite(conn),
+            acceleration_connection: AccelerationConnection::SQLite(pool),
         }
     }
 
