@@ -18,7 +18,8 @@ members = [
   "crates/telemetry",
   "tools/flightpublisher/",
   "tools/flightsubscriber/",
-  "tools/spicepodschema/",
+  "tools/spicepodschema/", 
+  "crates/document_parse",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021

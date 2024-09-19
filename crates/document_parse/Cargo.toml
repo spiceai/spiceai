@@ -1,0 +1,17 @@
+[package]
+name = "document_parse"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+docx-rs = "0.4.17"
+# docx = { git = "https://github.com/Jeadie/docx-rs", rev = "532f6b6ca5543eaf453976ec5bc683ebf38878d8"}
+lopdf = "0.34.0"
+snafu.workspace = true
+bytes = "1.6.0"
+tokio = { workspace = true }
