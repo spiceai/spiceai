@@ -18,7 +18,7 @@ use std::iter::zip;
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
@@ -80,6 +80,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct VectorSearch {
     pub df: Arc<DataFusion>,
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
+
+    // For tables, explicitly defined primary keys for datasets.
+    // Are in [`ResolvedTableReference`] format.
+    // Before use, must be resolved with spice defaults, `.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)`.
     explicit_primary_keys: HashMap<TableReference, Vec<String>>,
 }
 
@@ -150,6 +154,7 @@ pub struct VectorSearchTableResult {
     pub primary_key: Vec<RecordBatch>,
     pub embedded_column: Vec<RecordBatch>, // original data, not the embedding vector.
     pub additional_columns: Vec<RecordBatch>,
+    pub distances: Vec<ArrayRef>,
 }
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
@@ -260,7 +265,7 @@ impl VectorSearch {
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
         let query = format!(
-            "SELECT {projection_str} FROM {tbl} {where_str} ORDER BY array_distance({embedding_column}_embedding, {embedding:?}) LIMIT {n}"
+            "SELECT {projection_str} array_distance({embedding_column}_embedding, {embedding:?}) as dist FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
         );
         tracing::trace!("running SQL: {query}");
 
@@ -297,10 +302,21 @@ impl VectorSearch {
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
             .context(RecordProcessingSnafu)?;
 
+        let Some(distances) = batches
+            .iter()
+            .map(|s| s.column_by_name("dist").cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Err(Error::EmbeddingError {
+                source: "No distances returned".into(),
+            });
+        };
+
         Ok(VectorSearchTableResult {
             primary_key: primary_keys_records,
             embedded_column: embedding_records,
             additional_columns: primary_keys,
+            distances,
         })
     }
 
@@ -474,10 +490,16 @@ impl VectorSearch {
         let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
 
         for tbl in tables {
-            let pks = self.get_primary_keys(&tbl).await?;
+            // `explicit_primary_keys` are [`ResolvedTableReference`], must resolve with spice defaults first.
+            // Equivalent to using [`TableReference::resolve_eq`] on `explicit_primary_keys` keys.
+            let resolved_tbl: TableReference = tbl
+                .clone()
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .into();
+            let pks = self.get_primary_keys(&resolved_tbl).await?;
             if !pks.is_empty() {
                 tbl_to_pks.insert(tbl.clone(), pks);
-            } else if let Some(explicit_pks) = explicit_primary_keys.get(&tbl) {
+            } else if let Some(explicit_pks) = explicit_primary_keys.get(&resolved_tbl) {
                 tbl_to_pks.insert(tbl.clone(), explicit_pks.clone());
             }
         }
