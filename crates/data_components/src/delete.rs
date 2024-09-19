@@ -1,5 +1,5 @@
 #![allow(clippy::missing_errors_doc)]
-use std::{any::Any, error::Error, sync::Arc};
+use std::{any::Any, borrow::Cow, error::Error, sync::Arc};
 
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
@@ -169,7 +169,7 @@ impl TableProvider for DeletionTableProviderAdapter {
     fn table_type(&self) -> TableType {
         self.source.table_type()
     }
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
         self.source.get_logical_plan()
     }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
