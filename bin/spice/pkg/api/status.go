@@ -63,6 +63,25 @@ type ComponentStatusResult struct {
 	ComponentType string `json:"component_type"`
 }
 
+func GetDatasetsWithStatus(rtContext *context.RuntimeContext) ([]Dataset, error) {
+	_, dataset_statuses, err := GetComponentStatuses(rtContext)
+	if err != nil {
+		return nil, err
+	}
+
+	datasets, err := GetData[Dataset](rtContext, "/v1/datasets?status=true")
+	if err != nil {
+		return nil, err
+	}
+	for _, dataset := range datasets {
+		statusEnum, exists := dataset_statuses[dataset.Name]
+		if exists {
+			dataset.Status = statusEnum.String()
+		}
+	}
+	return datasets, nil
+}
+
 // Get the status of all models and datasets (respectively).
 func GetComponentStatuses(rtContext *context.RuntimeContext) (map[string]ComponentStatus, map[string]ComponentStatus, error) {
 	componentStatusQuery := `
