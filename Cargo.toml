@@ -62,7 +62,7 @@ datafusion-execution = "42"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
 datafusion-functions-json = "0.42"
-datafusion-table-providers = "0.1.0"
+datafusion-table-providers = "0.1"
 dotenvy = "0.15"
 duckdb = "1.0.0"
 fundu = "2.0.1"
