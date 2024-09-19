@@ -100,6 +100,8 @@ impl Display for RetrievalLimit {
     }
 }
 
+static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
+
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[allow(clippy::doc_markdown)]
@@ -162,7 +164,7 @@ pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Match {
     value: String,
-    // score: f64,
+    score: f64,
     dataset: String,
     primary_key: HashMap<String, serde_json::Value>,
     metadata: HashMap<String, serde_json::Value>,
@@ -209,9 +211,27 @@ pub fn table_to_matches(
         })
         .collect();
 
-    Ok(zip(zip(pks, add_cols), values)
-        .map(|((pks, add_cols), value)| Match {
+    let distances: Option<Vec<_>> = result
+        .distances
+        .iter()
+        .flat_map(|v| {
+            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float32Array>() {
+                col.iter().collect::<Vec<Option<f32>>>()
+            } else {
+                vec![]
+            }
+        })
+        .collect();
+    let Some(distances) = distances else {
+        return Err(Error::EmbeddingError {
+            source: "Empty embedding distances returned unexpectedly".into(),
+        });
+    };
+
+    Ok(zip(zip(zip(pks, add_cols), values), distances)
+        .map(|(((pks, add_cols), value), distance)| Match {
             value,
+            score: 1.0 / f64::from(distance),
             dataset: tbl.to_string(),
             primary_key: pks,
             metadata: add_cols,
@@ -265,7 +285,7 @@ impl VectorSearch {
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
         let query = format!(
-            "SELECT {projection_str} array_distance({embedding_column}_embedding, {embedding:?}) as dist FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
+            "SELECT {projection_str}, sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME} FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
         );
         tracing::trace!("running SQL: {query}");
 
@@ -304,13 +324,14 @@ impl VectorSearch {
 
         let Some(distances) = batches
             .iter()
-            .map(|s| s.column_by_name("dist").cloned())
+            .map(|s| s.column_by_name(VECTOR_DISTANCE_COLUMN_NAME).cloned())
             .collect::<Option<Vec<_>>>()
         else {
             return Err(Error::EmbeddingError {
                 source: "No distances returned".into(),
             });
         };
+        println!("distances: {:?}", distances.len());
 
         Ok(VectorSearchTableResult {
             primary_key: primary_keys_records,
