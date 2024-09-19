@@ -331,7 +331,6 @@ impl VectorSearch {
                 source: "No distances returned".into(),
             });
         };
-        println!("distances: {:?}", distances.len());
 
         Ok(VectorSearchTableResult {
             primary_key: primary_keys_records,
