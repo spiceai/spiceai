@@ -59,13 +59,15 @@ spice search --model <model> --cloud
 
 		rtcontext.RequireModelsFlavor(cmd)
 
-		datasets, err := api.GetData[api.Dataset](rtcontext, "/v1/datasets?status=true")
+		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 		}
+
 		var searchDatasets []string
 		for _, dataset := range datasets {
-			if strings.HasSuffix(dataset.Name, ".docs") {
+			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
+				cmd.PrintErrln(fmt.Sprintf("Warning: Dataset %s is not ready (%s) and will not be included in search.", dataset.Name, dataset.Status))
 				continue
 			}
 			searchDatasets = append(searchDatasets, dataset.Name)
@@ -100,6 +102,11 @@ spice search --model <model> --cloud
 				continue
 			}
 
+			if strings.Trim(message, " ") == "" {
+				cmd.Println("Please enter a search query.")
+				continue
+			}
+
 			line.AppendHistory(message)
 
 			done := make(chan bool)
@@ -125,6 +132,11 @@ spice search --model <model> --cloud
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
+
+				if !strings.HasPrefix(chunk, "{") || !strings.HasSuffix(chunk, "}") {
+					cmd.PrintErrf("Error: %s\n", chunk)
+					continue
+				}
 
 				var searchResponse SearchResponse = SearchResponse{}
 				err = json.Unmarshal([]byte(chunk), &searchResponse)
