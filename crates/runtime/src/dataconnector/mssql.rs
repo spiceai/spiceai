@@ -16,8 +16,9 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
+use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::{
-    self, SqlServerConnectionManager, SqlServerConnectionPool, SqlServerTableProvider,
+    self, connection_manager::SqlServerConnectionPool, SqlServerTableProvider,
 };
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
