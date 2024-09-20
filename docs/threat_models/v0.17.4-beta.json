@@ -134,7 +134,7 @@
                   "severity": "Medium",
                   "type": "Information disclosure",
                   "description": "Users with access to the Spice runtime APIs can access information from the data source either via federated SQL query or through queries on a configured accelerator, potentially getting access to data they don't normally have access to.",
-                  "mitigation": "This is an expected behavior of the system. Spice can be used by design to provide access to data without needing to divulge the underlying connection information.",
+                  "mitigation": "This is an expected behavior of the system. Spice can be used by design to provide access to data without needing to divulge the underlying connection information.\n\nThe current supported deployment model is that endpoints aren't exposed to untrusted entities.",
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 4,
@@ -147,7 +147,7 @@
                   "severity": "Low",
                   "type": "Repudiation",
                   "description": "The task history table is only kept in-memory, which means any tasks that would be captured are lost if an attacker wants to conceal what they did by either timing their activity to occur before a maintenance activity that results in a restart, or by purposefully causing the runtime to restart.",
-                  "mitigation": "",
+                  "mitigation": "Persist task_history locally",
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 5,
@@ -160,7 +160,7 @@
                   "severity": "Medium",
                   "type": "Denial of service",
                   "description": "An attacker or misconfigured application could potentially cause a denial of service on the Spice runtime.",
-                  "mitigation": "",
+                  "mitigation": "Configurable limit on how much time a query can take\nDeploy more Spice instances, where each Spice instance has its own resource limits",
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 6,
@@ -181,12 +181,12 @@
                 },
                 {
                   "id": "3b998f5e-b14c-471a-821a-70492d1f03cf",
-                  "title": "Data source connection details leaked via errors",
+                  "title": "Data source connection details (or any secrets) leaked via errors/logging",
                   "status": "Open",
                   "severity": "Medium",
                   "type": "Information disclosure",
                   "description": "Metadata about connected data sources is leaked through error messages, revealing sensitive infrastructure details.",
-                  "mitigation": "Review code where logs are emitted to ensure that potential sensitive information (i.e. credentials encoded in headers) is not leaked via error messages.",
+                  "mitigation": "Review code where logs are emitted to ensure that potential sensitive information (i.e. credentials encoded in headers) is not leaked via error messages.\n- [Action]: Remove ODBC printing the connection string",
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 12,
@@ -229,6 +229,58 @@
                   "modelType": "STRIDE",
                   "new": false,
                   "number": 16,
+                  "score": ""
+                },
+                {
+                  "id": "b2f796eb-4409-446f-8888-61d46a165b49",
+                  "title": "Malicious compressed small payload has unbounded/very large size",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Denial of service",
+                  "description": "If an attacker is able to send a payload to a Spice endpoint that is compressed, and the decompression of that payload causes Spice to run out of memory due to the payload itself having a very large/potentially unbounded size - then it could cause a denial of service. (i.e. Zipbomb)",
+                  "mitigation": "- No known Gzip attack vector and the HTTP endpoints only accept Gzip compression\n- For connecting to data sources, we rely on object_store's implementation which should protect against this.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 18,
+                  "score": ""
+                },
+                {
+                  "id": "9982eda7-8112-42ee-9459-a6606d997b28",
+                  "title": "Task History shows truncated results",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "If you have access to the runtime, you can access the task_history table along with some truncated outputs of data you might not normally be able to access.\n\nThis isn't a problem in v0.17.4-beta, because if you can access the task_history table, then you trivially can access any of the data sources.",
+                  "mitigation": "No mitigation currently. Once we add AuthN/AuthZ, we will need to design how to lock this down appropriately. (i.e. RLS)",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 19,
+                  "score": ""
+                },
+                {
+                  "id": "5432e91b-7e85-45eb-ae9f-0d9649b3c969",
+                  "title": "Malicious SQL / SQL injection leading to information disclosure",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "If there are functions that allow reading from the environment/file-system, this could lead to unexpected information disclosure of the system details/secrets",
+                  "mitigation": "- Run in a chroot process with limited file-system access\n- Disable functions that allow this access",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 21,
+                  "score": ""
+                },
+                {
+                  "id": "0c78df7c-43c7-4be4-9a31-78bb4d60acd6",
+                  "title": "Supply chain attack leading to compromised dependency",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Elevation of privilege",
+                  "description": "If an attacker is able to compromise a dependency that we depend on, and we release a version of Spice with that compromised dependency, then all of Spice users would potentially be affected.",
+                  "mitigation": "- CVE scanner/dependabot to scan for known issues with dependencies\n- Adopt a policy of waiting before upgrading a dependency to allow for the community to identify\n- Processing scanning to identify suspicious behavior",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 22,
                   "score": ""
                 }
               ]
@@ -694,7 +746,7 @@
             },
             "attrs": {
               "text": {
-                "text": "Sidecar Filesystem"
+                "text": "Local Machine Filesystem"
               },
               "topLine": {
                 "stroke": "red",
@@ -713,7 +765,7 @@
             "id": "03fb0ac1-ff87-46cc-8c51-f75357f8d350",
             "data": {
               "type": "tm.Store",
-              "name": "Sidecar Filesystem",
+              "name": "Local Machine Filesystem",
               "description": "",
               "outOfScope": false,
               "reasonOutOfScope": "",
@@ -736,6 +788,32 @@
                   "new": false,
                   "number": 1,
                   "score": ""
+                },
+                {
+                  "id": "1dd96996-2703-4cc7-9e02-9dee68efc22d",
+                  "title": "Bypass underlying data source AuthN/AuthZ by reading accelerator files",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Information disclosure",
+                  "description": "When Spice is configured to accelerate data from a data source to a file (i.e. DuckDB/SQLite) then its possible to bypass all AuthN/AuthZ measures if the attacker has access to the file.",
+                  "mitigation": "- Limit the file permissions to only the user running the Spice instance\n  - [Action]: Change default file permission to 600\n  - [Action]: Configuration to allow changing permission\n- Instead of running Spice on the same machine, run it in a separate machine in the trusted network.\n- chroot the Spice instance AND chroot the application",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 17,
+                  "score": ""
+                },
+                {
+                  "id": "946eec8b-6e87-45d4-976a-c11cbebc1d70",
+                  "title": "Tampering with the Spicepod",
+                  "status": "Open",
+                  "severity": "Medium",
+                  "type": "Tampering",
+                  "description": "If an attacker can access/modify the Spicepod, they can tamper with how the Spice runtime loads data sources and potentially point them to data sources that the attacker controls, to disrupt/poison the operations of applications configured to query this Spice instance.",
+                  "mitigation": "- Proper file permissions so that only the Spice instance can access the Spicepod.\n- [Action]: Update deployment examples to limit file permissions of Spicepod.",
+                  "modelType": "STRIDE",
+                  "new": false,
+                  "number": 20,
+                  "score": ""
                 }
               ]
             }
@@ -746,6 +824,6 @@
     ],
     "diagramTop": 2,
     "reviewer": "Spice AI Engineering Team",
-    "threatTop": 16
+    "threatTop": 22
   }
 }

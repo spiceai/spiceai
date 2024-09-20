@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use base64::{engine::general_purpose, Engine as _};
 use snafu::prelude::*;
+use std::io::Write;
 use std::str::FromStr;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
@@ -30,6 +32,9 @@ pub enum Error {
 
     #[snafu(display("Unable to connect to endpoint: {source}"))]
     UnableToConnectToEndpoint { source: tonic::transport::Error },
+
+    #[snafu(display("IO error: {source}"))]
+    Io { source: std::io::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -48,21 +53,17 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
         });
     }
 
-    let concatenated_pems = cert_result
-        .certs
-        .iter()
-        .filter_map(|cert| {
-            let mut buf = cert.as_ref();
-            rustls_pemfile::certs(&mut buf)
-                .filter_map(Result::ok)
-                .last()
-                .map(|cert| cert.to_vec())
-        })
-        .map(String::from_utf8)
-        .collect::<Result<String, _>>()
-        .context(FailedToConvertPemsSnafu)?;
+    let mut pem = Vec::new();
+    for cert in cert_result.certs {
+        pem.write_all(b"-----BEGIN CERTIFICATE-----\n")
+            .context(IoSnafu)?;
+        pem.write_all(general_purpose::STANDARD.encode(cert.as_ref()).as_bytes())
+            .context(IoSnafu)?;
+        pem.write_all(b"\n-----END CERTIFICATE-----\n")
+            .context(IoSnafu)?;
+    }
 
-    Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
+    Ok(tonic::transport::Certificate::from_pem(pem))
 }
 
 /// # Errors

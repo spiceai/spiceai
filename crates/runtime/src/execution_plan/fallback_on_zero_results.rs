@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::TableReference;
 use futures::{stream, StreamExt};
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
@@ -192,7 +192,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 tracing::info!("{fallback_msg}");
-                metrics::FEDERATED_FALLBACK.add(1, &[Key::from_static_str("dataset_name").string(table_name.to_string())]);
+                metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,

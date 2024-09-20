@@ -26,7 +26,7 @@ use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
 use futures::{stream, Stream, StreamExt};
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use snafu::{OptionExt, ResultExt};
 use tracing::Instrument;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -174,7 +174,7 @@ impl RefreshTask {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
         retry(retry_strategy, || async {
             self.run_once(&refresh).await.inspect_err(|_err| {
-                let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
+                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
             })
         })
@@ -203,7 +203,7 @@ impl RefreshTask {
                 RefreshMode::Append => &metrics::APPEND_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            vec![Key::from_static_str("dataset").string(self.dataset_name.to_string())],
+            vec![KeyValue::new("dataset", self.dataset_name.to_string())],
         );
 
         let start_time = SystemTime::now();
@@ -755,7 +755,7 @@ impl RefreshTask {
         self.runtime_status.update_dataset(dataset_name, status);
 
         if status == status::ComponentStatus::Error {
-            let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
+            let labels = [KeyValue::new("dataset", dataset_name.to_string())];
             metrics::REFRESH_ERRORS.add(1, &labels);
         }
 
@@ -764,9 +764,9 @@ impl RefreshTask {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
 
-            let mut labels = vec![Key::from_static_str("dataset").string(dataset_name.to_string())];
+            let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
             if let Some(sql) = sql {
-                labels.push(Key::from_static_str("sql").string(sql.to_string()));
+                labels.push(KeyValue::new("sql", sql.to_string()));
             };
 
             metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
