@@ -126,6 +126,7 @@ impl RuntimeBuilder {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
         tools::factory::register_all().await;
+        document_parse::register_all().await;
 
         let status = match self.runtime_status {
             Some(status) => status,

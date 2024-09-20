@@ -34,4 +34,7 @@ pub enum Error {
     MicrosoftGraphFailure {
         source: graph_rs_sdk::error::GraphFailure,
     },
+
+    #[snafu(display("Error parsing document: {source}"))]
+    DocumentParsing { source: document_parse::Error },
 }

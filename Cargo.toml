@@ -2,23 +2,24 @@
 default-members = ["bin/spiced"]
 members = [
   "bin/spiced/",
-  "crates/data_components",
-  "crates/flight_client",
-  "crates/spicepod",
   "crates/app",
   "crates/arrow_sql_gen",
   "crates/arrow_tools",
+  "crates/data_components",
+  "crates/document_parse",
   "crates/flightrepl",
+  "crates/flight_client",
   "crates/llms",
   "crates/model_components",
   "crates/ns_lookup",
-  "crates/util",
-  "crates/spice_cloud",
   "crates/otel-arrow",
+  "crates/spicepod",
+  "crates/spice_cloud",
   "crates/telemetry",
+  "crates/util",
   "tools/flightpublisher/",
   "tools/flightsubscriber/",
-  "tools/spicepodschema/",
+  "tools/spicepodschema/", 
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -123,7 +124,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "ce
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "ce18dfa80684d4084b9822e640c3989946b11e15" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b9be339bf79425df265c6b43f81825418cb61d81" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b42b2421f0e156d8b61830fb467fa9bd04494238" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "5b98603705a381ceeb5cc371e4f606b7332b57ce" }
 
