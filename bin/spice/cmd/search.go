@@ -151,7 +151,7 @@ spice search --cloud
 				}
 
 				for i, match := range searchResponse.Matches {
-					cmd.Printf("%d. [%s]", i+1, match.Dataset)
+					cmd.Printf("Rank %d, Score: %0.1f, Datasets [%s]", i+1, match.Score*100, match.Dataset)
 					if len(match.PrimaryKey) > 0 {
 						for key, value := range match.PrimaryKey {
 							cmd.Printf(" %s=%v", key, value)
