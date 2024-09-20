@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 use bytes::Bytes;
-use snafu::ResultExt;
-use std::{any::Any, collections::HashMap, sync::Arc};
 use docx_rs::Render;
 use docx_rs::{read_docx, Docx};
+use snafu::ResultExt;
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
