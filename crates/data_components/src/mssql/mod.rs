@@ -42,9 +42,6 @@ pub enum Error {
     #[snafu(display("Error executing query: {source}"))]
     QueryError { source: tiberius::error::Error },
 
-    #[snafu(display("Invalid connection string: {source}"))]
-    InvalidConnectionStringError { source: tiberius::error::Error },
-
     #[snafu(display("Unable to connect: {source}"))]
     SqlServerAccessError { source: tiberius::error::Error },
 
@@ -78,7 +75,6 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqlServerTableProvider {
-    #[allow(dead_code)]
     conn: Arc<SqlServerConnectionPool>,
     schema: SchemaRef,
     table: TableReference,
