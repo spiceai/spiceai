@@ -1,0 +1,16 @@
+[package]
+name = "document_parse"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="2d86a60b58afb02b157f96b42a92626417e47f71"}
+lopdf = "0.34.0"
+snafu.workspace = true
+bytes = "1.6.0"
+tokio = { workspace = true, features = ["sync"] }
