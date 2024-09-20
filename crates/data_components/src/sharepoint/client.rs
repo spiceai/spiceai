@@ -13,10 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
-use arrow::error::ArrowError;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use futures::Stream;
 
 use graph_rs_sdk::{
@@ -25,12 +23,9 @@ use graph_rs_sdk::{
 };
 
 use http::Response;
-use snafu::ResultExt;
 
 use super::{
-    drive_items::{
-        DriveItem, DriveItemResponse,
-    },
+    drive_items::{DriveItem, DriveItemResponse},
     error::Error,
 };
 
@@ -319,16 +314,10 @@ impl SharepointClient {
     pub(crate) async fn get_file_content(
         &self,
         items: &[DriveItem],
-    ) -> Result<Vec<String>, ArrowError> {
+    ) -> Result<Vec<String>, GraphFailure> {
         let mut content: Vec<String> = Vec::with_capacity(items.len());
         for item in items {
-            let file = self
-                .get_drive_item_content(&item.id)
-                .await
-                .boxed()
-                .map_err(ArrowError::ExternalError)?;
-
-            content.push(file);
+            content.push(self.get_drive_item_content(&item.id).await?);
         }
         Ok(content)
     }
@@ -336,16 +325,6 @@ impl SharepointClient {
 
 impl std::fmt::Debug for SharepointClient {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "SharepointClient drive={:?} drive_item={:?}",
-            self.drive, self.drive_item
-        )
-    }
-}
-
-impl DisplayAs for SharepointClient {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
             "SharepointClient drive={:?} drive_item={:?}",

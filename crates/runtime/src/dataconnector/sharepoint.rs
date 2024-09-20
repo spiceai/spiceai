@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::sharepoint::table::SharepointTableProvider;
+use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
 use graph_rs_sdk::{
     identity::{
@@ -160,14 +160,13 @@ impl DataConnector for Sharepoint {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = SharepointTableProvider::new(Arc::clone(&self.client), &dataset.from, true)
+        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
             })?;
-
-        Ok(Arc::new(client))
+        Ok(Arc::new(SharepointTableProvider::new(client, false)))
     }
 
     async fn metadata_provider(
@@ -178,14 +177,14 @@ impl DataConnector for Sharepoint {
             return None;
         }
 
-        match SharepointTableProvider::new(Arc::clone(&self.client), &dataset.from, false)
+        match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
             }) {
-            Err(e) => Some(Err(e)),
-            Ok(client) => Some(Ok(Arc::new(client))),
+            Ok(client) => Some(Ok(Arc::new(SharepointTableProvider::new(client, false)))),
+            Err(e) => return Some(Err(e)),
         }
     }
 }

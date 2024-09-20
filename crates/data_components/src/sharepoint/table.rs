@@ -32,7 +32,6 @@ use datafusion::{
     },
 };
 use futures::{Stream, StreamExt};
-use graph_rs_sdk::GraphClient;
 use snafu::ResultExt;
 
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
@@ -49,16 +48,12 @@ pub struct SharepointTableProvider {
 }
 
 impl SharepointTableProvider {
-    pub async fn new(
-        client: Arc<GraphClient>,
-        from: &str,
-        include_file_content: bool,
-    ) -> Result<Self, Error> {
-        let client = SharepointClient::new(client, from).await?;
-        Ok(Self {
+    #[must_use]
+    pub fn new(client: SharepointClient, include_file_content: bool) -> Self {
+        Self {
             client,
             include_file_content,
-        })
+        }
     }
 }
 
@@ -160,7 +155,7 @@ impl SharepointListExec {
                             match client.get_file_content(&drive_items.value).await {
                                 Ok(c) => Some(c),
                                 Err(e) => {
-                                    yield Err(DataFusionError::External(Box::new(e)));
+                                    yield Err(DataFusionError::External(Error::MicrosoftGraphFailure { source: e }.into()));
                                     continue;
                                 }
                             }
