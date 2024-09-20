@@ -71,13 +71,6 @@ impl TableProvider for SharepointTableProvider {
         TableType::Base
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-    }
-
     async fn scan(
         &self,
         _state: &dyn Session,
