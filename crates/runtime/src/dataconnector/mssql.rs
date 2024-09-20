@@ -111,7 +111,7 @@ impl SqlServer {
                         config.encryption(EncryptionLevel::Required);
                     }
                     "false" | "disable" => {
-                        config.encryption(EncryptionLevel::NotSupported);
+                        config.encryption(EncryptionLevel::Off);
                     }
                     _ => InvalidParamValueSnafu {
                         parameter: "encrypt",
