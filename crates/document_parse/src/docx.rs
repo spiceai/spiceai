@@ -63,8 +63,7 @@ struct DocxDocument {
 
 impl Document for DocxDocument {
     fn as_flat_utf8(&self) -> String {
-        let ascii = self.doc.document.render_ascii();
-        String::from_utf8_lossy(&ascii).to_string()
+        self.doc.document.render_ascii()
     }
 
     fn type_(&self) -> DocumentType {
