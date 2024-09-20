@@ -16,3 +16,4 @@ limitations under the License.
 pub mod client;
 mod drive_items;
 mod error;
+pub mod table;

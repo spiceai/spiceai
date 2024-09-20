@@ -13,25 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
-use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
-use async_stream::stream;
-use async_trait::async_trait;
-use datafusion::{
-    catalog::Session,
-    common::project_schema,
-    datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
-    execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown},
-    physical_expr::EquivalenceProperties,
-    physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
-    },
-};
-use futures::{Stream, StreamExt};
+use bytes::Bytes;
+use document_parse::DocumentParser;
+use futures::Stream;
 
 use graph_rs_sdk::{
     default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient, error::ErrorMessage,
@@ -39,14 +25,9 @@ use graph_rs_sdk::{
 };
 
 use http::Response;
-use snafu::ResultExt;
-
-use crate::sharepoint::drive_items::drive_items_to_record_batch;
 
 use super::{
-    drive_items::{
-        drive_item_table_schema, DriveItem, DriveItemResponse, DRIVE_ITEM_FILE_CONTENT_COLUMN,
-    },
+    drive_items::{DriveItem, DriveItemResponse},
     error::Error,
 };
 
@@ -246,19 +227,15 @@ enum DriveApi {
     Default(DefaultDriveApiClient),
 }
 
+#[derive(Clone)]
 pub struct SharepointClient {
     client: Arc<GraphClient>,
     drive: DrivePtr,
     drive_item: DriveItemPtr,
-    include_file_content: bool,
 }
 
 impl SharepointClient {
-    pub async fn new(
-        client: Arc<GraphClient>,
-        from: &str,
-        include_file_content: bool,
-    ) -> Result<Self, Error> {
+    pub async fn new(client: Arc<GraphClient>, from: &str) -> Result<Self, Error> {
         let (drive, drive_item) = parse_from(from)?;
 
         // Resolve `PublicDrivePtr`s into internal `DrivePtr`.
@@ -268,96 +245,30 @@ impl SharepointClient {
             client,
             drive,
             drive_item,
-            include_file_content,
         })
     }
-}
 
-#[async_trait]
-impl TableProvider for SharepointClient {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::new(drive_item_table_schema(self.include_file_content))
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(SharepointListExec::new(
-            Arc::clone(&self.client),
-            &self.drive,
-            &self.drive_item,
-            projection,
-            &self.schema(),
-            limit,
-        )?))
-    }
-}
-
-struct SharepointListExec {
-    client: Arc<GraphClient>,
-    drive: DrivePtr,
-    drive_item: DriveItemPtr,
-    schema: SchemaRef,
-    properties: PlanProperties,
-    projections: Option<Vec<usize>>,
-    limit: Option<usize>,
-}
-
-impl SharepointListExec {
-    pub fn new(
-        client: Arc<GraphClient>,
-        drive: &DrivePtr,
-        drive_item: &DriveItemPtr,
-        projections: Option<&Vec<usize>>,
-        schema: &SchemaRef,
-        limit: Option<usize>,
-    ) -> DataFusionResult<Self> {
-        let projected_schema = project_schema(schema, projections)?;
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&projected_schema)),
-            Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
-        );
-
-        Ok(Self {
-            client,
-            drive: drive.clone(),
-            drive_item: drive_item.clone(),
-            schema: projected_schema,
-            properties,
-            limit,
-            projections: projections.cloned(),
-        })
+    /// Returns the appropriate [`DriveApi`] for the given [`InternalDrivePtr`].
+    fn drive_client(&self) -> DriveApi {
+        match &self.drive {
+            DrivePtr::DriveId(drive_id) => DriveApi::Id(self.client.drive(drive_id)),
+            DrivePtr::UserId(user_id) => DriveApi::Default(self.client.user(user_id).drive()),
+            DrivePtr::SiteId(site_id) => DriveApi::Default(self.client.site(site_id).drive()),
+            DrivePtr::Me => DriveApi::Default(self.client.me().drive()),
+            DrivePtr::GroupId(group_id) => DriveApi::Default(self.client.group(group_id).drive()),
+        }
     }
 
     /// Streams [`DriveItemResponse`] from the Microsoft Graph API for the [`SharepointListExec`]'s selected drive and drive item.
-    fn stream_drive_items(
+    pub(crate) fn stream_drive_items(
         &self,
+        limit: Option<usize>,
     ) -> Result<
         impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,
         GraphFailure,
     > {
         // Request docs: `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
-        let mut req = match Self::drive_client(&self.client, &self.drive) {
+        let mut req = match self.drive_client() {
             DriveApi::Id(client) => match &self.drive_item {
                 DriveItemPtr::ItemId(id) => client.item(id).list_children(),
                 DriveItemPtr::ItemPath(path) => {
@@ -377,7 +288,7 @@ impl SharepointListExec {
         };
 
         // LIMIT `value`
-        if let Some(value) = self.limit {
+        if let Some(value) = limit {
             req = req.top(value.to_string());
         };
 
@@ -389,177 +300,57 @@ impl SharepointListExec {
         req.paging().stream::<DriveItemResponse>()
     }
 
-    /// Returns the drive items, converted into a stream of [`RecordBatch`]s.
-    /// If `include_file_content`, the file content for each drive item is downloaded and included
-    /// under the `DRIVE_ITEM_FILE_CONTENT_COLUMN` column.
-    fn create_record_stream(
-        &self,
-        include_file_content: bool,
-    ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>>> {
-        let mut resp_stream = self
-            .stream_drive_items()
-            .boxed()
-            .map_err(DataFusionError::External)?;
-
-        let graph = Arc::clone(&self.client);
-        let drive = self.drive.clone();
-        let projection = self.projections.clone();
-
-        Ok(stream! {
-
-            while let Some(s) = resp_stream.next().await {
-                let response = match s.boxed().map_err(DataFusionError::External) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        yield Err(e);
-                        continue;
-                    }
-                };
-                match response.body() {
-                    Ok(drive_items) => {
-                        let content = if include_file_content {
-                            match get_file_content(Arc::clone(&graph), &drive, &drive_items.value).await {
-                                Ok(c) => Some(c),
-                                Err(e) => {
-                                    yield Err(DataFusionError::External(Box::new(e)));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        match drive_items_to_record_batch(&drive_items.value, content) {
-                            Ok(record_batch) => {
-                                // Ensure that the record batch is projected to the required columns (since `select` on OData from Microsoft Graph isn't used).
-                                if let Some(projection) = &projection {
-                                    yield record_batch.project(projection).map_err(|e| DataFusionError::ArrowError(e, None))
-                                } else {
-                                    yield Ok(record_batch)
-                                }
-                            },
-                            Err(e) => yield Err(DataFusionError::ArrowError(e, None)),
-                        }
-                    },
-                    Err(e) => {
-                        tracing::debug!("Error fetching drive items. {:#?}", e);
-                        yield Err(DataFusionError::External(Box::new(e.clone())))
-                    },
-                }
-            }
-        })
-    }
-
     /// Returns the underlying content of a drive item.
-    async fn get_drive_item_content(
-        graph: &Arc<GraphClient>,
-        drive: &DrivePtr,
+    pub(crate) async fn get_drive_item_content(
+        &self,
         item_id: &str,
-    ) -> Result<String, GraphFailure> {
-        let resp = match Self::drive_client(graph, drive) {
+    ) -> Result<Bytes, GraphFailure> {
+        let resp = match self.drive_client() {
             DriveApi::Id(client) => client.item(item_id).get_items_content(),
             DriveApi::Default(client) => client.item(item_id).get_items_content(),
         }
         .send()
         .await?;
-
-        resp.text().await.map_err(GraphFailure::ReqwestError)
+        resp.bytes().await.map_err(GraphFailure::ReqwestError)
     }
 
-    /// Returns the appropriate [`DriveApi`] for the given [`InternalDrivePtr`].
-    fn drive_client(graph: &Arc<GraphClient>, drive: &DrivePtr) -> DriveApi {
-        match drive {
-            DrivePtr::DriveId(drive_id) => DriveApi::Id(graph.drive(drive_id)),
-            DrivePtr::UserId(user_id) => DriveApi::Default(graph.user(user_id).drive()),
-            DrivePtr::SiteId(site_id) => DriveApi::Default(graph.site(site_id).drive()),
-            DrivePtr::Me => DriveApi::Default(graph.me().drive()),
-            DrivePtr::GroupId(group_id) => DriveApi::Default(graph.group(group_id).drive()),
-        }
-    }
-}
-
-impl ExecutionPlan for SharepointListExec {
-    fn name(&self) -> &'static str {
-        "SharepointListExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
+    /// Downloads the file content for each drive item. Assumes that each field in `items` is in the `drive`.
+    pub(crate) async fn get_file_content(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        // Only retrieve file content if it is in projected schema.
-        let include_file_content: bool = self
-            .schema()
-            .index_of(DRIVE_ITEM_FILE_CONTENT_COLUMN)
-            .is_ok();
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            self.create_record_stream(include_file_content)?,
-        );
+        items: &[DriveItem],
+        formatter: Option<Arc<dyn DocumentParser>>,
+    ) -> Result<Vec<String>, Error> {
+        let mut content: Vec<String> = Vec::with_capacity(items.len());
+        for item in items {
+            let raw = self
+                .get_drive_item_content(&item.id)
+                .await
+                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
 
-        Ok(Box::pin(stream_adapter))
+            if let Some(formatter) = &formatter {
+                let doc = formatter
+                    .parse(&raw)
+                    .map_err(|e| Error::DocumentParsing { source: e })?;
+                let processed = doc
+                    .as_flat_utf8()
+                    .map_err(|e| Error::DocumentParsing { source: e })?;
+                content.push(processed);
+            } else {
+                content.push(String::from_utf8_lossy(&raw).to_string());
+            }
+        }
+        Ok(content)
     }
 }
 
-impl std::fmt::Debug for SharepointListExec {
+impl std::fmt::Debug for SharepointClient {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "SharepointListExec drive={:?} drive_item={:?}",
+            "SharepointClient drive={:?} drive_item={:?}",
             self.drive, self.drive_item
         )
     }
-}
-
-impl DisplayAs for SharepointListExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "SharepointListExec drive={:?} drive_item={:?}",
-            self.drive, self.drive_item
-        )
-    }
-}
-
-/// Downloads the file content for each drive item. Assumes that each fiel in `items` is in the `drive`.
-async fn get_file_content(
-    graph: Arc<GraphClient>,
-    drive: &DrivePtr,
-    items: &[DriveItem],
-) -> Result<Vec<String>, ArrowError> {
-    let mut content: Vec<String> = Vec::with_capacity(items.len());
-    for item in items {
-        let file = SharepointListExec::get_drive_item_content(&graph, drive, &item.id)
-            .await
-            .boxed()
-            .map_err(ArrowError::ExternalError)?;
-
-        content.push(file);
-    }
-    Ok(content)
 }
 
 /// Returns a mapping of drive ids to drive names.
