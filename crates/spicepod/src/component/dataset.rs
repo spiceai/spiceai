@@ -53,6 +53,7 @@ impl std::fmt::Display for TimeFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
@@ -237,6 +238,7 @@ pub mod acceleration {
     #[allow(clippy::struct_excessive_bools)]
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    #[serde(deny_unknown_fields)]
     pub struct Acceleration {
         #[serde(default = "default_true")]
         pub enabled: bool,

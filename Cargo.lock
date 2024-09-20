@@ -9283,6 +9283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float",
+ "serde",
+]
+
+[[package]]
 name = "serde_derive"
 version = "1.0.210"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9733,6 +9743,7 @@ version = "0.18.1-beta"
 dependencies = [
  "schemars",
  "serde",
+ "serde-value",
  "serde_json",
  "serde_yaml",
  "snafu",

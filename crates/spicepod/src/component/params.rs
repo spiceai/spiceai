@@ -18,9 +18,13 @@ use std::collections::HashMap;
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{
+    de::{self, Unexpected},
+    Deserialize, Deserializer, Serialize,
+};
+use serde_value::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(untagged)]
 pub enum ParamValue {
@@ -28,6 +32,40 @@ pub enum ParamValue {
     Int(i64),
     Float(f64),
     Bool(bool),
+}
+
+impl<'de> Deserialize<'de> for ParamValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::Bool(b) => Ok(ParamValue::Bool(b)),
+            Value::U8(u) => Ok(ParamValue::Int(i64::from(u))),
+            Value::U16(u) => Ok(ParamValue::Int(i64::from(u))),
+            Value::U32(u) => Ok(ParamValue::Int(i64::from(u))),
+            Value::U64(u) => Ok(ParamValue::Int(i64::try_from(u).map_err(|e| {
+                de::Error::invalid_type(Unexpected::Other(e.to_string().as_str()), &"")
+            })?)),
+            Value::I8(i) => Ok(ParamValue::Int(i64::from(i))),
+            Value::I16(i) => Ok(ParamValue::Int(i64::from(i))),
+            Value::I32(i) => Ok(ParamValue::Int(i64::from(i))),
+            Value::I64(i) => Ok(ParamValue::Int(i)),
+            Value::F32(f) => Ok(ParamValue::Float(f64::from(f))),
+            Value::F64(f) => Ok(ParamValue::Float(f)),
+            Value::Char(c) => Ok(ParamValue::String(c.to_string())),
+            Value::String(s) => Ok(ParamValue::String(s)),
+            Value::Unit => Err(de::Error::custom(
+                "a param value is missing for the component",
+            )),
+            Value::Option(_) => Err(de::Error::invalid_type(Unexpected::Option, &"")),
+            Value::Seq(_) => Err(de::Error::invalid_type(Unexpected::Seq, &"")),
+            Value::Map(_) => Err(de::Error::invalid_type(Unexpected::Map, &"")),
+            Value::Bytes(bytes) => Err(de::Error::invalid_type(Unexpected::Bytes(&bytes), &"")),
+            Value::Newtype(_) => Err(de::Error::invalid_type(Unexpected::Other("newtype"), &"")),
+        }
+    }
 }
 
 impl ParamValue {
