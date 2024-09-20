@@ -91,40 +91,44 @@ async fn main() -> Result<(), String> {
 
     let args = BenchArgs::parse();
 
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+
     match (args.connector.as_deref(), args.accelerator.as_deref(), args.mode.as_deref()) {
         (None, None, None) => {
             // Run all connector / accelerator benchmark tests
             let connectors = vec![
-                "spice.ai",
+                // "spice.ai",
                 "s3",
-                #[cfg(feature = "spark")]
-                "spark",
-                #[cfg(feature = "postgres")]
-                "postgres",
-                #[cfg(feature = "mysql")]
-                "mysql",
-                #[cfg(feature = "odbc")]
-                "odbc-databricks",
-                #[cfg(feature = "odbc")]
-                "odbc-athena",
-                #[cfg(feature = "delta_lake")]
-                "delta_lake",
+                // #[cfg(feature = "spark")]
+                // "spark",
+                // #[cfg(feature = "postgres")]
+                // "postgres",
+                // #[cfg(feature = "mysql")]
+                // "mysql",
+                // #[cfg(feature = "odbc")]
+                // "odbc-databricks",
+                // #[cfg(feature = "odbc")]
+                // "odbc-athena",
+                // #[cfg(feature = "delta_lake")]
+                // "delta_lake",
             ];
             for connector in connectors {
                 run_connector_bench(connector, &upload_results_dataset).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
-                create_acceleration("arrow", acceleration::Mode::Memory, None),
-                #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, None),
-                #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, None),
-                #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory, None),
-                #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File, None),
-                #[cfg(feature = "postgres")]
-                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
+                // create_acceleration("arrow", acceleration::Mode::Memory, None),
+                // #[cfg(feature = "duckdb")]
+                // create_acceleration("duckdb", acceleration::Mode::Memory, None),
+                // #[cfg(feature = "duckdb")]
+                // create_acceleration("duckdb", acceleration::Mode::File, None),
+                // #[cfg(feature = "sqlite")]
+                // create_acceleration("sqlite", acceleration::Mode::Memory, None),
+                // #[cfg(feature = "sqlite")]
+                // create_acceleration("sqlite", acceleration::Mode::File, None),
+                // #[cfg(feature = "postgres")]
+                // create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
             ];
             for accelerator in accelerators {
                 run_accelerator_bench(accelerator, &upload_results_dataset).await?;
