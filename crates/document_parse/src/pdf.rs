@@ -15,24 +15,23 @@ limitations under the License.
 */
 
 use bytes::Bytes;
-use docx_rs::Render;
-use docx_rs::{read_docx, Docx};
+use lopdf::Document as LopdfDocument;
 use snafu::ResultExt;
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, collections::HashMap, io::Cursor, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
 };
 
-pub struct DocxParserFactory {}
+pub struct PdfParserFactory {}
 
-impl DocumentParserFactory for DocxParserFactory {
+impl DocumentParserFactory for PdfParserFactory {
     fn create(&self, parser_options: &HashMap<String, String>) -> Result<Arc<dyn DocumentParser>> {
-        Ok(Arc::new(DocxParser::new(parser_options)))
+        Ok(Arc::new(PdfParser::new(parser_options)))
     }
 
     fn default(&self) -> Arc<dyn DocumentParser> {
-        Arc::new(DocxParser::default())
+        Arc::new(PdfParser::default())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -41,32 +40,40 @@ impl DocumentParserFactory for DocxParserFactory {
 }
 
 #[derive(Default)]
-pub struct DocxParser {}
-impl DocxParser {
+pub struct PdfParser {}
+impl PdfParser {
     pub fn new(_parser_options: &HashMap<String, String>) -> Self {
-        DocxParser::default()
+        PdfParser::default()
     }
 }
 
-impl DocumentParser for DocxParser {
+impl DocumentParser for PdfParser {
     fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        let doc = read_docx(raw).boxed().context(InternalParsingSnafu {
-            format: DocumentType::Docx,
-        })?;
-        Ok(Arc::new(DocxDocument { doc }))
+        let doc = LopdfDocument::load_from(Cursor::new(raw.to_vec()))
+            .boxed()
+            .context(InternalParsingSnafu {
+                format: DocumentType::Pdf,
+            })?;
+        Ok(Arc::new(PdfDocument { doc }))
     }
 }
 
-struct DocxDocument {
-    pub doc: Docx,
+struct PdfDocument {
+    pub doc: LopdfDocument,
 }
 
-impl Document for DocxDocument {
+impl Document for PdfDocument {
     fn as_flat_utf8(&self) -> Result<String> {
-        Ok(self.doc.document.render_ascii())
+        let pages = self.doc.get_pages().keys().copied().collect::<Vec<_>>();
+        self.doc
+            .extract_text(&pages)
+            .boxed()
+            .context(InternalParsingSnafu {
+                format: DocumentType::Pdf,
+            })
     }
 
     fn type_(&self) -> DocumentType {
-        DocumentType::Docx
+        DocumentType::Pdf
     }
 }

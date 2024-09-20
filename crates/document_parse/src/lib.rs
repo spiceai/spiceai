@@ -25,7 +25,9 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use tokio::sync::Mutex;
+
 mod docx;
+mod pdf;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -44,6 +46,7 @@ static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
 
 pub async fn register_all() {
     register_parser_factory("docx", Arc::new(docx::DocxParserFactory {})).await;
+    register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;
 }
 
 pub async fn get_parser_factory(ext: &str) -> Option<Arc<dyn DocumentParserFactory>> {
@@ -75,7 +78,7 @@ pub trait DocumentParser: Send + Sync {
 }
 
 pub trait Document {
-    fn as_flat_utf8(&self) -> String;
+    fn as_flat_utf8(&self) -> Result<String>;
     fn type_(&self) -> DocumentType;
 }
 

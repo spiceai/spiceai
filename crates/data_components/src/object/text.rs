@@ -94,7 +94,10 @@ impl ObjectStoreTextTable {
             .iter()
             .map(|bytes| {
                 let utf8 = match formatter {
-                    Some(ref f) => f.parse(bytes).boxed().map(|p| p.as_flat_utf8()),
+                    Some(ref f) => f
+                        .parse(bytes)
+                        .boxed()
+                        .and_then(|doc| doc.as_flat_utf8().boxed()),
                     None => std::str::from_utf8(bytes).boxed().map(ToString::to_string),
                 };
                 utf8.map_err(ArrowError::from_external_error)

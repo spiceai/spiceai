@@ -3532,7 +3532,7 @@ dependencies = [
  "bytes",
  "docx-rs",
  "lopdf",
- "snafu 0.8.4",
+ "snafu",
  "tokio",
 ]
 
