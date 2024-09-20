@@ -310,7 +310,7 @@ impl SharepointClient {
         resp.text().await.map_err(GraphFailure::ReqwestError)
     }
 
-    /// Downloads the file content for each drive item. Assumes that each fiel in `items` is in the `drive`.
+    /// Downloads the file content for each drive item. Assumes that each field in `items` is in the `drive`.
     pub(crate) async fn get_file_content(
         &self,
         items: &[DriveItem],
