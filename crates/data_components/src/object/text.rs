@@ -35,16 +35,21 @@ use datafusion::{
         ExecutionPlan, Partitioning, PlanProperties,
     },
 };
+use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
 use object_store::{path::Path, GetResult, ObjectMeta, ObjectStore};
-use std::{any::Any, fmt, str::Utf8Error, sync::Arc};
+use snafu::ResultExt;
+use std::{any::Any, fmt, sync::Arc};
 
 use super::ObjectStoreContext;
 use url::Url;
 
 pub struct ObjectStoreTextTable {
     ctx: ObjectStoreContext,
+
+    /// For document tables, provide an optional formatter
+    document_formatter: Option<Arc<dyn DocumentParser>>,
 }
 
 impl ObjectStoreTextTable {
@@ -52,9 +57,11 @@ impl ObjectStoreTextTable {
         store: Arc<dyn ObjectStore>,
         url: &Url,
         extension: Option<String>,
+        formatter: Option<Arc<dyn DocumentParser>>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Arc::new(Self {
             ctx: ObjectStoreContext::try_new(store, url, extension)?,
+            document_formatter: formatter,
         }))
     }
 
@@ -65,7 +72,11 @@ impl ObjectStoreTextTable {
         ])
     }
 
-    fn to_record_batch(meta_list: &[ObjectMeta], raw: &[Bytes]) -> Result<RecordBatch, ArrowError> {
+    fn to_record_batch(
+        meta_list: &[ObjectMeta],
+        raw: &[Bytes],
+        formatter: &Option<Arc<dyn DocumentParser>>,
+    ) -> Result<RecordBatch, ArrowError> {
         if meta_list.len() != raw.len() {
             return Err(ArrowError::ParseError("Length mismatch".to_string()));
         }
@@ -79,14 +90,22 @@ impl ObjectStoreTextTable {
                 .collect::<Vec<_>>(),
         ));
 
-        let utf8_strings: Result<Vec<_>, Utf8Error> =
-            raw.iter().map(|bytes| std::str::from_utf8(bytes)).collect();
+        let utf8_strings: Result<Vec<_>, ArrowError> = raw
+            .iter()
+            .map(|bytes| {
+                let utf8 = match formatter {
+                    Some(ref f) => f
+                        .parse(bytes)
+                        .boxed()
+                        .and_then(|doc| doc.as_flat_utf8().boxed()),
+                    None => std::str::from_utf8(bytes).boxed().map(ToString::to_string),
+                };
+                utf8.map_err(ArrowError::from_external_error)
+            })
+            .collect();
 
         let content_array: ArrayRef = Arc::new(StringArray::from(
-            utf8_strings?
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
+            utf8_strings?.into_iter().collect::<Vec<_>>(),
         ));
 
         RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])
@@ -124,6 +143,7 @@ impl TableProvider for ObjectStoreTextTable {
             filters,
             limit,
             self.ctx.clone(),
+            self.document_formatter.clone(),
         )))
     }
 
@@ -145,6 +165,7 @@ pub struct ObjectStoreTextExec {
     properties: PlanProperties,
 
     ctx: ObjectStoreContext,
+    formatter: Option<Arc<dyn DocumentParser>>,
 }
 
 impl std::fmt::Debug for ObjectStoreTextExec {
@@ -199,7 +220,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(self.ctx.clone(), self.limit), // TODO get prefix from filters
+            to_sendable_stream(self.ctx.clone(), self.formatter.clone(), self.limit), // TODO get prefix from filters
         )))
     }
 }
@@ -210,6 +231,7 @@ impl ObjectStoreTextExec {
         filters: &[Expr],
         limit: Option<usize>,
         ctx: ObjectStoreContext,
+        formatter: Option<Arc<dyn DocumentParser>>,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
@@ -221,12 +243,14 @@ impl ObjectStoreTextExec {
                 ExecutionMode::Bounded,
             ),
             ctx,
+            formatter,
         }
     }
 }
 
 pub(crate) fn to_sendable_stream(
     ctx: ObjectStoreContext,
+    formatter: Option<Arc<dyn DocumentParser>>,
     limit: Option<usize>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
@@ -244,7 +268,7 @@ pub(crate) fn to_sendable_stream(
                     let result: GetResult = ctx.store.get(&object_meta.location).await?;
                     let bytz = result.bytes().await?;
 
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz]) {
+                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], &formatter) {
                         Ok(batch) => {
                             let n = batch.num_rows();
                             yield Ok(batch);

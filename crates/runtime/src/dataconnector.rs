@@ -653,11 +653,20 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
             None => {
+                let content_formatter = document_parse::get_parser_factory(extension.as_str())
+                    .await
+                    .map(|factory| {
+                        // TODO: add opts.
+                        factory.default()
+                    });
+
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
+                // TODO pass in [`DocumentParser`]
                 Ok(ObjectStoreTextTable::try_new(
                     self.get_object_store(dataset)?,
                     &url.clone(),
                     Some(extension.clone()),
+                    content_formatter,
                 )
                 .context(InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),

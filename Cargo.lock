@@ -2007,7 +2007,7 @@ dependencies = [
  "safetensors",
  "thiserror",
  "yoke",
- "zip",
+ "zip 1.1.4",
 ]
 
 [[package]]
@@ -2027,7 +2027,7 @@ dependencies = [
  "safetensors",
  "thiserror",
  "yoke",
- "zip",
+ "zip 1.1.4",
 ]
 
 [[package]]
@@ -2762,6 +2762,7 @@ dependencies = [
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
+ "document_parse",
  "duckdb",
  "flight_client",
  "futures",
@@ -3523,6 +3524,31 @@ name = "doc-comment"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
+
+[[package]]
+name = "document_parse"
+version = "0.18.1-beta"
+dependencies = [
+ "bytes",
+ "docx-rs",
+ "lopdf",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
+name = "docx-rs"
+version = "0.4.17"
+source = "git+https://github.com/spiceai/docx-rs?rev=2d86a60b58afb02b157f96b42a92626417e47f71#2d86a60b58afb02b157f96b42a92626417e47f71"
+dependencies = [
+ "base64 0.13.1",
+ "image 0.24.9",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xml-rs",
+ "zip 0.6.6",
+]
 
 [[package]]
 name = "dotenvy"
@@ -5210,6 +5236,22 @@ dependencies = [
 
 [[package]]
 name = "image"
+version = "0.24.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5690139d2f55868e080017335e4b94cb7414274c74f1669c84fb5feba2c9f69d"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+ "color_quant",
+ "gif",
+ "jpeg-decoder",
+ "num-traits",
+ "png",
+ "tiff",
+]
+
+[[package]]
+name = "image"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99314c8a2152b8ddb211f924cdae532d8c5e4c8bb54728e12fff1b0cd5963a10"
@@ -5928,6 +5970,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lopdf"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff"
+dependencies = [
+ "chrono",
+ "encoding_rs",
+ "flate2",
+ "indexmap 2.5.0",
+ "itoa",
+ "log",
+ "md-5",
+ "nom",
+ "rangemap",
+ "rayon",
+ "time",
+ "weezl",
+]
+
+[[package]]
 name = "lrtable"
 version = "0.13.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6200,7 +6262,7 @@ dependencies = [
  "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
  "either",
  "futures",
- "image",
+ "image 0.25.2",
  "indexmap 2.5.0",
  "mistralrs-core",
  "rand",
@@ -6236,7 +6298,7 @@ dependencies = [
  "galil-seiferas",
  "half",
  "hf-hub",
- "image",
+ "image 0.25.2",
  "indexmap 2.5.0",
  "indicatif",
  "itertools 0.13.0",
@@ -6294,7 +6356,7 @@ version = "0.2.5"
 source = "git+https://github.com/spiceai/mistral.rs?rev=cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8#cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8"
 dependencies = [
  "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
- "image",
+ "image 0.25.2",
 ]
 
 [[package]]
@@ -8169,6 +8231,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rangemap"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f60fcc7d6849342eff22c4350c8b9a989ee8ceabc4b481253e8946b9fe83d684"
+
+[[package]]
 name = "raw-cpuid"
 version = "10.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8664,6 +8732,7 @@ dependencies = [
  "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",
+ "document_parse",
  "dotenvy",
  "duckdb",
  "flight_client",
@@ -11865,6 +11934,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
+name = "xml-rs"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af4e2e2f7cba5a093896c1e150fbfe177d1883e7448200efb81d40b9d339ef26"
+
+[[package]]
 name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12035,6 +12110,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.77",
+]
+
+[[package]]
+name = "zip"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "760394e246e4c28189f19d488c058bf16f564016aefac5d32bb1f3b51d5e9261"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "crossbeam-utils",
+ "flate2",
 ]
 
 [[package]]

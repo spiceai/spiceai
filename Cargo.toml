@@ -2,23 +2,24 @@
 default-members = ["bin/spiced"]
 members = [
   "bin/spiced/",
-  "crates/data_components",
-  "crates/flight_client",
-  "crates/spicepod",
   "crates/app",
   "crates/arrow_sql_gen",
   "crates/arrow_tools",
+  "crates/data_components",
+  "crates/document_parse",
   "crates/flightrepl",
+  "crates/flight_client",
   "crates/llms",
   "crates/model_components",
   "crates/ns_lookup",
-  "crates/util",
-  "crates/spice_cloud",
   "crates/otel-arrow",
+  "crates/spicepod",
+  "crates/spice_cloud",
   "crates/telemetry",
+  "crates/util",
   "tools/flightpublisher/",
   "tools/flightsubscriber/",
-  "tools/spicepodschema/",
+  "tools/spicepodschema/", 
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
