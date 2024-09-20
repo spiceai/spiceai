@@ -28,7 +28,6 @@ use arrow_flight::{
 use prost::Message;
 use rand::Rng;
 use runtime::{config::Config, tls::TlsConfig, Runtime};
-use rustls::crypto::{self, CryptoProvider};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -37,8 +36,9 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 #[tokio::test]
 async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    CryptoProvider::install_default(crypto::aws_lc_rs::default_provider())
-        .expect("valid crypto provider");
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
 
     let span = tracing::info_span!("test_tls_endpoints");
     let _span_guard = span.enter();

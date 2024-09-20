@@ -29,7 +29,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -546,10 +546,10 @@ async fn notify_refresh_done(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let mut labels = vec![Key::from_static_str("dataset").string(dataset_name.to_string())];
+    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
     let refresh_guard = refresh.read().await;
     if let Some(sql) = &refresh_guard.sql {
-        labels.push(Key::from_static_str("sql").string(sql.to_string()));
+        labels.push(KeyValue::new("sql", sql.to_string()));
     };
 
     metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);

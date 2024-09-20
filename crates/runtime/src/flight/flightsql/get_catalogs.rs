@@ -29,7 +29,7 @@ use crate::{
 
 /// Get a `FlightInfo` for listing catalogs.
 pub(crate) fn get_flight_info(
-    query: &sql::CommandGetCatalogs,
+    query: sql::CommandGetCatalogs,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
     tracing::trace!("get_flight_info_catalogs");

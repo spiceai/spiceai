@@ -78,6 +78,8 @@ pub mod ftp;
 pub mod github;
 pub mod graphql;
 pub mod https;
+#[cfg(feature = "mssql")]
+pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
@@ -302,6 +304,8 @@ pub async fn register_all() {
     #[cfg(feature = "ftp")]
     register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
     register_connector_factory("spiceai", spiceai::SpiceAIFactory::new_arc()).await;
+    #[cfg(feature = "mssql")]
+    register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
     #[cfg(feature = "mysql")]
     register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
     #[cfg(feature = "postgres")]
