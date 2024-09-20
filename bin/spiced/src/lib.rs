@@ -164,7 +164,7 @@ pub async fn run(args: Args) -> Result<()> {
     let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
 
     let rt: Runtime = Runtime::builder()
-        .with_app_opt(app)
+        .with_app_opt(app.clone())
         // User configured extensions
         .with_extensions(extension_factories)
         // Extensions that will be auto-loaded if not explicitly loaded and requested by a component
@@ -178,7 +178,7 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .await;
 
-    spiced_tracing::init_tracing(app_name.clone(), tracing_config.as_ref(), rt.datafusion())
+    spiced_tracing::init_tracing(app, tracing_config.as_ref(), rt.datafusion())
         .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
