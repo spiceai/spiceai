@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::mysqlpool::{self, MySQLConnectionPool};
 use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection,
+    mysqlpool::{self, MySQLConnectionPool},
     DbConnectionPool, Error as DbConnectionPoolError,
 };
 use mysql_async::prelude::ToValue;
@@ -139,12 +140,30 @@ impl DataConnector for MySQL {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.mysql_factory, dataset.path().into(), dataset.schema())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "mysql",
-                })?,
-        )
+        match Read::table_provider(&self.mysql_factory, dataset.path().into(), dataset.schema())
+            .await
+        {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(err_source) = e.source() {
+                    if let Some(dbconnection::Error::UndefinedTable {
+                        table_name,
+                        source: _,
+                    }) = err_source.downcast_ref::<dbconnection::Error>()
+                    {
+                        return Err(DataConnectorError::InvalidTableName {
+                            dataconnector: "mysql".to_string(),
+                            dataset_name: dataset.name.to_string(),
+                            table_name: table_name.clone(),
+                        });
+                    }
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "mysql".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 }
