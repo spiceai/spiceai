@@ -661,7 +661,6 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                     });
 
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
-                // TODO pass in [`DocumentParser`]
                 Ok(ObjectStoreTextTable::try_new(
                     self.get_object_store(dataset)?,
                     &url.clone(),

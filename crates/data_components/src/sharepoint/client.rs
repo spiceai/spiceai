@@ -15,6 +15,8 @@ limitations under the License.
 */
 use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
+use document_parse::DocumentParser;
 use futures::Stream;
 
 use graph_rs_sdk::{
@@ -299,25 +301,43 @@ impl SharepointClient {
     }
 
     /// Returns the underlying content of a drive item.
-    async fn get_drive_item_content(&self, item_id: &str) -> Result<String, GraphFailure> {
+    pub(crate) async fn get_drive_item_content(
+        &self,
+        item_id: &str,
+    ) -> Result<Bytes, GraphFailure> {
         let resp = match self.drive_client() {
             DriveApi::Id(client) => client.item(item_id).get_items_content(),
             DriveApi::Default(client) => client.item(item_id).get_items_content(),
         }
         .send()
         .await?;
-
-        resp.text().await.map_err(GraphFailure::ReqwestError)
+        resp.bytes().await.map_err(GraphFailure::ReqwestError)
     }
 
     /// Downloads the file content for each drive item. Assumes that each field in `items` is in the `drive`.
     pub(crate) async fn get_file_content(
         &self,
         items: &[DriveItem],
-    ) -> Result<Vec<String>, GraphFailure> {
+        formatter: Option<Arc<dyn DocumentParser>>,
+    ) -> Result<Vec<String>, Error> {
         let mut content: Vec<String> = Vec::with_capacity(items.len());
         for item in items {
-            content.push(self.get_drive_item_content(&item.id).await?);
+            let raw = self
+                .get_drive_item_content(&item.id)
+                .await
+                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
+
+            if let Some(formatter) = &formatter {
+                let doc = formatter
+                    .parse(&raw)
+                    .map_err(|e| Error::DocumentParsing { source: e })?;
+                let processed = doc
+                    .as_flat_utf8()
+                    .map_err(|e| Error::DocumentParsing { source: e })?;
+                content.push(processed);
+            } else {
+                content.push(String::from_utf8_lossy(&raw).to_string());
+            }
         }
         Ok(content)
     }

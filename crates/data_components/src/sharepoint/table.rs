@@ -24,13 +24,14 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown},
+    logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
 };
+use document_parse::DocumentParser;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
 
@@ -44,14 +45,20 @@ use super::{
 
 pub struct SharepointTableProvider {
     client: SharepointClient,
+    formatter: Option<Arc<dyn DocumentParser>>,
     include_file_content: bool,
 }
 
 impl SharepointTableProvider {
     #[must_use]
-    pub fn new(client: SharepointClient, include_file_content: bool) -> Self {
+    pub fn new(
+        client: SharepointClient,
+        include_file_content: bool,
+        formatter: Option<Arc<dyn DocumentParser>>,
+    ) -> Self {
         Self {
             client,
+            formatter,
             include_file_content,
         }
     }
@@ -83,6 +90,7 @@ impl TableProvider for SharepointTableProvider {
             projection,
             &self.schema(),
             limit,
+            &self.formatter,
         )?))
     }
 }
@@ -93,6 +101,7 @@ struct SharepointListExec {
     properties: PlanProperties,
     projections: Option<Vec<usize>>,
     limit: Option<usize>,
+    formatter: Option<Arc<dyn DocumentParser>>,
 }
 
 impl SharepointListExec {
@@ -101,6 +110,7 @@ impl SharepointListExec {
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         limit: Option<usize>,
+        formatter: &Option<Arc<dyn DocumentParser>>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
         let properties = PlanProperties::new(
@@ -115,6 +125,7 @@ impl SharepointListExec {
             properties,
             limit,
             projections: projections.cloned(),
+            formatter: formatter.clone(),
         })
     }
 
@@ -131,6 +142,7 @@ impl SharepointListExec {
 
         let client = self.client.clone();
         let projection = self.projections.clone();
+        let formatter = self.formatter.clone();
 
         Ok(stream! {
 
@@ -145,10 +157,10 @@ impl SharepointListExec {
                 match response.body() {
                     Ok(drive_items) => {
                         let content = if include_file_content {
-                            match client.get_file_content(&drive_items.value).await {
+                            match client.get_file_content(&drive_items.value, formatter.clone()).await.boxed() {
                                 Ok(c) => Some(c),
                                 Err(e) => {
-                                    yield Err(DataFusionError::External(Error::MicrosoftGraphFailure { source: e }.into()));
+                                    yield Err(DataFusionError::External(e));
                                     continue;
                                 }
                             }
