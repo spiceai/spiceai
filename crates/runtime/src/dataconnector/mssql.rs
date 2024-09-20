@@ -51,9 +51,9 @@ pub enum Error {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("connection_string").secret(),
     ParameterSpec::connector("username").secret(),
-    ParameterSpec::connector("password"),
-    ParameterSpec::connector("host").secret(),
-    ParameterSpec::connector("port").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("host"),
+    ParameterSpec::connector("port"),
     ParameterSpec::connector("database"),
     ParameterSpec::connector("encrypt"),
     ParameterSpec::connector("trust_server_certificate"),
