@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::sharepoint::client::SharepointClient;
+use data_components::sharepoint::table::SharepointTableProvider;
 use datafusion::datasource::TableProvider;
 use graph_rs_sdk::{
     identity::{
@@ -160,7 +160,7 @@ impl DataConnector for Sharepoint {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from, true)
+        let client = SharepointTableProvider::new(Arc::clone(&self.client), &dataset.from, true)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
@@ -178,7 +178,7 @@ impl DataConnector for Sharepoint {
             return None;
         }
 
-        match SharepointClient::new(Arc::clone(&self.client), &dataset.from, false)
+        match SharepointTableProvider::new(Arc::clone(&self.client), &dataset.from, false)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
