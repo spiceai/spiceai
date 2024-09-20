@@ -28,6 +28,7 @@ use datafusion::{
         ExecutionMode, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
     },
     sql::{
+        sqlparser::ast::DataType,
         unparser::{
             dialect::{CustomDialect, CustomDialectBuilder},
             Unparser,
@@ -95,7 +96,9 @@ impl SqlServerExecPlan {
     }
 
     fn dialect() -> CustomDialect {
-        CustomDialectBuilder::new().build()
+        CustomDialectBuilder::new()
+            .with_float64_ast_dtype(DataType::Float(None))
+            .build()
     }
 
     pub fn sql(&self) -> DataFusionResult<String> {

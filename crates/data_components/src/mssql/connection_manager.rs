@@ -22,7 +22,7 @@ use tokio::net::TcpStream;
 
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use super::{InvalidConnectionStringSnafu, SqlServerAccessSnafu};
+use super::SqlServerAccessSnafu;
 
 pub type SqlServerConnectionPool = Pool<SqlServerConnectionManager>;
 
@@ -36,11 +36,7 @@ impl SqlServerConnectionManager {
         Self { config }
     }
 
-    pub async fn create_connection_pool(
-        connection_string: &str,
-    ) -> super::Result<SqlServerConnectionPool> {
-        let config =
-            Config::from_ado_string(connection_string).context(InvalidConnectionStringSnafu)?;
+    pub async fn create(config: Config) -> super::Result<SqlServerConnectionPool> {
         let manager = SqlServerConnectionManager::new(config);
         let pool = bb8::Pool::builder()
             .build(manager)
