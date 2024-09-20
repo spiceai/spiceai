@@ -16,8 +16,9 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::sharepoint::client::SharepointClient;
+use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
+use document_parse::DocumentParser;
 use graph_rs_sdk::{
     identity::{
         AuthorizationCodeCredential, ConfidentialClientApplication, PublicClientApplication,
@@ -109,6 +110,17 @@ impl Sharepoint {
             client: Arc::new(graph_client),
         })
     }
+
+    async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
+        let file_format = dataset.params.get("file_format")?;
+
+        document_parse::get_parser_factory(file_format)
+            .await
+            .map(|factory| {
+                // TODO: add opts.
+                factory.default()
+            })
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -131,6 +143,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("auth_code").secret(),
     ParameterSpec::connector("tenant_id").secret().required(),
     ParameterSpec::connector("client_secret").secret(),
+    ParameterSpec::runtime("file_format"),
 ];
 
 impl DataConnectorFactory for SharepointFactory {
@@ -160,14 +173,17 @@ impl DataConnector for Sharepoint {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from, true)
+        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
             })?;
-
-        Ok(Arc::new(client))
+        Ok(Arc::new(SharepointTableProvider::new(
+            client,
+            true,
+            self.get_formatter(dataset).await,
+        )))
     }
 
     async fn metadata_provider(
@@ -178,14 +194,18 @@ impl DataConnector for Sharepoint {
             return None;
         }
 
-        match SharepointClient::new(Arc::clone(&self.client), &dataset.from, false)
+        match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
             }) {
-            Err(e) => Some(Err(e)),
-            Ok(client) => Some(Ok(Arc::new(client))),
+            Ok(client) => Some(Ok(Arc::new(SharepointTableProvider::new(
+                client,
+                false,
+                self.get_formatter(dataset).await,
+            )))),
+            Err(e) => return Some(Err(e)),
         }
     }
 }
