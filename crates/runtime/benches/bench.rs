@@ -83,6 +83,10 @@ struct BenchArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");

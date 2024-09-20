@@ -13,17 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use async_trait::async_trait;
-use bb8::Pool;
+
+use std::sync::Arc;
+
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
-use futures::StreamExt;
-use snafu::{OptionExt, ResultExt, Snafu};
-use tiberius::{numeric::Numeric, Client, ColumnType, Config, Row};
-use tokio::net::TcpStream;
+use tiberius::{numeric::Numeric, ColumnType, Row};
 use uuid::Uuid;
-
-use crate::arrow::write::MemTable;
 
 use arrow::{
     array::{
@@ -32,169 +28,15 @@ use arrow::{
         RecordBatchOptions, StringBuilder, Time64NanosecondBuilder, TimestampMillisecondBuilder,
         TimestampNanosecondBuilder, UInt8Builder,
     },
-    datatypes::{DataType, Date32Type, Field, Schema, SchemaRef, TimeUnit},
-};
-use datafusion::{
-    catalog::Session,
-    datasource::{TableProvider, TableType},
-    error::DataFusionError,
-    logical_expr::{Expr, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
-    sql::TableReference,
+    datatypes::{DataType, Date32Type, SchemaRef, TimeUnit},
 };
 
 use chrono::Timelike;
 
-use std::{any::Any, sync::Arc};
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Error executing query: {source}"))]
-    QueryError { source: tiberius::error::Error },
-
-    #[snafu(display("Invalid connection string: {source}"))]
-    InvalidConnectionStringError { source: tiberius::error::Error },
-
-    #[snafu(display("Unable to connect: {source}"))]
-    SqlServerAccessError { source: tiberius::error::Error },
-
-    #[snafu(display("Unable to connect: {source}"))]
-    ConnectionPoolError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Failed to retrieve table schema"))]
-    SchemaRetrieval,
-
-    #[snafu(display("Unable to retrieve table schema: dataset not found"))]
-    SchemaRetrievalTableNotFound,
-
-    #[snafu(display("Unsupported data type: {data_type}"))]
-    UnsupportedType { data_type: String },
-
-    #[snafu(display("Failed to build record batch: {source}"))]
-    FailedToBuildRecordBatch { source: arrow::error::ArrowError },
-
-    #[snafu(display("No builder found for index {index}"))]
-    NoBuilderForIndex { index: usize },
-
-    #[snafu(display("Failed to downcast builder for {mssql_type}"))]
-    FailedToDowncastBuilder { mssql_type: String },
-}
-
-pub type SqlServerConnectionPool = Pool<SqlServerConnectionManager>;
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub struct SqlServerTableProvider {
-    #[allow(dead_code)]
-    conn: Arc<SqlServerConnectionPool>,
-    schema: SchemaRef,
-    table: TableReference,
-}
-
-impl SqlServerTableProvider {
-    pub async fn new(conn: Arc<SqlServerConnectionPool>, table: &TableReference) -> Result<Self> {
-        let schema = Self::get_schema(Arc::clone(&conn), table).await?;
-
-        Ok(Self {
-            conn,
-            schema,
-            table: table.clone(),
-        })
-    }
-
-    pub async fn get_schema(
-        conn: Arc<SqlServerConnectionPool>,
-        table: &TableReference,
-    ) -> Result<SchemaRef> {
-        let table_name = table.table();
-        let table_schema = table.schema().unwrap_or("dbo");
-
-        let columns_meta_query: String = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS \
-            WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'"
-        );
-        tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
-
-        let mut conn = conn.get().await.boxed().context(ConnectionPoolSnafu)?;
-
-        let mut query_res = conn
-            .simple_query(columns_meta_query)
-            .await
-            .context(QuerySnafu)?
-            .into_row_stream();
-
-        let mut fields = Vec::new();
-
-        while let Some(row_result) = query_res.next().await {
-            let row = row_result.context(QuerySnafu)?;
-
-            let column_name: &str = row.get(0).context(SchemaRetrievalSnafu)?;
-            let data_type: &str = row.get(1).context(SchemaRetrievalSnafu)?;
-            let numeric_precision: Option<u8> = row.get(2);
-            let numeric_scale: Option<i32> = row.get(3);
-
-            let column_type = map_type_name_to_column_type(data_type)?;
-            let arrow_data_type = map_column_type_to_arrow_type(
-                column_type,
-                numeric_precision,
-                numeric_scale.map(|v| i8::try_from(v).unwrap_or_default()),
-            );
-
-            fields.push(Field::new(column_name, arrow_data_type, true));
-        }
-
-        if fields.is_empty() {
-            return Err(Error::SchemaRetrievalTableNotFound {});
-        }
-
-        tracing::trace!("Retrieved dataset {table_name} schema: {fields:?}");
-
-        Ok(Arc::new(Schema::new(fields)))
-    }
-
-    async fn query_arrow(
-        &self,
-        sql: &str,
-        projected_schema: SchemaRef,
-    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!("Executing sql: {sql}");
-
-        let schema = Arc::clone(&projected_schema);
-
-        let mut conn = self.conn.get().await.boxed().context(ConnectionPoolSnafu)?;
-
-        let query_res = conn
-            .simple_query(sql)
-            .await
-            .boxed()
-            .context(ConnectionPoolSnafu)?
-            .into_row_stream();
-
-        let mut chunked_stream = query_res.chunks(4_000).boxed();
-
-        let mut records: Vec<RecordBatch> = Vec::new();
-
-        while let Some(chunk) = chunked_stream.next().await {
-            let rows = chunk
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .context(QuerySnafu)
-                .map_err(to_datafusion_err)?;
-
-            records.push(rows_to_arrow(&rows, &schema)?);
-        }
-
-        Ok(records)
-    }
-}
-
 macro_rules! handle_primitive_type {
     ($builder:expr, $type:expr, $builder_ty:ty, $value_ty:ty, $row:expr, $index:expr) => {{
         let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_ty>() else {
-            return FailedToDowncastBuilderSnafu {
+            return super::FailedToDowncastBuilderSnafu {
                 mssql_type: format!("{:?}", $type),
             }
             .fail();
@@ -208,7 +50,7 @@ macro_rules! handle_primitive_type {
 }
 
 #[allow(clippy::too_many_lines)]
-fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
+pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<RecordBatch> {
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut mssql_types: Vec<ColumnType> = Vec::new();
     let mut column_names: Vec<String> = Vec::new();
@@ -239,12 +81,12 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
     for row in rows {
         for (i, mssql_type) in mssql_types.iter().enumerate() {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
-                return NoBuilderForIndexSnafu { index: i }.fail();
+                return super::NoBuilderForIndexSnafu { index: i }.fail();
             };
             match *mssql_type {
                 ColumnType::Null => {
                     let Some(builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -284,7 +126,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         .as_any_mut()
                         .downcast_mut::<TimestampMillisecondBuilder>()
                     else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -300,7 +142,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         .as_any_mut()
                         .downcast_mut::<TimestampNanosecondBuilder>()
                     else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -314,7 +156,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                 }
                 ColumnType::Daten => {
                     let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -330,7 +172,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                         .as_any_mut()
                         .downcast_mut::<Time64NanosecondBuilder>()
                     else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -349,7 +191,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                 ColumnType::Decimaln | ColumnType::Numericn => {
                     let Some(builder) = builder.as_any_mut().downcast_mut::<Decimal128Builder>()
                     else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -362,7 +204,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                 }
                 ColumnType::Guid => {
                     let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -383,7 +225,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                 | ColumnType::NText
                 | ColumnType::SSVariant => {
                     let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
-                        return FailedToDowncastBuilderSnafu {
+                        return super::FailedToDowncastBuilderSnafu {
                             mssql_type: format!("{mssql_type:?}"),
                         }
                         .fail();
@@ -395,7 +237,7 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
                     }
                 }
                 _ => {
-                    return UnsupportedTypeSnafu {
+                    return super::UnsupportedTypeSnafu {
                         data_type: format!("{mssql_type:?}"),
                     }
                     .fail();
@@ -411,10 +253,10 @@ fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> Result<RecordBatch> {
 
     let options = &RecordBatchOptions::new().with_row_count(Some(rows.len()));
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, options)
-        .map_err(|err| Error::FailedToBuildRecordBatch { source: err })
+        .map_err(|err| super::Error::FailedToBuildRecordBatch { source: err })
 }
 
-fn map_column_type_to_arrow_type(
+pub(crate) fn map_column_type_to_arrow_type(
     column_type: ColumnType,
     decimal_precision: Option<u8>,
     decimal_scale: Option<i8>,
@@ -458,7 +300,7 @@ fn map_column_type_to_arrow_type(
     }
 }
 
-fn map_type_name_to_column_type(data_type: &str) -> Result<ColumnType> {
+pub(crate) fn map_type_name_to_column_type(data_type: &str) -> super::Result<ColumnType> {
     // https://github.com/prisma/tiberius/blob/51f0cbb3e430db74ba0ea4830b236e89f1b1e03f/src/tds/codec/token/token_col_metadata.rs#L26
     let column_type = match data_type.to_lowercase().as_str() {
         "int" => ColumnType::Int4,
@@ -483,56 +325,13 @@ fn map_type_name_to_column_type(data_type: &str) -> Result<ColumnType> {
         "datetimeoffset" => ColumnType::DatetimeOffsetn,
         "bit" => ColumnType::Bit,
         other => {
-            return Err(Error::UnsupportedType {
+            return Err(super::Error::UnsupportedType {
                 data_type: other.to_string(),
             })
         }
     };
 
     Ok(column_type)
-}
-
-#[async_trait]
-impl TableProvider for SqlServerTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> std::result::Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let sql = format!("SELECT * from {dataset}", dataset = self.table);
-        let records = self.query_arrow(&sql, Arc::clone(&self.schema)).await?;
-
-        let table = MemTable::try_new(Arc::clone(&self.schema), vec![records])?;
-        table.scan(state, projection, filters, limit).await
-    }
-}
-
-fn to_datafusion_err(e: Error) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::External(Box::new(e))
 }
 
 fn get_column_precision_and_scale(
@@ -543,50 +342,5 @@ fn get_column_precision_and_scale(
     match field.data_type() {
         DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
         _ => None,
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SqlServerConnectionManager {
-    config: Config,
-}
-
-impl SqlServerConnectionManager {
-    fn new(config: Config) -> SqlServerConnectionManager {
-        Self { config }
-    }
-
-    pub async fn create_connection_pool(
-        connection_string: &str,
-    ) -> Result<SqlServerConnectionPool> {
-        let config =
-            Config::from_ado_string(connection_string).context(InvalidConnectionStringSnafu)?;
-        let manager = SqlServerConnectionManager::new(config);
-        let pool = bb8::Pool::builder()
-            .build(manager)
-            .await
-            .context(SqlServerAccessSnafu)?;
-        Ok(pool)
-    }
-}
-
-#[async_trait]
-impl bb8::ManageConnection for SqlServerConnectionManager {
-    type Connection = Client<Compat<TcpStream>>;
-    type Error = tiberius::error::Error;
-
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let tcp = TcpStream::connect(&self.config.get_addr()).await?;
-        tcp.set_nodelay(true)?;
-        Client::connect(self.config.clone(), tcp.compat_write()).await
-    }
-
-    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.simple_query("SELECT 1").await?.into_row().await?;
-        Ok(())
-    }
-
-    fn has_broken(&self, _: &mut Self::Connection) -> bool {
-        false
     }
 }
