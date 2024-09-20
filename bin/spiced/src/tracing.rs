@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{borrow::Cow, sync::Arc};
 
-use app::spicepod::component::runtime::TracingConfig;
+use app::{spicepod::component::runtime::TracingConfig, App};
 use futures::future::BoxFuture;
 use opentelemetry_sdk::{
     export::trace::{ExportResult, SpanData, SpanExporter},
@@ -28,7 +28,7 @@ use tracing::Subscriber;
 use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
 
 pub(crate) fn init_tracing(
-    app_name: Option<String>,
+    app: Option<Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -38,16 +38,36 @@ pub(crate) fn init_tracing(
         EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,WARN")
     };
 
-    let subscriber = tracing_subscriber::registry()
-        .with(filter)
-        .with(datafusion_task_history_tracing(df, app_name, config))
-        .with(
-            fmt::layer()
-                .with_ansi(true)
-                .with_filter(filter::filter_fn(|metadata| {
-                    metadata.target() != "task_history"
-                })),
-        );
+    if let Some(task_history) = app
+        .as_ref()
+        .and_then(|app| app.runtime.task_history.as_ref())
+    {
+        if task_history.enabled {
+            let app_name = app.map(|app| app.name.clone());
+            let subscriber =
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(datafusion_task_history_tracing(df, app_name, config))
+                    .with(fmt::layer().with_ansi(true).with_filter(filter::filter_fn(
+                        |metadata| metadata.target() != "task_history",
+                    )));
+
+            tracing::subscriber::set_global_default(subscriber)?;
+
+            return Ok(());
+        }
+    }
+
+    let subscriber =
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                fmt::layer()
+                    .with_ansi(true)
+                    .with_filter(filter::filter_fn(|metadata| {
+                        metadata.target() != "task_history"
+                    })),
+            );
 
     tracing::subscriber::set_global_default(subscriber)?;
 

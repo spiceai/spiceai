@@ -31,6 +31,8 @@ pub struct Runtime {
     pub tracing: Option<TracingConfig>,
 
     pub telemetry: Option<TelemetryConfig>,
+
+    pub task_history: Option<TaskHistory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,5 +92,12 @@ pub struct TracingConfig {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct TelemetryConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TaskHistory {
     pub enabled: bool,
 }
