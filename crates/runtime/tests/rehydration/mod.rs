@@ -17,6 +17,7 @@ limitations under the License.
 //!
 //! Expects a Docker daemon to be running.
 use crate::{
+    acceleration::ACCELERATION_MUTEX,
     docker::RunningContainer,
     get_test_datafusion,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
@@ -53,6 +54,7 @@ mod sqlite;
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = ACCELERATION_MUTEX.lock().await;
     let running_container = prepare_test_environment()
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -156,7 +158,11 @@ async fn execute_spill_to_disk_and_rehydration(
     // ensure data has been loaded correctly
     assert_eq!(num_rows_loaded as u64, 10);
 
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     drop(rt);
+    runtime::dataaccelerator::clear_registry().await;
+    runtime::dataaccelerator::register_all().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     let num_persisted_records: usize =
         get_locally_persisted_records(engine, &accelerated_db_file_path, test_query)
@@ -175,7 +181,11 @@ async fn execute_spill_to_disk_and_rehydration(
         arrow::util::pretty::pretty_format_batches(&restart1_items).expect("pretty format");
     insta::assert_snapshot!(restart1_items_pretty);
 
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     drop(rt);
+    runtime::dataaccelerator::clear_registry().await;
+    runtime::dataaccelerator::register_all().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
     let rt = init_spice_app(engine, db_file_path).await?;
