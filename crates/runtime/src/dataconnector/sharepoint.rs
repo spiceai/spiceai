@@ -79,7 +79,8 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(auth_code)) => {
+            (Some(_) | None, Some(auth_code)) => {
+                tracing::warn!("Both `params.client_secret` and `params.auth_code` are provided. Using `params.auth_code`.");
                 // Must match the redirect URL used in `spice login sharepoint...`.
                 let redirect_url = Url::parse("http://localhost:8091")
                     .boxed()
@@ -97,11 +98,6 @@ impl Sharepoint {
             (None, None) => {
                 return Err(Error::InvalidParameters {
                     source: "either 'client_secret' or 'auth_code' must be provided".into(),
-                })
-            }
-            (Some(_), Some(_)) => {
-                return Err(Error::InvalidParameters {
-                    source: "both 'client_secret' and 'auth_code' cannot be provided".into(),
                 })
             }
         };
