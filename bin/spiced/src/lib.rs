@@ -39,6 +39,7 @@ use runtime::spice_metrics;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
+use tracing::subscriber;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -143,7 +144,12 @@ pub async fn run(args: Args) -> Result<()> {
     {
         Ok(app) => Some(Arc::new(app)),
         Err(e) => {
-            tracing::warn!("{}", e);
+            let subscriber = tracing_subscriber::FmtSubscriber::builder()
+                .with_ansi(true)
+                .finish();
+            subscriber::with_default(subscriber, || {
+                tracing::error!("{e}");
+            });
             None
         }
     };
