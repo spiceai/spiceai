@@ -36,6 +36,7 @@ pub struct Runtime {
 
     pub telemetry: Option<TelemetryConfig>,
 
+    #[serde(default)]
     pub task_history: TaskHistory,
 }
 
