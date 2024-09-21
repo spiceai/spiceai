@@ -17,15 +17,15 @@ limitations under the License.
 use std::{any::Any, fmt, sync::Arc};
 
 use crate::mssql::{convert::rows_to_arrow, ConnectionPoolSnafu, QuerySnafu};
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow::datatypes::SchemaRef;
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        memory::MemoryStream, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
-        ExecutionMode, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
     },
     sql::{
         sqlparser::ast::DataType,
@@ -36,12 +36,14 @@ use datafusion::{
         TableReference,
     },
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use snafu::ResultExt;
 
 use super::connection_manager::SqlServerConnectionPool;
 
 pub type Result<T, E = super::Error> = std::result::Result<T, E>;
+
+use async_stream::try_stream;
 
 #[derive(Clone)]
 pub struct SqlServerExecPlan {
@@ -192,46 +194,47 @@ impl ExecutionPlan for SqlServerExecPlan {
 
         let schema = self.schema();
 
-        let fut = query_arrow(Arc::clone(&self.pool), sql, Arc::clone(&schema));
-
-        let stream = futures::stream::once(fut).try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(query_arrow(Arc::clone(&self.pool), sql, &schema))
     }
 }
 
-async fn query_arrow(
+fn query_arrow(
     pool: Arc<SqlServerConnectionPool>,
     sql: String,
-    projected_schema: SchemaRef,
-) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
+    projected_schema: &SchemaRef,
+) -> SendableRecordBatchStream {
     tracing::debug!("Executing sql: {sql}");
 
-    let schema = Arc::clone(&projected_schema);
+    let schema = Arc::clone(projected_schema);
 
-    let mut conn = pool.get().await.boxed().context(ConnectionPoolSnafu)?;
+    let stream = try_stream! {
+        let mut conn = pool.get().await.boxed().context(ConnectionPoolSnafu).map_err(to_datafusion_err)?;
+        let query_res = conn
+            .simple_query(sql)
+            .await
+            .boxed()
+            .context(ConnectionPoolSnafu)
+            .map_err(to_datafusion_err)?
+            .into_row_stream();
 
-    let query_res = conn
-        .simple_query(sql)
-        .await
-        .boxed()
-        .context(ConnectionPoolSnafu)?
-        .into_row_stream();
+        let mut chunked_stream = query_res.chunks(4_000).boxed();
 
-    let mut chunked_stream = query_res.chunks(4_000).boxed();
+        while let Some(chunk) = chunked_stream.next().await {
+            let rows = chunk
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .context(QuerySnafu)
+                .map_err(to_datafusion_err)?;
 
-    let mut records: Vec<RecordBatch> = Vec::new();
+            yield rows_to_arrow(&rows, &schema)
+                .map_err(to_datafusion_err)?;
+        }
+    };
 
-    while let Some(chunk) = chunked_stream.next().await {
-        let rows = chunk
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .context(QuerySnafu)
-            .map_err(to_datafusion_err)?;
-
-        records.push(rows_to_arrow(&rows, &schema)?);
-    }
-
-    Ok(Box::pin(MemoryStream::try_new(records, schema, None)?) as SendableRecordBatchStream)
+    Box::pin(RecordBatchStreamAdapter::new(
+        Arc::clone(projected_schema),
+        Box::pin(stream),
+    )) as SendableRecordBatchStream
 }
 
 #[allow(clippy::needless_pass_by_value)]

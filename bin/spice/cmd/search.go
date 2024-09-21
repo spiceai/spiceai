@@ -64,7 +64,7 @@ spice search --cloud
 			cmd.PrintErrln(err.Error())
 		}
 
-		var searchDatasets []string
+		searchDatasets := make([]string, 0)
 		for _, dataset := range datasets {
 			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
 				cmd.PrintErrln(fmt.Sprintf("Warning: Dataset %s is not ready (%s) and will not be included in search.", dataset.Name, dataset.Status))
@@ -151,7 +151,7 @@ spice search --cloud
 				}
 
 				for i, match := range searchResponse.Matches {
-					cmd.Printf("%d. [%s]", i+1, match.Dataset)
+					cmd.Printf("Rank %d, Score: %0.1f, Datasets [%s]", i+1, match.Score*100, match.Dataset)
 					if len(match.PrimaryKey) > 0 {
 						for key, value := range match.PrimaryKey {
 							cmd.Printf(" %s=%v", key, value)

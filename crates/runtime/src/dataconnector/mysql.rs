@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::{self, MySQLConnectionPool};
 use datafusion_table_providers::sql::db_connection_pool::{
     DbConnectionPool, Error as DbConnectionPoolError,
 };
@@ -30,7 +30,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -80,12 +80,40 @@ impl DataConnectorFactory for MySQLFactory {
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
-            > = Arc::new(
-                MySQLConnectionPool::new(params.to_secret_map())
-                    .await
-                    .context(UnableToCreateMySQLConnectionPoolSnafu)?,
-            );
+            > = match MySQLConnectionPool::new(params.to_secret_map()).await {
+                Ok(pool) => Arc::new(pool),
+                Err(error) => match error {
+                    mysqlpool::Error::InvalidUsernameOrPassword { .. } => {
+                        return Err(
+                            DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                                dataconnector: "mysql".to_string(),
+                            }
+                            .into(),
+                        )
+                    }
 
+                    mysqlpool::Error::InvalidHostOrPortError {
+                        source: _,
+                        host,
+                        port,
+                    } => {
+                        return Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                            dataconnector: "mysql".to_string(),
+                            host,
+                            port: format!("{port}"),
+                        }
+                        .into())
+                    }
+
+                    _ => {
+                        return Err(DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "mysql".to_string(),
+                            source: Box::new(error),
+                        }
+                        .into())
+                    }
+                },
+            };
             let mysql_factory = MySQLTableFactory::new(pool);
 
             Ok(Arc::new(MySQL { mysql_factory }) as Arc<dyn DataConnector>)

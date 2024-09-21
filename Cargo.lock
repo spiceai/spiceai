@@ -3203,7 +3203,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b42b2421f0e156d8b61830fb467fa9bd04494238#b42b2421f0e156d8b61830fb467fa9bd04494238"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c9356e3e7b65848d7dcd42e35557827405e1abc3#c9356e3e7b65848d7dcd42e35557827405e1abc3"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -9283,6 +9283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float",
+ "serde",
+]
+
+[[package]]
 name = "serde_derive"
 version = "1.0.210"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9733,6 +9743,7 @@ version = "0.18.1-beta"
 dependencies = [
  "schemars",
  "serde",
+ "serde-value",
  "serde_json",
  "serde_yaml",
  "snafu",
