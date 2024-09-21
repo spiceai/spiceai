@@ -6,9 +6,9 @@
 
 <!-- list any linked issues this pull request will close, or exclude if none -->
 
-## 📄 Documentation Requests
+## 📄 Documentation Requirements
 
-<!-- list any issues created requesting documentation, quickstarts/samples or video content related to this PR -->
+<!-- list any documentation related iusses, quickstarts/samples or video content related to this PR -->
 
 ## 🤔 Concerns
 
