@@ -64,7 +64,7 @@ spice search --cloud
 			cmd.PrintErrln(err.Error())
 		}
 
-		var searchDatasets []string
+		searchDatasets := make([]string, 0)
 		for _, dataset := range datasets {
 			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
 				cmd.PrintErrln(fmt.Sprintf("Warning: Dataset %s is not ready (%s) and will not be included in search.", dataset.Name, dataset.Status))

@@ -122,7 +122,6 @@ FROM
 WHERE
     rn = 1 AND name NOT LIKE 'runtime.%';
 `
-
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/v1/sql", rtContext.HttpEndpoint()), bytes.NewReader([]byte(componentStatusQuery)))
 	if err != nil {
 		return nil, nil, err
@@ -136,6 +135,17 @@ WHERE
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+
+		// If 400, it could be that metric service is disabled and `runtime.metrics` table doesn't exist. This isn't an error.
+		if resp.StatusCode == http.StatusBadRequest {
+			disabled, err := IsMetricsDisabled(rtContext)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get service status: %v", err)
+			}
+			if disabled {
+				return nil, nil, nil
+			}
+		}
 		return nil, nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 	// Parse the JSON response
@@ -158,4 +168,20 @@ WHERE
 		}
 	}
 	return modelStatusMap, datasetsStatusMap, nil
+}
+
+// Returns true iff the metrics service and endpoints on the spiced instance are disabled.
+func IsMetricsDisabled(rtContext *context.RuntimeContext) (bool, error) {
+	s, err := GetData[Service](rtContext, "/v1/status")
+	if err != nil {
+		return false, fmt.Errorf("failed to get service status: %v", err)
+	}
+	for _, service := range s {
+		if service.Name == "metrics" {
+			if service.Status == "Disabled" {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
