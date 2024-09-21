@@ -65,7 +65,7 @@ pub(crate) async fn post(
                                 .map(|s| serde_json::to_string(s).unwrap_or_default())
                                 .unwrap_or_default();
 
-                            tracing::info!(target: "task_history", parent: &span_clone, truncated_output = %preview);
+                            tracing::info!(target: "task_history", parent: &span_clone, captured_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
@@ -111,7 +111,7 @@ fn create_sse_response(
                 }
             }
         };
-        tracing::info!(target: "task_history", parent: &span, truncated_output = %chat_output);
+        tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);
         drop(span);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))

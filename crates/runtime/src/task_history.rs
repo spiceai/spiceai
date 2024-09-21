@@ -50,7 +50,7 @@ pub(crate) struct TaskSpan {
 
     pub(crate) task: Arc<str>,
     pub(crate) input: Arc<str>,
-    pub(crate) truncated_output: Option<Arc<str>>,
+    pub(crate) captured_output: Option<Arc<str>>,
 
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: SystemTime,
@@ -99,7 +99,7 @@ impl TaskSpan {
             Field::new("parent_span_id", DataType::Utf8, true),
             Field::new("task", DataType::Utf8, false),
             Field::new("input", DataType::Utf8, false),
-            Field::new("truncated_output", DataType::Utf8, true),
+            Field::new("captured_output", DataType::Utf8, true),
             Field::new(
                 "start_time",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -186,10 +186,10 @@ impl TaskSpan {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
                         str_builder.append_value(&span.input);
                     }
-                    "truncated_output" => {
+                    "captured_output" => {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                        match &span.truncated_output {
-                            Some(truncated_output) => str_builder.append_value(truncated_output),
+                        match &span.captured_output {
+                            Some(captured_output) => str_builder.append_value(captured_output),
                             None => str_builder.append_null(),
                         }
                     }

@@ -313,9 +313,9 @@ impl ChatWrapper {
 
 #[async_trait]
 impl Chat for ChatWrapper {
-    /// Expect `truncated_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
+    /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
     /// ```rust
-    /// tracing::info!(target: "task_history", truncated_output = %chat_output)
+    /// tracing::info!(target: "task_history", captured_output = %chat_output)
     /// ```
     async fn chat_stream(
         &self,
@@ -343,7 +343,7 @@ impl Chat for ChatWrapper {
         }
     }
 
-    /// Unlike [`ChatWrapper::chat_stream`], this method will instrument the `truncated_output` for the model output.
+    /// Unlike [`ChatWrapper::chat_stream`], this method will instrument the `captured_output` for the model output.
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
@@ -356,10 +356,10 @@ impl Chat for ChatWrapper {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                 };
-                let truncated_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
-                match serde_json::to_string(&truncated_output) {
+                let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
+                match serde_json::to_string(&captured_output) {
                     Ok(output) => {
-                        tracing::info!(target: "task_history", truncated_output = %output);
+                        tracing::info!(target: "task_history", captured_output = %output);
                     }
                     Err(e) => tracing::error!("Failed to serialize truncated output: {}", e),
                 }

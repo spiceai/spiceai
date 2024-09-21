@@ -1632,11 +1632,9 @@ impl Runtime {
     pub async fn init_query_history(&self) -> Result<()> {
         let app = self.app.read().await;
         if let Some(app) = app.as_ref() {
-            if let Some(task_history) = app.runtime.task_history.as_ref() {
-                if !task_history.enabled {
-                    tracing::debug!("Task history is disabled!");
-                    return Ok(());
-                }
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled!");
+                return Ok(());
             }
         }
 

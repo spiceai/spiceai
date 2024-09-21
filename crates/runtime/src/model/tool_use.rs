@@ -514,7 +514,7 @@ fn make_a_stream(
                 }
             }
 
-            tracing::info!(target: "task_history", truncated_output = %chat_output);
+            tracing::info!(target: "task_history", captured_output = %chat_output);
         }
         .instrument(span),
     );

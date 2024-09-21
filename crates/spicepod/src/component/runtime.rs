@@ -32,7 +32,7 @@ pub struct Runtime {
 
     pub telemetry: Option<TelemetryConfig>,
 
-    pub task_history: Option<TaskHistory>,
+    pub task_history: TaskHistory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -99,5 +99,35 @@ pub struct TelemetryConfig {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct TaskHistory {
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    pub captured_output: String,
+}
+
+impl Default for TaskHistory {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            captured_output: "truncated".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskHistoryCapturedOutput {
+    None,
+    Truncated,
+}
+
+impl TaskHistory {
+    pub fn get_captured_output(&self) -> Result<TaskHistoryCapturedOutput, String> {
+        match self.captured_output.as_str() {
+            "none" => Ok(TaskHistoryCapturedOutput::None),
+            "truncated" => Ok(TaskHistoryCapturedOutput::Truncated),
+            _ => Err(format!(
+                r#"Expected "none" or "truncated" for captured_output, but got: "{}""#,
+                self.captured_output
+            )),
+        }
+    }
 }
