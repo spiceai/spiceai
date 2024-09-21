@@ -79,7 +79,7 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (Some(_), Some(auth_code)) | (None, Some(auth_code)) => {
+            (Some(_) | None, Some(auth_code)) => {
                 tracing::warn!("Both `params.client_secret` and `params.auth_code` are provided. Using `params.auth_code`.");
                 // Must match the redirect URL used in `spice login sharepoint...`.
                 let redirect_url = Url::parse("http://localhost:8091")
