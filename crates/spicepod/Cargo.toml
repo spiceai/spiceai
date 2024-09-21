@@ -15,6 +15,7 @@ serde_yaml.workspace = true
 serde-value = "0.7.0"
 snafu.workspace = true
 tracing.workspace = true
+humantime.workspace = true
 
 [features]
 default = []

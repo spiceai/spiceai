@@ -1653,7 +1653,34 @@ impl Runtime {
             Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
         };
 
-        match task_history::TaskSpan::instantiate_table(self.status()).await {
+        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
+            Some(app) => (
+                app.runtime
+                    .task_history
+                    .retention_period_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
+                    })?,
+                app.runtime
+                    .task_history
+                    .retention_check_interval_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e },
+                    })?,
+            ),
+            None => (
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
+            ),
+        };
+
+        match task_history::TaskSpan::instantiate_table(
+            self.status(),
+            retention_period_secs,
+            retention_check_interval_secs,
+        )
+        .await
+        {
             Ok(table) => self
                 .df
                 .register_runtime_table(

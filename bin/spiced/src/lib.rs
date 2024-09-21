@@ -74,7 +74,9 @@ pub enum Error {
     UnableToInitializeTls { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Unable to initialize tracing: {source}"))]
-    UnableToInitializeTracing { source: Box<dyn std::error::Error> },
+    UnableToInitializeTracing {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to initialize metrics: {source}"))]
     UnableToInitializeMetrics { source: Box<dyn std::error::Error> },

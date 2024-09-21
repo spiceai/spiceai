@@ -37,6 +37,8 @@ use crate::accelerated_table::{AcceleratedTable, Retention};
 pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
+pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 24 * 60 * 60; // 1 day
+pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
@@ -64,15 +66,22 @@ pub(crate) struct TaskSpan {
 impl TaskSpan {
     pub async fn instantiate_table(
         status: Arc<status::RuntimeStatus>,
+        retention_period_secs: u64,
+        retention_check_interval_secs: u64,
     ) -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
         let time_format = Some(TimeFormat::UnixSeconds);
 
+        tracing::debug!("Task history retention period: {retention_period_secs} seconds");
+        tracing::debug!(
+            "Task history retention check interval: {retention_check_interval_secs} seconds"
+        );
+
         let retention = Retention::new(
             time_column.clone(),
             time_format,
-            Some(Duration::from_secs(24 * 60 * 60)), // 1 day
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_secs(retention_period_secs)), // 1 day
+            Some(Duration::from_secs(retention_check_interval_secs)),
             true,
         );
         let tbl_reference =
@@ -291,4 +300,9 @@ pub enum Error {
 
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
+
+    #[snafu(display("Invalid `task_history` configuration: {source}"))]
+    InvalidConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }

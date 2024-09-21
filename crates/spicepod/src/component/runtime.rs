@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::error::Error;
+
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -101,7 +105,24 @@ pub struct TelemetryConfig {
 pub struct TaskHistory {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_truncated")]
     pub captured_output: String,
+    #[serde(default = "default_retention_period")]
+    pub retention_period: String,
+    #[serde(default = "default_retention_check_interval")]
+    pub retention_check_interval: String,
+}
+
+fn default_truncated() -> String {
+    "truncated".to_string()
+}
+
+fn default_retention_period() -> String {
+    "1d".to_string()
+}
+
+fn default_retention_check_interval() -> String {
+    "30m".to_string()
 }
 
 impl Default for TaskHistory {
@@ -109,6 +130,8 @@ impl Default for TaskHistory {
         Self {
             enabled: true,
             captured_output: "truncated".to_string(),
+            retention_period: "1d".to_string(),
+            retention_check_interval: "30m".to_string(),
         }
     }
 }
@@ -120,14 +143,37 @@ pub enum TaskHistoryCapturedOutput {
 }
 
 impl TaskHistory {
-    pub fn get_captured_output(&self) -> Result<TaskHistoryCapturedOutput, String> {
+    pub fn get_captured_output(
+        &self,
+    ) -> Result<TaskHistoryCapturedOutput, Box<dyn Error + Send + Sync>> {
         match self.captured_output.as_str() {
             "none" => Ok(TaskHistoryCapturedOutput::None),
             "truncated" => Ok(TaskHistoryCapturedOutput::Truncated),
             _ => Err(format!(
                 r#"Expected "none" or "truncated" for captured_output, but got: "{}""#,
                 self.captured_output
-            )),
+            )
+            .into()),
         }
+    }
+
+    fn retention_value_as_secs(value: &str) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        let duration = humantime::parse_duration(value).map_err(|e| e.to_string())?;
+
+        if duration.as_secs() < TASK_HISTORY_RETENTION_MINIMUM {
+            return Err(format!(
+                "Task history retention period must be at least {TASK_HISTORY_RETENTION_MINIMUM} seconds",
+            ).into());
+        }
+
+        Ok(duration.as_secs())
+    }
+
+    pub fn retention_period_as_secs(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        Self::retention_value_as_secs(&self.retention_period)
+    }
+
+    pub fn retention_check_interval_as_secs(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        Self::retention_value_as_secs(&self.retention_check_interval)
     }
 }
