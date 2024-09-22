@@ -37,7 +37,7 @@ use futures::TryStreamExt;
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{datafusion::query::Protocol, spice_data_base_path, status, Runtime};
 use spicepod::component::dataset::{
-    acceleration::{Acceleration, Mode},
+    acceleration::{Acceleration, IndexType, Mode},
     Dataset,
 };
 
@@ -137,7 +137,7 @@ async fn execute_spill_to_disk_and_rehydration(
         }
     }
 
-    let rt = init_spice_app(engine, db_file_path).await?;
+    let rt = init_spice_app(engine, db_file_path, false).await?;
     runtime_ready_check(&rt).await;
 
     if std::fs::metadata(&accelerated_db_file_path).is_err() {
@@ -174,12 +174,21 @@ async fn execute_spill_to_disk_and_rehydration(
     assert_eq!(num_rows_loaded, num_persisted_records);
 
     // Restart the runtime and ensure the loaded items remain consistent
-    let rt = init_spice_app(engine, db_file_path).await?;
+    let rt = init_spice_app(engine, db_file_path, false).await?;
     // Do request immediately after restart w/o waiting for ready status (dataset is refreshed)
     let restart1_items = run_query(test_query, &rt).await?;
     let restart1_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart1_items).expect("pretty format");
-    insta::assert_snapshot!(restart1_items_pretty);
+    insta::assert_snapshot!("records", restart1_items_pretty);
+
+    drop(rt);
+
+    // Restart the runtime with updated app definition that includes primary key and indexes
+    let rt = init_spice_app(engine, db_file_path, true).await?;
+    let restart2_items = run_query(test_query, &rt).await?;
+    let restart2_items_pretty =
+        arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
+    insta::assert_snapshot!("records", restart2_items_pretty);
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     drop(rt);
@@ -188,12 +197,12 @@ async fn execute_spill_to_disk_and_rehydration(
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
-    let rt = init_spice_app(engine, db_file_path).await?;
+    let rt = init_spice_app(engine, db_file_path, false).await?;
     federated_dataset_container.stop().await?;
-    let restart2_items = run_query(test_query, &rt).await?;
-    let restart2_items_pretty =
-        arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
-    insta::assert_snapshot!(restart2_items_pretty);
+    let restart3_items = run_query(test_query, &rt).await?;
+    let restart3_items_pretty =
+        arrow::util::pretty::pretty_format_batches(&restart3_items).expect("pretty format");
+    insta::assert_snapshot!("records", restart3_items_pretty);
 
     Ok(())
 }
@@ -254,8 +263,9 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
 async fn init_spice_app(
     acceleration_engine: &str,
     db_file_path: Option<&str>,
+    with_pk_and_indexes: bool,
 ) -> Result<Runtime, anyhow::Error> {
-    let ds = create_test_dataset(acceleration_engine, db_file_path);
+    let ds = create_test_dataset(acceleration_engine, db_file_path, with_pk_and_indexes);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
@@ -279,7 +289,11 @@ async fn init_spice_app(
     Ok(rt)
 }
 
-fn create_test_dataset(acceleration_engine: &str, db_file_path: Option<&str>) -> Dataset {
+fn create_test_dataset(
+    acceleration_engine: &str,
+    db_file_path: Option<&str>,
+    with_pk_and_indexes: bool,
+) -> Dataset {
     let mut ds = make_mysql_dataset("lineitem", "lineitem", MYSQL_PORT, false);
 
     let mut acceleration = Acceleration {
@@ -299,6 +313,13 @@ fn create_test_dataset(acceleration_engine: &str, db_file_path: Option<&str>) ->
             .collect(),
         );
         acceleration.params = Some(params);
+    }
+
+    if with_pk_and_indexes {
+        acceleration.primary_key = Some("(l_orderkey, l_linenumber)".to_string());
+        acceleration.indexes = vec![("l_shipdate".to_string(), IndexType::Enabled)]
+            .into_iter()
+            .collect();
     }
 
     ds.acceleration = Some(acceleration);
