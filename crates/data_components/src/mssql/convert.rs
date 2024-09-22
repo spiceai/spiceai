@@ -16,17 +16,17 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
-use tiberius::{numeric::Numeric, ColumnType, Row};
+use tiberius::{numeric::Numeric, xml::XmlData, ColumnType, Row};
 use uuid::Uuid;
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-        Float64Builder, Int16Builder, Int32Builder, Int64Builder, NullBuilder, RecordBatch,
-        RecordBatchOptions, StringBuilder, Time64NanosecondBuilder, TimestampMillisecondBuilder,
-        TimestampNanosecondBuilder, UInt8Builder,
+        ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+        Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, NullBuilder,
+        RecordBatch, RecordBatchOptions, StringBuilder, Time64NanosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, UInt8Builder,
     },
     datatypes::{DataType, Date32Type, SchemaRef, TimeUnit},
 };
@@ -154,6 +154,27 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         None => builder.append_null(),
                     }
                 }
+                ColumnType::DatetimeOffsetn => {
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<TimestampNanosecondBuilder>()
+                    else {
+                        return super::FailedToDowncastBuilderSnafu {
+                            mssql_type: format!("{mssql_type:?}"),
+                        }
+                        .fail();
+                    };
+
+                    let v = row.get::<DateTime<chrono::FixedOffset>, usize>(i);
+                    match v {
+                        Some(v) => {
+                            let utc_value = v.with_timezone(&chrono::Utc);
+                            builder
+                                .append_value(utc_value.timestamp_nanos_opt().unwrap_or_default());
+                        }
+                        None => builder.append_null(),
+                    }
+                }
                 ColumnType::Daten => {
                     let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
                         return super::FailedToDowncastBuilderSnafu {
@@ -215,11 +236,36 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         None => builder.append_null(),
                     }
                 }
+                ColumnType::Xml => {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                        return super::FailedToDowncastBuilderSnafu {
+                            mssql_type: format!("{mssql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<&XmlData, usize>(i);
+                    match v {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
+                }
+                ColumnType::Image | ColumnType::BigVarBin | ColumnType::BigBinary => {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<BinaryBuilder>() else {
+                        return super::FailedToDowncastBuilderSnafu {
+                            mssql_type: format!("{mssql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<&[u8], usize>(i);
+                    match v {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
+                }
                 ColumnType::BigVarChar
                 | ColumnType::BigChar
                 | ColumnType::NVarchar
                 | ColumnType::NChar
-                | ColumnType::Xml
                 | ColumnType::Udt
                 | ColumnType::Text
                 | ColumnType::NText
@@ -275,8 +321,9 @@ pub(crate) fn map_column_type_to_arrow_type(
         ColumnType::Datetime4 | ColumnType::Datetime | ColumnType::Datetimen => {
             DataType::Timestamp(TimeUnit::Millisecond, None)
         }
-        ColumnType::Datetime2 | ColumnType::DatetimeOffsetn => {
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        ColumnType::Datetime2 => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ColumnType::DatetimeOffsetn => {
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         }
         ColumnType::Decimaln | ColumnType::Numericn => {
             let precision = decimal_precision.unwrap_or(38);
@@ -317,6 +364,7 @@ pub(crate) fn map_type_name_to_column_type(data_type: &str) -> super::Result<Col
         "varbinary" | "image" => ColumnType::BigVarBin,
         "xml" => ColumnType::Xml,
         "money" => ColumnType::Money,
+        "smallmoney" => ColumnType::Money4,
         "date" => ColumnType::Daten,
         "time" => ColumnType::Timen,
         "datetime" => ColumnType::Datetime,
@@ -324,6 +372,7 @@ pub(crate) fn map_type_name_to_column_type(data_type: &str) -> super::Result<Col
         "datetime2" => ColumnType::Datetime2,
         "datetimeoffset" => ColumnType::DatetimeOffsetn,
         "bit" => ColumnType::Bit,
+        "geography" => ColumnType::Udt,
         other => {
             return Err(super::Error::UnsupportedType {
                 data_type: other.to_string(),
