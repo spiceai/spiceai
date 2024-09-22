@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::component::dataset::Dataset;
 use crate::parameters::ParameterSpec;
@@ -178,18 +177,6 @@ pub trait DataAccelerator: Send + Sync {
         } else {
             false
         }
-    }
-
-    /// A hook that is called when the table is registered to the DataFusion context.
-    ///
-    /// Allow running any setup logic specific to the accelerator engine, i.e.
-    /// setting up a file watcher to refresh the table when the file is updated.
-    async fn on_registration(
-        &self,
-        _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
     }
 }
 

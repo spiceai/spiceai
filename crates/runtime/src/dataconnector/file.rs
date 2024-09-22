@@ -14,12 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
+use async_trait::async_trait;
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
 use std::future::Future;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{any::Any, env};
+use tokio::sync::mpsc;
 use url::Url;
 
 use super::{
@@ -85,6 +91,7 @@ impl DataConnectorFactory for FileFactory {
     }
 }
 
+#[async_trait]
 impl ListingTableConnector for File {
     fn as_any(&self) -> &dyn Any {
         self
@@ -98,15 +105,7 @@ impl ListingTableConnector for File {
     ///   1. Relative paths
     ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let clean_from = dataset.from.replace("file://", "file:/");
-
-        let Some(path) = clean_from.strip_prefix("file:") else {
-            // Should be unreachable
-            return Err(super::DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "File".to_string(),
-                message: "'dataset.from' must start with 'file:'".to_string(),
-            });
-        };
+        let path = get_path(dataset)?.to_string_lossy().into_owned();
 
         // Convert relative path to absolute path
         let url_str = if path.starts_with('/') {
@@ -131,5 +130,141 @@ impl ListingTableConnector for File {
                 dataconnector: "File".to_string(),
                 message: "Invalid URL".to_string(),
             })
+    }
+
+    /// Set up a file watcher to refresh the accelerated table when the file is updated.
+    ///
+    /// Spawns an async top-level Tokio task to watch the file(s) and adds it to the join
+    /// handles of the AcceleratedTable. When the AcceleratedTable is dropped, the file
+    /// watcher is aborted.
+    async fn on_accelerated_table_registration(
+        &self,
+        dataset: &Dataset,
+        accelerated_table: &mut AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let path = get_path(dataset)?;
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let watcher_task = tokio::spawn(async move {
+            let mut watcher = RecommendedWatcher::new(
+                move |res| {
+                    if let Ok(_) = res {
+                        let _ = tx.blocking_send(());
+                    }
+                },
+                Config::default(),
+            )
+            .expect("Failed to create file watcher");
+
+            let watch_path = Path::new(&path);
+            let mode = if watch_path.is_dir() {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+
+            watcher
+                .watch(watch_path, mode)
+                .expect("Failed to start watching path");
+
+            loop {
+                tokio::select! {
+                    Some(_) = rx.recv() => {
+                        if let Some(refresh_trigger) = accelerated_table.refresh_trigger.as_ref() {
+                            if let Err(e) = refresh_trigger.send(None).await {
+                                tracing::error!("Failed to trigger refresh: {}", e);
+                            }
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        accelerated_table.handlers.push(watcher_task);
+
+        Ok(())
+    }
+}
+
+fn get_path(dataset: &Dataset) -> DataConnectorResult<PathBuf> {
+    let clean_from = dataset.from.replace("file://", "file:/");
+
+    let Some(path) = clean_from.strip_prefix("file:") else {
+        // Should be unreachable
+        return Err(super::DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "File".to_string(),
+            message: "'dataset.from' must start with 'file:'".to_string(),
+        });
+    };
+
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::Dataset;
+    use crate::dataconnector::DataConnectorError;
+
+    #[test]
+    fn test_get_path() {
+        let test_cases = vec![
+            (
+                "file:/path/to/file.csv",
+                Ok(PathBuf::from("/path/to/file.csv")),
+            ),
+            (
+                "file://path/to/file.csv",
+                Ok(PathBuf::from("/path/to/file.csv")),
+            ),
+            (
+                "file:relative/path/to/file.csv",
+                Ok(PathBuf::from("relative/path/to/file.csv")),
+            ),
+            (
+                "http://example.com/file.csv",
+                Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "File".to_string(),
+                    message: "'dataset.from' must start with 'file:'".to_string(),
+                }),
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let dataset = Dataset::try_new(input.to_string(), "foo").expect("valid dataset");
+
+            let result = get_path(&dataset);
+
+            match (result, expected) {
+                (Ok(path), Ok(expected_path)) => {
+                    assert_eq!(path, expected_path, "Failed for input: {input}");
+                }
+                (Err(error), Err(expected_error)) => {
+                    assert_eq!(
+                        error.to_string(),
+                        expected_error.to_string(),
+                        "Failed for input: {input}"
+                    );
+                }
+                _ => panic!("Unexpected result for input: {input}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_path_empty_input() {
+        let dataset = Dataset::try_new(String::new(), "foo").expect("valid dataset");
+
+        let result = get_path(&dataset);
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("should error").to_string(),
+            DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "File".to_string(),
+                message: "'dataset.from' must start with 'file:'".to_string(),
+            }
+            .to_string()
+        );
     }
 }

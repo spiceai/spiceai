@@ -820,20 +820,8 @@ impl DataFusion {
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
 
-        let Some(accelerator_engine) = dataset.acceleration.as_ref().map(|a| a.engine) else {
-            unreachable!(
-                "In datafusion::register_accelerated_table, dataset.acceleration is always Some"
-            );
-        };
-
-        let Some(engine) = dataaccelerator::get_accelerator_engine(accelerator_engine).await else {
-            unreachable!(
-                "In datafusion::register_accelerated_table, the accelerator engine is always registered"
-            );
-        };
-
-        engine
-            .on_registration(&dataset, &mut accelerated_table)
+        source
+            .on_accelerated_table_registration(&dataset, &mut accelerated_table)
             .await
             .context(AccelerationRegistrationSnafu)?;
 
