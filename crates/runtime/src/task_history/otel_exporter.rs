@@ -51,15 +51,7 @@ impl TaskHistoryExporter {
     fn process_output(&self, output: Arc<str>) -> Arc<str> {
         match self.captured_output {
             TaskHistoryCapturedOutput::None => "".into(),
-            TaskHistoryCapturedOutput::Truncated => {
-                let output_str = output.as_ref();
-                if output_str.len() > 1000 {
-                    // TODO: set a config value for truncation length?
-                    output_str[..1000].into()
-                } else {
-                    output
-                }
-            }
+            TaskHistoryCapturedOutput::Truncated => output,
         }
     }
 
