@@ -25,7 +25,9 @@ use serde_json::json;
 use snafu::prelude::*;
 
 use runtime::{
-    accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
+    accelerated_table::{
+        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
+    },
     component::dataset::{
         acceleration::{Acceleration, RefreshMode},
         replication::Replication,
@@ -72,6 +74,11 @@ pub enum Error {
 
     #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
+
+    #[snafu(display("Unable to build accelerated table: {source}"))]
+    UnableToBuildAcceleratedTable {
+        source: AcceleratedTableBuilderError,
+    },
 }
 
 pub struct SpiceExtension {
@@ -360,7 +367,10 @@ pub async fn create_synced_internal_accelerated_table(
 
     builder.retention(retention);
 
-    let (accelerated_table, _) = builder.build().await;
+    let (accelerated_table, _) = builder
+        .build()
+        .await
+        .context(UnableToBuildAcceleratedTableSnafu)?;
 
     Ok(Arc::new(accelerated_table))
 }
