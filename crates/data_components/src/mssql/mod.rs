@@ -31,6 +31,7 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
+use tiberius::ColumnType;
 
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
@@ -123,6 +124,13 @@ impl SqlServerTableProvider {
             let numeric_scale: Option<i32> = row.get(3);
 
             let column_type = map_type_name_to_column_type(data_type)?;
+
+            // Tiberius does not support UDTs and will crash
+            if column_type == ColumnType::Udt {
+                tracing::warn!("Column '{column_name}' of table '{table_name}' has unsupported data type '{data_type}' and will be ignored");
+                continue;
+            }
+
             let arrow_data_type = map_column_type_to_arrow_type(
                 column_type,
                 numeric_precision,
