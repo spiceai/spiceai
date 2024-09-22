@@ -17,13 +17,15 @@ limitations under the License.
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 use std::{any::Any, env};
 use tokio::sync::mpsc;
 use url::Url;
@@ -142,19 +144,40 @@ impl ListingTableConnector for File {
         dataset: &Dataset,
         accelerated_table: &mut AcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Only enable the file watcher if the acceleration has the file_watcher parameter set to "enabled"
+        let enabled = dataset.acceleration.as_ref().is_some_and(|acceleration| {
+            acceleration
+                .params
+                .get("file_watcher")
+                .is_some_and(|v| v == "enabled")
+        });
+
+        if !enabled {
+            tracing::debug!("File watcher disabled for dataset {}", dataset.name);
+            return Ok(());
+        }
+
         let path = get_path(dataset)?;
         let (tx, mut rx) = mpsc::channel(100);
+        let Some(refresh_trigger) = accelerated_table.refresh_trigger() else {
+            return Ok(());
+        };
 
         let watcher_task = tokio::spawn(async move {
-            let mut watcher = RecommendedWatcher::new(
-                move |res| {
-                    if let Ok(_) = res {
+            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
+                move |res: Result<notify::Event, notify::Error>| match res {
+                    Ok(event) if event.kind.is_modify() => {
                         let _ = tx.blocking_send(());
                     }
+                    _ => {}
                 },
-                Config::default(),
-            )
-            .expect("Failed to create file watcher");
+            ) {
+                Ok(watcher) => watcher,
+                Err(e) => {
+                    tracing::error!("Failed to create file watcher: {e}");
+                    return;
+                }
+            };
 
             let watch_path = Path::new(&path);
             let mode = if watch_path.is_dir() {
@@ -163,18 +186,27 @@ impl ListingTableConnector for File {
                 RecursiveMode::NonRecursive
             };
 
-            watcher
-                .watch(watch_path, mode)
-                .expect("Failed to start watching path");
+            match watcher.watch(watch_path, mode) {
+                Ok(()) => (),
+                Err(e) => {
+                    tracing::error!("Failed to watch file: {e}");
+                    return;
+                }
+            };
 
+            let mut last_refresh = Instant::now();
             loop {
                 tokio::select! {
-                    Some(_) = rx.recv() => {
-                        if let Some(refresh_trigger) = accelerated_table.refresh_trigger.as_ref() {
-                            if let Err(e) = refresh_trigger.send(None).await {
-                                tracing::error!("Failed to trigger refresh: {}", e);
-                            }
+                    Some(()) = rx.recv() => {
+                        if last_refresh.elapsed() < Duration::from_millis(100) {
+                            tracing::debug!("Skipping refresh for file {}, last refresh was too recent", path.display());
+                            continue;
                         }
+                        tracing::debug!("Triggering refresh for file {}", path.display());
+                        if let Err(e) = refresh_trigger.send(None).await {
+                            tracing::error!("Failed to trigger refresh: {e}");
+                        }
+                        last_refresh = Instant::now();
                     }
                     else => break,
                 }
@@ -182,6 +214,8 @@ impl ListingTableConnector for File {
         });
 
         accelerated_table.handlers.push(watcher_task);
+
+        tracing::info!("Watching changes to {}", get_path(dataset)?.display());
 
         Ok(())
     }

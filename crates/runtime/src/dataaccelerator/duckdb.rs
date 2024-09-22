@@ -157,7 +157,10 @@ impl Default for DuckDBAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::accelerator("file")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::accelerator("file"),
+    ParameterSpec::runtime("file_watcher"),
+];
 
 #[async_trait]
 impl DataAccelerator for DuckDBAccelerator {

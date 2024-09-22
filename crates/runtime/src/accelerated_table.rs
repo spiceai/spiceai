@@ -150,7 +150,7 @@ pub struct AcceleratedTable {
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
-    handlers: Vec<JoinHandle<()>>,
+    pub(crate) handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
@@ -392,6 +392,11 @@ impl AcceleratedTable {
     #[must_use]
     pub fn refresh_params(&self) -> Arc<RwLock<refresh::Refresh>> {
         Arc::clone(&self.refresh_params)
+    }
+
+    #[must_use]
+    pub fn refresh_trigger(&self) -> Option<mpsc::Sender<Option<RefreshOverrides>>> {
+        self.refresh_trigger.clone()
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
