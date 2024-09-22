@@ -137,7 +137,23 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         None => builder.append_null(),
                     }
                 }
-
+                ColumnType::Datetime2 => {
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<TimestampNanosecondBuilder>()
+                    else {
+                        return super::FailedToDowncastBuilderSnafu {
+                            mssql_type: format!("{mssql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<NaiveDateTime, usize>(i);
+                    match v {
+                        Some(v) => builder
+                            .append_value(v.and_utc().timestamp_nanos_opt().unwrap_or_default()),
+                        None => builder.append_null(),
+                    }
+                }
                 ColumnType::DatetimeOffsetn => {
                     let Some(builder) = builder
                         .as_any_mut()
