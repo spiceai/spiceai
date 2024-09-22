@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::AcceleratedTableBuilderError;
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
@@ -76,6 +77,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("When processing the acceleration registration: {source}"))]
+    AccelerationRegistration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
@@ -197,6 +203,11 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
+
+    #[snafu(display("Unable to build accelerated table: {source}"))]
+    UnableToBuildAcceleratedTable {
+        source: AcceleratedTableBuilderError,
+    },
 }
 
 pub enum Table {
@@ -784,7 +795,10 @@ impl DataFusion {
             };
         }
 
-        Ok(accelerated_table_builder.build().await)
+        accelerated_table_builder
+            .build()
+            .await
+            .context(UnableToBuildAcceleratedTableSnafu)
     }
 
     pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
@@ -802,9 +816,26 @@ impl DataFusion {
         federated_read_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
-        let (accelerated_table, _) = self
+        let (mut accelerated_table, _) = self
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
+
+        let Some(accelerator_engine) = dataset.acceleration.as_ref().map(|a| a.engine) else {
+            unreachable!(
+                "In datafusion::register_accelerated_table, dataset.acceleration is always Some"
+            );
+        };
+
+        let Some(engine) = dataaccelerator::get_accelerator_engine(accelerator_engine).await else {
+            unreachable!(
+                "In datafusion::register_accelerated_table, the accelerator engine is always registered"
+            );
+        };
+
+        engine
+            .on_registration(&dataset, &mut accelerated_table)
+            .await
+            .context(AccelerationRegistrationSnafu)?;
 
         self.ctx
             .register_table(
