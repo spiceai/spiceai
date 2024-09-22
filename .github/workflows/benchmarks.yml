@@ -3,7 +3,7 @@ name: benchmark tests
 
 on:
   schedule:
-    - cron: '0 10 * * 3,0'
+    - cron: '0 10 * * 0,3,5,6' # Runs at 10 AM UTC (2AM PT) on Wednesday, Friday, Saturday, and Sunday.
   workflow_dispatch:
     inputs:
       run_all:
