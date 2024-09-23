@@ -13,11 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::datafusion::{query::Protocol, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
 use model_components::model::{Error as ModelError, Model};
 use std::result::Result;
 use std::sync::Arc;
+
 mod chat;
 mod embed;
 mod tool_use;
@@ -28,18 +30,19 @@ pub use embed::{try_to_embedding, EmbeddingModelStore};
 use crate::DataFusion;
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
-    // TODO: SUS
     match df
-        .ctx
-        .sql(
+        .query_builder(
             &(format!(
                 "select * from {SPICE_DEFAULT_CATALOG}.{SPICE_DEFAULT_SCHEMA}.{} order by ts asc",
                 m.model.datasets[0]
             )),
+            Protocol::Internal,
         )
+        .build()
+        .run()
         .await
     {
-        Ok(data) => match data.collect().await {
+        Ok(query_result) => match query_result.data.try_collect().await {
             Ok(d) => m.run(d),
             Err(e) => Err(ModelError::UnableToRunModel {
                 source: Box::new(e),

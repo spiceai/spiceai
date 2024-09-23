@@ -170,7 +170,6 @@ pub(crate) async fn handle(
 
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tokio::spawn(async move {
-        // TODO: SUS
         let Ok(df) = datafusion
             .ctx
             .sql(&format!(r#"SELECT * FROM {data_path}"#))
