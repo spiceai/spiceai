@@ -52,7 +52,7 @@ impl QueryTracker {
         self.finish(Arc::from("")).await;
     }
 
-    pub async fn finish(mut self, truncated_output: Arc<str>) {
+    pub async fn finish(mut self, captured_output: Arc<str>) {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -108,7 +108,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        if let Err(err) = self.write_query_history(truncated_output).await {
+        if let Err(err) = self.write_query_history(captured_output).await {
             tracing::error!("Error writing query history: {err}");
         };
     }
