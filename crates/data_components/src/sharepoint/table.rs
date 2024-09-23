@@ -181,7 +181,6 @@ impl SharepointListExec {
                         }
                     },
                     Err(e) => {
-                        //  TODO: Add more context to the error.
                         tracing::debug!("Error fetching drive items. {:#?}", e);
                         yield Err(DataFusionError::External(Error::MicrosoftGraphFailure { source: GraphFailure::ErrorMessage(e.clone()) }.into()));
                     },
