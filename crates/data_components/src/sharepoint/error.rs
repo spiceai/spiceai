@@ -31,10 +31,10 @@ pub enum Error {
     #[snafu(display("Group not found: {}", group))]
     GroupNotFound { group: String },
 
-    #[snafu(display("Group has no drive: {}", group))]
+    #[snafu(display("Group '{}' has no drive", group))]
     GroupHasNoDrive { group: String },
 
-    #[snafu(display("Site has no drive: {}", site))]
+    #[snafu(display("Site {} has no drive", site))]
     SiteHasNoDrive { site: String },
 
     #[snafu(display("Site not found: {}", site))]
