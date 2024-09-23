@@ -1631,12 +1631,6 @@ impl Runtime {
 
     pub async fn init_query_history(&self) -> Result<()> {
         let app = self.app.read().await;
-        if let Some(app) = app.as_ref() {
-            if !app.runtime.task_history.enabled {
-                tracing::debug!("Task history is disabled!");
-                return Ok(());
-            }
-        }
 
         let query_history_table_reference = TableReference::partial(
             SPICE_RUNTIME_SCHEMA,
@@ -1652,6 +1646,13 @@ impl Runtime {
             }
             Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
         };
+
+        if let Some(app) = app.as_ref() {
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled!");
+                return Ok(());
+            }
+        }
 
         let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
             Some(app) => (
