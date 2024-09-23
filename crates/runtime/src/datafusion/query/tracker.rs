@@ -30,6 +30,7 @@ pub(crate) struct QueryTracker {
     pub(crate) query_execution_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
     pub(crate) results_cache_hit: Option<bool>,
+    pub(crate) is_accelerated: Option<bool>,
     pub(crate) error_message: Option<String>,
     pub(crate) error_code: Option<ErrorCode>,
     pub(crate) query_duration_timer: Instant,
@@ -143,6 +144,10 @@ fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
 
     if let Some(true) = query_tracker.results_cache_hit {
         tracing::info!(target: "task_history", results_cache_hit = true, "labels");
+    }
+
+    if let Some(true) = &query_tracker.is_accelerated {
+        tracing::info!(target: "task_history", accelerated = true, "labels");
     }
 
     let datasets_str = query_tracker
