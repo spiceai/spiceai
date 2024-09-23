@@ -347,8 +347,9 @@ pub(crate) fn map_column_type_to_arrow_type(
     }
 }
 
-pub(crate) fn map_type_name_to_column_type(data_type: &str) -> super::Result<ColumnType> {
+pub(crate) fn map_type_name_to_column_type(data_type: &str) -> Option<ColumnType> {
     // https://github.com/prisma/tiberius/blob/51f0cbb3e430db74ba0ea4830b236e89f1b1e03f/src/tds/codec/token/token_col_metadata.rs#L26
+    // Data types (Transact-SQL): https://learn.microsoft.com/en-us/sql/t-sql/data-types/data-types-transact-sql
     let column_type = match data_type.to_lowercase().as_str() {
         "int" => ColumnType::Int4,
         "bigint" => ColumnType::Int8,
@@ -372,15 +373,13 @@ pub(crate) fn map_type_name_to_column_type(data_type: &str) -> super::Result<Col
         "datetime2" => ColumnType::Datetime2,
         "datetimeoffset" => ColumnType::DatetimeOffsetn,
         "bit" => ColumnType::Bit,
-        "geography" => ColumnType::Udt,
-        other => {
-            return Err(super::Error::UnsupportedType {
-                data_type: other.to_string(),
-            })
+        // ColumnType::Udt types such as Spatial/geography are not supported by Tiberius
+        _ => {
+            return None;
         }
     };
 
-    Ok(column_type)
+    Some(column_type)
 }
 
 fn get_column_precision_and_scale(
