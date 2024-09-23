@@ -139,7 +139,12 @@ impl RuntimeBuilder {
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
-            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
+            let is_task_history_enabled = self
+                .app
+                .as_ref()
+                .is_some_and(|app| app.runtime.task_history.enabled);
+            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df))
+                .with_task_history_enabled(is_task_history_enabled);
             datasets_health_monitor.start();
             Some(Arc::new(datasets_health_monitor))
         } else {
