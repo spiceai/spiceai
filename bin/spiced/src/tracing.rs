@@ -34,7 +34,7 @@ pub(crate) fn init_tracing(
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
         EnvFilter::new(env_log)
     } else {
@@ -77,7 +77,7 @@ fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
-) -> Result<impl Layer<S>, Box<dyn std::error::Error>>
+) -> Result<impl Layer<S>, Box<dyn std::error::Error + Send + Sync>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {

@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+fundu.workspace = true
 schemars = { version = "0.8.19", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
