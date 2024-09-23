@@ -1628,6 +1628,13 @@ impl Runtime {
     pub async fn init_task_history(&self) -> Result<()> {
         let app = self.app.read().await;
 
+        if let Some(app) = app.as_ref() {
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled!");
+                return Ok(());
+            }
+        }
+
         let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
             Some(app) => (
                 app.runtime
