@@ -42,6 +42,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
+use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
 use object_store::ObjectStore;
 use secrecy::SecretString;
@@ -437,7 +438,6 @@ pub async fn get_data(
     sql: Option<String>,
     filters: Vec<Expr>,
 ) -> Result<(SchemaRef, SendableRecordBatchStream), DataFusionError> {
-    // TODO: SUS
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -452,6 +452,9 @@ pub async fn get_data(
     for filter in filters {
         df = df.filter(filter)?;
     }
+
+    let sql = Unparser::default().plan_to_sql(df.logical_plan())?;
+    tracing::info!(target: "task_history", sql = %sql, "labels");
 
     let record_batch_stream = df.execute_stream().await?;
     Ok((table_provider.schema(), record_batch_stream))

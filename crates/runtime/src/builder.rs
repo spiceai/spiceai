@@ -139,7 +139,7 @@ impl RuntimeBuilder {
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
-            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df.ctx));
+            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
             datasets_health_monitor.start();
             Some(Arc::new(datasets_health_monitor))
         } else {
