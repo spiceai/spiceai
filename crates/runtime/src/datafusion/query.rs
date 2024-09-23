@@ -39,7 +39,6 @@ use tracing_futures::Instrument;
 pub(crate) use tracker::QueryTracker;
 
 pub mod builder;
-pub mod query_history;
 pub use builder::QueryBuilder;
 pub mod error_code;
 mod metrics;
@@ -126,9 +125,7 @@ pub struct Query {
 macro_rules! handle_error {
     ($self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-        $self
-            .finish_with_error(snafu_error.to_string(), $error_code)
-            .await;
+        $self.finish_with_error(snafu_error.to_string(), $error_code);
         return Err(snafu_error);
     }};
 }
@@ -232,6 +229,18 @@ impl Query {
                 inner_span.record("runtime_query", true);
             }
 
+            // If any of the input tables are accelerated, mark the query as accelerated
+            let mut is_accelerated = false;
+            for tr in &input_tables {
+                if ctx.df.is_accelerated(tr).await {
+                    is_accelerated = true;
+                    break;
+                }
+            }
+            if is_accelerated {
+                tracker.is_accelerated = Some(true);
+            }
+
             tracker = tracker.datasets(Arc::new(input_tables));
 
             // Start the timer for the query execution
@@ -288,14 +297,23 @@ impl Query {
         }
     }
 
-    pub async fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
-        self.tracker
-            .finish_with_error(error_message, error_code)
-            .await;
+    pub fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
+        self.tracker.finish_with_error(error_message, error_code);
     }
 
-    pub async fn get_schema(&self) -> Result<Schema, DataFusionError> {
-        let df = self.df.ctx.sql(&self.sql).await?;
+    pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
+        let df = match self.df.ctx.sql(&self.sql).await {
+            Ok(df) => df,
+            Err(e) => {
+                // If there is an error getting the schema, we still want to track it in task history
+                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+                let error_code = ErrorCode::from(&e);
+                span.in_scope(|| {
+                    self.finish_with_error(e.to_string(), error_code);
+                });
+                return Err(e);
+            }
+        };
         Ok(df.schema().into())
     }
 }
@@ -341,7 +359,7 @@ fn attach_query_tracker_to_stream(
                     ctx
                         .schema(schema_copy)
                         .rows_produced(num_records)
-                        .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError).await;
+                        .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError);
                     tracing::error!(target: "task_history", parent: &inner_span, "{e}");
                     yield batch_result;
                     return;
@@ -354,8 +372,7 @@ fn attach_query_tracker_to_stream(
         ctx
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish(Arc::from(captured_output))
-            .await;
+            .finish(&Arc::from(captured_output));
     };
 
     Box::pin(RecordBatchStreamAdapter::new(

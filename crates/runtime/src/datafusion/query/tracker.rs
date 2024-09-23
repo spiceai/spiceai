@@ -14,28 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc, time::SystemTime};
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use tokio::time::Instant;
-use uuid::Uuid;
 
 use super::{error_code::ErrorCode, metrics, Protocol};
 
 pub(crate) struct QueryTracker {
-    pub(crate) df: Arc<crate::datafusion::DataFusion>,
     pub(crate) schema: Option<SchemaRef>,
-    pub(crate) query_id: Uuid,
-    pub(crate) sql: Arc<str>,
     pub(crate) nsql: Option<Arc<str>>,
-    pub(crate) start_time: SystemTime,
-    pub(crate) end_time: Option<SystemTime>,
     pub(crate) query_duration_secs: Option<f32>,
     pub(crate) query_execution_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
     pub(crate) results_cache_hit: Option<bool>,
+    pub(crate) is_accelerated: Option<bool>,
     pub(crate) error_message: Option<String>,
     pub(crate) error_code: Option<ErrorCode>,
     pub(crate) query_duration_timer: Instant,
@@ -45,18 +40,14 @@ pub(crate) struct QueryTracker {
 }
 
 impl QueryTracker {
-    pub async fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
+    pub fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish(Arc::from("")).await;
+        self.finish(&Arc::from(""));
     }
 
-    pub async fn finish(mut self, captured_output: Arc<str>) {
-        if self.end_time.is_none() {
-            self.end_time = Some(SystemTime::now());
-        }
-
+    pub fn finish(mut self, captured_output: &Arc<str>) {
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
@@ -108,9 +99,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        if let Err(err) = self.write_query_history(captured_output).await {
-            tracing::error!("Error writing query history: {err}");
-        };
+        trace_query(&self, captured_output);
     }
 
     #[must_use]
@@ -136,4 +125,37 @@ impl QueryTracker {
         self.datasets = datasets;
         self
     }
+}
+
+fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
+    if let Some(error_code) = &query_tracker.error_code {
+        tracing::info!(target: "task_history", error_code = %error_code, "labels");
+    }
+
+    if let Some(error_message) = &query_tracker.error_message {
+        tracing::error!(target: "task_history", "{error_message}");
+    }
+
+    if let Some(query_execution_duration_secs) = &query_tracker.query_execution_duration_secs {
+        tracing::info!(target: "task_history", query_execution_duration_ms = %query_execution_duration_secs * 1000.0, "labels");
+    }
+
+    tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
+
+    if let Some(true) = query_tracker.results_cache_hit {
+        tracing::info!(target: "task_history", results_cache_hit = true, "labels");
+    }
+
+    if let Some(true) = &query_tracker.is_accelerated {
+        tracing::info!(target: "task_history", accelerated = true, "labels");
+    }
+
+    let datasets_str = query_tracker
+        .datasets
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join(",");
+    tracing::info!(target: "task_history", protocol = ?query_tracker.protocol, datasets = datasets_str, "labels");
+    tracing::info!(target: "task_history", truncated_output = %truncated_output);
 }
