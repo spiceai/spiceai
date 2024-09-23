@@ -427,7 +427,7 @@ impl VectorSearch {
                     }
                 };
             }
-            tracing::info!(target: "task_history", truncated_output = ?response);
+            tracing::info!(target: "task_history", captured_output = ?response);
             Ok(response)
         }.instrument(span.clone()).await;
 

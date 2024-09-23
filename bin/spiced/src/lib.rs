@@ -184,7 +184,7 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .await;
 
-    spiced_tracing::init_tracing(app, tracing_config.as_ref(), rt.datafusion())
+    spiced_tracing::init_tracing(&app, tracing_config.as_ref(), rt.datafusion())
         .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {

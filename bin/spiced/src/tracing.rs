@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::{borrow::Cow, sync::Arc};
 
-use app::{spicepod::component::runtime::TracingConfig, App};
+use app::{
+    spicepod::component::runtime::{TaskHistoryCapturedOutput, TracingConfig},
+    App,
+};
 use futures::future::BoxFuture;
 use opentelemetry_sdk::{
     export::trace::{ExportResult, SpanData, SpanExporter},
@@ -28,7 +31,7 @@ use tracing::Subscriber;
 use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
 
 pub(crate) fn init_tracing(
-    app: Option<Arc<App>>,
+    app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -38,19 +41,15 @@ pub(crate) fn init_tracing(
         EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,WARN")
     };
 
-    if let Some(task_history) = app
-        .as_ref()
-        .and_then(|app| app.runtime.task_history.as_ref())
-    {
-        if task_history.enabled {
-            let app_name = app.map(|app| app.name.clone());
-            let subscriber =
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(datafusion_task_history_tracing(df, app_name, config))
-                    .with(fmt::layer().with_ansi(true).with_filter(filter::filter_fn(
-                        |metadata| metadata.target() != "task_history",
-                    )));
+    if let Some(app) = app.as_ref() {
+        if !app.runtime.task_history.enabled {
+            let subscriber = tracing_subscriber::registry().with(filter).with(
+                fmt::layer()
+                    .with_ansi(true)
+                    .with_filter(filter::filter_fn(|metadata| {
+                        metadata.target() != "task_history"
+                    })),
+            );
 
             tracing::subscriber::set_global_default(subscriber)?;
 
@@ -58,16 +57,16 @@ pub(crate) fn init_tracing(
         }
     }
 
-    let subscriber =
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                fmt::layer()
-                    .with_ansi(true)
-                    .with_filter(filter::filter_fn(|metadata| {
-                        metadata.target() != "task_history"
-                    })),
-            );
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(datafusion_task_history_tracing(df, app, config)?)
+        .with(
+            fmt::layer()
+                .with_ansi(true)
+                .with_filter(filter::filter_fn(|metadata| {
+                    metadata.target() != "task_history"
+                })),
+        );
 
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -76,16 +75,23 @@ pub(crate) fn init_tracing(
 
 fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
-    app_name: Option<String>,
+    app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
-) -> impl Layer<S>
+) -> Result<impl Layer<S>, Box<dyn std::error::Error>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
     let trace_config = Config::default().with_resource(Resource::empty());
+    let app_name = app.as_ref().map(|app| app.name.clone());
+
+    let captured_output = if let Some(app) = app.as_ref() {
+        app.runtime.task_history.get_captured_output()?
+    } else {
+        TaskHistoryCapturedOutput::Truncated
+    };
 
     let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
-        task_history::otel_exporter::TaskHistoryExporter::new(df),
+        task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
     )];
 
     if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config) {
@@ -108,7 +114,7 @@ where
             metadata.target() == "task_history"
         }));
 
-    layer
+    Ok(layer)
 }
 
 fn zipkin_task_history_otel_exporter(
