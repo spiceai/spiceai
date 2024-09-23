@@ -49,7 +49,7 @@ VALUES (
 );
 GO
 
-IINSERT INTO test_mssql_table (
+INSERT INTO test_mssql_table (
     col_int, col_bigint, col_smallint, col_tinyint, col_float, col_real, col_decimal, col_char, col_varchar, col_text, 
     col_nchar, col_nvarchar, col_ntext, col_uniqueidentifier, col_binary, col_varbinary, col_xml, col_money, col_smallmoney, 
     col_date, col_time, col_datetime, col_smalldatetime, col_datetime2, col_datetimeoffset, col_bit, col_geography
