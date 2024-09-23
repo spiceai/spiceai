@@ -35,9 +35,9 @@ use crate::{
     metrics,
 };
 
-const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 10; // every minute
+const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
 const DATASET_UNAVAILABLE_THRESHOLD_MINUTES: u64 = 10;
-const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = 10; // 10 minutes
+const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = DATASET_UNAVAILABLE_THRESHOLD_MINUTES * 60; // 10 minutes
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
