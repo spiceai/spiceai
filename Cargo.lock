@@ -9741,7 +9741,7 @@ dependencies = [
 name = "spicepod"
 version = "0.18.1-beta"
 dependencies = [
- "humantime",
+ "fundu",
  "schemars",
  "serde",
  "serde-value",

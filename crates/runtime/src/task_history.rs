@@ -37,8 +37,8 @@ use crate::accelerated_table::{AcceleratedTable, Retention};
 pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
-pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 24 * 60 * 60; // 1 day
-pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
+pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 8 * 60 * 60; // 8 hours
+pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {

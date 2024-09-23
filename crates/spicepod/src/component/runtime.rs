@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -107,32 +107,32 @@ pub struct TaskHistory {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_truncated")]
-    pub captured_output: String,
+    pub captured_output: Arc<str>,
     #[serde(default = "default_retention_period")]
-    pub retention_period: String,
+    pub retention_period: Arc<str>,
     #[serde(default = "default_retention_check_interval")]
-    pub retention_check_interval: String,
+    pub retention_check_interval: Arc<str>,
 }
 
-fn default_truncated() -> String {
-    "truncated".to_string()
+fn default_truncated() -> Arc<str> {
+    "truncated".into()
 }
 
-fn default_retention_period() -> String {
-    "1d".to_string()
+fn default_retention_period() -> Arc<str> {
+    "8h".into()
 }
 
-fn default_retention_check_interval() -> String {
-    "30m".to_string()
+fn default_retention_check_interval() -> Arc<str> {
+    "15m".into()
 }
 
 impl Default for TaskHistory {
     fn default() -> Self {
         Self {
             enabled: true,
-            captured_output: "truncated".to_string(),
-            retention_period: "1d".to_string(),
-            retention_check_interval: "30m".to_string(),
+            captured_output: "truncated".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
         }
     }
 }
@@ -147,23 +147,28 @@ impl TaskHistory {
     pub fn get_captured_output(
         &self,
     ) -> Result<TaskHistoryCapturedOutput, Box<dyn Error + Send + Sync>> {
-        match self.captured_output.as_str() {
-            "none" => Ok(TaskHistoryCapturedOutput::None),
-            "truncated" => Ok(TaskHistoryCapturedOutput::Truncated),
-            _ => Err(format!(
-                r#"Expected "none" or "truncated" for captured_output, but got: "{}""#,
-                self.captured_output
-            )
-            .into()),
+        if self.captured_output == "none".into() {
+            return Ok(TaskHistoryCapturedOutput::None);
+        } else if self.captured_output == "truncated".into() {
+            return Ok(TaskHistoryCapturedOutput::Truncated);
         }
+
+        Err(format!(
+            r#"Expected "none" or "truncated" for "captured_output", but got: "{}""#,
+            self.captured_output
+        )
+        .into())
     }
 
-    fn retention_value_as_secs(value: &str) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let duration = humantime::parse_duration(value).map_err(|e| e.to_string())?;
+    fn retention_value_as_secs(
+        value: &str,
+        field: &str,
+    ) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        let duration = fundu::parse_duration(value).map_err(|e| e.to_string())?;
 
         if duration.as_secs() < TASK_HISTORY_RETENTION_MINIMUM {
             return Err(format!(
-                "Task history retention period must be at least {TASK_HISTORY_RETENTION_MINIMUM} seconds",
+                r#"Task history retention {field} must be at least {TASK_HISTORY_RETENTION_MINIMUM} seconds. To disable task history, set the property "enabled: false"."#,
             ).into());
         }
 
@@ -171,10 +176,10 @@ impl TaskHistory {
     }
 
     pub fn retention_period_as_secs(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        Self::retention_value_as_secs(&self.retention_period)
+        Self::retention_value_as_secs(&self.retention_period, "period")
     }
 
     pub fn retention_check_interval_as_secs(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        Self::retention_value_as_secs(&self.retention_check_interval)
+        Self::retention_value_as_secs(&self.retention_check_interval, "check interval")
     }
 }
