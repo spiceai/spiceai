@@ -4486,7 +4486,7 @@ dependencies = [
 [[package]]
 name = "graph-core"
 version = "2.0.1"
-source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=c6ee86397707363044c70c6d49e07628a1c170cf#c6ee86397707363044c70c6d49e07628a1c170cf"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=f8703df260146b313461029d41c4a021306832b8#f8703df260146b313461029d41c4a021306832b8"
 dependencies = [
  "Inflector",
  "async-stream",
@@ -4511,7 +4511,7 @@ dependencies = [
 [[package]]
 name = "graph-error"
 version = "0.3.1"
-source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=c6ee86397707363044c70c6d49e07628a1c170cf#c6ee86397707363044c70c6d49e07628a1c170cf"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=f8703df260146b313461029d41c4a021306832b8#f8703df260146b313461029d41c4a021306832b8"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -4534,12 +4534,13 @@ dependencies = [
 [[package]]
 name = "graph-http"
 version = "2.0.1"
-source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=c6ee86397707363044c70c6d49e07628a1c170cf#c6ee86397707363044c70c6d49e07628a1c170cf"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=f8703df260146b313461029d41c4a021306832b8#f8703df260146b313461029d41c4a021306832b8"
 dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
  "futures",
+ "futures-util",
  "graph-core",
  "graph-error",
  "handlebars 2.0.4",
@@ -4551,13 +4552,14 @@ dependencies = [
  "serde_urlencoded",
  "thiserror",
  "tokio",
+ "tower",
  "url",
 ]
 
 [[package]]
 name = "graph-oauth"
 version = "2.0.1"
-source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=c6ee86397707363044c70c6d49e07628a1c170cf#c6ee86397707363044c70c6d49e07628a1c170cf"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=f8703df260146b313461029d41c4a021306832b8#f8703df260146b313461029d41c4a021306832b8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4585,7 +4587,7 @@ dependencies = [
 [[package]]
 name = "graph-rs-sdk"
 version = "2.0.1"
-source = "git+https://github.com/Jeadie/graph-rs-sdk?rev=c6ee86397707363044c70c6d49e07628a1c170cf#c6ee86397707363044c70c6d49e07628a1c170cf"
+source = "git+https://github.com/spiceai/graph-rs-sdk?rev=f8703df260146b313461029d41c4a021306832b8#f8703df260146b313461029d41c4a021306832b8"
 dependencies = [
  "graph-core",
  "graph-error",
