@@ -148,6 +148,7 @@ enum DrivePtr {
 }
 
 /// Resolves a `DrivePtr` into a `DriveId`. This ensures that the `DriveId` is unique and can be used to fetch drive items.
+#[allow(clippy::too_many_lines)]
 async fn resolve_drive_ptr(
     client: Arc<GraphClient>,
     drive: &PublicDrivePtr,
@@ -196,6 +197,27 @@ async fn resolve_drive_ptr(
                     group: name.to_string(),
                 });
             };
+
+            // Check if the group has a drive. This can't be done in the above `get_group_items` call (with an $expand).
+            match Arc::clone(&client)
+                .group(group_id)
+                .drive()
+                .get_drive()
+                .send()
+                .await
+            {
+                Err(_) => {
+                    return Err(Error::GroupHasNoDrive { group: name.to_string() });
+                }
+                Ok(r) if !r.status().is_success() => {
+                    return Err(Error::GroupHasNoDrive { group: name.to_string() });
+                    
+                }
+                Ok(_) => {
+                    tracing::debug!("Found a drive for sharepoint group '{name}'");
+                }
+            }
+
             Ok(DrivePtr::GroupId(group_id.to_string()))
         }
         PublicDrivePtr::SiteName(name) => {
@@ -204,7 +226,7 @@ async fn resolve_drive_ptr(
                 .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
             let Some(site_id) = sites.get(name) else {
                 tracing::warn!(
-                    "Site with name '{}' is not found. Available sites: {}.",
+                    "Site '{}' is not found. Available sites: {}.",
                     name,
                     sites
                         .keys()
@@ -216,6 +238,24 @@ async fn resolve_drive_ptr(
                     site: name.to_string(),
                 });
             };
+            // Check if the site has a drive. This can't be done in the above `get_site_items` call (with an $expand).
+            match Arc::clone(&client)
+                .site(site_id)
+                .drive()
+                .get_drive()
+                .send()
+                .await
+            {
+                Err(_) => {
+                    return Err(Error::SiteHasNoDrive { site: name.to_string() });
+                }
+                Ok(r) if !r.status().is_success() => {
+                    return Err(Error::SiteHasNoDrive { site: name.to_string() });
+                }
+                Ok(_) => {
+                    tracing::debug!("Found a drive for sharepoint site '{name}'");
+                }
+            }
             Ok(DrivePtr::SiteId(site_id.to_string()))
         }
     }
@@ -275,7 +315,7 @@ impl SharepointClient {
                     client.item_by_path(format!(":{path}:")).list_children()
                 }
                 // _"If this property [root] is non-null, it indicates that the driveItem is the top-most driveItem in the drive."_
-                DriveItemPtr::Root => client.items().list_items().filter(&["root ne null"]),
+                DriveItemPtr::Root => client.items().list_items().filter(&["root ne null or root eq null"]) // item_by_path(""), //.list_children(),
             },
 
             DriveApi::Default(client) => match &self.drive_item {
@@ -283,7 +323,8 @@ impl SharepointClient {
                 DriveItemPtr::ItemPath(path) => {
                     client.item_by_path(format!(":{path}:")).list_children()
                 }
-                DriveItemPtr::Root => client.item_by_path("").list_children(),
+                // DriveItemPtr::Root => client.items().list_items().filter(&["root ne null"]),
+                DriveItemPtr::Root => client.items().list_items().filter(&["root ne null or root eq null"]) // item_by_path(""), //.list_children(),
             },
         };
 
@@ -358,6 +399,7 @@ async fn get_drive_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Stri
     let resp = graph
         .drives()
         .list_drive()
+        .select(&["id", "name"])
         .send()
         .await?
         .json::<serde_json::Value>()
@@ -371,6 +413,7 @@ async fn get_group_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Stri
     let resp = graph
         .groups()
         .list_group()
+        .select(&["id", "displayName"])
         .send()
         .await?
         .json::<serde_json::Value>()
@@ -384,6 +427,8 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
     let resp = graph
         .sites()
         .list_site()
+        .expand(&["drive"])
+        .select(&["id", "name"])
         .send()
         .await?
         .json::<serde_json::Value>()

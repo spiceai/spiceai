@@ -33,6 +33,7 @@ use datafusion::{
 };
 use document_parse::DocumentParser;
 use futures::{Stream, StreamExt};
+use graph_rs_sdk::GraphFailure;
 use snafu::ResultExt;
 
 use crate::sharepoint::drive_items::drive_items_to_record_batch;
@@ -147,10 +148,10 @@ impl SharepointListExec {
         Ok(stream! {
 
             while let Some(s) = resp_stream.next().await {
-                let response = match s.boxed().map_err(DataFusionError::External) {
+                let response = match s {
                     Ok(r) => r,
                     Err(e) => {
-                        yield Err(e);
+                        yield Err(DataFusionError::External(Error::MicrosoftGraphFailure { source: e }.into()));
                         continue;
                     }
                 };
@@ -180,8 +181,9 @@ impl SharepointListExec {
                         }
                     },
                     Err(e) => {
+                        //  TODO: Add more context to the error.
                         tracing::debug!("Error fetching drive items. {:#?}", e);
-                        yield Err(DataFusionError::External(Box::new(e.clone())))
+                        yield Err(DataFusionError::External(Error::MicrosoftGraphFailure { source: GraphFailure::ErrorMessage(e.clone()) }.into()));
                     },
                 }
             }
