@@ -96,7 +96,7 @@ impl SpiceModelTool for SqlTool {
 
             let query_result = rt
                 .datafusion()
-                .query_builder(&req.query, Protocol::Flight)
+                .query_builder(&req.query, Protocol::Internal)
                 .build()
                 .run()
                 .await
