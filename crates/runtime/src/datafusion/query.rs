@@ -319,7 +319,7 @@ fn attach_query_tracker_to_stream(
     let mut num_records = 0u64;
     let mut num_output_bytes = 0u64;
 
-    let mut truncated_output = "[]".to_string(); // default to empty preview
+    let mut captured_output = "[]".to_string(); // default to empty preview
 
     let inner_span = span.clone();
     let updated_stream = stream! {
@@ -329,7 +329,7 @@ fn attach_query_tracker_to_stream(
                 Ok(batch) => {
                     // Create a truncated output for the query history table on first batch.
                     if num_records == 0 {
-                        truncated_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
+                        captured_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
                     }
 
                     num_output_bytes += batch.get_array_memory_size() as u64;
@@ -354,7 +354,7 @@ fn attach_query_tracker_to_stream(
         ctx
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish(Arc::from(truncated_output))
+            .finish(Arc::from(captured_output))
             .await;
     };
 

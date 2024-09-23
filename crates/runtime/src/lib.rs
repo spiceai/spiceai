@@ -1631,14 +1631,6 @@ impl Runtime {
 
     pub async fn init_query_history(&self) -> Result<()> {
         let app = self.app.read().await;
-        if let Some(app) = app.as_ref() {
-            if let Some(task_history) = app.runtime.task_history.as_ref() {
-                if !task_history.enabled {
-                    tracing::debug!("Task history is disabled!");
-                    return Ok(());
-                }
-            }
-        }
 
         let query_history_table_reference = TableReference::partial(
             SPICE_RUNTIME_SCHEMA,
@@ -1655,7 +1647,41 @@ impl Runtime {
             Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
         };
 
-        match task_history::TaskSpan::instantiate_table(self.status()).await {
+        if let Some(app) = app.as_ref() {
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled!");
+                return Ok(());
+            }
+        }
+
+        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
+            Some(app) => (
+                app.runtime
+                    .task_history
+                    .retention_period_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
+                    })?,
+                app.runtime
+                    .task_history
+                    .retention_check_interval_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e },
+                    })?,
+            ),
+            None => (
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
+            ),
+        };
+
+        match task_history::TaskSpan::instantiate_table(
+            self.status(),
+            retention_period_secs,
+            retention_check_interval_secs,
+        )
+        .await
+        {
             Ok(table) => self
                 .df
                 .register_runtime_table(

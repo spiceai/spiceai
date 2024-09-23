@@ -46,6 +46,8 @@ impl Default for ArrowAccelerator {
     }
 }
 
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_watcher")];
+
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
     fn as_any(&self) -> &dyn Any {
@@ -73,6 +75,6 @@ impl DataAccelerator for ArrowAccelerator {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &[]
+        PARAMETERS
     }
 }
