@@ -139,6 +139,7 @@ WHERE labels.datasets IS NOT NULL
 AND NOW() < end_time + INTERVAL '{DATASET_UNAVAILABLE_THRESHOLD_MINUTES}' MINUTE
 AND labels.error_code IS NULL"
         );
+        // TODO: SUS
         let plan = df_ctx
             .sql(&query)
             .await

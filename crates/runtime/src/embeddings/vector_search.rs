@@ -288,7 +288,7 @@ impl VectorSearch {
             "SELECT {projection_str}, sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME} FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
         );
         tracing::trace!("running SQL: {query}");
-
+        // TODO: SUS
         let batches = self
             .df
             .ctx

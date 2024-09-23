@@ -437,6 +437,7 @@ pub async fn get_data(
     sql: Option<String>,
     filters: Vec<Expr>,
 ) -> Result<(SchemaRef, SendableRecordBatchStream), DataFusionError> {
+    // TODO: SUS
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));

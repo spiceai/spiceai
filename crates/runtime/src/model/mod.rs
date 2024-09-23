@@ -28,6 +28,7 @@ pub use embed::{try_to_embedding, EmbeddingModelStore};
 use crate::DataFusion;
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
+    // TODO: SUS
     match df
         .ctx
         .sql(

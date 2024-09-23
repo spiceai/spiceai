@@ -614,6 +614,7 @@ impl RefreshTask {
         ctx: SessionContext,
         sql_opt: Option<&str>,
     ) -> Result<DataFrame, DataFusionError> {
+        // TODO: SUS
         if let Some(sql) = sql_opt {
             ctx.sql(sql).await
         } else {
