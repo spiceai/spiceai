@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratedTable;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
@@ -78,6 +79,8 @@ pub mod ftp;
 pub mod github;
 pub mod graphql;
 pub mod https;
+#[cfg(feature = "mssql")]
+pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
@@ -302,6 +305,8 @@ pub async fn register_all() {
     #[cfg(feature = "ftp")]
     register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
     register_connector_factory("spiceai", spiceai::SpiceAIFactory::new_arc()).await;
+    #[cfg(feature = "mssql")]
+    register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
     #[cfg(feature = "mysql")]
     register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
     #[cfg(feature = "postgres")]
@@ -408,6 +413,20 @@ pub trait DataConnector: Send + Sync {
     ) -> Option<DataConnectorResult<Arc<dyn CatalogProvider>>> {
         None
     }
+
+    /// A hook that is called when an accelerated table is registered to the
+    /// DataFusion context for this data connector.
+    ///
+    /// Allows running any setup logic specific to the data connector when its
+    /// accelerated table is registered, i.e. setting up a file watcher to refresh
+    /// the table when the file is updated.
+    async fn on_accelerated_table_registration(
+        &self,
+        _dataset: &Dataset,
+        _accelerated_table: &mut AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 // Gets data from a table provider and returns it as a vector of RecordBatches.
@@ -437,6 +456,7 @@ pub async fn get_data(
     Ok((table_provider.schema(), record_batch_stream))
 }
 
+#[async_trait]
 pub trait ListingTableConnector: DataConnector {
     fn as_any(&self) -> &dyn Any;
 
@@ -609,6 +629,20 @@ pub trait ListingTableConnector: DataConnector {
                 ),
         ))
     }
+
+    /// A hook that is called when an accelerated table is registered to the
+    /// DataFusion context for this data connector.
+    ///
+    /// Allows running any setup logic specific to the data connector when its
+    /// accelerated table is registered, i.e. setting up a file watcher to refresh
+    /// the table when the file is updated.
+    async fn on_accelerated_table_registration(
+        &self,
+        _dataset: &Dataset,
+        _accelerated_table: &mut AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -649,11 +683,19 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
             None => {
+                let content_formatter = document_parse::get_parser_factory(extension.as_str())
+                    .await
+                    .map(|factory| {
+                        // TODO: add opts.
+                        factory.default()
+                    });
+
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
                 Ok(ObjectStoreTextTable::try_new(
                     self.get_object_store(dataset)?,
                     &url.clone(),
                     Some(extension.clone()),
+                    content_formatter,
                 )
                 .context(InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
@@ -689,6 +731,21 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 Ok(Arc::new(table))
             }
         }
+    }
+
+    /// A hook that is called when an accelerated table is registered to the
+    /// DataFusion context for this data connector.
+    ///
+    /// Allows running any setup logic specific to the data connector when its
+    /// accelerated table is registered, i.e. setting up a file watcher to refresh
+    /// the table when the file is updated.
+    async fn on_accelerated_table_registration(
+        &self,
+        dataset: &Dataset,
+        accelerated_table: &mut AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
+            .await
     }
 }
 

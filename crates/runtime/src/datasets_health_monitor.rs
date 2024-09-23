@@ -26,7 +26,7 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::{future::join_all, stream::TryStreamExt};
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 
@@ -270,7 +270,7 @@ async fn update_dataset_availability_info(
 }
 
 fn report_dataset_unavailable_time(dataset_name: &String, last_available_time: Option<SystemTime>) {
-    let labels = [Key::from_static_str("dataset").string(dataset_name.to_string())];
+    let labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
 
     match last_available_time {
         Some(last_available_time) => metrics::datasets::UNAVAILABLE_TIME.record(

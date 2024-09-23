@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection,
+    mysqlpool::{self, MySQLConnectionPool},
     DbConnectionPool, Error as DbConnectionPoolError,
 };
 use mysql_async::prelude::ToValue;
@@ -30,7 +31,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -80,12 +81,40 @@ impl DataConnectorFactory for MySQLFactory {
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
-            > = Arc::new(
-                MySQLConnectionPool::new(params.to_secret_map())
-                    .await
-                    .context(UnableToCreateMySQLConnectionPoolSnafu)?,
-            );
+            > = match MySQLConnectionPool::new(params.to_secret_map()).await {
+                Ok(pool) => Arc::new(pool),
+                Err(error) => match error {
+                    mysqlpool::Error::InvalidUsernameOrPassword { .. } => {
+                        return Err(
+                            DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                                dataconnector: "mysql".to_string(),
+                            }
+                            .into(),
+                        )
+                    }
 
+                    mysqlpool::Error::InvalidHostOrPortError {
+                        source: _,
+                        host,
+                        port,
+                    } => {
+                        return Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                            dataconnector: "mysql".to_string(),
+                            host,
+                            port: format!("{port}"),
+                        }
+                        .into())
+                    }
+
+                    _ => {
+                        return Err(DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "mysql".to_string(),
+                            source: Box::new(error),
+                        }
+                        .into())
+                    }
+                },
+            };
             let mysql_factory = MySQLTableFactory::new(pool);
 
             Ok(Arc::new(MySQL { mysql_factory }) as Arc<dyn DataConnector>)
@@ -111,12 +140,30 @@ impl DataConnector for MySQL {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.mysql_factory, dataset.path().into(), dataset.schema())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "mysql",
-                })?,
-        )
+        match Read::table_provider(&self.mysql_factory, dataset.path().into(), dataset.schema())
+            .await
+        {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(err_source) = e.source() {
+                    if let Some(dbconnection::Error::UndefinedTable {
+                        table_name,
+                        source: _,
+                    }) = err_source.downcast_ref::<dbconnection::Error>()
+                    {
+                        return Err(DataConnectorError::InvalidTableName {
+                            dataconnector: "mysql".to_string(),
+                            dataset_name: dataset.name.to_string(),
+                            table_name: table_name.clone(),
+                        });
+                    }
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "mysql".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 }

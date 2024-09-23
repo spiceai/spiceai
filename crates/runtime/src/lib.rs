@@ -24,7 +24,7 @@ use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
-use ::opentelemetry::Key;
+use ::opentelemetry::KeyValue;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
@@ -971,7 +971,7 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::datasets::COUNT.add(1, &[Key::from_static_str("engine").string(engine)]);
+                metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
                 Ok(())
             }
@@ -1018,7 +1018,7 @@ impl Runtime {
                 }
             },
         );
-        metrics::datasets::COUNT.add(-1, &[Key::from_static_str("engine").string(engine)]);
+        metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
     }
 
     async fn update_dataset(&self, ds: Arc<Dataset>) {
@@ -1281,8 +1281,9 @@ impl Runtime {
                         metrics::embeddings::COUNT.add(
                             1,
                             &[
-                                Key::from_static_str("embeddings").string(in_embed.name.clone()),
-                                Key::from_static_str("source").string(
+                                KeyValue::new("embeddings", in_embed.name.clone()),
+                                KeyValue::new(
+                                    "source",
                                     in_embed
                                         .get_prefix()
                                         .map(|x| x.to_string())
@@ -1351,8 +1352,7 @@ impl Runtime {
                 let mut tools_map = self.tools.write().await;
                 tools_map.insert(tool.name.clone(), t);
                 tracing::info!("Tool [{}] ready to use", tool.name);
-                metrics::tools::COUNT
-                    .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
+                metrics::tools::COUNT.add(1, &[KeyValue::new("tool", tool.name.clone())]);
                 self.status
                     .update_tool(&tool.name, status::ComponentStatus::Ready);
             }
@@ -1377,8 +1377,8 @@ impl Runtime {
         let _guard = TimeMeasurement::new(
             &metrics::models::LOAD_DURATION_MS,
             &[
-                Key::from_static_str("model").string(m.name.clone()),
-                Key::from_static_str("source").string(source_str.clone()),
+                KeyValue::new("model", m.name.clone()),
+                KeyValue::new("source", source_str.clone()),
             ],
         );
 
@@ -1436,8 +1436,8 @@ impl Runtime {
                 metrics::models::COUNT.add(
                     1,
                     &[
-                        Key::from_static_str("model").string(m.name.clone()),
-                        Key::from_static_str("source").string(source_str),
+                        KeyValue::new("model", m.name.clone()),
+                        KeyValue::new("source", source_str),
                     ],
                 );
                 self.status
@@ -1470,8 +1470,8 @@ impl Runtime {
         metrics::models::COUNT.add(
             -1,
             &[
-                Key::from_static_str("model").string(m.name.clone()),
-                Key::from_static_str("source").string(source_str),
+                KeyValue::new("model", m.name.clone()),
+                KeyValue::new("source", source_str),
             ],
         );
     }
@@ -1626,7 +1626,36 @@ impl Runtime {
     }
 
     pub async fn init_task_history(&self) -> Result<()> {
-        match task_history::TaskSpan::instantiate_table(self.status()).await {
+        let app = self.app.read().await;
+
+        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
+            Some(app) => (
+                app.runtime
+                    .task_history
+                    .retention_period_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
+                    })?,
+                app.runtime
+                    .task_history
+                    .retention_check_interval_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e },
+                    })?,
+            ),
+            None => (
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
+            ),
+        };
+
+        match task_history::TaskSpan::instantiate_table(
+            self.status(),
+            retention_period_secs,
+            retention_check_interval_secs,
+        )
+        .await
+        {
             Ok(table) => self
                 .df
                 .register_runtime_table(

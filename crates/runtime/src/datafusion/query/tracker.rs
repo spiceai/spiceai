@@ -18,7 +18,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use tokio::time::Instant;
 
 use super::{error_code::ErrorCode, metrics, Protocol};
@@ -46,7 +46,7 @@ impl QueryTracker {
         self.finish(&Arc::from(""));
     }
 
-    pub fn finish(mut self, truncated_output: &Arc<str>) {
+    pub fn finish(mut self, captured_output: &Arc<str>) {
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
@@ -74,15 +74,16 @@ impl QueryTracker {
         }
 
         let mut labels = vec![
-            Key::from_static_str("tags").string(tags.join(",")),
-            Key::from_static_str("datasets").string(
+            KeyValue::new("tags", tags.join(",")),
+            KeyValue::new(
+                "datasets",
                 self.datasets
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<String>>()
                     .join(","),
             ),
-            Key::from_static_str("protocol").string(self.protocol.as_arc_str()),
+            KeyValue::new("protocol", self.protocol.as_arc_str()),
         ];
 
         metrics::DURATION_SECONDS.record(query_duration.as_secs_f64(), &labels);
@@ -93,11 +94,11 @@ impl QueryTracker {
         );
 
         if let Some(err) = &self.error_code {
-            labels.push(Key::from_static_str("err_code").string(err.to_string()));
+            labels.push(KeyValue::new("err_code", err.to_string()));
             metrics::FAILURES.add(1, &labels);
         }
 
-        trace_query(&self, truncated_output);
+        trace_query(&self, captured_output);
     }
 
     #[must_use]

@@ -43,7 +43,7 @@ pub(crate) async fn handle(
             flightsql::prepared_statement_query::get_flight_info(flight_svc, handle, request).await
         }
         Command::CommandGetCatalogs(token) => {
-            Ok(flightsql::get_catalogs::get_flight_info(&token, request))
+            Ok(flightsql::get_catalogs::get_flight_info(token, request))
         }
         Command::CommandGetDbSchemas(token) => {
             Ok(flightsql::get_schemas::get_flight_info(&token, request))
@@ -55,7 +55,7 @@ pub(crate) async fn handle(
             flightsql::get_sql_info::get_flight_info(&token, request)
         }
         Command::CommandGetTableTypes(token) => {
-            Ok(flightsql::get_table_types::get_flight_info(&token, request))
+            Ok(flightsql::get_table_types::get_flight_info(token, request))
         }
         Command::CommandGetPrimaryKeys(token) => Ok(flightsql::get_primary_keys::get_flight_info(
             &token, request,

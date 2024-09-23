@@ -39,6 +39,7 @@ use runtime::spice_metrics;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
+use tracing::subscriber;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -73,7 +74,9 @@ pub enum Error {
     UnableToInitializeTls { source: Box<dyn std::error::Error> },
 
     #[snafu(display("Unable to initialize tracing: {source}"))]
-    UnableToInitializeTracing { source: Box<dyn std::error::Error> },
+    UnableToInitializeTracing {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to initialize metrics: {source}"))]
     UnableToInitializeMetrics { source: Box<dyn std::error::Error> },
@@ -143,7 +146,12 @@ pub async fn run(args: Args) -> Result<()> {
     {
         Ok(app) => Some(Arc::new(app)),
         Err(e) => {
-            tracing::warn!("{}", e);
+            let subscriber = tracing_subscriber::FmtSubscriber::builder()
+                .with_ansi(true)
+                .finish();
+            subscriber::with_default(subscriber, || {
+                tracing::error!("{e}");
+            });
             None
         }
     };
@@ -164,7 +172,7 @@ pub async fn run(args: Args) -> Result<()> {
     let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
 
     let rt: Runtime = Runtime::builder()
-        .with_app_opt(app)
+        .with_app_opt(app.clone())
         // User configured extensions
         .with_extensions(extension_factories)
         // Extensions that will be auto-loaded if not explicitly loaded and requested by a component
@@ -178,7 +186,7 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .await;
 
-    spiced_tracing::init_tracing(app_name.clone(), tracing_config.as_ref(), rt.datafusion())
+    spiced_tracing::init_tracing(&app, tracing_config.as_ref(), rt.datafusion())
         .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
