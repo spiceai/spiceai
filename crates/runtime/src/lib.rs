@@ -1001,7 +1001,7 @@ impl Runtime {
                     .await;
             }
 
-            if let Err(e) = self.df.remove_table(&ds.name) {
+            if let Err(e) = self.df.remove_table(&ds.name).await {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }

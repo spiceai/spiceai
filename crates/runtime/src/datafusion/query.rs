@@ -229,6 +229,18 @@ impl Query {
                 inner_span.record("runtime_query", true);
             }
 
+            // If any of the input tables are accelerated, mark the query as accelerated
+            let mut is_accelerated = false;
+            for tr in &input_tables {
+                if ctx.df.is_accelerated(tr).await {
+                    is_accelerated = true;
+                    break;
+                }
+            }
+            if is_accelerated {
+                tracker.is_accelerated = Some(true);
+            }
+
             tracker = tracker.datasets(Arc::new(input_tables));
 
             // Start the timer for the query execution

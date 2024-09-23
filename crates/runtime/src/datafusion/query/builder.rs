@@ -82,6 +82,7 @@ impl<'a> QueryBuilder<'a> {
                 query_execution_duration_secs: None,
                 rows_produced: 0,
                 results_cache_hit: None,
+                is_accelerated: None,
                 error_message: None,
                 error_code: None,
                 query_duration_timer: Instant::now(),
