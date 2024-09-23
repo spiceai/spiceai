@@ -92,6 +92,7 @@ enum AvailabilityVerificationResult {
 pub struct DatasetsHealthMonitor {
     df: Arc<DataFusion>,
     monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
+    is_task_history_enabled: bool,
 }
 
 impl DatasetsHealthMonitor {
@@ -100,7 +101,14 @@ impl DatasetsHealthMonitor {
         Self {
             df,
             monitored_datasets: Arc::new(Mutex::new(HashMap::new())),
+            is_task_history_enabled: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_task_history_enabled(mut self, is_enabled: bool) -> Self {
+        self.is_task_history_enabled = is_enabled;
+        self
     }
 
     pub async fn register_dataset(&self, dataset: &Dataset) -> Result<()> {
@@ -200,6 +208,7 @@ AND labels.error_code IS NULL"
         tracing::debug!("Starting datasets availability monitoring");
         let monitored_datasets = Arc::clone(&self.monitored_datasets);
         let df = Arc::clone(&self.df);
+        let is_task_history_enabled = self.is_task_history_enabled;
         tokio::spawn(async move {
             // no need to check status immediately after start
             tokio::time::sleep(tokio::time::Duration::from_secs(
@@ -213,14 +222,17 @@ AND labels.error_code IS NULL"
                 let datasets_to_check = datasets_for_availability_check(&monitored_datasets).await;
 
                 // check `task_history` first to exlude anything that had a successful query in the last 10 minutes
-                let recently_accessed_datasets =
+                let recently_accessed_datasets = if is_task_history_enabled {
                     match Self::get_recently_accessed_datasets(Arc::clone(&df)).await {
                         Ok(datasets) => datasets,
                         Err(e) => {
                             tracing::warn!("{e}");
                             Arc::new(HashSet::new())
                         }
-                    };
+                    }
+                } else {
+                    Arc::new(HashSet::new())
+                };
 
                 tracing::debug!("Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}");
 
