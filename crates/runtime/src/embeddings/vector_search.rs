@@ -24,6 +24,7 @@ use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use futures::TryStreamExt;
 use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::datafusion::query::write_to_json_string;
+use crate::datafusion::query::{write_to_json_string, Protocol};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 
@@ -288,15 +289,16 @@ impl VectorSearch {
             "SELECT {projection_str}, sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME} FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
         );
         tracing::trace!("running SQL: {query}");
-        // TODO: SUS
-        let batches = self
+        let batches: Vec<RecordBatch> = self
             .df
-            .ctx
-            .sql(&query)
+            .query_builder(&query, Protocol::Internal)
+            .build()
+            .run()
             .await
             .boxed()
             .context(DataFusionSnafu)?
-            .collect()
+            .data
+            .try_collect()
             .await
             .boxed()
             .context(DataFusionSnafu)?;
