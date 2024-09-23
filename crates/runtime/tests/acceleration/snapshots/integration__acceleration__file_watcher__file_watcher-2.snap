@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/acceleration/file_watcher.rs
+expression: pretty
+---
++----+--------------+-----+--------------+-------+
+| id | name         | age | city         | score |
++----+--------------+-----+--------------+-------+
+| 1  | John Doe     | 28  | New York     | 85    |
+| 2  | Jane Smith   | 34  | Los Angeles  | 92    |
+| 3  | Mike Johnson | 45  | Chicago      | 78    |
+| 4  | Emily Brown  | 31  | Houston      | 89    |
+| 5  | David Lee    | 39  | Phoenix      | 76    |
+| 6  | Sarah Wilson | 26  | Philadelphia | 94    |
+| 7  | Tom Anderson | 52  | San Antonio  | 81    |
+| 8  | Lisa Taylor  | 29  | San Diego    | 88    |
+| 9  | Chris Martin | 37  | Dallas       | 79    |
+| 10 | Anna Garcia  | 41  | San Jose     | 90    |
+| 11 | Spaceman     | 29  | LEO          | 100   |
++----+--------------+-----+--------------+-------+
