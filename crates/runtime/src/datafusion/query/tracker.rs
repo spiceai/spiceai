@@ -130,6 +130,11 @@ fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
     if let Some(error_code) = &query_tracker.error_code {
         tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
+
+    if let Some(error_message) = &query_tracker.error_message {
+        tracing::error!(target: "task_history", "{error_message}");
+    }
+
     if let Some(query_execution_duration_secs) = &query_tracker.query_execution_duration_secs {
         tracing::info!(target: "task_history", query_execution_duration_ms = %query_execution_duration_secs * 1000.0, "labels");
     }

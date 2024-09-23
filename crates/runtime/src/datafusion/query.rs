@@ -289,8 +289,19 @@ impl Query {
         self.tracker.finish_with_error(error_message, error_code);
     }
 
-    pub async fn get_schema(&self) -> Result<Schema, DataFusionError> {
-        let df = self.df.ctx.sql(&self.sql).await?;
+    pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
+        let df = match self.df.ctx.sql(&self.sql).await {
+            Ok(df) => df,
+            Err(e) => {
+                // If there is an error getting the schema, we still want to track it in task history
+                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+                let error_code = ErrorCode::from(&e);
+                span.in_scope(|| {
+                    self.finish_with_error(e.to_string(), error_code);
+                });
+                return Err(e);
+            }
+        };
         Ok(df.schema().into())
     }
 }

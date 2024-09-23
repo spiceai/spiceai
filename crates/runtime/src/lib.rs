@@ -1630,7 +1630,7 @@ impl Runtime {
 
         if let Some(app) = app.as_ref() {
             if !app.runtime.task_history.enabled {
-                tracing::debug!("Task history is disabled!");
+                tracing::debug!("Task history is disabled via configuration.");
                 return Ok(());
             }
         }
