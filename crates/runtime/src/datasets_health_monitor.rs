@@ -379,10 +379,7 @@ mod test {
     fn create_test_datafusion() -> Arc<DataFusion> {
         let df = Arc::new(DataFusion::new(RuntimeStatus::new()));
 
-        let catalog = df
-            .ctx
-            .catalog("datafusion")
-            .expect("default catalog is datafusion");
+        let catalog = df.ctx.catalog("spice").expect("default catalog is spice");
 
         let foo_schema = Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
         catalog
