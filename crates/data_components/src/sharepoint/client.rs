@@ -434,7 +434,6 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
     let resp = graph
         .sites()
         .list_site()
-        .expand(&["drive"])
         .select(&["id", "name"])
         .send()
         .await?
