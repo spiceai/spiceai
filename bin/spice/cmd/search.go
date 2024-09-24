@@ -123,6 +123,7 @@ spice search --cloud
 				})
 				if err != nil {
 					cmd.Printf("Error: %v\n", err)
+					out <- nil
 				} else {
 					out <- response
 				}
@@ -130,6 +131,10 @@ spice search --cloud
 
 			response := <-responses
 			done <- true
+			if response == nil {
+				// Error already printed in goroutine
+				continue
+			}
 
 			raw, err := io.ReadAll(response.Body)
 			if err != nil {
