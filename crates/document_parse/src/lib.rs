@@ -82,7 +82,7 @@ pub trait Document {
     fn type_(&self) -> DocumentType;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DocumentType {
     Pdf,
     Docx,

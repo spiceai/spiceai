@@ -5972,8 +5972,7 @@ dependencies = [
 [[package]]
 name = "lopdf"
 version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff"
+source = "git+https://github.com/J-F-Liu/lopdf?rev=38b8c25f3e92c578baf18928a8ce75d447a6009a#38b8c25f3e92c578baf18928a8ce75d447a6009a"
 dependencies = [
  "chrono",
  "encoding_rs",
