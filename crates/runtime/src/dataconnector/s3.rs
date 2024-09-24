@@ -20,6 +20,7 @@ use super::{
 };
 
 use crate::component::dataset::Dataset;
+use crate::parameters::ParamLookup;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -42,6 +43,14 @@ pub enum Error {
         url: String,
         source: url::ParseError,
     },
+
+    #[snafu(display("Unsupported S3 authentication method '{method}', supported methods are: 'public' (i.e. no auth), 'iam_role', and 'key'."))]
+    UnsupportedAuthenticationMethod { method: String },
+
+    #[snafu(display(
+        "The 's3_key' parameter cannot be set unless the `s3_auth` parameter is set to 'key'."
+    ))]
+    InvalidKeyAuthCombination,
 }
 
 pub struct S3 {
@@ -68,6 +77,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("endpoint").secret(),
     ParameterSpec::connector("key").secret(),
     ParameterSpec::connector("secret").secret(),
+    ParameterSpec::connector("auth").description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.").secret(),
     ParameterSpec::runtime("client_timeout")
         .description("The timeout setting for S3 client."),
 
@@ -102,6 +112,19 @@ impl DataConnectorFactory for S3Factory {
         }
 
         Box::pin(async move {
+            if let Some(auth) = params.get("auth").expose().ok() {
+                if auth != "public" && auth != "iam_role" && auth != "key" {
+                    return Err(Box::new(Error::UnsupportedAuthenticationMethod {
+                        method: auth.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+
+                if matches!(params.get("key"), ParamLookup::Present(_)) && auth != "key" {
+                    return Err(Box::new(Error::InvalidKeyAuthCombination)
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
             let s3 = S3 { params };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
@@ -142,7 +165,14 @@ impl ListingTableConnector for S3 {
 
         s3_url.set_fragment(Some(&super::build_fragments(
             &self.params,
-            vec!["region", "endpoint", "key", "secret", "client_timeout"],
+            vec![
+                "region",
+                "endpoint",
+                "key",
+                "secret",
+                "client_timeout",
+                "auth",
+            ],
         )));
 
         Ok(s3_url)

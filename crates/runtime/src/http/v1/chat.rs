@@ -46,7 +46,7 @@ pub(crate) async fn post(
         match llms.read().await.get(&model_id) {
             Some(model) => {
                 if req.stream.unwrap_or_default() {
-                    match model.write().await.chat_stream(req).await {
+                    match model.chat_stream(req).await {
                         Ok(strm) => {
                             create_sse_response(strm, time::Duration::from_secs(30), span_clone)
                         }
@@ -57,7 +57,7 @@ pub(crate) async fn post(
                         }
                     }
                 } else {
-                    match model.write().await.chat_request(req).await {
+                    match model.chat_request(req).await {
                         Ok(response) => {
                             let preview = response
                                 .choices
@@ -65,7 +65,7 @@ pub(crate) async fn post(
                                 .map(|s| serde_json::to_string(s).unwrap_or_default())
                                 .unwrap_or_default();
 
-                            tracing::info!(target: "task_history", parent: &span_clone, truncated_output = %preview);
+                            tracing::info!(target: "task_history", parent: &span_clone, captured_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
@@ -111,7 +111,7 @@ fn create_sse_response(
                 }
             }
         };
-        tracing::info!(target: "task_history", parent: &span, truncated_output = %chat_output);
+        tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);
         drop(span);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))

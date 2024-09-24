@@ -1,0 +1,25 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: select AVG(l_tax), l_linenumber, l_quantity from lineitem group by l_linenumber, l_quantity order by l_quantity desc limit 10"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                     |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: lineitem.l_quantity DESC NULLS FIRST, fetch=10                                                                                     |
+|               |   Projection: avg(lineitem.l_tax), lineitem.l_linenumber, lineitem.l_quantity                                                            |
+|               |     Aggregate: groupBy=[[lineitem.l_linenumber, lineitem.l_quantity]], aggr=[[avg(lineitem.l_tax)]]                                      |
+|               |       BytesProcessedNode                                                                                                                 |
+|               |         TableScan: lineitem projection=[l_linenumber, l_quantity, l_tax]                                                                 |
+| physical_plan | SortPreservingMergeExec: [l_quantity@2 DESC], fetch=10                                                                                   |
+|               |   SortExec: TopK(fetch=10), expr=[l_quantity@2 DESC], preserve_partitioning=[true]                                                       |
+|               |     ProjectionExec: expr=[avg(lineitem.l_tax)@2 as avg(lineitem.l_tax), l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity]      |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity], aggr=[avg(lineitem.l_tax)] |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                      |
+|               |           RepartitionExec: partitioning=Hash([l_linenumber@0, l_quantity@1], 4), input_partitions=4                                      |
+|               |             AggregateExec: mode=Partial, gby=[l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity], aggr=[avg(lineitem.l_tax)]    |
+|               |               BytesProcessedExec                                                                                                         |
+|               |                 SchemaCastScanExec                                                                                                       |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                   |
+|               |                     MemoryExec: partitions=1, partition_sizes=[733]                                                                      |
+|               |                                                                                                                                          |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------+

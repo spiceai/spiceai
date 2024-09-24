@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
+use std::fmt;
 use std::path::PathBuf;
+use std::{fmt::Debug, marker::PhantomData};
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde_value::Value;
 use snafu::prelude::*;
 
 use crate::reader;
@@ -52,12 +55,59 @@ pub struct ComponentReference {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(untagged)]
 pub enum ComponentOrReference<T> {
     Component(T),
     Reference(ComponentReference),
+}
+
+impl<'de, T> Deserialize<'de> for ComponentOrReference<T>
+where
+    T: Deserialize<'de> + Debug,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ComponentOrReferenceVisitor<T>(PhantomData<T>);
+
+        impl<'de, T> Visitor<'de> for ComponentOrReferenceVisitor<T>
+        where
+            T: Deserialize<'de> + Debug,
+        {
+            type Value = ComponentOrReference<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a Spicepod component or component reference")
+            }
+
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                // Deserialize the map into a serde_value::Value
+                let content = Value::deserialize(de::value::MapAccessDeserializer::new(map))?;
+
+                // Try to deserialize content into T (Component)
+                let component_result = T::deserialize(content.clone());
+                match component_result {
+                    Ok(c) => Ok(ComponentOrReference::Component(c)),
+                    Err(component_err) => {
+                        // Try to deserialize content into ComponentReference
+                        let reference_result = ComponentReference::deserialize(content);
+                        match reference_result {
+                            Ok(r) => Ok(ComponentOrReference::Reference(r)),
+                            Err(_) => Err(de::Error::custom(component_err.to_string())),
+                        }
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ComponentOrReferenceVisitor(PhantomData))
+    }
 }
 
 #[derive(Debug, Snafu)]

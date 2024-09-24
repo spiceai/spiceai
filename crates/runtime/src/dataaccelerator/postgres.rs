@@ -67,6 +67,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::accelerator("pass").secret(),
     ParameterSpec::accelerator("sslmode"),
     ParameterSpec::accelerator("sslrootcert"),
+    ParameterSpec::runtime("file_watcher"),
 ];
 
 #[async_trait]

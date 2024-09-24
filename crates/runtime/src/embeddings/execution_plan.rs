@@ -215,11 +215,9 @@ async fn get_embeddings(
         let read_guard = embedding_models.read().await;
         let model_lock_opt = read_guard.get(model_name);
 
-        let Some(model_lock) = model_lock_opt else {
+        let Some(model) = model_lock_opt else {
             continue;
         };
-
-        let mut model = model_lock.write().await;
 
         let raw_data = match rb.column_by_name(col) {
             None => {

@@ -14,13 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use arrow::array::RecordBatch;
+use futures::TryStreamExt;
+use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
-use runtime::{accelerated_table::AcceleratedTable, Runtime};
+use runtime::{
+    accelerated_table::{refresh::RefreshOverrides, AcceleratedTable},
+    component::dataset::acceleration::RefreshMode,
+    datafusion::query::Protocol,
+    Runtime,
+};
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
 
-use crate::init_tracing;
+use crate::{init_tracing, wait_until_true};
 
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
     let mut ds = Dataset::new(format!("spiceai:{path}"), name.to_string());
@@ -33,7 +40,6 @@ fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset 
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
     use runtime::accelerated_table::refresh_task::RefreshTask;
 
@@ -61,10 +67,16 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
         .downcast_ref::<AcceleratedTable>()
         .ok_or("traces table is not an AcceleratedTable")?;
 
+    let request = traces_accelerated_table
+        .refresh_params()
+        .read()
+        .await
+        .clone();
+
     let refresh_task = Arc::new(RefreshTask::new(
+        rt.status(),
         "traces".into(),
         Arc::clone(&traces_accelerated_table.get_federated_table()),
-        traces_accelerated_table.refresh_params(),
         traces_table,
     ));
 
@@ -73,7 +85,7 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        res = refresh_task.get_full_or_incremental_append_update(None) => {
+        res = refresh_task.get_full_or_incremental_append_update(&request, None) => {
             res.map_err(|e| e.to_string())?
         }
     };
@@ -85,6 +97,99 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
 
     assert_eq!(data_update.data.len(), 1);
     assert_eq!(data_update.data[0].num_rows(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(None);
+    let app = AppBuilder::new("refresh_sql_override_append")
+        .with_dataset(make_spiceai_dataset(
+            "tpch.nation",
+            "nation",
+            "SELECT * FROM nation WHERE n_regionkey != 0".to_string(),
+        ))
+        .build();
+
+    let rt = Runtime::builder().with_app(app).build().await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            panic!("Timeout waiting for components to load");
+        }
+        () = rt.load_components() => {}
+    }
+
+    let query = rt
+        .datafusion()
+        .query_builder(
+            "SELECT * FROM nation WHERE n_regionkey = 0",
+            Protocol::Internal,
+        )
+        .build()
+        .run()
+        .await?;
+
+    let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+    assert_eq!(
+        results.len(),
+        0,
+        "Expected refresh SQL to filter out all rows for n_regionkey = 0"
+    );
+
+    rt.datafusion()
+        .refresh_table(
+            "nation",
+            Some(RefreshOverrides {
+                sql: Some("SELECT * FROM nation WHERE n_regionkey = 0".to_string()),
+                mode: Some(RefreshMode::Append),
+                max_jitter: None,
+            }),
+        )
+        .await?;
+
+    assert!(
+        wait_until_true(Duration::from_secs(10), || async {
+            let Ok(query) = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT * FROM nation WHERE n_regionkey = 0",
+                    Protocol::Internal,
+                )
+                .build()
+                .run()
+                .await
+            else {
+                return false;
+            };
+
+            let results: Vec<RecordBatch> = match query.data.try_collect::<Vec<RecordBatch>>().await
+            {
+                Ok(results) => results,
+                Err(_) => return false,
+            };
+            !results.is_empty()
+        })
+        .await
+    );
+
+    let query = rt
+        .datafusion()
+        .query_builder(
+            "SELECT * FROM nation WHERE n_regionkey = 0 ORDER BY n_nationkey DESC",
+            Protocol::Internal,
+        )
+        .build()
+        .run()
+        .await?;
+
+    let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+    let results_str = arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+    insta::assert_snapshot!(results_str);
 
     Ok(())
 }

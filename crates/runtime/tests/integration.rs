@@ -16,13 +16,13 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use arrow::array::RecordBatch;
+use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::{
-    assert_batches_eq, execution::context::SessionContext,
+    execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
 use futures::Future;
-use runtime::{datafusion::DataFusion, Runtime};
+use runtime::{datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -33,7 +33,6 @@ mod delta_lake;
 mod docker;
 mod federation;
 mod graphql;
-mod grpc_api;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]
@@ -44,13 +43,19 @@ mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
 mod s3;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 mod tls;
+
+// MySQL is required for the rehydration tests
+#[cfg(feature = "mysql")]
+mod rehydration;
 
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn get_test_datafusion() -> Arc<DataFusion> {
-    let mut df = DataFusion::new();
+fn get_test_datafusion(status: Arc<status::RuntimeStatus>) -> Arc<DataFusion> {
+    let mut df = DataFusion::new(status);
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -99,8 +104,8 @@ type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
 
 async fn run_query_and_check_results<F>(
     rt: &mut Runtime,
+    snapshot_name: &str,
     query: &str,
-    expected_plan: &[&str],
     validate_result: Option<F>,
 ) -> Result<(), String>
 where
@@ -118,7 +123,16 @@ where
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
     println!("Query: {query}");
-    assert_batches_eq!(expected_plan, &plan_results);
+
+    let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
+        panic!("Failed to format plan");
+    };
+    insta::with_settings!({
+        description => format!("Query: {query}"),
+        omit_expression => true
+    }, {
+        insta::assert_snapshot!(snapshot_name, explain_plan);
+    });
 
     // Check the result
     if let Some(validate_result) = validate_result {
@@ -136,6 +150,85 @@ where
     }
 
     Ok(())
+}
+
+type PlanCheckFn = Box<dyn Fn(&str) -> bool>;
+
+async fn run_query_and_check_results_with_plan_checks<F>(
+    rt: &mut Runtime,
+    query: &str,
+    expected_plan_checks: Vec<(&str, PlanCheckFn)>,
+    validate_result: Option<F>,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<RecordBatch>),
+{
+    // Check the plan
+    let plan_results = rt
+        .datafusion()
+        .ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+    let Ok(formatted) = arrow::util::pretty::pretty_format_batches_with_options(
+        &plan_results,
+        &FormatOptions::default(),
+    ) else {
+        panic!("Failed to format plan");
+    };
+    let formatted = formatted.to_string();
+
+    let actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+    let mut matched_checks = vec![false; expected_plan_checks.len()];
+
+    for line in actual_lines {
+        for (i, (key, check_fn)) in expected_plan_checks.iter().enumerate() {
+            if line.contains(key) {
+                if matched_checks[i] {
+                    return Err(format!(
+                        "Check '{key}' matched multiple lines in plan:\n{formatted}",
+                    ));
+                }
+                matched_checks[i] = true;
+                if !check_fn(line) {
+                    return Err(format!("Check failed for line: {line}"));
+                }
+            }
+        }
+    }
+
+    if let Some(i) = matched_checks.iter().position(|&x| !x) {
+        return Err(format!(
+            "Expected check '{}' did not appear in plan:\n{formatted}",
+            expected_plan_checks[i].0,
+        ));
+    }
+
+    // Check the result
+    if let Some(validate_result) = validate_result {
+        let result_batches = rt
+            .datafusion()
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| format!("query `{query}` to plan: {e}"))?
+            .collect()
+            .await
+            .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+        validate_result(result_batches);
+    }
+
+    Ok(())
+}
+
+async fn runtime_ready_check(rt: &Runtime) {
+    assert!(wait_until_true(Duration::from_secs(30), || async { rt.status().is_ready() }).await);
 }
 
 async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool

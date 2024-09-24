@@ -35,7 +35,7 @@ impl TaskEmbed {
 
 #[async_trait]
 impl Embed for TaskEmbed {
-    async fn embed<'b>(&'b mut self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed<'b>(&'b self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&input).unwrap_or_default());
 
         match self.inner.embed(input).instrument(span.clone()).await {
@@ -50,7 +50,7 @@ impl Embed for TaskEmbed {
         }
     }
 
-    async fn health<'b>(&'b mut self) -> EmbedResult<()> {
+    async fn health<'b>(&'b self) -> EmbedResult<()> {
         self.inner.health().await
     }
 
@@ -60,7 +60,7 @@ impl Embed for TaskEmbed {
 
     #[allow(clippy::cast_possible_truncation)]
     async fn embed_request<'b>(
-        &'b mut self,
+        &'b self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&req.input).unwrap_or_default());

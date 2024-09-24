@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
-use crate::dataaccelerator::metadata::AcceleratedMetadata;
+use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -239,25 +239,24 @@ impl DataConnector for Debezium {
 }
 
 #[derive(Serialize, Deserialize)]
-struct DebeziumKafkaMetadata {
-    consumer_group_id: String,
-    topic: String,
-    primary_keys: Vec<String>,
-    schema_fields: Vec<change_event::Field>,
+pub(crate) struct DebeziumKafkaMetadata {
+    pub(crate) consumer_group_id: String,
+    pub(crate) topic: String,
+    pub(crate) primary_keys: Vec<String>,
+    pub(crate) schema_fields: Vec<change_event::Field>,
 }
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
-    let accelerated_metadata = AcceleratedMetadata::new(dataset).await?;
-    let metadata = accelerated_metadata.get_metadata().await?;
-    Some(metadata)
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset).await.ok()?;
+    debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let accelerated_metadata = AcceleratedMetadata::new_create_if_not_exists(dataset).await?;
-    accelerated_metadata.set_metadata(metadata).await
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
+    debezium_kafka_sys.upsert(metadata).await
 }
 
 async fn get_metadata_from_kafka(

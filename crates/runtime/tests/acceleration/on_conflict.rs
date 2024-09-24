@@ -1,9 +1,24 @@
-use crate::{get_test_datafusion, init_tracing, postgres::common, wait_until_true};
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use crate::{get_test_datafusion, init_tracing, postgres::common, runtime_ready_check};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
-use futures::StreamExt;
 use rand::Rng;
-use runtime::{datafusion::query::Protocol, Runtime};
+use runtime::{status, Runtime};
 use spicepod::component::{
     dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
@@ -11,13 +26,15 @@ use spicepod::component::{
     },
     params::Params,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
+
+use super::get_params;
 
 #[allow(clippy::too_many_lines)]
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let port: usize = 20963;
     let running_container = common::start_postgres_docker_container(port).await?;
 
@@ -69,45 +86,91 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         port,
     );
 
-    let duckdb_mem_on_conflict_upsert = create_duckdb_test_dataset(
+    let duckdb_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Upsert,
         "postgres:event_logs",
         "duckdb_mem_on_conflict_upsert",
         None,
         port,
         Mode::Memory,
+        "duckdb",
     );
 
-    let duckdb_mem_on_conflict_drop = create_duckdb_test_dataset(
+    let duckdb_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Drop,
         "postgres:event_logs",
         "duckdb_mem_on_conflict_drop",
         None,
         port,
         Mode::Memory,
+        "duckdb",
     );
 
-    let duckdb_upsert_file_path = random_db_name();
-    let duckdb_file_on_conflict_upsert = create_duckdb_test_dataset(
+    let duckdb_file_path = random_db_name();
+    let duckdb_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Upsert,
         "postgres:event_logs",
         "duckdb_file_on_conflict_upsert",
-        Some(duckdb_upsert_file_path.clone()),
+        Some(duckdb_file_path.clone()),
         port,
         Mode::File,
+        "duckdb",
     );
 
-    let duckdb_drop_file_path = random_db_name();
-    let duckdb_file_on_conflict_drop = create_duckdb_test_dataset(
+    let duckdb_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Drop,
         "postgres:event_logs",
         "duckdb_file_on_conflict_drop",
-        Some(duckdb_drop_file_path.clone()),
+        Some(duckdb_file_path.clone()),
         port,
         Mode::File,
+        "duckdb",
     );
 
-    let df = get_test_datafusion();
+    let sqlite_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Upsert,
+        "postgres:event_logs",
+        "sql_mem_on_conflict_upsert",
+        None,
+        port,
+        Mode::Memory,
+        "sqlite",
+    );
+
+    let sqlite_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Drop,
+        "postgres:event_logs",
+        "sql_mem_on_conflict_drop",
+        None,
+        port,
+        Mode::Memory,
+        "sqlite",
+    );
+
+    let sqlite_upsert_file_path = random_db_name();
+    let sqlite_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Upsert,
+        "postgres:event_logs",
+        "sql_file_on_conflict_upsert",
+        Some(sqlite_upsert_file_path.clone()),
+        port,
+        Mode::File,
+        "sqlite",
+    );
+
+    let sqlite_drop_file_path = random_db_name();
+    let sqlite_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+        OnConflictBehavior::Drop,
+        "postgres:event_logs",
+        "sql_file_on_conflict_drop",
+        Some(sqlite_drop_file_path.clone()),
+        port,
+        Mode::File,
+        "sqlite",
+    );
+
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let app = AppBuilder::new("on_conflict_behavior")
         .with_dataset(pg_on_conflict_upsert)
@@ -116,12 +179,17 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         .with_dataset(duckdb_mem_on_conflict_drop)
         .with_dataset(duckdb_file_on_conflict_upsert)
         .with_dataset(duckdb_file_on_conflict_drop)
+        .with_dataset(sqlite_mem_on_conflict_upsert)
+        .with_dataset(sqlite_mem_on_conflict_drop)
+        .with_dataset(sqlite_file_on_conflict_upsert)
+        .with_dataset(sqlite_file_on_conflict_drop)
         .build();
 
     let rt = Arc::new(
         Runtime::builder()
             .with_app(app)
             .with_datafusion(df)
+            .with_runtime_status(status)
             .build()
             .await,
     );
@@ -134,32 +202,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         () = rt.load_components() => {}
     }
 
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM pg_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(Arc::clone(&rt), "SELECT * FROM pg_on_conflict_drop LIMIT 1").await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_mem_on_conflict_drop LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_mem_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_file_on_conflict_upsert LIMIT 1",
-    )
-    .await;
-    dataset_ready_check(
-        Arc::clone(&rt),
-        "SELECT * FROM duckdb_file_on_conflict_drop LIMIT 1",
-    )
-    .await;
+    runtime_ready_check(&rt).await;
 
     db_conn
         .conn
@@ -189,6 +232,14 @@ WHERE event_name = 'File Download'
         get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert").await?;
     let duckdb_file_drop_data =
         get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_drop").await?;
+    let sqlite_mem_upsert_data =
+        get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_upsert").await?;
+    let sqlite_mem_drop_data =
+        get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_drop").await?;
+    let sqlite_file_upsert_data =
+        get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_upsert").await?;
+    let sqlite_file_drop_data =
+        get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_drop").await?;
 
     let upsert_expected_result = &[
         "+----------+-------------------+---------------------+",
@@ -220,33 +271,21 @@ WHERE event_name = 'File Download'
     assert_batches_eq!(drop_expected_result, &duckdb_mem_drop_data);
     assert_batches_eq!(upsert_expected_result, &duckdb_file_upsert_data);
     assert_batches_eq!(drop_expected_result, &duckdb_file_drop_data);
+    assert_batches_eq!(upsert_expected_result, &sqlite_mem_upsert_data);
+    assert_batches_eq!(drop_expected_result, &sqlite_mem_drop_data);
+    assert_batches_eq!(upsert_expected_result, &sqlite_file_upsert_data);
+    assert_batches_eq!(drop_expected_result, &sqlite_file_drop_data);
 
     running_container.remove().await?;
-    std::fs::remove_file(&duckdb_upsert_file_path).expect("File should be removed");
-    std::fs::remove_file(&duckdb_drop_file_path).expect("File should be removed");
+    std::fs::remove_file(&duckdb_file_path).expect("File should be removed");
+    std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
+    std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_upsert_file_path}-shm")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_upsert_file_path}-wal")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_drop_file_path}-shm")).expect("File should be removed");
+    std::fs::remove_file(format!("{sqlite_drop_file_path}-wal")).expect("File should be removed");
 
     Ok(())
-}
-
-async fn dataset_ready_check(rt: Arc<Runtime>, sql: &str) {
-    assert!(
-        wait_until_true(Duration::from_secs(30), || async {
-            let mut query_result = rt
-                .datafusion()
-                .query_builder(sql, Protocol::Internal)
-                .build()
-                .run()
-                .await
-                .unwrap_or_else(|_| panic!("Result should be returned"));
-            let mut batches = vec![];
-            while let Some(batch) = query_result.data.next().await {
-                batches.push(batch.unwrap_or_else(|_| panic!("Batch should be created")));
-            }
-            !batches.is_empty() && batches[0].num_rows() == 1
-        })
-        .await,
-        "Expected 1 rows returned"
-    );
 }
 
 async fn get_query_result(
@@ -284,13 +323,14 @@ fn create_postgres_test_dataset(
     dataset
 }
 
-fn create_duckdb_test_dataset(
+fn create_sqlite_or_duckdb_test_dataset(
     on_conflict: OnConflictBehavior,
     from: &str,
     name: &str,
-    duckdb_file: Option<String>,
+    file: Option<String>,
     port: usize,
     mode: Mode,
+    engine: &str,
 ) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(get_pg_params(port));
@@ -301,10 +341,10 @@ fn create_duckdb_test_dataset(
         .unwrap_or_default();
 
     dataset.acceleration = Some(Acceleration {
-        params: get_duckdb_params(&mode, duckdb_file),
+        params: get_params(&mode, file, engine),
         mode,
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some(engine.to_string()),
         refresh_mode: Some(RefreshMode::Append),
         refresh_check_interval: Some("1s".to_string()),
         primary_key: Some("event_id".to_string()),
@@ -331,17 +371,6 @@ fn get_pg_params(port: usize) -> Params {
     )
 }
 
-fn get_duckdb_params(mode: &Mode, duckdb_file: Option<String>) -> Option<Params> {
-    if mode == &Mode::File {
-        return Some(Params::from_string_map(
-            vec![("duckdb_file".to_string(), duckdb_file.unwrap_or_default())]
-                .into_iter()
-                .collect(),
-        ));
-    }
-    None
-}
-
 fn random_db_name() -> String {
     let mut rng = rand::thread_rng();
     let mut name = String::new();
@@ -350,5 +379,5 @@ fn random_db_name() -> String {
         name.push(rng.gen_range(b'a'..=b'z') as char);
     }
 
-    format!("./{name}.duckdb")
+    format!("./{name}.db")
 }

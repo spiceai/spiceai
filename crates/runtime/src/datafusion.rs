@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::accelerated_table::refresh;
+use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::AcceleratedTableBuilderError;
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -30,7 +32,7 @@ use crate::dataupdate::{
 };
 use crate::object_store_registry::default_runtime_env;
 use crate::secrets::Secrets;
-use crate::{embeddings, view};
+use crate::{embeddings, status, view};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -60,7 +62,6 @@ pub mod query;
 
 mod extension;
 pub mod filter_converter;
-pub mod initial_load;
 pub mod refresh_sql;
 pub mod schema;
 pub mod udf;
@@ -76,6 +77,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("When processing the acceleration registration: {source}"))]
+    AccelerationRegistration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
@@ -197,6 +203,11 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
+
+    #[snafu(display("Unable to build accelerated table: {source}"))]
+    UnableToBuildAcceleratedTable {
+        source: AcceleratedTableBuilderError,
+    },
 }
 
 pub enum Table {
@@ -220,19 +231,18 @@ struct PendingSinkRegistration {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
+    runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
+    accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
-
-    /// Has the initial load of the data been completed? It is the responsibility of the caller to call `mark_initial_load_complete` when the initial load is complete.
-    initial_load_complete: Mutex<bool>,
 }
 
 impl DataFusion {
     #[must_use]
-    pub fn new() -> Self {
-        Self::new_with_cache_provider(None)
+    pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
+        Self::new_with_cache_provider(status, None)
     }
 
     /// Create a new `DataFusion` instance.
@@ -241,7 +251,10 @@ impl DataFusion {
     ///
     /// Panics if the default schema cannot be registered.
     #[must_use]
-    pub fn new_with_cache_provider(cache_provider: Option<Arc<QueryResultsCacheProvider>>) -> Self {
+    pub fn new_with_cache_provider(
+        status: Arc<status::RuntimeStatus>,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    ) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -300,12 +313,18 @@ impl DataFusion {
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         DataFusion {
+            runtime_status: status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
-            initial_load_complete: Mutex::new(false),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
+            accelerated_tables: TokioRwLock::new(HashSet::new()),
         }
+    }
+
+    #[must_use]
+    pub fn runtime_status(&self) -> Arc<status::RuntimeStatus> {
+        Arc::clone(&self.runtime_status)
     }
 
     #[must_use]
@@ -427,6 +446,8 @@ impl DataFusion {
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     self.pending_sink_tables
                         .write()
                         .await
@@ -466,6 +487,14 @@ impl DataFusion {
         } else {
             false
         }
+    }
+
+    #[must_use]
+    pub async fn is_accelerated(&self, table_reference: &TableReference) -> bool {
+        self.accelerated_tables
+            .read()
+            .await
+            .contains(table_reference)
     }
 
     async fn get_table_provider(
@@ -626,7 +655,7 @@ impl DataFusion {
         self.ctx.catalog(catalog).is_some()
     }
 
-    pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
+    pub async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -645,9 +674,14 @@ impl DataFusion {
                 .remove(dataset_name);
         }
 
+        if self.is_accelerated(dataset_name).await {
+            self.accelerated_tables.write().await.remove(dataset_name);
+        }
+
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -698,25 +732,38 @@ impl DataFusion {
         }
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
-        let refresh = Refresh::new(
-            dataset.time_column.clone(),
-            dataset.time_format,
-            dataset.refresh_check_interval(),
-            refresh_sql.clone(),
-            refresh_mode,
-            dataset.refresh_data_window(),
-            acceleration_settings.refresh_append_overlap,
-        )
-        .with_retry(
+
+        let mut refresh = Refresh::new(refresh_mode).with_retry(
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-
+        if let Some(sql) = &refresh_sql {
+            refresh = refresh.sql(sql.clone());
+        }
+        if let Some(format) = dataset.time_format {
+            refresh = refresh.time_format(format);
+        }
+        if let Some(time_col) = &dataset.time_column {
+            refresh = refresh.time_column(time_col.clone());
+        }
+        if let Some(check_interval) = dataset.refresh_check_interval() {
+            refresh = refresh.check_interval(check_interval);
+        }
+        if let Some(max_jitter) = dataset.refresh_max_jitter() {
+            refresh = refresh.max_jitter(max_jitter);
+        }
+        if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
+            refresh = refresh.append_overlap(append_overlap);
+        }
+        if let Some(refresh_data_window) = dataset.refresh_data_window() {
+            refresh = refresh.period(refresh_data_window);
+        }
         refresh
             .validate_time_format(dataset.name.to_string(), &source_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
+            Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
             accelerated_table_provider,
@@ -733,6 +780,8 @@ impl DataFusion {
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
+
+        accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
         if acceleration_settings.disable_query_push_down {
             accelerated_table_builder.disable_query_push_down();
@@ -760,7 +809,10 @@ impl DataFusion {
             };
         }
 
-        Ok(accelerated_table_builder.build().await)
+        accelerated_table_builder
+            .build()
+            .await
+            .context(UnableToBuildAcceleratedTableSnafu)
     }
 
     pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
@@ -778,9 +830,14 @@ impl DataFusion {
         federated_read_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
-        let (accelerated_table, _) = self
+        let (mut accelerated_table, _) = self
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
+
+        source
+            .on_accelerated_table_registration(&dataset, &mut accelerated_table)
+            .await
+            .context(AccelerationRegistrationSnafu)?;
 
         self.ctx
             .register_table(
@@ -796,13 +853,22 @@ impl DataFusion {
         self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
 
+        self.accelerated_tables
+            .write()
+            .await
+            .insert(dataset.name.clone());
+
         Ok(())
     }
 
-    pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
+    pub async fn refresh_table(
+        &self,
+        dataset_name: &str,
+        overrides: Option<RefreshOverrides>,
+    ) -> Result<()> {
         let table = self.get_accelerated_table_provider(dataset_name).await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
-            return accelerated_table.trigger_refresh().await.context(
+            return accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
                     table_name: dataset_name.to_string(),
                 },
@@ -1025,13 +1091,11 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder(self: &Arc<Self>, sql: &str, protocol: Protocol) -> QueryBuilder {
+    pub fn query_builder<'a>(
+        self: &Arc<Self>,
+        sql: &'a str,
+        protocol: Protocol,
+    ) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self), protocol)
-    }
-}
-
-impl Default for DataFusion {
-    fn default() -> Self {
-        Self::new()
     }
 }

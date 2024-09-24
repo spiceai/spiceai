@@ -29,6 +29,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/msal"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v3"
 )
@@ -50,6 +51,8 @@ const (
 	azureAccountName      = "azure-storage-account-name"
 	azureAccessKey        = "azure-storage-access-key"
 	gcpServiceAccountPath = "google-service-account-path"
+	m365TenantId          = "tenant-id"
+	m365ClientId          = "client-id"
 	charset               = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
@@ -224,6 +227,47 @@ spice login snowflake --account <account-identifier> --username <username> --pri
 			passwordFlag: api.AUTH_PARAM_PASSWORD,
 		}, []string{})(cmd, args)
 
+	},
+}
+
+var sharepointCmd = &cobra.Command{
+	Use:   "sharepoint",
+	Short: "Login to a Microsoft 365 sharepoint account",
+	Example: `
+	spice login sharepoint --tenant-id <tenant-id> --client-id <client-id>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: func(cmd *cobra.Command, args []string) {
+		tenant_id, err := cmd.Flags().GetString(m365TenantId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		} else if tenant_id == "" {
+			cmd.Println("No tenant_id provided, use --tenant-id")
+			os.Exit(1)
+		}
+
+		client_id, err := cmd.Flags().GetString(m365ClientId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		} else if client_id == "" {
+			cmd.Println("No client_id provided, use --client-id")
+			os.Exit(1)
+		}
+
+		auth_code, err := msal.InteractivelyGetAuthCode(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"})
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		mergeAuthConfig(cmd, api.AUTH_TYPE_SHAREPOINT, map[string]string{
+			api.AUTH_PARAM_AUTHORIZATION_CODE: auth_code,
+			api.AUTH_PARAM_TENANT_ID:          tenant_id,
+			api.AUTH_PARAM_CLIENT_ID:          client_id,
+		})
 	},
 }
 
@@ -507,6 +551,11 @@ func init() {
 	deltaLakeCmd.Flags().String(azureAccessKey, "", "Azure Storage Access Key")
 	deltaLakeCmd.Flags().String(gcpServiceAccountPath, "", "Google Service Account Path")
 	loginCmd.AddCommand(deltaLakeCmd)
+
+	sharepointCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	sharepointCmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
+	sharepointCmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
+	loginCmd.AddCommand(sharepointCmd)
 
 	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")

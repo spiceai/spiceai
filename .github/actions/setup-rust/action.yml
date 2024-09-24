@@ -6,7 +6,7 @@ inputs:
     default: 'linux' # 'linux', 'darwin', 'windows'
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Install Rust if not installed (Linux/macOS)
       if: inputs.os != 'windows'
@@ -22,7 +22,7 @@ runs:
         fi
 
     - name: Install Rust if not installed (Windows)
-      if : inputs.os == 'windows'
+      if: inputs.os == 'windows'
       shell: pwsh
       run: |
         if( (-not (get-command rustup))) {

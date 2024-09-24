@@ -25,7 +25,9 @@ use serde_json::json;
 use snafu::prelude::*;
 
 use runtime::{
-    accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
+    accelerated_table::{
+        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
+    },
     component::dataset::{
         acceleration::{Acceleration, RefreshMode},
         replication::Replication,
@@ -36,7 +38,7 @@ use runtime::{
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
-    Runtime,
+    status, Runtime,
 };
 use tokio::sync::RwLock;
 
@@ -72,6 +74,11 @@ pub enum Error {
 
     #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
+
+    #[snafu(display("Unable to build accelerated table: {source}"))]
+    UnableToBuildAcceleratedTable {
+        source: AcceleratedTableBuilderError,
+    },
 }
 
 pub struct SpiceExtension {
@@ -172,19 +179,16 @@ impl SpiceExtension {
             true,
         );
 
-        let refresh = Refresh::new(
-            Some("timestamp".to_string()),
-            Some(TimeFormat::UnixSeconds),
-            Some(Duration::from_secs(10)),
-            None,
-            RefreshMode::Full,
-            Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("timestamp".to_string())
+            .time_format(TimeFormat::UnixSeconds)
+            .check_interval(Duration::from_secs(10))
+            .period(Duration::from_secs(1800)); // sync only last 30 minutes from cloud
 
         let metrics_table_reference = get_metrics_table_reference();
 
         let table = create_synced_internal_accelerated_table(
+            runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
             Acceleration::default(),
@@ -331,6 +335,7 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
+    runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,
     from: &str,
     acceleration: Acceleration,
@@ -353,6 +358,7 @@ pub async fn create_synced_internal_accelerated_table(
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
+        runtime_status,
         table_reference.clone(),
         source_table_provider,
         accelerated_table_provider,
@@ -361,7 +367,10 @@ pub async fn create_synced_internal_accelerated_table(
 
     builder.retention(retention);
 
-    let (accelerated_table, _) = builder.build().await;
+    let (accelerated_table, _) = builder
+        .build()
+        .await
+        .context(UnableToBuildAcceleratedTableSnafu)?;
 
     Ok(Arc::new(accelerated_table))
 }

@@ -74,7 +74,23 @@ impl SpiceObjectStoreRegistry {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
         } else {
-            s3_builder = s3_builder.with_skip_signature(true);
+            match params.get("auth") {
+                Some(auth) if auth == "iam_role" => {
+                    s3_builder = s3_builder.with_skip_signature(false);
+                }
+                Some(auth) if auth == "public" => {
+                    s3_builder = s3_builder.with_skip_signature(true);
+                }
+                None => {
+                    // Default to public if no auth is provided
+                    s3_builder = s3_builder.with_skip_signature(true);
+                }
+                Some(auth) => {
+                    return Err(DataFusionError::Configuration(format!(
+                        "Unexpected S3 auth method: {auth}",
+                    )));
+                }
+            }
         };
         s3_builder = s3_builder.with_client_options(client_options);
 

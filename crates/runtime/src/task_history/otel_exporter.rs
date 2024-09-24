@@ -22,6 +22,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use opentelemetry::trace::{SpanId, TraceError};
 use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+use spicepod::component::runtime::TaskHistoryCapturedOutput;
 
 use crate::datafusion::DataFusion;
 
@@ -30,6 +31,7 @@ use super::TaskSpan;
 #[derive(Clone)]
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
+    captured_output: TaskHistoryCapturedOutput,
 }
 
 impl Debug for TaskHistoryExporter {
@@ -39,14 +41,116 @@ impl Debug for TaskHistoryExporter {
 }
 
 impl TaskHistoryExporter {
-    pub fn new(df: Arc<DataFusion>) -> Self {
-        Self { df }
+    pub fn new(df: Arc<DataFusion>, captured_output: TaskHistoryCapturedOutput) -> Self {
+        Self {
+            df,
+            captured_output,
+        }
+    }
+
+    fn process_output(&self, output: Arc<str>) -> Arc<str> {
+        match self.captured_output {
+            TaskHistoryCapturedOutput::None => "".into(),
+            TaskHistoryCapturedOutput::Truncated => output,
+        }
+    }
+
+    fn span_to_task_span(&self, span: SpanData) -> TaskSpan {
+        let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
+        let span_id: Arc<str> = span.span_context.span_id().to_string().into();
+        let parent_span_id: Option<Arc<str>> = if span.parent_span_id == SpanId::INVALID {
+            None
+        } else {
+            Some(span.parent_span_id.to_string().into())
+        };
+        let task: Arc<str> = span.name.into();
+        let input: Arc<str> = span
+            .attributes
+            .iter()
+            .position(|kv| kv.key.as_str() == "input")
+            .map_or_else(
+                || "".into(),
+                |idx| span.attributes[idx].value.as_str().into(),
+            );
+        let captured_output: Option<Arc<str>> = span
+            .events
+            .iter()
+            .find_map(|event| {
+                let event_attr_idx = event
+                    .attributes
+                    .iter()
+                    .position(|kv| kv.key.as_str() == "captured_output")?;
+                Some(event.attributes[event_attr_idx].value.as_str().into())
+            })
+            .map(|output| self.process_output(output));
+
+        let start_time = span.start_time;
+        let end_time = span.end_time;
+        let execution_duration_ms = end_time
+            .duration_since(start_time)
+            .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
+        let error_message: Option<Arc<str>> = span
+            .events
+            .iter()
+            .position(|event| {
+                event
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "level" && kv.value.as_str() == "ERROR")
+            })
+            .map(|idx| span.events[idx].name.clone().into());
+        let mut labels: HashMap<Arc<str>, Arc<str>> = span
+            .attributes
+            .iter()
+            .filter(|kv| filter_event_keys(kv.key.as_str()))
+            .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
+            .collect();
+
+        let event_labels: HashMap<Arc<str>, Arc<str>> = span
+            .events
+            .iter()
+            .filter(|event| event.name == "labels")
+            .flat_map(|event| {
+                event
+                    .attributes
+                    .iter()
+                    .filter(|kv| filter_event_keys(kv.key.as_str()))
+                    .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
+            })
+            .collect();
+
+        labels.extend(event_labels);
+
+        let runtime_query = span.attributes.iter().any(|kv| {
+            kv.key.as_str() == "runtime_query"
+                && matches!(kv.value, opentelemetry::Value::Bool(true))
+        });
+        if runtime_query {
+            labels.insert("runtime_query".into(), "true".into());
+        }
+
+        TaskSpan {
+            trace_id,
+            span_id,
+            parent_span_id,
+            task,
+            input,
+            captured_output,
+            start_time,
+            end_time,
+            execution_duration_ms,
+            error_message,
+            labels,
+        }
     }
 }
 
 impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        let spans = batch.into_iter().filter_map(span_to_task_span).collect();
+        let spans = batch
+            .into_iter()
+            .map(|span| self.span_to_task_span(span))
+            .collect();
         let df = Arc::clone(&self.df);
         Box::pin(async move {
             TaskSpan::write(df, spans)
@@ -54,89 +158,6 @@ impl SpanExporter for TaskHistoryExporter {
                 .map_err(|e| TraceError::Other(Box::new(e)))
         })
     }
-}
-
-fn span_to_task_span(span: SpanData) -> Option<TaskSpan> {
-    let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
-    let span_id: Arc<str> = span.span_context.span_id().to_string().into();
-    let parent_span_id: Option<Arc<str>> = if span.parent_span_id == SpanId::INVALID {
-        None
-    } else {
-        Some(span.parent_span_id.to_string().into())
-    };
-    let task: Arc<str> = span.name.into();
-    let runtime_query = span.attributes.iter().any(|kv| {
-        kv.key.as_str() == "runtime_query" && matches!(kv.value, opentelemetry::Value::Bool(true))
-    });
-    // Filter out internal runtime queries from the task history table
-    if runtime_query {
-        return None;
-    }
-    let input: Arc<str> = span
-        .attributes
-        .iter()
-        .position(|kv| kv.key.as_str() == "input")
-        .map_or_else(
-            || "".into(),
-            |idx| span.attributes[idx].value.as_str().into(),
-        );
-    let truncated_output: Option<Arc<str>> = span.events.iter().find_map(|event| {
-        let event_attr_idx = event
-            .attributes
-            .iter()
-            .position(|kv| kv.key.as_str() == "truncated_output")?;
-        Some(event.attributes[event_attr_idx].value.as_str().into())
-    });
-    let start_time = span.start_time;
-    let end_time = span.end_time;
-    let execution_duration_ms = end_time
-        .duration_since(start_time)
-        .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
-    let error_message: Option<Arc<str>> = span
-        .events
-        .iter()
-        .position(|event| {
-            event
-                .attributes
-                .iter()
-                .any(|kv| kv.key.as_str() == "level" && kv.value.as_str() == "ERROR")
-        })
-        .map(|idx| span.events[idx].name.clone().into());
-    let mut labels: HashMap<Arc<str>, Arc<str>> = span
-        .attributes
-        .iter()
-        .filter(|kv| filter_event_keys(kv.key.as_str()))
-        .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
-        .collect();
-
-    let event_labels: HashMap<Arc<str>, Arc<str>> = span
-        .events
-        .iter()
-        .filter(|event| event.name == "labels")
-        .flat_map(|event| {
-            event
-                .attributes
-                .iter()
-                .filter(|kv| filter_event_keys(kv.key.as_str()))
-                .map(|kv| (kv.key.as_str().into(), kv.value.as_str().into()))
-        })
-        .collect();
-
-    labels.extend(event_labels);
-
-    Some(TaskSpan {
-        trace_id,
-        span_id,
-        parent_span_id,
-        task,
-        input,
-        truncated_output,
-        start_time,
-        end_time,
-        execution_duration_ms,
-        error_message,
-        labels,
-    })
 }
 
 const AUTOGENERATED_LABELS: [&str; 11] = [

@@ -19,24 +19,30 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
-use runtime::Runtime;
 use runtime::{datafusion::query::Protocol, extension::ExtensionFactory};
+use runtime::{status, Runtime};
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("spiceai_catalog_test")
         .with_catalog(Catalog::new("spiceai".to_string(), "spiceai".to_string()))
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .with_autoload_extensions(HashMap::from([(
             "spice_cloud".to_string(),
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
@@ -74,6 +80,9 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
     let _tracing = init_tracing(None);
     let mut catalog = Catalog::new("spiceai".to_string(), "spiceai".to_string());
     catalog.include = vec![
@@ -84,7 +93,8 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
         .with_catalog(catalog)
         .build();
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let rt = Runtime::builder()
         .with_app(app)

@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::time::Duration;
 
 use app::AppBuilder;
@@ -17,7 +33,10 @@ use crate::{init_tracing, wait_until_true};
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::get_test_datafusion;
     use crate::postgres::common;
+    use runtime::status;
+    use std::sync::Arc;
 
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = 20962;
     let running_container = common::start_postgres_docker_container(port).await?;
@@ -97,7 +116,8 @@ CREATE TABLE test (
         ..Acceleration::default()
     });
 
-    let df = get_test_datafusion();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
 
     let app = AppBuilder::new("acceleration_federation")
         .with_dataset(federated_acc)
@@ -107,6 +127,7 @@ CREATE TABLE test (
     let rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
 
@@ -197,23 +218,21 @@ CREATE TABLE test (
         .expect("collect working");
 
     let expected_plan = [
-        "+---------------+----------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                             |",
-        "+---------------+----------------------------------------------------------------------------------+",
-        "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                |",
-        "|               |   Projection:                                                                    |",
-        "|               |     BytesProcessedNode                                                           |",
-        "|               |       TableScan: non_federated_abc                                               |",
-        "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                        |",
-        "|               |   CoalescePartitionsExec                                                         |",
-        "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                  |",
-        "|               |       ProjectionExec: expr=[]                                                    |",
-        "|               |         BytesProcessedExec                                                       |",
-        "|               |           SchemaCastScanExec                                                     |",
-        "|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
-        "|               |               SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
-        "|               |                                                                                  |",
-        "+---------------+----------------------------------------------------------------------------------+",
+        "+---------------+--------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                           |",
+        "+---------------+--------------------------------------------------------------------------------+",
+        "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                              |",
+        "|               |   BytesProcessedNode                                                           |",
+        "|               |     TableScan: non_federated_abc projection=[]                                 |",
+        "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                      |",
+        "|               |   CoalescePartitionsExec                                                       |",
+        "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                |",
+        "|               |       BytesProcessedExec                                                       |",
+        "|               |         SchemaCastScanExec                                                     |",
+        "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
+        "|               |             SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
+        "|               |                                                                                |",
+        "+---------------+--------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected_plan, &plan_results);
 

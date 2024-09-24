@@ -54,7 +54,7 @@ pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
-pub mod metadata;
+pub mod spice_sys;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -92,6 +92,11 @@ pub async fn register_all() {
     register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new())).await;
     #[cfg(feature = "sqlite")]
     register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new())).await;
+}
+
+pub async fn clear_registry() {
+    let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
+    registry.clear();
 }
 
 pub async fn get_accelerator_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {

@@ -18,6 +18,7 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::internal_table::create_internal_accelerated_table;
+use crate::status;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringBuilder};
@@ -36,6 +37,8 @@ use crate::accelerated_table::{AcceleratedTable, Retention};
 pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
+pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 8 * 60 * 60; // 8 hours
+pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 pub(crate) struct TaskSpan {
@@ -49,7 +52,7 @@ pub(crate) struct TaskSpan {
 
     pub(crate) task: Arc<str>,
     pub(crate) input: Arc<str>,
-    pub(crate) truncated_output: Option<Arc<str>>,
+    pub(crate) captured_output: Option<Arc<str>>,
 
     pub(crate) start_time: SystemTime,
     pub(crate) end_time: SystemTime,
@@ -61,21 +64,31 @@ pub(crate) struct TaskSpan {
 }
 
 impl TaskSpan {
-    pub async fn instantiate_table() -> Result<Arc<AcceleratedTable>, Error> {
+    pub async fn instantiate_table(
+        status: Arc<status::RuntimeStatus>,
+        retention_period_secs: u64,
+        retention_check_interval_secs: u64,
+    ) -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
         let time_format = Some(TimeFormat::UnixSeconds);
+
+        tracing::debug!("Task history retention period: {retention_period_secs} seconds");
+        tracing::debug!(
+            "Task history retention check interval: {retention_check_interval_secs} seconds"
+        );
 
         let retention = Retention::new(
             time_column.clone(),
             time_format,
-            Some(Duration::from_secs(24 * 60 * 60)), // 1 day
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_secs(retention_period_secs)), // 1 day
+            Some(Duration::from_secs(retention_check_interval_secs)),
             true,
         );
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
         create_internal_accelerated_table(
+            status,
             tbl_reference,
             Arc::new(TaskSpan::table_schema()),
             Acceleration::default(),
@@ -95,7 +108,7 @@ impl TaskSpan {
             Field::new("parent_span_id", DataType::Utf8, true),
             Field::new("task", DataType::Utf8, false),
             Field::new("input", DataType::Utf8, false),
-            Field::new("truncated_output", DataType::Utf8, true),
+            Field::new("captured_output", DataType::Utf8, true),
             Field::new(
                 "start_time",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -182,10 +195,10 @@ impl TaskSpan {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
                         str_builder.append_value(&span.input);
                     }
-                    "truncated_output" => {
+                    "captured_output" => {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                        match &span.truncated_output {
-                            Some(truncated_output) => str_builder.append_value(truncated_output),
+                        match &span.captured_output {
+                            Some(captured_output) => str_builder.append_value(captured_output),
                             None => str_builder.append_null(),
                         }
                     }
@@ -287,4 +300,9 @@ pub enum Error {
 
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
+
+    #[snafu(display("Invalid `task_history` configuration: {source}"))]
+    InvalidConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }

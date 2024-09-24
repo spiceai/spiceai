@@ -26,6 +26,7 @@ use crate::{
     extension::{Extension, ExtensionFactory},
     metrics, podswatcher,
     secrets::{self, Secrets},
+    status,
     timing::TimeMeasurement,
     tools, tracers, Runtime,
 };
@@ -39,6 +40,7 @@ pub struct RuntimeBuilder {
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
     datafusion: Option<Arc<DataFusion>>,
+    runtime_status: Option<Arc<status::RuntimeStatus>>,
 }
 
 impl RuntimeBuilder {
@@ -52,6 +54,7 @@ impl RuntimeBuilder {
             prometheus_registry: None,
             datafusion: None,
             autoload_extensions: HashMap::new(),
+            runtime_status: None,
         }
     }
 
@@ -114,18 +117,34 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_runtime_status(mut self, runtime_status: Arc<status::RuntimeStatus>) -> Self {
+        self.runtime_status = Some(runtime_status);
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
         tools::factory::register_all().await;
+        document_parse::register_all().await;
+
+        let status = match self.runtime_status {
+            Some(status) => status,
+            None => status::RuntimeStatus::new(),
+        };
 
         let df = match self.datafusion {
             Some(df) => df,
-            None => Arc::new(DataFusion::new()),
+            None => Arc::new(DataFusion::new(Arc::clone(&status))),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
-            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df.ctx));
+            let is_task_history_enabled = self
+                .app
+                .as_ref()
+                .is_some_and(|app| app.runtime.task_history.enabled);
+            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df))
+                .with_task_history_enabled(is_task_history_enabled);
             datasets_health_monitor.start();
             Some(Arc::new(datasets_health_monitor))
         } else {
@@ -149,6 +168,7 @@ impl RuntimeBuilder {
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
+            status,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

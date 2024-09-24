@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::fmt::{self, Display, Formatter};
 
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -31,12 +31,9 @@ use arrow_flight::{
     Action, ActionType as FlightActionType,
 };
 
-pub mod datasets;
-
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
-    AcceleratedDatasetRefresh,
     Unknown,
 }
 
@@ -45,7 +42,6 @@ impl ActionType {
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
-            "AcceleratedDatasetRefresh" => ActionType::AcceleratedDatasetRefresh,
             _ => ActionType::Unknown,
         }
     }
@@ -54,7 +50,6 @@ impl ActionType {
         match self {
             ActionType::CreatePreparedStatement => "CreatePreparedStatement",
             ActionType::ClosePreparedStatement => "ClosePreparedStatement",
-            ActionType::AcceleratedDatasetRefresh => "AcceleratedDatasetRefresh",
             ActionType::Unknown => "Unknown",
         }
     }
@@ -82,17 +77,9 @@ pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> 
             Response Message: N/A"
             .into(),
     };
-    let accelerated_dataset_refresh_action_type = FlightActionType {
-        r#type: ActionType::AcceleratedDatasetRefresh.to_string(),
-        description: "Refreshes an accelerated dataset.\n
-            Request Message: ActionAcceleratedDatasetRefreshRequest\n
-            Response Message: N/A"
-            .into(),
-    };
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
-        Ok(accelerated_dataset_refresh_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || {
@@ -111,7 +98,7 @@ pub(crate) async fn do_action(
     let action_type_str = action_type.as_str().to_string();
     let start = TimeMeasurement::new(
         &metrics::DO_ACTION_DURATION_MS,
-        vec![Key::from_static_str("action_type").string(action_type_str)],
+        vec![KeyValue::new("action_type", action_type_str)],
     );
 
     let stream = match action_type {
@@ -134,22 +121,6 @@ pub(crate) async fn do_action(
         }
         ActionType::ClosePreparedStatement => {
             tracing::trace!("do_action: ClosePreparedStatement");
-            futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
-        }
-        ActionType::AcceleratedDatasetRefresh => {
-            tracing::trace!("do_action: AcceleratedDatasetRefresh");
-
-            let cmd = datasets::ActionAcceleratedDatasetRefreshRequest::decode(
-                request.get_ref().body.as_ref(),
-            )
-            .map_err(|e| {
-                Status::invalid_argument(format!(
-                    "Unable to decode ActionAcceleratedDatasetRefreshRequest: {e}"
-                ))
-            })?;
-
-            datasets::do_action_accelerated_dataset_refresh(flight_svc, cmd).await?;
-
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
         }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),

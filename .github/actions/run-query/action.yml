@@ -7,10 +7,14 @@ inputs:
   start-runtime: 
     description: 'Whether to start Spice runtime before executing the query'
     required: false
-    default: 'true'
+    default: 'false'
   working-directory:
     description: 'Directory to start Spice runtime'
     required: false
+  fail-on-error:
+    description: 'Whether action should fail if query execution failed'
+    required: false
+    default: 'false'
 outputs:
   query-result:
     description: "Query result encoded as base64 string"
@@ -49,6 +53,10 @@ runs:
 
         if [[ $sql_output != *"No error to display"* ]]; then
           echo "Query failed to execute."
+          fail_on_error="${{ inputs.fail-on-error }}"
+          if [[ "$fail_on_error" == "true" || "$fail_on_error" == "1" ]]; then
+            exit 1
+          fi
         else
           extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Time: /p' | sed '1d;$d')
         fi

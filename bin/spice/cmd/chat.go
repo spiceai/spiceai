@@ -9,13 +9,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/manifoldco/promptui"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 const (
@@ -73,22 +73,7 @@ spice chat --model <model> --cloud
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 
-		if !rtcontext.ModelsFlavorInstalled() {
-			cmd.Print("This feature requires a runtime version with models enabled. Install (y/n)? ")
-			var confirm string
-			_, _ = fmt.Scanf("%s", &confirm)
-			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
-				cmd.Println("Models runtime not installed, exiting...")
-				os.Exit(0)
-				return
-			}
-			cmd.Println("Installing models runtime...")
-			err := rtcontext.InstallOrUpgradeRuntime("models")
-			if err != nil {
-				cmd.Println("Error installing models runtime", err)
-				os.Exit(1)
-			}
-		}
+		rtcontext.RequireModelsFlavor(cmd)
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
@@ -114,7 +99,7 @@ spice chat --model <model> --cloud
 				}
 
 				prompt := promptui.Select{
-					Label:        "Select the model to chat with",
+					Label:        "Select model",
 					Items:        modelsSelection,
 					HideSelected: true,
 				}
@@ -159,7 +144,7 @@ spice chat --model <model> --cloud
 
 			done := make(chan bool)
 			go func() {
-				spinner(done)
+				util.ShowSpinner(done)
 			}()
 
 			body := &ChatRequestBody{
@@ -238,22 +223,6 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	}
 
 	return response, nil
-}
-
-func spinner(done chan bool) {
-	chars := []rune{'⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'}
-	for {
-		for _, char := range chars {
-			select {
-			case <-done:
-				fmt.Print("\r") // Clear the spinner
-				return
-			default:
-				fmt.Printf("\r%c ", char)
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-	}
 }
 
 func init() {

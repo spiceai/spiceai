@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use bollard::{
-    container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions},
+    container::{
+        Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+        StartContainerOptions,
+    },
     image::CreateImageOptions,
     secret::{
         ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum,
@@ -116,7 +119,7 @@ pub struct ContainerRunner<'a> {
 
 impl<'a> ContainerRunner<'a> {
     pub async fn run(self) -> Result<RunningContainer<'a>, anyhow::Error> {
-        if self.is_container_running().await? {
+        if self.container_exist().await? {
             remove(&self.docker, self.name).await?;
         }
 
@@ -226,8 +229,14 @@ impl<'a> ContainerRunner<'a> {
         Ok(())
     }
 
-    async fn is_container_running(&self) -> Result<bool, anyhow::Error> {
-        let containers = self.docker.list_containers::<&str>(None).await?;
+    async fn container_exist(&self) -> Result<bool, anyhow::Error> {
+        let containers = self
+            .docker
+            .list_containers::<&str>(Some(ListContainersOptions {
+                all: true,
+                ..Default::default()
+            }))
+            .await?;
         for container in containers {
             let Some(names) = container.names else {
                 continue;

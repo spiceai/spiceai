@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::refresh_task::RefreshTask;
+use crate::status;
+
+use super::{refresh::RefreshOverrides, refresh_task::RefreshTask};
 use futures::future::BoxFuture;
 use tokio::{
     select,
@@ -29,7 +31,11 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 
 use super::refresh::Refresh;
 
+/// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
+/// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
+/// refreshing an `accelerator`.
 pub struct RefreshTaskRunner {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
@@ -40,12 +46,14 @@ pub struct RefreshTaskRunner {
 impl RefreshTaskRunner {
     #[must_use]
     pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
+            runtime_status,
             dataset_name,
             federated,
             refresh,
@@ -54,10 +62,15 @@ impl RefreshTaskRunner {
         }
     }
 
-    pub fn start(&mut self) -> (Sender<()>, Receiver<super::Result<()>>) {
+    pub fn start(
+        &mut self,
+    ) -> (
+        Sender<Option<RefreshOverrides>>,
+        Receiver<super::Result<()>>,
+    ) {
         assert!(self.task.is_none());
 
-        let (start_refresh, mut on_start_refresh) = mpsc::channel::<()>(1);
+        let (start_refresh, mut on_start_refresh) = mpsc::channel::<Option<RefreshOverrides>>(1);
 
         let (notify_refresh_complete, on_refresh_complete) = mpsc::channel::<super::Result<()>>(1);
 
@@ -65,11 +78,12 @@ impl RefreshTaskRunner {
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
 
         let refresh_task = Arc::new(RefreshTask::new(
+            Arc::clone(&self.runtime_status),
             dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
+        let base_refresh = Arc::clone(&self.refresh);
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<BoxFuture<super::Result<()>>> = None;
@@ -93,14 +107,16 @@ impl RefreshTaskRunner {
                                 }
                             }
                         },
-                        _ = on_start_refresh.recv() => {
-                            task_completion = Some(Box::pin(refresh_task.run()));
+                        Some(overrides_opt) = on_start_refresh.recv() => {
+                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            task_completion = Some(Box::pin(refresh_task.run(request)));
                         }
                     }
                 } else {
                     select! {
-                        _ = on_start_refresh.recv() => {
-                            task_completion = Some(Box::pin(refresh_task.run()));
+                        Some(overrides_opt) = on_start_refresh.recv() => {
+                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            task_completion = Some(Box::pin(refresh_task.run(request)));
                         }
                     }
                 }
@@ -108,6 +124,18 @@ impl RefreshTaskRunner {
         }));
 
         (start_refresh, on_refresh_complete)
+    }
+
+    /// Create a new [`Refresh`] based on defaults and overrides.
+    async fn create_refresh_from_overrides(
+        defaults: Arc<RwLock<Refresh>>,
+        overrides_opt: Option<RefreshOverrides>,
+    ) -> Refresh {
+        let mut r = defaults.read().await.clone();
+        if let Some(overrides) = overrides_opt {
+            r = r.with_overrides(&overrides);
+        }
+        r
     }
 
     pub fn abort(&mut self) {

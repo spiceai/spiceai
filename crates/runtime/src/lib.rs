@@ -24,7 +24,7 @@ use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
-use ::opentelemetry::Key;
+use ::opentelemetry::KeyValue;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
@@ -34,7 +34,7 @@ use component::dataset::acceleration::RefreshMode;
 use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
-use datafusion::query::query_history;
+use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
@@ -79,7 +79,7 @@ pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
-pub mod flight;
+mod flight;
 mod http;
 pub mod internal_table;
 mod metrics;
@@ -245,9 +245,6 @@ pub enum Error {
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
-    #[snafu(display("Unable to track query history: {source}"))]
-    UnableToTrackQueryHistory { source: query_history::Error },
-
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
 
@@ -297,6 +294,8 @@ pub struct Runtime {
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
+
+    status: Arc<status::RuntimeStatus>,
 }
 
 impl Runtime {
@@ -313,6 +312,11 @@ impl Runtime {
     #[must_use]
     pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
         Arc::clone(&self.secrets)
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Arc<status::RuntimeStatus> {
+        Arc::clone(&self.status)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -441,7 +445,8 @@ impl Runtime {
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
-    /// The future returned by this function will not resolve until all components have been loaded.
+    /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
+    /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(&self) {
         self.start_extensions().await;
 
@@ -450,8 +455,8 @@ impl Runtime {
 
         let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
             Box::pin(async {
-                if let Err(err) = self.init_query_history().await {
-                    tracing::warn!("Creating internal query history table: {err}");
+                if let Err(err) = self.init_task_history().await {
+                    tracing::warn!("Creating internal task history table: {err}");
                 };
             }),
             Box::pin(self.init_results_cache()),
@@ -460,13 +465,10 @@ impl Runtime {
         ];
 
         if cfg!(feature = "models") {
-            self.load_tools().await; // Load tools before loading models.
             futures.push(Box::pin(self.load_models()));
         }
 
         join_all(futures).await;
-
-        self.df.mark_initial_load_complete();
     }
 
     pub async fn get_params_with_secrets(
@@ -517,10 +519,6 @@ impl Runtime {
                 Ok(ds) => Some(Arc::new(ds)),
                 Err(e) => {
                     if log_errors.0 {
-                        status::update_dataset(
-                            &TableReference::parse_str(&spicepod_ds.name),
-                            status::ComponentStatus::Error,
-                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         tracing::error!(dataset = &spicepod_ds.name, "{e}");
                     }
@@ -538,10 +536,6 @@ impl Runtime {
                 Ok(catalog) => Some(catalog),
                 Err(e) => {
                     if log_errors.0 {
-                        status::update_catalog(
-                            &spicepod_catalog.name,
-                            status::ComponentStatus::Error,
-                        );
                         metrics::catalogs::LOAD_ERROR.add(1, &[]);
                         tracing::error!(catalog = &spicepod_catalog.name, "{e}");
                     }
@@ -599,7 +593,8 @@ impl Runtime {
         let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(true));
         let mut futures = vec![];
         for catalog in &valid_catalogs {
-            status::update_catalog(&catalog.name, status::ComponentStatus::Initializing);
+            self.status
+                .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
             futures.push(self.load_catalog(catalog));
         }
 
@@ -615,7 +610,6 @@ impl Runtime {
                     (true, true) | (false, _) => Some(Arc::clone(&ds)),
                     (true, false) => {
                         if log_errors.0 {
-                            status::update_dataset(&ds.name, status::ComponentStatus::Error);
                             metrics::datasets::LOAD_ERROR.add(1, &[]);
                             tracing::error!(
                                 dataset = &ds.name.to_string(),
@@ -647,12 +641,23 @@ impl Runtime {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        self.status
+                            .update_dataset(ds_name, status::ComponentStatus::Error);
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         continue;
                     }
                 };
+
+                // If we already have an existing dataset checkpoint table that has been checkpointed,
+                // it means there is data from a previous acceleration and we don't need
+                // to wait for the first refresh to complete to mark it ready.
+                if let Ok(checkpoint) = DatasetCheckpoint::try_new(ds).await {
+                    if checkpoint.exists().await {
+                        self.status
+                            .update_dataset(&ds.name, status::ComponentStatus::Ready);
+                    }
+                }
 
                 match accelerator
                     .init(ds)
@@ -665,7 +670,8 @@ impl Runtime {
                     }
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status::update_dataset(ds_name, status::ComponentStatus::Error);
+                        self.status
+                            .update_dataset(ds_name, status::ComponentStatus::Error);
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     }
@@ -689,7 +695,8 @@ impl Runtime {
 
         // Load only successfully initialized datasets
         for ds in &self.initialize_accelerators(&valid_datasets).await {
-            status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             futures.push(self.load_dataset(Arc::clone(ds)));
         }
 
@@ -725,7 +732,8 @@ impl Runtime {
                 Ok(connector) => connector,
                 Err(err) => {
                     let catalog_name = &catalog.name;
-                    status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                    self.status
+                        .update_catalog(catalog_name, status::ComponentStatus::Error);
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
@@ -737,7 +745,8 @@ impl Runtime {
                 return Err(RetryError::transient(err));
             };
 
-            status::update_catalog(&catalog.name, status::ComponentStatus::Ready);
+            self.status
+                .update_catalog(&catalog.name, status::ComponentStatus::Ready);
 
             Ok(())
         })
@@ -755,7 +764,8 @@ impl Runtime {
                 Ok(connector) => connector,
                 Err(err) => {
                     let ds_name = &ds.name;
-                    status::update_dataset(ds_name, status::ComponentStatus::Error);
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
@@ -768,8 +778,6 @@ impl Runtime {
             {
                 return Err(RetryError::transient(err));
             };
-
-            status::update_dataset(&ds.name, status::ComponentStatus::Ready);
 
             Ok(())
         })
@@ -795,7 +803,8 @@ impl Runtime {
                 Ok(data_connector) => data_connector,
                 Err(err) => {
                     let catalog_name = &catalog.name;
-                    status::update_catalog(catalog_name, status::ComponentStatus::Error);
+                    self.status
+                        .update_catalog(catalog_name, status::ComponentStatus::Error);
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return UnableToLoadDatasetConnectorSnafu {
@@ -818,7 +827,8 @@ impl Runtime {
                 Ok(data_connector) => data_connector,
                 Err(err) => {
                     let ds_name = &ds.name;
-                    status::update_dataset(ds_name, status::ComponentStatus::Error);
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return UnableToLoadDatasetConnectorSnafu {
@@ -911,7 +921,8 @@ impl Runtime {
         let read_provider = match data_connector.read_provider(&ds).await {
             Ok(provider) => provider,
             Err(err) => {
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
@@ -960,13 +971,13 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::datasets::COUNT.add(1, &[Key::from_static_str("engine").string(engine)]);
-                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+                metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
                 Ok(())
             }
             Err(err) => {
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: datafusion::Error::RefreshSql { source },
@@ -990,7 +1001,7 @@ impl Runtime {
                     .await;
             }
 
-            if let Err(e) = self.df.remove_table(&ds.name) {
+            if let Err(e) = self.df.remove_table(&ds.name).await {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
@@ -1007,11 +1018,12 @@ impl Runtime {
                 }
             },
         );
-        metrics::datasets::COUNT.add(-1, &[Key::from_static_str("engine").string(engine)]);
+        metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
     }
 
     async fn update_dataset(&self, ds: Arc<Dataset>) {
-        status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+        self.status
+            .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         match self.load_dataset_connector(Arc::clone(&ds)).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
@@ -1021,7 +1033,8 @@ impl Runtime {
                         .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
                         .await
                     {
-                        status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+                        self.status
+                            .update_dataset(&ds.name, status::ComponentStatus::Ready);
                         return;
                     }
                     tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
@@ -1029,18 +1042,19 @@ impl Runtime {
 
                 self.remove_dataset(&ds).await;
 
-                if let Ok(()) = self
+                if (self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
-                    .await
+                    .await)
+                    .is_err()
                 {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-                } else {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Error);
                 }
             }
             Err(e) => {
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Error);
             }
         }
     }
@@ -1158,8 +1172,8 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            return self
-                .df
+            let ds_name: TableReference = ds.name.clone();
+            self.df
                 .register_table(
                     ds,
                     datafusion::Table::Federated {
@@ -1170,7 +1184,11 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
-                });
+                })?;
+
+            self.status
+                .update_dataset(&ds_name, status::ComponentStatus::Ready);
+            return Ok(());
         }
 
         // ACCELERATED TABLE
@@ -1193,6 +1211,9 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
+        // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
+        self.status
+            .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         self.df
             .register_table(
                 ds,
@@ -1232,7 +1253,7 @@ impl Runtime {
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
 
-        let mut l = try_to_embedding(in_embed, &params_with_secrets)
+        let l = try_to_embedding(in_embed, &params_with_secrets)
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()
@@ -1247,20 +1268,22 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for in_embed in &app.embeddings {
-                status::update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
+                self.status
+                    .update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
                 match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
 
                         let m = Box::new(TaskEmbed::new(e)) as Box<dyn Embed>;
-                        embeds_map.insert(in_embed.name.clone(), m.into());
+                        embeds_map.insert(in_embed.name.clone(), m);
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
                         metrics::embeddings::COUNT.add(
                             1,
                             &[
-                                Key::from_static_str("embeddings").string(in_embed.name.clone()),
-                                Key::from_static_str("source").string(
+                                KeyValue::new("embeddings", in_embed.name.clone()),
+                                KeyValue::new(
+                                    "source",
                                     in_embed
                                         .get_prefix()
                                         .map(|x| x.to_string())
@@ -1268,11 +1291,13 @@ impl Runtime {
                                 ),
                             ],
                         );
-                        status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);
+                        self.status
+                            .update_embedding(&in_embed.name, status::ComponentStatus::Ready);
                     }
                     Err(e) => {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
-                        status::update_embedding(&in_embed.name, status::ComponentStatus::Error);
+                        self.status
+                            .update_embedding(&in_embed.name, status::ComponentStatus::Error);
                         tracing::warn!(
                             "Unable to load embedding from spicepod {}, error: {}",
                             in_embed.name,
@@ -1285,10 +1310,14 @@ impl Runtime {
     }
 
     async fn load_models(&self) {
+        // Load tools before loading models.
+        self.load_tools().await;
+
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
-                status::update_model(&model.name, status::ComponentStatus::Initializing);
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Initializing);
                 self.load_model(model).await;
             }
         }
@@ -1310,7 +1339,8 @@ impl Runtime {
     }
 
     async fn load_tool(&self, tool: &Tool) {
-        status::update_tool(&tool.name, status::ComponentStatus::Initializing);
+        self.status
+            .update_tool(&tool.name, status::ComponentStatus::Initializing);
         let params_with_secrets: HashMap<String, SecretString> =
             self.get_params_with_secrets(&tool.params).await;
 
@@ -1322,13 +1352,14 @@ impl Runtime {
                 let mut tools_map = self.tools.write().await;
                 tools_map.insert(tool.name.clone(), t);
                 tracing::info!("Tool [{}] ready to use", tool.name);
-                metrics::tools::COUNT
-                    .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
-                status::update_tool(&tool.name, status::ComponentStatus::Ready);
+                metrics::tools::COUNT.add(1, &[KeyValue::new("tool", tool.name.clone())]);
+                self.status
+                    .update_tool(&tool.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
                 metrics::tools::LOAD_ERROR.add(1, &[]);
-                status::update_tool(&tool.name, status::ComponentStatus::Error);
+                self.status
+                    .update_tool(&tool.name, status::ComponentStatus::Error);
                 tracing::warn!(
                     "Unable to load tool from spicepod {}, error: {}",
                     tool.name,
@@ -1346,8 +1377,8 @@ impl Runtime {
         let _guard = TimeMeasurement::new(
             &metrics::models::LOAD_DURATION_MS,
             &[
-                Key::from_static_str("model").string(m.name.clone()),
-                Key::from_static_str("source").string(source_str.clone()),
+                KeyValue::new("model", m.name.clone()),
+                KeyValue::new("source", source_str.clone()),
             ],
         );
 
@@ -1375,7 +1406,7 @@ impl Runtime {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok(l) => {
                     let mut llm_map = self.llms.write().await;
-                    llm_map.insert(m.name.clone(), l.into());
+                    llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
                 Err(e) => Err(format!(
@@ -1405,15 +1436,17 @@ impl Runtime {
                 metrics::models::COUNT.add(
                     1,
                     &[
-                        Key::from_static_str("model").string(m.name.clone()),
-                        Key::from_static_str("source").string(source_str),
+                        KeyValue::new("model", m.name.clone()),
+                        KeyValue::new("source", source_str),
                     ],
                 );
-                status::update_model(&model.name, status::ComponentStatus::Ready);
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
                 metrics::models::LOAD_ERROR.add(1, &[]);
-                status::update_model(&model.name, status::ComponentStatus::Error);
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Error);
                 tracing::warn!(e);
             }
         }
@@ -1437,14 +1470,15 @@ impl Runtime {
         metrics::models::COUNT.add(
             -1,
             &[
-                Key::from_static_str("model").string(m.name.clone()),
-                Key::from_static_str("source").string(source_str),
+                KeyValue::new("model", m.name.clone()),
+                KeyValue::new("source", source_str),
             ],
         );
     }
 
     async fn update_model(&self, m: &SpicepodModel) {
-        status::update_model(&m.name, status::ComponentStatus::Refreshing);
+        self.status
+            .update_model(&m.name, status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
     }
@@ -1496,10 +1530,8 @@ impl Runtime {
                             self.load_catalog(catalog).await;
                         }
                     } else {
-                        status::update_catalog(
-                            &catalog.name,
-                            status::ComponentStatus::Initializing,
-                        );
+                        self.status
+                            .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
                         self.load_catalog(catalog).await;
                     }
                 }
@@ -1514,7 +1546,8 @@ impl Runtime {
                             self.update_dataset(ds).await;
                         }
                     } else {
-                        status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                        self.status
+                            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
                         self.load_dataset(ds).await;
                     }
                 }
@@ -1529,7 +1562,8 @@ impl Runtime {
                                 continue;
                             }
                         };
-                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
+                        self.status
+                            .update_dataset(&ds.name, status::ComponentStatus::Disabled);
                         self.remove_dataset(&ds).await;
                     }
                 }
@@ -1543,7 +1577,8 @@ impl Runtime {
                             self.update_model(model).await;
                         }
                     } else {
-                        status::update_model(&model.name, status::ComponentStatus::Initializing);
+                        self.status
+                            .update_model(&model.name, status::ComponentStatus::Initializing);
                         self.load_model(model).await;
                     }
                 }
@@ -1551,7 +1586,8 @@ impl Runtime {
                 // Remove models that are no longer in the app
                 for model in &current_app.models {
                     if !new_app.models.iter().any(|m| m.name == model.name) {
-                        status::update_model(&model.name, status::ComponentStatus::Disabled);
+                        self.status
+                            .update_model(&model.name, status::ComponentStatus::Disabled);
                         self.remove_model(model).await;
                     }
                 }
@@ -1589,23 +1625,44 @@ impl Runtime {
         };
     }
 
-    pub async fn init_query_history(&self) -> Result<()> {
-        let query_history_table_reference = TableReference::partial(
-            SPICE_RUNTIME_SCHEMA,
-            query_history::DEFAULT_QUERY_HISTORY_TABLE,
-        );
+    pub async fn init_task_history(&self) -> Result<()> {
+        let app = self.app.read().await;
 
-        match query_history::instantiate_query_history_table().await {
-            Ok(table) => {
-                let _ = self
-                    .df
-                    .register_runtime_table(query_history_table_reference, table)
-                    .context(UnableToCreateBackendSnafu);
+        if let Some(app) = app.as_ref() {
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled via configuration.");
+                return Ok(());
             }
-            Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
+        }
+
+        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
+            Some(app) => (
+                app.runtime
+                    .task_history
+                    .retention_period_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
+                    })?,
+                app.runtime
+                    .task_history
+                    .retention_check_interval_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e },
+                    })?,
+            ),
+            None => (
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
+            ),
         };
 
-        match task_history::TaskSpan::instantiate_table().await {
+        match task_history::TaskSpan::instantiate_table(
+            self.status(),
+            retention_period_secs,
+            retention_check_interval_secs,
+        )
+        .await
+        {
             Ok(table) => self
                 .df
                 .register_runtime_table(
@@ -1628,7 +1685,8 @@ pub struct RegisterDatasetContext {
     accelerated_table: Option<AcceleratedTable>,
 }
 
-pub(crate) fn spice_data_base_path() -> String {
+#[must_use]
+pub fn spice_data_base_path() -> String {
     let Ok(working_dir) = std::env::current_dir() else {
         return ".".to_string();
     };

@@ -66,11 +66,7 @@ pub async fn start_postgres_docker_container(
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{PG_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let port = if let Ok(port) = port.try_into() {
-        port
-    } else {
-        15432
-    };
+    let port = port.try_into().unwrap_or(15432);
 
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image(format!("{}postgres:latest", container_registry()))

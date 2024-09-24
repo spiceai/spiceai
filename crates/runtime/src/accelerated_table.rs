@@ -19,7 +19,9 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
+use crate::status;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -38,6 +40,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
+use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
 
@@ -76,7 +79,7 @@ pub enum Error {
 
     #[snafu(display("Failed to trigger table refresh: {source}"))]
     FailedToTriggerRefresh {
-        source: tokio::sync::mpsc::error::SendError<()>,
+        source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
 
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
@@ -125,6 +128,17 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, Snafu)]
+pub enum AcceleratedTableBuilderError {
+    #[snafu(display("Expected changes stream for `RefreshMode::Changes`"))]
+    ExpectedChangesStream,
+
+    #[snafu(display("Append stream is required for `RefreshMode::Append` without time_column"))]
+    AppendStreamRequired,
+}
+
+pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
+
 // An accelerated table consists of a federated table and a local accelerator.
 //
 // The accelerator must support inserts.
@@ -133,8 +147,10 @@ pub struct AcceleratedTable {
     dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
-    refresh_trigger: Option<mpsc::Sender<()>>,
-    handlers: Vec<JoinHandle<()>>,
+    refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
+
+    // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
+    pub(crate) handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
@@ -162,6 +178,7 @@ fn validate_refresh_data_window(
 }
 
 pub struct Builder {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
@@ -172,16 +189,19 @@ pub struct Builder {
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
+    checkpointer: Option<DatasetCheckpoint>,
 }
 
 impl Builder {
     pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Self {
         Self {
+            runtime_status,
             dataset_name,
             federated,
             accelerator,
@@ -191,6 +211,7 @@ impl Builder {
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
+            checkpointer: None,
             disable_query_push_down: false,
         }
     }
@@ -240,12 +261,22 @@ impl Builder {
         self
     }
 
+    /// Set the checkpointer for the accelerated table
+    pub fn checkpointer(&mut self, checkpointer: DatasetCheckpoint) -> &mut Self {
+        self.checkpointer = Some(checkpointer);
+        self
+    }
+
+    /// Set the checkpointer for the accelerated table
+    pub fn checkpointer_opt(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
+        self.checkpointer = checkpointer;
+        self
+    }
+
     /// Build the accelerated table
-    ///
-    /// # Panics
-    ///
-    /// Panics if the refresh mode is `RefreshMode::Changes` and no changes stream is provided.
-    pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
+    pub async fn build(
+        self,
+    ) -> AcceleratedTableBuilderResult<(AcceleratedTable, oneshot::Receiver<()>)> {
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
@@ -254,14 +285,15 @@ impl Builder {
                 if self.refresh.time_column.is_none() {
                     // Get the append stream
                     let Some(append_stream) = self.append_stream else {
-                        panic!("Append stream is required for `RefreshMode::Append` without time_column");
+                        return AppendStreamRequiredSnafu.fail();
                     };
                     (
                         refresh::AccelerationRefreshMode::Changes(append_stream),
                         None,
                     )
                 } else {
-                    let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                    let (start_refresh, on_start_refresh) =
+                        mpsc::channel::<Option<RefreshOverrides>>(1);
                     (
                         refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
                         Some(start_refresh),
@@ -269,7 +301,8 @@ impl Builder {
                 }
             }
             RefreshMode::Full => {
-                let (start_refresh, on_start_refresh) = mpsc::channel::<()>(1);
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
                 (
                     refresh::AccelerationRefreshMode::Full(on_start_refresh),
                     Some(start_refresh),
@@ -277,7 +310,7 @@ impl Builder {
             }
             RefreshMode::Changes => {
                 let Some(changes_stream) = self.changes_stream else {
-                    panic!("Changes stream is required for `RefreshMode::Changes`");
+                    return ExpectedChangesStreamSnafu.fail();
                 };
                 (
                     refresh::AccelerationRefreshMode::Changes(changes_stream),
@@ -289,12 +322,14 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         let mut refresher = refresh::Refresher::new(
+            Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
+        refresher.checkpointer(self.checkpointer);
 
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
@@ -315,7 +350,7 @@ impl Builder {
             ));
             handlers.push(retention_check_handle);
         }
-        (
+        Ok((
             AcceleratedTable {
                 dataset_name: self.dataset_name,
                 accelerator: self.accelerator,
@@ -328,18 +363,25 @@ impl Builder {
                 disable_query_push_down: self.disable_query_push_down,
             },
             is_ready,
-        )
+        ))
     }
 }
 
 impl AcceleratedTable {
     pub fn builder(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Builder {
-        Builder::new(dataset_name, federated, accelerator, refresh)
+        Builder::new(
+            runtime_status,
+            dataset_name,
+            federated,
+            accelerator,
+            refresh,
+        )
     }
 
     #[must_use]
@@ -352,11 +394,16 @@ impl AcceleratedTable {
         Arc::clone(&self.refresh_params)
     }
 
-    pub async fn trigger_refresh(&self) -> Result<()> {
+    #[must_use]
+    pub fn refresh_trigger(&self) -> Option<mpsc::Sender<Option<RefreshOverrides>>> {
+        self.refresh_trigger.clone()
+    }
+
+    pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         match &self.refresh_trigger {
             Some(refresh_trigger) => {
                 refresh_trigger
-                    .send(())
+                    .send(overrides)
                     .await
                     .context(FailedToTriggerRefreshSnafu)?;
             }

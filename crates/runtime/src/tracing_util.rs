@@ -69,7 +69,7 @@ fn dataset_acceleration_info(
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
-        info.push_str(&format!(", {refresh_interval} refresh"));
+        info.push_str(&format!(", {refresh_interval:#?} refresh"));
     }
     if let Some(retention_check_interval) = &acceleration.retention_check_interval {
         if acceleration.retention_check_enabled {
@@ -90,6 +90,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::datasource::TableProvider;
     use std::any::Any;
+    use std::time::Duration;
 
     struct TestDataConnector {}
 
@@ -143,7 +144,7 @@ mod tests {
             engine: Engine::DuckDB,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Append),
-            refresh_check_interval: Some("30s".to_string()),
+            refresh_check_interval: Some(Duration::from_secs(30)),
             retention_check_interval: Some("1hr".to_string()),
             retention_check_enabled: true,
             on_zero_results: ZeroResultsAction::UseSource,

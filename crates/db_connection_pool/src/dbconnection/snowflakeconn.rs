@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StructArray, TimestampMillisecondBuilder,
+    StructArray, TimestampNanosecondBuilder,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
@@ -69,6 +69,8 @@ pub enum Error {
     FailedToCreateRecordBatch { source: arrow::error::ArrowError },
 }
 
+static UTC_TIMEZONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("UTC"));
+
 pub struct SnowflakeConnection {
     pub api: Arc<SnowflakeApi>,
 }
@@ -98,30 +100,30 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
         table_reference: &TableReference,
     ) -> Result<SchemaRef, dbconnection::Error> {
         let table = table_reference.to_quoted_string();
+        let query = format!("SHOW COLUMNS IN {table}");
 
-        let res = self
-            .api
-            .exec(format!("SELECT * FROM {table} limit 1").as_str())
-            .await
-            .boxed()
-            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
+        let res =
+            self.api
+                .exec(&query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetSchema {
+                    source: e.to_string().into(),
+                })?;
 
         match res {
-            snowflake_api::QueryResult::Arrow(record_batches) => {
-                let record_batch = snowflake_schema_cast(&record_batches[0])
-                    .boxed()
-                    .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
-                let schema = record_batch.schema();
-                return Ok(Arc::clone(&schema));
+            snowflake_api::QueryResult::Json(resp) => {
+                parse_schema_from_json(&resp.value).map_err(|e| {
+                    dbconnection::Error::UnableToGetSchema {
+                        source: e.to_string().into(),
+                    }
+                })
             }
+            snowflake_api::QueryResult::Arrow(_) => Err(dbconnection::Error::UnableToGetSchema {
+                source: "Unexpected Arrow response".to_string().into(),
+            }),
             snowflake_api::QueryResult::Empty => Err(dbconnection::Error::UnableToGetSchema {
                 source: "Empty response".to_string().into(),
             }),
-            snowflake_api::QueryResult::Json(_json) => {
-                Err(dbconnection::Error::UnableToGetSchema {
-                    source: "Unexpected response".to_string().into(),
-                })
-            }
         }
     }
 
@@ -197,29 +199,37 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
         let column = record_batch.column(idx);
         let field_metadata = field.metadata();
         if let Some(sf_logical_type) = field_metadata.get("logicalType") {
-            if sf_logical_type.to_lowercase().as_str() == "timestamp_ntz" {
-                fields.push(Arc::new(Field::new(
-                    field.name(),
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    field.is_nullable(),
-                )));
-                columns.push(cast_sf_timestamp_ntz_to_arrow_timestamp(column)?);
-                continue;
-            }
-
-            let is_decimal_type = matches!(
-                field.data_type(),
-                DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-            );
-
-            if !is_decimal_type && sf_logical_type.to_lowercase().as_str() == "fixed" {
-                if let (Some(precision_str), Some(scale_str)) =
-                    (field_metadata.get("precision"), field_metadata.get("scale"))
+            match sf_logical_type.to_lowercase().as_str() {
+                "timestamp_ntz" => {
+                    fields.push(Arc::new(Field::new(
+                        field.name(),
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        field.is_nullable(),
+                    )));
+                    columns.push(cast_sf_timestamp_to_arrow_timestamp(column, false)?);
+                    continue;
+                }
+                "timestamp_tz" => {
+                    fields.push(Arc::new(Field::new(
+                        field.name(),
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        field.is_nullable(),
+                    )));
+                    columns.push(cast_sf_timestamp_to_arrow_timestamp(column, true)?);
+                    continue;
+                }
+                "fixed"
+                    if !matches!(
+                        field.data_type(),
+                        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                    ) =>
                 {
-                    if let (Ok(precision), Ok(scale)) =
-                        (precision_str.parse::<u8>(), scale_str.parse::<i8>())
+                    if let (Some(precision_str), Some(scale_str)) =
+                        (field_metadata.get("precision"), field_metadata.get("scale"))
                     {
-                        if scale != 0 {
+                        if let (Ok(precision), Ok(scale)) =
+                            (precision_str.parse::<u8>(), scale_str.parse::<i8>())
+                        {
                             fields.push(Arc::new(Field::new(
                                 field.name(),
                                 DataType::Decimal128(precision, scale),
@@ -233,6 +243,7 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
                         }
                     }
                 }
+                _ => {}
             }
         }
         fields.push(Arc::clone(field));
@@ -243,18 +254,21 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
     RecordBatch::try_new(schema, columns).context(FailedToCreateRecordBatchSnafu)
 }
 
-fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRef, Error> {
+fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Result<ArrayRef, Error> {
     let struct_array = column.as_any().downcast_ref::<StructArray>().context(
         UnableToCastSnowflakeTimestampSnafu {
             reason: "value is not a struct",
         },
     )?;
-    if struct_array.columns().len() < 2 {
+
+    let expected_fields = if is_tz { 3 } else { 2 };
+    if struct_array.columns().len() < expected_fields {
         return UnableToCastSnowflakeTimestampSnafu {
-            reason: "value is not a struct with 2 columns",
+            reason: format!("value is not a struct with {expected_fields} columns"),
         }
         .fail();
     }
+
     let epoch_array = struct_array
         .column(0)
         .as_any()
@@ -270,7 +284,14 @@ fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRe
             reason: "fraction is missing",
         })?;
 
-    let mut builder = TimestampMillisecondBuilder::new();
+    let builder = TimestampNanosecondBuilder::with_capacity(struct_array.len());
+
+    // Snowflake already stores timestamps in UTC, so we don't need to adjust for timezone
+    let mut builder = if is_tz {
+        builder.with_timezone(Arc::clone(&UTC_TIMEZONE))
+    } else {
+        builder
+    };
 
     for idx in 0..struct_array.len() {
         if struct_array.is_null(idx) {
@@ -278,11 +299,14 @@ fn cast_sf_timestamp_ntz_to_arrow_timestamp(column: &ArrayRef) -> Result<ArrayRe
         } else {
             let epoch = epoch_array.value(idx);
             let fraction = i64::from(fraction_array.value(idx));
-            let timestamp = epoch * 1_000 + fraction / 1_000_000;
+            let timestamp = epoch * 1_000_000_000 + fraction;
+
             builder.append_value(timestamp);
         }
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+
+    let timestamp_array = builder.finish();
+    Ok(Arc::new(timestamp_array) as ArrayRef)
 }
 
 fn cast_sf_fixed_point_number_to_decimal(
@@ -337,12 +361,94 @@ where
     ))
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
+    let data_type: serde_json::Value =
+        serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
+            reason: e.to_string(),
+        })?;
+
+    match data_type["type"].as_str() {
+        Some("FIXED") => {
+            let precision = data_type["precision"].as_u64().unwrap_or(38) as u8;
+            let scale = data_type["scale"].as_i64().unwrap_or(0) as i8;
+            Ok(DataType::Decimal128(precision, scale))
+        }
+        Some("TEXT" | "VARIANT" | "ARRAY") => Ok(DataType::Utf8),
+        Some("REAL") => Ok(DataType::Float64),
+        Some("BINARY") => Ok(DataType::Binary),
+        Some("BOOLEAN") => Ok(DataType::Boolean),
+        Some("DATE") => Ok(DataType::Date32),
+        Some("TIMESTAMP_NTZ") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        Some("TIME") => Ok(DataType::Time64(TimeUnit::Nanosecond)),
+        Some("TIMESTAMP_TZ") => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("UTC".into()),
+        )),
+        Some(t) => Err(Error::UnableToRetrieveSchema {
+            reason: format!("Unsupported Snowflake data type: {t}"),
+        }),
+        None => Err(Error::UnableToRetrieveSchema {
+            reason: "Missing data type".to_string(),
+        }),
+    }
+}
+
+fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> {
+    let columns: Vec<Vec<serde_json::Value>> = resp
+        .as_array()
+        .ok_or_else(|| Error::UnableToRetrieveSchema {
+            reason: "Response is not an array".to_string(),
+        })?
+        .iter()
+        .map(|column| {
+            column
+                .as_array()
+                .ok_or_else(|| Error::UnableToRetrieveSchema {
+                    reason: "Column data is not an array".to_string(),
+                })
+                .cloned()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut fields = Vec::new();
+
+    for column in columns {
+        if column.len() < 5 {
+            return Err(Error::UnableToRetrieveSchema {
+                reason: "Invalid column data format".to_string(),
+            });
+        }
+
+        let column_name = column[2]
+            .as_str()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: "Invalid column name".to_string(),
+            })?;
+
+        let data_type_str = column[3]
+            .as_str()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: "Invalid data type".to_string(),
+            })?;
+
+        let data_type: DataType = parse_snowflake_data_type(data_type_str)?;
+
+        let is_nullable = column[4]
+            .as_str()
+            .map_or(true, |s| s.to_uppercase() == "TRUE");
+
+        fields.push(Field::new(column_name, data_type, is_nullable));
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayBuilder, ArrayRef, Int32Builder, Int64Builder, StructBuilder,
-        TimestampMillisecondArray,
+        ArrayBuilder, ArrayRef, Int32Builder, Int64Builder, StructBuilder, TimestampNanosecondArray,
     };
     use arrow::datatypes::{DataType, Field};
     use arrow::util::display;
@@ -354,14 +460,43 @@ mod tests {
             vec![Some(1_696_164_330), None, Some(1_714_647_301)],
             vec![Some(0), None, Some(739_000_000)],
         );
-        let result = cast_sf_timestamp_ntz_to_arrow_timestamp(&timestamp_ntz_array)
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false)
             .expect("Should cast Snowflake timestamp to Arrow timestamp");
         let result = result
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-            .expect("Should downcast to TimestampMillisecondArray");
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
 
-        let expected_timestamps = [Some(1_696_164_330_000), None, Some(1_714_647_301_739)];
+        let expected_timestamps = [
+            Some(1_696_164_330_000_000_000),
+            None,
+            Some(1_714_647_301_739_000_000),
+        ];
+
+        assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
+        assert!(result.is_null(1));
+        assert_eq!(result.value(2), expected_timestamps[2].unwrap_or_default());
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_tz_to_arrow_timestamp() {
+        let timestamp_tz_array = create_timestamp_tz_array(
+            vec![Some(1_696_164_330), None, Some(1_714_647_301)],
+            vec![Some(0), None, Some(739_000_000)],
+            vec![Some(1440), None, Some(1500)],
+        );
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true)
+            .expect("Should cast Snowflake timestamp to Arrow timestamp");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        let expected_timestamps = [
+            Some(1_696_164_330_000_000_000),
+            None,
+            Some(1_714_647_301_739_000_000),
+        ];
 
         assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
         assert!(result.is_null(1));
@@ -381,8 +516,9 @@ mod tests {
             epoch_array,
         )]);
 
-        let result = cast_sf_timestamp_ntz_to_arrow_timestamp(
+        let result = cast_sf_timestamp_to_arrow_timestamp(
             &(Arc::new(timestamp_ntz_no_fraction) as ArrayRef),
+            false,
         );
 
         assert!(result.is_err());
@@ -449,6 +585,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_snowflake_data_type() {
+        let test_cases = vec![
+            (
+                r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#,
+                DataType::Decimal128(38, 0),
+            ),
+            (
+                r#"{"type":"FIXED","precision":10,"scale":2,"nullable":true}"#,
+                DataType::Decimal128(10, 2),
+            ),
+            (
+                r#"{"type":"TEXT","length":16777216,"byteLength":16777216,"nullable":true,"fixed":false}"#,
+                DataType::Utf8,
+            ),
+            (r#"{"type":"REAL","nullable":true}"#, DataType::Float64),
+            (
+                r#"{"type":"BINARY","length":8388608,"byteLength":8388608,"nullable":true,"fixed":true}"#,
+                DataType::Binary,
+            ),
+            (r#"{"type":"BOOLEAN","nullable":true}"#, DataType::Boolean),
+            (r#"{"type":"DATE","nullable":true}"#, DataType::Date32),
+            (
+                r#"{"type":"TIMESTAMP_NTZ","precision":0,"scale":9,"nullable":true}"#,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                r#"{"type":"TIME","precision":0,"scale":9,"nullable":true}"#,
+                DataType::Time64(TimeUnit::Nanosecond),
+            ),
+            (
+                r#"{"type":"TIMESTAMP_TZ","precision":0,"scale":9,"nullable":true}"#,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            ),
+            (r#"{"type":"VARIANT","nullable":true}"#, DataType::Utf8),
+            (r#"{"type":"ARRAY","nullable":true}"#, DataType::Utf8),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = parse_snowflake_data_type(input);
+            assert!(result.is_ok(), "Failed to parse: {input}");
+            assert_eq!(
+                result.expect("Failed to parse: {input}"),
+                expected,
+                "Mismatch for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_errors() {
+        let error_cases = vec![
+            (
+                r#"{"type":"UNKNOWN","nullable":true}"#,
+                "Unsupported Snowflake data type: UNKNOWN",
+            ),
+            (r#"{"nullable":true}"#, "Missing data type"),
+            ("invalid json", "expected value at line 1 column 1"),
+        ];
+
+        for (input, expected_error) in error_cases {
+            let result = parse_snowflake_data_type(input);
+            assert!(result.is_err(), "Expected error for input: {input}");
+            let error = result.expect_err("Expected error for input: {input}");
+            match error {
+                Error::UnableToRetrieveSchema { reason } => {
+                    assert!(
+                        reason.contains(expected_error),
+                        "Error '{reason}' does not contain expected message '{expected_error}' for input: '{input}'",
+                    );
+                }
+                _ => panic!("Unexpected error type: {error:?}"),
+            }
+        }
+    }
+
     fn create_timestamp_ntz_array(
         epochs: Vec<Option<i64>>,
         fractions: Vec<Option<i32>>,
@@ -485,6 +697,68 @@ mod tests {
                     .append_null();
                 builder
                     .field_builder::<Int32Builder>(1)
+                    .expect("Should return a field builder")
+                    .append_null();
+            }
+        }
+
+        Arc::new(builder.finish()) as ArrayRef
+    }
+
+    fn create_timestamp_tz_array(
+        epochs: Vec<Option<i64>>,
+        fractions: Vec<Option<i32>>,
+        timezones: Vec<Option<i32>>,
+    ) -> ArrayRef {
+        let fields = vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+            Field::new("timezone", DataType::Int32, true),
+        ];
+
+        let mut builder = StructBuilder::new(
+            fields.clone(),
+            vec![
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+
+        for (epoch, fraction, timezone) in epochs
+            .into_iter()
+            .zip(fractions)
+            .zip(timezones)
+            .map(|((a, b), c)| (a, b, c))
+        {
+            if let (Some(epoch_val), Some(fraction_val), Some(timezone_val)) =
+                (epoch, fraction, timezone)
+            {
+                builder
+                    .field_builder::<Int64Builder>(0)
+                    .expect("Should return a field builder")
+                    .append_value(epoch_val);
+                builder
+                    .field_builder::<Int32Builder>(1)
+                    .expect("Should return a field builder")
+                    .append_value(fraction_val);
+                builder
+                    .field_builder::<Int32Builder>(2)
+                    .expect("Should return a field builder")
+                    .append_value(timezone_val);
+                builder.append(true);
+            } else {
+                builder.append(false);
+                builder
+                    .field_builder::<Int64Builder>(0)
+                    .expect("Should return a field builder")
+                    .append_null();
+                builder
+                    .field_builder::<Int32Builder>(1)
+                    .expect("Should return a field builder")
+                    .append_null();
+                builder
+                    .field_builder::<Int32Builder>(2)
                     .expect("Should return a field builder")
                     .append_null();
             }

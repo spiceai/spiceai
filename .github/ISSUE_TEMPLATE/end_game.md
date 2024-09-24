@@ -61,6 +61,7 @@ assignees: ''
   - [ ] [Clickhouse Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/clickhouse/README.md)
   - [ ] [Snowflake Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/snowflake/README.md)
   - [ ] [GraphQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/graphql/README.md)
+  - [ ] [GitHub Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/github/README.md)
   - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
   - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/databricks/README.md)
   - [ ] [Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/unity_catalog/README.md)
@@ -73,6 +74,7 @@ assignees: ''
   - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
   - [ ] [Securing data in transit via TLS](https://github.com/spiceai/quickstarts/blob/trunk/tls/README.md)
 - [ ] Merge [Docs PRs](https://github.com/spiceai/docs/pulls)
+  - [ ] Update spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docusaurus.config.ts#L60)
 - [ ] Merge [Samples PRs](https://github.com/spiceai/samples/pulls)
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/quickstarts/pulls)
 - [ ] Update release notes
@@ -80,9 +82,10 @@ assignees: ''
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
   - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docs/acknowledgements/index.md)
 - [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
-- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the release branch.
+- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the trunk branch.
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
+- [ ] Create a new branch `release-v[semver]` for the release from trunk. E.g. `release-v0.17.0-beta`
 - [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.17.0-beta`
 - [ ] Release any docs updates by creating a `v[semver]` tag.
 - [ ] Trigger algolia search crawler [workflow](https://github.com/spiceai/docs/actions/workflows/trigger_search_reindex.yml), to reindex updated docs.
@@ -93,7 +96,6 @@ assignees: ''
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
 - [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
-- [ ] Create a new branch `release-v[semver]` for the next release version from the current release branch. E.g. `release-v0.17.0-beta`
 
 ## Announcement Checklist
 

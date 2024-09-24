@@ -13,6 +13,50 @@ pub enum Error {
     InvalidConfigurationNoSource { component: String, message: String },
 }
 impl Parameters {
+    fn validate_and_format_key(
+        all_params: &[ParameterSpec],
+        prefix: &'static str,
+        key: &str,
+        component_name: &str,
+    ) -> Option<String> {
+        let full_prefix = format!("{prefix}_");
+        let mut key_to_use = key;
+        let mut prefix_removed = false;
+        if key.starts_with(&full_prefix) {
+            prefix_removed = true;
+            key_to_use = &key[full_prefix.len()..];
+        }
+
+        let spec = all_params.iter().find(|p| p.name == key_to_use);
+
+        // Try again with the full key if the unprefixed key was not found
+        if spec.is_none() && all_params.iter().any(|p| p.name == key) {
+            // Early exit to avoid checks below.
+            return Some(key.to_string());
+        }
+
+        let Some(spec) = spec else {
+            tracing::warn!("Ignoring parameter {key}: not supported for {component_name}.");
+            return None;
+        };
+
+        if !prefix_removed && spec.r#type.is_prefixed() {
+            tracing::warn!(
+            "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+        );
+            return None;
+        }
+
+        if prefix_removed && !spec.r#type.is_prefixed() {
+            tracing::warn!(
+                "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
+            );
+            return None;
+        }
+
+        Some(key_to_use.to_string())
+    }
+
     pub async fn try_new(
         component_name: &str,
         params: Vec<(String, SecretString)>,
@@ -20,48 +64,25 @@ impl Parameters {
         secrets: Arc<RwLock<Secrets>>,
         all_params: &'static [ParameterSpec],
     ) -> AnyErrorResult<Self> {
-        let full_prefix = format!("{prefix}_");
-
         // Convert the user-provided parameters into the format expected by the component
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
             .filter_map(|(key, value)| {
-                let mut unprefixed_key = key.as_str();
-                let mut has_prefix = false;
-                if key.starts_with(&full_prefix) {
-                    has_prefix = true;
-                    unprefixed_key = &key[full_prefix.len()..];
-                }
-
-                let spec = all_params.iter().find(|p| p.name == unprefixed_key);
-
-                let Some(spec) = spec else {
-                    tracing::warn!("Ignoring parameter {key}: not supported for {component_name}.");
-                    return None;
-                };
-
-                if !has_prefix && spec.r#type.is_prefixed() {
-                    tracing::warn!(
-                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-                );
-                    return None;
-                }
-
-                if has_prefix && !spec.r#type.is_prefixed() {
-                    tracing::warn!(
-                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
-                );
-                    return None;
-                }
-
-                Some((unprefixed_key.to_string(), value))
+                Self::validate_and_format_key(all_params, prefix, &key, component_name)
+                    .map(|k| (k, value))
             })
             .collect();
+
         let secret_guard = secrets.read().await;
 
         // Try to autoload secrets that might be missing from params.
         for secret_key in all_params.iter().filter(|p| p.secret) {
-            let secret_key_with_prefix = format!("{prefix}_{}", secret_key.name);
+            let secret_key_with_prefix = if secret_key.name.starts_with(prefix) {
+                secret_key.name.to_string()
+            } else {
+                format!("{prefix}_{}", secret_key.name)
+            };
+
             tracing::debug!(
                 "Attempting to autoload secret for {component_name}: {secret_key_with_prefix}",
             );
@@ -91,7 +112,7 @@ impl Parameters {
 
             if parameter.required && missing {
                 let param = if parameter.r#type.is_prefixed() {
-                    format!("{full_prefix}{}", parameter.name)
+                    format!("{prefix}_{}", parameter.name)
                 } else {
                     parameter.name.to_string()
                 };
@@ -237,6 +258,7 @@ impl<'a> ExposedParamLookup<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,
@@ -328,7 +350,7 @@ impl ParameterSpec {
     }
 }
 
-#[derive(Default, Clone, Copy, PartialEq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub enum ParameterType {
     /// A parameter which tells Spice how to connect to the underlying data source.
     ///
@@ -376,5 +398,89 @@ impl ParameterType {
     #[must_use]
     pub const fn is_prefixed(self) -> bool {
         matches!(self, Self::Connector | Self::Accelerator)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_validate_and_format_key_combined() {
+        // key with prefix, parameter expects prefix.
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::connector("endpoint")],
+                "databricks",
+                "databricks_endpoint",
+                "connector databricks"
+            ),
+            Some("endpoint".to_string())
+        );
+
+        // key with wrong prefix, parameter expects prefix.
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::connector("endpoint")],
+                "not_databricks",
+                "databricks_endpoint",
+                "connector databricks"
+            ),
+            None
+        );
+
+        // key with prefix, parameter does not expect prefix.
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::runtime("endpoint")], // deliberately `runtime` not `connector`.
+                "databricks",
+                "databricks_endpoint",
+                "connector databricks"
+            ),
+            None
+        );
+
+        // key with prefix, parameter does not expect prefix. Prefix not stripped from key
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::runtime("file_format")],
+                "file",
+                "file_format",
+                "connector file"
+            ),
+            Some("file_format".to_string())
+        );
+
+        // key with prefix, parameter expects prefix. Prefix not stripped from key
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::connector("file_format")],
+                "file",
+                "file_format",
+                "connector file"
+            ),
+            Some("file_format".to_string())
+        );
+
+        // key with prefix, parameter expects prefix. Prefix stripped from key
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::connector("format")],
+                "file",
+                "file_format",
+                "connector file"
+            ),
+            Some("format".to_string())
+        );
+
+        assert_eq!(
+            Parameters::validate_and_format_key(
+                &[ParameterSpec::runtime("file_format")],
+                "not_file",
+                "file_format",
+                "accelerator not_file"
+            ),
+            Some("file_format".to_string())
+        );
     }
 }

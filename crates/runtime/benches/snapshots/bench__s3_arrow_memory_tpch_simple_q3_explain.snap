@@ -1,0 +1,22 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: select l_comment, l_partkey from lineitem order by l_linenumber desc limit 10"
+---
++---------------+-----------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                            |
++---------------+-----------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: lineitem.l_comment, lineitem.l_partkey                                                              |
+|               |   Sort: lineitem.l_linenumber DESC NULLS FIRST, fetch=10                                                        |
+|               |     Projection: lineitem.l_comment, lineitem.l_partkey, lineitem.l_linenumber                                   |
+|               |       BytesProcessedNode                                                                                        |
+|               |         TableScan: lineitem projection=[l_partkey, l_linenumber, l_comment]                                     |
+| physical_plan | ProjectionExec: expr=[l_comment@0 as l_comment, l_partkey@1 as l_partkey]                                       |
+|               |   SortPreservingMergeExec: [l_linenumber@2 DESC], fetch=10                                                      |
+|               |     SortExec: TopK(fetch=10), expr=[l_linenumber@2 DESC], preserve_partitioning=[true]                          |
+|               |       ProjectionExec: expr=[l_comment@2 as l_comment, l_partkey@0 as l_partkey, l_linenumber@1 as l_linenumber] |
+|               |         BytesProcessedExec                                                                                      |
+|               |           SchemaCastScanExec                                                                                    |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                |
+|               |               MemoryExec: partitions=1, partition_sizes=[733]                                                   |
+|               |                                                                                                                 |
++---------------+-----------------------------------------------------------------------------------------------------------------+

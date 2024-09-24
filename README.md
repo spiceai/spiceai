@@ -1,11 +1,12 @@
-# Spice.ai OSS
-
-[![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/kZnTfneP5u)
-[![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://x.com/intent/follow?screen_name=spice_ai)
-
-## What is Spice?
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/13ff4c9d-d6a7-4c20-9408-45573c508c41" alt="spice oss logo" width="600"/>
+</p>
+<p align="center">
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a> 
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a> 
+  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a> 
+  <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
+</p>
 
 **Spice** is a portable runtime offering developers a unified SQL interface to materialize, accelerate, and query data from any database, data warehouse, or data lake.
 
@@ -46,7 +47,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 |                            | Spice                              | Trino/Presto                     | Dremio                           | Clickhouse              |
 | -------------------------- | ---------------------------------- | -------------------------------- | -------------------------------- | ----------------------- |
-| Primary Use-Case           | Data & AI Applications             | Big Data Analytics               | Interative Analytics             | Real-Time Analytics     |
+| Primary Use-Case           | Data & AI Applications             | Big Data Analytics               | Interactive Analytics            | Real-Time Analytics     |
 | Typical Deployment         | Colocated with application         | Cloud Cluster                    | Cloud Cluster                    | On-Prem/Cloud Cluster   |
 | Application-to-Data System | One-to-One/Many                    | Many-to-One                      | Many-to-One                      | Many-to-One             |
 | Query Federation           | Native with query push-down        | Supported with push-down         | Supported with limited push-down | Limited                 |
@@ -62,7 +63,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance. [Predict hard drive failure with the SMART data demo](https://github.com/spiceai/demos/tree/trunk/smart-demo#spiceai-smart-demo)
 
-**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
+**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/components/data-connectors).
 
 ### FAQ
 
@@ -95,10 +96,12 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `spark`       | Spark                                                                                          | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  |
 | `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
-| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       |
+| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV, Markdown                                                                             |
 | `graphql`     | GraphQL                                                                                        | Alpha  | JSON                                                                                               |
 | `github`      | GitHub                                                                                         | Alpha  |                                                                                                    |
 | `debezium`    | Debezium CDC                                                                                   | Alpha  | Kafka + JSON                                                                                       |
+| `sharepoint`  | Microsoft SharePoint                                                                           | Alpha  | Unstructured UTF-8 documents                                                                       |
+| `mssql`       | Microsoft SQL Server                                                                           | Alpha  | Tabular Data Stream (TDS)                                                                          |
 
 ### Supported Data Stores/Accelerators
 
@@ -181,7 +184,7 @@ version: v1beta1
 kind: Spicepod
 name: spice_qs
 dependencies:
-    - spiceai/quickstart
+  - spiceai/quickstart
 ```
 
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
@@ -224,8 +227,8 @@ Time: 0.022671708 seconds. 3 rows.
 
 Enter a query to display the longest taxi trips:
 
-```bash
-sql> SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
+```sql
+SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
 ```
 
 Output:

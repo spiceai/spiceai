@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/acceleration/checkpoint_duckdb.rs
+expression: pretty
+---
++--------------+
+| dataset_name |
++--------------+
+| decimal      |
++--------------+

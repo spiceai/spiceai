@@ -41,12 +41,16 @@ pub mod flight;
 pub mod flightsql;
 #[cfg(feature = "debezium")]
 pub mod kafka;
+#[cfg(feature = "mssql")]
+pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sharepoint")]
+pub mod sharepoint;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 #[cfg(feature = "spark_connect")]

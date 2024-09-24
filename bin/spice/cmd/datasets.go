@@ -34,23 +34,16 @@ spice datasets
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
-		_, dataset_statuses, err := api.GetComponentStatuses(rtcontext)
+		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			cmd.PrintErrln(err)
 		}
 
-		datasets, err := api.GetData[api.Dataset](rtcontext, "/v1/datasets?status=true")
-		if err != nil {
-			cmd.PrintErrln(err.Error())
-		}
 		table := make([]interface{}, len(datasets))
 		for i, dataset := range datasets {
-			statusEnum, exists := dataset_statuses[dataset.Name]
-			if exists {
-				dataset.Status = statusEnum.String()
-			}
 			table[i] = dataset
 		}
+
 		util.WriteTable(table)
 	},
 }

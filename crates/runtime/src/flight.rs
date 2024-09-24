@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::query::error_code::ErrorCode;
 use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -42,7 +41,7 @@ use tokio::sync::RwLock;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
-pub mod actions;
+mod actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
@@ -164,15 +163,7 @@ impl Service {
     ) -> Result<Schema, Status> {
         let query = QueryBuilder::new(sql, datafusion, protocol).build();
 
-        let schema = match query.get_schema().await {
-            Ok(schema) => schema,
-            Err(err) => {
-                let error_code = ErrorCode::from(&err);
-                query.finish_with_error(err.to_string(), error_code).await;
-
-                return Err(handle_datafusion_error(err));
-            }
-        };
+        let schema = query.get_schema().await.map_err(handle_datafusion_error)?;
         Ok(schema)
     }
 

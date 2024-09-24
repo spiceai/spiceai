@@ -180,7 +180,7 @@ impl Chat for Openai {
 #[async_trait]
 impl Embed for Openai {
     async fn embed_request(
-        &mut self,
+        &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let mut inner_req = req.clone();
@@ -188,7 +188,7 @@ impl Embed for Openai {
         self.client.embeddings().create(inner_req).await
     }
 
-    async fn embed(&mut self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
         // Batch requests to OpenAI endpoint because "any array must be 2048 dimensions or less".
         // https://platform.openai.com/docs/api-reference/embeddings/create#embeddings-create-input
         let embed_batches = match input {

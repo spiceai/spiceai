@@ -6,10 +6,12 @@ labels: 'kind/bug'
 assignees: ''
 ---
 
-**Describe the bug**
+## Describe the bug
+
 A clear and concise description of what the bug is.
 
-**To Reproduce**
+## To Reproduce
+
 Steps to reproduce the behavior:
 
 1. Go to '...'
@@ -17,20 +19,27 @@ Steps to reproduce the behavior:
 3. Scroll down to '....'
 4. See error
 
-**Expected behavior**
+## Expected behavior
+
 A clear and concise description of what you expected to happen.
 
-**Spicepod**
+## Runtime Details
+
+### Spicepod
+
 Add the relevant `spicepod.yml` section.
 
-**Output of the `describe table`**
+### Output of the `describe table`
+
 Add any relevant `describe table` output here.
 
-**Output of `explain query`**
+### Output of `explain query`
+
 Add any relevant `explain query` output here.
 
 E.g. `explain select 1`
-```
+
+```bash
 +---------------+--------------------------------------+
 | plan_type     | plan                                 |
 +---------------+--------------------------------------+
@@ -42,19 +51,24 @@ E.g. `explain select 1`
 +---------------+--------------------------------------+
 ```
 
-**spice, spiced, OS info**
+### spice, spiced, OS info
+
 - spice version: `spice version`
 - spiced version: `spiced --version`
 - OS info: `uname -a`
 
 **Have you tried this on the latest `trunk` branch?**
 
+- [ ] Yes
+- [ ] No
+
 **If possible, run `spiced` with DEBUG log level**
+By setting the environment variable `SPICED_LOG="task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG"`
 
-By setting the environment variable `SPICED_LOG="spiced=DEBUG,runtime=DEBUG,data_components=DEBUG,cache=DEBUG"`
+## Screenshots
 
-**Screenshots**
 If applicable, add screenshots to help explain your problem.
 
-**Additional context**
+## Additional context
+
 Add any other context about the problem here.

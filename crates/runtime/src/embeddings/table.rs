@@ -92,13 +92,9 @@ impl EmbeddingTable {
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     ) -> HashMap<String, i32> {
         let mut model_sizes: HashMap<String, i32> = HashMap::new();
-        for (col, model) in embedded_columns {
-            if let Some(model_lock) = embedding_models.read().await.get(model) {
-                let z = model_lock.read().await.size();
-                model_sizes.insert(col.clone(), z);
-                tracing::debug!("Model {model} has size {z}");
-            } else {
-                tracing::debug!("Model {model} not found for column {col}");
+        for (col, model_name) in embedded_columns {
+            if let Some(model) = embedding_models.read().await.get(model_name) {
+                model_sizes.insert(col.clone(), model.size());
             }
         }
         model_sizes

@@ -21,13 +21,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::status;
 use arrow::datatypes::Schema;
 use cache::QueryResultsCacheProvider;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
-use opentelemetry::Key;
+use opentelemetry::KeyValue;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
@@ -60,6 +64,7 @@ pub struct Refresh {
     pub(crate) time_column: Option<String>,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
+    pub(crate) max_jitter: Option<Duration>,
     pub(crate) sql: Option<String>,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
@@ -68,33 +73,102 @@ pub struct Refresh {
     pub(crate) refresh_retry_max_attempts: Option<usize>,
 }
 
+/// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefreshOverrides {
+    #[serde(default, rename = "refresh_sql")]
+    pub sql: Option<String>,
+
+    #[serde(rename = "refresh_mode")]
+    pub mode: Option<RefreshMode>,
+
+    #[serde(rename = "refresh_jitter_max", deserialize_with = "parse_max_jitter")]
+    pub max_jitter: Option<Duration>,
+}
+
+fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) => fundu::parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
 impl Refresh {
     #[allow(clippy::needless_pass_by_value)]
     #[must_use]
-    pub fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        check_interval: Option<Duration>,
-        sql: Option<String>,
-        mode: RefreshMode,
-        period: Option<Duration>,
-        append_overlap: Option<Duration>,
-    ) -> Self {
+    pub fn new(mode: RefreshMode) -> Self {
         Self {
-            time_column,
-            time_format,
-            check_interval,
-            sql,
             mode,
-            period,
-            append_overlap,
             ..Default::default()
         }
     }
+
+    #[must_use]
+    pub fn time_column(mut self, time_column: String) -> Self {
+        self.time_column = Some(time_column);
+        self
+    }
+
+    #[must_use]
+    pub fn time_format(mut self, time_format: TimeFormat) -> Self {
+        self.time_format = Some(time_format);
+        self
+    }
+
+    #[must_use]
+    pub fn check_interval(mut self, check_interval: Duration) -> Self {
+        self.check_interval = Some(check_interval);
+        self
+    }
+
+    #[must_use]
+    pub fn max_jitter(mut self, max_jitter: Duration) -> Self {
+        self.max_jitter = Some(max_jitter);
+        self
+    }
+
+    #[must_use]
+    pub fn sql(mut self, sql: String) -> Self {
+        self.sql = Some(sql);
+        self
+    }
+
+    #[must_use]
+    pub fn period(mut self, period: Duration) -> Self {
+        self.period = Some(period);
+        self
+    }
+
+    #[must_use]
+    pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
+        self.append_overlap = Some(append_overlap);
+        self
+    }
+
     #[must_use]
     pub fn with_retry(mut self, enabled: bool, max_attempts: Option<usize>) -> Self {
         self.refresh_retry_enabled = enabled;
         self.refresh_retry_max_attempts = max_attempts;
+        self
+    }
+
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
+        if let Some(sql) = &overrides.sql {
+            self.sql = Some(sql.clone());
+        }
+        if let Some(mode) = overrides.mode {
+            self.mode = mode;
+        }
+        if let Some(max_jitter) = overrides.max_jitter {
+            self.max_jitter = Some(max_jitter);
+        }
         self
     }
 
@@ -197,6 +271,7 @@ impl Default for Refresh {
             time_column: None,
             time_format: None,
             check_interval: None,
+            max_jitter: None,
             sql: None,
             mode: RefreshMode::Full,
             period: None,
@@ -209,28 +284,32 @@ impl Default for Refresh {
 
 pub(crate) enum AccelerationRefreshMode {
     Disabled,
-    Full(Receiver<()>),
-    Append(Option<Receiver<()>>),
+    Full(Receiver<Option<RefreshOverrides>>),
+    Append(Option<Receiver<Option<RefreshOverrides>>>),
     Changes(ChangesStream),
 }
 
 pub struct Refresher {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: RefreshTaskRunner,
+    checkpointer: Option<Arc<DatasetCheckpoint>>,
 }
 
 impl Refresher {
     pub(crate) fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         let refresh_task_runner = RefreshTaskRunner::new(
+            Arc::clone(&runtime_status),
             dataset_name.clone(),
             Arc::clone(&federated),
             Arc::clone(&refresh),
@@ -238,12 +317,14 @@ impl Refresher {
         );
 
         Self {
+            runtime_status,
             dataset_name,
             federated,
             refresh,
             accelerator,
             cache_provider: None,
             refresh_task_runner,
+            checkpointer: None,
         }
     }
 
@@ -253,6 +334,26 @@ impl Refresher {
     ) -> &mut Self {
         self.cache_provider = cache_provider;
         self
+    }
+
+    pub fn checkpointer(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
+        self.checkpointer = checkpointer.map(Arc::new);
+        self
+    }
+
+    /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
+    fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
+        match max_jitter {
+            Some(max_jitter) if !max_jitter.is_zero() => {
+                let jitter = rand::thread_rng().gen_range(Duration::from_secs(0)..max_jitter);
+                if rand::thread_rng().gen_bool(0.5) {
+                    period + jitter
+                } else {
+                    period.saturating_sub(jitter)
+                }
+            }
+            Some(_) | None => period,
+        }
     }
 
     pub(crate) async fn start(
@@ -284,12 +385,26 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
+        let checkpointer = self.checkpointer.clone();
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
+        let max_jitter = self.refresh.read().await.max_jitter;
 
+        // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
+        // The `select!` block handle waiting on both
+        //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
+        //   2. The sleep [`future`] `scheduled_refresh_future`.
+        //
+        // Doing it in this way stops
+        //   1. Periodic and manual refreshes happening at the same time
+        //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
+        //        refresh (the sleep future is reset when a manual refresh completes).
         Some(tokio::spawn(async move {
             // first refresh is on start, thus duration is 0
-            let mut next_scheduled_refresh_timer = Some(sleep(Duration::from_secs(0)));
+            let mut next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
+                Duration::from_secs(0),
+                max_jitter,
+            )));
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
@@ -301,14 +416,21 @@ impl Refresher {
                 select! {
                     () = scheduled_refresh_future => {
                         tracing::debug!("Starting scheduled refresh");
-                        if let Err(err) = start_refresh.send(()).await {
+                        if let Err(err) = start_refresh.send(None).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
-                    _ = on_start_refresh_external.recv() => {
+                    Some(overrides_opt) = on_start_refresh_external.recv() => {
                         tracing::debug!("Received external trigger to start refresh");
 
-                        if let Err(err) = start_refresh.send(()).await {
+                        // Apply jitter on manual refreshes. For periodic refreshes, jitter
+                        // is added to the timer, `next_scheduled_refresh_timer`.
+                        let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
+                        if let Some(max_jitter) = override_jitter.or(max_jitter) {
+                            sleep(Self::compute_delay(Duration::from_secs(0), Some(max_jitter))).await;
+                        }
+
+                        if let Err(err) = start_refresh.send(overrides_opt).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
@@ -323,13 +445,24 @@ impl Refresher {
                                     .invalidate_for_table(dataset_name.clone())
                                     .await
                                 {
-                                    tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                    tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }
+                            }
+
+                            if let Some(checkpointer) = &checkpointer {
+                                if let Err(e) = checkpointer.checkpoint().await {
+                                    tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
+                                };
                             }
                         }
 
+                        // Restart periodic refresh timer (after either cron or manual dataset refresh).
+                        // For datasets with no periodic refresh, this will be a no-op.
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(sleep(refresh_check_interval));
+                            next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
+                                refresh_check_interval,
+                                max_jitter,
+                            )));
                         }
                     }
                 }
@@ -342,17 +475,19 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(RefreshTask::new(
+            Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
+
+        let refresh_defaults = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streaming_append(cache_provider, Some(ready_sender))
+                .start_streaming_append(cache_provider, Some(ready_sender), refresh_defaults)
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
@@ -366,17 +501,18 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(RefreshTask::new(
+            Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         ));
 
         let cache_provider = self.cache_provider.clone();
+        let refresh = Arc::clone(&self.refresh);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_changes_stream(changes_stream, cache_provider, Some(ready_sender))
+                .start_changes_stream(refresh, changes_stream, cache_provider, Some(ready_sender))
                 .await
             {
                 tracing::error!("Changes stream failed with error: {err}");
@@ -410,9 +546,10 @@ async fn notify_refresh_done(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let mut labels = vec![Key::from_static_str("dataset").string(dataset_name.to_string())];
-    if let Some(sql) = &refresh.read().await.sql {
-        labels.push(Key::from_static_str("sql").string(sql.to_string()));
+    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
+    let refresh_guard = refresh.read().await;
+    if let Some(sql) = &refresh_guard.sql {
+        labels.push(KeyValue::new("sql", sql.to_string()));
     };
 
     metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
@@ -438,6 +575,7 @@ mod tests {
     use super::*;
 
     async fn setup_and_test(
+        status: Arc<status::RuntimeStatus>,
         source_data: Vec<&str>,
         existing_data: Vec<&str>,
         expected_size: usize,
@@ -466,16 +604,17 @@ mod tests {
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         ) as Arc<dyn TableProvider>;
 
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
+        let refresh = Refresh::new(RefreshMode::Full);
 
         let mut refresher = Refresher::new(
+            status,
             TableReference::bare("test"),
             federated,
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
         );
 
-        let (trigger, receiver) = mpsc::channel::<()>(1);
+        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let (ready_sender, is_ready) = oneshot::channel::<()>();
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
         let refresh_handle = refresher
@@ -483,7 +622,7 @@ mod tests {
             .await;
 
         trigger
-            .send(())
+            .send(None)
             .await
             .expect("trigger sent correctly to refresh");
 
@@ -512,13 +651,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_full() {
+        let status = status::RuntimeStatus::new();
         setup_and_test(
+            Arc::clone(&status),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
         )
         .await;
         setup_and_test(
+            Arc::clone(&status),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![
                 "1970-01-01",
@@ -530,6 +672,7 @@ mod tests {
         )
         .await;
         setup_and_test(
+            Arc::clone(&status),
             vec![],
             vec![
                 "1970-01-01",
@@ -590,12 +733,14 @@ mod tests {
             .build();
         global::set_meter_provider(provider);
 
-        status::update_dataset(
+        let status = status::RuntimeStatus::new();
+        status.update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
         setup_and_test(
+            Arc::clone(&status),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
@@ -607,12 +752,12 @@ mod tests {
             status::ComponentStatus::Ready
         ));
 
-        status::update_dataset(
+        status.update_dataset(
             &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
-        setup_and_test(vec![], vec![], 0).await;
+        setup_and_test(Arc::clone(&status), vec![], vec![], 0).await;
 
         assert!(wait_until_ready_status(
             &registry,
@@ -653,24 +798,19 @@ mod tests {
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
             ) as Arc<dyn TableProvider>;
 
-            let refresh = Refresh::new(
-                Some("time_in_string".to_string()),
-                Some(TimeFormat::ISO8601),
-                None,
-                None,
-                RefreshMode::Append,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Append)
+                .time_column("time_in_string".to_string())
+                .time_format(TimeFormat::ISO8601);
 
             let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
@@ -678,7 +818,7 @@ mod tests {
                 .await;
 
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -803,24 +943,25 @@ mod tests {
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
             ) as Arc<dyn TableProvider>;
 
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                time_format,
-                None,
-                None,
-                RefreshMode::Append,
-                None,
-                append_overlap,
-            );
+            let mut refresh = Refresh::new(RefreshMode::Append).time_column("time".to_string());
+
+            if let Some(time_format) = time_format {
+                refresh = refresh.time_format(time_format);
+            }
+
+            if let Some(append_overlap) = append_overlap {
+                refresh = refresh.append_overlap(append_overlap);
+            }
 
             let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
@@ -828,7 +969,7 @@ mod tests {
                 .await;
 
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -1003,31 +1144,32 @@ mod tests {
                 MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
             ) as Arc<dyn TableProvider>;
 
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                time_format,
-                None,
-                None,
-                RefreshMode::Append,
-                None,
-                append_overlap,
-            );
+            let mut refresh = Refresh::new(RefreshMode::Append).time_column("time".to_string());
+
+            if let Some(time_format) = time_format {
+                refresh = refresh.time_format(time_format);
+            }
+
+            if let Some(append_overlap) = append_overlap {
+                refresh = refresh.append_overlap(append_overlap);
+            }
 
             let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
 
-            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher
                 .start(acceleration_refresh_mode, ready_sender)
                 .await;
             trigger
-                .send(())
+                .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
@@ -1157,7 +1299,7 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_no_time_column() {
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None, None);
+        let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
         assert!(refresh
             .validate_time_format("dataset_name".to_string(), &schema)
@@ -1166,15 +1308,8 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_time_column_not_found() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            None,
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Append).time_column("time".to_string());
+
         let schema = Arc::new(Schema::empty());
         assert!(matches!(
             refresh.validate_time_format("test_dataset".to_string(), &schema),
@@ -1190,15 +1325,9 @@ mod tests {
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
             let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
             assert!(matches!(
                 refresh.validate_time_format("test_dataset".to_string(), &schema),
@@ -1214,15 +1343,10 @@ mod tests {
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Int64,
@@ -1243,15 +1367,10 @@ mod tests {
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -1272,15 +1391,10 @@ mod tests {
             TimeFormat::Timestamp,
             TimeFormat::ISO8601,
         ] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
@@ -1295,15 +1409,10 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_iso8601_match() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            Some(TimeFormat::ISO8601),
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::ISO8601);
+
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
         assert!(refresh
             .validate_time_format("dataset_name".to_string(), &schema)
@@ -1313,15 +1422,10 @@ mod tests {
     #[test]
     fn test_validate_time_column_when_unix_timestamp_match() {
         for format in [TimeFormat::UnixMillis, TimeFormat::UnixSeconds] {
-            let refresh = Refresh::new(
-                Some("time".to_string()),
-                Some(format),
-                None,
-                None,
-                RefreshMode::Full,
-                None,
-                None,
-            );
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
                 DataType::Int64,
@@ -1335,15 +1439,10 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_timestamp_match() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            Some(TimeFormat::Timestamp),
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::Timestamp);
+
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -1356,15 +1455,10 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_timestamptz_match() {
-        let refresh = Refresh::new(
-            Some("time".to_string()),
-            Some(TimeFormat::Timestamptz),
-            None,
-            None,
-            RefreshMode::Full,
-            None,
-            None,
-        );
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::Timestamptz);
+
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
