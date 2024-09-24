@@ -1,10 +1,10 @@
 package cmd
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -108,68 +108,58 @@ spice search --cloud
 			}
 
 			line.AppendHistory(message)
-
 			done := make(chan bool)
 			go func() {
 				util.ShowSpinner(done)
 			}()
 
-			body := &SearchRequest{
-				Text:     message,
-				Datasets: searchDatasets,
-				Limit:    limit,
-			}
+			responses := make(chan *http.Response)
+			go func(out chan *http.Response) {
+				defer close(out)
+				response, err := sendSearchRequest(rtcontext, &SearchRequest{
+					Text:     message,
+					Datasets: searchDatasets,
+					Limit:    limit,
+				})
+				if err != nil {
+					cmd.Printf("Error: %v\n", err)
+					out <- nil
+				} else {
+					out <- response
+				}
+			}(responses)
 
-			response, err := sendSearchRequest(rtcontext, body)
-			if err != nil {
-				cmd.Printf("Error: %v\n", err)
+			response := <-responses
+			done <- true
+			if response == nil {
+				// Error already printed in goroutine
 				continue
 			}
 
-			scanner := bufio.NewScanner(response.Body)
+			raw, err := io.ReadAll(response.Body)
+			if err != nil {
+				cmd.Printf("Error: %v\n\n", err)
+				continue
+			}
+			var searchResponse SearchResponse = SearchResponse{}
+			err = json.Unmarshal([]byte(raw), &searchResponse)
+			if err != nil {
+				cmd.Printf("Error: %v\n\n", err)
+				continue
+			}
 
-			doneLoading := false
-
-			for scanner.Scan() {
-				chunk := scanner.Text()
-
-				if !strings.HasPrefix(chunk, "{") || !strings.HasSuffix(chunk, "}") {
-					cmd.PrintErrf("Error: %s\n", chunk)
-					continue
-				}
-
-				var searchResponse SearchResponse = SearchResponse{}
-				err = json.Unmarshal([]byte(chunk), &searchResponse)
-				if err != nil {
-					cmd.Printf("Error: %v\n\n", err)
-					continue
-				}
-
-				if !doneLoading {
-					done <- true
-					doneLoading = true
-				}
-
-				for i, match := range searchResponse.Matches {
-					cmd.Printf("Rank %d, Score: %0.1f, Datasets [%s]", i+1, match.Score*100, match.Dataset)
-					if len(match.PrimaryKey) > 0 {
-						for key, value := range match.PrimaryKey {
-							cmd.Printf(" %s=%v", key, value)
-						}
+			for i, match := range searchResponse.Matches {
+				cmd.Printf("Rank %d, Score: %0.1f, Datasets [%s]", i+1, match.Score*100, match.Dataset)
+				if len(match.PrimaryKey) > 0 {
+					for key, value := range match.PrimaryKey {
+						cmd.Printf(" %s=%v", key, value)
 					}
-					cmd.Printf("\n%s\n\n", match.Value)
 				}
-
-				matches[message] = append(matches[message], searchResponse.Matches...)
-				cmd.Printf("Time: %s. %d results.", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
+				cmd.Printf("\n%s\n\n", match.Value)
 			}
 
-			if !doneLoading {
-				done <- true
-				doneLoading = true
-			}
-
-			cmd.Print("\n\n")
+			matches[message] = append(matches[message], searchResponse.Matches...)
+			cmd.Printf("Time: %s. %d results.\n\n", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
 		}
 	},
 }
