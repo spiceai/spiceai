@@ -246,10 +246,10 @@ pub trait Chat: Sync + Send {
         if let Err(e) = self
             .chat_request(CreateChatCompletionRequest {
                 max_tokens: None,
-                messages: vec![ChatCompletionRequestMessage::System(
-                    ChatCompletionRequestSystemMessage {
-                        content: "health".to_string(),
-                        name: Some("health".to_string()),
+                messages: vec![ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        name: None,
+                        content: ChatCompletionRequestUserMessageContent::Text("health".to_string()),
                     },
                 )],
                 ..Default::default()
