@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::component::dataset::Dataset;
+use crate::dataconnector::DataConnectorError;
 use crate::model::EmbeddingModelStore;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -55,11 +56,33 @@ impl EmbeddingConnector {
             return Ok(inner_table_provider);
         }
 
+        // Runtime isn't built with model support, but user specified a dataset to use embeddings.
+        if !cfg!(feature = "models") {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: dataset.source(),
+                message: format!(
+                "Dataset '{}' expects to use an embedding model, but the runtime is not built with model support. Either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.",
+                dataset.name
+            )});
+        }
+
         let embed_columns: HashMap<String, String, _> = dataset
             .embeddings
             .iter()
             .map(|e| (e.column.clone(), e.model.clone()))
             .collect::<HashMap<_, _>>();
+
+        // Early check if embedding models are available.
+        for (column, model) in &embed_columns {
+            if !self.embedding_models.read().await.contains_key(model) {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "EmbeddingConnector".to_string(),
+                    message: format!(
+                    "Dataset '{}' expects to use embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').",
+                    dataset.name
+                )});
+            }
+        }
 
         Ok(Arc::new(
             EmbeddingTable::new(

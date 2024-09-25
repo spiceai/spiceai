@@ -45,7 +45,7 @@ jobs:
                 target_arch_go: "arm64"
               }, {
                 name: "macOS x64 (Intel)",
-                runner: "macos-12",
+                runner: "macos-13",
                 target_os: "darwin",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
@@ -1020,6 +1020,110 @@ jobs:
           with:
             fail-on-error: true
             query: "select * from spiceai.stargazers limit 10"
+    
+        - name: Stop spice and check logs
+          working-directory: test_app
+          if: always()
+          run: |
+            killall spice || true
+            cat spice.log
+
+  mssql_connector_quickstart:
+      name: 'Test MS SQL connector on ${{ matrix.target.name }}'
+      runs-on: ${{ matrix.target.runner }}
+      needs:
+        - build
+        - setup-matrix
+
+      strategy:
+          matrix:
+            target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+            # run only on "Linux x64"
+            exclude:
+              - target:
+                  target_os: "darwin"
+
+      services:
+        sqlserver:
+          image: mcr.microsoft.com/mssql/server:2019-latest
+          ports:
+            - 1433:1433
+          env:
+            ACCEPT_EULA: Y
+            SA_PASSWORD: 1StrongPwd!!
+
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Install mssql-tools
+          run: |
+            sudo apt-get update
+            sudo apt-get install -y mssql-tools unixodbc-dev
+            # echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bashrc
+            # source ~/.bashrc
+    
+        - name: Setup MS SQL test database
+          run: |
+            /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -i ./test/scripts/setup-data-mssql.sql
+
+        - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          uses: actions/download-artifact@v4
+          with:
+            name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+            path: ./build
+
+        - name: Install spice
+          uses: ./.github/actions/install-spice
+          with:
+            build-path: ./build
+
+        - name: Init spice app
+          run: |
+            spice init test_app
+
+        - name: Spice configure
+          working-directory: test_app
+          run: |
+  
+            echo "datasets:" >> spicepod.yaml
+            echo "  - from: mssql:test_mssql_table" >> spicepod.yaml
+            echo "    name: test_mssql_table" >> spicepod.yaml
+            echo "    params:" >> spicepod.yaml
+            echo "      mssql_host: localhost" >> spicepod.yaml
+            echo "      mssql_port: 1433" >> spicepod.yaml
+            echo "      mssql_database: MSSQLTestDB" >> spicepod.yaml
+            echo "      mssql_username: sa" >> spicepod.yaml
+            echo "      mssql_password: 1StrongPwd!!" >> spicepod.yaml
+            echo "      mssql_encrypt: false" >> spicepod.yaml
+            echo "      mssql_trust_server_certificate: true" >> spicepod.yaml
+            echo "    acceleration:" >> spicepod.yaml
+            echo "      enabled: true" >> spicepod.yaml
+
+            cat spicepod.yaml
+
+        - name: Start spice runtime
+          working-directory: test_app
+          run: |
+            spice run &> spice.log &
+            # time to accelerate added datasets
+            sleep 20
+
+        - name: Wait for Spice runtime healthy
+          working-directory: test_app
+          timeout-minutes: 1
+          run: |
+            while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+        
+        - name: Verify dataset
+          uses: ./.github/actions/verify-dataset
+          with:
+            name: test_mssql_table
+
+        - name: Run test query (issues)
+          uses: ./.github/actions/run-query
+          with:
+            fail-on-error: true
+            query: "select * from test_mssql_table"
     
         - name: Stop spice and check logs
           working-directory: test_app

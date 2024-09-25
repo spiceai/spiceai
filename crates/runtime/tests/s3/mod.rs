@@ -24,9 +24,12 @@ use crate::init_tracing;
 pub fn get_s3_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
     dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "parquet".to_string())]
-            .into_iter()
-            .collect(),
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
     ));
     dataset
 }

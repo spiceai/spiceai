@@ -8,15 +8,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.18.0-beta (Sep 2024)](https://github.com/spiceai/spiceai/milestone/32)
-
-- Bugfixes and performance improvements
-- Databricks DeltaLake data connector (Beta)
-- Spice Cloud Platform data connector (Beta)
-- S3 data connector (Beta)
-- ODBC Data Connector (Beta)
-- PostgreSQL data connector (Beta)
-
 ## [v1.0-rc (Sep 2024)](https://github.com/spiceai/spiceai/milestone/32)
 
 - Bugfixes and performance improvements
@@ -50,17 +41,19 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `s3`            | Stable |
 | `odbc`          | Stable |
 | `mysql`         | Stable |
+| `file`          | Stable |
 | `duckdb`        | Beta   |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |
 | `http`, `https` | Beta   |
 | `graphql`       | Beta   |
+| `github`        | Beta   |
 | `clickhouse`    | Alpha  |
 | `dremio`        | Alpha  |
 | `flightsql`     | Alpha  |
 | `debezium`      | Alpha  |
-| `github`        | Alpha  |
+| `sharepoint`    | Alpha  |
 
 ## v1.1 (Nov 2024)
 

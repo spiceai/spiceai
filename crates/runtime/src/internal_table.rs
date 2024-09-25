@@ -22,7 +22,7 @@ use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::Retention;
+use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
 use crate::secrets::Secrets;
@@ -55,6 +55,11 @@ pub enum Error {
     Internal {
         code: String,
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to build accelerated table: {source}"))]
+    UnableToBuildAcceleratedTable {
+        source: AcceleratedTableBuilderError,
     },
 }
 
@@ -113,7 +118,10 @@ pub async fn create_internal_accelerated_table(
 
     builder.retention(retention);
 
-    let (accelerated_table, _) = builder.build().await;
+    let (accelerated_table, _) = builder
+        .build()
+        .await
+        .context(UnableToBuildAcceleratedTableSnafu)?;
 
     Ok(Arc::new(accelerated_table))
 }

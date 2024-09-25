@@ -31,13 +31,12 @@ use crate::{init_tracing, wait_until_true};
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
-    use std::sync::Arc;
-
-    use runtime::status;
-
     use crate::get_test_datafusion;
     use crate::postgres::common;
+    use runtime::status;
+    use std::sync::Arc;
 
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
     let port: usize = 20962;
     let running_container = common::start_postgres_docker_container(port).await?;
@@ -180,34 +179,33 @@ CREATE TABLE test (
         "Expected 1 rows returned"
     );
 
-    // Re-enable with https://github.com/spiceai/spiceai/issues/2550
-    // let plan_results = rt
-    //     .datafusion()
-    //     .ctx
-    //     .sql("EXPLAIN SELECT COUNT(1) FROM abc")
-    //     .await
-    //     .expect("sql working")
-    //     .collect()
-    //     .await
-    //     .expect("collect working");
+    let plan_results = rt
+        .datafusion()
+        .ctx
+        .sql("EXPLAIN SELECT COUNT(1) FROM abc")
+        .await
+        .expect("sql working")
+        .collect()
+        .await
+        .expect("collect working");
 
-    // let expected_plan = [
-    //     "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    //     "| plan_type     | plan                                                                                                                                                                           |",
-    //     "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    //     "| logical_plan  | BytesProcessedNode                                                                                                                                                             |",
-    //     "|               |   Federated                                                                                                                                                                    |",
-    //     "|               |  Projection: count(Int64(1))                                                                                                                                                   |",
-    //     "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                            |",
-    //     "|               |     TableScan: abc                                                                                                                                                             |",
-    //     "| physical_plan | BytesProcessedExec                                                                                                                                                             |",
-    //     "|               |   SchemaCastScanExec                                                                                                                                                           |",
-    //     "|               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
-    //     "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
-    //     "|               |                                                                                                                                                                                |",
-    //     "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    // ];
-    // assert_batches_eq!(expected_plan, &plan_results);
+    let expected_plan = [
+        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                                                                                                                           |",
+        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| logical_plan  | BytesProcessedNode                                                                                                                                                             |",
+        "|               |   Federated                                                                                                                                                                    |",
+        "|               |  Projection: count(Int64(1))                                                                                                                                                   |",
+        "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                            |",
+        "|               |     TableScan: abc                                                                                                                                                             |",
+        "| physical_plan | BytesProcessedExec                                                                                                                                                             |",
+        "|               |   SchemaCastScanExec                                                                                                                                                           |",
+        "|               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |",
+        "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, sql=SELECT count(1) FROM abc rewritten_sql=SELECT count(1) FROM \"abc\" |",
+        "|               |                                                                                                                                                                                |",
+        "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+    ];
+    assert_batches_eq!(expected_plan, &plan_results);
 
     let plan_results = rt
         .datafusion()

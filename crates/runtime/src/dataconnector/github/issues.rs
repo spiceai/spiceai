@@ -59,12 +59,7 @@ impl GitHubTableArgs for IssuesTableArgs {
             name = self.repo
         );
 
-        GitHubTableGraphQLParams::new(
-            query.into(),
-            "/data/repository/issues/nodes".into(),
-            2,
-            Some(gql_schema()),
-        )
+        GitHubTableGraphQLParams::new(query.into(), None, 2, Some(gql_schema()))
     }
 }
 

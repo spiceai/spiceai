@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::AcceleratedTableBuilderError;
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
@@ -76,6 +77,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("When processing the acceleration registration: {source}"))]
+    AccelerationRegistration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
@@ -197,6 +203,11 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
+
+    #[snafu(display("Unable to build accelerated table: {source}"))]
+    UnableToBuildAcceleratedTable {
+        source: AcceleratedTableBuilderError,
+    },
 }
 
 pub enum Table {
@@ -222,6 +233,7 @@ pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
+    accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
@@ -306,6 +318,7 @@ impl DataFusion {
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
+            accelerated_tables: TokioRwLock::new(HashSet::new()),
         }
     }
 
@@ -476,6 +489,14 @@ impl DataFusion {
         }
     }
 
+    #[must_use]
+    pub async fn is_accelerated(&self, table_reference: &TableReference) -> bool {
+        self.accelerated_tables
+            .read()
+            .await
+            .contains(table_reference)
+    }
+
     async fn get_table_provider(
         &self,
         table_reference: &TableReference,
@@ -634,7 +655,7 @@ impl DataFusion {
         self.ctx.catalog(catalog).is_some()
     }
 
-    pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
+    pub async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -651,6 +672,10 @@ impl DataFusion {
                 .write()
                 .map_err(|_| Error::UnableToLockDataWriters {})?
                 .remove(dataset_name);
+        }
+
+        if self.is_accelerated(dataset_name).await {
+            self.accelerated_tables.write().await.remove(dataset_name);
         }
 
         Ok(())
@@ -784,7 +809,10 @@ impl DataFusion {
             };
         }
 
-        Ok(accelerated_table_builder.build().await)
+        accelerated_table_builder
+            .build()
+            .await
+            .context(UnableToBuildAcceleratedTableSnafu)
     }
 
     pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
@@ -802,9 +830,14 @@ impl DataFusion {
         federated_read_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
-        let (accelerated_table, _) = self
+        let (mut accelerated_table, _) = self
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
+
+        source
+            .on_accelerated_table_registration(&dataset, &mut accelerated_table)
+            .await
+            .context(AccelerationRegistrationSnafu)?;
 
         self.ctx
             .register_table(
@@ -819,6 +852,11 @@ impl DataFusion {
 
         self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
+
+        self.accelerated_tables
+            .write()
+            .await
+            .insert(dataset.name.clone());
 
         Ok(())
     }

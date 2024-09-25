@@ -5,5 +5,5 @@ expression: pretty
 +--------------+
 | dataset_name |
 +--------------+
-| taxi_trips   |
+| decimal      |
 +--------------+

@@ -63,7 +63,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance. [Predict hard drive failure with the SMART data demo](https://github.com/spiceai/demos/tree/trunk/smart-demo#spiceai-smart-demo)
 
-**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
+**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/components/data-connectors).
 
 ### FAQ
 
@@ -101,6 +101,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `github`      | GitHub                                                                                         | Alpha  |                                                                                                    |
 | `debezium`    | Debezium CDC                                                                                   | Alpha  | Kafka + JSON                                                                                       |
 | `sharepoint`  | Microsoft SharePoint                                                                           | Alpha  | Unstructured UTF-8 documents                                                                       |
+| `mssql`       | Microsoft SQL Server                                                                           | Alpha  | Tabular Data Stream (TDS)                                                                          |
 
 ### Supported Data Stores/Accelerators
 

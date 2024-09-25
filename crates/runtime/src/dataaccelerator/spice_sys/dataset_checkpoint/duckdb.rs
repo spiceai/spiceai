@@ -20,24 +20,7 @@ use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 impl DatasetCheckpoint {
-    #[expect(dead_code)]
-    pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
-        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
-            .get_underlying_conn_mut();
-
-        let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
-        let mut stmt = duckdb_conn.prepare(&query).map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query([&self.dataset_name])
-            .map_err(|e| e.to_string())?;
-
-        Ok(rows.next().map_err(|e| e.to_string())?.is_some())
-    }
-
-    #[expect(dead_code)]
-    pub(super) fn checkpoint_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+    pub(super) fn init_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(|e| e.to_string())?
@@ -53,6 +36,30 @@ impl DatasetCheckpoint {
         duckdb_conn
             .execute(&create_table, [])
             .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(|e| e.to_string())?
+            .get_underlying_conn_mut();
+
+        let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
+        let mut stmt = duckdb_conn.prepare(&query).map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query([&self.dataset_name])
+            .map_err(|e| e.to_string())?;
+
+        Ok(rows.next().map_err(|e| e.to_string())?.is_some())
+    }
+
+    pub(super) fn checkpoint_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(|e| e.to_string())?
+            .get_underlying_conn_mut();
 
         let upsert = format!(
             "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at)
@@ -78,15 +85,14 @@ mod tests {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
         );
+        DatasetCheckpoint::init_duckdb(&pool).expect("Failed to initialize DuckDB");
         DatasetCheckpoint {
             dataset_name: "test_dataset".to_string(),
             acceleration_connection: AccelerationConnection::DuckDB(pool),
         }
     }
 
-    // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
     #[tokio::test]
-    #[ignore]
     async fn test_duckdb_checkpoint_exists() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 
@@ -103,9 +109,7 @@ mod tests {
         assert!(checkpoint.exists().await);
     }
 
-    // Disabled until https://github.com/spiceai/spiceai/pull/2669 is merged
     #[tokio::test]
-    #[ignore]
     async fn test_duckdb_checkpoint_update() {
         let checkpoint = create_in_memory_duckdb_checkpoint();
 

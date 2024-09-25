@@ -89,7 +89,7 @@ pub(crate) async fn setup_benchmark(
 
 async fn runtime_ready_check(rt: &Runtime) {
     assert!(
-        wait_until_true(Duration::from_secs(200), || async {
+        wait_until_true(Duration::from_secs(300), || async {
             rt.status().is_ready()
         })
         .await
@@ -250,6 +250,24 @@ fn get_accelerator_indexes(
                     let mut indexes: HashMap<String, IndexType> = HashMap::new();
                     indexes.insert("c_phone".to_string(), IndexType::Enabled);
                     indexes.insert("c_acctbal".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                _ => None,
+            },
+            "postgres" => match dataset {
+                "partsupp" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "part" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("p_partkey".to_string(), IndexType::Enabled);
+                    Some(indexes)
+                }
+                "lineitem" => {
+                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                    indexes.insert("l_partkey".to_string(), IndexType::Enabled);
                     Some(indexes)
                 }
                 _ => None,

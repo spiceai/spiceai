@@ -16,8 +16,9 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::sharepoint::client::SharepointClient;
+use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
+use document_parse::DocumentParser;
 use graph_rs_sdk::{
     identity::{
         AuthorizationCodeCredential, ConfidentialClientApplication, PublicClientApplication,
@@ -78,7 +79,8 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(auth_code)) => {
+            (Some(_) | None, Some(auth_code)) => {
+                tracing::warn!("Both `params.client_secret` and `params.auth_code` are provided. Using `params.auth_code`.");
                 // Must match the redirect URL used in `spice login sharepoint...`.
                 let redirect_url = Url::parse("http://localhost:8091")
                     .boxed()
@@ -98,16 +100,22 @@ impl Sharepoint {
                     source: "either 'client_secret' or 'auth_code' must be provided".into(),
                 })
             }
-            (Some(_), Some(_)) => {
-                return Err(Error::InvalidParameters {
-                    source: "both 'client_secret' and 'auth_code' cannot be provided".into(),
-                })
-            }
         };
 
         Ok(Sharepoint {
             client: Arc::new(graph_client),
         })
+    }
+
+    async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
+        let file_format = dataset.params.get("file_format")?;
+
+        document_parse::get_parser_factory(file_format)
+            .await
+            .map(|factory| {
+                // TODO: add opts.
+                factory.default()
+            })
     }
 }
 
@@ -131,6 +139,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("auth_code").secret(),
     ParameterSpec::connector("tenant_id").secret().required(),
     ParameterSpec::connector("client_secret").secret(),
+    ParameterSpec::runtime("file_format"),
 ];
 
 impl DataConnectorFactory for SharepointFactory {
@@ -160,14 +169,17 @@ impl DataConnector for Sharepoint {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from, true)
+        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
             })?;
-
-        Ok(Arc::new(client))
+        Ok(Arc::new(SharepointTableProvider::new(
+            client,
+            true,
+            self.get_formatter(dataset).await,
+        )))
     }
 
     async fn metadata_provider(
@@ -178,14 +190,18 @@ impl DataConnector for Sharepoint {
             return None;
         }
 
-        match SharepointClient::new(Arc::clone(&self.client), &dataset.from, false)
+        match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
             }) {
-            Err(e) => Some(Err(e)),
-            Ok(client) => Some(Ok(Arc::new(client))),
+            Ok(client) => Some(Ok(Arc::new(SharepointTableProvider::new(
+                client,
+                false,
+                self.get_formatter(dataset).await,
+            )))),
+            Err(e) => return Some(Err(e)),
         }
     }
 }

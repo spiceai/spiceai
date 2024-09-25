@@ -14,20 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use base64::{engine::general_purpose, Engine as _};
 use snafu::prelude::*;
+use std::io::Write;
 use std::str::FromStr;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load system TLS certificate: {source}"))]
-    FailedToLoadCerts { source: std::io::Error },
+    #[snafu(display("Unable to load all system TLS certificates: {errors:?}"))]
+    FailedToLoadCerts {
+        errors: Vec<rustls_native_certs::Error>,
+    },
 
     #[snafu(display("Unable to convert PEMs to string: {source}"))]
     FailedToConvertPems { source: std::string::FromUtf8Error },
 
     #[snafu(display("Unable to connect to endpoint: {source}"))]
     UnableToConnectToEndpoint { source: tonic::transport::Error },
+
+    #[snafu(display("IO error: {source}"))]
+    Io { source: std::io::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -39,22 +46,24 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///     - It couldn't convert the PEMs to a string.
 pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     // Load root certificates found in the platform's native certificate store.
-    let certs = rustls_native_certs::load_native_certs().context(FailedToLoadCertsSnafu)?;
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        return Err(Error::FailedToLoadCerts {
+            errors: cert_result.errors,
+        });
+    }
 
-    let concatenated_pems = certs
-        .iter()
-        .filter_map(|cert| {
-            let mut buf = cert.as_ref();
-            rustls_pemfile::certs(&mut buf)
-                .filter_map(Result::ok)
-                .last()
-                .map(|cert| cert.to_vec())
-        })
-        .map(String::from_utf8)
-        .collect::<Result<String, _>>()
-        .context(FailedToConvertPemsSnafu)?;
+    let mut pem = Vec::new();
+    for cert in cert_result.certs {
+        pem.write_all(b"-----BEGIN CERTIFICATE-----\n")
+            .context(IoSnafu)?;
+        pem.write_all(general_purpose::STANDARD.encode(cert.as_ref()).as_bytes())
+            .context(IoSnafu)?;
+        pem.write_all(b"\n-----END CERTIFICATE-----\n")
+            .context(IoSnafu)?;
+    }
 
-    Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
+    Ok(tonic::transport::Certificate::from_pem(pem))
 }
 
 /// # Errors

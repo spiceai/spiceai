@@ -28,10 +28,12 @@ use {
 use {
     super::duckdb::DuckDBAccelerator,
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-    duckdb::AccessMode,
 };
 #[cfg(feature = "sqlite")]
-use {super::sqlite::SqliteAccelerator, tokio_rusqlite::Connection};
+use {
+    super::sqlite::SqliteAccelerator,
+    datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
+};
 
 use super::get_accelerator_engine;
 use crate::component::dataset::{acceleration::Engine, Dataset};
@@ -46,7 +48,7 @@ enum AccelerationConnection {
     #[cfg(feature = "postgres")]
     Postgres(PostgresConnectionPool),
     #[cfg(feature = "sqlite")]
-    SQLite(Connection),
+    SQLite(SqliteConnectionPool),
 }
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -77,7 +79,9 @@ async fn acceleration_connection(
                 return Err("DuckDB file does not exist.".into());
             }
 
-            let pool = DuckDbConnectionPool::new_file(&duckdb_file, &AccessMode::ReadWrite)
+            let pool = duckdb_accelerator
+                .get_shared_pool(dataset)
+                .await
                 .map_err(|e| e.to_string())?;
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
@@ -101,7 +105,7 @@ async fn acceleration_connection(
                 return Err("Sqlite file does not exist.".into());
             }
 
-            let conn = Connection::open(sqlite_file).await.map_err(Box::new)?;
+            let conn = sqlite_accelerator.get_shared_pool(dataset).await?;
 
             Ok(AccelerationConnection::SQLite(conn))
         }

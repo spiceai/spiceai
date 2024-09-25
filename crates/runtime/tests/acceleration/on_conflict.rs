@@ -34,6 +34,7 @@ use super::get_params;
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let port: usize = 20963;
     let running_container = common::start_postgres_docker_container(port).await?;
 
@@ -105,23 +106,22 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
         "duckdb",
     );
 
-    let duckdb_upsert_file_path = random_db_name();
+    let duckdb_file_path = random_db_name();
     let duckdb_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Upsert,
         "postgres:event_logs",
         "duckdb_file_on_conflict_upsert",
-        Some(duckdb_upsert_file_path.clone()),
+        Some(duckdb_file_path.clone()),
         port,
         Mode::File,
         "duckdb",
     );
 
-    let duckdb_drop_file_path = random_db_name();
     let duckdb_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
         OnConflictBehavior::Drop,
         "postgres:event_logs",
         "duckdb_file_on_conflict_drop",
-        Some(duckdb_drop_file_path.clone()),
+        Some(duckdb_file_path.clone()),
         port,
         Mode::File,
         "duckdb",
@@ -277,8 +277,7 @@ WHERE event_name = 'File Download'
     assert_batches_eq!(drop_expected_result, &sqlite_file_drop_data);
 
     running_container.remove().await?;
-    std::fs::remove_file(&duckdb_upsert_file_path).expect("File should be removed");
-    std::fs::remove_file(&duckdb_drop_file_path).expect("File should be removed");
+    std::fs::remove_file(&duckdb_file_path).expect("File should be removed");
     std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
     std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");
     std::fs::remove_file(format!("{sqlite_upsert_file_path}-shm")).expect("File should be removed");

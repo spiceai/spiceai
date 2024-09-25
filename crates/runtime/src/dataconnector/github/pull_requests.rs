@@ -68,12 +68,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
             name = self.repo,
         );
 
-        GitHubTableGraphQLParams::new(
-            query.into(),
-            "/data/repository/pullRequests/nodes".into(),
-            1,
-            Some(gql_schema()),
-        )
+        GitHubTableGraphQLParams::new(query.into(), None, 1, Some(gql_schema()))
     }
 }
 

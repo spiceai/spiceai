@@ -103,6 +103,9 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
 
 #[tokio::test]
 async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("refresh_sql_override_append")
         .with_dataset(make_spiceai_dataset(
@@ -114,7 +117,12 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
 
     let rt = Runtime::builder().with_app(app).build().await;
 
-    rt.load_components().await;
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            panic!("Timeout waiting for components to load");
+        }
+        () = rt.load_components() => {}
+    }
 
     let query = rt
         .datafusion()

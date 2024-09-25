@@ -24,7 +24,7 @@ use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
-use ::opentelemetry::Key;
+use ::opentelemetry::KeyValue;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use builder::RuntimeBuilder;
@@ -35,7 +35,6 @@ use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
 use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
@@ -245,9 +244,6 @@ pub enum Error {
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
-
-    #[snafu(display("Unable to track query history: {source}"))]
-    UnableToTrackQueryHistory { source: query_history::Error },
 
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
@@ -459,8 +455,8 @@ impl Runtime {
 
         let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
             Box::pin(async {
-                if let Err(err) = self.init_query_history().await {
-                    tracing::warn!("Creating internal query history table: {err}");
+                if let Err(err) = self.init_task_history().await {
+                    tracing::warn!("Creating internal task history table: {err}");
                 };
             }),
             Box::pin(self.init_results_cache()),
@@ -469,7 +465,6 @@ impl Runtime {
         ];
 
         if cfg!(feature = "models") {
-            self.load_tools().await; // Load tools before loading models.
             futures.push(Box::pin(self.load_models()));
         }
 
@@ -976,7 +971,7 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::datasets::COUNT.add(1, &[Key::from_static_str("engine").string(engine)]);
+                metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
                 Ok(())
             }
@@ -1006,7 +1001,7 @@ impl Runtime {
                     .await;
             }
 
-            if let Err(e) = self.df.remove_table(&ds.name) {
+            if let Err(e) = self.df.remove_table(&ds.name).await {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
@@ -1023,7 +1018,7 @@ impl Runtime {
                 }
             },
         );
-        metrics::datasets::COUNT.add(-1, &[Key::from_static_str("engine").string(engine)]);
+        metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
     }
 
     async fn update_dataset(&self, ds: Arc<Dataset>) {
@@ -1286,8 +1281,9 @@ impl Runtime {
                         metrics::embeddings::COUNT.add(
                             1,
                             &[
-                                Key::from_static_str("embeddings").string(in_embed.name.clone()),
-                                Key::from_static_str("source").string(
+                                KeyValue::new("embeddings", in_embed.name.clone()),
+                                KeyValue::new(
+                                    "source",
                                     in_embed
                                         .get_prefix()
                                         .map(|x| x.to_string())
@@ -1314,6 +1310,9 @@ impl Runtime {
     }
 
     async fn load_models(&self) {
+        // Load tools before loading models.
+        self.load_tools().await;
+
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
@@ -1353,8 +1352,7 @@ impl Runtime {
                 let mut tools_map = self.tools.write().await;
                 tools_map.insert(tool.name.clone(), t);
                 tracing::info!("Tool [{}] ready to use", tool.name);
-                metrics::tools::COUNT
-                    .add(1, &[Key::from_static_str("tool").string(tool.name.clone())]);
+                metrics::tools::COUNT.add(1, &[KeyValue::new("tool", tool.name.clone())]);
                 self.status
                     .update_tool(&tool.name, status::ComponentStatus::Ready);
             }
@@ -1379,8 +1377,8 @@ impl Runtime {
         let _guard = TimeMeasurement::new(
             &metrics::models::LOAD_DURATION_MS,
             &[
-                Key::from_static_str("model").string(m.name.clone()),
-                Key::from_static_str("source").string(source_str.clone()),
+                KeyValue::new("model", m.name.clone()),
+                KeyValue::new("source", source_str.clone()),
             ],
         );
 
@@ -1438,8 +1436,8 @@ impl Runtime {
                 metrics::models::COUNT.add(
                     1,
                     &[
-                        Key::from_static_str("model").string(m.name.clone()),
-                        Key::from_static_str("source").string(source_str),
+                        KeyValue::new("model", m.name.clone()),
+                        KeyValue::new("source", source_str),
                     ],
                 );
                 self.status
@@ -1472,8 +1470,8 @@ impl Runtime {
         metrics::models::COUNT.add(
             -1,
             &[
-                Key::from_static_str("model").string(m.name.clone()),
-                Key::from_static_str("source").string(source_str),
+                KeyValue::new("model", m.name.clone()),
+                KeyValue::new("source", source_str),
             ],
         );
     }
@@ -1627,23 +1625,44 @@ impl Runtime {
         };
     }
 
-    pub async fn init_query_history(&self) -> Result<()> {
-        let query_history_table_reference = TableReference::partial(
-            SPICE_RUNTIME_SCHEMA,
-            query_history::DEFAULT_QUERY_HISTORY_TABLE,
-        );
+    pub async fn init_task_history(&self) -> Result<()> {
+        let app = self.app.read().await;
 
-        match query_history::instantiate_query_history_table(self.status()).await {
-            Ok(table) => {
-                let _ = self
-                    .df
-                    .register_runtime_table(query_history_table_reference, table)
-                    .context(UnableToCreateBackendSnafu);
+        if let Some(app) = app.as_ref() {
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled via configuration.");
+                return Ok(());
             }
-            Err(err) => return Err(Error::UnableToTrackQueryHistory { source: err }),
+        }
+
+        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
+            Some(app) => (
+                app.runtime
+                    .task_history
+                    .retention_period_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
+                    })?,
+                app.runtime
+                    .task_history
+                    .retention_check_interval_as_secs()
+                    .map_err(|e| Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::InvalidConfiguration { source: e },
+                    })?,
+            ),
+            None => (
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
+                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
+            ),
         };
 
-        match task_history::TaskSpan::instantiate_table(self.status()).await {
+        match task_history::TaskSpan::instantiate_table(
+            self.status(),
+            retention_period_secs,
+            retention_check_interval_secs,
+        )
+        .await
+        {
             Ok(table) => self
                 .df
                 .register_runtime_table(
