@@ -288,26 +288,30 @@ fn build_odbc_reader<C: Cursor>(
     let mut builder = OdbcReaderBuilder::new();
     builder.with_schema(Arc::clone(schema));
 
-    let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize)| {
+    let bind_as_usize = |k: &str, default: Option<usize>, f: &mut dyn FnMut(usize)| {
         params
             .get(k)
             .map(Secret::expose_secret)
             .cloned()
             .and_then(|s| s.parse::<usize>().ok())
+            .or(default)
             .into_iter()
             .for_each(f);
     };
 
-    bind_as_usize("max_binary_size", &mut |s| {
+    bind_as_usize("max_binary_size", None, &mut |s| {
         builder.with_max_binary_size(s);
     });
-    bind_as_usize("max_text_size", &mut |s| {
+    bind_as_usize("max_text_size", None, &mut |s| {
         builder.with_max_text_size(s);
     });
-    bind_as_usize("max_bytes_per_batch", &mut |s| {
+    bind_as_usize("max_bytes_per_batch", Some(512_000_000), &mut |s| {
         builder.with_max_bytes_per_batch(s);
     });
-    bind_as_usize("max_num_rows_per_batch", &mut |s| {
+
+    // larger default max_num_rows_per_batch reduces IO overhead but increases memory usage
+    // lower numbers reduce memory usage but increase IO overhead
+    bind_as_usize("max_num_rows_per_batch", Some(4000), &mut |s| {
         builder.with_max_num_rows_per_batch(s);
     });
 
