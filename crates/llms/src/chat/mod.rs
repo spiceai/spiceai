@@ -249,7 +249,9 @@ pub trait Chat: Sync + Send {
                 messages: vec![ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
                         name: None,
-                        content: ChatCompletionRequestUserMessageContent::Text("health".to_string()),
+                        content: ChatCompletionRequestUserMessageContent::Text(
+                            "health".to_string(),
+                        ),
                     },
                 )],
                 ..Default::default()
