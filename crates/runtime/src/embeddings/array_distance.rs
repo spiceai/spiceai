@@ -521,8 +521,29 @@ mod tests {
         execution::context::SessionContext,
         logical_expr::{ColumnarValue, ScalarUDF},
     };
+    use itertools::Itertools;
 
     use super::ArrayDistance;
+
+    fn create_fixed_size_list_array(
+        values: Vec<Vec<f32>>,
+        is_f32: bool,
+    ) -> FixedSizeListArray {
+        let size = values.first().map(|v| v.len()).unwrap_or_default();
+        let flattened = values.into_iter().flat_map(|x| x).collect_vec();
+        
+        let (arr, fields): (ArrayRef, Arc<Field>) = if is_f32 {
+            let arr = Arc::new(Float32Array::try_new(flattened.into(), None).unwrap());
+            let field = Arc::new(Field::new("item", DataType::Float32, false));
+            (arr, field)
+        } else {
+            let v: Vec<f64> = flattened.iter().map(|x| *x as f64).collect();
+            let arr = Arc::new(Float64Array::try_new(v.into(), None).unwrap());
+            let field = Arc::new(Field::new("item", DataType::Float64, false));
+            (arr, field)
+        };
+        FixedSizeListArray::try_new(fields, size as i32, arr, None).unwrap()
+    }
 
     #[allow(clippy::float_cmp)]
     #[tokio::test]
@@ -531,20 +552,12 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let field = Arc::new(Field::new("item", DataType::Float32, false));
-        let values = Float32Array::try_new(
-            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
-            None,
-        )?;
-
-        let list_array =
-            FixedSizeListArray::try_new(Arc::clone(&field), 3_i32, Arc::new(values), None)?;
-
-        let arc_list = Arc::new(list_array) as Arc<dyn Array>;
-
+        let l1 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
+        let l2 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
+        
         let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&arc_list)),
-            ColumnarValue::Array(Arc::clone(&arc_list)),
+            ColumnarValue::Array(Arc::clone(&l1)),
+            ColumnarValue::Array(Arc::clone(&l2)),
         ])?;
 
         let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
@@ -567,29 +580,12 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let f32 = FixedSizeListArray::try_new(
-            Arc::clone(&Arc::new(Field::new("item", DataType::Float32, false))),
-            3_i32,
-            Arc::new(Float32Array::try_new(
-                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
-                None,
-            )?),
-            None,
-        )?;
-
-        let f64 = FixedSizeListArray::try_new(
-            Arc::clone(&Arc::new(Field::new("item", DataType::Float64, false))),
-            3_i32,
-            Arc::new(Float64Array::try_new(
-                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
-                None,
-            )?),
-            None,
-        )?;
-
+        let f32 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
+        let f64 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], false)) as Arc<dyn Array>; 
+        
         let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&Arc::new(f32)) as ArrayRef),
-            ColumnarValue::Array(Arc::clone(&Arc::new(f64)) as ArrayRef),
+            ColumnarValue::Array(Arc::clone(&f32)),
+            ColumnarValue::Array(Arc::clone(&f64)),
         ])?;
 
         let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
@@ -612,20 +608,12 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let field = Arc::new(Field::new("item", DataType::Float64, false));
-        let values = Float64Array::try_new(
-            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
-            None,
-        )?;
-
-        let list_array =
-            FixedSizeListArray::try_new(Arc::clone(&field), 3_i32, Arc::new(values), None)?;
-
-        let arc_list = Arc::new(list_array) as Arc<dyn Array>;
-
+        let l1 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], false)) as Arc<dyn Array>; 
+        let l2 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], false)) as Arc<dyn Array>; 
+        
         let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&arc_list)),
-            ColumnarValue::Array(Arc::clone(&arc_list)),
+            ColumnarValue::Array(Arc::clone(&l1)),
+            ColumnarValue::Array(Arc::clone(&l2)),
         ])?;
 
         let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
@@ -648,16 +636,8 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let field = Arc::new(Field::new("item", DataType::Float32, false));
-        let values = Float32Array::try_new(
-            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].into(),
-            None,
-        )?;
-
-        let list_array =
-            FixedSizeListArray::try_new(Arc::clone(&field), 3_i32, Arc::new(values), None)?;
-
-        let arc_array = Arc::new(list_array) as Arc<dyn Array>;
+        
+        let l1 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
 
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
         let field2 = Arc::new(Field::new("item", DataType::Float64, true));
@@ -672,7 +652,7 @@ mod tests {
         )) as Arc<dyn Array>;
 
         let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&arc_array)),
+            ColumnarValue::Array(Arc::clone(&l1)),
             ColumnarValue::Array(Arc::clone(&list)),
         ])?;
 
