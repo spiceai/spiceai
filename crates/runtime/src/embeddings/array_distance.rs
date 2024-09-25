@@ -15,9 +15,12 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array},
+    array::{
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
+    },
+    buffer::OffsetBuffer,
     compute::{binary, cast, sum},
-    datatypes::{ArrowPrimitiveType, DataType, Float64Type},
+    datatypes::{ArrowPrimitiveType, DataType, Float32Type, Float64Type},
 };
 
 use arrow_schema::Field;
@@ -185,17 +188,13 @@ impl VectorBatchType {
         matches!(dtype, DataType::Float32) || matches!(dtype, DataType::Float64)
     }
 
-    /// Returns true if the [`VectorBatchType`] is a single vector. 
+    /// Returns true if the [`VectorBatchType`] is a single vector.
     fn is_single_vector(&self) -> bool {
-        matches!(
-            self,
-            Self::FixedVectors { .. } | Self::ListVectors { .. }
-        )
+        matches!(self, Self::FixedVectors { .. } | Self::ListVectors { .. })
     }
 
     /// Returns the [`ScalarUDFImpl::return_type`] for the [`ArrayDistance`] UDF. If None, the two [`VectorBatchType`]s are incompatible.
     pub fn array_distance_return_type(&self, other: &VectorBatchType) -> Result<DataType, String> {
-        println!("array_distance_return_type||self: {:?}, other: {:?}", self, other);
         match (self, other) {
             (
                 Self::FixedVectors {
@@ -213,7 +212,8 @@ impl VectorBatchType {
                     ));
                 }
                 Ok((&s1.array_distance_scalar_type(s2)).into())
-            }, (
+            }
+            (
                 Self::ListOfFixedVectors {
                     scalar_type: s1,
                     size: len1,
@@ -223,18 +223,13 @@ impl VectorBatchType {
                     scalar_type: s2,
                     size: len2,
                     ..
-                },
-            ) | (
-                Self::ListOfFixedVectors {
-                    scalar_type: s1,
-                    size: len1,
-                    ..
-                },
-                Self::FixedVectors {
+                }
+                | Self::FixedVectors {
                     scalar_type: s2,
                     size: len2,
                 },
-            ) | (
+            )
+            | (
                 Self::FixedVectors {
                     scalar_type: s1,
                     size: len1,
@@ -250,19 +245,24 @@ impl VectorBatchType {
                         "FixedVectors must have the same length, found {len1}!={len2}."
                     ));
                 }
-                let inner_type: DataType = (&s1.array_distance_scalar_type(s2)).into(); 
-                Ok(DataType::List(Arc::new(Field::new("item", inner_type, true))))
-            },
-            (Self::FixedVectors {
-                scalar_type: s1,
-                ..
-            }, Self::ListOfListVectors {
-                scalar_type: s2,
-                ..
-            }) => {
-                let inner_type: DataType = (&s1.array_distance_scalar_type(s2)).into(); 
-                Ok(DataType::List(Arc::new(Field::new("item", inner_type, true))))
-            },
+                let inner_type: DataType = (&s1.array_distance_scalar_type(s2)).into();
+                Ok(DataType::List(Arc::new(Field::new(
+                    "item", inner_type, true,
+                ))))
+            }
+            (
+                Self::FixedVectors {
+                    scalar_type: s1, ..
+                },
+                Self::ListOfListVectors {
+                    scalar_type: s2, ..
+                },
+            ) => {
+                let inner_type: DataType = (&s1.array_distance_scalar_type(s2)).into();
+                Ok(DataType::List(Arc::new(Field::new(
+                    "item", inner_type, true,
+                ))))
+            }
             (
                 Self::FixedVectors {
                     scalar_type: s1, ..
@@ -280,7 +280,7 @@ impl VectorBatchType {
                 },
             ) => Ok((&s1.array_distance_scalar_type(s2)).into()),
             (_, _) => Err("Only Flat vectors currently supported.".into()),
-        }        
+        }
     }
 
     fn scalar_type(&self) -> VectorScalarType {
@@ -352,19 +352,56 @@ impl ArrayDistance {
                         FIXED_SIZE_LIST_WILDCARD,
                         *nullable,
                     ),
-                    DataType::new_fixed_size_list(DataType::new_large_list(type_.clone(), *nullable), FIXED_SIZE_LIST_WILDCARD,*nullable),
-                    DataType::new_fixed_size_list(DataType::new_list(type_.clone(), *nullable), FIXED_SIZE_LIST_WILDCARD,*nullable),
-                    DataType::new_fixed_size_list(DataType::new_fixed_size_list(type_.clone(), FIXED_SIZE_LIST_WILDCARD, *nullable), FIXED_SIZE_LIST_WILDCARD, *nullable),
-
+                    DataType::new_fixed_size_list(
+                        DataType::new_large_list(type_.clone(), *nullable),
+                        FIXED_SIZE_LIST_WILDCARD,
+                        *nullable,
+                    ),
+                    DataType::new_fixed_size_list(
+                        DataType::new_list(type_.clone(), *nullable),
+                        FIXED_SIZE_LIST_WILDCARD,
+                        *nullable,
+                    ),
+                    DataType::new_fixed_size_list(
+                        DataType::new_fixed_size_list(
+                            type_.clone(),
+                            FIXED_SIZE_LIST_WILDCARD,
+                            *nullable,
+                        ),
+                        FIXED_SIZE_LIST_WILDCARD,
+                        *nullable,
+                    ),
                     DataType::new_list(type_.clone(), *nullable),
-                    DataType::new_list(DataType::new_large_list(type_.clone(), *nullable), *nullable),
+                    DataType::new_list(
+                        DataType::new_large_list(type_.clone(), *nullable),
+                        *nullable,
+                    ),
                     DataType::new_list(DataType::new_list(type_.clone(), *nullable), *nullable),
-                    DataType::new_list(DataType::new_fixed_size_list(type_.clone(), FIXED_SIZE_LIST_WILDCARD, *nullable), *nullable),
-
+                    DataType::new_list(
+                        DataType::new_fixed_size_list(
+                            type_.clone(),
+                            FIXED_SIZE_LIST_WILDCARD,
+                            *nullable,
+                        ),
+                        *nullable,
+                    ),
                     DataType::new_large_list(type_.clone(), *nullable),
-                    DataType::new_large_list(DataType::new_large_list(type_.clone(), *nullable), *nullable),
-                    DataType::new_large_list(DataType::new_list(type_.clone(), *nullable), *nullable),
-                    DataType::new_large_list(DataType::new_fixed_size_list(type_.clone(), FIXED_SIZE_LIST_WILDCARD, *nullable), *nullable),
+                    DataType::new_large_list(
+                        DataType::new_large_list(type_.clone(), *nullable),
+                        *nullable,
+                    ),
+                    DataType::new_large_list(
+                        DataType::new_list(type_.clone(), *nullable),
+                        *nullable,
+                    ),
+                    DataType::new_large_list(
+                        DataType::new_fixed_size_list(
+                            type_.clone(),
+                            FIXED_SIZE_LIST_WILDCARD,
+                            *nullable,
+                        ),
+                        *nullable,
+                    ),
                 ]
             })
             .collect_vec();
@@ -410,7 +447,34 @@ impl ArrayDistance {
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .cloned()
-            .ok_or_else(|| DataFusionError::Internal("downcast unexpectedly failed".into()))
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "downcast to 'FixedSizeListArray' unexpectedly failed".into(),
+                )
+            })
+    }
+
+    /// Casts the [`ArrayRef`] to a [`ListArray`].
+    fn downcast_to_list(value: &ArrayRef) -> DataFusionResult<LargeListArray> {
+        if let Some(list) = value.as_any().downcast_ref::<LargeListArray>() {
+            return Ok(list.clone());
+        }
+
+        let list = value
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Internal("downcast to 'ListArray' unexpectedly failed".into())
+            })?;
+
+        let (fields, offsets, values, nulls) = list.into_parts();
+        Ok(LargeListArray::new(
+            fields,
+            OffsetBuffer::<i64>::new(offsets.iter().map(|x| i64::from(*x)).collect_vec().into()),
+            values,
+            nulls,
+        ))
     }
 
     /// Casts the input to a [`Float64Array`].
@@ -463,6 +527,64 @@ impl ArrayDistance {
                     .collect::<Vec<Option<f32>>>(),
             ))),
             VectorScalarType::Float64 => Ok(Arc::new(Float64Array::from(result?))),
+        }
+    }
+
+    /// Computes the L2 squared distance of two non-nested (i.e. not a `FixedSizeList`[`FixedSizeList`[f32]]) list types.
+    #[allow(clippy::cast_possible_truncation)]
+    fn calculate_distance_with_broadcast(
+        vectors: &FixedSizeListArray,
+        list_of_vectors: &ArrayRef,
+        output_scalar_type: VectorScalarType,
+    ) -> DataFusionResult<ArrayRef> {
+        // For each row, there is a list of distances. Both the row can be null, but each entry in the distance list could be null.
+        let result: Vec<Option<Vec<Option<f64>>>> = vectors
+            .iter()
+            .zip(Self::downcast_to_list(list_of_vectors)?.iter())
+            .map(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => {
+                    let smol = &Self::cast_to_float64_array(&a)?;
+                    let list_of_vs = Self::downcast_to_list(&b)?;
+
+                    // This is the distance for each vector in the list to the singular vector.
+                    let each_distance = list_of_vs
+                        .iter()
+                        .map(|v| match v {
+                            Some(v) => {
+                                let z: Float64Array =
+                                    binary(smol, &Self::cast_to_float64_array(&v)?, |x, y| {
+                                        (x - y).powi(2)
+                                    })
+                                    .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+                                Ok(sum(&z))
+                            }
+                            _ => Ok(None),
+                        })
+                        .collect::<DataFusionResult<Vec<Option<_>>>>()?;
+
+                    Ok(Some(each_distance))
+                }
+                _ => Ok(None),
+            })
+            .collect::<DataFusionResult<Vec<Option<Vec<Option<f64>>>>>>()?;
+
+        match output_scalar_type {
+            VectorScalarType::Float32 => {
+                let result_f32: Vec<Option<Vec<Option<f32>>>> = result
+                    .into_iter()
+                    .map(|opt| {
+                        opt.map(|inner| inner.into_iter().map(|v| v.map(|f| f as f32)).collect())
+                    })
+                    .collect();
+                Ok(Arc::new(
+                    ListArray::from_iter_primitive::<Float32Type, _, _>(result_f32),
+                ))
+            }
+            VectorScalarType::Float64 => {
+                Ok(Arc::new(
+                    ListArray::from_iter_primitive::<Float64Type, _, _>(result),
+                ))
+            }
         }
     }
 
@@ -547,7 +669,6 @@ impl ScalarUDFImpl for ArrayDistance {
         let type2 = VectorBatchType::try_from(&args[1])
             .map_err(|e| DataFusionError::Plan(format!("Inappropriate second argument: {e}")))?;
 
-        
         let z = type1.array_distance_return_type(&type2).map_err(|e| {
             DataFusionError::Plan(format!(
                 "{} and {} are incompatible for {}. Error: {e}",
@@ -561,9 +682,8 @@ impl ScalarUDFImpl for ArrayDistance {
 
     #[allow(clippy::cast_possible_truncation)]
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        println!("invoke||args: {:?}", args);
         let arrays = ColumnarValue::values_to_arrays(args)?;
-        let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
+        let (v1, v2) = (&arrays[0], &arrays[1]);
 
         // Raise [`DataFusionError::Internal`] as type issues should have been resolved in [`ArrayDistance::return_type`].
         let type1 = VectorBatchType::try_from(v1.data_type())
@@ -576,29 +696,36 @@ impl ScalarUDFImpl for ArrayDistance {
             .array_distance_scalar_type(&type2.scalar_type());
 
         if !type1.is_single_vector() && !type2.is_single_vector() {
-            return Err(DataFusionError::Internal(
-                format!("both arguments of {} cannot be lists of vectors.", self.name()).into(),
-            ));
+            return Err(DataFusionError::Internal(format!(
+                "both arguments of {} cannot be lists of vectors.",
+                self.name()
+            )));
         }
         if type1.is_single_vector() && type2.is_single_vector() {
-            return Ok(ColumnarValue::Array(Self::calculate_distance(&v1, &v2, scalar_type)?));
+            let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
+            return Ok(ColumnarValue::Array(Self::calculate_distance(
+                &v1,
+                &v2,
+                scalar_type,
+            )?));
         }
 
         let (single, batch): (FixedSizeListArray, _) = if type1.is_single_vector() {
-            (Self::downcast_to_fixed_size_list(&v1)?, v2)
+            (Self::downcast_to_fixed_size_list(v1)?, v2)
         } else {
-            (Self::downcast_to_fixed_size_list(&v2)?, v1)
+            (Self::downcast_to_fixed_size_list(v2)?, v1)
         };
 
-
-
+        Ok(ColumnarValue::Array(
+            Self::calculate_distance_with_broadcast(&single, batch, scalar_type)?,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ArrayDistance;
-    use arrow::array::{Array, Float32Array};
+    use arrow::array::{Array, Float32Array, ListArray};
     use datafusion::{execution::context::SessionContext, logical_expr::ScalarUDF};
 
     #[allow(clippy::float_cmp)]
@@ -722,7 +849,8 @@ mod tests {
         )
         .await?;
 
-        let df = ctx.sql(
+        let df = ctx
+            .sql(
                 r#"
         SELECT array_distance(
             arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
@@ -730,7 +858,9 @@ mod tests {
         ) as output
         FROM tbl"#,
             )
-            .await?.collect().await?;
+            .await?
+            .collect()
+            .await?;
 
         assert_eq!(df.len(), 1);
         let col = df
@@ -815,11 +945,13 @@ mod tests {
         "#).await?;
 
         let df = ctx
-            .sql(r#"SELECT array_distance(
+            .sql(
+                r#"SELECT array_distance(
                     arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
                     column1
-                ) as output FROM tbl"#
-            ).await?
+                ) as output FROM tbl"#,
+            )
+            .await?
             .collect()
             .await?;
 
@@ -828,17 +960,23 @@ mod tests {
             .first()
             .unwrap()
             .column_by_name("output")
-            .unwrap();
-            // .as_any()
-            // .downcast_ref::<Float64Array>()
-            // .unwrap()
-            // .values()
-            // .iter()
-            // .cloned()
-            // .collect::<Vec<f64>>();
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .iter()
+            .map(|x| match x {
+                Some(x) => x
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec(),
+                None => vec![],
+            })
+            .collect::<Vec<Vec<f32>>>();
 
-        println!("col: {:?}", col);
-        assert_eq!(1, 2);
+        assert_eq!(col, vec![vec![5.0, 5.0, 25.0, 25.0, 61.0]]);
         Ok(())
     }
 }
