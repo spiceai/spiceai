@@ -510,65 +510,40 @@ impl ScalarUDFImpl for ArrayDistance {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow::{
-        array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, ListArray},
-        buffer::{OffsetBuffer, ScalarBuffer},
-        datatypes::{DataType, Field},
-    };
+    use arrow::array::{Array, Float32Array};
     use datafusion::{
         execution::context::SessionContext,
-        logical_expr::{ColumnarValue, ScalarUDF},
+        logical_expr::ScalarUDF,
     };
-    use itertools::Itertools;
-
     use super::ArrayDistance;
-
-    fn create_fixed_size_list_array(
-        values: Vec<Vec<f32>>,
-        is_f32: bool,
-    ) -> FixedSizeListArray {
-        let size = values.first().map(|v| v.len()).unwrap_or_default();
-        let flattened = values.into_iter().flat_map(|x| x).collect_vec();
-        
-        let (arr, fields): (ArrayRef, Arc<Field>) = if is_f32 {
-            let arr = Arc::new(Float32Array::try_new(flattened.into(), None).unwrap());
-            let field = Arc::new(Field::new("item", DataType::Float32, false));
-            (arr, field)
-        } else {
-            let v: Vec<f64> = flattened.iter().map(|x| *x as f64).collect();
-            let arr = Arc::new(Float64Array::try_new(v.into(), None).unwrap());
-            let field = Arc::new(Field::new("item", DataType::Float64, false));
-            (arr, field)
-        };
-        FixedSizeListArray::try_new(fields, size as i32, arr, None).unwrap()
-    }
 
     #[allow(clippy::float_cmp)]
     #[tokio::test]
-    async fn test_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn test_f32_f32() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let l1 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
-        let l2 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
-        
-        let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&l1)),
-            ColumnarValue::Array(Arc::clone(&l2)),
-        ])?;
+        ctx.sql(r#"
+            CREATE TABLE tbl
+            AS VALUES
+                (arrow_cast(make_array(0.0, 1.0), 'FixedSizeList(2, Float32)')),
+                (arrow_cast(make_array(3.0, 4.0), 'FixedSizeList(2, Float32)')),
+                (arrow_cast(make_array(6.0, 8.0), 'FixedSizeList(2, Float32)'))
+            ;
+        "#).await?;
 
-        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
-        let array = array_vec[0]
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or("failed downcast of result")?;
-        assert_eq!(array.len(), 3);
-        assert_eq!(array.value(0), 0.0);
-        assert_eq!(array.value(1), 0.0);
-        assert_eq!(array.value(2), 0.0);
+        let df = ctx.sql(r#"
+        SELECT array_distance(
+            arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float32)'),
+            column1
+        ) as output
+        FROM tbl"#).await?.collect().await?;
+
+        assert_eq!(df.len(), 1);
+        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
+        
+        assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
     }
@@ -580,23 +555,26 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let f32 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
-        let f64 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], false)) as Arc<dyn Array>; 
-        
-        let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&f32)),
-            ColumnarValue::Array(Arc::clone(&f64)),
-        ])?;
+        ctx.sql(r#"
+            CREATE TABLE tbl
+            AS VALUES
+                (arrow_cast(make_array(0.0, 1.0), 'FixedSizeList(2, Float32)')),
+                (arrow_cast(make_array(3.0, 4.0), 'FixedSizeList(2, Float32)')),
+                (arrow_cast(make_array(6.0, 8.0), 'FixedSizeList(2, Float32)'))
+            ;
+        "#).await?;
 
-        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
-        let array = array_vec[0]
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or("failed downcast of result")?;
-        assert_eq!(array.len(), 3);
-        assert_eq!(array.value(0), 0.0);
-        assert_eq!(array.value(1), 0.0);
-        assert_eq!(array.value(2), 0.0);
+        let df = ctx.sql(r#"
+        SELECT array_distance(
+            arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
+            column1
+        ) as output
+        FROM tbl"#).await?.collect().await?;
+
+        assert_eq!(df.len(), 1);
+        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
+        
+        assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
     }
@@ -608,23 +586,26 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        let l1 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], false)) as Arc<dyn Array>; 
-        let l2 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], false)) as Arc<dyn Array>; 
-        
-        let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&l1)),
-            ColumnarValue::Array(Arc::clone(&l2)),
-        ])?;
+        ctx.sql(r#"
+            CREATE TABLE tbl
+            AS VALUES
+                (arrow_cast(make_array(0.0, 1.0), 'FixedSizeList(2, Float64)')),
+                (arrow_cast(make_array(3.0, 4.0), 'FixedSizeList(2, Float64)')),
+                (arrow_cast(make_array(6.0, 8.0), 'FixedSizeList(2, Float64)'))
+            ;
+        "#).await?;
 
-        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
-        let array = array_vec[0]
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or("failed downcast of result")?;
-        assert_eq!(array.len(), 3);
-        assert_eq!(array.value(0), 0.0);
-        assert_eq!(array.value(1), 0.0);
-        assert_eq!(array.value(2), 0.0);
+        let df = ctx.sql(r#"
+        SELECT array_distance(
+            arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
+            column1
+        ) as output
+        FROM tbl"#).await?.collect().await?;
+
+        assert_eq!(df.len(), 1);
+        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
+        
+        assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
     }
@@ -636,35 +617,46 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
+        ctx.sql(r#"
+            CREATE TABLE tbl
+            AS VALUES
+                (arrow_cast(make_array(0.0, 1.0), 'List(Float32)')),
+                (arrow_cast(make_array(3.0, 4.0), 'List(Float32)')),
+                (arrow_cast(make_array(6.0, 8.0), 'List(Float32)'))
+            ;
+        "#).await?;
+
+        let df = ctx.sql(r#"
+        SELECT array_distance(
+            arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
+            column1
+        ) as output
+        FROM tbl"#).await?.collect().await?;
+
+        assert_eq!(df.len(), 1);
+        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
         
-        let l1 = Arc::new(create_fixed_size_list_array(vec![vec![0.0, 1.0], vec![3.0, 4.0],vec![6.0, 8.0]], true)) as Arc<dyn Array>; 
+        assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
-        let field2 = Arc::new(Field::new("item", DataType::Float64, true));
-        let list = Arc::new(ListArray::new(
-            field2,
-            offsets,
-            Arc::new(Float64Array::try_new(
-                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 11.1].into(),
-                None,
-            )?),
-            None,
-        )) as Arc<dyn Array>;
+        Ok(())
+    }
 
-        let col_array = array_distance.invoke(&[
-            ColumnarValue::Array(Arc::clone(&l1)),
-            ColumnarValue::Array(Arc::clone(&list)),
-        ])?;
 
-        let array_vec = ColumnarValue::values_to_arrays(&[col_array])?;
-        let array = array_vec[0]
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or("failed downcast of result")?;
-        assert_eq!(array.len(), 3);
-        assert_eq!(array.value(0), 0.0);
-        assert_eq!(array.value(1), 0.0);
-        assert_eq!(array.value(2), 0.0);
+    #[allow(clippy::float_cmp)]
+    #[tokio::test]
+    async fn test_list_of_arrays() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = SessionContext::new();
+        let array_distance = ScalarUDF::from(ArrayDistance::new());
+        ctx.register_udf(array_distance.clone());
+
+        ctx.sql(r#"
+            CREATE TABLE tbl
+            AS VALUES (arrow_cast(make_array([1,2], [1,2], [3,4], [3,4], [5,6]), 'List(FixedSizeList(2, Float64))'));
+        "#).await?;
+
+        let df = ctx.sql(format!(r#"SELECT array_distance([1.0, 2.0], column1) as output FROM tbl"#).as_str()).await?.show().await; // collect().await?;
+
+        assert_eq!(1, 5);
 
         Ok(())
     }
