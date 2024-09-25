@@ -20,6 +20,7 @@ use arrow::{
     datatypes::{ArrowPrimitiveType, DataType, Float64Type},
 };
 
+use arrow_schema::Field;
 use datafusion::{
     common::{plan_err, DataFusionError, Result as DataFusionResult},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
@@ -68,6 +69,7 @@ impl VectorScalarType {
     }
 }
 
+#[derive(Debug)]
 pub enum VectorBatchType {
     /// Represents a nested [`ColumnarValue`] of type [`DataType::List`] or [`DataType::LargeList`]. Inner values are of type [`DataType::FixedSizeList`].
     /// Values have non-constant number of entries, each entries is of `size` length.
@@ -183,8 +185,17 @@ impl VectorBatchType {
         matches!(dtype, DataType::Float32) || matches!(dtype, DataType::Float64)
     }
 
+    /// Returns true if the [`VectorBatchType`] is a single vector. 
+    fn is_single_vector(&self) -> bool {
+        matches!(
+            self,
+            Self::FixedVectors { .. } | Self::ListVectors { .. }
+        )
+    }
+
     /// Returns the [`ScalarUDFImpl::return_type`] for the [`ArrayDistance`] UDF. If None, the two [`VectorBatchType`]s are incompatible.
     pub fn array_distance_return_type(&self, other: &VectorBatchType) -> Result<DataType, String> {
+        println!("array_distance_return_type||self: {:?}, other: {:?}", self, other);
         match (self, other) {
             (
                 Self::FixedVectors {
@@ -202,7 +213,56 @@ impl VectorBatchType {
                     ));
                 }
                 Ok((&s1.array_distance_scalar_type(s2)).into())
-            }
+            }, (
+                Self::ListOfFixedVectors {
+                    scalar_type: s1,
+                    size: len1,
+                    ..
+                },
+                Self::ListOfFixedVectors {
+                    scalar_type: s2,
+                    size: len2,
+                    ..
+                },
+            ) | (
+                Self::ListOfFixedVectors {
+                    scalar_type: s1,
+                    size: len1,
+                    ..
+                },
+                Self::FixedVectors {
+                    scalar_type: s2,
+                    size: len2,
+                },
+            ) | (
+                Self::FixedVectors {
+                    scalar_type: s1,
+                    size: len1,
+                    ..
+                },
+                Self::ListOfFixedVectors {
+                    scalar_type: s2,
+                    size: len2,
+                },
+            ) => {
+                if len1 != len2 {
+                    return Err(format!(
+                        "FixedVectors must have the same length, found {len1}!={len2}."
+                    ));
+                }
+                let inner_type: DataType = (&s1.array_distance_scalar_type(s2)).into(); 
+                Ok(DataType::List(Arc::new(Field::new("item", inner_type, true))))
+            },
+            (Self::FixedVectors {
+                scalar_type: s1,
+                ..
+            }, Self::ListOfListVectors {
+                scalar_type: s2,
+                ..
+            }) => {
+                let inner_type: DataType = (&s1.array_distance_scalar_type(s2)).into(); 
+                Ok(DataType::List(Arc::new(Field::new("item", inner_type, true))))
+            },
             (
                 Self::FixedVectors {
                     scalar_type: s1, ..
@@ -220,7 +280,7 @@ impl VectorBatchType {
                 },
             ) => Ok((&s1.array_distance_scalar_type(s2)).into()),
             (_, _) => Err("Only Flat vectors currently supported.".into()),
-        }
+        }        
     }
 
     fn scalar_type(&self) -> VectorScalarType {
@@ -292,8 +352,19 @@ impl ArrayDistance {
                         FIXED_SIZE_LIST_WILDCARD,
                         *nullable,
                     ),
+                    DataType::new_fixed_size_list(DataType::new_large_list(type_.clone(), *nullable), FIXED_SIZE_LIST_WILDCARD,*nullable),
+                    DataType::new_fixed_size_list(DataType::new_list(type_.clone(), *nullable), FIXED_SIZE_LIST_WILDCARD,*nullable),
+                    DataType::new_fixed_size_list(DataType::new_fixed_size_list(type_.clone(), FIXED_SIZE_LIST_WILDCARD, *nullable), FIXED_SIZE_LIST_WILDCARD, *nullable),
+
                     DataType::new_list(type_.clone(), *nullable),
+                    DataType::new_list(DataType::new_large_list(type_.clone(), *nullable), *nullable),
+                    DataType::new_list(DataType::new_list(type_.clone(), *nullable), *nullable),
+                    DataType::new_list(DataType::new_fixed_size_list(type_.clone(), FIXED_SIZE_LIST_WILDCARD, *nullable), *nullable),
+
                     DataType::new_large_list(type_.clone(), *nullable),
+                    DataType::new_large_list(DataType::new_large_list(type_.clone(), *nullable), *nullable),
+                    DataType::new_large_list(DataType::new_list(type_.clone(), *nullable), *nullable),
+                    DataType::new_large_list(DataType::new_fixed_size_list(type_.clone(), FIXED_SIZE_LIST_WILDCARD, *nullable), *nullable),
                 ]
             })
             .collect_vec();
@@ -476,18 +547,21 @@ impl ScalarUDFImpl for ArrayDistance {
         let type2 = VectorBatchType::try_from(&args[1])
             .map_err(|e| DataFusionError::Plan(format!("Inappropriate second argument: {e}")))?;
 
-        type1.array_distance_return_type(&type2).map_err(|e| {
+        
+        let z = type1.array_distance_return_type(&type2).map_err(|e| {
             DataFusionError::Plan(format!(
                 "{} and {} are incompatible for {}. Error: {e}",
                 &args[0],
                 &args[1],
                 self.name()
             ))
-        })
+        })?;
+        Ok(z)
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
+        println!("invoke||args: {:?}", args);
         let arrays = ColumnarValue::values_to_arrays(args)?;
         let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
 
@@ -501,21 +575,31 @@ impl ScalarUDFImpl for ArrayDistance {
             .scalar_type()
             .array_distance_scalar_type(&type2.scalar_type());
 
-        // TODO: this only handles non-nested v1, v2.
-        let arr = Self::calculate_distance(&v1, &v2, scalar_type)?;
+        if !type1.is_single_vector() && !type2.is_single_vector() {
+            return Err(DataFusionError::Internal(
+                format!("both arguments of {} cannot be lists of vectors.", self.name()).into(),
+            ));
+        }
+        if type1.is_single_vector() && type2.is_single_vector() {
+            return Ok(ColumnarValue::Array(Self::calculate_distance(&v1, &v2, scalar_type)?));
+        }
 
-        Ok(ColumnarValue::Array(arr))
+        let (single, batch): (FixedSizeListArray, _) = if type1.is_single_vector() {
+            (Self::downcast_to_fixed_size_list(&v1)?, v2)
+        } else {
+            (Self::downcast_to_fixed_size_list(&v2)?, v1)
+        };
+
+
+
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, Float32Array};
-    use datafusion::{
-        execution::context::SessionContext,
-        logical_expr::ScalarUDF,
-    };
     use super::ArrayDistance;
+    use arrow::array::{Array, Float32Array};
+    use datafusion::{execution::context::SessionContext, logical_expr::ScalarUDF};
 
     #[allow(clippy::float_cmp)]
     #[tokio::test]
@@ -524,25 +608,45 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        ctx.sql(r#"
+        ctx.sql(
+            r#"
             CREATE TABLE tbl
             AS VALUES
                 (arrow_cast(make_array(0.0, 1.0), 'FixedSizeList(2, Float32)')),
                 (arrow_cast(make_array(3.0, 4.0), 'FixedSizeList(2, Float32)')),
                 (arrow_cast(make_array(6.0, 8.0), 'FixedSizeList(2, Float32)'))
             ;
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        let df = ctx.sql(r#"
+        let df = ctx
+            .sql(
+                r#"
         SELECT array_distance(
             arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float32)'),
             column1
         ) as output
-        FROM tbl"#).await?.collect().await?;
+        FROM tbl"#,
+            )
+            .await?
+            .collect()
+            .await?;
 
         assert_eq!(df.len(), 1);
-        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
-        
+        let col = df
+            .first()
+            .unwrap()
+            .column_by_name("output")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .cloned()
+            .collect::<Vec<f32>>();
+
         assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
@@ -555,25 +659,45 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        ctx.sql(r#"
+        ctx.sql(
+            r#"
             CREATE TABLE tbl
             AS VALUES
                 (arrow_cast(make_array(0.0, 1.0), 'FixedSizeList(2, Float32)')),
                 (arrow_cast(make_array(3.0, 4.0), 'FixedSizeList(2, Float32)')),
                 (arrow_cast(make_array(6.0, 8.0), 'FixedSizeList(2, Float32)'))
             ;
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        let df = ctx.sql(r#"
+        let df = ctx
+            .sql(
+                r#"
         SELECT array_distance(
             arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
             column1
         ) as output
-        FROM tbl"#).await?.collect().await?;
+        FROM tbl"#,
+            )
+            .await?
+            .collect()
+            .await?;
 
         assert_eq!(df.len(), 1);
-        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
-        
+        let col = df
+            .first()
+            .unwrap()
+            .column_by_name("output")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .cloned()
+            .collect::<Vec<f32>>();
+
         assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
@@ -586,25 +710,42 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        ctx.sql(r#"
+        ctx.sql(
+            r#"
             CREATE TABLE tbl
             AS VALUES
                 (arrow_cast(make_array(0.0, 1.0), 'FixedSizeList(2, Float64)')),
                 (arrow_cast(make_array(3.0, 4.0), 'FixedSizeList(2, Float64)')),
                 (arrow_cast(make_array(6.0, 8.0), 'FixedSizeList(2, Float64)'))
             ;
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        let df = ctx.sql(r#"
+        let df = ctx.sql(
+                r#"
         SELECT array_distance(
             arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
             column1
         ) as output
-        FROM tbl"#).await?.collect().await?;
+        FROM tbl"#,
+            )
+            .await?.collect().await?;
 
         assert_eq!(df.len(), 1);
-        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
-        
+        let col = df
+            .first()
+            .unwrap()
+            .column_by_name("output")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .cloned()
+            .collect::<Vec<f32>>();
+
         assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
@@ -617,30 +758,49 @@ mod tests {
         let array_distance = ScalarUDF::from(ArrayDistance::new());
         ctx.register_udf(array_distance.clone());
 
-        ctx.sql(r#"
+        ctx.sql(
+            r#"
             CREATE TABLE tbl
             AS VALUES
                 (arrow_cast(make_array(0.0, 1.0), 'List(Float32)')),
                 (arrow_cast(make_array(3.0, 4.0), 'List(Float32)')),
                 (arrow_cast(make_array(6.0, 8.0), 'List(Float32)'))
             ;
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        let df = ctx.sql(r#"
+        let df = ctx
+            .sql(
+                r#"
         SELECT array_distance(
             arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
             column1
         ) as output
-        FROM tbl"#).await?.collect().await?;
+        FROM tbl"#,
+            )
+            .await?
+            .collect()
+            .await?;
 
         assert_eq!(df.len(), 1);
-        let col = df.first().unwrap().column_by_name("output").unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().iter().cloned().collect::<Vec<f32>>();
-        
+        let col = df
+            .first()
+            .unwrap()
+            .column_by_name("output")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .cloned()
+            .collect::<Vec<f32>>();
+
         assert_eq!(col, vec![1.0, 25.0, 100.0]);
 
         Ok(())
     }
-
 
     #[allow(clippy::float_cmp)]
     #[tokio::test]
@@ -654,10 +814,31 @@ mod tests {
             AS VALUES (arrow_cast(make_array([1,2], [1,2], [3,4], [3,4], [5,6]), 'List(FixedSizeList(2, Float64))'));
         "#).await?;
 
-        let df = ctx.sql(format!(r#"SELECT array_distance([1.0, 2.0], column1) as output FROM tbl"#).as_str()).await?.show().await; // collect().await?;
+        let df = ctx
+            .sql(r#"SELECT array_distance(
+                    arrow_cast(make_array(0.0, 0.0), 'FixedSizeList(2, Float64)'),
+                    column1
+                ) as output FROM tbl"#
+            ).await?
+            .collect()
+            .await?;
 
-        assert_eq!(1, 5);
+        assert_eq!(df.len(), 1);
+        let col = df
+            .first()
+            .unwrap()
+            .column_by_name("output")
+            .unwrap();
+            // .as_any()
+            // .downcast_ref::<Float64Array>()
+            // .unwrap()
+            // .values()
+            // .iter()
+            // .cloned()
+            // .collect::<Vec<f64>>();
 
+        println!("col: {:?}", col);
+        assert_eq!(1, 2);
         Ok(())
     }
 }
