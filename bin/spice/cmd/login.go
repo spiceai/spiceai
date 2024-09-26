@@ -530,7 +530,6 @@ func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConf
 }
 
 func init() {
-	dremioCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	dremioCmd.Flags().StringP(usernameFlag, "u", "", "Username")
 	dremioCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	loginCmd.AddCommand(dremioCmd)
@@ -552,21 +551,17 @@ func init() {
 	deltaLakeCmd.Flags().String(gcpServiceAccountPath, "", "Google Service Account Path")
 	loginCmd.AddCommand(deltaLakeCmd)
 
-	sharepointCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	sharepointCmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
 	sharepointCmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
 	loginCmd.AddCommand(sharepointCmd)
 
-	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
 	s3Cmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")
 	loginCmd.AddCommand(s3Cmd)
 
-	postgresCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	postgresCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	loginCmd.AddCommand(postgresCmd)
 
-	snowflakeCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	snowflakeCmd.Flags().StringP(accountFlag, "a", "", "Account identifier")
 	snowflakeCmd.Flags().StringP(usernameFlag, "u", "", "Username")
 	snowflakeCmd.Flags().StringP(passwordFlag, "p", "", "Password")
@@ -574,11 +569,9 @@ func init() {
 	snowflakeCmd.Flags().StringP(passphraseFlag, "s", "", "Passphrase")
 	loginCmd.AddCommand(snowflakeCmd)
 
-	sparkCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	sparkCmd.Flags().String(sparkRemoteFlag, "", "Spark Remote")
 	loginCmd.AddCommand(sparkCmd)
 
-	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
 	RootCmd.AddCommand(loginCmd)
 }

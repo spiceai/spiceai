@@ -30,16 +30,48 @@ use runtime::{datafusion::DataFusion, task_history};
 use tracing::Subscriber;
 use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
 
+pub enum LogVerbosity {
+    Default,
+    Verbose,
+    VeryVerbose,
+    Specific(String),
+}
+
+impl LogVerbosity {
+    pub(crate) fn from_flags_and_env(verbose: bool, very_verbose: bool, env_var: &str) -> Self {
+        if very_verbose {
+            return LogVerbosity::VeryVerbose;
+        }
+
+        if verbose {
+            return LogVerbosity::Verbose;
+        }
+
+        if let Ok(filter) = std::env::var(env_var) {
+            return LogVerbosity::Specific(filter);
+        }
+
+        LogVerbosity::Default
+    }
+}
+impl From<LogVerbosity> for EnvFilter {
+    fn from(v: LogVerbosity) -> Self {
+        match v {
+            LogVerbosity::Default => EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,WARN"),
+            LogVerbosity::Verbose => EnvFilter::new("task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,INFO"),
+            LogVerbosity::VeryVerbose => EnvFilter::new("task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,DEBUG"),
+            LogVerbosity::Specific(filter) => EnvFilter::new(filter),
+        }
+    }
+}
+
 pub(crate) fn init_tracing(
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
+    verbosity: LogVerbosity,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
-        EnvFilter::new(env_log)
-    } else {
-        EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,WARN")
-    };
+    let filter: EnvFilter = verbosity.into();
 
     if let Some(app) = app.as_ref() {
         if !app.runtime.task_history.enabled {
