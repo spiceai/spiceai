@@ -228,9 +228,7 @@ spice dataset configure
 }
 
 func init() {
-	configureCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	datasetCmd.AddCommand(configureCmd)
 
-	datasetCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(datasetCmd)
 }

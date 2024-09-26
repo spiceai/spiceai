@@ -75,6 +75,5 @@ sql> show tables
 
 func init() {
 	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
-	sqlCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(sqlCmd)
 }
