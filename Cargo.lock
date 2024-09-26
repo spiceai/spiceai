@@ -6366,7 +6366,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "dirs",
- "ndarray",
+ "ndarray 0.15.6",
  "regex",
  "reqwest 0.12.7",
  "secrecy",
@@ -6563,6 +6563,21 @@ dependencies = [
  "num-complex",
  "num-integer",
  "num-traits",
+ "rawpointer",
+]
+
+[[package]]
+name = "ndarray"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
  "rawpointer",
 ]
 
@@ -7737,6 +7752,15 @@ name = "portable-atomic"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da544ee218f0d287a911e9c99a39a8c9bc8fcad3cb8db5959940044ecfc67265"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcdd8420072e66d54a407b3316991fe946ce3ab1083a7f575b2463866624704d"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "postgres-native-tls"
@@ -10755,9 +10779,9 @@ dependencies = [
 
 [[package]]
 name = "tract-core"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "014a18847f3eedca062eb1e5a57b37e091e16ffff34bc2fe0904953ab7c91454"
+checksum = "e0f7f982e823b593bf3a238dfa25f0c83f7647b06ef483059eb39a21946ccd9b"
 dependencies = [
  "anyhow",
  "bit-set",
@@ -10767,7 +10791,7 @@ dependencies = [
  "lazy_static",
  "log",
  "maplit",
- "ndarray",
+ "ndarray 0.16.1",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -10780,9 +10804,9 @@ dependencies = [
 
 [[package]]
 name = "tract-data"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9159c8ecbce8ab033a869010869c4b70a96d9bf0fb47371d5dd60a7aeef1b7b"
+checksum = "ebe5517c92e26086711180ab339a422224f5c2497cb399c1cda6dca6ed545140"
 dependencies = [
  "anyhow",
  "downcast-rs",
@@ -10792,10 +10816,11 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "maplit",
- "ndarray",
+ "ndarray 0.16.1",
  "nom",
  "num-integer",
  "num-traits",
+ "parking_lot 0.12.3",
  "scan_fmt",
  "smallvec",
  "string-interner",
@@ -10803,9 +10828,9 @@ dependencies = [
 
 [[package]]
 name = "tract-hir"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4adfb9eb37616340d6db8927c4bce3375e3c8c30e2b3a77eb95109d9e56e91a2"
+checksum = "b51acfef8f5f8ce153ec9ade9a4c1061df80e2f589549926ba92f516d989f91f"
 dependencies = [
  "derive-new 0.5.9",
  "log",
@@ -10814,9 +10839,9 @@ dependencies = [
 
 [[package]]
 name = "tract-linalg"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f728d735e1e1be0859e6d79a8deed9cb75a96abd6d2fdf97f1465c1f63960016"
+checksum = "ad0506e62347d2f3a6bb6a6ad647b4200a11e58be4ca5ba9622e9689bb8ec6c1"
 dependencies = [
  "byteorder",
  "cc",
@@ -10842,9 +10867,9 @@ dependencies = [
 
 [[package]]
 name = "tract-nnef"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4582406b5308d7e5663726c6fa6d8acb859586e30fef4fe7138c9f558857db33"
+checksum = "2827eed28481b2a7fd32131840af4b4937721ea514960223a9ae2767f3a57201"
 dependencies = [
  "byteorder",
  "flate2",
@@ -10857,9 +10882,9 @@ dependencies = [
 
 [[package]]
 name = "tract-onnx"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c5ced0ce4539a8566ac3cb0bb094a2c10046a7fb521df77683dac55af1f03df"
+checksum = "25115886fba190b86c777f267b3f8d0122747b29360f15ea5bd8bbc0557c9680"
 dependencies = [
  "bytes",
  "derive-new 0.5.9",
@@ -10875,9 +10900,9 @@ dependencies = [
 
 [[package]]
 name = "tract-onnx-opl"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d18c6b457815bcc9dbc11d2dcea1cab36965a296c163a9bd99e322d89460d6d4"
+checksum = "a9f5449dd4ccd3de145f0a219aaeb7c1bbe909a54eb1e3b4229c5499315a0615"
 dependencies = [
  "getrandom",
  "log",
