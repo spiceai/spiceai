@@ -436,6 +436,7 @@ impl PaginationParameters {
                 count.format_arguments(cursor)
             ),
         );
+
         (new_query.to_string(), limit_reached)
     }
 
