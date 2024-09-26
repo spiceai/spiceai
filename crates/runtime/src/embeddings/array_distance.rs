@@ -18,7 +18,6 @@ use arrow::{
     array::{
         Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
     },
-    buffer::OffsetBuffer,
     compute::{binary, cast, sum},
     datatypes::{ArrowPrimitiveType, DataType, Float32Type, Float64Type},
 };
@@ -194,6 +193,15 @@ impl VectorBatchType {
     }
 
     /// Returns the [`ScalarUDFImpl::return_type`] for the [`ArrayDistance`] UDF. If None, the two [`VectorBatchType`]s are incompatible.
+    /// Three return types are possible:
+    ///   1. A [`DataType::Float64`] or [`DataType::Float32`] when both inputs are un-nested vectors. Example:
+    ///      - `array_distance([1, 2], [3, 4])`
+    ///   2. A [`DataType::List`] of [`DataType::Float64`] or [`DataType::Float32`] inner type. When exactly one of the two inputs is a list (fixed or unsized), and the other is a vector. Example:
+    ///      - `array_distance([1, 2], [[3, 4], [5, 6]])`
+    ///   3. None, if the two inputs are incompatible. Incompatible means:
+    ///      - The vector lengths are different. Example: `array_distance([1, 2], [3, 4, 5])`
+    /// 
+    /// Note: Currently [`ArrayDistance`] does not support both inputs being lists of vectors.
     pub fn array_distance_return_type(&self, other: &VectorBatchType) -> Result<DataType, String> {
         match (self, other) {
             (
@@ -337,8 +345,10 @@ impl Default for ArrayDistance {
 /// ### Nested Rules
 /// `array_distance`([A, B], E) = [`array_distance`(A, E), `array_distance`(B, E)]
 /// `array_distance`(E, [A, B]) = [`array_distance`(E, A), `array_distance`(E, B)]
-/// `array_distance`([A, B], [C, D]) = [`array_distance`(A, C), `array_distance`(B, D)]
 /// `array_distance`([A, B], [C, D, E]); invalid
+/// 
+/// #### Unsupported
+/// `array_distance`([A, B], [C, D]) = [`array_distance`(A, C), `array_distance`(B, D)]
 impl ArrayDistance {
     #[must_use]
     pub fn new() -> Self {
@@ -379,7 +389,7 @@ impl ArrayDistance {
             })
     }
 
-    /// Casts the [`ArrayRef`] to a [`ListArray`].
+    /// Casts the [`ArrayRef`] to a [`LargeListArray`]. Will cast a [`ListArray`] to a [`LargeListArray`].
     fn downcast_to_list(value: &ArrayRef) -> DataFusionResult<LargeListArray> {
         if let Some(list) = value.as_any().downcast_ref::<LargeListArray>() {
             return Ok(list.clone());
@@ -393,12 +403,14 @@ impl ArrayDistance {
                 DataFusionError::Internal("downcast to 'ListArray' unexpectedly failed".into())
             })?;
 
-        let (fields, offsets, values, nulls) = list.into_parts();
-        Ok(LargeListArray::new(
-            fields,
-            OffsetBuffer::<i64>::new(offsets.iter().map(|x| i64::from(*x)).collect_vec().into()),
-            values,
-            nulls,
+        if let Some(z) = cast(&value, &DataType::LargeList(Arc::new(Field::new("item", list.value_type(), true))))
+            .map_err(|e| DataFusionError::ArrowError(e, Some("'array_distance' failed to downcast to list".to_string())))?
+            .as_any().downcast_ref::<LargeListArray>() {
+            return Ok(z.clone());
+        }
+
+        Err(DataFusionError::Internal(
+            "downcast to 'LargeListArray' unexpectedly failed".into(),
         ))
     }
 
@@ -462,7 +474,8 @@ impl ArrayDistance {
         list_of_vectors: &ArrayRef,
         output_scalar_type: VectorScalarType,
     ) -> DataFusionResult<ArrayRef> {
-        // For each row, there is a list of distances. Both the row can be null, but each entry in the distance list could be null.
+        // For each row, there is a list of distances.
+        // Both the row can be null, but each entry in the distance list could be null (if the [`list_of_vectors`] has null entries).
         let result: Vec<Option<Vec<Option<f64>>>> = vectors
             .iter()
             .zip(Self::downcast_to_list(list_of_vectors)?.iter())
@@ -584,6 +597,8 @@ impl ScalarUDFImpl for ArrayDistance {
         &self.signature
     }
 
+    /// Explicitly do not let datafusion coerce the types. This ensures we can return [`DataType::Float32`] or [`DataType::Float64`] correctly.
+    /// [`ArrayDistance::return_type`] will handle the type coercion.
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
         Ok(arg_types.to_vec())
     }
@@ -624,12 +639,26 @@ impl ScalarUDFImpl for ArrayDistance {
             .scalar_type()
             .array_distance_scalar_type(&type2.scalar_type());
 
+
+        // No broadcast needed. Calculate the distance between two vectors.
+        if type1.is_single_vector() && type2.is_single_vector() {
+            let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
+            return Ok(ColumnarValue::Array(Self::calculate_distance(
+                &v1,
+                &v2,
+                scalar_type,
+            )?));
+        }
+        
+        // Currently not supported.
         if !type1.is_single_vector() && !type2.is_single_vector() {
             return Err(DataFusionError::Internal(format!(
                 "both arguments of {} cannot be lists of vectors.",
                 self.name()
             )));
         }
+
+        // Broadcast the single vector to the list of vectors.
         if type1.is_single_vector() && type2.is_single_vector() {
             let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
             return Ok(ColumnarValue::Array(Self::calculate_distance(
