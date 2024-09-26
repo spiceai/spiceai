@@ -124,6 +124,5 @@ spice add spiceai/quickstart
 }
 
 func init() {
-	addCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(addCmd)
 }

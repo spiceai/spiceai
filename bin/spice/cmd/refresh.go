@@ -109,7 +109,6 @@ spice refresh taxi_trips
 }
 
 func init() {
-	refreshCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	refreshCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	refreshCmd.Flags().String(refreshSqlFlag, "", "'refresh_sql' to refresh a dataset.")
 	refreshCmd.Flags().String(refreshModeFlag, "", "'refresh_mode', one of: full, append")

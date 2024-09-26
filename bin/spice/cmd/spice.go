@@ -22,7 +22,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
+
+var verbosity = util.NewVerbosity()
 
 var RootCmd = &cobra.Command{
 	Use:   "spice",
@@ -37,6 +40,12 @@ func Execute() {
 		RootCmd.Println(err)
 		os.Exit(-1)
 	}
+}
+
+func init() {
+	RootCmd.PersistentFlags().CountVarP(&verbosity.VerbosityCount, "verbose", "v", "Verbose logging")
+	RootCmd.PersistentFlags().BoolVar(&verbosity.VeryVerbose, "very-verbose", false, "Very verbose logging")
+	RootCmd.PersistentFlags().BoolP("help", "h", false, "Print this help message")
 }
 
 func initConfig() {

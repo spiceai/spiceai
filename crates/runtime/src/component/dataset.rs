@@ -256,7 +256,7 @@ impl Dataset {
     ///
     /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
     ///
-    /// assert_eq!(dataset.source(), "spiceai");
+    /// assert_eq!(dataset.source(), "spice.ai");
     /// ```
     #[must_use]
     pub fn source(&self) -> String {
@@ -267,7 +267,7 @@ impl Dataset {
             if self.from == "sink" || self.from.is_empty() {
                 return "sink".to_string();
             }
-            "spiceai".to_string()
+            "spice.ai".to_string()
         }
     }
 
