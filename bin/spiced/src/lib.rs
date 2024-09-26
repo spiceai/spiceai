@@ -136,9 +136,10 @@ pub struct Args {
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 
-    #[arg(long)]
-    pub verbose: bool,
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
 
+    /// Enable very verbose logging. In conjunction with `verbose` can be set via -vv or --very-verbose.
     #[arg(long)]
     pub very_verbose: bool,
 }
@@ -197,7 +198,11 @@ pub async fn run(args: Args) -> Result<()> {
         &app,
         tracing_config.as_ref(),
         rt.datafusion(),
-        LogVerbosity::from_flags_and_env(args.verbose, args.very_verbose, "SPICED_LOG"),
+        LogVerbosity::from_flags_and_env(
+            args.verbose == 1, // -v or --verbose
+            args.verbose >= 2 || args.very_verbose, // -vv or --very-verbose
+            "SPICED_LOG",
+        ),
     )
     .context(UnableToInitializeTracingSnafu)?;
 

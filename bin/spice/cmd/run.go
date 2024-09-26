@@ -17,7 +17,9 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
@@ -37,6 +39,12 @@ spice run
 		err := checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+		}
+
+		// Pass through verbosity of `spice run`
+		level := verbosity.GetLevel()
+		if level > 0 {
+			args = append(args, fmt.Sprintf("-%s", strings.Repeat("v", level)))
 		}
 
 		err = runtime.Run(args)
