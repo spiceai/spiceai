@@ -200,7 +200,7 @@ impl VectorBatchType {
     ///      - `array_distance([1, 2], [[3, 4], [5, 6]])`
     ///   3. None, if the two inputs are incompatible. Incompatible means:
     ///      - The vector lengths are different. Example: `array_distance([1, 2], [3, 4, 5])`
-    /// 
+    ///
     /// Note: Currently [`ArrayDistance`] does not support both inputs being lists of vectors.
     pub fn array_distance_return_type(&self, other: &VectorBatchType) -> Result<DataType, String> {
         match (self, other) {
@@ -346,7 +346,7 @@ impl Default for ArrayDistance {
 /// `array_distance`([A, B], E) = [`array_distance`(A, E), `array_distance`(B, E)]
 /// `array_distance`(E, [A, B]) = [`array_distance`(E, A), `array_distance`(E, B)]
 /// `array_distance`([A, B], [C, D, E]); invalid
-/// 
+///
 /// #### Unsupported
 /// `array_distance`([A, B], [C, D]) = [`array_distance`(A, C), `array_distance`(B, D)]
 impl ArrayDistance {
@@ -403,9 +403,19 @@ impl ArrayDistance {
                 DataFusionError::Internal("downcast to 'ListArray' unexpectedly failed".into())
             })?;
 
-        if let Some(z) = cast(&value, &DataType::LargeList(Arc::new(Field::new("item", list.value_type(), true))))
-            .map_err(|e| DataFusionError::ArrowError(e, Some("'array_distance' failed to downcast to list".to_string())))?
-            .as_any().downcast_ref::<LargeListArray>() {
+        if let Some(z) = cast(
+            &value,
+            &DataType::LargeList(Arc::new(Field::new("item", list.value_type(), true))),
+        )
+        .map_err(|e| {
+            DataFusionError::ArrowError(
+                e,
+                Some("'array_distance' failed to downcast to list".to_string()),
+            )
+        })?
+        .as_any()
+        .downcast_ref::<LargeListArray>()
+        {
             return Ok(z.clone());
         }
 
@@ -639,7 +649,6 @@ impl ScalarUDFImpl for ArrayDistance {
             .scalar_type()
             .array_distance_scalar_type(&type2.scalar_type());
 
-
         // No broadcast needed. Calculate the distance between two vectors.
         if type1.is_single_vector() && type2.is_single_vector() {
             let (v1, v2) = Self::cast_input_args(&arrays[0], &arrays[1])?;
@@ -649,7 +658,7 @@ impl ScalarUDFImpl for ArrayDistance {
                 scalar_type,
             )?));
         }
-        
+
         // Currently not supported.
         if !type1.is_single_vector() && !type2.is_single_vector() {
             return Err(DataFusionError::Internal(format!(
@@ -890,7 +899,8 @@ mod tests {
             .first()
             .and_then(|r| r.column_by_name("output"))
             .and_then(|c| c.as_any().downcast_ref::<ListArray>())
-            .map(|a|  a.iter()
+            .map(|a| {
+                a.iter()
                     .map(|x| match x {
                         None => None,
                         Some(x) => {
@@ -901,8 +911,8 @@ mod tests {
                             x
                         }
                     })
-                    .collect::<Vec<Option<Vec<f64>>>>()            
-            );
+                    .collect::<Vec<Option<Vec<f64>>>>()
+            });
 
         assert_eq!(col, Some(vec![Some(vec![5.0, 5.0, 25.0, 25.0, 61.0])]));
         Ok(())
