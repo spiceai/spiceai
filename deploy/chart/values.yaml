@@ -1,6 +1,6 @@
 image:
   repository: spiceai/spiceai
-  tag: 0.18.1-beta
+  tag: 0.18.2-beta
 replicaCount: 1
 monitoring:
   podMonitor:
