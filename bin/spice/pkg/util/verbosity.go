@@ -16,6 +16,12 @@ limitations under the License.
 
 package util
 
+// Verbosity is a struct to handle the complexity of verbosity level from the CLI flags.
+// Specifically, it lets us have both `--verbose` and `--very-verbose` flags.
+//
+// VeryVerbose is a boolean flag to indicate at least 2 levels of verbosity.
+// If `VerbosityCount` is greater than 2, it will be ignored, otherwise it will
+// be set to 2 if `VeryVerbose` is true.
 type Verbosity struct {
 	VerbosityCount int
 	VeryVerbose    bool
