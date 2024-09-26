@@ -56,6 +56,5 @@ spice run
 }
 
 func init() {
-	runCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(runCmd)
 }

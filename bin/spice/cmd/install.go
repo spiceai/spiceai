@@ -84,7 +84,6 @@ spice install ai
 }
 
 func init() {
-	installCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	installCmd.Flags().BoolP("force", "f", false, "Force installation of the latest released runtime")
 	RootCmd.AddCommand(installCmd)
 }
