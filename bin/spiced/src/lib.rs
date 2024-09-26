@@ -39,6 +39,7 @@ use runtime::spice_metrics;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
+use spiced_tracing::LogVerbosity;
 use tracing::subscriber;
 
 #[path = "tracing.rs"]
@@ -134,6 +135,12 @@ pub struct Args {
     /// Enable/disable anonymous telemetry collection.
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
+
+    #[arg(long)]
+    pub verbose: bool,
+
+    #[arg(long)]
+    pub very_verbose: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -186,8 +193,13 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .await;
 
-    spiced_tracing::init_tracing(&app, tracing_config.as_ref(), rt.datafusion())
-        .context(UnableToInitializeTracingSnafu)?;
+    spiced_tracing::init_tracing(
+        &app,
+        tracing_config.as_ref(),
+        rt.datafusion(),
+        LogVerbosity::from_flags_and_env(args.verbose, args.very_verbose, "SPICED_LOG"),
+    )
+    .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
