@@ -187,7 +187,7 @@ impl EmbeddingTable {
         }
     }
 
-    /// Get the appropriate [`DataType`] for the embedding column for a given `embedding_column`.
+    /// Get the appropriate [`DataType`] for the vectors associated with an embedding column.
     fn embedding_column_type(&self, embedding_column: &str) -> DataType {
         let embedding_size = self
             .embedding_sizes

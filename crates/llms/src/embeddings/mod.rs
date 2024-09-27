@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 /*
 Copyright 2024 The Spice.ai OSS Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +18,7 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
+use std::sync::Arc;
 
 use crate::chunking::{CharacterSplittingChunker, Chunker, ChunkingConfig};
 
@@ -72,6 +71,7 @@ pub trait Embed: Sync + Send {
         Ok(())
     }
 
+    // TODO: Should have tokenizer specific method for specific implementations.
     fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
         Some(Arc::new(CharacterSplittingChunker::new(&cfg)))
     }
