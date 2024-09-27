@@ -160,7 +160,7 @@ fn build_app(
     if let Some(accel) = acceleration {
         app.datasets.iter_mut().for_each(|ds| {
             let mut accel = accel.clone();
-            let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name);
+            let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name, bench_name);
             if let Some(indexes) = indexes {
                 accel.indexes = indexes;
             }
@@ -176,75 +176,82 @@ fn build_app(
 fn get_accelerator_indexes(
     engine: Option<String>,
     dataset: &str,
+    bench_name: &str,
 ) -> Option<HashMap<String, IndexType>> {
     if let Some(engine) = engine {
         match engine.as_str() {
-            "sqlite" => match dataset {
-                "orders" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("o_orderdate".to_string(), IndexType::Enabled);
-                    indexes.insert("o_orderkey".to_string(), IndexType::Enabled);
-                    indexes.insert("o_custkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "lineitem" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("l_orderkey".to_string(), IndexType::Enabled);
-                    indexes.insert("l_suppkey".to_string(), IndexType::Enabled);
-                    indexes.insert("l_discount".to_string(), IndexType::Enabled);
-                    indexes.insert("l_shipdate".to_string(), IndexType::Enabled);
-                    indexes.insert("l_partkey".to_string(), IndexType::Enabled);
-                    indexes.insert("l_quantity".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "partsupp" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("ps_suppkey".to_string(), IndexType::Enabled);
-                    indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "part" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("p_partkey".to_string(), IndexType::Enabled);
-                    indexes.insert("p_brand".to_string(), IndexType::Enabled);
-                    indexes.insert("p_container".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "nation" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("n_nationkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "supplier" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("s_suppkey".to_string(), IndexType::Enabled);
-                    indexes.insert("s_nationkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "customer" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("c_phone".to_string(), IndexType::Enabled);
-                    indexes.insert("c_acctbal".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
+            "sqlite" => match bench_name {
+                "tpch" => match dataset {
+                    "orders" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("o_orderdate".to_string(), IndexType::Enabled);
+                        indexes.insert("o_orderkey".to_string(), IndexType::Enabled);
+                        indexes.insert("o_custkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "lineitem" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("l_orderkey".to_string(), IndexType::Enabled);
+                        indexes.insert("l_suppkey".to_string(), IndexType::Enabled);
+                        indexes.insert("l_discount".to_string(), IndexType::Enabled);
+                        indexes.insert("l_shipdate".to_string(), IndexType::Enabled);
+                        indexes.insert("l_partkey".to_string(), IndexType::Enabled);
+                        indexes.insert("l_quantity".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "partsupp" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("ps_suppkey".to_string(), IndexType::Enabled);
+                        indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "part" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("p_partkey".to_string(), IndexType::Enabled);
+                        indexes.insert("p_brand".to_string(), IndexType::Enabled);
+                        indexes.insert("p_container".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "nation" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("n_nationkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "supplier" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("s_suppkey".to_string(), IndexType::Enabled);
+                        indexes.insert("s_nationkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "customer" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("c_phone".to_string(), IndexType::Enabled);
+                        indexes.insert("c_acctbal".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
-            "postgres" => match dataset {
-                "partsupp" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "part" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("p_partkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
-                "lineitem" => {
-                    let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                    indexes.insert("l_partkey".to_string(), IndexType::Enabled);
-                    Some(indexes)
-                }
+            "postgres" => match bench_name {
+                "tpch" => match dataset {
+                    "partsupp" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("ps_partkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "part" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("p_partkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "lineitem" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("l_partkey".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
