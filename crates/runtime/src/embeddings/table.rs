@@ -29,6 +29,7 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
+use llms::chunking::{Chunker, ChunkingConfig};
 use snafu::prelude::*;
 
 use tokio::sync::RwLock;
@@ -52,6 +53,10 @@ pub struct EmbeddingTable {
     // Precompute to avoid async lock waits from `embedding_models` data structure.
     // Mapping of column name to the expected size of its embedding.
     embedding_sizes: HashMap<String, i32>,
+
+    // Column name -> how to chunk the text for the embedding model.
+    // If None, no chunking is needed.
+    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
 }
 
 impl EmbeddingTable {
@@ -59,13 +64,22 @@ impl EmbeddingTable {
         base_table: Arc<dyn TableProvider>,
         embedded_columns: HashMap<String, String>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+        embed_chunker_config: HashMap<String, ChunkingConfig>,
     ) -> Self {
         let sizes = Self::precompute_embedding_sizes(&embedded_columns, &embedding_models).await;
+        let chunkers = Self::prepare_chunkers(
+            embed_chunker_config,
+            &embedding_models,
+            embedded_columns.clone(),
+        )
+        .await;
+
         Self {
             base_table,
             embedded_columns,
             embedding_models,
             embedding_sizes: sizes,
+            embedding_chunkers: chunkers,
         }
     }
 
@@ -85,6 +99,42 @@ impl EmbeddingTable {
     #[must_use]
     pub fn get_base_table_schema(&self) -> SchemaRef {
         self.base_table.schema()
+    }
+
+    /// For a given set of columns that should be chunked (i.e. keys of `cfgs`), prepare the chunkers based on the column's embedding model in [`EmbeddingModelStore`].
+    async fn prepare_chunkers(
+        cfgs: HashMap<String, ChunkingConfig>,
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+        column_to_model: HashMap<String, String>,
+    ) -> HashMap<String, Arc<dyn Chunker>> {
+        let mut chunkers: HashMap<String, Arc<dyn Chunker>> = HashMap::new();
+
+        for (col, chunk_cfg) in cfgs {
+            let Some(model_name) = column_to_model.get(&col) else {
+                tracing::debug!(
+                    "No model specified for column '{}', skipping chunker setup.",
+                    col
+                );
+                continue;
+            };
+            let embedding_models_guard = embedding_models.read().await;
+            let Some(embed_model) = embedding_models_guard.get(model_name) else {
+                // Don't need warn, as we should have already checked/logged this.
+                tracing::debug!(
+                    "Expected model '{}' for column '{}', but it was not found in the model store.",
+                    model_name,
+                    col
+                );
+                continue;
+            };
+
+            if let Some(chunker) = embed_model.chunker(chunk_cfg) {
+                chunkers.insert(col, chunker);
+            } else {
+                tracing::warn!("Column '{}' expects to be chunked, but the model '{}' does not support chunking. Ignoring chunking config.", col, model_name);
+            }
+        }
+        chunkers
     }
 
     async fn precompute_embedding_sizes(
@@ -136,6 +186,23 @@ impl EmbeddingTable {
             }
         }
     }
+
+    /// Get the appropriate [`DataType`] for the embedding column for a given `embedding_column`.
+    fn embedding_column_type(&self, embedding_column: &str) -> DataType {
+        let embedding_size = self
+            .embedding_sizes
+            .get(embedding_column)
+            .copied()
+            .unwrap_or_default();
+
+        let vector_type = DataType::new_fixed_size_list(DataType::Float32, embedding_size, false);
+
+        if self.embedding_chunkers.contains_key(embedding_column) {
+            DataType::new_list(vector_type, false)
+        } else {
+            vector_type
+        }
+    }
 }
 
 #[async_trait]
@@ -180,26 +247,15 @@ impl TableProvider for EmbeddingTable {
             .embedded_columns
             .keys()
             .sorted() // Important to be kept alphabetical for fast lookup
-            .filter_map(|k| match base_schema.column_with_name(k) {
-                Some((_, field)) => {
-                    let embedding_size = self
-                        .embedding_sizes
-                        .get(field.name())
-                        .copied()
-                        .unwrap_or_default();
-
-                    Some(Arc::new(
+            .filter_map(|k| {
+                base_schema.column_with_name(k).map(|(_, field)| {
+                    Arc::new(
                         field
                             .clone()
-                            .with_data_type(DataType::new_fixed_size_list(
-                                DataType::Float32,
-                                embedding_size,
-                                false,
-                            ))
-                            .with_name(format!("{}_embedding", field.name())),
-                    ))
-                }
-                None => None,
+                            .with_data_type(self.embedding_column_type(k))
+                            .with_name(format!("{k}_embedding")),
+                    )
+                })
             })
             .collect();
 
@@ -287,16 +343,7 @@ impl TableProvider for EmbeddingTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // let base_supports = self.base_table.supports_filters_pushdown(filters)?;
-        // let embed_keys = HashSet::from_iter(self.embedded_columns.keys().map(|x| format!("{x}_embedding")));
-
-        // Ok(filters.iter().enumerate().map(|(i, &f)| {
-        //     let is_standard = f.to_columns().map(|c| c.intersection(embed_keys).count() == 0).ok();
-        //     if let Some(true) = is_standard {
-        //         return base_supports[i];
-        //     }
-        //     TableProviderFilterPushDown::Unsupported
-        // }).collect_vec())
+        // TODO: Implement pushdown for filters that can be exact.
         Ok(vec![
             TableProviderFilterPushDown::Unsupported;
             filters.len()

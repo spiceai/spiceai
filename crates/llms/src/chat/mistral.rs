@@ -191,7 +191,6 @@ impl MistralLlama {
         let device = Self::get_device();
 
         let pipeline = Self::load_gguf_pipeline(paths, &device, tokenizer, &model_id)?;
-
         Ok(Self::from_pipeline(pipeline))
     }
 

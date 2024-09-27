@@ -137,6 +137,22 @@ impl Display for EmbeddingPrefix {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct EmbeddingChunkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub desired_chunk_size: usize,
+
+    #[serde(default)]
+    pub overlap_size: usize,
+
+    #[serde(default)]
+    pub trim: bool,
+}
+
 /// Configuration for if and how a dataset's column should be embedded.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -148,4 +164,7 @@ pub struct ColumnEmbeddingConfig {
 
     #[serde(rename = "column_pk", skip_serializing_if = "Option::is_none")]
     pub primary_keys: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking: Option<EmbeddingChunkConfig>,
 }

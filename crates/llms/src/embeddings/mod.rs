@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /*
 Copyright 2024 The Spice.ai OSS Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +20,8 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
+
+use crate::chunking::{CharacterSplittingChunker, Chunker, ChunkingConfig};
 
 pub mod candle;
 
@@ -66,6 +70,10 @@ pub trait Embed: Sync + Send {
             .boxed()
             .context(HealthCheckSnafu)?;
         Ok(())
+    }
+
+    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        Some(Arc::new(CharacterSplittingChunker::new(&cfg)))
     }
 
     /// Returns the size of the embedding vector returned by the model.

@@ -18,6 +18,7 @@ use crate::dataconnector::DataConnectorError;
 use crate::model::EmbeddingModelStore;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
+use llms::chunking::ChunkingConfig;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,11 +85,29 @@ impl EmbeddingConnector {
             }
         }
 
+        let embed_chunker_config: HashMap<String, ChunkingConfig> = dataset
+            .embeddings
+            .iter()
+            .filter_map(|e| {
+                e.chunking.as_ref().map(|chunk_cfg| {
+                    (
+                        e.column.clone(),
+                        ChunkingConfig {
+                            desired_size: chunk_cfg.desired_chunk_size,
+                            overlap_size: chunk_cfg.overlap_size,
+                            trim: chunk_cfg.trim,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
         Ok(Arc::new(
             EmbeddingTable::new(
                 inner_table_provider,
                 embed_columns,
                 Arc::clone(&self.embedding_models),
+                embed_chunker_config,
             )
             .await,
         ) as Arc<dyn TableProvider>)
