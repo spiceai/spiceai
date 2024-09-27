@@ -22,12 +22,14 @@ use std::sync::Arc;
 pub struct IssuesTableArgs {
     pub owner: String,
     pub repo: String,
+    pub use_search: bool,
 }
 
 impl GitHubTableArgs for IssuesTableArgs {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
-        let query = format!(
-            r#"{{
+        let query = if self.use_search {
+            format!(
+                r#"{{
                 search(query:"repo:{owner}/{name} type:issue", first:100, type:ISSUE) {{
                     pageInfo {{
                         hasNextPage
@@ -55,16 +57,45 @@ impl GitHubTableArgs for IssuesTableArgs {
                     }}
                 }}
             }}"#,
-            owner = self.owner,
-            name = self.repo
-        );
+                owner = self.owner,
+                name = self.repo
+            )
+        } else {
+            format!(
+                r#"{{
+                repository(owner: "{owner}", name: "{name}") {{
+                    issues(first: 100) {{
+                        pageInfo {{
+                            hasNextPage
+                            endCursor
+                        }}
+                        nodes {{
+                            id
+                            number
+                            title
+                            url
+                            author: author {{ author: login }}
+                            body
+                            created_at: createdAt
+                            updated_at: updatedAt
+                            closed_at: closedAt
+                            state
+                            milestone_id: milestone {{ milestone_id: id}}
+                            milestone_title: milestone {{ milestone_title: title }}
+                            labels(first: 100) {{ labels: nodes {{ name }} }}
+                            milestone_title: milestone {{ milestone_title: title }}
+                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                        }}
+                    }}
+                }}
+            }}"#,
+                owner = self.owner,
+                name = self.repo
+            )
+        };
 
-        GitHubTableGraphQLParams::new(
-            query.into(),
-            Some("/data/search/nodes"),
-            2,
-            Some(gql_schema()),
-        )
+        GitHubTableGraphQLParams::new(query.into(), None, 2, Some(gql_schema()))
     }
 }
 

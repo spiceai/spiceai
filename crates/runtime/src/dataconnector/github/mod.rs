@@ -230,6 +230,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
+    ParameterSpec::connector("use_search")
+        .description("Boolean to specify if the search API should be used where possible.")
+        .default("false"),
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
@@ -268,6 +271,22 @@ impl DataConnector for Github {
         let path = dataset.path().clone();
         let mut parts = path.split('/');
 
+        let use_search = dataset
+            .params
+            .get("github_use_search")
+            .map_or("false", |v| v);
+
+        let use_search = match use_search {
+            "true" => true,
+            "false" => false,
+            e => {
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    source: format!("Invalid value for 'github_use_search' parameter: {e}").into(),
+                })
+            }
+        };
+
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
                 let table_args = Arc::new(PullRequestTableArgs {
@@ -287,6 +306,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    use_search,
                 });
                 self.create_gql_table_provider(table_args).await
             }
