@@ -21,9 +21,15 @@ use async_trait::async_trait;
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
-    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
+    graphql::{
+        client::GraphQLClient,
+        provider::{FilterPushdownResult, GraphQLTableProviderBuilder},
+    },
 };
-use datafusion::datasource::TableProvider;
+use datafusion::{
+    datasource::TableProvider, error::DataFusionError, logical_expr::TableProviderFilterPushDown,
+    prelude::Expr,
+};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use issues::IssuesTableArgs;
 use pull_requests::PullRequestTableArgs;
@@ -79,6 +85,63 @@ pub trait GitHubTableArgs: Send + Sync {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams;
 }
 
+#[allow(clippy::unnecessary_wraps)]
+fn filter_pushdown_fn(expr: &Expr) -> Result<FilterPushdownResult, DataFusionError> {
+    // implement simple filter pushdown for column BinaryOp like `column = 'value'`
+    println!("expr: {expr}");
+    if let Expr::BinaryExpr(binary_expr) = expr {
+        let ((Expr::Literal(value), Expr::Column(column))
+        | (Expr::Column(column), Expr::Literal(value))) =
+            (*binary_expr.left.clone(), *binary_expr.right.clone())
+        else {
+            return Ok(FilterPushdownResult {
+                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                expr: expr.clone(),
+                parameter: None,
+            });
+        };
+
+        let parameter = format!("{column}:{value}", column = column.name);
+
+        println!("Filter pushdown: {parameter}");
+
+        return Ok(FilterPushdownResult {
+            filter_pushdown: TableProviderFilterPushDown::Inexact,
+            expr: expr.clone(),
+            parameter: Some(parameter),
+        });
+    }
+
+    Ok(FilterPushdownResult {
+        filter_pushdown: TableProviderFilterPushDown::Unsupported,
+        expr: expr.clone(),
+        parameter: None,
+    })
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parameter_injection_fn(
+    filter_pushdown_results: &[FilterPushdownResult],
+    query: &str,
+) -> Result<Arc<str>, DataFusionError> {
+    // simple parameter injection that relies on the existence of "search" in the query
+    if query.contains(r#"query:""#) {
+        let mut query = query.to_string();
+        for filter_pushdown_result in filter_pushdown_results {
+            if let Some(parameter) = &filter_pushdown_result.parameter {
+                println!("{parameter}");
+                query = query.replace(r#"query:""#, &format!(r#"query:"{parameter} "#));
+            }
+        }
+
+        println!("Parameter injection: {query}");
+
+        return Ok(query.into());
+    }
+
+    Ok(query.into())
+}
+
 impl Github {
     pub(crate) fn create_graphql_client(
         &self,
@@ -121,6 +184,8 @@ impl Github {
         Ok(Arc::new(
             GraphQLTableProviderBuilder::new(client)
                 .with_schema_transform(github_gql_raw_schema_cast)
+                .with_filter_pushdown(filter_pushdown_fn)
+                .with_parameter_injection(parameter_injection_fn)
                 .build()
                 .await
                 .boxed()

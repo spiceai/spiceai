@@ -502,6 +502,8 @@ impl PaginationParameters {
             ),
         );
 
+        println!("new query: {new_query}");
+
         (new_query.to_string(), arguments.limit_reached)
     }
 
@@ -670,8 +672,13 @@ impl GraphQLClient {
         })
     }
 
+    pub(crate) fn get_query(&self) -> Arc<str> {
+        Arc::clone(&self.query)
+    }
+
     pub(crate) async fn execute(
         &self,
+        query: &Arc<str>,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
@@ -679,8 +686,8 @@ impl GraphQLClient {
         let (query, limit_reached) = self
             .pagination_parameters
             .as_ref()
-            .map(|x| x.apply(&self.query, limit, cursor))
-            .unwrap_or((self.query.to_string(), false));
+            .map(|x| x.apply(query, limit, cursor))
+            .unwrap_or((query.to_string(), false));
 
         let body = format!(r#"{{"query": {}}}"#, json!(query));
 
@@ -741,11 +748,14 @@ impl GraphQLClient {
 
     pub(crate) async fn execute_paginated(
         &self,
+        query: &Arc<str>,
         schema: SchemaRef,
         limit: Option<usize>,
     ) -> Result<Vec<Vec<RecordBatch>>> {
-        let (first_batch, _, mut next_cursor) =
-            self.execute(Some(Arc::clone(&schema)), limit, None).await?;
+        println!("initial query: {query}");
+        let (first_batch, _, mut next_cursor) = self
+            .execute(query, Some(Arc::clone(&schema)), limit, None)
+            .await?;
         let mut res = vec![first_batch];
         let mut limit = limit;
 
@@ -754,8 +764,15 @@ impl GraphQLClient {
                 limit = Some(p.reduce_limit(l));
             };
 
+            println!("next query: {query}");
+
             let (next_batch, _, new_cursor) = self
-                .execute(Some(Arc::clone(&schema)), limit, Some(next_cursor_val))
+                .execute(
+                    query,
+                    Some(Arc::clone(&schema)),
+                    limit,
+                    Some(next_cursor_val),
+                )
                 .await?;
             next_cursor = new_cursor;
             res.push(next_batch);
