@@ -32,6 +32,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
 use llms::chunking::Chunker;
+use llms::embeddings::Embed;
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -219,113 +220,156 @@ async fn get_embeddings(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     embedding_chunkers: &HashMap<String, Arc<dyn Chunker>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
-    let field = Arc::new(Field::new("item", DataType::Float32, false));
-
     let mut embed_arrays: HashMap<String, ArrayRef> =
         HashMap::with_capacity(embedded_columns.len());
+
     for (col, model_name) in embedded_columns {
         let read_guard = embedding_models.read().await;
         let Some(model) = read_guard.get(model_name) else {
+            tracing::debug!(
+                "When embedding col='{col}', model {model_name} expected, but not found"
+            );
             continue;
         };
 
-        let raw_data = match rb.column_by_name(col) {
-            None => {
-                continue;
-            }
-            Some(data) => data,
-        };
-
-        let string_array = raw_data.as_any().downcast_ref::<StringArray>();
-
-        let Some(arr) = string_array else {
+        let Some(raw_data) = rb.column_by_name(col) else {
+            tracing::debug!("When embedding col='{col}', column not found in record batch");
             continue;
         };
 
-        let column: Vec<String> = arr
-            .iter()
-            .filter_map(|s| s.map(ToString::to_string))
-            .collect();
+        let Some(arr) = raw_data.as_any().downcast_ref::<StringArray>() else {
+            tracing::debug!("When embedding col='{col}', column is not a StringArray");
+            continue;
+        };
 
         let list_array = if let Some(chunker) = embedding_chunkers.get(col) {
-            // Iterate over (chunks per row, (starting_offset into row, chunk))
-            let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
-                .iter()
-                .filter_map(|s| match s {
-                    // TODO: filter_map doesn't handle nulls
-                    Some(s) => {
-                        let chunks = chunker.chunk_indices(s).collect_vec();
-                        Some((chunks.len(), chunks))
-                    }
-                    None => None,
-                })
-                .unzip();
-
-            let (_chunk_offsets, chunks): (Vec<_>, Vec<_>) =
-                chunks_in_row.into_iter().flatten().unzip();
-
-            let chunks2 = chunks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<String>>();
-            let embedded_data = model.embed(EmbeddingInput::StringArray(chunks2)).await?;
-            let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
-
-            let mut values = Float32Array::builder(embedded_data.len() * vector_length);
-            let mut lengths = Vec::with_capacity(chunks_per_row.len());
-
-            let mut curr = 0;
-            for chunks_in_row in chunks_per_row {
-                lengths.push(chunks_in_row);
-                let inner = embedded_data.as_slice()[curr..curr + chunks_in_row]
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .collect_vec();
-                values.append_slice(&inner);
-                curr += chunks_in_row;
-            }
-
-            let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
-
-            let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
-
-            // Inner FixedSizeListArray
-            let fixed_size_list_array = FixedSizeListArray::try_new(
-                Arc::clone(&scalar_field),
-                i32::try_from(vector_length).boxed()?,
-                Arc::new(values.finish()),
-                None,
-            )
-            .boxed()?;
-
-            let l = ListArray::try_new(
-                Arc::new(Field::new_fixed_size_list(
-                    "item",
-                    Arc::clone(&scalar_field),
-                    i32::try_from(vector_length).boxed()?,
-                    false,
-                )),
-                offsets, // Offsets are for how many chunks per row.
-                Arc::new(fixed_size_list_array),
-                None,
-            );
-
-            Arc::new(l.boxed()?) as ArrayRef
+            let list_array = get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
+            Arc::new(list_array) as ArrayRef
         } else {
-            let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
-            let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
-            let processed = embedded_data.iter().flatten().copied().collect_vec();
-
-            let values = Float32Array::try_new(processed.into(), None)?;
-            Arc::new(FixedSizeListArray::try_new(
-                Arc::clone(&field),
-                i32::try_from(vector_length)?,
-                Arc::new(values),
-                None,
-            )?) as ArrayRef
+            let fixed_size_array = get_vectors(arr, &**model).await?;
+            Arc::new(fixed_size_array) as ArrayRef
         };
         embed_arrays.insert(format!("{col}_embedding"), list_array);
     }
     Ok(embed_arrays)
+}
+
+/// Embed a [`StringArray`] using the provided [`Embed`] model. The output is a [`FixedSizeListArray`],
+/// where each [`String`] gets embedded into a single [`f32`] vector.
+///
+/// ```text
+///                +- Embedding Model -+
+///                |                   v
+/// +---------------------+      +-------------+
+/// | "Hello, World!"     |      | [0.1, 1.2] |
+/// | "How are you doing?"|      | [0.5, 0.6] |
+/// | "I'm doing well."   |      | [1.1, 1.2] |
+/// +---------------------+      +-------------+
+///     [`StringArray`]        [`FixedSizeListArray`]
+/// ```
+async fn get_vectors(
+    arr: &StringArray,
+    model: &dyn Embed,
+) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
+    let field = Arc::new(Field::new("item", DataType::Float32, false));
+    let column: Vec<String> = arr
+        .iter()
+        .filter_map(|s| s.map(ToString::to_string))
+        .collect();
+    let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+    let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
+    let processed = embedded_data.iter().flatten().copied().collect_vec();
+
+    let values = Float32Array::try_new(processed.into(), None)?;
+    FixedSizeListArray::try_new(
+        Arc::clone(&field),
+        i32::try_from(vector_length)?,
+        Arc::new(values),
+        None,
+    )
+    .boxed()
+}
+
+/// Embed a [`StringArray`] using the provided [`Embed`] model and [`Chunker`]. The output is a [`ListArray`],
+/// where each input [`String`] gets chunked and embedded into a [`FixedSizeListArray`].
+///
+/// ```text
+///                 +--- Chunker ---+               +--- Embedding Model ---+
+///                 |               v               |                       v
+/// +---------------------+  +-------------------------------+  +--------------------------------------+  
+/// | "Hello, World!"     |  | ["Hello, ", ", World!"]       |  | [[0.1, 1.2], [0.3, 0.4]]             |
+/// | "How are you doing?"|  | ["How ", "are you ", "doing?"]|  | [[0.5, 0.6], [0.7, 0.8], [0.9, 1.0]] |
+/// | "I'm doing well."   |  | ["I'm doing ", "doing well."] |  | [[1.1, 1.2], [1.3, 1.4]]             |
+/// +---------------------+  +-------------------------------+  +--------------------------------------+
+///     [`StringArray`]                                                   [`ListArray`]
+/// ```
+async fn get_vectors_with_chunker(
+    arr: &StringArray,
+    chunker: Arc<dyn Chunker>,
+    model: &dyn Embed,
+) -> Result<ListArray, Box<dyn std::error::Error + Send + Sync>> {
+    // Iterate over (chunks per row, (starting_offset into row, chunk))
+    let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
+        .iter()
+        .filter_map(|s| match s {
+            // TODO: filter_map doesn't handle nulls
+            Some(s) => {
+                let chunks = chunker
+                    .chunk_indices(s)
+                    .map(|(idx, s)| (idx, s.to_string()))
+                    .collect_vec();
+                Some((chunks.len(), chunks))
+            }
+            None => None,
+        })
+        .unzip();
+
+    let (_chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
+
+    let embedded_data = model
+        .embed(EmbeddingInput::StringArray(chunks))
+        .await
+        .boxed()?;
+    let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
+
+    let mut values = Float32Array::builder(embedded_data.len() * vector_length);
+    let mut lengths = Vec::with_capacity(chunks_per_row.len());
+
+    let mut curr = 0;
+    for chunks_in_row in chunks_per_row {
+        lengths.push(chunks_in_row);
+        let inner = embedded_data.as_slice()[curr..curr + chunks_in_row]
+            .iter()
+            .flatten()
+            .copied()
+            .collect_vec();
+        values.append_slice(&inner);
+        curr += chunks_in_row;
+    }
+
+    let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
+
+    let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
+
+    // Inner FixedSizeListArray
+    let fixed_size_list_array = FixedSizeListArray::try_new(
+        Arc::clone(&scalar_field),
+        i32::try_from(vector_length).boxed()?,
+        Arc::new(values.finish()),
+        None,
+    )
+    .boxed()?;
+
+    ListArray::try_new(
+        Arc::new(Field::new_fixed_size_list(
+            "item",
+            Arc::clone(&scalar_field),
+            i32::try_from(vector_length).boxed()?,
+            false,
+        )),
+        offsets, // Offsets are for how many chunks per row.
+        Arc::new(fixed_size_list_array),
+        None,
+    )
+    .boxed()
 }
