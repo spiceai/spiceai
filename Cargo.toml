@@ -33,7 +33,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.81"
-version = "0.18.2-beta"
+version = "0.19.0-beta"
 
 [workspace.dependencies]
 arrow = "53"
@@ -51,7 +51,7 @@ base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
 chrono = "0.4.38"
-clap = { version = "4.5.16", features = ["derive"] }
+clap = { version = "4.5.18", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
   "tokio_io",
   "tls",
