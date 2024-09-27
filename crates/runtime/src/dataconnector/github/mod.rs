@@ -292,6 +292,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(PullRequestTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    use_search,
                 });
                 self.create_gql_table_provider(table_args).await
             }
