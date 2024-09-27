@@ -29,7 +29,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
-use std::{cmp::min, io::Cursor, sync::Arc};
+use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 
 use url::Url;
 
@@ -234,12 +234,66 @@ struct FieldArgument {
     value: String,
 }
 
+impl Display for FieldArgument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{name}: {value}", name = self.name, value = self.value)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     resource_name: String,
     pub pagination_argument: PaginationArgument,
     other_arguments: Vec<FieldArgument>,
     page_info_path: Option<String>,
+}
+
+struct FieldArguments {
+    args: String,
+    limit_reached: bool,
+}
+
+impl PaginationParameters {
+    #[must_use]
+    fn parameters_string(&self, limit: Option<usize>, cursor: Option<String>) -> FieldArguments {
+        let mut limit_reached = false;
+        let pagination_argument = if let Some(limit) = limit {
+            if limit <= self.pagination_argument.size() {
+                let pagination_argument = self.pagination_argument.with_limit(limit);
+                limit_reached = true;
+                pagination_argument
+            } else {
+                self.pagination_argument.clone()
+            }
+        } else {
+            self.pagination_argument.clone()
+        };
+
+        if self.other_arguments.is_empty() {
+            FieldArguments {
+                args: pagination_argument.format_arguments(cursor),
+                limit_reached,
+            }
+        } else {
+            let mut args = self
+                .other_arguments
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<String>>();
+
+            args.push(self.pagination_argument.to_string());
+
+            let args = args.join(", ");
+
+            FieldArguments {
+                args: format!(
+                    "{}, {args}",
+                    self.pagination_argument.format_arguments(cursor)
+                ),
+                limit_reached,
+            }
+        }
+    }
 }
 
 impl PaginationParameters {
@@ -436,43 +490,22 @@ impl PaginationParameters {
     }
 
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
-        let mut limit_reached = false;
-
-        let mut count = self.pagination_argument.clone();
-
-        if let Some(limit) = limit {
-            if limit <= count.size() {
-                count = count.with_limit(limit);
-                limit_reached = true;
-            }
-        }
-
         let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
         let regex =
             Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
 
-        let other_arguments = self
-            .other_arguments
-            .iter()
-            .map(|arg| format!("{}: {}", arg.name, arg.value))
-            .collect::<Vec<String>>()
-            .join(", ");
-
-        let arguments = if self.other_arguments.is_empty() {
-            count.format_arguments(cursor).to_string()
-        } else {
-            format!("{}, {}", count.format_arguments(cursor), other_arguments)
-        };
+        let arguments = self.parameters_string(limit, cursor);
 
         let new_query = regex.replace(
             query,
             format!(
                 r#"{resource_name} ({arguments})"#,
+                arguments = arguments.args,
                 resource_name = self.resource_name,
             ),
         );
 
-        (new_query.to_string(), limit_reached)
+        (new_query.to_string(), arguments.limit_reached)
     }
 
     fn get_next_cursor_from_response(&self, response: &Value) -> Option<String> {
@@ -988,7 +1021,7 @@ mod tests {
                         other_arguments: vec![
                             super::FieldArgument {
                                 name: "some_field".to_owned(),
-                                value: "\"value\"".to_owned(),
+                                value: r#""value""#.to_owned(),
                             },
                             super::FieldArgument {
                                 name: "integer_field".to_owned(),
