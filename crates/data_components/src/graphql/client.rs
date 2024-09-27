@@ -286,10 +286,7 @@ impl PaginationParameters {
             let args = args.join(", ");
 
             FieldArguments {
-                args: format!(
-                    "{}, {args}",
-                    self.pagination_argument.format_arguments(cursor)
-                ),
+                args,
                 limit_reached,
             }
         }
