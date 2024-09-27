@@ -59,10 +59,11 @@ pub(crate) async fn setup_benchmark(
     upload_results_dataset: &Option<String>,
     connector: &str,
     acceleration: Option<Acceleration>,
+    bench_name: &str,
 ) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = build_app(upload_results_dataset, connector, acceleration);
+    let app = build_app(upload_results_dataset, connector, acceleration, bench_name);
 
     let status = status::RuntimeStatus::new();
     let rt = Runtime::builder()
@@ -125,41 +126,15 @@ fn build_app(
     upload_results_dataset: &Option<String>,
     connector: &str,
     acceleration: Option<Acceleration>,
+    bench_name: &str,
 ) -> App {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test");
 
     app_builder = match connector {
-        "spice.ai" => app_builder
-            .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
-            .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
-            .with_dataset(make_spiceai_dataset("tpch.part", "part"))
-            .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
-            .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
-            .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
-            .with_dataset(make_spiceai_dataset("tpch.region", "region"))
-            .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier")),
-        "spark" => app_builder
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.customer",
-                "customer",
-            ))
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.lineitem",
-                "lineitem",
-            ))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.part", "part"))
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.partsupp",
-                "partsupp",
-            ))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.orders", "orders"))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.nation", "nation"))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.region", "region"))
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.supplier",
-                "supplier",
-            )),
-        "s3" => crate::bench_s3::build_app(app_builder),
+        "spice.ai" => crate::bench_spicecloud::build_app(app_builder),
+        "s3" => crate::bench_s3::build_app(app_builder, bench_name),
+        #[cfg(feature = "spark")]
+        "spark" => crate::bench_spark::build_app(app_builder),
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder),
         #[cfg(feature = "mysql")]
@@ -292,14 +267,6 @@ fn init_tracing() {
         .with_ansi(true)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
-}
-
-fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("spice.ai:{path}"), name.to_string())
-}
-
-fn make_spark_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("spark:{path}"), name.to_string())
 }
 
 fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {

@@ -65,7 +65,7 @@ mod bench_spark;
 #[command(version, about, long_about = None)]
 struct BenchArgs {
     /// Run the benchmark
-    #[arg(short, long)]
+    #[arg(long)]
     bench: bool,
 
     /// Set the connector to run benchmark test on
@@ -79,6 +79,10 @@ struct BenchArgs {
     /// Set the acceleration mode for accelerator
     #[arg(short, long)]
     mode: Option<String>,
+
+    /// Set the benchmark to run: TPCH / TPCDS
+    #[arg(short, long, default_value = "tpch")]
+    bench_name: String,
 }
 
 #[tokio::main]
@@ -100,43 +104,44 @@ async fn main() -> Result<(), String> {
             // Run all connector / accelerator benchmark tests
             let connectors = vec![
                 "spice.ai",
-                "s3",
-                #[cfg(feature = "spark")]
-                "spark",
-                #[cfg(feature = "postgres")]
-                "postgres",
-                #[cfg(feature = "mysql")]
-                "mysql",
-                #[cfg(feature = "odbc")]
-                "odbc-databricks",
-                #[cfg(feature = "odbc")]
-                "odbc-athena",
-                #[cfg(feature = "delta_lake")]
-                "delta_lake",
+                // "s3",
+                // #[cfg(feature = "spark")]
+                // "spark",
+                // #[cfg(feature = "postgres")]
+                // "postgres",å
+                // #[cfg(feature = "mysql")]
+                // "mysql",
+                // #[cfg(feature = "odbc")]
+                // "odbc-databricks",
+                // #[cfg(feature = "odbc")]
+                // "odbc-athena",
+                // #[cfg(feature = "delta_lake")]
+                // "delta_lake",
             ];
             for connector in connectors {
-                run_connector_bench(connector, &upload_results_dataset).await?;
+                run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
                 create_acceleration("arrow", acceleration::Mode::Memory, None),
-                #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, None),
-                #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, None),
-                #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory, None),
-                #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File, None),
-                #[cfg(feature = "postgres")]
-                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
+                // #[cfg(feature = "duckdb")]
+                // create_acceleration("duckdb", acceleration::Mode::Memory, None),
+                // #[cfg(feature = "duckdb")]
+                // create_acceleration("duckdb", acceleration::Mode::File, None),
+                // #[cfg(feature = "sqlite")]
+                // create_acceleration("sqlite", acceleration::Mode::Memory, None),
+                // #[cfg(feature = "sqlite")]
+                // create_acceleration("sqlite", acceleration::Mode::File, None),
+                // #[cfg(feature = "postgres")]
+                // create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
             ];
             for accelerator in accelerators {
-                run_accelerator_bench(accelerator, &upload_results_dataset).await?;
+                run_accelerator_bench(accelerator.clone(), &upload_results_dataset, "tpch").await?;
+                run_accelerator_bench(accelerator, &upload_results_dataset, "tpcds").await?;
             }
         },
         (Some(connector), None, None) => {
             // Run connector benchmark test
-            run_connector_bench(connector, &upload_results_dataset).await?;
+            run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
         },
         (None, Some(accelerator), mode) => {
             // Run accelerator benchmark test
@@ -158,7 +163,16 @@ async fn main() -> Result<(), String> {
             };
 
             let acceleration = create_acceleration(accelerator, mode, params);
-            run_accelerator_bench(acceleration, &upload_results_dataset).await?;
+
+            match args.bench_name.as_ref() {
+                "tpch" => {
+                    run_accelerator_bench(acceleration, &upload_results_dataset, "tpch").await?;
+                }
+                "tpcds" => {
+                    run_accelerator_bench(acceleration, &upload_results_dataset, "tpcds").await?;
+                }
+                _ => return Err(format!("Invalid mode bench_name parameter {}", args.bench_name)),
+            }
         },
         _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
     }
@@ -169,18 +183,26 @@ async fn main() -> Result<(), String> {
 async fn run_connector_bench(
     connector: &str,
     upload_results_dataset: &Option<String>,
+    bench_name: &str,
 ) -> Result<(), String> {
+    // TODO: Implement and enable connector TPCDS bench if it's required
+    if bench_name == "tpcds" {
+        return Err(
+            "TPCDS Benchmark not implemented for data connectors, please implement if needed",
+        );
+    }
+
     let mut display_records = vec![];
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(upload_results_dataset, connector, None).await;
+        setup::setup_benchmark(upload_results_dataset, connector, None, bench_name).await;
 
     match connector {
         "spice.ai" => {
             bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
         "s3" => {
-            bench_s3::run(&mut rt, &mut benchmark_results, None, None).await?;
+            bench_s3::run(&mut rt, &mut benchmark_results, None, None, "tpch").await?;
         }
         #[cfg(feature = "spark")]
         "spark" => {
@@ -225,6 +247,7 @@ async fn run_connector_bench(
 async fn run_accelerator_bench(
     accelerator: Acceleration,
     upload_results_dataset: &Option<String>,
+    bench_name: &str,
 ) -> Result<(), String> {
     let mut display_records = vec![];
 
@@ -232,9 +255,16 @@ async fn run_accelerator_bench(
     let mode = accelerator.mode.clone();
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(upload_results_dataset, "s3", Some(accelerator)).await;
+        setup::setup_benchmark(upload_results_dataset, "s3", Some(accelerator), bench_name).await;
 
-    bench_s3::run(&mut rt, &mut benchmark_results, engine, Some(mode)).await?;
+    bench_s3::run(
+        &mut rt,
+        &mut benchmark_results,
+        engine,
+        Some(mode),
+        bench_name,
+    )
+    .await?;
 
     let data_update: DataUpdate = benchmark_results.into();
 
@@ -406,6 +436,11 @@ async fn record_explain_plan(
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
+    // TODO: Turn on snapshot for tpcds queries after tpcds hardening
+    if query_name.starts_with("tpcds") {
+        return Ok(());
+    }
+
     if !ENABLED_SNAPSHOT_CONNECTORS.contains(&connector) {
         return Ok(());
     }
