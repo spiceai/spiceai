@@ -33,7 +33,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
     );
     let _tracing = init_tracing(None);
     let app = AppBuilder::new("spiceai_catalog_test")
-        .with_catalog(Catalog::new("spiceai".to_string(), "spiceai".to_string()))
+        .with_catalog(Catalog::new("spice.ai".to_string(), "spiceai".to_string()))
         .build();
 
     let status = status::RuntimeStatus::new();
@@ -84,7 +84,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
-    let mut catalog = Catalog::new("spiceai".to_string(), "spiceai".to_string());
+    let mut catalog = Catalog::new("spice.ai".to_string(), "spiceai".to_string());
     catalog.include = vec![
         "eth.recent_bl*".to_string(),
         "eth.recent_transactions".to_string(),

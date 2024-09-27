@@ -78,6 +78,5 @@ spice init my_app
 }
 
 func init() {
-	initCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(initCmd)
 }
