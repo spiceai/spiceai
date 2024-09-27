@@ -229,15 +229,22 @@ impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct FieldArgument {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct PaginationParameters {
     resource_name: String,
-    pub args: PaginationArgument,
+    pub pagination_argument: PaginationArgument,
+    other_arguments: Vec<FieldArgument>,
     page_info_path: Option<String>,
 }
 
 impl PaginationParameters {
     fn reduce_limit(&self, l: usize) -> usize {
-        l.saturating_sub(self.args.size())
+        l.saturating_sub(self.pagination_argument.size())
     }
 
     /// Parses the GraphQL query and returns the appropriate [`PaginationParameters`] if the query
@@ -374,25 +381,41 @@ impl PaginationParameters {
                         let json_pointer =
                             data_field.map(|f| format!("/data{current_path}/{}", f.name.as_ref()));
 
-                        let pag_args = match TryInto::<PaginationArgument>::try_into(parent_field) {
-                            Ok(pag_args) => pag_args,
-                            Err(e) => {
-                                tracing::warn!("Invalid pagination argument from field: {e}");
-                                return (None, None);
-                            }
-                        };
+                        let pagination_argument =
+                            match TryInto::<PaginationArgument>::try_into(parent_field) {
+                                Ok(pagination_argument) => pagination_argument,
+                                Err(e) => {
+                                    tracing::warn!("Invalid pagination argument from field: {e}");
+                                    return (None, None);
+                                }
+                            };
+
+                        tracing::debug!("pagination_argument: {pagination_argument}");
+
+                        let other_arguments = parent_field
+                            .arguments
+                            .iter()
+                            .filter_map(|(k, v)| match k.as_ref() {
+                                "first" | "last" | "after" | "before" => None,
+                                _ => Some(FieldArgument {
+                                    name: k.as_ref().to_string(),
+                                    value: v.to_string(),
+                                }),
+                            })
+                            .collect();
 
                         // Check [`PaginationArgument`] and `pageInfo` fields are consistent.
-                        if let Err(e) = pag_args.validate_page_info(field) {
-                            tracing::warn!("GraphQL query has pagination specified ({pag_args}), but invalid pagination fields: {e}");
+                        if let Err(e) = pagination_argument.validate_page_info(field) {
+                            tracing::warn!("GraphQL query has pagination specified ({pagination_argument}), but invalid pagination fields: {e}");
                             return (None, None);
                         }
 
                         return (
                             Some(PaginationParameters {
                                 resource_name: parent_field.name.as_ref().to_string(),
-                                args: pag_args,
                                 page_info_path: Some(new_path),
+                                pagination_argument,
+                                other_arguments,
                             }),
                             json_pointer,
                         );
@@ -415,7 +438,7 @@ impl PaginationParameters {
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
         let mut limit_reached = false;
 
-        let mut count = self.args.clone();
+        let mut count = self.pagination_argument.clone();
 
         if let Some(limit) = limit {
             if limit <= count.size() {
@@ -428,14 +451,28 @@ impl PaginationParameters {
         let regex =
             Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
 
+        let other_arguments = self
+            .other_arguments
+            .iter()
+            .map(|arg| format!("{}: {}", arg.name, arg.value))
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        let arguments = if self.other_arguments.is_empty() {
+            count.format_arguments(cursor).to_string()
+        } else {
+            format!("{}, {}", count.format_arguments(cursor), other_arguments)
+        };
+
         let new_query = regex.replace(
             query,
             format!(
-                r#"{} ({})"#,
-                self.resource_name,
-                count.format_arguments(cursor)
+                r#"{resource_name} ({arguments})"#,
+                resource_name = self.resource_name,
             ),
         );
+
+        tracing::debug!("New query with pagination rewrite: {new_query}");
 
         (new_query.to_string(), limit_reached)
     }
@@ -453,7 +490,7 @@ impl PaginationParameters {
             .ok()
             .flatten()?;
 
-        page_info.cursor_from_pagination(&self.args)
+        page_info.cursor_from_pagination(&self.pagination_argument)
     }
 }
 
@@ -853,8 +890,9 @@ mod tests {
                 expected: (
                     Some(PaginationParameters {
                         resource_name: "users".to_owned(),
-                        args: super::PaginationArgument::First(10),
+                        pagination_argument: super::PaginationArgument::First(10),
                         page_info_path: Some("/users/pageInfo".into()),
+                        other_arguments: vec![],
                     }),
                     None,
                 ),
@@ -874,8 +912,9 @@ mod tests {
                 expected: (
                     Some(PaginationParameters {
                         resource_name: "users".to_owned(),
-                        args: super::PaginationArgument::First(10),
+                        pagination_argument: super::PaginationArgument::First(10),
                         page_info_path: Some("/users/pageInfo".into()),
+                        other_arguments: vec![],
                     }),
                     None,
                 ),
@@ -915,8 +954,53 @@ mod tests {
                 expected: (
                     Some(PaginationParameters {
                         resource_name: "paginatedUsers".to_owned(),
-                        args: super::PaginationArgument::First(2),
+                        pagination_argument: super::PaginationArgument::First(2),
                         page_info_path: Some("/paginatedUsers/pageInfo".to_owned()),
+                        other_arguments: vec![],
+                    }),
+                    Some("/data/paginatedUsers/users".into()),
+                ),
+            },
+            TestPaginationParseCase {
+                name: "Pagination with other fields",
+                query: r#"
+                    query {
+                        paginatedUsers(first: 2, some_field: "value", integer_field: 10, boolean_field: true) {
+                            users {
+                                id
+                                name
+                                posts {
+                                    id
+                                    title
+                                    content
+                                }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                "#,
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "paginatedUsers".to_owned(),
+                        pagination_argument: super::PaginationArgument::First(2),
+                        page_info_path: Some("/paginatedUsers/pageInfo".to_owned()),
+                        other_arguments: vec![
+                            super::FieldArgument {
+                                name: "some_field".to_owned(),
+                                value: "\"value\"".to_owned(),
+                            },
+                            super::FieldArgument {
+                                name: "integer_field".to_owned(),
+                                value: "10".to_owned(),
+                            },
+                            super::FieldArgument {
+                                name: "boolean_field".to_owned(),
+                                value: "true".to_owned(),
+                            },
+                        ],
                     }),
                     Some("/data/paginatedUsers/users".into()),
                 ),

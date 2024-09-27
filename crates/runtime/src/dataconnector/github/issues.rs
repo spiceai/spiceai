@@ -28,7 +28,11 @@ impl GitHubTableArgs for IssuesTableArgs {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
         let query = format!(
             r#"{{
-                search(query:"repo:{owner}/{name}", first:100, type:ISSUE) {{
+                search(query:"repo:{owner}/{name} type:issue", first:100, type:ISSUE) {{
+                    pageInfo {{
+                        hasNextPage
+                        endCursor
+                    }}
                     nodes {{
                         ... on Issue {{
                             id
