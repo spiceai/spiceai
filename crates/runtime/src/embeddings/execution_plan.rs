@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
+};
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
 
 use arrow::error::ArrowError;
@@ -28,6 +31,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
+use llms::chunking::Chunker;
+use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
@@ -46,6 +51,7 @@ pub struct EmbeddingTableExec {
 
     embedded_columns: HashMap<String, String>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
 }
 
 impl std::fmt::Debug for EmbeddingTableExec {
@@ -97,6 +103,7 @@ impl ExecutionPlan for EmbeddingTableExec {
             Arc::clone(&self.base_plan).with_new_children(children)?,
             self.embedded_columns.clone(),
             Arc::clone(&self.embedding_models),
+            self.embedding_chunkers.clone(),
         )) as Arc<dyn ExecutionPlan>)
     }
 
@@ -113,6 +120,7 @@ impl ExecutionPlan for EmbeddingTableExec {
                 Arc::clone(&self.projected_schema),
                 self.embedded_columns.clone(),
                 Arc::clone(&self.embedding_models),
+                self.embedding_chunkers.clone(),
             ),
         )))
     }
@@ -127,6 +135,7 @@ impl EmbeddingTableExec {
         base_plan: Arc<dyn ExecutionPlan>,
         embedded_columns: HashMap<String, String>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+        embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(projected_schema),
@@ -136,6 +145,7 @@ impl EmbeddingTableExec {
             base_plan,
             embedded_columns,
             embedding_models,
+            embedding_chunkers,
         }
     }
 
@@ -155,12 +165,13 @@ fn to_sendable_stream(
     projected_schema: SchemaRef,
     embedded_columns: HashMap<String, String>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
         while let Some(batch_result) = base_stream.next().await {
             match batch_result {
                 Ok(batch) => {
-                    match get_embeddings(&batch, &embedded_columns, Arc::clone(&embedding_models)).await {
+                    match get_embeddings(&batch, &embedded_columns, Arc::clone(&embedding_models), &embedding_chunkers).await {
                         Ok(embeddings) => {
 
                             match construct_record_batch(
@@ -206,6 +217,7 @@ async fn get_embeddings(
     rb: &RecordBatch,
     embedded_columns: &HashMap<String, String>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+    embedding_chunkers: &HashMap<String, Arc<dyn Chunker>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
     let field = Arc::new(Field::new("item", DataType::Float32, false));
 
@@ -213,9 +225,7 @@ async fn get_embeddings(
         HashMap::with_capacity(embedded_columns.len());
     for (col, model_name) in embedded_columns {
         let read_guard = embedding_models.read().await;
-        let model_lock_opt = read_guard.get(model_name);
-
-        let Some(model) = model_lock_opt else {
+        let Some(model) = read_guard.get(model_name) else {
             continue;
         };
 
@@ -237,18 +247,85 @@ async fn get_embeddings(
             .filter_map(|s| s.map(ToString::to_string))
             .collect();
 
-        let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
-        let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
-        let processed = embedded_data.iter().flatten().copied().collect_vec();
+        let list_array = if let Some(chunker) = embedding_chunkers.get(col) {
+            // Iterate over (chunks per row, (starting_offset into row, chunk))
+            let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
+                .iter()
+                .filter_map(|s| match s {
+                    // TODO: filter_map doesn't handle nulls
+                    Some(s) => {
+                        let chunks = chunker.chunk_indices(s).collect_vec();
+                        Some((chunks.len(), chunks))
+                    }
+                    None => None,
+                })
+                .unzip();
 
-        let values = Float32Array::try_new(processed.into(), None)?;
-        let list_array = FixedSizeListArray::try_new(
-            Arc::clone(&field),
-            i32::try_from(vector_length)?,
-            Arc::new(values),
-            None,
-        )?;
-        embed_arrays.insert(format!("{col}_embedding"), Arc::new(list_array));
+            let (_chunk_offsets, chunks): (Vec<_>, Vec<_>) =
+                chunks_in_row.into_iter().flatten().unzip();
+
+            let chunks2 = chunks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>();
+            let embedded_data = model.embed(EmbeddingInput::StringArray(chunks2)).await?;
+            let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
+
+            let mut values = Float32Array::builder(embedded_data.len() * vector_length);
+            let mut lengths = Vec::with_capacity(chunks_per_row.len());
+
+            let mut curr = 0;
+            for chunks_in_row in chunks_per_row {
+                lengths.push(chunks_in_row);
+                let inner = embedded_data.as_slice()[curr..curr + chunks_in_row]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect_vec();
+                values.append_slice(&inner);
+                curr += chunks_in_row;
+            }
+
+            let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
+
+            let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
+
+            // Inner FixedSizeListArray
+            let fixed_size_list_array = FixedSizeListArray::try_new(
+                Arc::clone(&scalar_field),
+                i32::try_from(vector_length).boxed()?,
+                Arc::new(values.finish()),
+                None,
+            )
+            .boxed()?;
+
+            let l = ListArray::try_new(
+                Arc::new(Field::new_fixed_size_list(
+                    "item",
+                    Arc::clone(&scalar_field),
+                    i32::try_from(vector_length).boxed()?,
+                    false,
+                )),
+                offsets, // Offsets are for how many chunks per row.
+                Arc::new(fixed_size_list_array),
+                None,
+            );
+
+            Arc::new(l.boxed()?) as ArrayRef
+        } else {
+            let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+            let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
+            let processed = embedded_data.iter().flatten().copied().collect_vec();
+
+            let values = Float32Array::try_new(processed.into(), None)?;
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::clone(&field),
+                i32::try_from(vector_length)?,
+                Arc::new(values),
+                None,
+            )?) as ArrayRef
+        };
+        embed_arrays.insert(format!("{col}_embedding"), list_array);
     }
     Ok(embed_arrays)
 }

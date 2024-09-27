@@ -335,6 +335,7 @@ impl TableProvider for EmbeddingTable {
             base_plan,
             scan_embed_columns,
             Arc::clone(&self.embedding_models),
+            self.embedding_chunkers.clone(),
         )) as Arc<dyn ExecutionPlan>)
     }
 
