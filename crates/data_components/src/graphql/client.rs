@@ -472,8 +472,6 @@ impl PaginationParameters {
             ),
         );
 
-        tracing::debug!("New query with pagination rewrite: {new_query}");
-
         (new_query.to_string(), limit_reached)
     }
 
