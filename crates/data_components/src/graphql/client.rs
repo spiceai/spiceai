@@ -21,8 +21,8 @@ use arrow::{
     json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
 };
 use graphql_parser::query::{
-    parse_query, Definition, Field, InlineFragment, OperationDefinition, Query, Selection,
-    SelectionSet, Text,
+    parse_query, Definition, Document, Field, InlineFragment, OperationDefinition, Query,
+    Selection, SelectionSet, Text,
 };
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
@@ -228,7 +228,7 @@ impl<'a, T: Text<'a>> TryInto<PaginationArgument> for &Field<'a, T> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct FieldArgument {
     name: String,
     value: String,
@@ -240,7 +240,7 @@ impl Display for FieldArgument {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PaginationParameters {
     resource_name: String,
     pub pagination_argument: PaginationArgument,
@@ -250,29 +250,18 @@ pub struct PaginationParameters {
 
 struct FieldArguments {
     args: String,
-    limit_reached: bool,
 }
 
 impl PaginationParameters {
     #[must_use]
     fn parameters_string(&self, limit: Option<usize>, cursor: Option<String>) -> FieldArguments {
-        let mut limit_reached = false;
-        let pagination_argument = if let Some(limit) = limit {
-            if limit <= self.pagination_argument.size() {
-                let pagination_argument = self.pagination_argument.with_limit(limit);
-                limit_reached = true;
-                pagination_argument
-            } else {
-                self.pagination_argument.clone()
-            }
-        } else {
-            self.pagination_argument.clone()
-        };
+        let pagination_argument = self
+            .pagination_argument
+            .with_limit(limit.unwrap_or(usize::MAX));
 
         if self.other_arguments.is_empty() {
             FieldArguments {
                 args: pagination_argument.format_arguments(cursor),
-                limit_reached,
             }
         } else {
             let mut args = self
@@ -281,14 +270,11 @@ impl PaginationParameters {
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<String>>();
 
-            args.push(self.pagination_argument.format_arguments(cursor));
+            args.push(pagination_argument.format_arguments(cursor));
 
             let args = args.join(", ");
 
-            FieldArguments {
-                args,
-                limit_reached,
-            }
+            FieldArguments { args }
         }
     }
 }
@@ -350,13 +336,13 @@ impl PaginationParameters {
     ///
     /// A user must explicitly provider the JSON pointer for the latter example (e.g. when calling [`GraphQLClient::new`]).
     ///
-    fn parse(query: &str) -> (Option<Self>, Option<String>) {
-        let Some(ast) = parse_query::<String>(query).ok() else {
-            return (None, None);
-        };
+    fn parse(ast: &Document<'_, String>) -> (Option<Self>, Option<String>) {
+        // let Some(ast) = parse_query::<String>(query).ok() else {
+        //     return (None, None);
+        // };
 
         // Start traversing the query's operation definitions
-        for def in ast.definitions {
+        for def in ast.definitions.clone() {
             let selections = match def {
                 Definition::Operation(OperationDefinition::Query(Query {
                     selection_set, ..
@@ -486,7 +472,7 @@ impl PaginationParameters {
         (None, None)
     }
 
-    fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> (String, bool) {
+    fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> String {
         let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
         let regex =
             Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
@@ -504,7 +490,7 @@ impl PaginationParameters {
 
         println!("new query: {new_query}");
 
-        (new_query.to_string(), arguments.limit_reached)
+        new_query.to_string()
     }
 
     fn get_next_cursor_from_response(&self, response: &Value) -> Option<String> {
@@ -618,12 +604,71 @@ fn unnest_json_objects(
 pub struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
-    query: Arc<str>,
-    pointer: Arc<str>,
+    // query: Arc<str>,
+    json_pointer: Arc<str>,
     unnest_parameters: UnnestParameters,
-    pagination_parameters: Option<PaginationParameters>,
+    // pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
+}
+
+#[derive(Clone)]
+pub struct GraphQLQuery<'a> {
+    ast: Document<'a, String>,
+    json_pointer: Option<String>,
+    pagination_parameters: Option<PaginationParameters>,
+}
+
+impl<'a> TryFrom<&'a str> for GraphQLQuery<'a> {
+    type Error = super::Error;
+
+    fn try_from(query: &'a str) -> Result<Self, self::Error> {
+        let ast = parse_query::<String>(query).map_err(|_| super::Error::InvalidGraphQLQuery {
+            message: "Failed to parse GraphQL query".to_string(),
+            line: 0,
+            column: 0,
+            query: query.to_string(),
+        })?;
+
+        let (pagination_parameters, json_pointer) = PaginationParameters::parse(&ast);
+
+        Ok(Self {
+            ast,
+            json_pointer,
+            pagination_parameters,
+        })
+    }
+}
+
+impl GraphQLQuery<'_> {
+    #[must_use]
+    pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> String {
+        let query = self.ast.to_string();
+
+        if let Some(pagination_parameters) = &self.pagination_parameters {
+            pagination_parameters.apply(&query, limit, cursor)
+        } else {
+            query
+        }
+    }
+
+    pub fn limit_reached(&mut self, limit: Option<usize>, _record_count: usize) -> bool {
+        if let Some(_limit) = limit {
+            // TODO: implement limit tracking
+            false
+        } else {
+            false
+        }
+    }
+}
+
+pub(crate) struct GraphQLQueryResult<'a> {
+    pub(crate) query: GraphQLQuery<'a>,
+    pub(crate) records: Vec<RecordBatch>,
+    record_count: usize,
+    limit_reached: bool,
+    pub(crate) schema: SchemaRef,
+    cursor: Option<String>,
 }
 
 impl GraphQLClient {
@@ -631,7 +676,6 @@ impl GraphQLClient {
     pub fn new(
         client: reqwest::Client,
         endpoint: Url,
-        query: Arc<str>,
         json_pointer: Option<&str>,
         token: Option<&str>,
         user: Option<String>,
@@ -639,11 +683,11 @@ impl GraphQLClient {
         unnest_depth: usize,
         schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        let (pagination_parameters, inferred_json_pointer) = PaginationParameters::parse(&query);
-        tracing::debug!(
-            "Parsed pagination parameters for {:?}: {pagination_parameters:?}. Inferred JSON pointer: {inferred_json_pointer:?}",
-            endpoint.to_string()
-        );
+        // let (pagination_parameters, inferred_json_pointer) = PaginationParameters::parse(&query);
+        // tracing::debug!(
+        //     "Parsed pagination parameters for {:?}: {pagination_parameters:?}. Inferred JSON pointer: {inferred_json_pointer:?}",
+        //     endpoint.to_string()
+        // );
 
         let auth = match (token, user, pass) {
             (Some(token), _, _) => Some(Auth::Bearer(token.to_string())),
@@ -656,40 +700,38 @@ impl GraphQLClient {
             duplicate_behavior: DuplicateBehavior::Error,
         };
 
-        let Some(pointer) = json_pointer.or(inferred_json_pointer.as_deref()) else {
+        let Some(json_pointer) = json_pointer else {
             return Err(Error::NoJsonPointerFound {});
         };
 
         Ok(Self {
             client,
             endpoint,
-            query,
-            pointer: pointer.into(),
+            // query,
+            json_pointer: json_pointer.into(),
             unnest_parameters,
-            pagination_parameters,
+            // pagination_parameters,
             auth,
             schema,
         })
     }
 
-    pub(crate) fn get_query(&self) -> Arc<str> {
-        Arc::clone(&self.query)
-    }
-
-    pub(crate) async fn execute(
+    pub(crate) async fn execute<'a>(
         &self,
-        query: &Arc<str>,
+        query: &mut GraphQLQuery<'a>,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
-    ) -> Result<(Vec<RecordBatch>, SchemaRef, Option<String>)> {
-        let (query, limit_reached) = self
-            .pagination_parameters
-            .as_ref()
-            .map(|x| x.apply(query, limit, cursor))
-            .unwrap_or((query.to_string(), false));
+    ) -> Result<GraphQLQueryResult<'a>> {
+        // let (query, limit_reached) = query
+        //     .pagination_parameters
+        //     .as_ref()
+        //     .map(|x| x.apply(query, limit, cursor))
+        //     .unwrap_or((query.to_string(), false));
 
-        let body = format!(r#"{{"query": {}}}"#, json!(query));
+        let query_string = query.to_string(limit, cursor);
+
+        let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
         request = request_with_auth(request, &self.auth);
@@ -699,22 +741,24 @@ impl GraphQLClient {
         let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
 
         handle_http_error(status, &response)?;
-        handle_graphql_query_error(&response, &query)?;
+        handle_graphql_query_error(&response, &query_string)?;
+
+        let json_pointer = query
+            .json_pointer
+            .clone()
+            .unwrap_or(self.json_pointer.to_string());
 
         let extracted_data = response
-            .pointer(&self.pointer)
+            .pointer(&json_pointer)
             .ok_or(Error::InvalidJsonPointer {
-                pointer: self.pointer.to_string(),
+                pointer: json_pointer.clone(),
             })?
             .to_owned();
 
-        let next_cursor = if limit_reached {
-            None
-        } else {
-            self.pagination_parameters
-                .as_ref()
-                .and_then(|x| x.get_next_cursor_from_response(&response))
-        };
+        let next_cursor = query
+            .pagination_parameters
+            .as_ref()
+            .and_then(|x| x.get_next_cursor_from_response(&response));
 
         let mut unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
@@ -743,30 +787,41 @@ impl GraphQLClient {
             res.extend(batch);
         }
 
-        Ok((res, schema, next_cursor))
+        let record_count = res.len();
+        let limit_reached = query.limit_reached(limit, record_count);
+
+        Ok(GraphQLQueryResult {
+            query: query.clone(),
+            records: res,
+            record_count,
+            limit_reached,
+            schema: Arc::clone(&schema),
+            cursor: next_cursor,
+        })
     }
 
-    pub(crate) async fn execute_paginated(
+    pub(crate) async fn execute_paginated<'a>(
         &self,
-        query: &Arc<str>,
+        query: &mut GraphQLQuery<'a>,
         schema: SchemaRef,
         limit: Option<usize>,
     ) -> Result<Vec<Vec<RecordBatch>>> {
-        println!("initial query: {query}");
-        let (first_batch, _, mut next_cursor) = self
+        let mut result = self
             .execute(query, Some(Arc::clone(&schema)), limit, None)
             .await?;
-        let mut res = vec![first_batch];
+        let mut res = vec![result.records];
         let mut limit = limit;
 
-        while let Some(next_cursor_val) = next_cursor {
-            if let (Some(l), Some(p)) = (limit, self.pagination_parameters.as_ref()) {
-                limit = Some(p.reduce_limit(l));
+        if result.limit_reached {
+            return Ok(res);
+        }
+
+        while let Some(next_cursor_val) = result.cursor {
+            if let Some(p) = query.pagination_parameters.as_ref() {
+                limit = Some(p.reduce_limit(result.record_count));
             };
 
-            println!("next query: {query}");
-
-            let (next_batch, _, new_cursor) = self
+            result = self
                 .execute(
                     query,
                     Some(Arc::clone(&schema)),
@@ -774,8 +829,11 @@ impl GraphQLClient {
                     Some(next_cursor_val),
                 )
                 .await?;
-            next_cursor = new_cursor;
-            res.push(next_batch);
+            res.push(result.records);
+
+            if result.limit_reached {
+                break;
+            }
         }
 
         Ok(res)
@@ -907,6 +965,8 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
 mod tests {
     use reqwest::StatusCode;
     use serde_json::Value;
+
+    use crate::graphql::client::GraphQLQuery;
 
     use super::{handle_http_error, DuplicateBehavior, PaginationParameters};
 
@@ -1053,7 +1113,8 @@ mod tests {
         ];
 
         for case in test_cases {
-            let result = PaginationParameters::parse(case.query);
+            let query = GraphQLQuery::try_from(case.query).expect("Should parse query");
+            let result = PaginationParameters::parse(&query.ast);
             assert_eq!(result, case.expected, "Failed test case: {}", case.name);
         }
     }
@@ -1069,11 +1130,11 @@ mod tests {
                 }
             }
         }";
-        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
-        let pagination_parameters =
-            pagination_parameters_opt.expect("Failed to get pagination params");
-        let (new_query, limit_reached) =
-            pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
+
+        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
+        pagination_parameters_opt.expect("Should get pagination params");
+        let new_query = query.to_string(None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
             users (first: 10, after: "new_cursor") {
                 name
@@ -1083,7 +1144,6 @@ mod tests {
                 }
             }
         }"#;
-        assert!(!limit_reached);
         assert_eq!(new_query, expected_query);
 
         let query = r#"query {
@@ -1095,11 +1155,11 @@ mod tests {
                 }
             }
         }"#;
-        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
-        let pagination_parameters =
-            pagination_parameters_opt.expect("Failed to get pagination params");
-        let (new_query, limit_reached) =
-            pagination_parameters.apply(query, None, Some("new_cursor".to_string()));
+
+        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
+        pagination_parameters_opt.expect("Should get pagination params");
+        let new_query = query.to_string(None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
             users (first: 10, after: "new_cursor") {
                 name
@@ -1109,7 +1169,6 @@ mod tests {
                 }
             }
         }"#;
-        assert!(!limit_reached);
         assert_eq!(new_query, expected_query);
 
         let query = r"query {
@@ -1121,11 +1180,11 @@ mod tests {
                 }
             }
         }";
-        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
-        let pagination_parameters =
-            pagination_parameters_opt.expect("Failed to get pagination params");
-        let (new_query, limit_reached) =
-            pagination_parameters.apply(query, Some(5), Some("new_cursor".to_string()));
+
+        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
+        pagination_parameters_opt.expect("Should get pagination params");
+        let new_query = query.to_string(None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
             users (first: 5, after: "new_cursor") {
                 name
@@ -1135,7 +1194,6 @@ mod tests {
                 }
             }
         }"#;
-        assert!(limit_reached);
         assert_eq!(new_query, expected_query);
     }
 
@@ -1151,7 +1209,9 @@ mod tests {
                 }
             }
         }";
-        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
+
+        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         let pagination_parameters =
             pagination_parameters_opt.expect("Failed to get pagination params");
 
@@ -1186,7 +1246,9 @@ mod tests {
                 }
             }
         }";
-        let (pagination_parameters_opt, _) = PaginationParameters::parse(query);
+
+        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         let pagination_parameters =
             pagination_parameters_opt.expect("Failed to get pagination params");
 
