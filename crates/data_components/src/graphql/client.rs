@@ -281,7 +281,7 @@ impl PaginationParameters {
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<String>>();
 
-            args.push(self.pagination_argument.to_string());
+            args.push(self.pagination_argument.format_arguments(cursor));
 
             let args = args.join(", ");
 
