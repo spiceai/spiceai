@@ -29,9 +29,29 @@ use datafusion::{
 };
 use itertools::Itertools;
 use std::{any::Any, convert::From, sync::Arc};
+use snafu::prelude::*;
 
 // See: https://github.com/apache/datafusion/blob/888504a8da6d20f9caf3ecb6cd1a6b7d1956e23e/datafusion/expr/src/signature.rs#L36
 pub const FIXED_SIZE_LIST_WILDCARD: i32 = i32::MIN;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    
+    #[snafu(display("{} is not a valid scalar type for array_distance calculations.", scalar_type))]
+    InvalidScalarType {
+        scalar_type: DataType,
+    },
+
+    #[snafu(display("{data_type} cannot be used as a vector type"))]
+    InvalidVectorType {
+        data_type: DataType,
+    },
+
+    #[snafu(display("vector operations on {data_type} are not yet implemented."))]
+    UnimplementedVectorType {
+        data_type: DataType,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorScalarType {
@@ -49,13 +69,13 @@ impl From<&VectorScalarType> for DataType {
 }
 
 impl TryFrom<&DataType> for VectorScalarType {
-    type Error = String;
+    type Error = Error;
 
     fn try_from(dtype: &DataType) -> Result<Self, Self::Error> {
         match dtype {
             DataType::Float64 => Ok(Self::Float64),
             DataType::Float32 => Ok(Self::Float32),
-            other => Err(format!("{other:?} cannot be used as a VectorScalarType.")),
+            other => Err(Error::InvalidScalarType{scalar_type: other.clone()}),
         }
     }
 }
@@ -108,7 +128,7 @@ pub enum VectorBatchType {
 }
 
 impl TryFrom<&DataType> for VectorBatchType {
-    type Error = String;
+    type Error = Error;
 
     fn try_from(dtype: &DataType) -> Result<Self, Self::Error> {
         match dtype {
@@ -121,10 +141,7 @@ impl TryFrom<&DataType> for VectorBatchType {
                             scalar_type: VectorScalarType::try_from(f2.data_type())?,
                         })
                     } else {
-                        Err(format!(
-                            "{} is not a valid inner scalar type for VectorBatches",
-                            f2.data_type()
-                        ))
+                        Err(Error::InvalidScalarType{scalar_type: f2.data_type().clone()})
                     }
                 }
                 DataType::LargeList(f2) | DataType::List(f2) => {
@@ -134,17 +151,14 @@ impl TryFrom<&DataType> for VectorBatchType {
                             scalar_type: VectorScalarType::try_from(f2.data_type())?,
                         })
                     } else {
-                        Err(format!(
-                            "{} is not a valid inner scalar type for VectorBatches",
-                            f2.data_type()
-                        ))
+                        Err(Error::InvalidScalarType{scalar_type: f2.data_type().clone()})
                     }
                 }
                 DataType::Float32 | DataType::Float64 => Ok(VectorBatchType::FixedVectors {
                     size: *count, // for flat FixedSizeList, inner elements are numerics so size=count.
-                    scalar_type: VectorScalarType::try_from(f1.data_type())?,
+                    scalar_type: VectorScalarType::try_from(f1.data_type()).into()?,
                 }),
-                _ => unimplemented!(),
+                &data_type => Err(Error::UnimplementedVectorType{data_type}),
             },
             DataType::LargeList(f1) | DataType::List(f1) => match f1.data_type() {
                 DataType::FixedSizeList(f2, size) => {
@@ -154,10 +168,7 @@ impl TryFrom<&DataType> for VectorBatchType {
                             scalar_type: VectorScalarType::try_from(f2.data_type())?,
                         })
                     } else {
-                        Err(format!(
-                            "{} is not a valid inner scalar type for VectorBatches",
-                            f2.data_type()
-                        ))
+                        Err(Error::InvalidScalarType{scalar_type: f2.data_type().clone()})
                     }
                 }
                 DataType::LargeList(f2) | DataType::List(f2) => {
@@ -166,10 +177,7 @@ impl TryFrom<&DataType> for VectorBatchType {
                             scalar_type: VectorScalarType::try_from(f2.data_type())?,
                         })
                     } else {
-                        Err(format!(
-                            "{} is not a valid inner scalar type for VectorBatches",
-                            f2.data_type()
-                        ))
+                        Err(Error::InvalidScalarType{scalar_type: f2.data_type().clone()})
                     }
                 }
                 DataType::Float32 | DataType::Float64 => Ok(VectorBatchType::ListVectors {
@@ -177,7 +185,7 @@ impl TryFrom<&DataType> for VectorBatchType {
                 }),
                 _ => unimplemented!(),
             },
-            _ => Err(format!("{dtype} is not a VectorBatchType.")),
+            _ => Err(Error::InvalidVectorType{data_type: dtype.clone()})
         }
     }
 }
