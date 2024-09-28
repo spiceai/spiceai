@@ -64,6 +64,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
     match bench_name {
         "tpch" => app_builder
@@ -250,6 +251,7 @@ fn get_test_queries() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
 fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpcds_q1", include_str!("../queries/tpcds/q1.sql")),
