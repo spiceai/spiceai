@@ -106,7 +106,7 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
       postgres_acc:
-        image: ${{ matrix.cmd == '-a postgres' && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        image: ${{( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="pg_isready -U postgres"
@@ -199,7 +199,7 @@ jobs:
           name: spice_bench
 
       - name: 'Restart accelerator service container with customize configurations'
-        if: matrix.cmd == '-a postgres' && ((github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        if: ( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "shared_buffers=1GB" >> /var/lib/postgresql/data/postgresql.conf'
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "work_mem=256MB" >> /var/lib/postgresql/data/postgresql.conf'
