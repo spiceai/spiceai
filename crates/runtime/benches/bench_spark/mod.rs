@@ -16,6 +16,7 @@ limitations under the License.
 
 use app::AppBuilder;
 use runtime::Runtime;
+use spicepod::component::dataset::Dataset;
 
 use crate::results::BenchmarkResultsBuilder;
 
