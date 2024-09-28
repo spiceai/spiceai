@@ -44,6 +44,9 @@ pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
+    #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
+    CannotVectorSearchDataset { data_source: TableReference },
+
     #[snafu(display("Error occurred interacting with datafusion: {}", source))]
     DataFusionError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -262,6 +265,8 @@ impl VectorSearch {
         }
     }
 
+    // column_is_chunked_and_embedding
+
     /// Perform a single SQL query vector search.
     #[allow(clippy::too_many_arguments)]
     async fn individual_search(
@@ -270,6 +275,7 @@ impl VectorSearch {
         embedding: Vec<f32>,
         primary_keys: &[String],
         embedding_column: &str,
+        is_chunked: bool,
         additional_columns: &[String],
         where_cond: Option<&str>,
         n: usize,
@@ -399,11 +405,16 @@ impl VectorSearch {
                         data_source: vec![tbl.clone()],
                     })?;
 
-                let embedding_column = get_embedding_table(&table_provider)
-                    .and_then(|e| e.get_embedding_columns().first().cloned())
-                    .ok_or(Error::NoEmbeddingColumns {
-                        data_source: tbl.clone(),
-                    })?;
+                let Some(embedding_table) = get_embedding_table(&table_provider) else {
+                    return Err(Error::CannotVectorSearchDataset {
+                        data_source: tbl.clone()
+                    });
+                };
+
+                let embedding_column = embedding_table.get_embedding_columns().first().cloned().ok_or(Error::NoEmbeddingColumns {
+                    data_source: tbl.clone(),
+                })?;
+
 
                 if search_vectors.len() != 1 {
                     return Err(Error::IncorrectNumberOfEmbeddingColumns {
@@ -420,6 +431,7 @@ impl VectorSearch {
                                 embedding.clone(),
                                 &primary_keys,
                                 &embedding_column,
+                                embedding_table.is_chunked(&embedding_column),
                                 additional_columns,
                                 where_cond.as_deref(),
                                 *limit,

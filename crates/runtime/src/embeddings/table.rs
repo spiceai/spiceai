@@ -90,6 +90,12 @@ impl EmbeddingTable {
         self.embedded_columns.values().cloned().collect()
     }
 
+    /// Checks if a column has an embedding column associated with it, and should be chunked.
+    #[must_use]
+    pub fn is_chunked(&self, column: &str) -> bool {
+        self.embedding_chunkers.contains_key(column)
+    }
+
     /// Get the names of the columns that are augmented with embeddings.
     #[must_use]
     pub fn get_embedding_columns(&self) -> Vec<String> {
