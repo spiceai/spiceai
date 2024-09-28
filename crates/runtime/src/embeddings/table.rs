@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{project_schema, Constraints, Statistics};
@@ -187,20 +188,49 @@ impl EmbeddingTable {
         }
     }
 
-    /// Get the appropriate [`DataType`] for the vectors associated with an embedding column.
-    fn embedding_column_type(&self, embedding_column: &str) -> DataType {
+    /// For a given field in the base table, return the additional field(s) that should be added to the schema for the embedding.
+    /// For fields that shouldn't be embedded, an empty vector is returned.
+    fn embedding_fields(&self, field: &Field) -> Vec<Arc<Field>> {
         let embedding_size = self
             .embedding_sizes
-            .get(embedding_column)
+            .get(field.name())
             .copied()
             .unwrap_or_default();
 
-        let vector_type = DataType::new_fixed_size_list(DataType::Float32, embedding_size, false);
-
-        if self.embedding_chunkers.contains_key(embedding_column) {
-            DataType::new_list(vector_type, false)
+        if self.embedding_chunkers.contains_key(field.name()) {
+            vec![
+                Arc::new(Field::new_list(
+                    format!("{}_embedding", field.name()),
+                    Field::new_fixed_size_list(
+                        "item",
+                        Field::new("item", DataType::Float32, false),
+                        embedding_size,
+                        false,
+                    ),
+                    false,
+                )),
+                Arc::new(Field::new_list(
+                    format!("{}_offsets", field.name()),
+                    Field::new_fixed_size_list(
+                        "item",
+                        Field::new("item", DataType::Int32, false),
+                        2,
+                        false,
+                    ),
+                    false,
+                )),
+            ]
         } else {
-            vector_type
+            vec![Arc::new(Field::new_fixed_size_list(
+                "item",
+                Field::new(
+                    format!("{}_embedding", field.name()),
+                    DataType::Float32,
+                    false,
+                ),
+                embedding_size,
+                false,
+            ))]
         }
     }
 }
@@ -219,20 +249,6 @@ impl TableProvider for EmbeddingTable {
         self.base_table.table_type()
     }
 
-    // fn get_table_definition(&self) -> Option<&str> {
-    //     self.base_table.get_table_definition()
-    // }
-
-    // fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-    //     let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
-    //     let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
-    //         .context(UnableToConstructLogicalPlanBuilderSnafu {})?
-    //         .build()
-    //         .context(UnableToBuildLogicalPlanSnafu {})?;
-
-    //     self.base_table.get_logical_plan()
-    // }
-
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.base_table.get_column_default(column)
     }
@@ -248,15 +264,11 @@ impl TableProvider for EmbeddingTable {
             .keys()
             .sorted() // Important to be kept alphabetical for fast lookup
             .filter_map(|k| {
-                base_schema.column_with_name(k).map(|(_, field)| {
-                    Arc::new(
-                        field
-                            .clone()
-                            .with_data_type(self.embedding_column_type(k))
-                            .with_name(format!("{k}_embedding")),
-                    )
-                })
+                base_schema
+                    .column_with_name(k)
+                    .map(|(_, field)| self.embedding_fields(field))
             })
+            .flatten()
             .collect();
 
         base_fields.append(&mut embedding_fields);

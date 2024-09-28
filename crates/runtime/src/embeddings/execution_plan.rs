@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
+    StringArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
@@ -172,7 +173,7 @@ fn to_sendable_stream(
         while let Some(batch_result) = base_stream.next().await {
             match batch_result {
                 Ok(batch) => {
-                    match get_embeddings(&batch, &embedded_columns, Arc::clone(&embedding_models), &embedding_chunkers).await {
+                    match get_embedding_columns(&batch, &embedded_columns, Arc::clone(&embedding_models), &embedding_chunkers).await {
                         Ok(embeddings) => {
 
                             match construct_record_batch(
@@ -214,14 +215,19 @@ fn construct_record_batch(
     RecordBatch::try_new(Arc::clone(projected_schema), cols)
 }
 
-async fn get_embeddings(
+/// Get the additional, embedding, columns to add to the [`RecordBatch`]. The columns are
+///     1. Embedding vectors for each column in `embedded_columns`.
+///     2. If a [`Chunker`] is provided for a given column, an additional column of offsets. For
+///         each string, these offsets map the substrings used for each embeddding vector.
+async fn get_embedding_columns(
     rb: &RecordBatch,
     embedded_columns: &HashMap<String, String>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     embedding_chunkers: &HashMap<String, Arc<dyn Chunker>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
+    // 1 column per embedded_column, 1 additional offset column per chunked column.
     let mut embed_arrays: HashMap<String, ArrayRef> =
-        HashMap::with_capacity(embedded_columns.len());
+        HashMap::with_capacity(embedded_columns.len() + embedding_chunkers.len());
 
     for (col, model_name) in embedded_columns {
         let read_guard = embedding_models.read().await;
@@ -243,8 +249,11 @@ async fn get_embeddings(
         };
 
         let list_array = if let Some(chunker) = embedding_chunkers.get(col) {
-            let list_array = get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
-            Arc::new(list_array) as ArrayRef
+            let (vectors, offsets) =
+                get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
+            embed_arrays.insert(format!("{col}_offsets"), Arc::new(offsets) as ArrayRef);
+
+            Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = get_vectors(arr, &**model).await?;
             Arc::new(fixed_size_array) as ArrayRef
@@ -301,13 +310,18 @@ async fn get_vectors(
 /// | "How are you doing?"|  | ["How ", "are you ", "doing?"]|  | [[0.5, 0.6], [0.7, 0.8], [0.9, 1.0]] |
 /// | "I'm doing well."   |  | ["I'm doing ", "doing well."] |  | [[1.1, 1.2], [1.3, 1.4]]             |
 /// +---------------------+  +-------------------------------+  +--------------------------------------+
-///     [`StringArray`]                                                   [`ListArray`]
+///     [`StringArray`]                     +                             [`ListArray`]
+///                          +-------------------------------+
+///                          | [[0, 7], [7, 15]              |
+///                          | [[0, 4], [4, 12], [12, 18]]   |
+///                          | [[0, 10], [10, 21]]           |
+///                          +-------------------------------+
 /// ```
 async fn get_vectors_with_chunker(
     arr: &StringArray,
     chunker: Arc<dyn Chunker>,
     model: &dyn Embed,
-) -> Result<ListArray, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
         .iter()
@@ -324,7 +338,7 @@ async fn get_vectors_with_chunker(
         })
         .unzip();
 
-    let (_chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
+    let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
 
     let embedded_data = model
         .embed(EmbeddingInput::StringArray(chunks))
@@ -333,43 +347,100 @@ async fn get_vectors_with_chunker(
     let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
 
     let mut values = Float32Array::builder(embedded_data.len() * vector_length);
-    let mut lengths = Vec::with_capacity(chunks_per_row.len());
+    let mut chunk_values = Int32Array::builder(embedded_data.len() * 2);
 
+    let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
+
     for chunks_in_row in chunks_per_row {
         lengths.push(chunks_in_row);
+
+        // Get the actual vectors
         let inner = embedded_data.as_slice()[curr..curr + chunks_in_row]
             .iter()
             .flatten()
             .copied()
             .collect_vec();
-        values.append_slice(&inner);
+        values.append_slice(&inner); // I believe this is a clone under the hood.
+
+        // Get the chunk offsets
+        let inner_offsets =
+            chunk_offsets_to_col_values(&chunk_offsets.as_slice()[curr..curr + chunks_in_row]);
+        chunk_values.append_slice(&inner_offsets.iter().flatten().copied().collect_vec());
+
         curr += chunks_in_row;
     }
 
+    // These are offsets for both the vectors and the content offsets
     let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
 
-    let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors = {
+        let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
 
-    // Inner FixedSizeListArray
-    let fixed_size_list_array = FixedSizeListArray::try_new(
-        Arc::clone(&scalar_field),
-        i32::try_from(vector_length).boxed()?,
-        Arc::new(values.finish()),
-        None,
-    )
-    .boxed()?;
-
-    ListArray::try_new(
-        Arc::new(Field::new_fixed_size_list(
-            "item",
+        // Inner FixedSizeListArray
+        let fixed_size_list_array = FixedSizeListArray::try_new(
             Arc::clone(&scalar_field),
             i32::try_from(vector_length).boxed()?,
-            false,
-        )),
-        offsets, // Offsets are for how many chunks per row.
-        Arc::new(fixed_size_list_array),
-        None,
-    )
-    .boxed()
+            Arc::new(values.finish()),
+            None,
+        )
+        .boxed()?;
+
+        ListArray::try_new(
+            Arc::new(Field::new_fixed_size_list(
+                "item",
+                Arc::clone(&scalar_field),
+                i32::try_from(vector_length).boxed()?,
+                false,
+            )),
+            offsets.clone(),
+            Arc::new(fixed_size_list_array),
+            None,
+        )
+        .boxed()?
+    };
+
+    let content_offsets = {
+        let scalar_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let fixed_size_list_array = FixedSizeListArray::try_new(
+            Arc::clone(&scalar_field),
+            2,
+            Arc::new(chunk_values.finish()),
+            None,
+        )
+        .boxed()?;
+
+        ListArray::try_new(
+            Arc::new(Field::new_fixed_size_list(
+                "item",
+                Arc::clone(&scalar_field),
+                2,
+                false,
+            )),
+            offsets,
+            Arc::new(fixed_size_list_array),
+            None,
+        )
+        .boxed()?
+    };
+
+    Ok((vectors, content_offsets))
+}
+
+/// Convert a slice of [`usize`] offsets into the format expected by [`ListArray`].
+/// Example:
+/// ```rust
+/// assert_eq!(chunk_offsets_to_col_values(&[0, 4, 7, 12]), [[0, 4], [4, 7], [7, 12], [12, -1]]);
+/// ```
+///
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn chunk_offsets_to_col_values(offsets: &[usize]) -> Vec<[i32; 2]> {
+    let mut values = Vec::with_capacity(offsets.len());
+    for window in offsets.windows(2) {
+        values.push([window[0] as i32, window[1] as i32]);
+    }
+    if let Some(last) = offsets.last() {
+        values.push([*last as i32, -1]);
+    }
+    values
 }
