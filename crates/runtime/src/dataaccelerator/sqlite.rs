@@ -26,7 +26,7 @@ use datafusion_table_providers::{
 };
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, sync::Arc};
+use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
     component::dataset::{
@@ -108,6 +108,17 @@ impl SqliteAccelerator {
         )
     }
 
+    /// Returns the `Sqlite` busy_timeout param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset
+    #[must_use]
+    pub fn sqlite_busy_timeout(&self, dataset: &Dataset) -> Duration {
+        let acceleration = dataset.acceleration.as_ref().unwrap();
+        let acceleration_params = acceleration.params.clone();
+
+        self.sqlite_factory
+            .sqlite_busy_timeout(&acceleration_params)
+            .unwrap()
+    }
+
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
     pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
         let sqlite_file = self.sqlite_file_path(dataset);
@@ -127,7 +138,7 @@ impl SqliteAccelerator {
 
         let pool = self
             .sqlite_factory
-            .get_or_init_instance(file_path, mode)
+            .get_or_init_instance(file_path, mode, self.sqlite_busy_timeout(dataset))
             .await
             .boxed()
             .context(AccelerationCreationFailedSnafu)?;
@@ -144,6 +155,7 @@ impl Default for SqliteAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::accelerator("file"),
+    ParameterSpec::runtime("busy_timeout"),
     ParameterSpec::runtime("file_watcher"),
 ];
 
