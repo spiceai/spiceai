@@ -144,7 +144,7 @@ pub struct EmbeddingChunkConfig {
     pub enabled: bool,
 
     #[serde(default)]
-    pub desired_chunk_size: usize,
+    pub chunk_target_size: usize,
 
     #[serde(default)]
     pub overlap_size: usize,

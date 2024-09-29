@@ -93,7 +93,7 @@ impl EmbeddingConnector {
                     (
                         e.column.clone(),
                         ChunkingConfig {
-                            desired_size: chunk_cfg.desired_chunk_size,
+                            desired_size: chunk_cfg.chunk_target_size,
                             overlap_size: chunk_cfg.overlap_size,
                             trim: chunk_cfg.trim,
                         },
