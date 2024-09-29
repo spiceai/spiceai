@@ -154,7 +154,7 @@ impl SearchRequest {
 
 pub type ModelKey = String;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct VectorSearchTableResult {
     pub primary_key: Vec<RecordBatch>,
 
@@ -162,9 +162,6 @@ pub struct VectorSearchTableResult {
     pub embedded_column: Vec<RecordBatch>,
     pub additional_columns: Vec<RecordBatch>,
     pub distances: Vec<ArrayRef>,
-
-    // Relevant chunk from `embedded_column`. Only present for chunked dataset embedding columns.
-    pub highlights: Option<Vec<ArrayRef>>,
 }
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
@@ -173,11 +170,13 @@ pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 pub struct Match {
     value: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    highlight: Option<String>,
     score: f64,
     dataset: String,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     primary_key: HashMap<String, serde_json::Value>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -239,21 +238,6 @@ pub fn table_to_matches(
         });
     };
 
-    let highlights: Option<Vec<_>> = result.highlights.as_ref().map(|highlight_batch| {
-        highlight_batch
-            .iter()
-            .flat_map(|v| {
-                if let Some(col) = v.as_any().downcast_ref::<StringArray>() {
-                    col.iter()
-                        .map(|v| v.unwrap_or_default().to_string())
-                        .collect::<Vec<String>>()
-                } else {
-                    vec![]
-                }
-            })
-            .collect()
-    });
-
     values
         .iter()
         .enumerate()
@@ -264,15 +248,12 @@ pub fn table_to_matches(
                 });
             };
 
-            let highlight = highlights.as_ref().and_then(|h| h.get(i).cloned());
-
             Ok(Match {
                 value: value.clone(),
                 score: 1.0 / f64::from(*distance),
                 dataset: tbl.to_string(),
                 primary_key: pks.get(i).cloned().unwrap_or_default(),
                 metadata: add_cols.get(i).cloned().unwrap_or_default(),
-                highlight,
             })
         })
         .collect::<Result<Vec<Match>>>()
@@ -300,8 +281,6 @@ impl VectorSearch {
         }
     }
 
-    // column_is_chunked_and_embedding
-
     /// Perform a single SQL query vector search.
     #[allow(clippy::too_many_arguments)]
     async fn individual_search(
@@ -320,6 +299,7 @@ impl VectorSearch {
             .cloned()
             .chain(Some(embedding_column.to_string()))
             .chain(additional_columns.iter().cloned())
+            .unique()
             .collect();
 
         let projection_str = projection.iter().map(|s| quote_identifier(s)).join(", ");
@@ -330,8 +310,8 @@ impl VectorSearch {
             format!(
                 "SELECT
                     {projection_str},
-                    {VECTOR_DISTANCE_COLUMN_NAME},
-                    substring({embedding_column}, offsets[1], offsets[2] - offsets[1]) as {embedding_column}_chunk
+                    substring({embed_col}, offsets[1], offsets[2] - offsets[1]) as {embed_col}_chunk,
+                    {VECTOR_DISTANCE_COLUMN_NAME}
                 FROM (
                     SELECT
                         {projection_str},
@@ -340,7 +320,7 @@ impl VectorSearch {
                     FROM {tbl}
                     {where_str}
                     ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
-                ) LIMIT {n}")
+                ) LIMIT {n}", embed_col=quote_identifier(embedding_column).to_string())
         } else {
             format!(
                     "SELECT
@@ -368,10 +348,23 @@ impl VectorSearch {
             .boxed()
             .context(DataFusionSnafu)?;
 
-        let primary_key_projection = (0..primary_keys.len()).collect_vec();
-        let embedding_projection = (primary_keys.len()..=primary_keys.len()).collect_vec();
-        let additional_columns_projection =
-            (primary_keys.len() + 1..projection.len()).collect_vec();
+        let Some(first) = batches.first() else {
+            tracing::trace!("No results returned");
+            return Ok(VectorSearchTableResult::default());
+        };
+
+        let primary_key_projection = get_projection(first, primary_keys);
+        let additional_columns_projection = get_projection(first, additional_columns);
+
+        let embedding_column = if is_chunked {
+            format!(
+                "{embed_col}_chunk",
+                embed_col = quote_identifier(embedding_column)
+            )
+        } else {
+            quote_identifier(embedding_column).to_string()
+        };
+        let embedding_projection = get_projection(first, &[embedding_column]);
 
         let primary_keys_records = batches
             .iter()
@@ -399,24 +392,11 @@ impl VectorSearch {
             });
         };
 
-        let highlights = if is_chunked {
-            batches
-                .iter()
-                .map(|s| {
-                    s.column_by_name(format!("{embedding_column}_chunk").as_str())
-                        .cloned()
-                })
-                .collect::<Option<Vec<_>>>()
-        } else {
-            None
-        };
-
         Ok(VectorSearchTableResult {
             primary_key: primary_keys_records,
             embedded_column: embedding_records,
             additional_columns: additional_columns_records,
             distances,
-            highlights,
         })
     }
 
@@ -674,6 +654,19 @@ impl VectorSearch {
             })
             .collect())
     }
+}
+
+/// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
+fn get_projection(batch: &RecordBatch, column_names: &[String]) -> Vec<usize> {
+    column_names
+        .iter()
+        .filter_map(|name| {
+            batch
+                .schema()
+                .index_of(quote_identifier(name).to_string().as_str())
+                .ok()
+        })
+        .collect_vec()
 }
 
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
