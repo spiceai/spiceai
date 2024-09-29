@@ -215,17 +215,18 @@ fn construct_record_batch(
     RecordBatch::try_new(Arc::clone(projected_schema), cols)
 }
 
-/// Get the additional, embedding, columns to add to the [`RecordBatch`]. The columns are
+/// Get the additional, embedding, columns to add to the [`RecordBatch`]. The columns are 
 ///     1. Embedding vectors for each column in `embedded_columns`.
 ///     2. If a [`Chunker`] is provided for a given column, an additional column of offsets. For
 ///         each string, these offsets map the substrings used for each embeddding vector.
-async fn get_embedding_columns(
+/// 
+/// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
+pub(crate) async fn get_embedding_columns(
     rb: &RecordBatch,
     embedded_columns: &HashMap<String, String>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     embedding_chunkers: &HashMap<String, Arc<dyn Chunker>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
-    // 1 column per embedded_column, 1 additional offset column per chunked column.
     let mut embed_arrays: HashMap<String, ArrayRef> =
         HashMap::with_capacity(embedded_columns.len() + embedding_chunkers.len());
 

@@ -196,6 +196,8 @@ impl EmbeddingTable {
 
     /// For a given field in the base table, return the additional field(s) that should be added to the schema for the embedding.
     /// For fields that shouldn't be embedded, an empty vector is returned.
+    /// 
+    /// These fields should match produces in [`super::execution_plan::get_embedding_columns`].
     fn embedding_fields(&self, field: &Field) -> Vec<Arc<Field>> {
         let embedding_size = self
             .embedding_sizes
