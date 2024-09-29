@@ -88,6 +88,7 @@ impl EmbeddingConnector {
         let embed_chunker_config: HashMap<String, ChunkingConfig> = dataset
             .embeddings
             .iter()
+            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
             .filter_map(|e| {
                 e.chunking.as_ref().map(|chunk_cfg| {
                     (
