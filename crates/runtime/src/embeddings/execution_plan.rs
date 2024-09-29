@@ -363,9 +363,13 @@ async fn get_vectors_with_chunker(
             .collect_vec();
         values.append_slice(&inner); // I believe this is a clone under the hood.
 
-        // Get the chunk offsets
-        let inner_offsets =
-            chunk_offsets_to_col_values(&chunk_offsets.as_slice()[curr..curr + chunks_in_row]);
+        // Get the length of the last chunk
+        let last_chunk_length = embedded_data.as_slice()[curr + chunks_in_row - 1].len();
+
+        let inner_offsets = chunk_offsets_to_col_values(
+            &chunk_offsets.as_slice()[curr..curr + chunks_in_row],
+            last_chunk_length,
+        );
         chunk_values.append_slice(&inner_offsets.iter().flatten().copied().collect_vec());
 
         curr += chunks_in_row;
@@ -430,17 +434,17 @@ async fn get_vectors_with_chunker(
 /// Convert a slice of [`usize`] offsets into the format expected by [`ListArray`].
 /// Example:
 /// ```rust
-/// assert_eq!(chunk_offsets_to_col_values(&[0, 4, 7, 12]), [[0, 4], [4, 7], [7, 12], [12, -1]]);
+/// assert_eq!(chunk_offsets_to_col_values(&[0, 4, 7, 12], 3), [[0, 4], [4, 7], [7, 12], [12, 15]]);
 /// ```
 ///
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn chunk_offsets_to_col_values(offsets: &[usize]) -> Vec<[i32; 2]> {
+fn chunk_offsets_to_col_values(offsets: &[usize], last_chunk_length: usize) -> Vec<[i32; 2]> {
     let mut values = Vec::with_capacity(offsets.len());
     for window in offsets.windows(2) {
         values.push([window[0] as i32, window[1] as i32]);
     }
     if let Some(last) = offsets.last() {
-        values.push([*last as i32, -1]);
+        values.push([*last as i32, (*last + last_chunk_length) as i32]);
     }
     values
 }

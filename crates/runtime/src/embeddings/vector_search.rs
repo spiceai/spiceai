@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::iter::zip;
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
@@ -158,9 +157,14 @@ pub type ModelKey = String;
 #[derive(Debug)]
 pub struct VectorSearchTableResult {
     pub primary_key: Vec<RecordBatch>,
-    pub embedded_column: Vec<RecordBatch>, // original data, not the embedding vector.
+
+    // original data, not the embedding vector.
+    pub embedded_column: Vec<RecordBatch>,
     pub additional_columns: Vec<RecordBatch>,
     pub distances: Vec<ArrayRef>,
+
+    // Relevant chunk from `embedded_column`. Only present for chunked dataset embedding columns.
+    pub highlights: Option<Vec<ArrayRef>>,
 }
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
@@ -168,6 +172,9 @@ pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Match {
     value: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    highlight: Option<String>,
     score: f64,
     dataset: String,
     primary_key: HashMap<String, serde_json::Value>,
@@ -232,15 +239,43 @@ pub fn table_to_matches(
         });
     };
 
-    Ok(zip(zip(zip(pks, add_cols), values), distances)
-        .map(|(((pks, add_cols), value), distance)| Match {
-            value,
-            score: 1.0 / f64::from(distance),
-            dataset: tbl.to_string(),
-            primary_key: pks,
-            metadata: add_cols,
+    let highlights: Option<Vec<_>> = result.highlights.as_ref().map(|highlight_batch| {
+        highlight_batch
+            .iter()
+            .flat_map(|v| {
+                if let Some(col) = v.as_any().downcast_ref::<StringArray>() {
+                    col.iter()
+                        .map(|v| v.unwrap_or_default().to_string())
+                        .collect::<Vec<String>>()
+                } else {
+                    vec![]
+                }
+            })
+            .collect()
+    });
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            let Some(distance) = distances.get(i) else {
+                return Err(Error::EmbeddingError {
+                    source: format!("No distance returned for {i}th result").into(),
+                });
+            };
+
+            let highlight = highlights.as_ref().and_then(|h| h.get(i).cloned());
+
+            Ok(Match {
+                value: value.clone(),
+                score: 1.0 / f64::from(*distance),
+                dataset: tbl.to_string(),
+                primary_key: pks.get(i).cloned().unwrap_or_default(),
+                metadata: add_cols.get(i).cloned().unwrap_or_default(),
+                highlight,
+            })
         })
-        .collect::<Vec<Match>>())
+        .collect::<Result<Vec<Match>>>()
 }
 
 pub fn to_matches(result: &VectorSearchResult) -> Result<Vec<Match>> {
@@ -291,10 +326,34 @@ impl VectorSearch {
 
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
-        let query = format!(
-            "SELECT {projection_str}, sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME} FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
-        );
+        let query = if is_chunked {
+            format!(
+                "SELECT
+                    {projection_str},
+                    {VECTOR_DISTANCE_COLUMN_NAME},
+                    substring({embedding_column}, offsets[1], offsets[2] - offsets[1]) as {embedding_column}_chunk
+                FROM (
+                    SELECT
+                        {projection_str},
+                        unnest({embedding_column}_offsets) as offsets,
+                        sqrt(array_distance(unnest({embedding_column}_embedding), {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME}
+                    FROM {tbl}
+                    {where_str}
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
+                ) LIMIT {n}")
+        } else {
+            format!(
+                    "SELECT
+                        {projection_str},
+                        sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME}
+                    FROM {tbl}
+                    {where_str}
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
+                    LIMIT {n}"
+                )
+        };
         tracing::trace!("running SQL: {query}");
+
         let batches: Vec<RecordBatch> = self
             .df
             .query_builder(&query, Protocol::Internal)
@@ -324,7 +383,7 @@ impl VectorSearch {
             .map(|s| s.project(&embedding_projection))
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
             .context(RecordProcessingSnafu)?;
-        let primary_keys = batches
+        let additional_columns_records = batches
             .iter()
             .map(|s| s.project(&additional_columns_projection))
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
@@ -340,11 +399,24 @@ impl VectorSearch {
             });
         };
 
+        let highlights = if is_chunked {
+            batches
+                .iter()
+                .map(|s| {
+                    s.column_by_name(format!("{embedding_column}_chunk").as_str())
+                        .cloned()
+                })
+                .collect::<Option<Vec<_>>>()
+        } else {
+            None
+        };
+
         Ok(VectorSearchTableResult {
             primary_key: primary_keys_records,
             embedded_column: embedding_records,
-            additional_columns: primary_keys,
+            additional_columns: additional_columns_records,
             distances,
+            highlights,
         })
     }
 
