@@ -69,7 +69,7 @@ tiberius ={ workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
-object_store = { workspace = true, features = ["aws", "http"] }
+object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.19.0"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
