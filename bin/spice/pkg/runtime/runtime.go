@@ -18,7 +18,7 @@ package runtime
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -34,19 +34,19 @@ func EnsureInstalled(flavor string) (bool, error) {
 	rtcontext := context.NewContext()
 	err := rtcontext.Init()
 	if err != nil {
-		fmt.Println(err.Error())
+		slog.Error("initializing runtime context", "error", err)
 		os.Exit(1)
 	}
 
 	shouldInstall := false
 	var upgradeVersion string
 	if installRequired := rtcontext.IsRuntimeInstallRequired(); installRequired {
-		fmt.Println("Spice runtime installation required")
+		slog.Info("Spice runtime installation required")
 		shouldInstall = true
 	} else {
 		upgradeVersion, err = rtcontext.IsRuntimeUpgradeAvailable()
 		if err != nil {
-			log.Printf("error checking for runtime upgrade: %s", err.Error())
+			slog.Warn("error checking for runtime upgrade", "error", err)
 		} else if upgradeVersion != "" {
 			shouldInstall = true
 		}
@@ -67,12 +67,12 @@ func EnsureInstalled(flavor string) (bool, error) {
 }
 
 func Run(args []string) error {
-	fmt.Println("Checking for latest Spice runtime release...")
+	slog.Info("Checking for latest Spice runtime release...")
 	rtcontext := context.NewContext()
 
 	err := rtcontext.Init()
 	if err != nil {
-		fmt.Println(err.Error())
+		slog.Error("initializing runtime context", "error", err)
 		os.Exit(1)
 	}
 
@@ -89,7 +89,7 @@ func Run(args []string) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
-	fmt.Println("Spice.ai runtime starting...")
+	slog.Info("Spice.ai runtime starting...")
 	err = util.RunCommand(cmd)
 	if err != nil {
 		return err
