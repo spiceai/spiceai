@@ -40,7 +40,6 @@ INSERT INTO test_mysql_table (
   col_decimal,
   col_unsigned_int,
   col_char,
-  col_enum,
   col_set,
   col_json
 ) VALUES (
@@ -83,7 +82,6 @@ INSERT INTO test_mysql_table (
   col_decimal,
   col_unsigned_int,
   col_char,
-  col_enum,
   col_set,
   col_json
 ) VALUES (
