@@ -18,14 +18,13 @@ limitations under the License.
 use async_stream::stream;
 use datafusion::{
     common::{
-        tree_node::{Transformed, TreeNode},
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
         DFSchemaRef,
     },
-    config::ConfigOptions,
     error::Result,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore},
-    optimizer::AnalyzerRule,
+    optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -44,20 +43,35 @@ use std::{
 use crate::datafusion::query::Protocol;
 
 #[derive(Default)]
-pub struct BytesProcessedAnalyzerRule {}
+pub struct BytesProcessedOptimizerRule {}
 
-impl AnalyzerRule for BytesProcessedAnalyzerRule {
+/// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
+///
+/// This should be added as an optimizer rule to run after the `PushDownLimit` rule, since it doesn't support pushing
+/// down limits for extension nodes.
+impl OptimizerRule for BytesProcessedOptimizerRule {
     /// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        let transformed_plan = plan.transform_up(|plan| match plan {
-            LogicalPlan::TableScan(table_scan) => {
-                let bytes_processed = BytesProcessedNode::new(LogicalPlan::TableScan(table_scan));
-                let ext_node = Extension {
-                    node: Arc::new(bytes_processed),
-                };
-                Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
-            }
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        plan.transform_down(|plan| match plan {
             LogicalPlan::Extension(extension) => {
+                // If the extension is already a BytesProcessedNode, don't add another one.
+                if extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<BytesProcessedNode>()
+                    .is_some()
+                {
+                    return Ok(Transformed::new(
+                        LogicalPlan::Extension(extension),
+                        false,
+                        TreeNodeRecursion::Jump, // Don't process any further children of this sub-tree.
+                    ));
+                }
+
                 let plan_node = extension.node.as_any().downcast_ref::<FederatedPlanNode>();
 
                 if plan_node.is_some() {
@@ -66,23 +80,37 @@ impl AnalyzerRule for BytesProcessedAnalyzerRule {
                     let ext_node = Extension {
                         node: Arc::new(bytes_processed),
                     };
-                    Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
+                    Ok(Transformed::new(
+                        LogicalPlan::Extension(ext_node),
+                        true,
+                        TreeNodeRecursion::Jump,
+                    ))
                 } else {
                     Ok(Transformed::no(LogicalPlan::Extension(extension)))
                 }
             }
+            LogicalPlan::TableScan(table_scan) => {
+                let bytes_processed = BytesProcessedNode::new(LogicalPlan::TableScan(table_scan));
+                let ext_node = Extension {
+                    node: Arc::new(bytes_processed),
+                };
+                Ok(Transformed::new(
+                    LogicalPlan::Extension(ext_node),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ))
+            }
             _ => Ok(Transformed::no(plan)),
-        })?;
-        Ok(transformed_plan.data)
+        })
     }
 
     /// A human readable name for this optimizer rule
     fn name(&self) -> &str {
-        "bytes_processed_analyzer_rule"
+        "bytes_processed_optimizer_rule"
     }
 }
 
-impl BytesProcessedAnalyzerRule {
+impl BytesProcessedOptimizerRule {
     pub fn new() -> Self {
         Self::default()
     }

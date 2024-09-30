@@ -25,6 +25,11 @@ on:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - './docs/**'
+      - 'README.md'
+      - 'version.txt'
+      - 'acknowledgements.md'
 
 env:
   FORBIDDEN_LICENSE_CHECK: |
