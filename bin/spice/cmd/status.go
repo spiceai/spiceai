@@ -17,6 +17,8 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
+
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -35,7 +37,7 @@ spice status
 		}
 		err := api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("getting spiced status", "error", err)
 		}
 	},
 }
