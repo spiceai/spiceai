@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
@@ -22,14 +22,15 @@ use std::sync::Arc;
 pub struct PullRequestTableArgs {
     pub owner: String,
     pub repo: String,
-    pub use_search: bool,
+    pub query_mode: GitHubQueryMode,
 }
 
 impl GitHubTableArgs for PullRequestTableArgs {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
-        let query = if self.use_search {
-            format!(
-                r#"{{
+        let query = match self.query_mode {
+            GitHubQueryMode::Search => {
+                format!(
+                    r#"{{
                 search(query:"repo:{owner}/{name} type:pr", first:100, type:ISSUE) {{
                     pageInfo {{
                         hasNextPage
@@ -64,12 +65,13 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     }}
                 }}
             }}"#,
-                owner = self.owner,
-                name = self.repo,
-            )
-        } else {
-            format!(
-                r#"
+                    owner = self.owner,
+                    name = self.repo,
+                )
+            }
+            GitHubQueryMode::Auto => {
+                format!(
+                    r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
                     pullRequests(first: 100) {{
@@ -106,9 +108,10 @@ impl GitHubTableArgs for PullRequestTableArgs {
                 }}
             }}
             "#,
-                owner = self.owner,
-                name = self.repo,
-            )
+                    owner = self.owner,
+                    name = self.repo,
+                )
+            }
         };
 
         GitHubTableGraphQLParams::new(query.into(), None, 1, Some(gql_schema()))

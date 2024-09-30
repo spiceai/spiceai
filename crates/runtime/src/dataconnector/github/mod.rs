@@ -35,7 +35,7 @@ use issues::IssuesTableArgs;
 use pull_requests::PullRequestTableArgs;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
 use super::{
@@ -294,9 +294,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
-    ParameterSpec::connector("use_search")
-        .description("Boolean to specify if the search API should be used where possible.")
-        .default("false"),
+    ParameterSpec::connector("query_mode")
+        .description(
+            "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
+        )
+        .default("auto"),
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
@@ -322,6 +324,26 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
+pub(crate) enum GitHubQueryMode {
+    Auto,
+    Search,
+}
+
+impl std::str::FromStr for GitHubQueryMode {
+    type Err = DataConnectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "search" => Ok(Self::Search),
+            s => Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                source: format!("Invalid value for 'github_query_mode' parameter: {s}").into(),
+            }),
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
@@ -335,28 +357,19 @@ impl DataConnector for Github {
         let path = dataset.path().clone();
         let mut parts = path.split('/');
 
-        let use_search = dataset
+        let query_mode = dataset
             .params
-            .get("github_use_search")
-            .map_or("false", |v| v);
+            .get("github_query_mode")
+            .map_or("auto", |v| v);
 
-        let use_search = match use_search {
-            "true" => true,
-            "false" => false,
-            e => {
-                return Err(DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "github".to_string(),
-                    source: format!("Invalid value for 'github_use_search' parameter: {e}").into(),
-                })
-            }
-        };
+        let query_mode = GitHubQueryMode::from_str(query_mode)?;
 
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
                 let table_args = Arc::new(PullRequestTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
-                    use_search,
+                    query_mode,
                 });
                 self.create_gql_table_provider(table_args).await
             }
@@ -371,7 +384,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
-                    use_search,
+                    query_mode,
                 });
                 self.create_gql_table_provider(table_args).await
             }
