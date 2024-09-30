@@ -341,7 +341,7 @@ async fn run_query_and_record_result(
                         });
                         if result.is_err() {
                             let error_str = format!(
-                                "Query `{connector}` `{query_name}` snapshort assertion failed",
+                                "Query `{connector}` `{query_name}` snapshot assertion failed",
                             );
                             tracing::error!(error_str);
                             query_err = Some(error_str);
