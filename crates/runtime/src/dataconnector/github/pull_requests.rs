@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubSearchMode, GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
@@ -22,13 +22,13 @@ use std::sync::Arc;
 pub struct PullRequestTableArgs {
     pub owner: String,
     pub repo: String,
-    pub search_mode: GitHubSearchMode,
+    pub query_mode: GitHubQueryMode,
 }
 
 impl GitHubTableArgs for PullRequestTableArgs {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
-        let query = match self.search_mode {
-            GitHubSearchMode::Search => {
+        let query = match self.query_mode {
+            GitHubQueryMode::Search => {
                 format!(
                     r#"{{
                 search(query:"repo:{owner}/{name} type:pr", first:100, type:ISSUE) {{
@@ -69,7 +69,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     name = self.repo,
                 )
             }
-            GitHubSearchMode::Auto => {
+            GitHubQueryMode::Auto => {
                 format!(
                     r#"
             {{
