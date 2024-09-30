@@ -18,13 +18,13 @@ use text_splitter::{ChunkCapacity, ChunkConfig};
 #[derive(Debug, Clone)]
 pub struct ChunkingConfig {
     // The desired size of each chunk, in tokens.
-    pub desired_size: usize,
+    pub target_chunk_size: usize,
 
     // The amount of overlap between chunks, in tokens.
     pub overlap_size: usize,
 
     // Whether to trim the chunks to remove leading and trailing whitespace.
-    pub trim: bool,
+    pub trim_whitespace: bool,
 }
 
 type ChunkIndicesIter<'a> = Box<dyn Iterator<Item = (usize, &'a str)> + 'a>;
@@ -45,11 +45,23 @@ pub struct CharacterSplittingChunker {
 impl CharacterSplittingChunker {
     #[must_use]
     pub fn new(cfg: &ChunkingConfig) -> Self {
-        // TODO: .with_overlap(cfg.overlap_size)
+        let cfg_with_overlap = ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
+            .with_trim(cfg.trim_whitespace)
+            .with_overlap(cfg.overlap_size);
+
+        let split_cfg = if let Ok(overlap_config) = cfg_with_overlap {
+            overlap_config
+        } else {
+            tracing::warn!(
+                "Cannot use overlap={} for chunking, when target_chunk_size={}. Not using overlap.",
+                cfg.overlap_size,
+                cfg.target_chunk_size
+            );
+            ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
+                .with_trim(cfg.trim_whitespace)
+        };
         Self {
-            splitter: Arc::new(text_splitter::TextSplitter::new(
-                ChunkConfig::new(ChunkCapacity::new(cfg.desired_size)).with_trim(cfg.trim),
-            )),
+            splitter: Arc::new(text_splitter::TextSplitter::new(split_cfg)),
         }
     }
 }
