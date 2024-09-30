@@ -19,6 +19,7 @@ package cmd
 import (
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"os"
 	"time"
@@ -70,7 +71,7 @@ spice login
 		spiceApiClient := api.NewSpiceApiClient()
 		err := spiceApiClient.Init()
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error initializing Spice.ai API client", "error", err)
 			os.Exit(1)
 		}
 
@@ -85,19 +86,19 @@ spice login
 
 		var accessToken string
 
-		cmd.Println("Waiting for authentication...")
+		slog.Info("Waiting for authentication...")
 		// poll for auth status
 		for {
 			time.Sleep(time.Second)
 
 			authStatusResponse, err := spiceApiClient.ExchangeCode(authCode)
 			if err != nil {
-				cmd.Println("Error:", err)
+				slog.Error("Error exchanging auth code with spice.ai", "error", err)
 				continue
 			}
 
 			if authStatusResponse.AccessDenied {
-				cmd.Println("Access denied")
+				slog.Error("Access denied")
 				os.Exit(1)
 			}
 
@@ -124,7 +125,7 @@ spice login
 
 		spiceAuthContext, err := spiceApiClient.GetAuthContext(accessToken, &orgName, &appName)
 		if err != nil {
-			cmd.Println("Error:", err)
+			slog.Error("Error getting auth context", "error", err)
 			os.Exit(1)
 		}
 
@@ -133,8 +134,8 @@ spice login
 			api.AUTH_PARAM_API_KEY: spiceAuthContext.App.ApiKey,
 		})
 
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully logged in to Spice.ai as %s (%s)", spiceAuthContext.Username, spiceAuthContext.Email)))
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Using app %s/%s", spiceAuthContext.Org.Name, spiceAuthContext.App.Name)))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Successfully logged in to Spice.ai as %s (%s)", spiceAuthContext.Username, spiceAuthContext.Email))))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Using app %s/%s", spiceAuthContext.Org.Name, spiceAuthContext.App.Name))))
 	},
 }
 
@@ -241,25 +242,25 @@ var sharepointCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		tenant_id, err := cmd.Flags().GetString(m365TenantId)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting tenant_id", "error", err)
 			os.Exit(1)
 		} else if tenant_id == "" {
-			cmd.Println("No tenant_id provided, use --tenant-id")
+			slog.Error("No tenant_id provided, use --tenant-id")
 			os.Exit(1)
 		}
 
 		client_id, err := cmd.Flags().GetString(m365ClientId)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting client_id", "error", err)
 			os.Exit(1)
 		} else if client_id == "" {
-			cmd.Println("No client_id provided, use --client-id")
+			slog.Error("No client_id provided, use --client-id")
 			os.Exit(1)
 		}
 
 		auth_code, err := msal.InteractivelyGetAuthCode(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"})
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error getting Microsoft auth code", "error", err)
 			os.Exit(1)
 		}
 
@@ -293,11 +294,11 @@ func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagTo
 		for flag, errMsg := range requiredFlags {
 			value, err := cmd.Flags().GetString(flag)
 			if err != nil {
-				cmd.Println(err.Error())
+				slog.Error("getting flag", "flag", flag, "error", err)
 				os.Exit(1)
 			}
 			if value == "" {
-				cmd.Println(errMsg)
+				slog.Error(errMsg)
 				os.Exit(1)
 			}
 			authParams[flag] = value
@@ -306,7 +307,7 @@ func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagTo
 		for _, flag := range optionalFlags {
 			value, err := cmd.Flags().GetString(flag)
 			if err != nil {
-				cmd.Println(err.Error())
+				slog.Error("getting flag", "flag", flag, "error", err)
 				os.Exit(1)
 			}
 			if value != "" {
@@ -325,7 +326,7 @@ func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagTo
 		}
 		mergeAuthConfig(cmd, authName, configParams)
 
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully logged in to %s", toSentenceCase(authName))))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Successfully logged in to %s", toSentenceCase(authName)))))
 	}
 }
 
@@ -362,7 +363,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 	Run: func(cmd *cobra.Command, args []string) {
 		db_token, err := cmd.Flags().GetString(token)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", token, "error", err)
 			os.Exit(1)
 		}
 
@@ -377,7 +378,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		awsRegion, err := cmd.Flags().GetString(awsRegion)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", awsRegion, "error", err)
 			os.Exit(1)
 		}
 		if awsRegion != "" {
@@ -386,7 +387,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		awsAccessKeyId, err := cmd.Flags().GetString(awsAccessKeyId)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", awsAccessKeyId, "error", err)
 			os.Exit(1)
 		}
 		if awsAccessKeyId != "" {
@@ -395,7 +396,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		awsSecret, err := cmd.Flags().GetString(awsSecret)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", awsSecret, "error", err)
 			os.Exit(1)
 		}
 		if awsSecret != "" {
@@ -404,7 +405,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		azureAccountName, err := cmd.Flags().GetString(azureAccountName)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", azureAccountName, "error", err)
 			os.Exit(1)
 		}
 		if azureAccountName != "" {
@@ -413,7 +414,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		azureAccessKey, err := cmd.Flags().GetString(azureAccessKey)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", azureAccessKey, "error", err)
 			os.Exit(1)
 		}
 		if azureAccessKey != "" {
@@ -422,7 +423,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		gcpServiceAccountPath, err := cmd.Flags().GetString(gcpServiceAccountPath)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", gcpServiceAccountPath, "error", err)
 			os.Exit(1)
 		}
 		if gcpServiceAccountPath != "" {
@@ -431,7 +432,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DATABRICKS, params)
 
-		cmd.Println(aurora.BrightGreen("Successfully logged in to Databricks"))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen("Successfully configured credentials for Databricks")))
 	},
 }
 
@@ -455,7 +456,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		awsRegion, err := cmd.Flags().GetString(awsRegion)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", awsRegion, "error", err)
 			os.Exit(1)
 		}
 		if awsRegion != "" {
@@ -464,7 +465,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		awsAccessKeyId, err := cmd.Flags().GetString(awsAccessKeyId)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", awsAccessKeyId, "error", err)
 			os.Exit(1)
 		}
 		if awsAccessKeyId != "" {
@@ -473,7 +474,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		awsSecret, err := cmd.Flags().GetString(awsSecret)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", awsSecret, "error", err)
 			os.Exit(1)
 		}
 		if awsSecret != "" {
@@ -482,7 +483,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		azureAccountName, err := cmd.Flags().GetString(azureAccountName)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", azureAccountName, "error", err)
 			os.Exit(1)
 		}
 		if azureAccountName != "" {
@@ -491,7 +492,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		azureAccessKey, err := cmd.Flags().GetString(azureAccessKey)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", azureAccessKey, "error", err)
 			os.Exit(1)
 		}
 		if azureAccessKey != "" {
@@ -500,7 +501,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		gcpServiceAccountPath, err := cmd.Flags().GetString(gcpServiceAccountPath)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("getting flag", "flag", gcpServiceAccountPath, "error", err)
 			os.Exit(1)
 		}
 		if gcpServiceAccountPath != "" {
@@ -509,7 +510,7 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DELTA_LAKE, params)
 
-		cmd.Println(aurora.BrightGreen("Successfully configured credentials for Delta Lake"))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen("Successfully configured credentials for Delta Lake")))
 	},
 }
 
@@ -524,7 +525,7 @@ func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConf
 
 	err := godotenv.Write(spiceEnv, ".env")
 	if err != nil {
-		cmd.Println(err.Error())
+		slog.Error("Error writing .env file", "error", err)
 		os.Exit(1)
 	}
 }

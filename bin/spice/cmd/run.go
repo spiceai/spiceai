@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -38,7 +39,7 @@ spice run
 	Run: func(cmd *cobra.Command, args []string) {
 		err := checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
-			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
 
 		// Pass through verbosity of `spice run`
@@ -49,7 +50,7 @@ spice run
 
 		err = runtime.Run(args)
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("error running Spice.ai", "error", err)
 			os.Exit(1)
 		}
 	},
