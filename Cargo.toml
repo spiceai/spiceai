@@ -33,7 +33,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.81"
-version = "0.19.0-beta"
+version = "0.18.3-beta"
 
 [workspace.dependencies]
 arrow = "53"
@@ -119,10 +119,10 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c26a677467e2718912cc174c3a38fc10b24cd537" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c26a677467e2718912cc174c3a38fc10b24cd537" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "c26a677467e2718912cc174c3a38fc10b24cd537" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "c26a677467e2718912cc174c3a38fc10b24cd537" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "1ed39635ee8298daab5abb662d3de12e1abbfb3c" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "1ed39635ee8298daab5abb662d3de12e1abbfb3c" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "1ed39635ee8298daab5abb662d3de12e1abbfb3c" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "1ed39635ee8298daab5abb662d3de12e1abbfb3c" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b0af91992699ecbf5adf2036a07122578f06150e" }

@@ -315,7 +315,7 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let data_connector = create_new_connector("spice.ai", HashMap::new(), secrets)
+    let data_connector = create_new_connector("spiceai", HashMap::new(), secrets)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
