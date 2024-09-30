@@ -34,6 +34,7 @@ pub(crate) async fn run(
             "odbc-athena",
             query_name,
             query,
+            false,
         )
         .await
         {

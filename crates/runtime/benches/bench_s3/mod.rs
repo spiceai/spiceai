@@ -45,6 +45,7 @@ pub(crate) async fn run(
             bench_name.as_str(),
             query_name,
             query,
+            false,
         )
         .await
         {
