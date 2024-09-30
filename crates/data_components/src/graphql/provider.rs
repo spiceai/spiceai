@@ -108,8 +108,8 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let mut query =
-            GraphQLQuery::try_from(self.base_query.as_str()).expect("Should have a query");
+        let mut query = GraphQLQuery::try_from(self.base_query.as_str())
+            .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
         let mut res = self
             .client
