@@ -7,25 +7,45 @@ on:
       - trunk
       - release-*
       - feature-*
-    paths-ignore:
-      - './docs/**'
-      - 'README.md'
-      - 'version.txt'
-      - 'acknowledgements.md'
-
   workflow_dispatch:
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+
 jobs:
+
+  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via 
+  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report 
+  # a sucess when skipped).
+  check_changes:
+    runs-on: ubuntu-latest
+    outputs:
+      relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for relevant changes
+        id: check_changes
+        run: |
+          if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -vE "${{ env.IGNORED_PATHS }}"; then
+            echo "Relevant changes detected."
+            echo "::set-output name=relevant_changes::true"
+          else
+            echo "No relevant changes detected."
+            echo "::set-output name=relevant_changes::false"
+          fi
+
   lint:
     name: Run Go & Rust Linters
     runs-on: rust
     env:
       GOVER: 1.22.0
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +88,8 @@ jobs:
     runs-on: rust
     env:
       GOVER: 1.22.0
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +110,8 @@ jobs:
   build-docker:
     name: Build Docker Image
     runs-on: rust
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@v4
