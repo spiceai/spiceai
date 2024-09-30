@@ -17,14 +17,14 @@ use text_splitter::{ChunkCapacity, ChunkConfig};
 
 #[derive(Debug, Clone)]
 pub struct ChunkingConfig {
-    // The desired size of each chunk, in tokens.
-    pub desired_size: usize,
+    // The target size of each chunk, in tokens.
+    pub target_chunk_size: usize,
 
     // The amount of overlap between chunks, in tokens.
     pub overlap_size: usize,
 
     // Whether to trim the chunks to remove leading and trailing whitespace.
-    pub trim: bool,
+    pub trim_whitespace: bool,
 }
 
 type ChunkIndicesIter<'a> = Box<dyn Iterator<Item = (usize, &'a str)> + 'a>;
@@ -48,7 +48,8 @@ impl CharacterSplittingChunker {
         // TODO: .with_overlap(cfg.overlap_size)
         Self {
             splitter: Arc::new(text_splitter::TextSplitter::new(
-                ChunkConfig::new(ChunkCapacity::new(cfg.desired_size)).with_trim(cfg.trim),
+                ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
+                    .with_trim(cfg.trim_whitespace),
             )),
         }
     }
