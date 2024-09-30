@@ -22,7 +22,7 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    logical_expr::Expr,
+    logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
 };
 use std::{any::Any, sync::Arc};
@@ -91,6 +91,16 @@ impl TableProvider for GraphQLTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, datafusion::error::DataFusionError> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
     }
 
     async fn scan(
