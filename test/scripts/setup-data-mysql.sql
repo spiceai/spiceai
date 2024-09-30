@@ -1,3 +1,4 @@
+-- TODO: Add MySQL enum type back when DucKDB & SQLite accelerator support accelerating arrow dictionary type
 CREATE TABLE test_mysql_table (
   id SERIAL PRIMARY KEY,
   col_bit BIT(1),
