@@ -66,11 +66,11 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - TPCDS: Primary/foreign key constraints & index
 
 - [ ] End-to-end test to cover accelerating TPCH-SF1 data from S3 and benchmarking TPCH queries (official and simple).
-  - [ ] File mode
-  - [ ] In-Memory mode
+  - [ ] File mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
+  - [ ] In-Memory mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
 - [ ] End-to-end test to cover accelerating TPCDS-SF1 data from S3 and benchmarking TPCDS queries (official and simple).
-  - [ ] File mode
-  - [ ] In-Memory mode
+  - [ ] File mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
+  - [ ] In-Memory mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
 - [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with arrow types:
   - [ ] Null
   - [ ] All Int types
