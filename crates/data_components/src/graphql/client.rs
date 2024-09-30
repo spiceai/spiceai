@@ -653,9 +653,7 @@ impl GraphQLQuery<'_> {
     }
 }
 
-pub(crate) struct GraphQLQueryResult<'a> {
-    #[allow(dead_code)]
-    pub(crate) query: GraphQLQuery<'a>,
+pub(crate) struct GraphQLQueryResult {
     pub(crate) records: Vec<RecordBatch>,
     record_count: usize,
     limit_reached: bool,
@@ -704,7 +702,7 @@ impl GraphQLClient {
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
-    ) -> Result<GraphQLQueryResult<'a>> {
+    ) -> Result<GraphQLQueryResult> {
         let query_string = query.to_string(limit, cursor);
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
@@ -768,7 +766,6 @@ impl GraphQLClient {
         let limit_reached = query.limit_reached(limit, record_count);
 
         Ok(GraphQLQueryResult {
-            query: query.clone(),
             records: res,
             record_count,
             limit_reached,
