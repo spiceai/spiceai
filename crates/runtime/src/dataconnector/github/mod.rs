@@ -97,7 +97,6 @@ impl Github {
         GraphQLClient::new(
             client,
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
-            gql_client_params.query,
             gql_client_params.json_pointer,
             access_token,
             None,
@@ -121,7 +120,7 @@ impl Github {
         Ok(Arc::new(
             GraphQLTableProviderBuilder::new(client)
                 .with_schema_transform(github_gql_raw_schema_cast)
-                .build()
+                .build(table_args.get_graphql_values().query.as_ref())
                 .await
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
