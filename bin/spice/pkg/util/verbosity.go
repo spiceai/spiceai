@@ -16,6 +16,19 @@ limitations under the License.
 
 package util
 
+// `log/slog` does not have a `trace` level. We define it here. To use
+// ```golang
+// slog.Log(context.Background(), util.TRACE_LEVEL, "my little trace")
+// ```
+//
+// Outputs
+// ```shell
+//
+//	2024/09/30 11:16:38 DEBUG-4 my little trace
+//
+// ```
+const TRACE_LEVEL = -8
+
 // Verbosity is a struct to handle the complexity of verbosity level from the CLI flags.
 // Specifically, it lets us have both `--verbose` and `--very-verbose` flags.
 //
