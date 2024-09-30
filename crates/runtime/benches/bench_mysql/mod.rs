@@ -28,9 +28,15 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        if let Err(e) =
-            super::run_query_and_record_result(rt, benchmark_results, "mysql", query_name, query)
-                .await
+        if let Err(e) = super::run_query_and_record_result(
+            rt,
+            benchmark_results,
+            "mysql",
+            query_name,
+            query,
+            false,
+        )
+        .await
         {
             errors.push(format!("Query {query_name} failed with error: {e}"));
         };
