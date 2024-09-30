@@ -33,7 +33,10 @@ async fn duckdb_from_functions() -> Result<(), String> {
             "csv",
             &format!(
                 "'{}'",
-                local_path_root.join("taxi_sample.csv").to_str().unwrap_or("invalid_path")
+                local_path_root
+                    .join("taxi_sample.csv")
+                    .to_str()
+                    .unwrap_or("invalid_path")
             ),
         ))
         .with_dataset(make_duckdb_dataset(
@@ -51,7 +54,10 @@ async fn duckdb_from_functions() -> Result<(), String> {
             "json",
             &format!(
                 "'{}'",
-                local_path_root.join("taxi_sample.json").to_str().unwrap_or("invalid_path")
+                local_path_root
+                    .join("taxi_sample.json")
+                    .to_str()
+                    .unwrap_or("invalid_path")
             ),
         ))
         .build();
