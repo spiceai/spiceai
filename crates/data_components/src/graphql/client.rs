@@ -337,10 +337,6 @@ impl PaginationParameters {
     /// A user must explicitly provider the JSON pointer for the latter example (e.g. when calling [`GraphQLClient::new`]).
     ///
     fn parse(ast: &Document<'_, String>) -> (Option<Self>, Option<String>) {
-        // let Some(ast) = parse_query::<String>(query).ok() else {
-        //     return (None, None);
-        // };
-
         // Start traversing the query's operation definitions
         for def in ast.definitions.clone() {
             let selections = match def {
@@ -488,8 +484,6 @@ impl PaginationParameters {
             ),
         );
 
-        println!("new query: {new_query}");
-
         new_query.to_string()
     }
 
@@ -604,10 +598,8 @@ fn unnest_json_objects(
 pub struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
-    // query: Arc<str>,
-    json_pointer: Arc<str>,
+    pub(crate) json_pointer: Option<Arc<str>>,
     unnest_parameters: UnnestParameters,
-    // pagination_parameters: Option<PaginationParameters>,
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
 }
@@ -615,7 +607,7 @@ pub struct GraphQLClient {
 #[derive(Clone)]
 pub struct GraphQLQuery<'a> {
     ast: Document<'a, String>,
-    json_pointer: Option<String>,
+    pub(crate) json_pointer: Option<Arc<str>>,
     pagination_parameters: Option<PaginationParameters>,
 }
 
@@ -634,7 +626,7 @@ impl<'a> TryFrom<&'a str> for GraphQLQuery<'a> {
 
         Ok(Self {
             ast,
-            json_pointer,
+            json_pointer: json_pointer.map(Arc::from),
             pagination_parameters,
         })
     }
@@ -652,10 +644,9 @@ impl GraphQLQuery<'_> {
         }
     }
 
-    pub fn limit_reached(&mut self, limit: Option<usize>, _record_count: usize) -> bool {
-        if let Some(_limit) = limit {
-            // TODO: implement limit tracking
-            false
+    pub fn limit_reached(&mut self, limit: Option<usize>, record_count: usize) -> bool {
+        if let Some(limit) = limit {
+            record_count >= limit
         } else {
             false
         }
@@ -663,6 +654,7 @@ impl GraphQLQuery<'_> {
 }
 
 pub(crate) struct GraphQLQueryResult<'a> {
+    #[allow(dead_code)]
     pub(crate) query: GraphQLQuery<'a>,
     pub(crate) records: Vec<RecordBatch>,
     record_count: usize,
@@ -683,12 +675,6 @@ impl GraphQLClient {
         unnest_depth: usize,
         schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        // let (pagination_parameters, inferred_json_pointer) = PaginationParameters::parse(&query);
-        // tracing::debug!(
-        //     "Parsed pagination parameters for {:?}: {pagination_parameters:?}. Inferred JSON pointer: {inferred_json_pointer:?}",
-        //     endpoint.to_string()
-        // );
-
         let auth = match (token, user, pass) {
             (Some(token), _, _) => Some(Auth::Bearer(token.to_string())),
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
@@ -700,17 +686,13 @@ impl GraphQLClient {
             duplicate_behavior: DuplicateBehavior::Error,
         };
 
-        let Some(json_pointer) = json_pointer else {
-            return Err(Error::NoJsonPointerFound {});
-        };
+        let json_pointer = json_pointer.map(Arc::from);
 
         Ok(Self {
             client,
             endpoint,
-            // query,
-            json_pointer: json_pointer.into(),
+            json_pointer,
             unnest_parameters,
-            // pagination_parameters,
             auth,
             schema,
         })
@@ -723,12 +705,6 @@ impl GraphQLClient {
         limit: Option<usize>,
         cursor: Option<String>,
     ) -> Result<GraphQLQueryResult<'a>> {
-        // let (query, limit_reached) = query
-        //     .pagination_parameters
-        //     .as_ref()
-        //     .map(|x| x.apply(query, limit, cursor))
-        //     .unwrap_or((query.to_string(), false));
-
         let query_string = query.to_string(limit, cursor);
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
@@ -745,13 +721,14 @@ impl GraphQLClient {
 
         let json_pointer = query
             .json_pointer
-            .clone()
-            .unwrap_or(self.json_pointer.to_string());
+            .as_ref()
+            .or(self.json_pointer.as_ref())
+            .ok_or(Error::NoJsonPointerFound {})?;
 
         let extracted_data = response
-            .pointer(&json_pointer)
+            .pointer(json_pointer)
             .ok_or(Error::InvalidJsonPointer {
-                pointer: json_pointer.clone(),
+                pointer: json_pointer.to_string(),
             })?
             .to_owned();
 
@@ -818,8 +795,10 @@ impl GraphQLClient {
 
         while let Some(next_cursor_val) = result.cursor {
             if let Some(p) = query.pagination_parameters.as_ref() {
-                limit = Some(p.reduce_limit(result.record_count));
-            };
+                if limit.is_some() {
+                    limit = Some(p.reduce_limit(result.record_count));
+                }
+            }
 
             result = self
                 .execute(
@@ -1136,14 +1115,15 @@ mod tests {
         pagination_parameters_opt.expect("Should get pagination params");
         let new_query = query.to_string(None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
-            users (first: 10, after: "new_cursor") {
-                name
-                pageInfo {
-                    hasNextPage
-                    endCursor
-                }
-            }
-        }"#;
+  users (first: 10, after: "new_cursor") {
+    name
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"#;
         assert_eq!(new_query, expected_query);
 
         let query = r#"query {
@@ -1161,14 +1141,15 @@ mod tests {
         pagination_parameters_opt.expect("Should get pagination params");
         let new_query = query.to_string(None, Some("new_cursor".to_string()));
         let expected_query = r#"query {
-            users (first: 10, after: "new_cursor") {
-                name
-                pageInfo {
-                    hasNextPage
-                    endCursor
-                }
-            }
-        }"#;
+  users (first: 10, after: "new_cursor") {
+    name
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"#;
         assert_eq!(new_query, expected_query);
 
         let query = r"query {
@@ -1184,16 +1165,17 @@ mod tests {
         let query = GraphQLQuery::try_from(query).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
-        let new_query = query.to_string(None, Some("new_cursor".to_string()));
+        let new_query = query.to_string(Some(5), Some("new_cursor".to_string()));
         let expected_query = r#"query {
-            users (first: 5, after: "new_cursor") {
-                name
-                pageInfo {
-                    hasNextPage
-                    endCursor
-                }
-            }
-        }"#;
+  users (first: 5, after: "new_cursor") {
+    name
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"#;
         assert_eq!(new_query, expected_query);
     }
 

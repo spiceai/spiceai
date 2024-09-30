@@ -22,7 +22,7 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    logical_expr::{Expr, TableProviderFilterPushDown},
+    logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
 use std::{any::Any, sync::Arc};
@@ -33,24 +33,9 @@ use super::{client::GraphQLQuery, Result};
 pub type TransformFn =
     fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
 
-pub type FilterPushdownFn =
-    fn(&Expr) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
-
-pub type ParameterInjectionFn =
-    fn(&[FilterPushdownResult], &str) -> Result<Arc<str>, datafusion::error::DataFusionError>;
-
-#[derive(Debug, Clone)]
-pub struct FilterPushdownResult {
-    pub filter_pushdown: TableProviderFilterPushDown,
-    pub expr: Expr,
-    pub parameter: Option<String>,
-}
-
 pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
     transform_fn: Option<TransformFn>,
-    filter_pushdown_fn: Option<FilterPushdownFn>,
-    parameter_injection_fn: Option<ParameterInjectionFn>,
 }
 
 impl GraphQLTableProviderBuilder {
@@ -59,8 +44,6 @@ impl GraphQLTableProviderBuilder {
         Self {
             client,
             transform_fn: None,
-            filter_pushdown_fn: None,
-            parameter_injection_fn: None,
         }
     }
 
@@ -70,23 +53,12 @@ impl GraphQLTableProviderBuilder {
         self
     }
 
-    #[must_use]
-    pub fn with_filter_pushdown(mut self, filter_pushdown_fn: FilterPushdownFn) -> Self {
-        self.filter_pushdown_fn = Some(filter_pushdown_fn);
-        self
-    }
-
-    #[must_use]
-    pub fn with_parameter_injection(
-        mut self,
-        parameter_injection_fn: ParameterInjectionFn,
-    ) -> Self {
-        self.parameter_injection_fn = Some(parameter_injection_fn);
-        self
-    }
-
     pub async fn build(self, query_string: &str) -> Result<GraphQLTableProvider> {
         let mut query = GraphQLQuery::try_from(query_string)?;
+
+        if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
+            return Err(super::Error::NoJsonPointerFound {});
+        }
 
         let result = self.client.execute(&mut query, None, None, None).await?;
 
@@ -103,8 +75,6 @@ impl GraphQLTableProviderBuilder {
             gql_schema: Arc::clone(&result.schema),
             table_schema,
             transform_fn: self.transform_fn,
-            filter_pushdown_fn: self.filter_pushdown_fn,
-            parameter_injection_fn: self.parameter_injection_fn,
         })
     }
 }
@@ -115,21 +85,6 @@ pub struct GraphQLTableProvider {
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
     transform_fn: Option<TransformFn>,
-    filter_pushdown_fn: Option<FilterPushdownFn>,
-    parameter_injection_fn: Option<ParameterInjectionFn>,
-}
-
-// remove duplicate parameters
-fn compact_parameters(parameters: &[FilterPushdownResult]) -> Vec<FilterPushdownResult> {
-    let mut compacted: Vec<FilterPushdownResult> = vec![];
-
-    for parameter in parameters {
-        if !compacted.iter_mut().any(|p| p.expr == parameter.expr) {
-            compacted.push(parameter.clone());
-        }
-    }
-
-    compacted
 }
 
 #[async_trait]
@@ -146,23 +101,6 @@ impl TableProvider for GraphQLTableProvider {
         TableType::Base
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, datafusion::error::DataFusionError> {
-        if let Some(filter_pushdown_fn) = &self.filter_pushdown_fn {
-            filters
-                .iter()
-                .map(|f| filter_pushdown_fn(f).map(|r| r.filter_pushdown))
-                .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()
-        } else {
-            Ok(vec![
-                TableProviderFilterPushDown::Unsupported;
-                filters.len()
-            ])
-        }
-    }
-
     async fn scan(
         &self,
         state: &dyn Session,
@@ -170,29 +108,6 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        println!("provided len: {}", filters.len());
-        let parameters = if let Some(filter_pushdown_fn) = self.filter_pushdown_fn {
-            compact_parameters(
-                &filters
-                    .iter()
-                    .map(filter_pushdown_fn)
-                    .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?,
-            )
-        } else {
-            println!("defaulting to no pushdown");
-            vec![]
-        };
-
-        println!("parameters: {parameters:?}");
-
-        // let query = if let Some(injection_fn) = self.parameter_injection_fn {
-        //     injection_fn(&parameters, &self.client.get_query())?
-        // } else {
-        //     self.client.get_query()
-        // };
-
-        // println!("query: {query}");
-
         let mut query =
             GraphQLQuery::try_from(self.base_query.as_str()).expect("Should have a query");
 

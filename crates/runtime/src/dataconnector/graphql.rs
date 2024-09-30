@@ -116,19 +116,6 @@ impl GraphQL {
             .ok()
             .map(str::to_string);
 
-        let query: Arc<str> = self
-            .params
-            .get("query")
-            .expose()
-            .ok_or_else(|p| {
-                super::InvalidConfigurationNoSourceSnafu {
-                    dataconnector: "graphql",
-                    message: format!("`{}` not found in params", p.0),
-                }
-                .build()
-            })?
-            .into();
-
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "graphql",
@@ -162,7 +149,6 @@ impl GraphQL {
         GraphQLClient::new(
             client,
             endpoint,
-            query,
             json_pointer,
             token,
             user,
@@ -189,9 +175,17 @@ impl DataConnector for GraphQL {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.get_client(dataset)?;
 
+        let query = self.params.get("query").expose().ok_or_else(|p| {
+            super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "graphql",
+                message: format!("`{}` not found in params", p.0),
+            }
+            .build()
+        })?;
+
         Ok(Arc::new(
             GraphQLTableProviderBuilder::new(client)
-                .build()
+                .build(query)
                 .await
                 .map_err(Into::into)
                 .context(super::InternalWithSourceSnafu {
