@@ -45,7 +45,7 @@ use tokenizers::{Encoding, Tokenizer};
 
 pub struct CandleEmbedding {
     backend: Arc<Mutex<CandleBackend>>,
-    tok: Tokenizer,
+    tok: Arc<Tokenizer>,
     model_cfg: ModelConfig,
 }
 
@@ -83,6 +83,8 @@ impl CandleEmbedding {
 
     /// Attempt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
     pub fn try_new(model_root: &Path, dtype: &str) -> Result<Self> {
+        let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
+            .context(FailedToInstantiateEmbeddingModelSnafu)?;
         Ok(Self {
             backend: Arc::new(Mutex::new(
                 CandleBackend::new(
@@ -93,8 +95,7 @@ impl CandleEmbedding {
                 .boxed()
                 .context(FailedToInstantiateEmbeddingModelSnafu)?,
             )),
-            tok: Tokenizer::from_file(model_root.join("tokenizer.json"))
-                .context(FailedToInstantiateEmbeddingModelSnafu)?,
+            tok: Arc::new(tokenizer),
             model_cfg: Self::model_config(model_root)?,
         })
     }
