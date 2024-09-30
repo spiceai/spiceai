@@ -18,7 +18,7 @@ limitations under the License.
 use async_stream::stream;
 use datafusion::{
     common::{
-        tree_node::{Transformed, TreeNode},
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
         DFSchemaRef,
     },
     error::Result,
@@ -56,25 +56,20 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(|plan| match plan {
+        plan.transform_down(|plan| match plan {
             LogicalPlan::Extension(extension) => {
                 // If the extension is already a BytesProcessedNode, don't add another one.
-                if let Some(bytes_processed) =
-                    extension.node.as_any().downcast_ref::<BytesProcessedNode>()
+                if extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<BytesProcessedNode>()
+                    .is_some()
                 {
-                    if let LogicalPlan::Extension(inner_extension) = &bytes_processed.input {
-                        if inner_extension
-                            .node
-                            .as_any()
-                            .downcast_ref::<BytesProcessedNode>()
-                            .is_some()
-                        {
-                            return Ok(Transformed::yes(LogicalPlan::Extension(
-                                inner_extension.clone(),
-                            )));
-                        }
-                    }
-                    return Ok(Transformed::yes(LogicalPlan::Extension(extension)));
+                    return Ok(Transformed::new(
+                        LogicalPlan::Extension(extension),
+                        false,
+                        TreeNodeRecursion::Jump, // Don't process any further children of this sub-tree.
+                    ));
                 }
 
                 let plan_node = extension.node.as_any().downcast_ref::<FederatedPlanNode>();
@@ -85,7 +80,11 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
                     let ext_node = Extension {
                         node: Arc::new(bytes_processed),
                     };
-                    Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
+                    Ok(Transformed::new(
+                        LogicalPlan::Extension(ext_node),
+                        true,
+                        TreeNodeRecursion::Jump,
+                    ))
                 } else {
                     Ok(Transformed::no(LogicalPlan::Extension(extension)))
                 }
@@ -95,7 +94,11 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
                 let ext_node = Extension {
                     node: Arc::new(bytes_processed),
                 };
-                Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
+                Ok(Transformed::new(
+                    LogicalPlan::Extension(ext_node),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ))
             }
             _ => Ok(Transformed::no(plan)),
         })
