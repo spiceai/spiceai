@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use arrow::error::ArrowError;
+use client::GraphQLQuery;
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
-use graphql_parser::query::Document;
 use snafu::Snafu;
 
 pub mod client;
@@ -86,9 +86,9 @@ pub trait GraphQLOptimizer: Send + Sync {
         &self,
         expr: &Expr,
     ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
-    fn parameter_injection<'a>(
+    fn inject_parameters(
         &self,
         filters: &[FilterPushdownResult],
-        document: &Document<'a, String>,
-    ) -> Result<Document<'a, String>, datafusion::error::DataFusionError>;
+        query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError>;
 }
