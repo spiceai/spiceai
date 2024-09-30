@@ -144,13 +144,13 @@ pub struct EmbeddingChunkConfig {
     pub enabled: bool,
 
     #[serde(default)]
-    pub target_chunk_size: usize,
+    pub chunk_target_size: usize,
 
     #[serde(default)]
     pub overlap_size: usize,
 
     #[serde(default)]
-    pub trim_whitespace: bool,
+    pub trim: bool,
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
