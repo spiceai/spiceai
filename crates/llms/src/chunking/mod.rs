@@ -53,7 +53,7 @@ impl CharacterSplittingChunker {
             overlap_config
         } else {
             tracing::warn!(
-                "Cannot use overlap={} for chunking, when target_chunk_size={}. Not using overlap.",
+                "Overlap={} cannot be used with chunking when target_chunk_size={} is set. Overlap will be ignored.",
                 cfg.overlap_size,
                 cfg.target_chunk_size
             );
