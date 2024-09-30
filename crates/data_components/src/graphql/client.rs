@@ -705,7 +705,6 @@ impl GraphQLClient {
         cursor: Option<String>,
     ) -> Result<GraphQLQueryResult> {
         let query_string = query.to_string(limit, cursor);
-        println!("{query_string}");
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 

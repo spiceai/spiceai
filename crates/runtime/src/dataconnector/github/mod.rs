@@ -438,7 +438,6 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
         };
 
         let parameter = format!("{column_name}:{value}");
-        println!("{parameter}");
 
         return FilterPushdownResult {
             filter_pushdown: TableProviderFilterPushDown::Inexact,
