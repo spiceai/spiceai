@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
 	"os"
 	"strings"
 
@@ -37,7 +38,7 @@ func Execute() {
 	cobra.OnInitialize(initConfig)
 
 	if err := RootCmd.Execute(); err != nil {
-		RootCmd.Println(err)
+		slog.Error("Error executing command", "error", err)
 		os.Exit(-1)
 	}
 }

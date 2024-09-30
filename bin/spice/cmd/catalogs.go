@@ -17,6 +17,8 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
+
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -37,7 +39,7 @@ spice catalogs
 
 		catalogs, err := api.GetData[api.Catalog](rtcontext, "/v1/catalogs")
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("getting spiced catalogs", "error", err)
 		}
 		table := make([]interface{}, len(catalogs))
 		for i, catalog := range catalogs {
