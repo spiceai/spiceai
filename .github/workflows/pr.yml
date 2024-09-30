@@ -31,7 +31,7 @@ jobs:
       - name: Check for relevant changes
         id: check_changes
         run: |
-          if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -vE "${{ env.IGNORED_PATHS }}"; then
+          if git diff --name-only origin/${{ github.base_ref }} ${{ github.sha }} | grep -vE "${{ env.IGNORED_PATHS }}"; then
             echo "Relevant changes detected."
             echo "::set-output name=relevant_changes::true"
           else
