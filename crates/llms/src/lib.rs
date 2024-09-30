@@ -14,5 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 pub mod chat;
+pub mod chunking;
 pub mod embeddings;
 pub mod openai;
