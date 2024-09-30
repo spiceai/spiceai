@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -57,7 +58,7 @@ sql> show tables
 
 		execCmd, err := rtcontext.GetRunCmd(args)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("getting run command", "error", err)
 			os.Exit(1)
 		}
 
@@ -67,7 +68,7 @@ sql> show tables
 
 		err = util.RunCommand(execCmd)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("running command", "error", err, "command", execCmd.String())
 			os.Exit(1)
 		}
 	},
