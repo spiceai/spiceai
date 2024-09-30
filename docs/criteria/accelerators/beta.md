@@ -23,8 +23,8 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 A major bug is classified as a bug that:
 
-- Renders the accelerator completely inoperable, or;
-- Causes data inconsistency errors on data stored within the accelerator, or;
+- Renders the accelerator completely inoperable (i.e. all queries on the accelerator fail, loading fails, etc), or;
+- Causes data inconsistency errors, or;
 - A bug that occurs in more than one accelerator, or;
 - At the discretion of the DRI, is a bug that is likely to be experienced in common use cases.
 
