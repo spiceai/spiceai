@@ -57,14 +57,26 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_up(|plan| match plan {
-            LogicalPlan::TableScan(table_scan) => {
-                let bytes_processed = BytesProcessedNode::new(LogicalPlan::TableScan(table_scan));
-                let ext_node = Extension {
-                    node: Arc::new(bytes_processed),
-                };
-                Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
-            }
             LogicalPlan::Extension(extension) => {
+                // If the extension is already a BytesProcessedNode, don't add another one.
+                if let Some(bytes_processed) =
+                    extension.node.as_any().downcast_ref::<BytesProcessedNode>()
+                {
+                    if let LogicalPlan::Extension(inner_extension) = &bytes_processed.input {
+                        if inner_extension
+                            .node
+                            .as_any()
+                            .downcast_ref::<BytesProcessedNode>()
+                            .is_some()
+                        {
+                            return Ok(Transformed::yes(LogicalPlan::Extension(
+                                inner_extension.clone(),
+                            )));
+                        }
+                    }
+                    return Ok(Transformed::yes(LogicalPlan::Extension(extension)));
+                }
+
                 let plan_node = extension.node.as_any().downcast_ref::<FederatedPlanNode>();
 
                 if plan_node.is_some() {
@@ -77,6 +89,13 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
                 } else {
                     Ok(Transformed::no(LogicalPlan::Extension(extension)))
                 }
+            }
+            LogicalPlan::TableScan(table_scan) => {
+                let bytes_processed = BytesProcessedNode::new(LogicalPlan::TableScan(table_scan));
+                let ext_node = Extension {
+                    node: Arc::new(bytes_processed),
+                };
+                Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
             }
             _ => Ok(Transformed::no(plan)),
         })
