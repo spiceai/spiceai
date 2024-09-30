@@ -17,7 +17,7 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -37,11 +37,11 @@ spice install ai
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Checking for latest Spice runtime release...")
+		slog.Info("Checking for latest Spice runtime release...")
 
 		err := checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
-			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
 
 		flavor := ""
@@ -52,7 +52,7 @@ spice install ai
 		var installed bool
 		force, err := cmd.Flags().GetBool("force")
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("getting force flag", "error", err)
 			os.Exit(1)
 		}
 
@@ -60,25 +60,25 @@ spice install ai
 			rtcontext := context.NewContext()
 			err := rtcontext.Init()
 			if err != nil {
-				fmt.Println(err.Error())
+				slog.Error("initializing runtime context", "error", err)
 				os.Exit(1)
 			}
 			err = rtcontext.InstallOrUpgradeRuntime(flavor)
 			if err != nil {
-				cmd.PrintErrln(err.Error())
+				slog.Error("installing runtime", "error", err)
 				os.Exit(1)
 			}
 			installed = true
 		} else {
 			installed, err = runtime.EnsureInstalled(flavor)
 			if err != nil {
-				cmd.PrintErrln(err.Error())
+				slog.Error("verifying runtime install", "error", err)
 				os.Exit(1)
 			}
 		}
 
 		if !installed {
-			cmd.Println("Spice.ai runtime already installed")
+			slog.Info("Spice.ai runtime already installed")
 		}
 	},
 }

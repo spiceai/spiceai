@@ -18,6 +18,7 @@ package github
 
 import (
 	"fmt"
+	"log/slog"
 	"runtime"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
@@ -52,7 +53,7 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 
 func DownloadRuntimeAsset(flavor string, release *RepoRelease, downloadPath string) error {
 	assetName := GetRuntimeAssetName(flavor)
-	fmt.Println("Downloading the Spice runtime...", assetName)
+	slog.Info(fmt.Sprintf("Downloading the Spice runtime..., %s", assetName))
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 

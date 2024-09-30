@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -77,17 +77,17 @@ spice chat --model <model> --cloud
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("could not get model flag", "error", err)
 			os.Exit(1)
 		}
 		if model == "" {
 			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
 			if err != nil {
-				cmd.PrintErrln(err.Error())
+				slog.Error("could not list models", "error", err)
 				os.Exit(1)
 			}
 			if len(models) == 0 {
-				cmd.Println("No models found")
+				slog.Error("No models found")
 				os.Exit(1)
 			}
 
@@ -106,19 +106,19 @@ spice chat --model <model> --cloud
 
 				_, selectedModel, err = prompt.Run()
 				if err != nil {
-					fmt.Printf("Prompt failed %v\n", err)
+					slog.Error("prompt failed", "error", err)
 					return
 				}
 			}
 
-			fmt.Println("Using model:", selectedModel)
+			slog.Info(fmt.Sprintf("Using model: %s\n", selectedModel))
 			fmt.Println()
 			model = selectedModel
 		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("could not get http-endpoint flag", "error", err)
 			os.Exit(1)
 		}
 		if httpEndpoint != "" {
@@ -135,7 +135,7 @@ spice chat --model <model> --cloud
 			if err == liner.ErrPromptAborted {
 				break
 			} else if err != nil {
-				log.Print("Error reading line: ", err)
+				slog.Error("reading input line", "error", err)
 				continue
 			}
 
@@ -155,7 +155,7 @@ spice chat --model <model> --cloud
 
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
-				cmd.Printf("Error: %v\n", err)
+				slog.Error("failed to send chat request to spiced", "error", err)
 				continue
 			}
 
@@ -174,7 +174,7 @@ spice chat --model <model> --cloud
 				var chatResponse ChatCompletion = ChatCompletion{}
 				err = json.Unmarshal([]byte(chunk), &chatResponse)
 				if err != nil {
-					cmd.Printf("Error: %v\n\n", err)
+					slog.Error("failed to unmarshal chat response", "error", err)
 					continue
 				}
 

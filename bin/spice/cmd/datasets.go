@@ -17,6 +17,8 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
+
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -36,7 +38,7 @@ spice datasets
 		}
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
-			cmd.PrintErrln(err)
+			slog.Error("listing dataset statuses", "error", err)
 		}
 
 		table := make([]interface{}, len(datasets))

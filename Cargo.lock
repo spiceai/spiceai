@@ -8764,6 +8764,7 @@ dependencies = [
  "futures",
  "globset",
  "graph-rs-sdk",
+ "graphql-parser",
  "headers-accept",
  "http 1.1.0",
  "http-body-util",
