@@ -51,18 +51,20 @@ pub struct Azure {
     params: Parameters,
 }
 
-#[derive(Default, Copy, Clone)]
-pub struct AzureFactory {}
+#[derive(Default, Clone)]
+pub struct AzureFactory {
+    prefix: &'static str
+}
 
 impl AzureFactory {
     #[must_use]
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(prefix: &'static str) -> Self {
+        Self { prefix }
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    pub fn new_arc(prefix: &'static str) -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self { prefix }) as Arc<dyn DataConnectorFactory>
     }
 }
 
@@ -147,6 +149,20 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
 ];
 
+pub const PREFIXES: [&'static str; 7] = [
+    "azure",
+    "abfs",
+    "abfss",
+    "adl",
+    "adls",
+    "az",
+    "azure:https"
+];
+
+pub fn is_azure_url(url: &str) -> bool {
+    PREFIXES.iter().any(|prefix| url.starts_with(prefix))
+}
+
 impl DataConnectorFactory for AzureFactory {
     fn create(
         &self,
@@ -180,7 +196,7 @@ impl DataConnectorFactory for AzureFactory {
     }
 
     fn prefix(&self) -> &'static str {
-        "azure"
+        &self.prefix
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -204,7 +220,11 @@ impl ListingTableConnector for Azure {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let prefixed_url = dataset.from.replace("azure:", "azure+");
+        let prefixed_url = if dataset.from.starts_with("azure:https") {
+            dataset.from.replace("azure:", "azure+")
+        } else {
+            dataset.from.clone()
+        };
         let mut azure_url =
             Url::parse(&prefixed_url)
                 .boxed()

@@ -298,7 +298,11 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
     register_connector_factory("s3", s3::S3Factory::new_arc()).await;
-    register_connector_factory("azure", azure::AzureFactory::new_arc()).await;
+
+    for prefix in azure::PREFIXES.iter() {
+        register_connector_factory(prefix, azure::AzureFactory::new_arc(prefix)).await;
+    }
+    //register_connector_factory("azure", azure::AzureFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;

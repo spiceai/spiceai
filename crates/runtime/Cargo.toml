@@ -124,6 +124,9 @@ bollard = "0.16.1"
 spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
 insta.workspace = true
+azure_storage_blobs = "0.20.0"
+azure_core = "0.20.0"
+azure_storage = "0.20.0"
 
 [features]
 aws-secrets-manager = [
