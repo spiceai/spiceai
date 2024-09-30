@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,13 +30,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
-	"github.com/spiceai/spiceai/bin/spice/pkg/loggers"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
-	"go.uber.org/zap"
-)
-
-var (
-	zaplog *zap.Logger = loggers.ZapLogger()
 )
 
 type SpiceRackRegistry struct{}
@@ -65,7 +60,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 
 	response, err := spice_http.Get(url, "application/zip")
 	if err != nil {
-		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
+		slog.Debug(fmt.Sprintf("%s: %s", failureMessage, err.Error()))
 		return "", errors.New(failureMessage)
 	}
 	defer response.Body.Close()

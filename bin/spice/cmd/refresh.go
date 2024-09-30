@@ -19,6 +19,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -80,11 +81,11 @@ spice refresh taxi_trips
 
 		// If the mode is not empty, it must be either 'full' or 'append'.
 		if mode != "" && mode != spec.REFRESH_MODE_FULL && mode != spec.REFRESH_MODE_APPEND {
-			cmd.PrintErrln("Invalid refresh mode. Valid modes are 'full' or 'append'")
+			slog.Error("Invalid refresh mode. Valid modes are 'full' or 'append'")
 			return
 		}
 
-		cmd.Printf("Refreshing dataset %s ...\n", dataset)
+		slog.Info(fmt.Sprintf("Refreshing dataset %s ...\n", dataset))
 
 		rtcontext := context.NewContext()
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
@@ -95,16 +96,16 @@ spice refresh taxi_trips
 
 		body, err := constructRequest(sql, mode, maxJitter)
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("constructing request", "error", err)
 			return
 		}
 		res, err := api.PostRuntime[DatasetRefreshApiResponse](rtcontext, url, body)
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("refreshing dataset", "error", err)
 			return
 		}
 
-		cmd.Println(res.Message)
+		slog.Info(res.Message)
 	},
 }
 

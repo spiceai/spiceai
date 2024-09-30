@@ -17,6 +17,8 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,10 +39,10 @@ var upgradeCmd = &cobra.Command{
 spice upgrade
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Println("Checking for latest Spice CLI release...")
+		slog.Info("Checking for latest Spice CLI release...")
 		release, err := github.GetLatestCliRelease()
 		if err != nil {
-			cmd.PrintErrln("Error checking for latest release:", err)
+			slog.Error("checking for latest release", "error", err)
 			return
 		}
 
@@ -48,18 +50,18 @@ spice upgrade
 		cliVersion := version.Version()
 
 		if cliVersion == release.TagName {
-			cmd.Printf("Using the latest version %s. No upgrade required.\n", release.TagName)
+			slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.\n", release.TagName))
 			return
 		}
 
 		assetName := github.GetAssetName(constants.SpiceCliFilename)
 		spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
 
-		cmd.Println("Upgrading the Spice.ai CLI ...")
+		slog.Info("Upgrading the Spice.ai CLI ...")
 
 		stat, err := os.Stat(spiceBinDir)
 		if err != nil {
-			cmd.PrintErrln("Error upgrading the spice binary:", err)
+			slog.Error("upgrading the spice binary", "error", err)
 			return
 		}
 
@@ -68,14 +70,14 @@ spice upgrade
 
 		err = os.Mkdir(tmpDir, stat.Mode())
 		if err != nil {
-			cmd.PrintErrln("Error upgrading the spice binary:", err)
+			slog.Error("upgrading the spice binary", "error", err)
 			return
 		}
 		defer os.RemoveAll(tmpDir)
 
 		err = github.DownloadAsset(release, tmpDir, assetName)
 		if err != nil {
-			cmd.PrintErrln("Error downloading the spice binary:", err)
+			slog.Error("downloading the spice binary", "error", err)
 			return
 		}
 
@@ -83,7 +85,7 @@ spice upgrade
 
 		err = util.MakeFileExecutable(tempFilePath)
 		if err != nil {
-			cmd.PrintErrln("Error upgrading the spice binary:", err)
+			slog.Error("upgrading the spice binary", "error", err)
 			return
 		}
 
@@ -95,18 +97,18 @@ spice upgrade
 			runningCliTempLocation := filepath.Join(spiceBinDir, constants.SpiceCliFilename+".bak")
 			err = os.Rename(releaseFilePath, runningCliTempLocation)
 			if err != nil {
-				cmd.PrintErrln("Error upgrading the spice binary:", err)
+				slog.Error("upgrading the spice binary", "error", err)
 				return
 			}
 		}
 
 		err = os.Rename(tempFilePath, releaseFilePath)
 		if err != nil {
-			cmd.PrintErrln("Error upgrading the spice binary:", err)
+			slog.Error("upgrading the spice binary", "error", err)
 			return
 		}
 
-		cmd.Printf("Spice.ai CLI upgraded to %s successfully.\n", release.TagName)
+		slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.\n", release.TagName))
 	},
 }
 
