@@ -22,12 +22,12 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    logical_expr::Expr,
+    logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
 };
 use std::{any::Any, sync::Arc};
 
-use super::{client::GraphQLClient, ResultTransformSnafu};
+use super::{client::GraphQLClient, GraphQLOptimizer, ResultTransformSnafu};
 use super::{client::GraphQLQuery, Result};
 
 pub type TransformFn =
@@ -36,6 +36,7 @@ pub type TransformFn =
 pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
     transform_fn: Option<TransformFn>,
+    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
 }
 
 impl GraphQLTableProviderBuilder {
@@ -44,12 +45,19 @@ impl GraphQLTableProviderBuilder {
         Self {
             client,
             transform_fn: None,
+            optimizer: None,
         }
     }
 
     #[must_use]
     pub fn with_schema_transform(mut self, transform_fn: TransformFn) -> Self {
         self.transform_fn = Some(transform_fn);
+        self
+    }
+
+    #[must_use]
+    pub fn with_optimizer(mut self, optimizer: Arc<dyn GraphQLOptimizer>) -> Self {
+        self.optimizer = Some(optimizer);
         self
     }
 
@@ -75,6 +83,7 @@ impl GraphQLTableProviderBuilder {
             gql_schema: Arc::clone(&result.schema),
             table_schema,
             transform_fn: self.transform_fn,
+            optimizer: self.optimizer,
         })
     }
 }
@@ -85,6 +94,7 @@ pub struct GraphQLTableProvider {
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
     transform_fn: Option<TransformFn>,
+    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
 }
 
 #[async_trait]
@@ -101,6 +111,23 @@ impl TableProvider for GraphQLTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, datafusion::error::DataFusionError> {
+        if let Some(optimizer) = &self.optimizer {
+            filters
+                .iter()
+                .map(|f| optimizer.filter_pushdown(f).map(|r| r.filter_pushdown))
+                .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()
+        } else {
+            Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ])
+        }
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -110,6 +137,15 @@ impl TableProvider for GraphQLTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let mut query = GraphQLQuery::try_from(self.base_query.as_str())
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+
+        if let Some(optimizer) = &self.optimizer {
+            let parameters = filters
+                .iter()
+                .map(|f| optimizer.filter_pushdown(f))
+                .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
+
+            query.ast = optimizer.parameter_injection(&parameters, &query.ast)?;
+        }
 
         let mut res = self
             .client

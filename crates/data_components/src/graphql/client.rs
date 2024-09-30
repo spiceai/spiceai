@@ -606,7 +606,7 @@ pub struct GraphQLClient {
 
 #[derive(Clone)]
 pub struct GraphQLQuery<'a> {
-    ast: Document<'a, String>,
+    pub(crate) ast: Document<'a, String>,
     pub(crate) json_pointer: Option<Arc<str>>,
     pagination_parameters: Option<PaginationParameters>,
 }
