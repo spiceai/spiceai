@@ -276,6 +276,7 @@ async fn run_query_and_record_result(
     connector: &str,
     query_name: &str,
     query: &str,
+    verify_query_result: bool,
 ) -> Result<(), String> {
     // Additional round of query run before recording results.
     // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
@@ -329,8 +330,24 @@ async fn run_query_and_record_result(
                             .map_err(|e| e.to_string())?;
 
                     tracing::info!(
-                    "Query `{connector}` `{query_name}` iteration {idx} returned {num_rows} rows:\n{records_pretty}",
+                    "Query `{connector}` `{query_name}` returned {num_rows} rows:\n{records_pretty}",
                 );
+                    if verify_query_result {
+                        let result = panic::catch_unwind(|| {
+                            insta::assert_snapshot!(
+                                format!("{connector}_{query_name}"),
+                                records_pretty
+                            );
+                        });
+                        if result.is_err() {
+                            let error_str = format!(
+                                "Query `{connector}` `{query_name}` snapshot assertion failed",
+                            );
+                            tracing::error!(error_str);
+                            query_err = Some(error_str);
+                            break;
+                        }
+                    }
                 }
             }
             Err(e) => {
