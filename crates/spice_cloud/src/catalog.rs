@@ -120,7 +120,7 @@ impl SpiceAICatalogProvider {
                     }
                 }
 
-                let Ok(dataset) = Dataset::try_new(format!("spice.ai:{}", &ds.name), &dataset_name)
+                let Ok(dataset) = Dataset::try_new(format!("spiceai:{}", &ds.name), &dataset_name)
                 else {
                     return acc;
                 };

@@ -188,7 +188,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to get {dataconnector} data connector for dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
+        "Unable to load {dataconnector} dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
     ))]
     InvalidTableName {
         dataconnector: String,
@@ -305,7 +305,7 @@ pub async fn register_all() {
     register_connector_factory("github", github::GithubFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
-    register_connector_factory("spice.ai", spiceai::SpiceAIFactory::new_arc()).await;
+    register_connector_factory("spiceai", spiceai::SpiceAIFactory::new_arc()).await;
     #[cfg(feature = "mssql")]
     register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
     #[cfg(feature = "mysql")]
