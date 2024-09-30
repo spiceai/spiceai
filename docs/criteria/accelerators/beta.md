@@ -26,7 +26,7 @@ A major bug is classified as a bug that:
 - Renders the accelerator completely inoperable (i.e. all queries on the accelerator fail, loading fails, etc), or;
 - Causes data inconsistency errors, or;
 - A bug that occurs in more than one accelerator, or;
-- At the discretion of the DRI, is a bug that is likely to be experienced in common use cases.
+- A bug that is high impact or likely to be experienced in common use cases, and there is no viable workaround.
 
 #### Minor Bug
 
