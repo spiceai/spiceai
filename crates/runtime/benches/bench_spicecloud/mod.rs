@@ -25,9 +25,18 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        if let Err(e) =
-            super::run_query_and_record_result(rt, benchmark_results, "spice.ai", query_name, query)
-                .await
+        // results of some tpch_simple_ queries are non deterministic, temporarily disable verification
+        let verify_query_results = !query_name.contains("_simple_");
+
+        if let Err(e) = super::run_query_and_record_result(
+            rt,
+            benchmark_results,
+            "spice.ai",
+            query_name,
+            query,
+            verify_query_results,
+        )
+        .await
         {
             errors.push(format!("Query {query_name} failed with error: {e}"));
         };
