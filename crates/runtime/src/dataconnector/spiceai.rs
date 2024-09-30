@@ -153,7 +153,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory = FlightFactory::new(
-                "spice.ai",
+                "spiceai",
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
             );
@@ -194,7 +194,7 @@ impl DataConnector for SpiceAI {
                     .await
                     .boxed()
                     .context(UnableToGetReadProviderSnafu {
-                        dataconnector: "spice.ai",
+                        dataconnector: "spiceai",
                     })?,
                 ));
             }
@@ -216,14 +216,14 @@ impl DataConnector for SpiceAI {
                 {
                     tracing::debug!("{e}");
                     return Err(DataConnectorError::UnableToGetSchema {
-                        dataconnector: "spice.ai".to_string(),
+                        dataconnector: "spiceai".to_string(),
                         dataset_name: dataset.name.to_string(),
                         table_name: table.clone(),
                     });
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "spice.ai".to_string(),
+                    dataconnector: "spiceai".to_string(),
                     source: e,
                 });
             }
@@ -241,7 +241,7 @@ impl DataConnector for SpiceAI {
         )
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
-            dataconnector: "spice.ai",
+            dataconnector: "spiceai",
         });
 
         Some(read_write_result)
@@ -277,7 +277,7 @@ impl DataConnector for SpiceAI {
         if catalog.catalog_id.is_some() {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "spice.ai".into(),
+                    dataconnector: "spiceai".into(),
                     message: "Catalog ID is not supported for SpiceAI data connector".into(),
                 },
             ));

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
@@ -22,12 +22,46 @@ use std::sync::Arc;
 pub struct IssuesTableArgs {
     pub owner: String,
     pub repo: String,
+    pub query_mode: GitHubQueryMode,
 }
 
 impl GitHubTableArgs for IssuesTableArgs {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
-        let query = format!(
-            r#"{{
+        let query = match self.query_mode {
+            GitHubQueryMode::Search => format!(
+                r#"{{
+                search(query:"repo:{owner}/{name} type:issue", first:100, type:ISSUE) {{
+                    pageInfo {{
+                        hasNextPage
+                        endCursor
+                    }}
+                    nodes {{
+                        ... on Issue {{
+                            id
+                            number
+                            title
+                            url
+                            author: author {{ author: login }}
+                            body
+                            created_at: createdAt
+                            updated_at: updatedAt
+                            closed_at: closedAt
+                            state
+                            milestone_id: milestone {{ milestone_id: id}}
+                            milestone_title: milestone {{ milestone_title: title }}
+                            labels(first: 100) {{ labels: nodes {{ name }} }}
+                            milestone_title: milestone {{ milestone_title: title }}
+                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                        }}
+                    }}
+                }}
+            }}"#,
+                owner = self.owner,
+                name = self.repo
+            ),
+            GitHubQueryMode::Auto => format!(
+                r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
                     issues(first: 100) {{
                         pageInfo {{
@@ -55,9 +89,10 @@ impl GitHubTableArgs for IssuesTableArgs {
                     }}
                 }}
             }}"#,
-            owner = self.owner,
-            name = self.repo
-        );
+                owner = self.owner,
+                name = self.repo
+            ),
+        };
 
         GitHubTableGraphQLParams::new(query.into(), None, 2, Some(gql_schema()))
     }

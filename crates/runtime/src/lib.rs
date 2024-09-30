@@ -830,7 +830,11 @@ impl Runtime {
                     self.status
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    warn_spaced!(
+                        spaced_tracer,
+                        "Error initializing dataset {}. {err}",
+                        ds_name.table()
+                    );
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }
