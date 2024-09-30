@@ -22,7 +22,7 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    logical_expr::{Expr, TableProviderFilterPushDown},
+    logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
 use std::{any::Any, sync::Arc};
