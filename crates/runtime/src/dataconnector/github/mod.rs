@@ -230,7 +230,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
-    ParameterSpec::connector("search_mode")
+    ParameterSpec::connector("query_mode")
         .description(
             "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
         )
@@ -260,12 +260,12 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
-pub(crate) enum GitHubSearchMode {
+pub(crate) enum GitHubQueryMode {
     Auto,
     Search,
 }
 
-impl std::str::FromStr for GitHubSearchMode {
+impl std::str::FromStr for GitHubQueryMode {
     type Err = DataConnectorError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -274,7 +274,7 @@ impl std::str::FromStr for GitHubSearchMode {
             "search" => Ok(Self::Search),
             s => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: format!("Invalid value for 'github_search_mode' parameter: {s}").into(),
+                source: format!("Invalid value for 'github_query_mode' parameter: {s}").into(),
             }),
         }
     }
@@ -293,12 +293,12 @@ impl DataConnector for Github {
         let path = dataset.path().clone();
         let mut parts = path.split('/');
 
-        let search_mode = dataset
+        let query_mode = dataset
             .params
-            .get("github_search_mode")
+            .get("github_query_mode")
             .map_or("auto", |v| v);
 
-        let search_mode = GitHubSearchMode::from_str(search_mode)?;
+        let query_mode = GitHubQueryMode::from_str(query_mode)?;
 
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
@@ -320,7 +320,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
-                    search_mode,
+                    query_mode,
                 });
                 self.create_gql_table_provider(table_args).await
             }
