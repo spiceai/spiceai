@@ -188,7 +188,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to get {dataconnector} data connector for dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
+        "Unable to load {dataconnector} dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
     ))]
     InvalidTableName {
         dataconnector: String,
