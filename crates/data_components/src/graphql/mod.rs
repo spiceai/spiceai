@@ -74,15 +74,6 @@ Please verify the syntax of your GraphQL query."#
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub type FilterPushdownFn =
-    fn(&Expr) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
-
-pub type ParameterInjectionFn =
-    fn(
-        &[FilterPushdownResult],
-        &Document<'static, String>,
-    ) -> Result<Document<'static, String>, datafusion::error::DataFusionError>;
-
 #[derive(Debug, Clone)]
 pub struct FilterPushdownResult {
     pub filter_pushdown: TableProviderFilterPushDown,
@@ -90,19 +81,14 @@ pub struct FilterPushdownResult {
     pub context: Option<String>,
 }
 
-pub struct GraphQLOptimizer {
-    filter_pushdown_fn: FilterPushdownFn,
-    parameter_injection_fn: ParameterInjectionFn,
-}
-
-impl GraphQLOptimizer {
-    pub fn new(
-        filter_pushdown_fn: FilterPushdownFn,
-        parameter_injection_fn: ParameterInjectionFn,
-    ) -> Self {
-        Self {
-            filter_pushdown_fn,
-            parameter_injection_fn,
-        }
-    }
+pub trait GraphQLOptimizer: Send + Sync {
+    fn filter_pushdown(
+        &self,
+        expr: &Expr,
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
+    fn parameter_injection<'a>(
+        &self,
+        filters: &[FilterPushdownResult],
+        document: &Document<'a, String>,
+    ) -> Result<Document<'a, String>, datafusion::error::DataFusionError>;
 }

@@ -36,7 +36,7 @@ pub type TransformFn =
 pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
     transform_fn: Option<TransformFn>,
-    optimizer: Option<GraphQLOptimizer>,
+    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
 }
 
 impl GraphQLTableProviderBuilder {
@@ -56,7 +56,7 @@ impl GraphQLTableProviderBuilder {
     }
 
     #[must_use]
-    pub fn with_optimizer(mut self, optimizer: GraphQLOptimizer) -> Self {
+    pub fn with_optimizer(mut self, optimizer: Arc<dyn GraphQLOptimizer>) -> Self {
         self.optimizer = Some(optimizer);
         self
     }
@@ -94,7 +94,7 @@ pub struct GraphQLTableProvider {
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
     transform_fn: Option<TransformFn>,
-    optimizer: Option<GraphQLOptimizer>,
+    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
 }
 
 #[async_trait]
@@ -118,7 +118,7 @@ impl TableProvider for GraphQLTableProvider {
         if let Some(optimizer) = &self.optimizer {
             filters
                 .iter()
-                .map(|f| (optimizer.filter_pushdown_fn)(f).map(|r| r.filter_pushdown))
+                .map(|f| optimizer.filter_pushdown(f).map(|r| r.filter_pushdown))
                 .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()
         } else {
             Ok(vec![
@@ -135,17 +135,16 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let base_query: &'static str = self.base_query.clone().leak(); // surely we don't need to leak here
-        let mut query = GraphQLQuery::try_from(base_query)
+        let mut query = GraphQLQuery::try_from(self.base_query.as_str())
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
         if let Some(optimizer) = &self.optimizer {
             let parameters = filters
                 .iter()
-                .map(optimizer.filter_pushdown_fn)
+                .map(|f| optimizer.filter_pushdown(f))
                 .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
 
-            query.ast = (optimizer.parameter_injection_fn)(&parameters, &query.ast)?;
+            query.ast = optimizer.parameter_injection(&parameters, &query.ast)?;
         }
 
         let mut res = self
