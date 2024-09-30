@@ -451,7 +451,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     }
 }
 
-pub(crate) fn parameter_injection(
+pub(crate) fn inject_parameters(
     filters: &[FilterPushdownResult],
     query: &mut GraphQLQuery<'_>,
 ) -> Result<(), datafusion::error::DataFusionError> {

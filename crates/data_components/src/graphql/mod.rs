@@ -86,7 +86,7 @@ pub trait GraphQLOptimizer: Send + Sync {
         &self,
         expr: &Expr,
     ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
-    fn parameter_injection(
+    fn inject_parameters(
         &self,
         filters: &[FilterPushdownResult],
         query: &mut GraphQLQuery<'_>,

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataconnector::github::parameter_injection;
-
-use super::{filter_pushdown, GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{
+    filter_pushdown, inject_parameters, GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::graphql::{
     client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer, Result,
@@ -47,7 +47,7 @@ impl GraphQLOptimizer for PullRequestTableArgs {
         Ok(filter_pushdown(expr))
     }
 
-    fn parameter_injection(
+    fn inject_parameters(
         &self,
         filters: &[FilterPushdownResult],
         query: &mut GraphQLQuery<'_>,
@@ -56,7 +56,7 @@ impl GraphQLOptimizer for PullRequestTableArgs {
             return Ok(());
         }
 
-        parameter_injection(filters, query)
+        inject_parameters(filters, query)
     }
 }
 

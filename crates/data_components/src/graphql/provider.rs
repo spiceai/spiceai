@@ -144,7 +144,7 @@ impl TableProvider for GraphQLTableProvider {
                 .map(|f| optimizer.filter_pushdown(f))
                 .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
 
-            optimizer.parameter_injection(&parameters, &mut query)?;
+            optimizer.inject_parameters(&parameters, &mut query)?;
         }
 
         let mut res = self
