@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use arrow::error::ArrowError;
+use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use graphql_parser::query::Document;
 use snafu::Snafu;
 
 pub mod client;
@@ -71,3 +73,36 @@ Please verify the syntax of your GraphQL query."#
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub type FilterPushdownFn =
+    fn(&Expr) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
+
+pub type ParameterInjectionFn =
+    fn(
+        &[FilterPushdownResult],
+        &Document<'static, String>,
+    ) -> Result<Document<'static, String>, datafusion::error::DataFusionError>;
+
+#[derive(Debug, Clone)]
+pub struct FilterPushdownResult {
+    pub filter_pushdown: TableProviderFilterPushDown,
+    pub expr: Expr,
+    pub context: Option<String>,
+}
+
+pub struct GraphQLOptimizer {
+    filter_pushdown_fn: FilterPushdownFn,
+    parameter_injection_fn: ParameterInjectionFn,
+}
+
+impl GraphQLOptimizer {
+    pub fn new(
+        filter_pushdown_fn: FilterPushdownFn,
+        parameter_injection_fn: ParameterInjectionFn,
+    ) -> Self {
+        Self {
+            filter_pushdown_fn,
+            parameter_injection_fn,
+        }
+    }
+}
