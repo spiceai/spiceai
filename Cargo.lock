@@ -3215,7 +3215,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=ab340d624ccb0f24ea898b4fef1bf8cc7ffd25f7#ab340d624ccb0f24ea898b4fef1bf8cc7ffd25f7"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b9cfc4dfe7d328188ccc95312bc9233ef7f80e11#b9cfc4dfe7d328188ccc95312bc9233ef7f80e11"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3232,6 +3232,7 @@ dependencies = [
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
+ "fundu",
  "futures",
  "geo-types",
  "itertools 0.13.0",
