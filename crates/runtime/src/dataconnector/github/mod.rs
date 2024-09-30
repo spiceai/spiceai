@@ -400,7 +400,7 @@ pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
 // TODO: add support for LIKE and IN filters, to support columns like assignees, labels, etc
 // TODO: add support for date comparisons to support columns like updated_at, created_at, closed_at, etc
 const GITHUB_SUPPORTED_FILTER_PUSHDOWN_COLUMNS: &[&str] =
-    &["author", "title", "state", "id", "number"];
+    &["login", "title", "state", "id", "number"];
 
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     if let Expr::BinaryExpr(binary_expr) = expr {
@@ -424,18 +424,20 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
         }
 
         let value = if let ScalarValue::Utf8(Some(v)) = &value {
-            if column == "state".into() {
-                // state enums output their value as uppercase, but search with lowercase
-                // e.g. OPEN -> open
-                ScalarValue::Utf8(Some(v.to_lowercase()))
-            } else {
-                value
+            match column.name.as_str() {
+                "state" => ScalarValue::Utf8(Some(v.to_lowercase())),
+                _ => value.clone(),
             }
         } else {
             value
         };
 
-        let parameter = format!("{column}:{value}", column = column.name);
+        let column_name = match column.name.as_str() {
+            "login" => "author",
+            _ => column.name.as_str(),
+        };
+
+        let parameter = format!("{column_name}:{value}");
 
         return FilterPushdownResult {
             filter_pushdown: TableProviderFilterPushDown::Inexact,
