@@ -336,8 +336,7 @@ impl PaginationParameters {
     ///
     /// A user must explicitly provider the JSON pointer for the latter example (e.g. when calling [`GraphQLClient::new`]).
     ///
-    #[must_use]
-    pub fn parse(ast: &Document<'_, String>) -> (Option<Self>, Option<String>) {
+    fn parse(ast: &Document<'_, String>) -> (Option<Self>, Option<String>) {
         // Start traversing the query's operation definitions
         for def in ast.definitions.clone() {
             let selections = match def {
@@ -607,9 +606,9 @@ pub struct GraphQLClient {
 
 #[derive(Clone)]
 pub struct GraphQLQuery<'a> {
-    pub ast: Document<'a, String>,
-    pub json_pointer: Option<Arc<str>>,
-    pub pagination_parameters: Option<PaginationParameters>,
+    pub(crate) ast: Document<'a, String>,
+    pub(crate) json_pointer: Option<Arc<str>>,
+    pagination_parameters: Option<PaginationParameters>,
 }
 
 impl<'a> TryFrom<&'a str> for GraphQLQuery<'a> {
@@ -764,7 +763,6 @@ impl GraphQLClient {
         }
 
         let record_count = res.len();
-
         let limit_reached = query.limit_reached(limit, record_count);
 
         Ok(GraphQLQueryResult {
