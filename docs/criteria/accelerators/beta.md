@@ -58,18 +58,18 @@ A minor bug is any bug that cannot be classified as a major bug.
 
 ### Test Coverage
 
+Beta quality accelerators should be able to run test packages derived from the following:
+
+- [TPC-H](https://www.tpc.org/tpch/)
+- [TPC-DS](https://www.tpc.org/tpcds/)
+- [ClickBench](https://github.com/ClickHouse/ClickBench)
+
 Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
 
-- Clickhouse: Primary key constraint & index: <https://github.com/ClickHouse/ClickBench/#indexing>
-- TPCH: Primary/foreign key constraints & index
-- TPCDS: Primary/foreign key constraints & index
+When referring to accelerator access modes, "all supported modes" identifies every possible way to use that accelerator. For example, for DuckDB this would be file and memory modes. For PostgreSQL, this would only be the direct database access mode.
 
-- [ ] End-to-end test to cover accelerating TPCH-SF1 data from S3 and benchmarking TPCH queries (official and simple).
-  - [ ] File mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-  - [ ] In-Memory mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-- [ ] End-to-end test to cover accelerating TPCDS-SF1 data from S3 and benchmarking TPCDS queries (official and simple).
-  - [ ] File mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-  - [ ] In-Memory mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
+#### General
+
 - [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with arrow types:
   - [ ] Null
   - [ ] All Int types
@@ -87,23 +87,42 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] Struct
   - [ ] Decimal128/Decimal256
 - [ ] Integration tests to cover "On Conflict" behaviors.
-- [ ] A reproducible test script that can load a variety of datasets into accelerators in both file/embedded memory mode.
-  - Loads and runs these benchmarks:
-    - [ ] TPCH-SF10 (embedded memory/file)
-    - [ ] TPCH-SF100 (file)
-    - [ ] TPCDS-SF10 (embedded memory/file)
-    - [ ] TPCDS-SF100 (file)
-    - [ ] ClickBench (memory/file)
+
+#### TPCH
+
+- [ ] End-to-end test to cover accelerating TPCH-SF1 data from S3 and benchmarking TPCH queries (official and simple).
+  - [ ] All supported modes should run all queries with no [major bugs](#bug-levels).
+- [ ] A test script exists that can load TPCH-SF10 and TPCH-SF100 data into this accelerator in all supported modes.
+- [ ] The accelerator can load TPCH-SF10 in all supported modes, and can run all queries with no [major bugs](#bug-levels).
+- [ ] The accelerator can load TPCH-SF100 in either file or direct database mode, and can run all queries with no [major bugs](#bug-levels).
+
+#### TPCDS
+
+- [ ] End-to-end test to cover accelerating TPCDS-SF1 data from S3 and benchmarking TPCDS queries (official and simple).
+  - [ ] All supported modes should run all queries with no [major bugs](#bug-levels).
+- [ ] A test script exists that can load TPCDS-SF10 and TPCDS-SF100 data into this accelerator in all supported modes.
+- [ ] The accelerator can load TPCDS-SF10 in all supported modes, and can run all queries with no [major bugs](#bug-levels).
+- [ ] The accelerator can load TPCDS-SF100 in either file or direct database mode, and can run all queries with no [major bugs](#bug-levels).
+
+#### ClickBench
+
+- [ ] A test script exists that can load ClickBench data into this accelerator in either file or direct database mode.
+- [ ] The accelerator can load ClickBench in either file or direct database mode, and all queries are attempted.
+  - [ ] All query failures should be logged as issues. No bug fixes are required for ClickBench
+
+#### Data correctness
+
+- [ ] TPCH-SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPCH queries and TPCH simple queries.
+- [ ] TPCH-SF100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPCH queries and TPCH simple queries.
+
+- [ ] TPCDS-SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPCDS queries and TPCDS simple queries.
+- [ ] TPCDS-F100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPCDS queries and TPCDS simple queries.
 
 ### Docs
 
-- [ ] Doc/Specification include all required information for a user to set up the accelerator.
-- [ ] Include all known issues/limitations.
-- [ ] Include any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
-- [ ] Easy to follow quickstart.
-- [ ] All remaining [minor](#bug-levels) TPCDS, TPCH and ClickBench bugs are raised as issues.
-
-### Data correctness
-
-- [ ] TPCH SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all 21 TPCH queries and TPC simple queries.
-- [ ] TPCH SF100 loaded into file, returned results are identical across source/federated/accelerated queries for all 21 TPCH queries and TPC simple queries.
+- [ ] Documentation includes all information and steps for a user to set up the accelerator.
+- [ ] Documentation includes all known issues/limitations for the accelerator.
+- [ ] Documentation includes any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [ ] The accelerator has an easy to follow quickstart.
+- [ ] All [minor](#bug-levels) TPCDS and TPCH bugs are raised as issues.
+- [ ] All ClickBench bugs are raised as issues.
