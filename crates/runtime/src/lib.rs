@@ -1050,7 +1050,7 @@ impl Runtime {
                 // Fail when there's no successfully initiated dataset
                 if ds.is_file_accelerated() {
                     let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
-                    if datasets.len() != 1 {
+                    if datasets.is_empty() {
                         return;
                     }
                 }
