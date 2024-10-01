@@ -39,13 +39,15 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
+        let verify_query_results = bench_name.eq("s3") && !query_name.contains("_simple_");
+
         if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
             bench_name.as_str(),
             query_name,
             query,
-            false,
+            verify_query_results,
         )
         .await
         {
