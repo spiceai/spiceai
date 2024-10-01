@@ -110,10 +110,10 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 
 #### Data correctness
 
-- [ ] TPC-H SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPC-H queries and TPC-H simple queries.
-- [ ] TPC-H SF100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPC-H queries and TPC-H simple queries.
-- [ ] TPC-DS SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPC-DS queries and TPC-DS simple queries.
-- [ ] TPC-DS-F100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPC-DS queries and TPC-DS simple queries.
+- [ ] TPC-H SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [ ] TPC-H SF100 loaded into file or direct database mode, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [ ] TPC-DS SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-DS queries and TPC-DS simple queries.
+- [ ] TPC-DS SF100 loaded into file or direct database mode, returned results are identical across source and accelerated queries for all TPC-DS queries and TPC-DS simple queries.
 
 ### Documentation
 
