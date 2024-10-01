@@ -28,7 +28,7 @@ use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, Vali
 mod mysql;
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("spiceai:{path}"), name.to_string())
+    Dataset::new(format!("spice.ai:{path}"), name.to_string())
 }
 
 #[tokio::test]
