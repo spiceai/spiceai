@@ -398,9 +398,6 @@ impl SpiceObjectStoreRegistry {
             return Self::prepare_s3_object_store(url);
         }
 
-        /*if url.as_str().starts_with("azure+") {
-            return Self::prepare_azure_object_store(url);
-        }*/
         if dataconnector::azure::is_azure_url(url.as_str()) {
             return Self::prepare_azure_object_store(url);
         }
