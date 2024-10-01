@@ -9,7 +9,7 @@ description: "Query: SELECT * FROM (SELECT o_orderkey FROM orders LIMIT 10) AS c
 |               |   Projection: orders.o_orderkey AS key                                         |
 |               |     Limit: skip=0, fetch=10                                                    |
 |               |       BytesProcessedNode                                                       |
-|               |         TableScan: orders projection=[o_orderkey]                              |
+|               |         TableScan: orders projection=[o_orderkey], fetch=10                    |
 | physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                                     |
 |               |   GlobalLimitExec: skip=0, fetch=10                                            |
 |               |     CoalescePartitionsExec                                                     |
