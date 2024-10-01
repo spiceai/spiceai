@@ -27,16 +27,35 @@ jobs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set base and head refs
+        id: set_refs
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "base_ref=${{ github.base_ref }}" >> $GITHUB_OUTPUT
+            echo "head_ref=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "base_ref=${{ github.event.inputs.base_ref }}" >> $GITHUB_OUTPUT
+            echo "head_ref=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ steps.set_refs.outputs.base_ref }}
 
       - name: Check for relevant changes
         id: check_changes
         run: |
-          if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -vE "${{ env.IGNORED_PATHS }}"; then
+          BASE_SHA=$(git rev-parse origin/${{ steps.set_refs.outputs.base_ref }})
+          HEAD_SHA=${{ steps.set_refs.outputs.head_ref }}
+          echo "Comparing $BASE_SHA...$HEAD_SHA"
+          if git diff --name-only $BASE_SHA $HEAD_SHA | grep -vE "${{ env.IGNORED_PATHS }}"; then
             echo "Relevant changes detected."
-            echo "::set-output name=relevant_changes::true"
+            echo "relevant_changes=true" >> $GITHUB_OUTPUT
           else
             echo "No relevant changes detected."
-            echo "::set-output name=relevant_changes::false"
+            echo "relevant_changes=false" >> $GITHUB_OUTPUT
           fi
 
   lint:
