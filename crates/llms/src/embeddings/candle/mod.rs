@@ -22,7 +22,7 @@ use super::{
 use std::{
     collections::HashMap,
     fs,
-    path::{self, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -73,10 +73,6 @@ impl CandleEmbedding {
         .collect();
 
         let model_root = link_files_into_tmp_dir(files)?;
-        tracing::trace!(
-            "Embedding model has files linked at location={:?}",
-            model_root
-        );
         Self::try_new(&model_root, F32_DTYPE)
     }
 
@@ -87,14 +83,8 @@ impl CandleEmbedding {
 
     /// Attempt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
     pub fn try_new(model_root: &Path, dtype: &str) -> Result<Self> {
-        tracing::trace!(
-            "Loading tokenizer from {:?}",
-            model_root.join("tokenizer.json")
-        );
         let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
-        tracing::trace!("Tokenizer loaded.");
-
         Ok(Self {
             backend: Arc::new(Mutex::new(
                 CandleBackend::new(
@@ -111,22 +101,13 @@ impl CandleEmbedding {
     }
 
     fn model_config(model_root: &Path) -> Result<ModelConfig> {
-        tracing::trace!(
-            "Loading model config from {:?}",
-            model_root.join("config.json")
-        );
         let config_str = fs::read_to_string(model_root.join("config.json"))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-        tracing::trace!("Model config loaded.");
-
         let config: ModelConfig = serde_json::from_str(&config_str)
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
-
-        tracing::trace!("Model config parsed: {:?}", config);
-
         Ok(config)
     }
 }
@@ -246,16 +227,7 @@ fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
     for (name, file) in files {
-        let Ok(abs_path) = path::absolute(file) else {
-            return Err(super::Error::FailedToCreateEmbedding {
-                source: format!(
-                    "Failed to get absolute path of provided file: {}",
-                    file.as_os_str().to_string_lossy()
-                )
-                .into(),
-            });
-        };
-        symlink(abs_path, temp_dir.path().join(name))
+        symlink(file, temp_dir.path().join(name))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
     }
