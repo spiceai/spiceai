@@ -215,11 +215,6 @@ impl SpiceObjectStoreRegistry {
         url.set_fragment(None);
         let mut builder = MicrosoftAzureBuilder::from_env();
 
-        if url.scheme().starts_with("azure+") {
-            url = Url::parse(url.as_str().strip_prefix("azure+").unwrap())
-                .map_err(|e| DataFusionError::Configuration(format!("{e}")))?;
-        }
-
         if let Some(sas) = params.get("sas_string") {
             url.set_query(Some(sas));
         }

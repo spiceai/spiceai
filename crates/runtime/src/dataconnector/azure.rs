@@ -216,17 +216,12 @@ impl ListingTableConnector for Azure {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let prefixed_url = if dataset.from.starts_with("azure:http") {
-            dataset.from.replace("azure:", "azure+")
-        } else {
-            dataset.from.clone()
-        };
         let mut azure_url =
-            Url::parse(&prefixed_url)
+            Url::parse(&dataset.from)
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL", prefixed_url),
+                    message: format!("{} is not a valid URL", &dataset.from),
                 })?;
 
         let params = super::build_fragments(
