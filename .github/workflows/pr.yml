@@ -64,18 +64,19 @@ jobs:
     env:
       GOVER: 1.22.0
     needs: check_changes
-    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GOVER }}
           cache: false
 
       - name: Install golangci-lint
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           if ! command -v golangci-lint &> /dev/null ; then
             curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
@@ -83,17 +84,21 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           os: 'linux'
       
       - name: Install Protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - run: make lint
+        if: needs.check_changes.outputs.relevant_changes == 'true'
 
       - name: Check if Cargo.lock is updated
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           if git diff --exit-code Cargo.lock; then
             echo "Cargo.lock is up to date"
@@ -108,7 +113,6 @@ jobs:
     env:
       GOVER: 1.22.0
     needs: check_changes
-    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@v4
@@ -125,18 +129,19 @@ jobs:
           os: 'linux'
 
       - run: make ci test
+        if: needs.check_changes.outputs.relevant_changes == 'true'
 
   build-docker:
     name: Build Docker Image
     runs-on: rust
     needs: check_changes
-    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Build and push Docker images
         uses: docker/build-push-action@v6
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           context: .
           file: Dockerfile
