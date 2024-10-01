@@ -34,13 +34,10 @@ github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.8.1/LICENSE.txt, 
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.5/LICENSE, BSD-3-Clause
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.19.0/LICENSE, MIT
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
-go.uber.org/multierr, https://github.com/uber-go/multierr/blob/v1.10.0/LICENSE.txt, MIT
-go.uber.org/zap, https://github.com/uber-go/zap/blob/v1.27.0/LICENSE, MIT
 golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.21.0:LICENSE, BSD-3-Clause
 golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.24.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.17.0:LICENSE, BSD-3-Clause
 gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.67.0/LICENSE, Apache-2.0
-gopkg.in/natefinch/lumberjack.v2, https://github.com/natefinch/lumberjack/blob/v2.2.1/LICENSE, MIT
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
@@ -138,7 +135,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.9.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.17, Apache-2.0 OR MIT 
+- clap 4.5.18, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
@@ -428,6 +425,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - text-embeddings-backend-core 1.2.3,  
   <br/>
+
+- text-splitter 0.16.1, MIT 
+  <br/>https://github.com/benbrandt/text-splitter
 
 - tiberius 0.12.3, Apache-2.0 OR MIT 
   <br/>https://github.com/prisma/tiberius
