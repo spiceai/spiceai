@@ -63,10 +63,12 @@ pub enum Error {
         extension: String,
     },
 
-    #[snafu(display("The \"sqlite_file\" acceleration parameter is a directory."))]
+    #[snafu(display("The \"sqlite_file\" acceleration parameter value is a directory."))]
     InvalidFileIsDirectory,
 
-    #[snafu(display("The \"busy_timeout\" acceleration parameter must be a valid duration."))]
+    #[snafu(display(
+        "The \"busy_timeout\" acceleration parameter value must be a valid duration."
+    ))]
     InvalidBusyTimeoutValue,
 
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
