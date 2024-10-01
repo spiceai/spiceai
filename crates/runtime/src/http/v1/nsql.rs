@@ -17,8 +17,7 @@ use async_openai::{
     error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseFormat, ChatCompletionResponseFormatType,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, ResponseFormat, ResponseFormatJsonSchema,
     },
 };
 use axum::{
@@ -32,7 +31,7 @@ use llms::{
     openai::MAX_COMPLETION_TOKENS,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -176,8 +175,21 @@ pub fn create_chat_request(
 
     CreateChatCompletionRequestArgs::default()
         .model(model_id)
-        .response_format(ChatCompletionResponseFormat {
-            r#type: ChatCompletionResponseFormatType::JsonObject,
+        .response_format(ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema{
+                name: "sql_mode".to_string(),
+                description: None,
+                strict: Some(true),
+                schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["sql"]
+                })),
+            }
         })
         .messages(messages)
         .max_tokens(MAX_COMPLETION_TOKENS)
