@@ -131,7 +131,6 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 
 - [ ] TPCH-SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPCH queries and TPCH simple queries.
 - [ ] TPCH-SF100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPCH queries and TPCH simple queries.
-
 - [ ] TPCDS-SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPCDS queries and TPCDS simple queries.
 - [ ] TPCDS-F100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPCDS queries and TPCDS simple queries.
 
