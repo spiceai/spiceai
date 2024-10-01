@@ -104,49 +104,31 @@ mod view;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
-    UnableToStartHttpServer {
-        source: http::Error,
-    },
+    UnableToStartHttpServer { source: http::Error },
 
     #[snafu(display("{source}"))]
-    UnableToJoinTask {
-        source: tokio::task::JoinError,
-    },
+    UnableToJoinTask { source: tokio::task::JoinError },
 
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
-    UnableToStartMetricsServer {
-        source: metrics_server::Error,
-    },
+    UnableToStartMetricsServer { source: metrics_server::Error },
 
     #[snafu(display("Unable to start Flight server: {source}"))]
-    UnableToStartFlightServer {
-        source: flight::Error,
-    },
+    UnableToStartFlightServer { source: flight::Error },
 
     #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
-    UnableToStartOpenTelemetryServer {
-        source: opentelemetry::Error,
-    },
+    UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
 
     #[snafu(display("Unknown data source: {data_source}"))]
-    UnknownDataSource {
-        data_source: String,
-    },
+    UnknownDataSource { data_source: String },
 
     #[snafu(display("Unable to create data backend: {source}"))]
-    UnableToCreateBackend {
-        source: datafusion::Error,
-    },
+    UnableToCreateBackend { source: datafusion::Error },
 
     #[snafu(display("Unable to attach view: {source}"))]
-    UnableToAttachView {
-        source: datafusion::Error,
-    },
+    UnableToAttachView { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
-    UnableToInitializePodsWatcher {
-        source: NotifyError,
-    },
+    UnableToInitializePodsWatcher { source: NotifyError },
 
     #[snafu(display("{source}"))]
     UnableToInitializeDataConnector {
@@ -169,14 +151,10 @@ pub enum Error {
     },
 
     #[snafu(display("Unknown data connector: {data_connector}"))]
-    UnknownDataConnector {
-        data_connector: String,
-    },
+    UnknownDataConnector { data_connector: String },
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
-    UnableToLoadDataConnectorSecrets {
-        data_connector: String,
-    },
+    UnableToLoadDataConnectorSecrets { data_connector: String },
 
     #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
     UnableToGetSecretForDataConnector {
@@ -207,14 +185,10 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to create view: {reason}"))]
-    UnableToCreateView {
-        reason: String,
-    },
+    UnableToCreateView { reason: String },
 
     #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
-    NeedToSpecifySQLView {
-        name: String,
-    },
+    NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
         "A federated table was configured as read_write without setting replication.enabled = true"
@@ -225,19 +199,13 @@ pub enum Error {
     AcceleratedReadWriteTableWithoutReplication,
 
     #[snafu(display("An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."))]
-    AcceleratedTableInvalidChanges {
-        dataset_name: String,
-    },
+    AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
-    ExpectedAccelerationSettings {
-        name: String,
-    },
+    ExpectedAccelerationSettings { name: String },
 
     #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
-    AcceleratorEngineNotAvailable {
-        name: String,
-    },
+    AcceleratorEngineNotAvailable { name: String },
 
     #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
     AcceleratorInitializationFailed {
@@ -251,15 +219,10 @@ pub enum Error {
         name,
         catalog,
     ))]
-    DatasetNameIncludesCatalog {
-        catalog: Arc<str>,
-        name: Arc<str>,
-    },
+    DatasetNameIncludesCatalog { catalog: Arc<str>, name: Arc<str> },
 
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
-    UnableToLoadDatasetConnector {
-        dataset: TableReference,
-    },
+    UnableToLoadDatasetConnector { dataset: TableReference },
 
     #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
     UnableToLoadCatalogConnector {
@@ -268,9 +231,7 @@ pub enum Error {
     },
 
     #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
-    DataConnectorDoesntSupportCatalogs {
-        dataconnector: String,
-    },
+    DataConnectorDoesntSupportCatalogs { dataconnector: String },
 
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
@@ -279,29 +240,19 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
-    UnableToReceiveAcceleratedTableStatus {
-        source: RecvError,
-    },
+    UnableToReceiveAcceleratedTableStatus { source: RecvError },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
-    UnableToStartLocalMetrics {
-        source: spice_metrics::Error,
-    },
+    UnableToStartLocalMetrics { source: spice_metrics::Error },
 
     #[snafu(display("Unable to track task history: {source}"))]
-    UnableToTrackTaskHistory {
-        source: task_history::Error,
-    },
+    UnableToTrackTaskHistory { source: task_history::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
-    UnableToCreateMetricsTable {
-        source: DataFusionError,
-    },
+    UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to register metrics table: {source}"))]
-    UnableToRegisterMetricsTable {
-        source: datafusion::Error,
-    },
+    UnableToRegisterMetricsTable { source: datafusion::Error },
 
     #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
     InvalidSpicepodDataset {
@@ -315,16 +266,10 @@ pub enum Error {
     },
 
     #[snafu(display("Error converting GlobSet to Regex: {source}"))]
-    ErrorConvertingGlobSetToRegex {
-        source: globset::Error,
-    },
+    ErrorConvertingGlobSetToRegex { source: globset::Error },
 
     #[snafu(display("Unable to create directory: {source}"))]
-    UnableToCreateDirectory {
-        source: std::io::Error,
-    },
-
-    UnableToReload,
+    UnableToCreateDirectory { source: std::io::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
