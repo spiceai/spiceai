@@ -40,11 +40,6 @@ pub enum Error {
         "Only one of access_key, bearer token or client credentials must be provided"
     ))]
     InvalidKeyAuthCombination,
-    #[snafu(display("Invalid value for {param}, expected {expected_type}"))]
-    InvalidParamValue {
-        param: String,
-        expected_type: String,
-    },
 }
 
 pub struct Azure {
