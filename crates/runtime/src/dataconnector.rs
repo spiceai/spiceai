@@ -302,7 +302,7 @@ pub async fn register_all() {
     for prefix in azure::PREFIXES.iter() {
         register_connector_factory(prefix, azure::AzureFactory::new_arc(prefix)).await;
     }
-    //register_connector_factory("azure", azure::AzureFactory::new_arc()).await;
+    
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
