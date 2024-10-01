@@ -373,8 +373,8 @@ mod test {
     async fn test_register_dataset_with_schema() {
         let df = create_test_datafusion();
 
-        let dataset =
-            Dataset::try_new("spiceai".to_string(), "foo.dataset_name").expect("to create dataset");
+        let dataset = Dataset::try_new("spice.ai".to_string(), "foo.dataset_name")
+            .expect("to create dataset");
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let table_provider = MemTable::try_new(schema, vec![]).expect("to create table provider");
         df.ctx
