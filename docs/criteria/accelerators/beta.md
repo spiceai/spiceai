@@ -1,5 +1,22 @@
 # Spice.ai OSS Data Accelerators - Beta Release Criteria
 
+## Contents
+
+- [Description](#description)
+- [Beta Quality Accelerators](#beta-quality-accelerators)
+- [Beta Release Criteria](#beta-release-criteria)
+  - [Bug Levels](#bug-levels)
+    - [Major Bug](#major-bug)
+    - [Minor Bug](#minor-bug)
+  - [Feature Complete](#feature-complete)
+  - [Test Coverage](#test-coverage)
+    - [General](#general)
+    - [TPCH](#tpch)
+    - [TPCDS](#tpcds)
+    - [ClickBench](#clickbench)
+    - [Data Correctness](#data-correctness)
+  - [Documentation](#documentation)
+
 ## Description
 
 This doucment defines the set of criteria that is required before a data accelerator is considered to be of Beta quality.
@@ -118,7 +135,7 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 - [ ] TPCDS-SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all TPCDS queries and TPCDS simple queries.
 - [ ] TPCDS-F100 loaded into file, returned results are identical across source/federated/accelerated queries for all TPCDS queries and TPCDS simple queries.
 
-### Docs
+### Documentation
 
 - [ ] Documentation includes all information and steps for a user to set up the accelerator.
 - [ ] Documentation includes all known issues/limitations for the accelerator.
