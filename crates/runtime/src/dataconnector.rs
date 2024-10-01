@@ -212,7 +212,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (github.com/spiceai/spiceai) and reference the code: {code} {source}"
+        "An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (github.com/spiceai/spiceai) and reference the code: {code}"
     ))]
     Internal {
         dataconnector: String,
