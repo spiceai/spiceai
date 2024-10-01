@@ -560,8 +560,13 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             let value = match value {
                 ScalarValue::Utf8(Some(v)) => {
                     if column.name == "state" {
+                        // "state" in GitHub search is odd
+                        // it returns values for CLOSED, MERGED and OPEN
+                        // but you can only search with either closed or open (in lowercase as well)
                         if v.to_lowercase() == "merged" {
-                            "closed".to_string()
+                            "closed".to_string() // so merged gets remapped to closed
+                                                 // and because the filter is Inexact, we expect the Memtable to do the final filter to find only MERGED items
+                                                 // not the best, but its better filtering than nothing
                         } else {
                             v.to_lowercase()
                         }
