@@ -270,6 +270,8 @@ impl PaginationParameters {
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<String>>();
 
+            tracing::debug!("GraphQL found other arguments: {}", args.join(", "));
+
             args.push(pagination_argument.format_arguments(cursor));
 
             let args = args.join(", ");
