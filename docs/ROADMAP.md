@@ -8,7 +8,27 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v1.0-rc (Sep 2024)](https://github.com/spiceai/spiceai/milestone/32)
+## [v0.18.3-beta (Sep 2024)](https://github.com/spiceai/spiceai/milestone/32)
+
+- Bugfixes and performance improvements
+- Databricks DeltaLake data connector (Beta)
+- Spice Cloud Platform data connector (Beta)
+- S3 data connector (Beta)
+- ODBC Data Connector (Beta)
+- PostgreSQL data connector (Beta)
+- MySQL data connector (Beta)
+
+## [v0.19.0-beta (Oct 2024)](https://github.com/spiceai/spiceai/milestone/44)
+
+- Bugfixes and performance improvements
+- Databricks DeltaLake data connector (Beta)
+- Spice Cloud Platform data connector (Beta)
+- S3 data connector (Beta)
+- ODBC Data Connector (Beta)
+- PostgreSQL data connector (Beta)
+- MySQL data connector (Beta)
+
+## [v1.0-rc (Oct 2024)](https://github.com/spiceai/spiceai/milestone/33)
 
 - Bugfixes and performance improvements
 - Databricks DeltaLake data connector (Release Candidate)
@@ -16,15 +36,19 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - S3 data connector (Release Candidate)
 - ODBC Data Connector (Release Candidate)
 - PostgreSQL data connector (Release Candidate)
+- MySQL data connector (Release Candidate)
 
-## [v1.0-stable (Oct 2024)](https://github.com/spiceai/spiceai/milestone/33)
+## v1.0-stable
 
 - Bugfixes and performance improvements
+- CLI
+  - Spicepod publish to [spicerack.org](https://spicerack.org)
 - Databricks DeltaLake data connector (Stable)
 - Spice AI data connector (Stable)
 - S3 data connector (Stable)
 - ODBC Data Connector (Stable)
 - PostgreSQL Data Connector (Stable)
+- MySQL Data Connector (Stable)
 - DuckDB data connector (Beta)
 - FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
@@ -55,7 +79,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `debezium`      | Alpha  |
 | `sharepoint`    | Alpha  |
 
-## v1.1 (Nov 2024)
+## v1.1
 
 - Bugfixes
 
@@ -84,7 +108,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   - MotherDuck
   - BigQuery
   - Kafka
-  - Sharepoint
   - Google Docs
 - Catalog Providers
   - Iceberg Catalogs
@@ -95,5 +118,3 @@ If you have a feature request or suggestion, please [get in touch](https://githu
     - SlateDB data accelerator
     - RocksDB data accelerator
     - DynamoDB data connector
-- CLI
-  - Spicepod publish to [spicerack.org](https://spicerack.org)
