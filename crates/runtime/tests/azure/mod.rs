@@ -14,19 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::init_tracing;
-use bollard::secret::HealthConfig;
-use spicepod::component::{
-    dataset::Dataset,
-    params::Params as DatasetParams,
-};
 use anyhow::anyhow;
 use app::AppBuilder;
+use azure_storage_blobs::prelude::*;
+use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
+use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use std::path::PathBuf;
-use azure_storage::prelude::*;
-use azure_storage_blobs::prelude::*;
 use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
@@ -40,7 +35,7 @@ pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
-                "netstat -tulpn | grep 10000".to_string()
+                "netstat -tulpn | grep 10000".to_string(),
             ]),
             interval: Some(250_000_000), // 250ms
             timeout: Some(100_000_000),  // 100ms
@@ -62,17 +57,21 @@ pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
     container_client.create().await?;
     tracing::trace!("Container created");
     tracing::trace!("Uploading sample file");
-    let sample_file = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data/taxi_sample.csv"))?;
+    let sample_file = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data/taxi_sample.csv"),
+    )?;
     let blob_client = container_client.blob_client("taxi_sample.csv");
 
-    blob_client.put_block_blob(sample_file).content_type("text/csv").await?;
+    blob_client
+        .put_block_blob(sample_file)
+        .content_type("text/csv")
+        .await?;
     tracing::trace!("Sample file uploaded");
     Ok(())
 }
 
 #[tokio::test]
 async fn test_azure_connector() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=trace,debug,info"));
     tracing::info!("Starting Azure connector test");
     let azurite_container = start_azurite_docker_container().await?;
     tracing::info!("Azurite container started");
@@ -91,20 +90,32 @@ async fn run_test() -> Result<(), anyhow::Error> {
     tracing::info!("Uploading sample file to Azure Blob Storage");
     upload_sample_file().await?;
 
-    let mut emulator_dataset = Dataset::new("abfs://devstoreaccount1/testcontainer/taxi_sample.csv", "emulator");
+    let mut emulator_dataset = Dataset::new("azure://testcontainer/taxi_sample.csv", "emulator");
     let emulator_params = DatasetParams::from_string_map(
-            vec![
-                ("use_emulator".to_string(), "true".to_string()),
-            ]
+        vec![("azure_use_emulator".to_string(), "true".to_string())]
             .into_iter()
             .collect(),
-        );
+    );
     emulator_dataset.params = Some(emulator_params);
 
+    let mut abfs_dataset = Dataset::new("abfss://testcontainer/taxi_sample.csv", "abfs_prefix");
+    let abfs_params = DatasetParams::from_string_map(
+        vec![
+            (
+                "azure_account".to_string(),
+                "spiceazuretestblob".to_string(),
+            ),
+            // `skip_signature` is required for Anonymous blob access
+            ("azure_skip_signature".to_string(), "true".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    abfs_dataset.params = Some(abfs_params);
+
     let app = AppBuilder::new("azure_connector_test")
-        .with_dataset(Dataset::new("azure://devstoreaccount1/testcontainer/taxi_sample.csv", "azure_prefix"))
-        .with_dataset(Dataset::new("azure:http://localhost:10000/devstoreaccount1/testcontainer/taxi_sample.csv", "http_prefix"))
         .with_dataset(emulator_dataset)
+        .with_dataset(abfs_dataset)
         .build();
 
     let rt = Runtime::builder().with_app(app).build().await;
@@ -118,8 +129,7 @@ async fn run_test() -> Result<(), anyhow::Error> {
     }
 
     let queries = vec![
-        ("azure_prefix", make_test_query("azure_prefix")),
-        ("http_prefix", make_test_query("http_prefix")),
+        ("abfs_prefix", make_test_query("abfs_prefix")),
         ("emulator", make_test_query("emulator")),
     ];
 

@@ -212,13 +212,12 @@ impl SpiceObjectStoreRegistry {
         let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
-
+        url.set_fragment(None);
         let mut builder = MicrosoftAzureBuilder::from_env();
 
-        let scheme = url.scheme().to_string();
-        if scheme.starts_with("azure+") {
-            url.set_scheme(&scheme.strip_prefix("azure+").unwrap_or(&scheme))
-                .unwrap();
+        if url.scheme().starts_with("azure+") {
+            url = Url::parse(url.as_str().strip_prefix("azure+").unwrap())
+                .map_err(|e| DataFusionError::Configuration(format!("{e}")))?;
         }
 
         if let Some(sas) = params.get("sas_string") {

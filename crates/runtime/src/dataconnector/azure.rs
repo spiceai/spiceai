@@ -53,7 +53,7 @@ pub struct Azure {
 
 #[derive(Default, Clone)]
 pub struct AzureFactory {
-    prefix: &'static str
+    prefix: &'static str,
 }
 
 impl AzureFactory {
@@ -149,15 +149,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
 ];
 
-pub const PREFIXES: [&'static str; 7] = [
-    "azure",
-    "abfs",
-    "abfss",
-    "adl",
-    "adls",
-    "az",
-    "azure:https"
-];
+pub const PREFIXES: [&'static str; 6] = ["azure", "abfs", "abfss", "adl", "adls", "az"];
 
 pub fn is_azure_url(url: &str) -> bool {
     PREFIXES.iter().any(|prefix| url.starts_with(prefix))
@@ -170,7 +162,6 @@ impl DataConnectorFactory for AzureFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(sas_token) = params.get("sas_string").expose().ok() {
             if sas_token.starts_with('?') {
-                tracing::warn!("Removing leading '?' from SAS token");
                 let sas_token = sas_token[1..].to_string();
                 params.insert("sas_string".to_string(), sas_token.into());
             }
@@ -199,6 +190,11 @@ impl DataConnectorFactory for AzureFactory {
         &self.prefix
     }
 
+    // We need a unified parameter prefix for all Azure connectors
+    fn parameter_prefix(&self) -> &'static str {
+        "azure"
+    }
+
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
@@ -220,7 +216,7 @@ impl ListingTableConnector for Azure {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let prefixed_url = if dataset.from.starts_with("azure:https") {
+        let prefixed_url = if dataset.from.starts_with("azure:http") {
             dataset.from.replace("azure:", "azure+")
         } else {
             dataset.from.clone()

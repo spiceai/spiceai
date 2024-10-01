@@ -272,7 +272,7 @@ pub async fn create_new_connector(
     let params = match Parameters::try_new(
         &format!("connector {name}"),
         params.into_iter().collect(),
-        factory.prefix(),
+        factory.parameter_prefix(),
         secrets,
         factory.parameters(),
     )
@@ -359,6 +359,11 @@ pub trait DataConnectorFactory: Send + Sync {
     ///
     /// The prefix will be stripped from the parameter name before being passed to the data connector.
     fn prefix(&self) -> &'static str;
+
+    /// The prefix to use for parameters in the spicepod configuration. In most cases should just match the `prefix`.
+    fn parameter_prefix(&self) -> &'static str {
+        self.prefix()
+    }
 
     /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
     ///
