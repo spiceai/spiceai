@@ -51,6 +51,7 @@ use std::borrow::Borrow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tonic::metadata::MetadataMap;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -118,6 +119,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("api_key").secret(),
     ParameterSpec::connector("token").secret(),
     ParameterSpec::connector("endpoint"),
+    ParameterSpec::connector("app_id").secret(),
 ];
 
 impl DataConnectorFactory for SpiceAIFactory {
@@ -149,7 +151,17 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let credentials = Credentials::new("", api_key);
-            let flight_client = FlightClient::try_new(url, credentials)
+
+            let metadata_map = match params.get("app_id").expose().ok() {
+                Some(app_id) => {
+                    let mut map = MetadataMap::new();
+                    map.insert("x-spiceai-app-id", app_id.parse().unwrap());
+                    Some(map)
+                }
+                None => None,
+            };
+
+            let flight_client = FlightClient::try_new(url, credentials, metadata_map)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory = FlightFactory::new(
