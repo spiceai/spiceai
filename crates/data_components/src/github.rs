@@ -16,11 +16,12 @@ limitations under the License.
 use async_trait::async_trait;
 use futures::future;
 use globset::GlobSet;
+use octocrab::{models::commits::Commit, Octocrab, Page};
 use snafu::{ResultExt, Snafu};
 
 use crate::arrow::write::MemTable;
 use arrow::{
-    array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
+    array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use datafusion::{
@@ -160,6 +161,7 @@ impl TableProvider for GithubFilesTableProvider {
 
 pub struct GithubRestClient {
     client: reqwest::Client,
+    octocrab_client: Option<Octocrab>,
     token: Arc<str>,
 }
 
@@ -172,8 +174,19 @@ impl GithubRestClient {
         let client = reqwest::Client::new();
         GithubRestClient {
             client,
+            octocrab_client: None,
             token: token.into(),
         }
+    }
+
+    #[must_use]
+    pub fn with_octocrab(mut self) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        self.octocrab_client = Some(
+            Octocrab::builder()
+                .personal_token(self.token.to_string())
+                .build()?,
+        );
+        Ok(self)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -352,6 +365,137 @@ impl GithubRestClient {
             Err(err_msg.into())
         }
     }
+
+    async fn search_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        parameters: Option<&str>,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(octocrab) = &self.octocrab_client {
+            let page = octocrab.search_commits(owner, repo, parameters).await?;
+            let mut commits = page.items;
+
+            while let Some(next_page) = octocrab.get_page(&page.next).await? {
+                commits.extend(next_page.items);
+            }
+
+            let batch = commits_to_record_batch(commits)?;
+
+            Ok(vec![batch])
+        } else {
+            Err("Cannot search commits on the REST API - Octocrab client is not initialized".into())
+        }
+    }
+}
+
+#[async_trait]
+trait CommitSearchExt {
+    async fn search_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        parameters: Option<&str>,
+    ) -> Result<Page<Commit>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[async_trait]
+impl CommitSearchExt for Octocrab {
+    async fn search_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        parameters: Option<&str>,
+    ) -> Result<Page<Commit>, Box<dyn std::error::Error + Send + Sync>> {
+        let query = format!(
+            "repo:{owner}/{repo} {parameters}",
+            parameters = parameters.unwrap_or("")
+        );
+
+        self.get(format!("/search/commits?q={query}"), None::<&()>)
+            .await
+            .map_err(std::convert::Into::into)
+    }
+}
+
+fn commits_to_record_batch(commits: Vec<Commit>) -> Result<RecordBatch> {
+    // prepare column builders
+    let mut sha_builder = StringBuilder::new();
+    let mut id_builder = StringBuilder::new();
+    let mut author_name_builder = StringBuilder::new();
+    let mut author_email_builder = StringBuilder::new();
+    let mut committed_date_builder = StringBuilder::new();
+    let mut message_builder = StringBuilder::new();
+    let mut message_body_builder = StringBuilder::new();
+    let mut message_head_line_builder = StringBuilder::new();
+    let mut additions_builder = Int64Builder::new();
+    let mut deletions_builder = Int64Builder::new();
+
+    for commit in commits {
+        sha_builder.append_value(commit.sha);
+        id_builder.append_value(commit.node_id);
+
+        if let Some(author) = commit.author {
+            author_name_builder.append_value(author.login);
+            author_email_builder.append_option(author.email);
+        } else {
+            author_name_builder.append_null();
+            author_email_builder.append_null();
+        }
+
+        if let Some(committer) = commit.commit.committer {
+            committed_date_builder.append_option(committer.date);
+        } else {
+            committed_date_builder.append_null();
+        }
+
+        message_builder.append_value(commit.commit.message);
+        message_body_builder.append_null();
+        message_head_line_builder.append_null();
+
+        if let Some(stats) = commit.stats {
+            additions_builder.append_option(stats.additions);
+            deletions_builder.append_option(stats.deletions);
+        } else {
+            additions_builder.append_null();
+            deletions_builder.append_null();
+        }
+    }
+
+    // build columns
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(sha_builder.finish()),
+        Arc::new(id_builder.finish()),
+        Arc::new(author_name_builder.finish()),
+        Arc::new(author_email_builder.finish()),
+        Arc::new(committed_date_builder.finish()),
+        Arc::new(message_builder.finish()),
+        Arc::new(message_body_builder.finish()),
+        Arc::new(message_head_line_builder.finish()),
+        Arc::new(additions_builder.finish()),
+        Arc::new(deletions_builder.finish()),
+    ];
+
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("sha", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("author_name", DataType::Utf8, true),
+            Field::new("author_email", DataType::Utf8, true),
+            Field::new(
+                "committed_date",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("message", DataType::Utf8, true),
+            Field::new("message_body", DataType::Utf8, true),
+            Field::new("message_head_line", DataType::Utf8, true),
+            Field::new("additions", DataType::Int64, true),
+            Field::new("deletions", DataType::Int64, true),
+        ])),
+        columns,
+    )
+    .context(UnableToConstructRecordBatchSnafu)
 }
 
 fn extract_name_from_path(path: &str) -> Option<&str> {

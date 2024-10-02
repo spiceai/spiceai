@@ -41,6 +41,7 @@ globset.workspace = true
 graph-rs-sdk = {workspace = true, optional=true}
 graphql-parser.workspace = true
 http = {version= "1.1.0", optional=true}
+octocrab = "0.41.0"
 object_store = { workspace = true }
 rdkafka = { version = "0.36.2", optional = true }
 regex = "1.10.4"
