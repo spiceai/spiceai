@@ -1,63 +1,39 @@
-use arrow::array::{
-    Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait};
 use arrow_schema::DataType;
 use arrow_schema::DataType::{FixedSizeList, Float64, LargeList, List};
+use core::any::type_name;
 use datafusion::common::cast::{
-    as_float32_array, as_float64_array, as_generic_list_array, as_int32_array,
-    as_int64_array,
+    as_float32_array, as_float64_array, as_generic_list_array, as_int32_array, as_int64_array,
 };
 use datafusion::common::utils::coerced_fixed_size_list_to_list;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
-     common::{exec_err, DataFusionError, Result as DataFusionResult},
-     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
+    common::{exec_err, DataFusionError, Result as DataFusionResult},
+    logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
-use core::any::type_name;
-    
+
 use std::any::Any;
 use std::sync::Arc;
 
-/// returns the Euclidean distance between two numeric arrays."]
-pub fn cosine_distance(array: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
-    datafusion::logical_expr::Expr::ScalarFunction(
-        datafusion::logical_expr::expr::ScalarFunction::new_udf(
-            cosine_distance_udf(),
-            vec![array],
-        )
-    )
-}
+// /// returns the Euclidean distance between two numeric arrays."]
+// pub fn cosine_distance(array: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
+//     datafusion::logical_expr::Expr::ScalarFunction(
+//         datafusion::logical_expr::expr::ScalarFunction::new_udf(cosine_distance_udf(), vec![array]),
+//     )
+// }
 
 macro_rules! downcast_arg {
     ($ARG:expr, $ARRAY_TYPE:ident) => {{
         $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "could not cast to {}",
-                type_name::<$ARRAY_TYPE>()
-            ))
+            DataFusionError::Internal(format!("could not cast to {}", type_name::<$ARRAY_TYPE>()))
         })?
     }};
 }
 
-/// Singleton instance of [` CosineDistance`], ensures the UDF is only created once
-/// named STATIC_ CosineDistance. For example `STATIC_ArrayToString`
-#[allow(non_upper_case_globals)]
-static STATIC_CosineDistance: std::sync::OnceLock<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> =
-    std::sync::OnceLock::new();
-
-/// ScalarFunction that returns a [`ScalarUDF`](datafusion::logical_expr::ScalarUDF) for  CosineDistance.
-pub fn cosine_distance_udf() -> std::sync::Arc<datafusion::logical_expr::ScalarUDF> {
-    STATIC_CosineDistance
-        .get_or_init(|| {
-            std::sync::Arc::new(datafusion::logical_expr::ScalarUDF::new_from_impl(
-                < CosineDistance>::new(),
-            ))
-        })
-        .clone()
-}
-
 /// array function wrapper that differentiates between scalar (length 1) and array.
-pub(crate) fn make_scalar_function<F>(inner: F) -> impl Fn(&[ColumnarValue]) -> DataFusionResult<ColumnarValue>
+pub(crate) fn make_scalar_function<F>(
+    inner: F,
+) -> impl Fn(&[ColumnarValue]) -> DataFusionResult<ColumnarValue>
 where
     F: Fn(&[ArrayRef]) -> DataFusionResult<ArrayRef>,
 {
@@ -86,11 +62,17 @@ where
 }
 
 #[derive(Debug)]
-pub(super) struct  CosineDistance {
+pub struct CosineDistance {
     signature: Signature,
 }
+impl Default for CosineDistance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-impl  CosineDistance {
+impl CosineDistance {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             signature: Signature::user_defined(Volatility::Immutable),
@@ -98,7 +80,7 @@ impl  CosineDistance {
     }
 }
 
-impl ScalarUDFImpl for  CosineDistance {
+impl ScalarUDFImpl for CosineDistance {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -114,7 +96,9 @@ impl ScalarUDFImpl for  CosineDistance {
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
         match arg_types[0] {
             List(_) | LargeList(_) | FixedSizeList(_, _) => Ok(Float64),
-            _ => exec_err!("The cosine_distance function can only accept List/LargeList/FixedSizeList."),
+            _ => exec_err!(
+                "The cosine_distance function can only accept List/LargeList/FixedSizeList."
+            ),
         }
     }
 
@@ -125,8 +109,14 @@ impl ScalarUDFImpl for  CosineDistance {
         let mut result = Vec::new();
         for arg_type in arg_types {
             match arg_type {
-                List(_) | LargeList(_) | FixedSizeList(_, _) => result.push(coerced_fixed_size_list_to_list(arg_type)),
-                _ => return exec_err!("The cosine_distance function can only accept List/LargeList/FixedSizeList."),
+                List(_) | LargeList(_) | FixedSizeList(_, _) => {
+                    result.push(coerced_fixed_size_list_to_list(arg_type));
+                }
+                _ => {
+                    return exec_err!(
+                    "The cosine_distance function can only accept List/LargeList/FixedSizeList."
+                )
+                }
             }
         }
 
@@ -147,7 +137,9 @@ pub fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
         (List(_), List(_)) => general_cosine_distance::<i32>(args),
         (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
         (array_type1, array_type2) => {
-            exec_err!("cosine_distance does not support types '{array_type1:?}' and '{array_type2:?}'")
+            exec_err!(
+                "cosine_distance does not support types '{array_type1:?}' and '{array_type2:?}'"
+            )
         }
     }
 }
@@ -170,17 +162,13 @@ fn compute_cosine_distance(
     arr1: Option<ArrayRef>,
     arr2: Option<ArrayRef>,
 ) -> DataFusionResult<Option<f64>> {
-    let value1 = match arr1 {
-        Some(arr) => arr,
-        None => return Ok(None),
-    };
-    let value2 = match arr2 {
-        Some(arr) => arr,
-        None => return Ok(None),
+    let Some(mut value1) = arr1 else {
+        return Ok(None);
     };
 
-    let mut value1 = value1;
-    let mut value2 = value2;
+    let Some(mut value2) = arr2 else {
+        return Ok(None);
+    };
 
     loop {
         match value1.data_type() {
@@ -221,19 +209,19 @@ fn compute_cosine_distance(
         return Ok(None);
     }
 
-    let values1 = convert_to_f64_array(&value1)?;
-    let values2 = convert_to_f64_array(&value2)?;
+    let float_vals1 = convert_to_f64_array(&value1)?;
+    let float_vals2 = convert_to_f64_array(&value2)?;
 
-    if values1.len() != values2.len() {
+    if float_vals1.len() != float_vals2.len() {
         return exec_err!("Both arrays must have the same length");
     }
 
     let mut a1_length: f64 = 0.0;
     let mut a2_length: f64 = 0.0;
 
-    let sum_squares: f64 = values1
+    let sum_squares: f64 = float_vals1
         .iter()
-        .zip(values2.iter())
+        .zip(float_vals2.iter())
         .map(|(v1, v2)| {
             let a = v1.unwrap_or(0.0);
             let b = v2.unwrap_or(0.0);
@@ -241,37 +229,34 @@ fn compute_cosine_distance(
             a1_length += a * a;
             a2_length += b * b;
 
-            a * b 
-            
+            a * b
         })
         .sum();
 
-    let a1_norm = (a1_length * a1_length).sqrt();
-    let a2_norm = (a2_length * a2_length).sqrt();
+    let similarity = sum_squares / (a1_length.sqrt() * a2_length.sqrt());
 
-    Ok(Some(sum_squares/(a1_norm * a2_norm)))
+    // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
+    Ok(Some((1.0 - similarity) / 2.0))
 }
 
-/// Converts an array of any numeric type to a Float64Array.
+/// Converts an array of any numeric type to a `Float64Array`.
+#[allow(clippy::cast_lossless, clippy::cast_precision_loss)]
 fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
     match array.data_type() {
         DataType::Float64 => Ok(as_float64_array(array)?.clone()),
         DataType::Float32 => {
             let array = as_float32_array(array)?;
-            let converted: Float64Array =
-                array.iter().map(|v| v.map(|v| v as f64)).collect();
+            let converted: Float64Array = array.iter().map(|v| v.map(f64::from)).collect();
             Ok(converted)
         }
         DataType::Int64 => {
             let array = as_int64_array(array)?;
-            let converted: Float64Array =
-                array.iter().map(|v| v.map(|v| v as f64)).collect();
+            let converted: Float64Array = array.iter().map(|v| v.map(|v| v as f64)).collect();
             Ok(converted)
         }
         DataType::Int32 => {
             let array = as_int32_array(array)?;
-            let converted: Float64Array =
-                array.iter().map(|v| v.map(|v| v as f64)).collect();
+            let converted: Float64Array = array.iter().map(|v| v.map(|v| v as f64)).collect();
             Ok(converted)
         }
         _ => exec_err!("Unsupported array type for conversion to Float64Array"),
