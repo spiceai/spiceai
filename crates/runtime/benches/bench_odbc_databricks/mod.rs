@@ -34,6 +34,7 @@ pub(crate) async fn run(
             "odbc-databricks",
             query_name,
             query,
+            false,
         )
         .await
         {

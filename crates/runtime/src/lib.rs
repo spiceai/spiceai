@@ -830,7 +830,11 @@ impl Runtime {
                     self.status
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    warn_spaced!(
+                        spaced_tracer,
+                        "Error initializing dataset {}. {err}",
+                        ds_name.table()
+                    );
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }
@@ -1041,6 +1045,15 @@ impl Runtime {
                 }
 
                 self.remove_dataset(&ds).await;
+
+                // Initialize file mode accelerator when reloading with file mode acceleration
+                // Fail when there's no successfully initiated dataset
+                if ds.is_file_accelerated() {
+                    let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
+                    if datasets.is_empty() {
+                        return;
+                    }
+                }
 
                 if (self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)

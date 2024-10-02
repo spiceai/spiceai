@@ -72,6 +72,12 @@
           "eviction_policy": null,
           "item_ttl": null
         },
+        "task_history": {
+          "captured_output": "truncated",
+          "enabled": true,
+          "retention_check_interval": "15m",
+          "retention_period": "8h"
+        },
         "telemetry": null,
         "tls": null,
         "tracing": null
@@ -240,7 +246,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Catalog": {
       "type": "object",
@@ -495,7 +502,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Embeddings": {
       "type": "object",
@@ -752,6 +760,19 @@
             }
           ]
         },
+        "task_history": {
+          "default": {
+            "captured_output": "truncated",
+            "enabled": true,
+            "retention_check_interval": "15m",
+            "retention_period": "8h"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/TaskHistory"
+            }
+          ]
+        },
         "telemetry": {
           "anyOf": [
             {
@@ -828,6 +849,28 @@
       "enum": [
         "v1beta1"
       ]
+    },
+    "TaskHistory": {
+      "type": "object",
+      "properties": {
+        "captured_output": {
+          "default": "truncated",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "retention_check_interval": {
+          "default": "15m",
+          "type": "string"
+        },
+        "retention_period": {
+          "default": "8h",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "TelemetryConfig": {
       "type": "object",

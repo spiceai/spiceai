@@ -7,6 +7,11 @@ on:
       - trunk
       - release-*
       - feature-*
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'version.txt'
+      - 'acknowledgements.md'
 
   workflow_dispatch:
 

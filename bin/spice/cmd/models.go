@@ -17,6 +17,8 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
+
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -36,12 +38,12 @@ spice models
 		}
 		model_statuses, _, err := api.GetComponentStatuses(rtcontext)
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("getting component statuses", "error", err)
 		}
 
 		models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("listing spiced models", "error", err)
 		}
 
 		table := make([]interface{}, len(models))
