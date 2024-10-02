@@ -37,59 +37,58 @@ pub enum Error {
         source: url::ParseError,
     },
     #[snafu(display(
-        "Only one of access_key, bearer token or client credentials must be provided"
+        "Provide only one of the following: access key, bearer token, or client credentials. Use skip_signature to disable all authentication."
     ))]
     InvalidKeyAuthCombination,
 }
 
-pub struct Azure {
+pub struct AzureBlobFS {
     params: Parameters,
 }
 
 #[derive(Default, Clone)]
-pub struct AzureFactory {
-    prefix: &'static str,
-}
+pub struct AzureBlobFSFactory {}
 
-impl AzureFactory {
+impl AzureBlobFSFactory {
     #[must_use]
-    pub fn new(prefix: &'static str) -> Self {
-        Self { prefix }
+    pub fn new() -> Self {
+        Self {  }
     }
 
     #[must_use]
-    pub fn new_arc(prefix: &'static str) -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self { prefix }) as Arc<dyn DataConnectorFactory>
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self { }) as Arc<dyn DataConnectorFactory>
     }
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("account")
-        .description("The Azure Storage account name.")
+        .description("Azure Storage account name.")
         .secret(),
     ParameterSpec::connector("container_name")
-        .description("The Azure Storage container name.")
+        .description("Azure Storage container name.")
         .secret(),
     ParameterSpec::connector("access_key")
-        .description("The Azure Storage account access key.")
+        .description("Azure Storage account access key.")
         .secret(),
     ParameterSpec::connector("bearer_token")
-        .description("The bearer token to use in the Azure requests.")
+        .description("Bearer token to use in Azure requests.")
         .secret(),
     ParameterSpec::connector("client_id")
-        .description("The Azure client ID.")
+        .description("Azure client ID.")
         .secret(),
     ParameterSpec::connector("client_secret")
-        .description("The Azure client secret.")
+        .description("Azure client secret.")
         .secret(),
     ParameterSpec::connector("tenant_id")
-        .description("The Azure tenant ID.")
+        .description("Azure tenant ID.")
         .secret(),
     ParameterSpec::connector("sas_string")
-        .description("The Azure SAS string.")
+        .description("Azure SAS string.")
         .secret(),
     ParameterSpec::connector("endpoint")
-        .description("The Azure Storage endpoint."),
+        .description("Azure Storage endpoint.")
+        .secret(),
     ParameterSpec::connector("use_emulator")
         .description("Use the Azure Storage emulator.")
         .default("false"),
@@ -105,21 +104,23 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("The maximum number of retries.")
         .default("3"),
     ParameterSpec::connector("retry_timeout")
-        .description("The retry timeout."),
+        .description("Retry timeout."),
     ParameterSpec::connector("backoff_initial_duration")
-        .description("The initial backoff duration."),
+        .description("Initial backoff duration."),
     ParameterSpec::connector("backoff_max_duration")
-        .description("The maximum backoff duration."),
+        .description("Maximum backoff duration."),
     ParameterSpec::connector("backoff_base")
         .description("The base of the exponential to use"),
     ParameterSpec::connector("proxy_url")
-        .description("The proxy URL to use."),
+        .description("Proxy URL to use when connecting"),
     ParameterSpec::connector("proxy_ca_certificate")
-        .description("The CA certificate for the proxy."),
+        .description("CA certificate for the proxy.")
+        .secret(),
     ParameterSpec::connector("proxy_excludes")
         .description("Set list of hosts to exclude from proxy connections"),
     ParameterSpec::connector("msi_endpoint")
-        .description("Sets the endpoint for acquiring managed identity tokens."),
+        .description("Sets the endpoint for acquiring managed identity tokens.")
+        .secret(),
     ParameterSpec::connector("federated_token_file")
         .description("Sets a file path for acquiring Azure federated identity token in Kubernetes"),
     ParameterSpec::connector("use_cli")
@@ -141,16 +142,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("csv_delimiter")
         .description("The character separating values within a row."),
     ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+        .description("The type of compression used on the file. Supported types are: gzip, bzip2, xz, zstd, uncompressed"),
 ];
 
-pub const PREFIXES: [&'static str; 6] = ["azure", "abfs", "abfss", "adl", "adls", "az"];
-
-pub fn is_azure_url(url: &str) -> bool {
-    PREFIXES.iter().any(|prefix| url.starts_with(prefix))
-}
-
-impl DataConnectorFactory for AzureFactory {
+impl DataConnectorFactory for AzureBlobFSFactory {
     fn create(
         &self,
         mut params: Parameters,
@@ -166,28 +161,33 @@ impl DataConnectorFactory for AzureFactory {
             let access_key = params.get("access_key").expose().ok();
             let bearer_token = params.get("bearer_token").expose().ok();
             let sas_string = params.get("sas_string").expose().ok();
+            let skip_signature = params.get("skip_signature").expose().ok();
+            let use_emulator = params.get("use_emulator").expose().ok();
 
-            match (access_key, bearer_token, sas_string) {
-                (Some(_), None, None)
-                | (None, Some(_), None)
-                | (None, None, Some(_))
-                | (None, None, None) => {
-                    let azure = Azure { params };
-                    Ok(Arc::new(azure) as Arc<dyn DataConnector>)
+            let use_emulator = use_emulator.map(|b| b.parse::<bool>().unwrap_or(false)).unwrap_or(false);
+            
+            if use_emulator {
+                let azure = AzureBlobFS { params };
+                Ok(Arc::new(azure) as Arc<dyn DataConnector>)
+            } else {
+                match (access_key, bearer_token, sas_string, skip_signature) {
+                    (Some(_), None, None, None)
+                    | (None, Some(_), None, None)
+                    | (None, None, Some(_), None)
+                    | (None, None, None, Some(_)) => {
+                        let azure = AzureBlobFS { params };
+                        Ok(Arc::new(azure) as Arc<dyn DataConnector>)
+                    }
+                    _ => Err(Box::new(Error::InvalidKeyAuthCombination)
+                        as Box<dyn std::error::Error + Send + Sync>),
                 }
-                _ => Err(Box::new(Error::InvalidKeyAuthCombination)
-                    as Box<dyn std::error::Error + Send + Sync>),
             }
+            
         })
     }
 
     fn prefix(&self) -> &'static str {
-        &self.prefix
-    }
-
-    // We need a unified parameter prefix for all Azure connectors
-    fn parameter_prefix(&self) -> &'static str {
-        "azure"
+        "abfss"
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -195,13 +195,13 @@ impl DataConnectorFactory for AzureFactory {
     }
 }
 
-impl std::fmt::Display for Azure {
+impl std::fmt::Display for AzureBlobFS {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "azure")
+        write!(f, "abfss")
     }
 }
 
-impl ListingTableConnector for Azure {
+impl ListingTableConnector for AzureBlobFS {
     fn as_any(&self) -> &dyn Any {
         self
     }

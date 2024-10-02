@@ -59,7 +59,7 @@ use url::{form_urlencoded, Url};
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;
-pub mod azure;
+pub mod abfss;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
@@ -272,7 +272,7 @@ pub async fn create_new_connector(
     let params = match Parameters::try_new(
         &format!("connector {name}"),
         params.into_iter().collect(),
-        factory.parameter_prefix(),
+        factory.prefix(),
         secrets,
         factory.parameters(),
     )
@@ -298,11 +298,7 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
     register_connector_factory("s3", s3::S3Factory::new_arc()).await;
-
-    for prefix in azure::PREFIXES.iter() {
-        register_connector_factory(prefix, azure::AzureFactory::new_arc(prefix)).await;
-    }
-    
+    register_connector_factory("abfss", abfss::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
@@ -359,11 +355,6 @@ pub trait DataConnectorFactory: Send + Sync {
     ///
     /// The prefix will be stripped from the parameter name before being passed to the data connector.
     fn prefix(&self) -> &'static str;
-
-    /// The prefix to use for parameters in the spicepod configuration. In most cases should just match the `prefix`.
-    fn parameter_prefix(&self) -> &'static str {
-        self.prefix()
-    }
 
     /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
     ///

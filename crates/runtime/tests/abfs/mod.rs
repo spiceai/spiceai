@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::init_tracing;
 use anyhow::anyhow;
 use app::AppBuilder;
 use azure_storage_blobs::prelude::*;
@@ -52,10 +53,10 @@ pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static
 }
 
 pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
-    tracing::trace!("Creating container");
+    tracing::trace!("Creating storage container");
     let container_client = ClientBuilder::emulator().container_client("testcontainer");
     container_client.create().await?;
-    tracing::trace!("Container created");
+    tracing::trace!("Storage container created");
     tracing::trace!("Uploading sample file");
     let sample_file = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data/taxi_sample.csv"),
@@ -70,12 +71,27 @@ pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_azure_connector() -> Result<(), anyhow::Error> {
-    tracing::info!("Starting Azure connector test");
+pub async fn prepare_container() -> Result<RunningContainer<'static>, anyhow::Error> {
     let azurite_container = start_azurite_docker_container().await?;
     tracing::info!("Azurite container started");
-    let res = run_test().await;
+    tracing::info!("Uploading sample file to Azure Blob Storage");
+    match upload_sample_file().await {
+        Ok(_) => Ok(azurite_container),
+        Err(e) => {
+            azurite_container.stop().await?;
+            azurite_container.remove().await?;
+            return Err(e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_spice_with_abfs() -> Result<(), anyhow::Error> {
+    //let _tracing = init_tracing(Some("trace"));
+    tracing::info!("Starting AzureBlobFS connector test");
+    let azurite_container = prepare_container().await?;
+    
+    let res = run_queries().await;
     tracing::info!("Test completed");
     azurite_container.stop().await?;
     azurite_container.remove().await?;
@@ -86,13 +102,10 @@ fn make_test_query(table_name: &str) -> String {
     format!("SELECT DISTINCT(\"VendorID\") FROM {table_name} ORDER BY \"VendorID\" DESC")
 }
 
-async fn run_test() -> Result<(), anyhow::Error> {
-    tracing::info!("Uploading sample file to Azure Blob Storage");
-    upload_sample_file().await?;
-
-    let mut emulator_dataset = Dataset::new("azure://testcontainer/taxi_sample.csv", "emulator");
+async fn run_queries() -> Result<(), anyhow::Error> {
+    let mut emulator_dataset = Dataset::new("abfss://testcontainer/taxi_sample.csv", "emulator");
     let emulator_params = DatasetParams::from_string_map(
-        vec![("azure_use_emulator".to_string(), "true".to_string())]
+        vec![("abfss_use_emulator".to_string(), "true".to_string())]
             .into_iter()
             .collect(),
     );
@@ -102,11 +115,11 @@ async fn run_test() -> Result<(), anyhow::Error> {
     let abfs_params = DatasetParams::from_string_map(
         vec![
             (
-                "azure_account".to_string(),
+                "abfss_account".to_string(),
                 "spiceazuretestblob".to_string(),
             ),
             // `skip_signature` is required for Anonymous blob access
-            ("azure_skip_signature".to_string(), "true".to_string()),
+            ("abfss_skip_signature".to_string(), "true".to_string()),
         ]
         .into_iter()
         .collect(),
