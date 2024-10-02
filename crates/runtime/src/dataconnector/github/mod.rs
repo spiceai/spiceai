@@ -18,6 +18,7 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use chrono::{offset::LocalResult, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
@@ -425,7 +426,6 @@ lazy_static! {
             GitHubPushdownSupport {
                 ops: vec![
                     Operator::Eq,
-                    Operator::NotEq,
                     Operator::LikeMatch,
                     Operator::ILikeMatch,
                     Operator::NotLikeMatch,
@@ -448,13 +448,68 @@ lazy_static! {
             GitHubPushdownSupport {
                 ops: vec![
                     Operator::Eq,
-                    Operator::NotEq,
                     Operator::LikeMatch,
                     Operator::ILikeMatch,
                     Operator::NotLikeMatch,
                     Operator::NotILikeMatch,
                 ],
                 remap: None,
+            },
+        );
+
+        m.insert(
+            "created_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("created"),
+            },
+        );
+
+        m.insert(
+            "updated_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("updated"),
+            },
+        );
+
+        m.insert(
+            "closed_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("closed"),
+            },
+        );
+
+        m.insert(
+            "merged_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("merged"),
             },
         );
 
@@ -502,13 +557,37 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 };
             }
 
-            let value = if let ScalarValue::Utf8(Some(v)) = &value {
-                match column.name.as_str() {
-                    "state" => ScalarValue::Utf8(Some(v.to_lowercase())),
-                    _ => value.clone(),
+            let value = match value {
+                ScalarValue::Utf8(Some(v)) => {
+                    if column.name == "state" {
+                        // "state" in GitHub search is odd
+                        // it returns values for CLOSED, MERGED and OPEN
+                        // but you can only search with either closed or open (in lowercase as well)
+                        if v.to_lowercase() == "merged" {
+                            "closed".to_string() // so merged gets remapped to closed
+                                                 // and because the filter is Inexact, we expect the Memtable to do the final filter to find only MERGED items
+                                                 // not the best, but its better filtering than nothing
+                        } else {
+                            v.to_lowercase()
+                        }
+                    } else {
+                        v
+                    }
                 }
-            } else {
-                value
+                ScalarValue::TimestampMillisecond(Some(millis), _) => {
+                    let dt = Utc.timestamp_millis_opt(millis);
+                    match dt {
+                        LocalResult::Single(dt) => dt.to_rfc3339(),
+                        _ => {
+                            return FilterPushdownResult {
+                                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                                expr: expr.clone(),
+                                context: None,
+                            }
+                        }
+                    }
+                }
+                _ => value.to_string(),
             };
 
             let column_name = if let Some(remap) = column_support.remap {
@@ -517,10 +596,23 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 column.name.as_str()
             };
 
+            let neq = match op {
+                Operator::NotEq => "-",
+                _ => "",
+            };
+
+            let modifier = match op {
+                Operator::LtEq => "<=",
+                Operator::Lt => "<",
+                Operator::GtEq => ">=",
+                Operator::Gt => ">",
+                _ => "",
+            };
+
             let parameter = match column_name {
                 "title" => format!("{value} in:title"),
                 "body" => format!("{value} in:body"),
-                _ => format!("{column_name}:{value}"),
+                _ => format!("{neq}{column_name}:{modifier}{value}"),
             };
 
             return FilterPushdownResult {
