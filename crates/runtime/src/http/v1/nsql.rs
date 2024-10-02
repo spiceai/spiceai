@@ -86,8 +86,11 @@ pub(crate) async fn post(
     for t in &tables {
         match df.get_arrow_schema(t).await {
             Ok(schm) => {
-                let stmts = CreateTableBuilder::new(Arc::new(schm), t).build_postgres();
-                table_create_stms.extend_from_slice(&stmts);
+                tracing::trace!("Table {t} has CREATE STATEMENT='{schm}'.");
+ 
+                // Ensure compiling without `--features models` is successful.
+                #[cfg(feature = "models")]
+                table_create_stms.extend_from_slice(&CreateTableBuilder::new(Arc::new(schm), t).build_postgres());
             }
             Err(e) => {
                 tracing::error!("Error getting table={t} schema: {e}");
