@@ -52,12 +52,12 @@ pub struct AzureBlobFSFactory {}
 impl AzureBlobFSFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {  }
+        Self {}
     }
 
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self { }) as Arc<dyn DataConnectorFactory>
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
 
@@ -164,8 +164,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
             let skip_signature = params.get("skip_signature").expose().ok();
             let use_emulator = params.get("use_emulator").expose().ok();
 
-            let use_emulator = use_emulator.map(|b| b.parse::<bool>().unwrap_or(false)).unwrap_or(false);
-            
+            let use_emulator = use_emulator
+                .map(|b| b.parse::<bool>().unwrap_or(false))
+                .unwrap_or(false);
+
             if use_emulator {
                 let azure = AzureBlobFS { params };
                 Ok(Arc::new(azure) as Arc<dyn DataConnector>)
@@ -182,7 +184,6 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                         as Box<dyn std::error::Error + Send + Sync>),
                 }
             }
-            
         })
     }
 

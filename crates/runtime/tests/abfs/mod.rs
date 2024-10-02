@@ -90,7 +90,7 @@ async fn test_spice_with_abfs() -> Result<(), anyhow::Error> {
     //let _tracing = init_tracing(Some("trace"));
     tracing::info!("Starting AzureBlobFS connector test");
     let azurite_container = prepare_container().await?;
-    
+
     let res = run_queries().await;
     tracing::info!("Test completed");
     azurite_container.stop().await?;
