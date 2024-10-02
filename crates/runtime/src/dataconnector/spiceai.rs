@@ -155,8 +155,12 @@ impl DataConnectorFactory for SpiceAIFactory {
             let metadata_map = match params.get("app_id").expose().ok() {
                 Some(app_id) => {
                     let mut map = MetadataMap::new();
-                    map.insert("x-spiceai-app-id", app_id.parse().unwrap());
-                    Some(map)
+                    if let Ok(parsed_app_id) = app_id.parse() {
+                        map.insert("x-spiceai-app-id", parsed_app_id);
+                        Some(map)
+                    } else {
+                        None
+                    }
                 }
                 None => None,
             };
