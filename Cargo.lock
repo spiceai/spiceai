@@ -8773,6 +8773,7 @@ dependencies = [
  "insta",
  "itertools 0.13.0",
  "keyring",
+ "lazy_static",
  "llms",
  "logos",
  "mediatype",

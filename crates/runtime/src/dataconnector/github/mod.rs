@@ -18,6 +18,7 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use chrono::{offset::LocalResult, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
@@ -28,15 +29,20 @@ use data_components::{
     },
 };
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, logical_expr::TableProviderFilterPushDown,
-    prelude::Expr, scalar::ScalarValue,
+    datasource::TableProvider,
+    error::DataFusionError,
+    logical_expr::{Operator, TableProviderFilterPushDown},
+    prelude::Expr,
+    scalar::ScalarValue,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{Definition, OperationDefinition, Query, SelectionSet};
 use issues::IssuesTableArgs;
+use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
+use std::collections::HashMap;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
@@ -397,53 +403,224 @@ pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
     Ok(Arc::new(glob_set))
 }
 
+struct GitHubPushdownSupport {
+    ops: Vec<Operator>,
+    remap: Option<&'static str>,
+}
+
 // TODO: add support for LIKE and IN filters, to support columns like assignees, labels, etc
 // TODO: add support for date comparisons to support columns like updated_at, created_at, closed_at, etc
-const GITHUB_SUPPORTED_FILTER_PUSHDOWN_COLUMNS: &[&str] =
-    &["login", "title", "state", "id", "number"];
+lazy_static! {
+    static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
+        let mut m = HashMap::new();
+        m.insert(
+            "login",
+            GitHubPushdownSupport {
+                ops: vec![Operator::Eq, Operator::NotEq],
+                remap: Some("author"),
+            },
+        );
+
+        m.insert(
+            "title",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::LikeMatch,
+                    Operator::ILikeMatch,
+                    Operator::NotLikeMatch,
+                    Operator::NotILikeMatch,
+                ],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "state",
+            GitHubPushdownSupport {
+                ops: vec![Operator::Eq, Operator::NotEq],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "body",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::LikeMatch,
+                    Operator::ILikeMatch,
+                    Operator::NotLikeMatch,
+                    Operator::NotILikeMatch,
+                ],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "created_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("created"),
+            },
+        );
+
+        m.insert(
+            "updated_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("updated"),
+            },
+        );
+
+        m.insert(
+            "closed_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("closed"),
+            },
+        );
+
+        m.insert(
+            "merged_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("merged"),
+            },
+        );
+
+        m
+    };
+}
 
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
-    if let Expr::BinaryExpr(binary_expr) = expr {
-        let ((Expr::Literal(value), Expr::Column(column))
-        | (Expr::Column(column), Expr::Literal(value))) =
-            (*binary_expr.left.clone(), *binary_expr.right.clone())
-        else {
-            return FilterPushdownResult {
-                filter_pushdown: TableProviderFilterPushDown::Unsupported,
-                expr: expr.clone(),
-                context: None,
-            };
-        };
+    let column_matches = match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
+                (Expr::Column(column), Expr::Literal(value))
+                | (Expr::Literal(value), Expr::Column(column)) => {
+                    Some((column, value, binary_expr.op))
+                }
+                _ => None,
+            }
+        }
+        Expr::Like(like_expr) => match (*like_expr.expr.clone(), *like_expr.pattern.clone()) {
+            (Expr::Column(column), Expr::Literal(value))
+            | (Expr::Literal(value), Expr::Column(column)) => {
+                let op = match (like_expr.negated, like_expr.case_insensitive) {
+                    (false, false) => Operator::LikeMatch,
+                    (true, false) => Operator::NotLikeMatch,
+                    (false, true) => Operator::ILikeMatch,
+                    (true, true) => Operator::NotILikeMatch,
+                };
 
-        if !GITHUB_SUPPORTED_FILTER_PUSHDOWN_COLUMNS.contains(&column.name.as_str()) {
+                Some((column, value, op))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some((column, value, op)) = column_matches {
+        if let Some(column_support) = GITHUB_FILTER_PUSHDOWNS_SUPPORTED.get(column.name.as_str()) {
+            if !column_support.ops.contains(&op) {
+                tracing::debug!("Unsupported operator {op} for column {}", column.name);
+
+                return FilterPushdownResult {
+                    filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                    expr: expr.clone(),
+                    context: None,
+                };
+            }
+
+            let value = match value {
+                ScalarValue::Utf8(Some(v)) => {
+                    if column.name == "state" {
+                        // "state" in GitHub search is odd
+                        // it returns values for CLOSED, MERGED and OPEN
+                        // but you can only search with either closed or open (in lowercase as well)
+                        if v.to_lowercase() == "merged" {
+                            "closed".to_string() // so merged gets remapped to closed
+                                                 // and because the filter is Inexact, we expect the Memtable to do the final filter to find only MERGED items
+                                                 // not the best, but its better filtering than nothing
+                        } else {
+                            v.to_lowercase()
+                        }
+                    } else {
+                        v
+                    }
+                }
+                ScalarValue::TimestampMillisecond(Some(millis), _) => {
+                    let dt = Utc.timestamp_millis_opt(millis);
+                    match dt {
+                        LocalResult::Single(dt) => dt.to_rfc3339(),
+                        _ => {
+                            return FilterPushdownResult {
+                                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                                expr: expr.clone(),
+                                context: None,
+                            }
+                        }
+                    }
+                }
+                _ => value.to_string(),
+            };
+
+            let column_name = if let Some(remap) = column_support.remap {
+                remap
+            } else {
+                column.name.as_str()
+            };
+
+            let neq = match op {
+                Operator::NotEq => "-",
+                _ => "",
+            };
+
+            let modifier = match op {
+                Operator::LtEq => "<=",
+                Operator::Lt => "<",
+                Operator::GtEq => ">=",
+                Operator::Gt => ">",
+                _ => "",
+            };
+
+            let parameter = match column_name {
+                "title" => format!("{value} in:title"),
+                "body" => format!("{value} in:body"),
+                _ => format!("{neq}{column_name}:{modifier}{value}"),
+            };
+
             return FilterPushdownResult {
-                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                filter_pushdown: TableProviderFilterPushDown::Inexact,
                 expr: expr.clone(),
-                context: None,
+                context: Some(parameter),
             };
         }
-
-        let value = if let ScalarValue::Utf8(Some(v)) = &value {
-            match column.name.as_str() {
-                "state" => ScalarValue::Utf8(Some(v.to_lowercase())),
-                _ => value.clone(),
-            }
-        } else {
-            value
-        };
-
-        let column_name = match column.name.as_str() {
-            "login" => "author",
-            _ => column.name.as_str(),
-        };
-
-        let parameter = format!("{column_name}:{value}");
-
-        return FilterPushdownResult {
-            filter_pushdown: TableProviderFilterPushDown::Inexact,
-            expr: expr.clone(),
-            context: Some(parameter),
-        };
     }
 
     FilterPushdownResult {
