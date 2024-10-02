@@ -74,7 +74,7 @@ pub async fn prepare_container() -> Result<RunningContainer<'static>, anyhow::Er
     tracing::info!("Azurite container started");
     tracing::info!("Uploading sample file to Azure Blob Storage");
     match upload_sample_file().await {
-        Ok(_) => Ok(azurite_container),
+        Ok(()) => Ok(azurite_container),
         Err(e) => {
             azurite_container.stop().await?;
             azurite_container.remove().await?;

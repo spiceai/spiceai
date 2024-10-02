@@ -169,19 +169,18 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 let azure = AzureBlobFS { params };
                 Ok(Arc::new(azure) as Arc<dyn DataConnector>)
             } else {
-                match (access_key, bearer_token, sas_string, skip_signature) {
-                    (Some(_), None, None, None)
-                    | (None, Some(_), None, None)
-                    | (None, None, Some(_), None)
-                    | (None, None, None, Some(_))
-                    // None of the above defaults to using Managed Identity
-                    | (None, None, None, None)
-                     => {
-                        let azure = AzureBlobFS { params };
-                        Ok(Arc::new(azure) as Arc<dyn DataConnector>)
-                    }
-                    _ => Err(Box::new(Error::InvalidKeyAuthCombination)
-                        as Box<dyn std::error::Error + Send + Sync>),
+                let conflicting = [
+                    access_key.is_some(),
+                    bearer_token.is_some(),
+                    sas_string.is_some(),
+                    skip_signature.is_some(),
+                ];
+                if conflicting.iter().filter(|b| **b).count() > 1 {
+                    Err(Box::new(Error::InvalidKeyAuthCombination)
+                        as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    let azure = AzureBlobFS { params };
+                    Ok(Arc::new(azure) as Arc<dyn DataConnector>)
                 }
             }
         })
