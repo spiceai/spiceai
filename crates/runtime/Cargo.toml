@@ -82,7 +82,6 @@ opentelemetry-proto = { version = "0.25", features = [
 ] }
 opentelemetry-prometheus.workspace = true
 otel-arrow = { path = "../otel-arrow" }
-paste = "1.0.15"
 pin-project = "1.0"
 prometheus.workspace = true
 prometheus-parse = "0.2.5"

@@ -15,13 +15,6 @@ use datafusion::{
 use std::any::Any;
 use std::sync::Arc;
 
-// /// returns the Euclidean distance between two numeric arrays."]
-// pub fn cosine_distance(array: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
-//     datafusion::logical_expr::Expr::ScalarFunction(
-//         datafusion::logical_expr::expr::ScalarFunction::new_udf(cosine_distance_udf(), vec![array]),
-//     )
-// }
-
 macro_rules! downcast_arg {
     ($ARG:expr, $ARRAY_TYPE:ident) => {{
         $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
@@ -157,7 +150,6 @@ fn general_cosine_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusio
     Ok(Arc::new(result) as ArrayRef)
 }
 
-/// Computes the Euclidean distance between two arrays
 fn compute_cosine_distance(
     arr1: Option<ArrayRef>,
     arr2: Option<ArrayRef>,
