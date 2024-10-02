@@ -124,7 +124,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("federated_token_file")
         .description("Sets a file path for acquiring Azure federated identity token in Kubernetes"),
     ParameterSpec::connector("use_cli")
-        .description("Set if the Azure Cli should be used for acquiring access tokens."),
+        .description("Set if the Azure CLI should be used for acquiring access tokens."),
     ParameterSpec::connector("skip_signature")
         .description("Skip fetching credentials and skip signing requests. Used for interacting with public containers."),
     ParameterSpec::connector("disable_tagging")
