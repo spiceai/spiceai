@@ -30,6 +30,23 @@ A major bug is classified as a bug that:
 
 A minor bug is any bug that cannot be classified as a major bug.
 
+#### Core Arrow Data Types
+
+Core Arrow Data Types consist of the following data types:
+
+- Null
+- Int/Float/Decimal
+- Time32/64
+- Timestamp/TimestampTZ
+- Date32/64
+- Duration
+- Interval
+- Binary/LargeBinary/FixedSizeBinary
+- Utf8/LargeUtf8
+- List/FixedSizeList/LargeList
+- Struct
+- Decimal128/Decimal256
+
 ### Feature complete
 
 - [ ] Data is streamed when accelerating from source into this accelerator
@@ -39,19 +56,7 @@ A minor bug is any bug that cannot be classified as a major bug.
 - [ ] The accelerator supports federation push down across multiple datasets within the same accelerator (e.g. `select * from first_dataset, second_dataset`)
 - [ ] The accelerator supports resolving on conflict behaviors (e.g. Drop/Upsert)
 - [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
-- [ ] Core Arrow data types are supported:
-  - Null
-  - Int/Float/Decimal
-  - Time32/64
-  - Timestamp/TimestampTZ
-  - Date32/64
-  - Duration
-  - Interval
-  - Binary/LargeBinary/FixedSizeBinary
-  - Utf8/LargeUtf8
-  - List/FixedSizeList/LargeList
-  - Struct
-  - Decimal128/Decimal256
+- [ ] [Core Arrow Data Types](#definitions) are supported
 - [ ] All known [Major Bugs](#definitions) are resolved
 
 ### Test Coverage
@@ -68,22 +73,7 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 
 #### General
 
-- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with arrow types:
-  - [ ] Null
-  - [ ] All Int types
-  - [ ] All Float types
-  - [ ] Time32
-  - [ ] Time64
-  - [ ] Timestamp (with/without TZ)
-  - [ ] Date32
-  - [ ] Date64
-  - [ ] Duration
-  - [ ] Interval
-  - [ ] Binary/LargeBinary/FixedSizeBinary
-  - [ ] Utf8/LargeUtf8
-  - [ ] List/FixedSizeList/LargeList
-  - [ ] Struct
-  - [ ] Decimal128/Decimal256
+- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](#definitions)
 - [ ] Integration tests to cover "On Conflict" behaviors.
 
 #### TPC-H
