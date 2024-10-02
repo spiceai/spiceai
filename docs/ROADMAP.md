@@ -8,16 +8,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.18.3-beta (Sep 2024)](https://github.com/spiceai/spiceai/milestone/32)
-
-- Bugfixes and performance improvements
-- Databricks DeltaLake data connector (Beta)
-- Spice Cloud Platform data connector (Beta)
-- S3 data connector (Beta)
-- ODBC Data Connector (Beta)
-- PostgreSQL data connector (Beta)
-- MySQL data connector (Beta)
-
 ## [v0.19.0-beta (Oct 2024)](https://github.com/spiceai/spiceai/milestone/44)
 
 - Bugfixes and performance improvements
