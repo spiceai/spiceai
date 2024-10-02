@@ -128,7 +128,7 @@ impl DataConnectorFactory for DremioFactory {
                 params.get("username").expose().ok().unwrap_or_default(),
                 params.get("password").expose().ok().unwrap_or_default(),
             );
-            let flight_client = FlightClient::try_new(endpoint, credentials)
+            let flight_client = FlightClient::try_new(endpoint, credentials, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
