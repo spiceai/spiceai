@@ -29,6 +29,7 @@ pub(crate) async fn query_local_db(
         datafusion_table_providers::sql::db_connection_pool::Mode::File,
         JoinPushDown::Disallow,
         vec![],
+        std::time::Duration::from_millis(5000),
     )
     .await
     .map_err(|e| Error::msg(format!("Failed to create SQLite connection pool: {e}")))?;
