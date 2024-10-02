@@ -154,7 +154,11 @@ async fn main() -> Result<(), String> {
             let params: Option<Params> = {
                 #[cfg(feature = "postgres")]
                 {
-                    Some(get_postgres_params(true))
+                    if accelerator == "postgres" {
+                        Some(get_postgres_params(true))
+                    } else {
+                        None
+                    }
                 }
                 #[cfg(not(feature = "postgres"))]
                 {
