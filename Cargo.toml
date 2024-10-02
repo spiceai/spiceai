@@ -33,7 +33,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.81"
-version = "0.18.3-beta"
+version = "0.19.0-beta"
 
 [workspace.dependencies]
 arrow = "53"
@@ -44,7 +44,7 @@ arrow-ipc = "53"
 arrow-schema = "53"
 parquet = "53"
 arrow-odbc = "11.2.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "9b0f8caa3be0eb97ec35e0abebb31d016821035d" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "e8158e59d7a74e801cbf0148900e8d727bba235d" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
 base64 = "0.22.1"
