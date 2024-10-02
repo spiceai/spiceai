@@ -173,7 +173,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                     (Some(_), None, None, None)
                     | (None, Some(_), None, None)
                     | (None, None, Some(_), None)
-                    | (None, None, None, Some(_)) => {
+                    | (None, None, None, Some(_))
+                    // None of the above defaults to using Managed Identity
+                    | (None, None, None, None)
+                     => {
                         let azure = AzureBlobFS { params };
                         Ok(Arc::new(azure) as Arc<dyn DataConnector>)
                     }
