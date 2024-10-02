@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::init_tracing;
 use anyhow::anyhow;
 use app::AppBuilder;
 use azure_storage_blobs::prelude::*;
@@ -53,7 +52,6 @@ pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static
 }
 
 pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
-    tracing::trace!("Creating storage container");
     let container_client = ClientBuilder::emulator().container_client("testcontainer");
     container_client.create().await?;
     tracing::trace!("Storage container created");
@@ -80,7 +78,7 @@ pub async fn prepare_container() -> Result<RunningContainer<'static>, anyhow::Er
         Err(e) => {
             azurite_container.stop().await?;
             azurite_container.remove().await?;
-            return Err(e);
+            Err(e)
         }
     }
 }
@@ -103,23 +101,20 @@ fn make_test_query(table_name: &str) -> String {
 }
 
 async fn run_queries() -> Result<(), anyhow::Error> {
-    let mut emulator_dataset = Dataset::new("abfss://testcontainer/taxi_sample.csv", "emulator");
+    let mut emulator_dataset = Dataset::new("abfs://testcontainer/taxi_sample.csv", "emulator");
     let emulator_params = DatasetParams::from_string_map(
-        vec![("abfss_use_emulator".to_string(), "true".to_string())]
+        vec![("abfs_use_emulator".to_string(), "true".to_string())]
             .into_iter()
             .collect(),
     );
     emulator_dataset.params = Some(emulator_params);
 
-    let mut abfs_dataset = Dataset::new("abfss://testcontainer/taxi_sample.csv", "abfs_prefix");
+    let mut abfs_dataset = Dataset::new("abfs://testcontainer/taxi_sample.csv", "abfs_prefix");
     let abfs_params = DatasetParams::from_string_map(
         vec![
-            (
-                "abfss_account".to_string(),
-                "spiceazuretestblob".to_string(),
-            ),
+            ("abfs_account".to_string(), "spiceazuretestblob".to_string()),
             // `skip_signature` is required for Anonymous blob access
-            ("abfss_skip_signature".to_string(), "true".to_string()),
+            ("abfs_skip_signature".to_string(), "true".to_string()),
         ]
         .into_iter()
         .collect(),

@@ -151,9 +151,8 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         mut params: Parameters,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(sas_token) = params.get("sas_string").expose().ok() {
-            if sas_token.starts_with('?') {
-                let sas_token = sas_token[1..].to_string();
-                params.insert("sas_string".to_string(), sas_token.into());
+            if let Some(sas_token) = sas_token.strip_prefix('?') {
+                params.insert("sas_string".to_string(), sas_token.to_string().into());
             }
         }
 
@@ -164,9 +163,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
             let skip_signature = params.get("skip_signature").expose().ok();
             let use_emulator = params.get("use_emulator").expose().ok();
 
-            let use_emulator = use_emulator
-                .map(|b| b.parse::<bool>().unwrap_or(false))
-                .unwrap_or(false);
+            let use_emulator = use_emulator.is_some_and(|b| b.parse::<bool>().unwrap_or(false));
 
             if use_emulator {
                 let azure = AzureBlobFS { params };
@@ -188,7 +185,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
     }
 
     fn prefix(&self) -> &'static str {
-        "abfss"
+        "abfs"
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -198,7 +195,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
 
 impl std::fmt::Display for AzureBlobFS {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "abfss")
+        write!(f, "abfs")
     }
 }
 

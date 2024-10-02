@@ -29,7 +29,6 @@ use object_store::{
 };
 use url::{form_urlencoded::parse, Url};
 
-use crate::dataconnector;
 #[cfg(feature = "ftp")]
 use crate::objectstore::ftp::FTPObjectStore;
 #[cfg(feature = "ftp")]
@@ -207,8 +206,18 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
+    // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
+    #[allow(clippy::too_many_lines)]
     fn prepare_azure_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let mut url = url.clone();
+
+        // Rewrite the URL Scheme
+        url.set_scheme("abfss").map_err(|()| {
+            DataFusionError::Configuration(format!(
+                "Unable to set scheme to abfss for URL: {url:?}"
+            ))
+        })?;
+
         let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
@@ -222,8 +231,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(use_emulator) = params.get("use_emulator") {
             let as_bool = use_emulator.parse::<bool>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid boolean for use_emulator",
-                    use_emulator
+                    "{use_emulator} is not a valid boolean for use_emulator"
                 ))
             })?;
             builder = builder.with_use_emulator(as_bool);
@@ -266,8 +274,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(use_fabric_endpoint) = params.get("use_fabric_endpoint") {
             let as_bool = use_fabric_endpoint.parse::<bool>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid boolean for use_fabric_endpoint",
-                    use_fabric_endpoint
+                    "{use_fabric_endpoint} is not a valid boolean for use_fabric_endpoint"
                 ))
             })?;
             builder = builder.with_use_fabric_endpoint(as_bool);
@@ -275,8 +282,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(allow_http) = params.get("allow_http") {
             let as_bool = allow_http.parse::<bool>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid boolean for allow_http",
-                    allow_http
+                    "{allow_http} is not a valid boolean for allow_http"
                 ))
             })?;
             builder = builder.with_allow_http(as_bool);
@@ -291,8 +297,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(retry_timeout) = params.get("retry_timeout") {
             let as_duration = fundu::parse_duration(retry_timeout).map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid duration for retry_timeout",
-                    retry_timeout
+                    "{retry_timeout} is not a valid duration for retry_timeout"
                 ))
             })?;
             retry_config.retry_timeout = as_duration;
@@ -300,8 +305,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(max_retries) = params.get("max_retries") {
             let as_usize = max_retries.parse::<usize>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid usize for max_retries",
-                    max_retries
+                    "{max_retries} is not a valid usize for max_retries"
                 ))
             })?;
             retry_config.max_retries = as_usize;
@@ -309,8 +313,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(backoff_initial_duration) = params.get("backoff_initial_duration") {
             let as_duration = fundu::parse_duration(backoff_initial_duration).map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid duration for backoff_initial_duration",
-                    backoff_initial_duration
+                    "{backoff_initial_duration} is not a valid duration for backoff_initial_duration"
                 ))
             })?;
             retry_config.backoff.init_backoff = as_duration;
@@ -318,8 +321,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(backoff_max_duration) = params.get("backoff_max_duration") {
             let as_duration = fundu::parse_duration(backoff_max_duration).map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid duration for backoff_max_duration",
-                    backoff_max_duration
+                    "{backoff_max_duration} is not a valid duration for backoff_max_duration"
                 ))
             })?;
             retry_config.backoff.max_backoff = as_duration;
@@ -327,8 +329,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(backoff_base) = params.get("backoff_base") {
             let as_f64 = backoff_base.parse::<f64>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid f64 for backoff_base",
-                    backoff_base
+                    "{backoff_base} is not a valid f64 for backoff_base"
                 ))
             })?;
             retry_config.backoff.base = as_f64;
@@ -354,8 +355,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(use_cli) = params.get("use_cli") {
             let as_bool = use_cli.parse::<bool>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid boolean for use_cli",
-                    use_cli
+                    "{use_cli} is not a valid boolean for use_cli"
                 ))
             })?;
             builder = builder.with_use_azure_cli(as_bool);
@@ -364,8 +364,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(skip_signature) = params.get("skip_signature") {
             let as_bool = skip_signature.parse::<bool>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid boolean for skip_signature",
-                    skip_signature
+                    "{skip_signature} is not a valid boolean for skip_signature"
                 ))
             })?;
             builder = builder.with_skip_signature(as_bool);
@@ -374,18 +373,13 @@ impl SpiceObjectStoreRegistry {
         if let Some(disable_tagging) = params.get("disable_tagging") {
             let as_bool = disable_tagging.parse::<bool>().map_err(|_| {
                 DataFusionError::Configuration(format!(
-                    "{} is not a valid boolean for disable_tagging",
-                    disable_tagging
+                    "{disable_tagging} is not a valid boolean for disable_tagging"
                 ))
             })?;
             builder = builder.with_disable_tagging(as_bool);
         }
 
-        let azure_store = Arc::new(
-            builder
-                .build()
-                .map_err(|e| DataFusionError::ObjectStore(e))?,
-        );
+        let azure_store = Arc::new(builder.build().map_err(DataFusionError::ObjectStore)?);
 
         Ok(azure_store as Arc<dyn ObjectStore>)
     }
@@ -398,7 +392,7 @@ impl SpiceObjectStoreRegistry {
             return Self::prepare_s3_object_store(url);
         }
 
-        if url.as_str().starts_with("abfss://") {
+        if url.as_str().starts_with("abfs://") {
             return Self::prepare_azure_object_store(url);
         }
 
@@ -413,8 +407,7 @@ impl SpiceObjectStoreRegistry {
         }
 
         Err(DataFusionError::Execution(format!(
-            "No object store available for: {:?}",
-            url,
+            "No object store available for: {url:?}"
         )))
     }
 }
