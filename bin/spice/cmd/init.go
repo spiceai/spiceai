@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"strings"
@@ -42,7 +43,7 @@ spice init my_app
 		if len(args) < 1 || args[0] == "." {
 			wd, err := os.Getwd()
 			if err != nil {
-				cmd.PrintErrf("Error getting current working directory: %s\n", err.Error())
+				slog.Error("getting current working directory", "error", err)
 				return
 			}
 			dirName := path.Base(wd)
@@ -69,11 +70,11 @@ spice init my_app
 
 		spicepodPath, err := spicepod.CreateManifest(spicepodName, spicepodDir)
 		if err != nil {
-			cmd.PrintErrf("Error creating spicepod.yaml: %s\n", err.Error())
+			slog.Error("creating spicepod.yaml", "error", err)
 			return
 		}
 
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("%s initialized!", spicepodPath)))
+		slog.Info(fmt.Sprintf("Initialized %s\n", aurora.BrightGreen(spicepodPath)))
 	},
 }
 

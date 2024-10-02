@@ -19,6 +19,7 @@ package cmd
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"regexp"
@@ -46,7 +47,7 @@ spice dataset configure
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		if fi, err := os.Stat("spicepod.yaml"); os.IsNotExist(err) || fi.IsDir() {
-			cmd.Println(aurora.BrightRed("No spicepod.yaml found. Run spice init <app> first."))
+			slog.Error(fmt.Sprintf("%s", aurora.BrightRed("No spicepod.yaml found. Run spice init <app> first.")))
 			os.Exit(1)
 		}
 
@@ -54,15 +55,15 @@ spice dataset configure
 
 		cwd, err := os.Getwd()
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("getting current working directory", "error", err)
 			os.Exit(1)
 		}
 
 		defaultDatasetName := path.Base(cwd)
-		cmd.Printf("dataset name: (%s) ", defaultDatasetName)
+		slog.Info(fmt.Sprintf("dataset name: %s", defaultDatasetName))
 		datasetName, err := reader.ReadString('\n')
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error reading dataset name", "error", err)
 			os.Exit(1)
 		}
 		datasetName = strings.TrimSpace(strings.TrimSuffix(datasetName, "\n"))
@@ -72,24 +73,24 @@ spice dataset configure
 
 		match, err := regexp.MatchString("^[a-zA-Z0-9_-]+$", datasetName)
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error validating dataset name", "error", err)
 			os.Exit(1)
 		}
 
 		if !match {
-			cmd.Println(aurora.BrightRed("Dataset name can only contain letters, numbers, underscores, and hyphens"))
+			slog.Error(fmt.Sprintf("%v", aurora.BrightRed("Dataset name can only contain letters, numbers, underscores, and hyphens")))
 			os.Exit(1)
 		}
 
 		if strings.Contains(datasetName, "-") {
 			// warn that dataset name with hyphen should be quoted in queries
-			cmd.Println(aurora.BrightYellow(fmt.Sprintf("Dataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName)))
+			slog.Warn(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
 		}
 
 		cmd.Print("description: ")
 		description, err := reader.ReadString('\n')
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error reading stdin", "error", err)
 			os.Exit(1)
 		}
 		description = strings.TrimSuffix(description, "\n")
@@ -97,7 +98,7 @@ spice dataset configure
 		cmd.Print("from: ")
 		from, err := reader.ReadString('\n')
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error reading stdin", "error", err)
 			os.Exit(1)
 		}
 		from = strings.TrimSpace(strings.TrimSuffix(from, "\n"))
@@ -108,7 +109,7 @@ spice dataset configure
 			cmd.Print("endpoint: ")
 			endpoint, err := reader.ReadString('\n')
 			if err != nil {
-				cmd.Println(err.Error())
+				slog.Error("Error reading stdin", "error", err)
 				os.Exit(1)
 			}
 			endpoint = strings.TrimSuffix(endpoint, "\n")
@@ -123,7 +124,7 @@ spice dataset configure
 				cmd.Print("file_format (parquet/csv) (parquet) ")
 				file_format, err := reader.ReadString('\n')
 				if err != nil {
-					cmd.Println(err.Error())
+					slog.Error("Error reading stdin", "error", err)
 					os.Exit(1)
 				}
 				file_format = strings.TrimSuffix(file_format, "\n")
@@ -133,7 +134,7 @@ spice dataset configure
 				}
 
 				if file_format != "parquet" && file_format != "csv" {
-					cmd.Println(aurora.BrightRed("file_format must be either parquet or csv"))
+					slog.Error(fmt.Sprintf("%v\n", aurora.BrightRed("file_format must be either parquet or csv")))
 					os.Exit(1)
 				}
 
@@ -141,10 +142,10 @@ spice dataset configure
 			}
 		}
 
-		cmd.Print("locally accelerate (y/n)? (y) ")
+		slog.Info("locally accelerate (y/n)? (y) ")
 		locallyAccelerateStr, err := reader.ReadString('\n')
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("Error reading stdin", "error", err)
 			os.Exit(1)
 		}
 		locallyAccelerateStr = strings.TrimSuffix(locallyAccelerateStr, "\n")
@@ -167,34 +168,34 @@ spice dataset configure
 
 		datasetBytes, err := yaml.Marshal(dataset)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("marshalling dataset", "error", err)
 			os.Exit(1)
 		}
 
 		dirPath := fmt.Sprintf("datasets/%s", dataset.Name)
 		err = os.MkdirAll(dirPath, 0766)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("creating dataset directory", "error", err)
 			os.Exit(1)
 		}
 
 		filePath := fmt.Sprintf("%s/dataset.yaml", dirPath)
 		err = os.WriteFile(filePath, datasetBytes, 0766)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error(fmt.Sprintf("writing dataset file to %s", filePath), "error", err)
 			os.Exit(1)
 		}
 
 		spicepodBytes, err := os.ReadFile("spicepod.yaml")
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("reading spicepod.yaml", "error", err)
 			os.Exit(1)
 		}
 
 		var spicePod spec.SpicepodSpec
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("parsing spicepod.yaml", "error", err)
 			os.Exit(1)
 		}
 
@@ -212,18 +213,18 @@ spice dataset configure
 			}.ToComponent())
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
-				cmd.Println(err)
+				slog.Error("marshalling spicepod.yaml", "error", err)
 				os.Exit(1)
 			}
 
 			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
 			if err != nil {
-				cmd.Println(err)
+				slog.Error("writing spicepod.yaml", "error", err)
 				os.Exit(1)
 			}
 		}
 
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Saved %s", filePath)))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Saved %s", filePath))))
 	},
 }
 

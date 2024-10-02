@@ -22,6 +22,8 @@ import (
 	"os"
 	"path"
 
+	"log/slog"
+
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -42,16 +44,16 @@ spice add spiceai/quickstart
 	Run: func(cmd *cobra.Command, args []string) {
 		podPath := args[0]
 
-		cmd.Printf("Getting Spicepod %s ...\n", podPath)
+		slog.Info(fmt.Sprintf("Getting Spicepod %s ...\n", podPath))
 
 		r := registry.GetRegistry(podPath)
 		downloadPath, err := r.GetPod(podPath)
 		if err != nil {
 			var itemNotFound *registry.RegistryItemNotFound
 			if errors.As(err, &itemNotFound) {
-				cmd.Printf("No Spicepod found at '%s'.\n", podPath)
+				slog.Error(fmt.Sprintf("No Spicepod found at '%s'.\n", podPath))
 			} else {
-				cmd.Println(err)
+				slog.Error(err.Error())
 			}
 			return
 		}
@@ -63,23 +65,23 @@ spice add spiceai/quickstart
 			if os.IsNotExist(err) {
 				wd, err := os.Getwd()
 				if err != nil {
-					cmd.PrintErrf("Error getting current working directory: %s\n", err.Error())
+					slog.Error("getting current working directory", "error", err)
 					os.Exit(1)
 				}
 				name := path.Base(wd)
 				spicepodPath, err := spicepod.CreateManifest(name, ".")
 				if err != nil {
-					cmd.PrintErrf("Error creating spicepod.yaml: %s\n", err.Error())
+					slog.Error("creating spicepod.yaml", "error", err)
 					os.Exit(1)
 				}
-				cmd.Println(aurora.BrightGreen(fmt.Sprintf("%s initialized!", spicepodPath)))
+				slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("%s initialized!", spicepodPath))))
 				spicepodBytes, err = os.ReadFile("spicepod.yaml")
 				if err != nil {
-					cmd.PrintErrf("Error reading spicepod.yaml: %s\n", err.Error())
+					slog.Error("reading spicepod.yaml", "error", err)
 					os.Exit(1)
 				}
 			} else {
-				cmd.Println(err)
+				slog.Error("reading spicepod.yaml", "error", err)
 				os.Exit(1)
 			}
 		}
@@ -87,7 +89,7 @@ spice add spiceai/quickstart
 		var spicePod spec.SpicepodSpec
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("unmarshalling spicepod.yaml", "error", err)
 			os.Exit(1)
 		}
 
@@ -103,22 +105,22 @@ spice add spiceai/quickstart
 			spicePod.Dependencies = append(spicePod.Dependencies, podPath)
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
-				cmd.Println(err)
+				slog.Error("marshalling spicepod.yaml with dependencies", "error", err)
 				os.Exit(1)
 			}
 
 			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
 			if err != nil {
-				cmd.Println(err)
+				slog.Error("writing spicepod.yaml with dependencies", "error", err)
 				os.Exit(1)
 			}
 		}
 
-		cmd.Printf("Added %s\n", relativePath)
+		slog.Info(fmt.Sprintf("added %s\n", relativePath))
 
 		err = checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
-			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
 	},
 }

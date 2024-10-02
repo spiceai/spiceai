@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"log/slog"
 	"os"
 	"strings"
 
@@ -37,7 +38,7 @@ func Execute() {
 	cobra.OnInitialize(initConfig)
 
 	if err := RootCmd.Execute(); err != nil {
-		RootCmd.Println(err)
+		slog.Error("Error executing command", "error", err)
 		os.Exit(-1)
 	}
 }
@@ -46,10 +47,26 @@ func init() {
 	RootCmd.PersistentFlags().CountVarP(&verbosity.VerbosityCount, "verbose", "v", "Verbose logging")
 	RootCmd.PersistentFlags().BoolVar(&verbosity.VeryVerbose, "very-verbose", false, "Very verbose logging")
 	RootCmd.PersistentFlags().BoolP("help", "h", false, "Print this help message")
+
 }
 
 func initConfig() {
 	viper.SetEnvPrefix("spice")
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
+	initLogLevel()
+}
+
+func initLogLevel() {
+	switch verbosity.GetLevel() {
+	case 0:
+		// Default `spice` with no flags
+		slog.SetLogLoggerLevel(slog.LevelInfo)
+	case 1:
+		// `spice -v`, `spice --verbose`
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	case 2:
+		// `spice -vv`, `spice --very-verbose`
+		slog.SetLogLoggerLevel(util.TRACE_LEVEL)
+	}
 }
