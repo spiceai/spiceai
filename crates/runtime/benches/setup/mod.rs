@@ -252,6 +252,50 @@ fn get_accelerator_indexes(
                     }
                     _ => None,
                 },
+                "tpcds" => match dataset {
+                    "date_dim" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("d_year".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "store_sales" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("ss_item_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("ss_store_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("ss_customer_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("ss_ticket_number".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "item" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("i_item_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("i_manufact_id".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "customer" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("c_current_addr_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("c_customer_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "catalog_sales" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("cs_sold_date_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "date_dim" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("d_year".to_string(), IndexType::Enabled);
+                        indexes.insert("d_date".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "customer_demographics" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("cd_demo_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
