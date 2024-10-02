@@ -93,10 +93,14 @@ mod tests {
     use super::*;
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
-        let pool = SqliteConnectionPoolFactory::new("", Mode::Memory)
-            .build()
-            .await
-            .expect("to build in-memory sqlite connection pool");
+        let pool = SqliteConnectionPoolFactory::new(
+            "",
+            Mode::Memory,
+            std::time::Duration::from_millis(5000),
+        )
+        .build()
+        .await
+        .expect("to build in-memory sqlite connection pool");
         DatasetCheckpoint::init_sqlite(&pool)
             .await
             .expect("Failed to initialize SQLite");
