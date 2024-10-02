@@ -62,6 +62,7 @@ hyper-util = { version = "0.1.6", features = ["service"] }
 indexmap = "2"
 itertools.workspace = true
 keyring = { version = "2.3.2", optional = true }
+lazy_static.workspace = true
 llms = { path = "../llms" }
 logos = "0.14.0"
 mediatype = "0.19.18"
