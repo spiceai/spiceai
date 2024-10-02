@@ -110,8 +110,8 @@ impl ScalarUDFImpl for CosineDistance {
                 }
                 _ => {
                     return exec_err!(
-                    "The cosine_distance function can only accept List/LargeList/FixedSizeList."
-                )
+                        "The cosine_distance function can only accept List/LargeList/FixedSizeList."
+                    )
                 }
             }
         }
