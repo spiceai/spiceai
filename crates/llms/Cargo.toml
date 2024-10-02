@@ -25,6 +25,7 @@ serde = { workspace = true, features = ["derive"] }
 tokenizers = { version = "0.19.1" }
 tracing.workspace = true
 tracing-futures.workspace = true
+text-splitter = "0.16.1"
 
 ## `candle` feature packages
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8", optional = true }

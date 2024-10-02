@@ -18,18 +18,32 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use chrono::{offset::LocalResult, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
-    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
+    graphql::{
+        client::{GraphQLClient, GraphQLQuery, PaginationParameters},
+        provider::GraphQLTableProviderBuilder,
+        FilterPushdownResult, GraphQLOptimizer,
+    },
 };
-use datafusion::datasource::TableProvider;
+use datafusion::{
+    datasource::TableProvider,
+    error::DataFusionError,
+    logical_expr::{Operator, TableProviderFilterPushDown},
+    prelude::Expr,
+    scalar::ScalarValue,
+};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use graphql_parser::query::{Definition, OperationDefinition, Query, SelectionSet};
 use issues::IssuesTableArgs;
+use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::collections::HashMap;
+use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
 use super::{
@@ -97,7 +111,6 @@ impl Github {
         GraphQLClient::new(
             client,
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
-            gql_client_params.query,
             gql_client_params.json_pointer,
             access_token,
             None,
@@ -111,6 +124,7 @@ impl Github {
     async fn create_gql_table_provider(
         &self,
         table_args: Arc<dyn GitHubTableArgs>,
+        optimizer: Option<Arc<dyn GraphQLOptimizer>>,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
@@ -118,10 +132,18 @@ impl Github {
             },
         )?;
 
+        let provider_builder = GraphQLTableProviderBuilder::new(client)
+            .with_schema_transform(github_gql_raw_schema_cast);
+
+        let provider_builder = if let Some(optimizer) = optimizer {
+            provider_builder.with_optimizer(optimizer)
+        } else {
+            provider_builder
+        };
+
         Ok(Arc::new(
-            GraphQLTableProviderBuilder::new(client)
-                .with_schema_transform(github_gql_raw_schema_cast)
-                .build()
+            provider_builder
+                .build(table_args.get_graphql_values().query.as_ref())
                 .await
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
@@ -230,6 +252,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
+    ParameterSpec::connector("query_mode")
+        .description(
+            "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
+        )
+        .default("auto"),
     ParameterSpec::connector("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
@@ -255,6 +282,27 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
+#[derive(PartialEq, Eq)]
+pub(crate) enum GitHubQueryMode {
+    Auto,
+    Search,
+}
+
+impl std::str::FromStr for GitHubQueryMode {
+    type Err = DataConnectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "search" => Ok(Self::Search),
+            s => Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                source: format!("Invalid value for 'github_query_mode' parameter: {s}").into(),
+            }),
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
@@ -268,34 +316,51 @@ impl DataConnector for Github {
         let path = dataset.path().clone();
         let mut parts = path.split('/');
 
+        let query_mode = dataset
+            .params
+            .get("github_query_mode")
+            .map_or("auto", |v| v);
+
+        let query_mode = GitHubQueryMode::from_str(query_mode)?;
+
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
                 let table_args = Arc::new(PullRequestTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    query_mode,
                 });
-                self.create_gql_table_provider(table_args).await
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                )
+                .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                 });
-                self.create_gql_table_provider(table_args).await
+                self.create_gql_table_provider(table_args, None).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
                 let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    query_mode,
                 });
-                self.create_gql_table_provider(table_args).await
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                )
+                .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("stargazers")) => {
                 let table_args = Arc::new(StargazersTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                 });
-                self.create_gql_table_provider(table_args).await
+                self.create_gql_table_provider(table_args, None).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
                 self.create_files_table_provider(owner, repo, parts.next(), dataset)
@@ -336,4 +401,325 @@ pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
         .build()
         .context(super::InvalidGlobPatternSnafu { pattern: input })?;
     Ok(Arc::new(glob_set))
+}
+
+struct GitHubPushdownSupport {
+    ops: Vec<Operator>,
+    remap: Option<&'static str>,
+}
+
+// TODO: add support for LIKE and IN filters, to support columns like assignees, labels, etc
+// TODO: add support for date comparisons to support columns like updated_at, created_at, closed_at, etc
+lazy_static! {
+    static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
+        let mut m = HashMap::new();
+        m.insert(
+            "login",
+            GitHubPushdownSupport {
+                ops: vec![Operator::Eq, Operator::NotEq],
+                remap: Some("author"),
+            },
+        );
+
+        m.insert(
+            "title",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::LikeMatch,
+                    Operator::ILikeMatch,
+                    Operator::NotLikeMatch,
+                    Operator::NotILikeMatch,
+                ],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "state",
+            GitHubPushdownSupport {
+                ops: vec![Operator::Eq, Operator::NotEq],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "body",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::LikeMatch,
+                    Operator::ILikeMatch,
+                    Operator::NotLikeMatch,
+                    Operator::NotILikeMatch,
+                ],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "created_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("created"),
+            },
+        );
+
+        m.insert(
+            "updated_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("updated"),
+            },
+        );
+
+        m.insert(
+            "closed_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("closed"),
+            },
+        );
+
+        m.insert(
+            "merged_at",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remap: Some("merged"),
+            },
+        );
+
+        m
+    };
+}
+
+pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
+    let column_matches = match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
+                (Expr::Column(column), Expr::Literal(value))
+                | (Expr::Literal(value), Expr::Column(column)) => {
+                    Some((column, value, binary_expr.op))
+                }
+                _ => None,
+            }
+        }
+        Expr::Like(like_expr) => match (*like_expr.expr.clone(), *like_expr.pattern.clone()) {
+            (Expr::Column(column), Expr::Literal(value))
+            | (Expr::Literal(value), Expr::Column(column)) => {
+                let op = match (like_expr.negated, like_expr.case_insensitive) {
+                    (false, false) => Operator::LikeMatch,
+                    (true, false) => Operator::NotLikeMatch,
+                    (false, true) => Operator::ILikeMatch,
+                    (true, true) => Operator::NotILikeMatch,
+                };
+
+                Some((column, value, op))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some((column, value, op)) = column_matches {
+        if let Some(column_support) = GITHUB_FILTER_PUSHDOWNS_SUPPORTED.get(column.name.as_str()) {
+            if !column_support.ops.contains(&op) {
+                tracing::debug!("Unsupported operator {op} for column {}", column.name);
+
+                return FilterPushdownResult {
+                    filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                    expr: expr.clone(),
+                    context: None,
+                };
+            }
+
+            let value = match value {
+                ScalarValue::Utf8(Some(v)) => {
+                    if column.name == "state" {
+                        // "state" in GitHub search is odd
+                        // it returns values for CLOSED, MERGED and OPEN
+                        // but you can only search with either closed or open (in lowercase as well)
+                        if v.to_lowercase() == "merged" {
+                            "closed".to_string() // so merged gets remapped to closed
+                                                 // and because the filter is Inexact, we expect the Memtable to do the final filter to find only MERGED items
+                                                 // not the best, but its better filtering than nothing
+                        } else {
+                            v.to_lowercase()
+                        }
+                    } else {
+                        v
+                    }
+                }
+                ScalarValue::TimestampMillisecond(Some(millis), _) => {
+                    let dt = Utc.timestamp_millis_opt(millis);
+                    match dt {
+                        LocalResult::Single(dt) => dt.to_rfc3339(),
+                        _ => {
+                            return FilterPushdownResult {
+                                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                                expr: expr.clone(),
+                                context: None,
+                            }
+                        }
+                    }
+                }
+                _ => value.to_string(),
+            };
+
+            let column_name = if let Some(remap) = column_support.remap {
+                remap
+            } else {
+                column.name.as_str()
+            };
+
+            let neq = match op {
+                Operator::NotEq => "-",
+                _ => "",
+            };
+
+            let modifier = match op {
+                Operator::LtEq => "<=",
+                Operator::Lt => "<",
+                Operator::GtEq => ">=",
+                Operator::Gt => ">",
+                _ => "",
+            };
+
+            let parameter = match column_name {
+                "title" => format!("{value} in:title"),
+                "body" => format!("{value} in:body"),
+                _ => format!("{neq}{column_name}:{modifier}{value}"),
+            };
+
+            return FilterPushdownResult {
+                filter_pushdown: TableProviderFilterPushDown::Inexact,
+                expr: expr.clone(),
+                context: Some(parameter),
+            };
+        }
+    }
+
+    FilterPushdownResult {
+        filter_pushdown: TableProviderFilterPushDown::Unsupported,
+        expr: expr.clone(),
+        context: None,
+    }
+}
+
+pub(crate) fn inject_parameters(
+    filters: &[FilterPushdownResult],
+    query: &mut GraphQLQuery<'_>,
+) -> Result<(), datafusion::error::DataFusionError> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+
+    // only inject filters that aren't unsupported
+    let filters: Vec<&FilterPushdownResult> = filters
+        .iter()
+        .filter(|f| f.filter_pushdown != TableProviderFilterPushDown::Unsupported)
+        .collect();
+
+    // find the search() field leaf in the AST
+    let search_field = query.ast
+            .definitions
+            .iter_mut()
+            .find_map(|def| match def {
+                Definition::Operation(OperationDefinition::Query(Query {
+                    selection_set, ..
+                })) => selection_set.items.iter_mut().find_map(|item| match item {
+                    graphql_parser::query::Selection::Field(field) => {
+                        if field.name == "search" {
+                            Some(field)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }),
+
+                Definition::Operation(OperationDefinition::SelectionSet(SelectionSet {
+                    items,
+                    ..
+                })) => items.iter_mut().find_map(|item| match item {
+                    graphql_parser::query::Selection::Field(field) => {
+                        if field.name == "search" {
+                            Some(field)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .ok_or_else(|| DataFusionError::Execution("GitHub GraphQL query did not contain a 'search()' statement, when one was expected".to_string()))?;
+
+    // get the query: argument from the search() field
+    let query_arg = search_field.arguments.iter_mut().find_map(|arg| {
+            if arg.0 == "query" {
+                Some(arg)
+            } else {
+                None
+            }
+        }).ok_or_else(|| DataFusionError::Execution("GitHub GraphQL query did not contain a 'query' argument in the 'search()' statement, when one was expected".to_string()))?;
+
+    let arg_additions = filters
+        .iter()
+        .map(|filter| {
+            if let Some(context) = &filter.context {
+                format!(" {context}")
+            } else {
+                String::new()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ");
+
+    let query_value = match &query_arg.1 {
+        graphql_parser::query::Value::String(v) => {
+            let v = v.replace('"', "");
+            Ok(format!(r#"{v} {arg_additions}"#))
+        }
+        _ => Err(DataFusionError::Execution(
+            "GitHub GraphQL query 'query' argument was not a string".to_string(),
+        )),
+    }?;
+
+    // now replace the argument in search()
+    *query_arg = (
+        query_arg.0.clone(),
+        graphql_parser::query::Value::String(query_value),
+    );
+
+    // update any change in JSON pointer and pagination parameters
+    let (pagination_parameters, json_pointer) = PaginationParameters::parse(&query.ast);
+    query.pagination_parameters = pagination_parameters;
+    query.json_pointer = json_pointer.map(Arc::from);
+
+    Ok(())
 }

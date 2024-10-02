@@ -9,6 +9,12 @@ on:
   pull_request:
     branches:
       - trunk
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'version.txt'
+      - 'acknowledgements.md'
+
 
   workflow_dispatch:
 

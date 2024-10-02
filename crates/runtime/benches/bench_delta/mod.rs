@@ -34,6 +34,7 @@ pub(crate) async fn run(
             "databricks_delta",
             query_name,
             query,
+            false,
         )
         .await
         {
