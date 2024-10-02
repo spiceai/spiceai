@@ -1,19 +1,3 @@
-/*
-Copyright 2024 The Spice.ai OSS Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 use arrow::array::{
     Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait,
 };
@@ -34,74 +18,46 @@ use core::any::type_name;
 use std::any::Any;
 use std::sync::Arc;
 
-
-macro_rules! make_udf_expr_and_func {
-    ($UDF:ty, $EXPR_FN:ident, $($arg:ident)*, $DOC:expr , $SCALAR_UDF_FN:ident) => {
-        paste::paste! {
-            // "fluent expr_fn" style function
-            #[doc = $DOC]
-            pub fn $EXPR_FN($($arg: datafusion::logical_expr::Expr),*) -> datafusion::logical_expr::Expr {
-                datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                    $SCALAR_UDF_FN(),
-                    vec![$($arg),*],
-                ))
-            }
-            create_func!($UDF, $SCALAR_UDF_FN);
-        }
-    };
-    ($UDF:ty, $EXPR_FN:ident, $DOC:expr , $SCALAR_UDF_FN:ident) => {
-        paste::paste! {
-            // "fluent expr_fn" style function
-            #[doc = $DOC]
-            pub fn $EXPR_FN(arg: Vec<datafusion::logical_expr::Expr>) -> datafusion::logical_expr::Expr {
-                datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                    $SCALAR_UDF_FN(),
-                    arg,
-                ))
-            }
-            create_func!($UDF, $SCALAR_UDF_FN);
-        }
-    };
+/// returns the Euclidean distance between two numeric arrays."]
+pub fn cosine_distance(array: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
+    datafusion::logical_expr::Expr::ScalarFunction(
+        datafusion::logical_expr::expr::ScalarFunction::new_udf(
+            cosine_distance_udf(),
+            vec![array],
+        )
+    )
 }
 
-/// Creates a singleton `ScalarUDF` of the `$UDF` function named `STATIC_$(UDF)` and a
-/// function named `$SCALAR_UDF_FUNC` which returns that function named `STATIC_$(UDF)`.
-///
-/// This is used to ensure creating the list of `ScalarUDF` only happens once.
-///
-/// # Arguments
-/// * `UDF`: name of the [`ScalarUDFImpl`]
-/// * `SCALAR_UDF_FUNC`: name of the function to create (just) the `ScalarUDF`
-///
-/// [`ScalarUDFImpl`]: datafusion::logical_expr::ScalarUDFImpl
-macro_rules! create_func {
-    ($UDF:ty, $SCALAR_UDF_FN:ident) => {
-        paste::paste! {
-            /// Singleton instance of [`$UDF`], ensures the UDF is only created once
-            /// named STATIC_$(UDF). For example `STATIC_ArrayToString`
-            #[allow(non_upper_case_globals)]
-            static [< STATIC_ $UDF >]: std::sync::OnceLock<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> =
-                std::sync::OnceLock::new();
+macro_rules! downcast_arg {
+    ($ARG:expr, $ARRAY_TYPE:ident) => {{
+        $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "could not cast to {}",
+                type_name::<$ARRAY_TYPE>()
+            ))
+        })?
+    }};
+}
 
-            #[doc = concat!("ScalarFunction that returns a [`ScalarUDF`](datafusion::logical_expr::ScalarUDF) for ")]
-            #[doc = stringify!($UDF)]
-            pub fn $SCALAR_UDF_FN() -> std::sync::Arc<datafusion::logical_expr::ScalarUDF> {
-                [< STATIC_ $UDF >]
-                    .get_or_init(|| {
-                        std::sync::Arc::new(datafusion::logical_expr::ScalarUDF::new_from_impl(
-                            <$UDF>::new(),
-                        ))
-                    })
-                    .clone()
-            }
-        }
-    };
+/// Singleton instance of [` CosineDistance`], ensures the UDF is only created once
+/// named STATIC_ CosineDistance. For example `STATIC_ArrayToString`
+#[allow(non_upper_case_globals)]
+static STATIC_CosineDistance: std::sync::OnceLock<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> =
+    std::sync::OnceLock::new();
+
+/// ScalarFunction that returns a [`ScalarUDF`](datafusion::logical_expr::ScalarUDF) for  CosineDistance.
+pub fn cosine_distance_udf() -> std::sync::Arc<datafusion::logical_expr::ScalarUDF> {
+    STATIC_CosineDistance
+        .get_or_init(|| {
+            std::sync::Arc::new(datafusion::logical_expr::ScalarUDF::new_from_impl(
+                < CosineDistance>::new(),
+            ))
+        })
+        .clone()
 }
 
 /// array function wrapper that differentiates between scalar (length 1) and array.
-pub(crate) fn make_scalar_function<F>(
-    inner: F,
-) -> impl Fn(&[ColumnarValue]) -> DataFusionResult<ColumnarValue>
+pub(crate) fn make_scalar_function<F>(inner: F) -> impl Fn(&[ColumnarValue]) -> DataFusionResult<ColumnarValue>
 where
     F: Fn(&[ArrayRef]) -> DataFusionResult<ArrayRef>,
 {
@@ -115,14 +71,12 @@ where
                 ColumnarValue::Array(a) => Some(a.len()),
             });
 
-        let is_scalar = len.is_none();
-
         let args = ColumnarValue::values_to_arrays(args)?;
 
         let result = (inner)(&args);
 
-        if is_scalar {
-            // If all inputs are scalar, keeps output as scalar
+        // If all inputs are scalar, keeps output as scalar
+        if len.is_none() {
             let result = result.and_then(|arr| ScalarValue::try_from_array(&arr, 0));
             result.map(ColumnarValue::Scalar)
         } else {
@@ -131,48 +85,26 @@ where
     }
 }
 
-make_udf_expr_and_func!(
-    ArrayDistance,
-    array_distance,
-    array,
-    "returns the Euclidean distance between two numeric arrays.",
-    array_distance_udf
-);
-
-
-macro_rules! downcast_arg {
-    ($ARG:expr, $ARRAY_TYPE:ident) => {{
-        $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "could not cast to {}",
-                type_name::<$ARRAY_TYPE>()
-            ))
-        })?
-    }};
-}
-
 #[derive(Debug)]
-pub(super) struct ArrayDistance {
+pub(super) struct  CosineDistance {
     signature: Signature,
-    aliases: Vec<String>,
 }
 
-impl ArrayDistance {
+impl  CosineDistance {
     pub fn new() -> Self {
         Self {
             signature: Signature::user_defined(Volatility::Immutable),
-            aliases: vec!["list_distance".to_string()],
         }
     }
 }
 
-impl ScalarUDFImpl for ArrayDistance {
+impl ScalarUDFImpl for  CosineDistance {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn name(&self) -> &str {
-        "array_distance"
+        "cosine_distance"
     }
 
     fn signature(&self) -> &Signature {
@@ -182,19 +114,19 @@ impl ScalarUDFImpl for ArrayDistance {
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
         match arg_types[0] {
             List(_) | LargeList(_) | FixedSizeList(_, _) => Ok(Float64),
-            _ => exec_err!("The array_distance function can only accept List/LargeList/FixedSizeList."),
+            _ => exec_err!("The cosine_distance function can only accept List/LargeList/FixedSizeList."),
         }
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
         if arg_types.len() != 2 {
-            return exec_err!("array_distance expects exactly two arguments");
+            return exec_err!("cosine_distance expects exactly two arguments");
         }
         let mut result = Vec::new();
         for arg_type in arg_types {
             match arg_type {
                 List(_) | LargeList(_) | FixedSizeList(_, _) => result.push(coerced_fixed_size_list_to_list(arg_type)),
-                _ => return exec_err!("The array_distance function can only accept List/LargeList/FixedSizeList."),
+                _ => return exec_err!("The cosine_distance function can only accept List/LargeList/FixedSizeList."),
             }
         }
 
@@ -202,43 +134,39 @@ impl ScalarUDFImpl for ArrayDistance {
     }
 
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        make_scalar_function(array_distance_inner)(args)
-    }
-
-    fn aliases(&self) -> &[String] {
-        &self.aliases
+        make_scalar_function(cosine_distance_inner)(args)
     }
 }
 
-pub fn array_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
+pub fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     if args.len() != 2 {
-        return exec_err!("array_distance expects exactly two arguments");
+        return exec_err!("cosine_distance expects exactly two arguments");
     }
 
     match (&args[0].data_type(), &args[1].data_type()) {
-        (List(_), List(_)) => general_array_distance::<i32>(args),
-        (LargeList(_), LargeList(_)) => general_array_distance::<i64>(args),
+        (List(_), List(_)) => general_cosine_distance::<i32>(args),
+        (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
         (array_type1, array_type2) => {
-            exec_err!("array_distance does not support types '{array_type1:?}' and '{array_type2:?}'")
+            exec_err!("cosine_distance does not support types '{array_type1:?}' and '{array_type2:?}'")
         }
     }
 }
 
-fn general_array_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
+fn general_cosine_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     let list_array1 = as_generic_list_array::<O>(&arrays[0])?;
     let list_array2 = as_generic_list_array::<O>(&arrays[1])?;
 
     let result = list_array1
         .iter()
         .zip(list_array2.iter())
-        .map(|(arr1, arr2)| compute_array_distance(arr1, arr2))
+        .map(|(arr1, arr2)| compute_cosine_distance(arr1, arr2))
         .collect::<DataFusionResult<Float64Array>>()?;
 
     Ok(Arc::new(result) as ArrayRef)
 }
 
 /// Computes the Euclidean distance between two arrays
-fn compute_array_distance(
+fn compute_cosine_distance(
     arr1: Option<ArrayRef>,
     arr2: Option<ArrayRef>,
 ) -> DataFusionResult<Option<f64>> {
