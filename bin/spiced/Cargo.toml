@@ -50,7 +50,6 @@ default = [
   "dremio",
   "clickhouse",
   "sharepoint",
-  "spark",
   "snowflake",
   "ftp",
   "debezium",

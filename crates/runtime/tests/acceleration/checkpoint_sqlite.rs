@@ -85,6 +85,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
         datafusion_table_providers::sql::db_connection_pool::Mode::File,
         JoinPushDown::Disallow,
         vec![],
+        std::time::Duration::from_millis(5000),
     )
     .await
     .expect("connection pool");
