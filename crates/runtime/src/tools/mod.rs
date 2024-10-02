@@ -32,6 +32,9 @@ pub mod options;
 pub trait SpiceModelTool: Sync + Send {
     fn name(&self) -> &str;
     fn description(&self) -> Option<&str>;
+    fn strict(&self) -> Option<bool> {
+        None
+    }
     fn parameters(&self) -> Option<Value>;
     async fn call(
         &self,

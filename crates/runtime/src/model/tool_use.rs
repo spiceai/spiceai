@@ -69,6 +69,7 @@ impl ToolUsingChat {
             .map(|t| ChatCompletionTool {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
+                    strict: t.strict(),
                     name: t.name().to_string(),
                     description: t.description().map(ToString::to_string),
                     parameters: t.parameters(),
