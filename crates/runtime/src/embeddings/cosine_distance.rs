@@ -15,8 +15,8 @@ use datafusion::{
 use std::any::Any;
 use std::sync::Arc;
 
-//! [ScalarUDFImpl] definitions for cosine distance function.
-//! Keep implementation inline with https://github.com/apache/datafusion/blob/main/datafusion/functions-nested/src/distance.rs#L47
+/// [`ScalarUDFImpl`] definitions for cosine distance function.
+/// Keep implementation inline with `<https://github.com/apache/datafusion/blob/main/datafusion/functions-nested/src/distance.rs#L47>`
 
 macro_rules! downcast_arg {
     ($ARG:expr, $ARRAY_TYPE:ident) => {{
