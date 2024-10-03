@@ -357,6 +357,10 @@ impl Chat for ChatWrapper {
         let req = self.prepare_req(req)?;
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
 
+        if let Some(metadata) = &req.metadata {
+            tracing::info!(target: "task_history", metadata = %metadata, "labels");
+        }
+
         match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(resp) => {
                 if let Some(usage) = resp.usage.clone() {
