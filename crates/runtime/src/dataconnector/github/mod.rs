@@ -18,7 +18,7 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use chrono::{offset::LocalResult, TimeZone, Utc};
+use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
@@ -419,6 +419,7 @@ enum GitHubFilterRemap {
 struct GitHubPushdownSupport {
     ops: Vec<Operator>,
     remaps: Option<Vec<GitHubFilterRemap>>,
+    uses_modifiers: bool,
 }
 
 // TODO: add support for LIKE and IN filters, to support columns like assignees, labels, etc
@@ -431,14 +432,7 @@ lazy_static! {
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
                 remaps: Some(vec![GitHubFilterRemap::Column("author")]),
-            },
-        );
-
-        m.insert(
-            "author_name",
-            GitHubPushdownSupport {
-                ops: vec![Operator::Eq],
-                remaps: Some(vec![GitHubFilterRemap::Column("author")]),
+                uses_modifiers: true
             },
         );
 
@@ -453,6 +447,7 @@ lazy_static! {
                     Operator::NotILikeMatch,
                 ],
                 remaps: None,
+                uses_modifiers: false
             },
         );
 
@@ -461,6 +456,7 @@ lazy_static! {
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
                 remaps: None,
+                uses_modifiers: true
             },
         );
 
@@ -475,6 +471,7 @@ lazy_static! {
                     Operator::NotILikeMatch,
                 ],
                 remaps: None,
+                uses_modifiers: false
             },
         );
 
@@ -489,6 +486,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("created")]),
+                uses_modifiers: true
             },
         );
 
@@ -503,6 +501,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("updated")]),
+                uses_modifiers: true
             },
         );
 
@@ -517,6 +516,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("closed")]),
+                uses_modifiers: true
             },
         );
 
@@ -531,6 +531,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("merged")]),
+                uses_modifiers: true
             },
         );
 
@@ -549,6 +550,7 @@ lazy_static! {
                     GitHubFilterRemap::Operator((Operator::GtEq, "since")),
                     GitHubFilterRemap::Operator((Operator::Lt, "until")),
                     GitHubFilterRemap::Operator((Operator::LtEq, "until"))]),
+                uses_modifiers: false
             },
         );
 
@@ -639,7 +641,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                     match dt {
                         LocalResult::Single(dt) => match column_name {
                             "updated" | "created" | "closed" | "merged" => dt.to_rfc3339(),
-                            "since" | "until" => dt.format("%Y-%m-%d").to_string(),
+                            "since" | "until" => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
                             _ => {
                                 return FilterPushdownResult {
                                     filter_pushdown: TableProviderFilterPushDown::Unsupported,
@@ -665,11 +667,11 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 _ => "",
             };
 
-            let modifier = match op {
-                Operator::LtEq => "<=",
-                Operator::Lt => "<",
-                Operator::GtEq => ">=",
-                Operator::Gt => ">",
+            let modifier = match (column_support.uses_modifiers, op) {
+                (true, Operator::LtEq) => "<=",
+                (true, Operator::Lt) => "<",
+                (true, Operator::GtEq) => ">=",
+                (true, Operator::Gt) => ">",
                 _ => "",
             };
 
