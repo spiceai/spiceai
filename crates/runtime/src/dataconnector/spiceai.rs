@@ -48,6 +48,7 @@ use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -126,6 +127,7 @@ impl DataConnectorFactory for SpiceAIFactory {
     fn create(
         &self,
         params: Parameters,
+        metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".into()
@@ -152,17 +154,20 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let mut credentials = Credentials::new("", api_key);
 
-            let metadata_map = match params.get("app_id").expose().ok() {
-                Some(app_id) => {
-                    let mut map = MetadataMap::new();
-                    if let Ok(parsed_app_id) = app_id.parse() {
-                        map.insert("x-spiceai-app-id", parsed_app_id);
-                        credentials = Credentials::new(app_id, api_key);
-                        Some(map)
-                    } else {
-                        None
+            let metadata_map = match metadata {
+                Some(metadata) => match metadata.get("spiceai_app_id") {
+                    Some(app_id) => {
+                        let mut map = MetadataMap::new();
+                        if let Ok(parsed_app_id) = app_id.parse() {
+                            map.insert("x-spiceai-app-id", parsed_app_id);
+                            credentials = Credentials::new(app_id, api_key);
+                            Some(map)
+                        } else {
+                            None
+                        }
                     }
-                }
+                    None => None,
+                },
                 None => None,
             };
 

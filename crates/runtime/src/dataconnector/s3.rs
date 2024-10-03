@@ -24,6 +24,7 @@ use crate::parameters::ParamLookup;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
@@ -100,6 +101,7 @@ impl DataConnectorFactory for S3Factory {
     fn create(
         &self,
         mut params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(endpoint) = params.get("endpoint").expose().ok() {
             if endpoint.ends_with('/') {

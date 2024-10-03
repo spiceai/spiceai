@@ -168,6 +168,7 @@ impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<Hashmap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let dialect = if let Some(sql_dialect) = params.get("sql_dialect").expose().ok() {

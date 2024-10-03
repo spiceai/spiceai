@@ -92,6 +92,7 @@ impl DataConnectorFactory for SparkFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<Hashmap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(params).await {
