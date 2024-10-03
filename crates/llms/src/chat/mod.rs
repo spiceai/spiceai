@@ -35,6 +35,7 @@ use async_openai::{
     },
 };
 
+pub mod nsql;
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
 use indexmap::IndexMap;

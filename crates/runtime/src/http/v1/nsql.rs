@@ -29,13 +29,14 @@ use axum::{
 };
 use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
 use llms::{
-    chat::{Error as ChatError, Result as ChatResult},
+    chat::{nsql::SqlGeneration, Error as ChatError, Result as ChatResult},
     openai::MAX_COMPLETION_TOKENS,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
+use tract_core::downcast_rs::Downcast;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -111,21 +112,34 @@ pub(crate) async fn post(
     tracing::trace!("Running prompt: {nsql_query}");
 
     let model_id = payload.model.clone();
-    let response = match llms.read().await.get(&model_id) {
+
+    let sql_query_result = match llms.read().await.get(&model_id) {
         Some(nql_model) => {
-            let Ok(req) = create_chat_request(model_id, &nsql_query) else {
+
+            let sql_generation_opt: Option<&dyn SqlGeneration> = None; // nql_model.as_ref().as_any().downcast_ref::<Box<dyn SqlGeneration>>();
+
+            let req_result = match sql_generation_opt {
+                Some(sql_gen) => sql_gen.create_request_for_query(&payload.query, &table_create_stms).boxed(),
+                None => create_chat_request(model_id, &nsql_query).boxed(),
+            };
+
+            let Ok(req) = req_result else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error preparing data for NQL model".to_string(),
                 )
                     .into_response();
             };
-            match nql_model.chat_request(req).await {
+            let resp = match nql_model.chat_request(req).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Error running NQL model: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
+            };
+            match sql_generation_opt {
+                Some(sql_gen) => sql_gen.parse_response(resp).boxed(),
+                None => process_response(resp).boxed(),
             }
         }
         None => {
@@ -138,7 +152,7 @@ pub(crate) async fn post(
     };
 
     // Run the SQL from the NSQL model through datafusion.
-    match process_response(response) {
+    match sql_query_result {
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
             tracing::trace!("Running query:\n{cleaned_query}");
