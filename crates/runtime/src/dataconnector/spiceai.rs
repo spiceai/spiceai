@@ -150,13 +150,14 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .get("api_key")
                 .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
-            let credentials = Credentials::new("", api_key);
+            let mut credentials = Credentials::new("", api_key);
 
             let metadata_map = match params.get("app_id").expose().ok() {
                 Some(app_id) => {
                     let mut map = MetadataMap::new();
                     if let Ok(parsed_app_id) = app_id.parse() {
                         map.insert("x-spiceai-app-id", parsed_app_id);
+                        credentials = Credentials::new(app_id, api_key);
                         Some(map)
                     } else {
                         None
