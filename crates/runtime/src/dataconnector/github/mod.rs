@@ -343,7 +343,6 @@ impl DataConnector for Github {
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
-                    query_mode,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,

@@ -15,19 +15,18 @@ limitations under the License.
 */
 
 use super::{
-    commits_inject_parameters, filter_pushdown, inject_parameters, GitHubQueryMode,
-    GitHubTableArgs, GitHubTableGraphQLParams,
+    commits_inject_parameters, filter_pushdown, inject_parameters, GitHubTableArgs,
+    GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::graphql::{client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer};
-use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use datafusion::prelude::Expr;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
-    pub query_mode: GitHubQueryMode,
 }
 
 impl GraphQLOptimizer for CommitsTableArgs {
@@ -35,14 +34,6 @@ impl GraphQLOptimizer for CommitsTableArgs {
         &self,
         expr: &Expr,
     ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
-        if self.query_mode == GitHubQueryMode::Auto {
-            return Ok(FilterPushdownResult {
-                filter_pushdown: TableProviderFilterPushDown::Unsupported,
-                expr: expr.clone(),
-                context: None,
-            });
-        }
-
         Ok(filter_pushdown(expr))
     }
 
@@ -51,10 +42,6 @@ impl GraphQLOptimizer for CommitsTableArgs {
         filters: &[FilterPushdownResult],
         query: &mut GraphQLQuery<'_>,
     ) -> Result<(), datafusion::error::DataFusionError> {
-        if self.query_mode == GitHubQueryMode::Auto {
-            return Ok(());
-        }
-
         inject_parameters("history", commits_inject_parameters, filters, query)
     }
 }
