@@ -26,12 +26,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[cfg(target_os = "windows")]
-use std::os::windows::fs::symlink_file as symlink;
-
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::fs::symlink;
-
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use hf_hub::api::sync::ApiBuilder;
@@ -255,7 +249,9 @@ fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
                 .into(),
             });
         };
-        symlink(abs_path, temp_dir.path().join(name))
+
+        // Hard link so windows can handle it without developer mode.
+        std::fs::hard_link(abs_path, temp_dir.path().join(name))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
     }
