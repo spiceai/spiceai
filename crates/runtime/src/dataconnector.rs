@@ -788,6 +788,7 @@ mod tests {
         fn create(
             &self,
             params: Parameters,
+            _metadata: Option<HashMap<String, String>>,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };

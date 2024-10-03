@@ -23,7 +23,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -93,7 +92,7 @@ impl DataConnectorFactory for SparkFactory {
     fn create(
         &self,
         params: Parameters,
-        _metadata: Option<Hashmap<String, String>>,
+        _metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(params).await {
