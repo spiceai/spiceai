@@ -20,6 +20,7 @@ use axum::{
     Extension, Json,
 };
 use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
+use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -94,11 +95,10 @@ pub(crate) async fn post(
 
     let sql_query_result = match llms.read().await.get(&model_id) {
         Some(nql_model) => {
-            let Ok(req) = nql_model.as_sql().create_request_for_query(
-                &model_id,
-                &payload.query,
-                &table_create_stms,
-            ) else {
+            let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
+            let Ok(req) =
+                sql_gen.create_request_for_query(&model_id, &payload.query, &table_create_stms)
+            else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error preparing data for NQL model".to_string(),
@@ -112,7 +112,7 @@ pub(crate) async fn post(
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             };
-            nql_model.as_sql().parse_response(resp)
+            sql_gen.parse_response(resp)
         }
         None => {
             return (

@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::chat::message_to_mistral;
 
-use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu, Result};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -355,6 +355,9 @@ impl MistralLlama {
 
 #[async_trait]
 impl Chat for MistralLlama {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
     async fn health(&self) -> Result<()> {
         // If [`MistralLlama`] is instantiated successfully, it is healthy.
         Ok(())

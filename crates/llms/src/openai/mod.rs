@@ -89,14 +89,19 @@ impl Openai {
 
 #[async_trait]
 impl Chat for Openai {
-    fn as_sql(&self) -> &dyn SqlGeneration {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
+        tracing::error!(
+            "self.client.config().api_base() ={}",
+            self.client.config().api_base()
+        );
         if self.client.config().api_base() == OPENAI_API_BASE {
-            &StructuredOutputSqlGeneration {}
+            Some(&StructuredOutputSqlGeneration {})
         } else {
-            &JsonSchemaSqlGeneration {}
+            Some(&JsonSchemaSqlGeneration {})
         }
     }
+
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
         let span = tracing::Span::current();
 

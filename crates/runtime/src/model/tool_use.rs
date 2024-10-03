@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use itertools::Itertools;
+use llms::chat::nsql::SqlGeneration;
 use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
@@ -321,6 +322,10 @@ impl Chat for ToolUsingChat {
             }
             None => Ok(resp),
         }
+    }
+
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        self.inner_chat.as_sql()
     }
 }
 

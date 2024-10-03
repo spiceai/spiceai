@@ -32,7 +32,7 @@ impl SqlGeneration for DefaultSqlGeneration {
         create_table_statements: &[String],
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         let prompt = format!(
-            "```SQL\n{table_create_schemas}\n-- Using valid postgres SQL, without comments, answer the following questions for the tables provided above.\n-- {query}",
+            "```SQL\n{table_create_schemas}```\nTask: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional.",
             table_create_schemas=create_table_statements.join("\n")
         );
 
@@ -50,6 +50,13 @@ impl SqlGeneration for DefaultSqlGeneration {
         &self,
         resp: CreateChatCompletionResponse,
     ) -> Result<Option<String>, OpenAIError> {
-        Ok(resp.choices.iter().find_map(|c| c.message.content.clone()))
+        // Often models prefix with '```sql', (since markdown syntax in request). If present, remove.
+        let value = resp
+            .choices
+            .iter()
+            .find_map(|c| c.message.content.clone())
+            .map(|c| c.strip_prefix("```SQL").unwrap_or(c.as_str()).to_string());
+
+        Ok(value)
     }
 }

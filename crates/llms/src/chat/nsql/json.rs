@@ -67,8 +67,9 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
         resp: CreateChatCompletionResponse,
     ) -> Result<Option<String>, OpenAIError> {
         match resp.choices.iter().find_map(|c| c.message.content.clone()) {
-            Some(json_resp) => Self::convert_json_object_to_sql(&json_resp)
-                .map_err(OpenAIError::JSONDeserialize),
+            Some(json_resp) => {
+                Self::convert_json_object_to_sql(&json_resp).map_err(OpenAIError::JSONDeserialize)
+            }
             None => Ok(None),
         }
     }

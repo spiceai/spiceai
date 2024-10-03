@@ -16,7 +16,7 @@ use async_openai::{
     types::{CreateChatCompletionRequest, CreateChatCompletionResponse},
 };
 
-pub(crate) mod default;
+pub mod default;
 pub(crate) mod json;
 pub(crate) mod structured_output;
 

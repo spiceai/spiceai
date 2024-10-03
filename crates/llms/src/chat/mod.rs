@@ -15,7 +15,6 @@ use async_openai::types::ChatCompletionRequestAssistantMessageContent;
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
-use nsql::default::DefaultSqlGeneration;
 use nsql::SqlGeneration;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
@@ -347,9 +346,7 @@ pub fn message_to_mistral(
 
 #[async_trait]
 pub trait Chat: Sync + Send {
-    fn as_sql(&self) -> &dyn SqlGeneration {
-        &DefaultSqlGeneration {}
-    }
+    fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>>;
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
