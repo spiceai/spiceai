@@ -169,7 +169,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let helper = ReplHelper {};
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
-    rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::Abort);
+    rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
     rl.bind_sequence(KeyEvent::new('\t', Modifiers::NONE), rustyline::Cmd::Insert(1, "\t".to_string()));
     rl.set_helper(Some(helper));
     println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
