@@ -85,7 +85,7 @@ opentelemetry-http = { version = "0.25", features = ["reqwest-rustls"] }
 pem = "3.0.4"
 prometheus = "0.13"
 r2d2 = "0.8.10"
-regex = "1.10.3"
+regex = "1.11.0"
 reqwest = {version = "0.12.5", features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31.0", features = ["bundled-decimal"] }
 rustls = "0.23"
