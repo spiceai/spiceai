@@ -1025,7 +1025,7 @@ jobs:
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select * from spiceai.stargazers limit 10"
+            query: "select * from spiceai.stargazers limit 10;"
     
         - name: Stop spice and check logs
           working-directory: test_app
@@ -1129,7 +1129,7 @@ jobs:
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select * from test_mssql_table"
+            query: "select * from test_mssql_table;"
     
         - name: Stop spice and check logs
           working-directory: test_app
