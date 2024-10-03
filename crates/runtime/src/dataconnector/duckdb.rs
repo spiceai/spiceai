@@ -25,10 +25,10 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{any::Any, collections::HashMap};
 
 use super::{
     AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec,
@@ -97,6 +97,7 @@ impl DataConnectorFactory for DuckDBFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory = if let Some(db_path) = params.get("open").expose().ok() {
