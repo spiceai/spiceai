@@ -44,7 +44,7 @@ use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use model::{try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
+use model::{ENABLE_MODEL_SUPPORT_MESSAGE, try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -450,8 +450,11 @@ impl Runtime {
     pub async fn load_components(&self) {
         self.start_extensions().await;
 
-        #[cfg(feature = "models")]
-        self.load_embeddings().await; // Must be loaded before datasets
+        if cfg!(feature = "models") {
+            self.load_embeddings().await; // Must be loaded before datasets
+        } else {
+            tracing::error!("Cannot load embedding models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+        }
 
         let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
             Box::pin(async {
@@ -466,6 +469,8 @@ impl Runtime {
 
         if cfg!(feature = "models") {
             futures.push(Box::pin(self.load_models()));
+        } else {
+            tracing::error!("Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
         }
 
         join_all(futures).await;

@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 
 use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorResult;
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 
 use super::table::EmbeddingTable;
 
@@ -62,7 +63,7 @@ impl EmbeddingConnector {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: dataset.source(),
                 message: format!(
-                "Dataset '{}' expects to use an embedding model, but the runtime is not built with model support. Either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.",
+                "Dataset '{}' expects to use an embedding model, but the runtime is not built with model support. {ENABLE_MODEL_SUPPORT_MESSAGE}",
                 dataset.name
             )});
         }
