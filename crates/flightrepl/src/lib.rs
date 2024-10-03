@@ -117,19 +117,17 @@ impl ConditionalEventHandler for KeyEventHandler {
         _positive: bool,
         ctx: &rustyline::EventContext,
     ) -> Option<rustyline::Cmd> {
-        if let Some(k) = evt.get(0) {
+        evt.get(0).and_then(|k| {
             if *k == KeyEvent::ctrl('C') {
-                if ctx.line().is_empty() {
-                    Some(rustyline::Cmd::EndOfFile)
+                Some(if ctx.line().is_empty() {
+                    rustyline::Cmd::EndOfFile
                 } else {
-                    Some(rustyline::Cmd::Interrupt)
-                }
+                    rustyline::Cmd::Interrupt
+                })
             } else {
                 None
             }
-        } else {
-            None
-        }
+        })
     }
 }
 
