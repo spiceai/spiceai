@@ -267,10 +267,10 @@ impl ChatWrapper {
                 }
                 "store" => {
                     req.store = req.store.or_else(|| serde_json::from_value(value).ok());
-                },
+                }
                 "metadata" => {
                     req.metadata = req.metadata.or_else(|| serde_json::from_value(value).ok());
-                },
+                }
                 "n" => req.n = req.n.or_else(|| serde_json::from_value(value).ok()),
                 "presence_penalty" => {
                     req.presence_penalty = req
