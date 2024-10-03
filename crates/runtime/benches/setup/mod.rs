@@ -253,17 +253,19 @@ fn get_accelerator_indexes(
                     _ => None,
                 },
                 "tpcds" => match dataset {
-                    "date_dim" => {
-                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
-                        indexes.insert("d_year".to_string(), IndexType::Enabled);
-                        Some(indexes)
-                    }
                     "store_sales" => {
                         let mut indexes: HashMap<String, IndexType> = HashMap::new();
                         indexes.insert("ss_item_sk".to_string(), IndexType::Enabled);
                         indexes.insert("ss_store_sk".to_string(), IndexType::Enabled);
                         indexes.insert("ss_customer_sk".to_string(), IndexType::Enabled);
                         indexes.insert("ss_ticket_number".to_string(), IndexType::Enabled);
+                        indexes.insert("ss_hdemo_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "store" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("s_store_name".to_string(), IndexType::Enabled);
+                        indexes.insert("s_zip".to_string(), IndexType::Enabled);
                         Some(indexes)
                     }
                     "item" => {
@@ -276,6 +278,7 @@ fn get_accelerator_indexes(
                         let mut indexes: HashMap<String, IndexType> = HashMap::new();
                         indexes.insert("c_current_addr_sk".to_string(), IndexType::Enabled);
                         indexes.insert("c_customer_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("c_current_hdemo_sk".to_string(), IndexType::Enabled);
                         Some(indexes)
                     }
                     "catalog_sales" => {
