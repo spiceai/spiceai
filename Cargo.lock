@@ -846,8 +846,8 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.23.4"
-source = "git+https://github.com/spiceai/async-openai?rev=9b0f8caa3be0eb97ec35e0abebb31d016821035d#9b0f8caa3be0eb97ec35e0abebb31d016821035d"
+version = "0.24.1"
+source = "git+https://github.com/spiceai/async-openai?rev=e8158e59d7a74e801cbf0148900e8d727bba235d#e8158e59d7a74e801cbf0148900e8d727bba235d"
 dependencies = [
  "async-convert",
  "backoff",
@@ -3215,7 +3215,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b0af91992699ecbf5adf2036a07122578f06150e#b0af91992699ecbf5adf2036a07122578f06150e"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b9cfc4dfe7d328188ccc95312bc9233ef7f80e11#b9cfc4dfe7d328188ccc95312bc9233ef7f80e11"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3232,6 +3232,7 @@ dependencies = [
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
+ "fundu",
  "futures",
  "geo-types",
  "itertools 0.13.0",

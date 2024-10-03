@@ -1,3 +1,6 @@
+-- TODO: Add MySQL enum type back when DucKDB & SQLite accelerator support accelerating arrow dictionary type
+-- https://github.com/spiceai/spiceai/issues/2891
+-- https://github.com/spiceai/spiceai/issues/2889
 CREATE TABLE test_mysql_table (
   id SERIAL PRIMARY KEY,
   col_bit BIT(1),
@@ -17,7 +20,6 @@ CREATE TABLE test_mysql_table (
   col_decimal DECIMAL(10, 2),
   col_unsigned_int INT UNSIGNED,
   col_char CHAR(3),
-  col_enum ENUM('option1', 'option2', 'option3'),
   col_set SET('apple', 'banana', 'cherry'),
   col_json JSON
 );
@@ -40,7 +42,6 @@ INSERT INTO test_mysql_table (
   col_decimal,
   col_unsigned_int,
   col_char,
-  col_enum,
   col_set,
   col_json
 ) VALUES (
@@ -61,7 +62,6 @@ INSERT INTO test_mysql_table (
   1.11,
   10,
   'USA',
-  'option1',
   'apple,banana',
   '{"name": "John", "age": 30, "is_active": true, "balance": 1234.56}'
 );
@@ -84,11 +84,9 @@ INSERT INTO test_mysql_table (
   col_decimal,
   col_unsigned_int,
   col_char,
-  col_enum,
   col_set,
   col_json
 ) VALUES (
-  NULL,
   NULL,
   NULL,
   NULL,

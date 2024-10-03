@@ -313,6 +313,16 @@
         "column"
       ],
       "properties": {
+        "chunking": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EmbeddingChunkConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "column": {
           "type": "string"
         },
@@ -504,6 +514,31 @@
         }
       },
       "additionalProperties": false
+    },
+    "EmbeddingChunkConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "overlap_size": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "target_chunk_size": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "trim_whitespace": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
     },
     "Embeddings": {
       "type": "object",

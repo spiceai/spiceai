@@ -26,7 +26,7 @@ use datafusion_table_providers::{
 };
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, sync::Arc};
+use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
     component::dataset::{
@@ -63,8 +63,13 @@ pub enum Error {
         extension: String,
     },
 
-    #[snafu(display("The \"sqlite_file\" acceleration parameter is a directory."))]
+    #[snafu(display("The \"sqlite_file\" acceleration parameter value is a directory."))]
     InvalidFileIsDirectory,
+
+    #[snafu(display(
+        "The \"busy_timeout\" acceleration parameter value must be a valid duration."
+    ))]
+    InvalidBusyTimeoutValue,
 
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
     AccelerationNotEnabled { dataset: Arc<str> },
@@ -108,6 +113,18 @@ impl SqliteAccelerator {
         )
     }
 
+    /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
+    pub fn sqlite_busy_timeout(&self, dataset: &Dataset) -> Result<Duration> {
+        if let Some(acceleration) = dataset.acceleration.as_ref() {
+            let acceleration_params = acceleration.params.clone();
+            return self
+                .sqlite_factory
+                .sqlite_busy_timeout(&acceleration_params)
+                .map_err(|_| InvalidBusyTimeoutValueSnafu.build());
+        }
+        Ok(Duration::from_millis(5000))
+    }
+
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
     pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
         let sqlite_file = self.sqlite_file_path(dataset);
@@ -124,10 +141,11 @@ impl SqliteAccelerator {
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.map_or_else(|| "".into(), Arc::from);
+        let busy_timeout = self.sqlite_busy_timeout(dataset)?;
 
         let pool = self
             .sqlite_factory
-            .get_or_init_instance(file_path, mode)
+            .get_or_init_instance(file_path, mode, busy_timeout)
             .await
             .boxed()
             .context(AccelerationCreationFailedSnafu)?;
@@ -144,6 +162,7 @@ impl Default for SqliteAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::accelerator("file"),
+    ParameterSpec::runtime("busy_timeout"),
     ParameterSpec::runtime("file_watcher"),
 ];
 
