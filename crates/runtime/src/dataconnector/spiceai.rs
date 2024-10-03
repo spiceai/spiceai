@@ -154,22 +154,17 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let mut credentials = Credentials::new("", api_key);
 
-            let metadata_map = match metadata {
-                Some(metadata) => match metadata.get("spiceai_app_id") {
-                    Some(app_id) => {
+            let metadata_map = metadata
+                .as_ref()
+                .and_then(|m| m.get("spiceai_app_id"))
+                .and_then(|app_id| {
+                    app_id.parse().ok().map(|parsed_app_id| {
                         let mut map = MetadataMap::new();
-                        if let Ok(parsed_app_id) = app_id.parse() {
-                            map.insert("x-spiceai-app-id", parsed_app_id);
-                            credentials = Credentials::new(app_id, api_key);
-                            Some(map)
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                },
-                None => None,
-            };
+                        map.insert("x-spiceai-app-id", parsed_app_id);
+                        credentials = Credentials::new(app_id, api_key);
+                        map
+                    })
+                });
 
             let flight_client = FlightClient::try_new(url, credentials, metadata_map)
                 .await
