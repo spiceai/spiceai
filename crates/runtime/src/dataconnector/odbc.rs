@@ -27,6 +27,7 @@ use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -168,7 +169,7 @@ impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
         params: Parameters,
-        _metadata: Option<Hashmap<String, String>>,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let dialect = if let Some(sql_dialect) = params.get("sql_dialect").expose().ok() {
