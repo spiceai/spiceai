@@ -26,6 +26,7 @@ use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -130,6 +131,7 @@ impl DataConnectorFactory for ClickhouseFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match get_config_from_params(params).await {
