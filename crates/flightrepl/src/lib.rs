@@ -36,9 +36,9 @@ use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
-use rustyline::{Editor, EventHandler, Modifiers};
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Completer, Helper, Highlighter, Hinter, ConditionalEventHandler, KeyEvent};
+use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter, KeyEvent};
+use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
@@ -98,10 +98,10 @@ struct ReplHelper;
 impl Validator for ReplHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         let input = ctx.input();
-        if !input.trim().ends_with(';') {
-            Ok(ValidationResult::Incomplete)
-        } else {
+        if input.trim().ends_with(';') {
             Ok(ValidationResult::Valid(None))
+        } else {
+            Ok(ValidationResult::Incomplete)
         }
     }
 }
@@ -111,19 +111,19 @@ struct KeyEventHandler;
 
 impl ConditionalEventHandler for KeyEventHandler {
     fn handle(
-            &self,
-            evt: &rustyline::Event,
-            _n: rustyline::RepeatCount,
-            _positive: bool,
-            ctx: &rustyline::EventContext,
-        ) -> Option<rustyline::Cmd> {
+        &self,
+        evt: &rustyline::Event,
+        _n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
         if let Some(k) = evt.get(0) {
             if *k == KeyEvent::ctrl('C') {
-                if !ctx.line().is_empty() {
-                    Some(rustyline::Cmd::Interrupt)
-                } else {
+                if ctx.line().is_empty() {
                     Some(rustyline::Cmd::EndOfFile)
-                }  
+                } else {
+                    Some(rustyline::Cmd::Interrupt)
+                }
             } else {
                 None
             }
@@ -170,7 +170,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
-    rl.bind_sequence(KeyEvent::new('\t', Modifiers::NONE), rustyline::Cmd::Insert(1, "\t".to_string()));
+    rl.bind_sequence(
+        KeyEvent::new('\t', Modifiers::NONE),
+        rustyline::Cmd::Insert(1, "\t".to_string()),
+    );
     rl.set_helper(Some(helper));
     println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
