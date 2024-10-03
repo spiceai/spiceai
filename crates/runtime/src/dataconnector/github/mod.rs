@@ -462,7 +462,29 @@ lazy_static! {
         );
 
         m.insert(
+            "author_name",
+            GitHubPushdownSupport {
+                ops: vec![Operator::Eq, Operator::NotEq],
+                remap: Some("author"),
+            },
+        );
+
+        m.insert(
             "title",
+            GitHubPushdownSupport {
+                ops: vec![
+                    Operator::Eq,
+                    Operator::LikeMatch,
+                    Operator::ILikeMatch,
+                    Operator::NotLikeMatch,
+                    Operator::NotILikeMatch,
+                ],
+                remap: None,
+            },
+        );
+
+        m.insert(
+            "message",
             GitHubPushdownSupport {
                 ops: vec![
                     Operator::Eq,
@@ -650,6 +672,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             };
 
             let parameter = match column_name {
+                "message" => value,
                 "title" => format!("{value} in:title"),
                 "body" => format!("{value} in:body"),
                 _ => format!("{neq}{column_name}:{modifier}{value}"),

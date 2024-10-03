@@ -477,6 +477,8 @@ impl TableProvider for GitHubCommitsTableProvider {
             })
             .collect::<Vec<_>>();
 
+        println!("commits parameters {}", parameters.join(" "));
+
         let res = self
             .client
             .search_commits(&self.owner, &self.repo, Some(&parameters.join(" ")))
