@@ -14,31 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, model::LLMModelStore};
-use async_openai::{
-    error::OpenAIError,
-    types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        ResponseFormat, ResponseFormatJsonSchema,
-    },
-};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
 };
 use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
-use llms::{
-    chat::{nsql::SqlGeneration, Error as ChatError, Result as ChatResult},
-    openai::MAX_COMPLETION_TOKENS,
-};
-use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use snafu::ResultExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tract_core::downcast_rs::Downcast;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
