@@ -260,11 +260,17 @@ impl ChatWrapper {
                         .top_logprobs
                         .or_else(|| serde_json::from_value(value).ok());
                 }
-                "max_tokens" => {
-                    req.max_tokens = req
-                        .max_tokens
+                "max_completion_tokens" => {
+                    req.max_completion_tokens = req
+                        .max_completion_tokens
                         .or_else(|| serde_json::from_value(value).ok());
                 }
+                "store" => {
+                    req.store = req.store.or_else(|| serde_json::from_value(value).ok());
+                },
+                "metadata" => {
+                    req.metadata = req.metadata.or_else(|| serde_json::from_value(value).ok());
+                },
                 "n" => req.n = req.n.or_else(|| serde_json::from_value(value).ok()),
                 "presence_penalty" => {
                     req.presence_penalty = req
