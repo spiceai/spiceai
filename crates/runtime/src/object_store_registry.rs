@@ -23,7 +23,10 @@ use datafusion::{
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
 };
-use object_store::{aws::AmazonS3Builder, http::HttpBuilder, ClientOptions, ObjectStore};
+use object_store::{
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, http::HttpBuilder, ClientOptions,
+    ObjectStore, RetryConfig,
+};
 use url::{form_urlencoded::parse, Url};
 
 #[cfg(feature = "ftp")]
@@ -203,6 +206,184 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
+    // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
+    #[allow(clippy::too_many_lines)]
+    fn prepare_azure_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let mut url = url.clone();
+
+        // Rewrite the URL Scheme
+        url.set_scheme("abfss").map_err(|()| {
+            DataFusionError::Configuration(format!(
+                "Unable to set scheme to abfss for URL: {url:?}"
+            ))
+        })?;
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+        url.set_fragment(None);
+        let mut builder = MicrosoftAzureBuilder::from_env();
+
+        if let Some(sas) = params.get("sas_string") {
+            url.set_query(Some(sas));
+        }
+
+        if let Some(use_emulator) = params.get("use_emulator") {
+            let as_bool = use_emulator.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{use_emulator} is not a valid boolean for use_emulator"
+                ))
+            })?;
+            builder = builder.with_use_emulator(as_bool);
+            if !as_bool {
+                builder = builder.with_url(url.to_string());
+            }
+        } else {
+            builder = builder.with_url(url.to_string());
+        }
+
+        builder = builder.with_url(url.to_string());
+
+        if let Some(account) = params.get("account") {
+            builder = builder.with_account(account);
+        }
+
+        if let Some(container_name) = params.get("container_name") {
+            builder = builder.with_container_name(container_name);
+        }
+
+        if let Some(access_key) = params.get("access_key") {
+            builder = builder.with_access_key(access_key);
+        }
+        if let Some(bearer_token) = params.get("bearer_token") {
+            builder = builder.with_bearer_token_authorization(bearer_token);
+        }
+        if let Some(client_id) = params.get("client_id") {
+            builder = builder.with_client_id(client_id);
+        }
+        if let Some(client_secret) = params.get("client_secret") {
+            builder = builder.with_client_secret(client_secret);
+        }
+        if let Some(tenant_id) = params.get("tenant_id") {
+            builder = builder.with_tenant_id(tenant_id);
+        }
+        if let Some(endpoint) = params.get("endpoint") {
+            builder = builder.with_endpoint(endpoint.to_string());
+        }
+
+        if let Some(use_fabric_endpoint) = params.get("use_fabric_endpoint") {
+            let as_bool = use_fabric_endpoint.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{use_fabric_endpoint} is not a valid boolean for use_fabric_endpoint"
+                ))
+            })?;
+            builder = builder.with_use_fabric_endpoint(as_bool);
+        }
+        if let Some(allow_http) = params.get("allow_http") {
+            let as_bool = allow_http.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{allow_http} is not a valid boolean for allow_http"
+                ))
+            })?;
+            builder = builder.with_allow_http(as_bool);
+        }
+        if let Some(authority_host) = params.get("authority_host") {
+            builder = builder.with_authority_host(authority_host);
+        }
+
+        // Retry and backoff configuration
+        let mut retry_config = RetryConfig::default();
+
+        if let Some(retry_timeout) = params.get("retry_timeout") {
+            let as_duration = fundu::parse_duration(retry_timeout).map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{retry_timeout} is not a valid duration for retry_timeout"
+                ))
+            })?;
+            retry_config.retry_timeout = as_duration;
+        }
+        if let Some(max_retries) = params.get("max_retries") {
+            let as_usize = max_retries.parse::<usize>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{max_retries} is not a valid usize for max_retries"
+                ))
+            })?;
+            retry_config.max_retries = as_usize;
+        }
+        if let Some(backoff_initial_duration) = params.get("backoff_initial_duration") {
+            let as_duration = fundu::parse_duration(backoff_initial_duration).map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{backoff_initial_duration} is not a valid duration for backoff_initial_duration"
+                ))
+            })?;
+            retry_config.backoff.init_backoff = as_duration;
+        }
+        if let Some(backoff_max_duration) = params.get("backoff_max_duration") {
+            let as_duration = fundu::parse_duration(backoff_max_duration).map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{backoff_max_duration} is not a valid duration for backoff_max_duration"
+                ))
+            })?;
+            retry_config.backoff.max_backoff = as_duration;
+        }
+        if let Some(backoff_base) = params.get("backoff_base") {
+            let as_f64 = backoff_base.parse::<f64>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{backoff_base} is not a valid f64 for backoff_base"
+                ))
+            })?;
+            retry_config.backoff.base = as_f64;
+        }
+        builder = builder.with_retry(retry_config);
+
+        if let Some(proxy_url) = params.get("proxy_url") {
+            builder = builder.with_proxy_url(proxy_url);
+        }
+        if let Some(proxy_ca_certificate) = params.get("proxy_ca_certificate") {
+            builder = builder.with_proxy_ca_certificate(proxy_ca_certificate);
+        }
+        if let Some(proxy_excludes) = params.get("proxy_excludes") {
+            builder = builder.with_proxy_excludes(proxy_excludes);
+        }
+        if let Some(msi_endpoint) = params.get("msi_endpoint") {
+            builder = builder.with_msi_endpoint(msi_endpoint);
+        }
+        if let Some(federated_token_file) = params.get("federated_token_file") {
+            builder = builder.with_federated_token_file(federated_token_file);
+        }
+
+        if let Some(use_cli) = params.get("use_cli") {
+            let as_bool = use_cli.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{use_cli} is not a valid boolean for use_cli"
+                ))
+            })?;
+            builder = builder.with_use_azure_cli(as_bool);
+        }
+
+        if let Some(skip_signature) = params.get("skip_signature") {
+            let as_bool = skip_signature.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{skip_signature} is not a valid boolean for skip_signature"
+                ))
+            })?;
+            builder = builder.with_skip_signature(as_bool);
+        }
+
+        if let Some(disable_tagging) = params.get("disable_tagging") {
+            let as_bool = disable_tagging.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{disable_tagging} is not a valid boolean for disable_tagging"
+                ))
+            })?;
+            builder = builder.with_disable_tagging(as_bool);
+        }
+
+        let azure_store = Arc::new(builder.build().map_err(DataFusionError::ObjectStore)?);
+
+        Ok(azure_store as Arc<dyn ObjectStore>)
+    }
+
     fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
             return Self::prepare_https_object_store(url);
@@ -210,6 +391,11 @@ impl SpiceObjectStoreRegistry {
         if url.as_str().starts_with("s3://") {
             return Self::prepare_s3_object_store(url);
         }
+
+        if url.as_str().starts_with("abfs://") {
+            return Self::prepare_azure_object_store(url);
+        }
+
         #[cfg(feature = "ftp")]
         if url.as_str().starts_with("ftp://") {
             return Self::prepare_ftp_object_store(url);
@@ -221,9 +407,7 @@ impl SpiceObjectStoreRegistry {
         }
 
         Err(DataFusionError::Execution(format!(
-            "No object store available for: {:?}/{}",
-            url.host_str(),
-            url.path(),
+            "No object store available for: {url:?}"
         )))
     }
 }

@@ -71,7 +71,7 @@ tiberius ={ workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "6.1.1"
 ns_lookup = { path = "../ns_lookup" }
-object_store = { workspace = true, features = ["aws", "http"] }
+object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.19.0"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -126,6 +126,9 @@ bollard = "0.16.1"
 spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
 insta.workspace = true
+azure_storage_blobs = "0.20.0"
+azure_core = "0.20.0"
+azure_storage = "0.20.0"
 
 [features]
 aws-secrets-manager = [

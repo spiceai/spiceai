@@ -59,7 +59,7 @@ use url::{form_urlencoded, Url};
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;
-
+pub mod abfs;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
@@ -299,6 +299,7 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
     register_connector_factory("s3", s3::S3Factory::new_arc()).await;
+    register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
