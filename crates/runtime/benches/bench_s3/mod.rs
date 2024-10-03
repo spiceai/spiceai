@@ -193,7 +193,7 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
                 "spiceai-public-datasets/tpcds/web_site/",
                 "web_site",
             )),
-        _ => unreachable!(),
+        _ => panic!("Only tpcds or tpch benchmark suites are supported"),
     }
 }
 
