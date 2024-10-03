@@ -95,10 +95,14 @@ async fn send_nsql_request(
 #[derive(Completer, Helper, Highlighter, Hinter)]
 struct ReplHelper;
 
+const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
+
 impl Validator for ReplHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         let input = ctx.input();
-        if input.trim().ends_with(';') {
+        if SPECIAL_COMMANDS.contains(&input.to_ascii_lowercase().trim())
+            || input.trim().ends_with(';')
+        {
             Ok(ValidationResult::Valid(None))
         } else {
             Ok(ValidationResult::Incomplete)
