@@ -11,12 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use text_splitter::{ChunkCapacity, ChunkConfig};
 
 #[derive(Debug, Clone)]
-pub struct ChunkingConfig {
+pub struct ChunkingConfig<'a> {
     // The desired size of each chunk, in tokens.
     pub target_chunk_size: usize,
 
@@ -25,6 +23,8 @@ pub struct ChunkingConfig {
 
     // Whether to trim the chunks to remove leading and trailing whitespace.
     pub trim_whitespace: bool,
+
+    pub file_format: Option<&'a str>,
 }
 
 type ChunkIndicesIter<'a> = Box<dyn Iterator<Item = (usize, &'a str)> + 'a>;
@@ -38,37 +38,38 @@ pub trait Chunker: Sync + Send {
     }
 }
 
+enum Splitter {
+    Markdown(text_splitter::MarkdownSplitter<text_splitter::Characters>),
+    Text(text_splitter::TextSplitter<text_splitter::Characters>),
+}
+
 pub struct CharacterSplittingChunker {
-    splitter: Arc<text_splitter::TextSplitter<text_splitter::Characters>>,
+    splitter: Splitter,
 }
 
 impl CharacterSplittingChunker {
     #[must_use]
     pub fn new(cfg: &ChunkingConfig) -> Self {
         let cfg_with_overlap = ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
-            .with_trim(cfg.trim_whitespace)
-            .with_overlap(cfg.overlap_size);
+            .with_trim(cfg.trim_whitespace);
 
-        let split_cfg = if let Ok(overlap_config) = cfg_with_overlap {
-            overlap_config
-        } else {
-            tracing::warn!(
-                "Overlap={} cannot be used with chunking when target_chunk_size={} is set. Overlap will be ignored.",
-                cfg.overlap_size,
-                cfg.target_chunk_size
-            );
-            ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
-                .with_trim(cfg.trim_whitespace)
+        let splitter = match cfg.file_format {
+            Some("md" | ".md") => {
+                Splitter::Markdown(text_splitter::MarkdownSplitter::new(cfg_with_overlap))
+            }
+            _ => Splitter::Text(text_splitter::TextSplitter::new(cfg_with_overlap)),
         };
-        Self {
-            splitter: Arc::new(text_splitter::TextSplitter::new(split_cfg)),
-        }
+
+        Self { splitter }
     }
 }
 
 impl Chunker for CharacterSplittingChunker {
     fn chunk_indices<'a>(&self, text: &'a str) -> ChunkIndicesIter<'a> {
-        let z: Vec<_> = self.splitter.chunk_indices(text).collect();
+        let z: Vec<_> = match &self.splitter {
+            Splitter::Markdown(splitter) => splitter.chunk_indices(text).collect(),
+            Splitter::Text(splitter) => splitter.chunk_indices(text).collect(),
+        };
         Box::new(z.into_iter())
     }
 }
