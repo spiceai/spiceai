@@ -183,22 +183,17 @@ fn to_sendable_stream(
                             ) {
                                 Ok(embedded_batch) => yield Ok(embedded_batch),
                                 Err(e) => {
-                                    tracing::debug!("Failed to construct record batch");
                                     yield Err(DataFusionError::ArrowError(e, None))
                                 },
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("Error when getting embedding columns: {:?}", e);
                             yield Err(DataFusionError::Internal(e.to_string()));
 
                         },
                     };
                 },
-                Err(e) => {
-                    tracing::debug!("Error in underlying base stream");
-                    yield Err(e)
-                },
+                Err(e) => yield Err(e),
             }
         }
     }
@@ -210,14 +205,13 @@ fn construct_record_batch(
     embedding_cols: &HashMap<String, ArrayRef>,
 ) -> Result<RecordBatch, ArrowError> {
     let cols: Vec<ArrayRef> = projected_schema
-        .fields()
+        .flattened_fields()
         .iter()
-        .filter_map(|f| match embedding_cols.get(f.name()).cloned() {
+        .filter_map(|&f| match embedding_cols.get(f.name()).cloned() {
             Some(embedded_col) => Some(embedded_col),
             None => batch.column_by_name(f.name()).cloned(),
         })
         .collect_vec();
-
     RecordBatch::try_new(Arc::clone(projected_schema), cols)
 }
 
@@ -351,10 +345,7 @@ async fn get_vectors_with_chunker(
         .embed(EmbeddingInput::StringArray(chunks))
         .await
         .boxed()?;
-
-    // `model.size()` is a `u32` for for compatibility with `FixedSizeList(FieldRef, i32)`.
-    #[allow(clippy::cast_sign_loss)]
-    let vector_length = model.size() as usize;
+    let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
 
     let mut values = Float32Array::builder(embedded_data.len() * vector_length);
     let mut chunk_values = Int32Array::builder(embedded_data.len() * 2);
@@ -374,11 +365,7 @@ async fn get_vectors_with_chunker(
         values.append_slice(&inner); // I believe this is a clone under the hood.
 
         // Get the length of the last chunk
-        let last_chunk_length = embedded_data
-            .as_slice()
-            .get(curr + chunks_in_row - 1)
-            .map(Vec::len)
-            .unwrap_or_default();
+        let last_chunk_length = embedded_data.as_slice()[curr + chunks_in_row - 1].len();
 
         let inner_offsets = chunk_offsets_to_col_values(
             &chunk_offsets.as_slice()[curr..curr + chunks_in_row],
