@@ -23,6 +23,7 @@ use crate::component::dataset::Dataset;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
@@ -149,6 +150,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
     fn create(
         &self,
         mut params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(sas_token) = params.get("sas_string").expose().ok() {
             if let Some(sas_token) = sas_token.strip_prefix('?') {
