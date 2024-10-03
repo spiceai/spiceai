@@ -196,7 +196,7 @@ fn to_sendable_stream(
                     };
                 },
                 Err(e) => {
-                    tracing::debug!("Error in underlying base stream");
+                    tracing::debug!("Error in underlying base stream: {e:?}");
                     yield Err(e)
                 },
             }
