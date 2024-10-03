@@ -33,6 +33,7 @@ pub(crate) async fn run(
     let test_queries = match bench_name {
         "tpch" => get_test_queries(),
         "tpcds" => {
+            // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             if engine.clone().unwrap_or_default().as_str() == "postgres" {
                 get_postgres_tpcds_test_queries()
             } else {
