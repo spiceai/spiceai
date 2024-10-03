@@ -14,14 +14,49 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{
+    commits_inject_parameters, filter_pushdown, inject_parameters, GitHubQueryMode,
+    GitHubTableArgs, GitHubTableGraphQLParams,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_components::graphql::{client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer};
+use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
+    pub query_mode: GitHubQueryMode,
+}
+
+impl GraphQLOptimizer for CommitsTableArgs {
+    fn filter_pushdown(
+        &self,
+        expr: &Expr,
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
+        if self.query_mode == GitHubQueryMode::Auto {
+            return Ok(FilterPushdownResult {
+                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                expr: expr.clone(),
+                context: None,
+            });
+        }
+
+        Ok(filter_pushdown(expr))
+    }
+
+    fn inject_parameters(
+        &self,
+        filters: &[FilterPushdownResult],
+        query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        if self.query_mode == GitHubQueryMode::Auto {
+            return Ok(());
+        }
+
+        inject_parameters("history", commits_inject_parameters, filters, query)
+    }
 }
 
 impl GitHubTableArgs for CommitsTableArgs {
