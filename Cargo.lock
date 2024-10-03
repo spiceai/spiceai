@@ -5928,6 +5928,7 @@ dependencies = [
  "mistralrs",
  "mistralrs-core",
  "rand",
+ "schemars",
  "serde",
  "serde_json",
  "snafu",

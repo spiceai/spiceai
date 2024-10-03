@@ -36,9 +36,9 @@ use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
-use tract_core::downcast_rs::Downcast;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tract_core::downcast_rs::Downcast;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -62,11 +62,6 @@ pub struct Request {
 
 fn default_model() -> String {
     "nql".to_string()
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct StructuredNsqlOutput {
-    pub sql: String,
 }
 
 pub(crate) async fn post(
@@ -115,15 +110,11 @@ pub(crate) async fn post(
 
     let sql_query_result = match llms.read().await.get(&model_id) {
         Some(nql_model) => {
-
-            let sql_generation_opt: Option<&dyn SqlGeneration> = None; // nql_model.as_ref().as_any().downcast_ref::<Box<dyn SqlGeneration>>();
-
-            let req_result = match sql_generation_opt {
-                Some(sql_gen) => sql_gen.create_request_for_query(&payload.query, &table_create_stms).boxed(),
-                None => create_chat_request(model_id, &nsql_query).boxed(),
-            };
-
-            let Ok(req) = req_result else {
+            let Ok(req) = nql_model.as_sql().create_request_for_query(
+                &model_id,
+                &payload.query,
+                &table_create_stms,
+            ) else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error preparing data for NQL model".to_string(),
@@ -137,10 +128,7 @@ pub(crate) async fn post(
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             };
-            match sql_generation_opt {
-                Some(sql_gen) => sql_gen.parse_response(resp).boxed(),
-                None => process_response(resp).boxed(),
-            }
+            nql_model.as_sql().parse_response(resp)
         }
         None => {
             return (
@@ -171,75 +159,5 @@ pub(crate) async fn post(
             tracing::error!("Error running NSQL model: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
-    }
-}
-
-pub fn create_chat_request(
-    model_id: String,
-    prompt: &str,
-) -> Result<CreateChatCompletionRequest, OpenAIError> {
-    let messages: Vec<ChatCompletionRequestMessage> = vec![
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content("Return JSON, with the requested SQL under 'sql'.")
-            .build()?
-            .into(),
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(prompt)
-            .build()?
-            .into(),
-    ];
-
-    let mut structured_output_schema = serde_json::to_value(schema_for!(StructuredNsqlOutput))
-        .map_err(|e| {
-            OpenAIError::InvalidArgument(format!(
-                "Failed to serialize structured output schema: {e}"
-            ))
-        })?;
-
-    // [`schemars:schema_for`] does not include the `additionalProperties` field when false. Explictly required by some providers (e.g. OpenAI).
-    structured_output_schema["additionalProperties"] = Value::Bool(false);
-
-    tracing::debug!("Structured output schema: {structured_output_schema}");
-
-    CreateChatCompletionRequestArgs::default()
-        .model(model_id)
-        .response_format(ResponseFormat::JsonSchema {
-            json_schema: ResponseFormatJsonSchema {
-                name: "sql_mode".to_string(),
-                description: None,
-                strict: Some(true),
-                schema: Some(structured_output_schema),
-            },
-        })
-        .messages(messages)
-        .max_tokens(MAX_COMPLETION_TOKENS)
-        .build()
-}
-
-pub fn process_response(resp: CreateChatCompletionResponse) -> ChatResult<Option<String>> {
-    if let Some(usage) = resp.usage {
-        if usage.completion_tokens >= u32::from(MAX_COMPLETION_TOKENS) {
-            tracing::warn!(
-                "Completion response may have been cut off after {} tokens",
-                MAX_COMPLETION_TOKENS
-            );
-        }
-    }
-
-    match resp
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_ref())
-    {
-        Some(message) => {
-            match serde_json::from_str(message).boxed() {
-                Ok(StructuredNsqlOutput { sql }) => Ok(Some(sql)),
-                Err(e) => {
-                    tracing::debug!("Failed to deserialize model response into `StructuredNsqlOutput`. Error: {e}");
-                    Err(ChatError::FailedToRunModel { source: e })
-                }
-            }
-        }
-        None => Ok(None),
     }
 }

@@ -11,20 +11,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use snafu::Snafu;
-use async_openai::types::{CreateChatCompletionRequest, CreateChatCompletionResponse};
+use async_openai::{
+    error::OpenAIError,
+    types::{CreateChatCompletionRequest, CreateChatCompletionResponse},
+};
+
+pub(crate) mod default;
+pub(crate) mod json;
+pub(crate) mod structured_output;
 
 /// Additional methods (beyond [`super::Chat`]), whereby a model can provide improved results for SQL code generation.
 pub trait SqlGeneration: Sync + Send {
-    fn create_request_for_query(&self, query: &str, create_table_statements: &[String]) -> Result<CreateChatCompletionRequest>;
+    fn create_request_for_query(
+        &self,
+        model_id: &str,
+        query: &str,
+        create_table_statements: &[String],
+    ) -> Result<CreateChatCompletionRequest, OpenAIError>;
 
-    fn parse_response(&self, resp: CreateChatCompletionResponse) -> Result<Option<String>>;
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to generate SQL code from response: {}", source))]
-    ResponseError { source: Box<dyn std::error::Error + Send + Sync> },
+    fn parse_response(
+        &self,
+        resp: CreateChatCompletionResponse,
+    ) -> Result<Option<String>, OpenAIError>;
 }
