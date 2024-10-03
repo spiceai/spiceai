@@ -21,7 +21,6 @@ use async_openai::{
 
 use super::SqlGeneration;
 
-/// Implementation for [`SqlGeneration`] for [`super::Chat`] models that support [`ResponseFormat::JsonObject`].
 pub struct DefaultSqlGeneration;
 
 impl SqlGeneration for DefaultSqlGeneration {
