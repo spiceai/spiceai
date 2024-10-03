@@ -198,7 +198,6 @@ pub fn create_chat_request(
             },
         })
         .messages(messages)
-        .max_tokens(MAX_COMPLETION_TOKENS)
         .build()
 }
 
