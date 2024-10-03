@@ -173,6 +173,7 @@ fn build_app(
     app
 }
 
+#[allow(clippy::too_many_lines)]
 fn get_accelerator_indexes(
     engine: Option<String>,
     dataset: &str,
