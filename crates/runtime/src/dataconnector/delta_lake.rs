@@ -20,10 +20,10 @@ use data_components::delta_lake::DeltaTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
-use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{any::Any, collections::HashMap};
 
 use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
@@ -101,6 +101,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let delta = DeltaLake::new(params);

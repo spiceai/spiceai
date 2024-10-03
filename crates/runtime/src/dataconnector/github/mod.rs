@@ -269,6 +269,7 @@ impl DataConnectorFactory for GithubFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(Github { params }) as Arc<dyn DataConnector>) })
     }

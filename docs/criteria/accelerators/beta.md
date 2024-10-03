@@ -1,8 +1,6 @@
 # Spice.ai OSS Data Accelerators - Beta Release Criteria
 
-## Description
-
-This doucment defines the set of criteria that is required before a data accelerator is considered to be of Beta quality.
+This document defines the set of criteria that is required before a data accelerator is considered to be of Beta quality.
 
 All criteria must be met for the accelerator to be considered Beta, with exceptions only permitted in some circumstances (e.g. it would be technically infeasible to add a feature/fix a bug for a particular accelerator).
 
@@ -17,7 +15,7 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 ## Beta Release Criteria
 
-### Bug levels
+### Definitions
 
 #### Major Bug
 
@@ -32,6 +30,23 @@ A major bug is classified as a bug that:
 
 A minor bug is any bug that cannot be classified as a major bug.
 
+#### Core Arrow Data Types
+
+Core Arrow Data Types consist of the following data types:
+
+- Null
+- Int/Float/Decimal
+- Time32/64
+- Timestamp/TimestampTZ
+- Date32/64
+- Duration
+- Interval
+- Binary/LargeBinary/FixedSizeBinary
+- Utf8/LargeUtf8
+- List/FixedSizeList/LargeList
+- Struct
+- Decimal128/Decimal256
+
 ### Feature complete
 
 - [ ] Data is streamed when accelerating from source into this accelerator
@@ -41,69 +56,60 @@ A minor bug is any bug that cannot be classified as a major bug.
 - [ ] The accelerator supports federation push down across multiple datasets within the same accelerator (e.g. `select * from first_dataset, second_dataset`)
 - [ ] The accelerator supports resolving on conflict behaviors (e.g. Drop/Upsert)
 - [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
-- [ ] Core Arrow data types are supported:
-  - Null
-  - Int/Float/Decimal
-  - Time32/64
-  - Timestamp/TimestampTZ
-  - Date32/64
-  - Duration
-  - Interval
-  - Binary/LargeBinary/FixedSizeBinary
-  - Utf8/LargeUtf8
-  - List/FixedSizeList/LargeList
-  - Struct
-  - Decimal128/Decimal256
-- [ ] All known [major bugs](#bug-levels) are resolved
+- [ ] [Core Arrow Data Types](#definitions) are supported
+- [ ] All known [Major Bugs](#definitions) are resolved
 
 ### Test Coverage
 
+Beta quality accelerators should be able to run test packages derived from the following:
+
+- [TPC-H](https://www.tpc.org/TPC-H/)
+- [TPC-DS](https://www.tpc.org/TPC-DS/)
+- [ClickBench](https://github.com/ClickHouse/ClickBench)
+
 Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
 
-- Clickhouse: Primary key constraint & index: <https://github.com/ClickHouse/ClickBench/#indexing>
-- TPCH: Primary/foreign key constraints & index
-- TPCDS: Primary/foreign key constraints & index
+When referring to accelerator access modes, "all supported modes" identifies every possible way to use that accelerator. For example, for DuckDB this would be file and memory modes. For PostgreSQL, this would only be the direct database access mode.
 
-- [ ] End-to-end test to cover accelerating TPCH-SF1 data from S3 and benchmarking TPCH queries (official and simple).
-  - [ ] File mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-  - [ ] In-Memory mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-- [ ] End-to-end test to cover accelerating TPCDS-SF1 data from S3 and benchmarking TPCDS queries (official and simple).
-  - [ ] File mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-  - [ ] In-Memory mode should run all queries, and any query failures due to [major bugs](#bug-levels) should be resolved.
-- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with arrow types:
-  - [ ] Null
-  - [ ] All Int types
-  - [ ] All Float types
-  - [ ] Time32
-  - [ ] Time64
-  - [ ] Timestamp (with/without TZ)
-  - [ ] Date32
-  - [ ] Date64
-  - [ ] Duration
-  - [ ] Interval
-  - [ ] Binary/LargeBinary/FixedSizeBinary
-  - [ ] Utf8/LargeUtf8
-  - [ ] List/FixedSizeList/LargeList
-  - [ ] Struct
-  - [ ] Decimal128/Decimal256
+#### General
+
+- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](#definitions)
 - [ ] Integration tests to cover "On Conflict" behaviors.
-- [ ] A reproducible test script that can load a variety of datasets into accelerators in both file/embedded memory mode.
-  - Loads and runs these benchmarks:
-    - [ ] TPCH-SF10 (embedded memory/file)
-    - [ ] TPCH-SF100 (file)
-    - [ ] TPCDS-SF10 (embedded memory/file)
-    - [ ] TPCDS-SF100 (file)
-    - [ ] ClickBench (memory/file)
 
-### Docs
+#### TPC-H
 
-- [ ] Doc/Specification include all required information for a user to set up the accelerator.
-- [ ] Include all known issues/limitations.
-- [ ] Include any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
-- [ ] Easy to follow quickstart.
-- [ ] All remaining [minor](#bug-levels) TPCDS, TPCH and ClickBench bugs are raised as issues.
+- [ ] End-to-end test to cover accelerating TPC-H SF1 data from S3 and benchmarking TPC-H queries (official and simple).
+  - [ ] All supported modes should run all queries with no [Major Bugs](#definitions).
+- [ ] A test script exists that can load TPC-H SF10 and TPC-H SF100 data into this accelerator in all supported modes.
+- [ ] The accelerator can load TPC-H SF10 in all supported modes, and can run all queries with no [Major Bugs](#definitions).
+- [ ] The accelerator can load TPC-H SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](#definitions).
 
-### Data correctness
+#### TPC-DS
 
-- [ ] TPCH SF10 loaded into memory, returned results are identical across source/federated/accelerated queries for all 21 TPCH queries and TPC simple queries.
-- [ ] TPCH SF100 loaded into file, returned results are identical across source/federated/accelerated queries for all 21 TPCH queries and TPC simple queries.
+- [ ] End-to-end test to cover accelerating TPC-DS SF1 data from S3 and benchmarking TPC-DS queries (official and simple).
+  - [ ] All supported modes should run all queries with no [Major Bugs](#definitions).
+- [ ] A test script exists that can load TPC-DS SF10 and TPC-DS SF100 data into this accelerator in all supported modes.
+- [ ] The accelerator can load TPC-DS SF10 in all supported modes, and can run all queries with no [Major Bugs](#definitions).
+- [ ] The accelerator can load TPC-DS SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](#definitions).
+
+#### ClickBench
+
+- [ ] A test script exists that can load ClickBench data into this accelerator in either file or direct database mode.
+- [ ] The accelerator can load ClickBench in either file or direct database mode, and all queries are attempted.
+  - [ ] All query failures should be logged as issues. No bug fixes are required for ClickBench
+
+#### Data correctness
+
+- [ ] TPC-H SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [ ] TPC-H SF100 loaded into file or direct database mode, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [ ] TPC-DS SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-DS queries and TPC-DS simple queries.
+- [ ] TPC-DS SF100 loaded into file or direct database mode, returned results are identical across source and accelerated queries for all TPC-DS queries and TPC-DS simple queries.
+
+### Documentation
+
+- [ ] Documentation includes all information and steps for a user to set up the accelerator.
+- [ ] Documentation includes all known issues/limitations for the accelerator.
+- [ ] Documentation includes any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [ ] The accelerator has an easy to follow quickstart.
+- [ ] All [Minor Bugs](#definitions) for TPC-DS and TPC-H are raised as issues.
+- [ ] All ClickBench bugs are raised as issues.

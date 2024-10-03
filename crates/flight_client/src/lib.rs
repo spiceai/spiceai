@@ -114,6 +114,7 @@ pub struct FlightClient {
     flight_client: FlightServiceClient<Channel>,
     credentials: Credentials,
     url: Arc<str>,
+    metadata: Option<tonic::metadata::MetadataMap>,
 }
 
 impl FlightClient {
@@ -127,7 +128,11 @@ impl FlightClient {
     /// # Errors
     ///
     /// Returns an error if unable to create the `FlightClient`.
-    pub async fn try_new(url: Arc<str>, credentials: Credentials) -> Result<Self> {
+    pub async fn try_new(
+        url: Arc<str>,
+        credentials: Credentials,
+        metadata: Option<tonic::metadata::MetadataMap>,
+    ) -> Result<Self> {
         let flight_channel = tls::new_tls_flight_channel(&url)
             .await
             .context(UnableToConnectToServerSnafu)?;
@@ -138,6 +143,7 @@ impl FlightClient {
                 .max_decoding_message_size(100 * 1024 * 1024),
             credentials,
             url,
+            metadata,
         })
     }
 
@@ -154,7 +160,7 @@ impl FlightClient {
         let token = self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_path(path);
-        let mut req = descriptor.into_request();
+        let mut req = tonic::Request::new(descriptor);
 
         let auth_header_value = match &token {
             Some(token) => format!("Bearer {token}")
@@ -166,6 +172,13 @@ impl FlightClient {
         };
         req.metadata_mut()
             .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let schema_result = self
             .flight_client
@@ -203,6 +216,13 @@ impl FlightClient {
         };
         req.metadata_mut()
             .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let schema_result = self
             .flight_client
@@ -240,6 +260,13 @@ impl FlightClient {
         };
         req.metadata_mut()
             .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let info = self
             .flight_client
@@ -262,6 +289,14 @@ impl FlightClient {
             };
             req.metadata_mut()
                 .insert("authorization", auth_header_value);
+            if let Some(metadata) = &self.metadata {
+                for key_and_value in metadata.iter() {
+                    if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                        req.metadata_mut().insert(key, value.clone());
+                    }
+                }
+            }
+
             let (md, response_stream, _ext) = self
                 .flight_client
                 .clone()
@@ -306,6 +341,13 @@ impl FlightClient {
         };
         req.metadata_mut()
             .insert("authorization", auth_header_value);
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
 
         let (_md, response_stream, _ext) = self
             .flight_client

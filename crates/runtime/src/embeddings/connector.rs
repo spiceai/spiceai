@@ -97,6 +97,7 @@ impl EmbeddingConnector {
                             target_chunk_size: chunk_cfg.target_chunk_size,
                             overlap_size: chunk_cfg.overlap_size,
                             trim_whitespace: chunk_cfg.trim_whitespace,
+                            file_format: dataset.params.get("file_format").map(String::as_str),
                         },
                     )
                 })

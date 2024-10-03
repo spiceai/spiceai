@@ -126,6 +126,7 @@ impl DataConnectorFactory for UnityCatalogFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(UnityCatalog { params }) as Arc<dyn DataConnector>) })
     }
