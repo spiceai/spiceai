@@ -88,7 +88,11 @@ pub trait GraphQLOptimizer: Send + Sync {
     ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
     fn inject_parameters(
         &self,
-        filters: &[FilterPushdownResult],
-        query: &mut GraphQLQuery<'_>,
-    ) -> Result<(), datafusion::error::DataFusionError>;
+        _filters: &[FilterPushdownResult],
+        _query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        Err(datafusion::error::DataFusionError::NotImplemented(
+            "Optimizer does not support parameter injection".to_string(),
+        ))
+    }
 }

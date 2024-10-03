@@ -14,14 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{filter_pushdown, GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_components::graphql::{FilterPushdownResult, GraphQLOptimizer};
+use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
+    pub query_mode: GitHubQueryMode,
+}
+
+impl GraphQLOptimizer for CommitsTableArgs {
+    fn filter_pushdown(
+        &self,
+        expr: &Expr,
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
+        if self.query_mode == GitHubQueryMode::Auto {
+            return Ok(FilterPushdownResult {
+                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                expr: expr.clone(),
+                context: None,
+            });
+        }
+
+        Ok(filter_pushdown(expr))
+    }
 }
 
 impl GitHubTableArgs for CommitsTableArgs {

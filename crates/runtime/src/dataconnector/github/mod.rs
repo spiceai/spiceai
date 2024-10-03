@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use chrono::{offset::LocalResult, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
-    github::{GithubFilesTableProvider, GithubRestClient},
+    github::{GitHubCommitsTableProvider, GithubFilesTableProvider, GithubRestClient},
     graphql::{
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
@@ -160,6 +160,40 @@ impl Github {
         };
 
         Ok(GithubRestClient::new(access_token))
+    }
+
+    pub(crate) fn create_rest_octocrab_client(
+        &self,
+    ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(access_token) = self.params.get("token").expose().ok() else {
+            return Err("Github token not provided".into());
+        };
+
+        GithubRestClient::new(access_token).with_octocrab()
+    }
+
+    fn create_commits_table_provider(
+        &self,
+        commits_args: &Arc<CommitsTableArgs>,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let client =
+            self.create_rest_octocrab_client()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                })?;
+
+        Ok(Arc::new(
+            GitHubCommitsTableProvider::new(
+                client,
+                &commits_args.owner,
+                &commits_args.repo,
+                Arc::clone(commits_args) as Arc<dyn GraphQLOptimizer>,
+            )
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+            })?,
+        ))
     }
 
     async fn create_files_table_provider(
@@ -340,8 +374,14 @@ impl DataConnector for Github {
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    query_mode,
                 });
-                self.create_gql_table_provider(table_args, None).await
+
+                if table_args.query_mode == GitHubQueryMode::Search {
+                    self.create_commits_table_provider(&table_args)
+                } else {
+                    self.create_gql_table_provider(table_args, None).await
+                }
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
                 let table_args = Arc::new(IssuesTableArgs {

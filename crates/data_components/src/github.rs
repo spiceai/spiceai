@@ -19,7 +19,7 @@ use globset::GlobSet;
 use octocrab::{models::commits::Commit, Octocrab, Page};
 use snafu::{ResultExt, Snafu};
 
-use crate::arrow::write::MemTable;
+use crate::{arrow::write::MemTable, graphql::GraphQLOptimizer};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -375,9 +375,11 @@ impl GithubRestClient {
         if let Some(octocrab) = &self.octocrab_client {
             let page = octocrab.search_commits(owner, repo, parameters).await?;
             let mut commits = page.items;
+            println!("{}", commits.len());
 
             while let Some(next_page) = octocrab.get_page(&page.next).await? {
                 commits.extend(next_page.items);
+                println!("{}", commits.len());
             }
 
             let batch = commits_to_record_batch(commits)?;
@@ -389,6 +391,102 @@ impl GithubRestClient {
     }
 }
 
+pub struct GitHubCommitsTableProvider {
+    client: GithubRestClient,
+    owner: Arc<str>,
+    repo: Arc<str>,
+    schema: SchemaRef,
+    optimizer: Arc<dyn GraphQLOptimizer>,
+}
+
+impl GitHubCommitsTableProvider {
+    pub fn new(
+        client: GithubRestClient,
+        owner: &str,
+        repo: &str,
+        optimizer: Arc<dyn GraphQLOptimizer>,
+    ) -> Result<Self> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sha", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("author_name", DataType::Utf8, true),
+            Field::new("author_email", DataType::Utf8, true),
+            Field::new(
+                "committed_date",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("message", DataType::Utf8, true),
+            Field::new("message_body", DataType::Utf8, true),
+            Field::new("message_head_line", DataType::Utf8, true),
+            Field::new("additions", DataType::Int64, true),
+            Field::new("deletions", DataType::Int64, true),
+        ]));
+
+        // TODO: ensure configuration is correct
+
+        Ok(Self {
+            client,
+            owner: owner.into(),
+            repo: repo.into(),
+            schema,
+            optimizer,
+        })
+    }
+}
+
+#[async_trait]
+impl TableProvider for GitHubCommitsTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> std::result::Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        filters
+            .iter()
+            .map(|f| self.optimizer.filter_pushdown(f).map(|r| r.filter_pushdown))
+            .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let parameters = filters
+            .iter()
+            .filter_map(|f| {
+                self.optimizer
+                    .filter_pushdown(f)
+                    .map(|r| r.context)
+                    .ok()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+
+        let res = self
+            .client
+            .search_commits(&self.owner, &self.repo, Some(&parameters.join(" ")))
+            .await?;
+
+        let table = MemTable::try_new(Arc::clone(&self.schema), vec![res])?;
+        table.scan(state, projection, filters, limit).await
+    }
+}
+
 #[async_trait]
 trait CommitSearchExt {
     async fn search_commits(
@@ -396,7 +494,7 @@ trait CommitSearchExt {
         owner: &str,
         repo: &str,
         parameters: Option<&str>,
-    ) -> Result<Page<Commit>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Page<Commit>, DataFusionError>;
 }
 
 #[async_trait]
@@ -406,15 +504,16 @@ impl CommitSearchExt for Octocrab {
         owner: &str,
         repo: &str,
         parameters: Option<&str>,
-    ) -> Result<Page<Commit>, Box<dyn std::error::Error + Send + Sync>> {
-        let query = format!(
-            "repo:{owner}/{repo} {parameters}",
-            parameters = parameters.unwrap_or("")
-        );
+    ) -> Result<Page<Commit>, DataFusionError> {
+        let Some(parameters) = parameters else {
+            return Err(DataFusionError::Execution("No GitHub commit search parameters provided. A commit message search term is required.".to_string()));
+        };
 
-        self.get(format!("/search/commits?q={query}"), None::<&()>)
+        let query = format!("repo:{owner}/{repo} {parameters}",);
+
+        self.get("/search/commits", Some(&[("q", query)]))
             .await
-            .map_err(std::convert::Into::into)
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))
     }
 }
 
@@ -424,7 +523,7 @@ fn commits_to_record_batch(commits: Vec<Commit>) -> Result<RecordBatch> {
     let mut id_builder = StringBuilder::new();
     let mut author_name_builder = StringBuilder::new();
     let mut author_email_builder = StringBuilder::new();
-    let mut committed_date_builder = StringBuilder::new();
+    let mut committed_date_builder = TimestampMillisecondBuilder::new();
     let mut message_builder = StringBuilder::new();
     let mut message_body_builder = StringBuilder::new();
     let mut message_head_line_builder = StringBuilder::new();
@@ -444,7 +543,15 @@ fn commits_to_record_batch(commits: Vec<Commit>) -> Result<RecordBatch> {
         }
 
         if let Some(committer) = commit.commit.committer {
-            committed_date_builder.append_option(committer.date);
+            // parse the ISO8601 date to get out the i64 millis
+            if let Some(Ok(date)) = committer
+                .date
+                .map(|date| chrono::DateTime::parse_from_rfc3339(&date))
+            {
+                committed_date_builder.append_value(date.timestamp_millis());
+            } else {
+                committed_date_builder.append_null();
+            }
         } else {
             committed_date_builder.append_null();
         }
