@@ -416,13 +416,17 @@ enum GitHubFilterRemap {
 }
 
 struct GitHubPushdownSupport {
+    // which operators are permitted to be pushed down
     ops: Vec<Operator>,
+    // if the column name needs to be changed for the query, include a remap
+    // remaps can be operator dependent. For example, the "since" and "until" operators for "committed_date"
     remaps: Option<Vec<GitHubFilterRemap>>,
+    // Whether this query parameter permits the use of modifiers like <, >, -, etc
     uses_modifiers: bool,
 }
 
-// TODO: add support for LIKE and IN filters, to support columns like assignees, labels, etc
-// TODO: add support for date comparisons to support columns like updated_at, created_at, closed_at, etc
+// TODO: add support for IN filters, to support columns like assignees, labels, etc.
+// Table currently doesn't support IN at all though, with or without pushdown, so that needs to be fixed first
 lazy_static! {
     static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
         let mut m = HashMap::new();
