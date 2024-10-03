@@ -22,6 +22,7 @@ use data_components::mssql::{
 };
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
+use std::collections::HashMap;
 use std::num::ParseIntError;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -169,6 +170,7 @@ impl DataConnectorFactory for SqlServerFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(
             async move { Ok(Arc::new(SqlServer::new(&params).await?) as Arc<dyn DataConnector>) },

@@ -262,6 +262,7 @@ pub async fn create_new_connector(
     name: &str,
     params: HashMap<String, SecretString>,
     secrets: Arc<RwLock<Secrets>>,
+    metadata: Option<HashMap<String, String>>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -282,7 +283,7 @@ pub async fn create_new_connector(
         Err(e) => return Some(Err(e)),
     };
 
-    let result = factory.create(params).await;
+    let result = factory.create(params, metadata).await;
     Some(result)
 }
 
@@ -339,6 +340,7 @@ pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
         params: Parameters,
+        metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
     /// The prefix to use for parameters and secrets for this `DataConnector`.
@@ -786,6 +788,7 @@ mod tests {
         fn create(
             &self,
             params: Parameters,
+            _metadata: Option<HashMap<String, String>>,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };
