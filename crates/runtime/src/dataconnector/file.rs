@@ -19,6 +19,7 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -80,6 +81,7 @@ impl DataConnectorFactory for FileFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(File { params }) as Arc<dyn DataConnector>) })
     }
