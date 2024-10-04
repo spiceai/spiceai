@@ -19,8 +19,7 @@ jobs:
 
       - name: Start temporary MySQL server
         run: |
-          docker run --name spice-mysql-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 13306:3306 -d mysql:latest --local-infile=1
-          sleep 10
+          docker run --name spice-mysql-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d mysql:latest --local-infile=1
 
       - name: Install necessary tools
         run: sudo apt-get update && sudo apt-get install -y git make gcc
@@ -46,8 +45,8 @@ jobs:
           for sf in 1; do
             DB_NAME=tpcds_sf${sf//./_}
             DBGEN_SCALE=$sf make tpcds-gen
-            DB_HOST=127.0.0.1 DB_PORT=13306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-init
-            DB_HOST=127.0.0.1 DB_PORT=13306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-load
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-init
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-load
             echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-bench/backup_$DB_NAME.sql
             echo "USE $DB_NAME;" >> mysql-bench/backup_$DB_NAME.sql
             docker exec spice-mysql-bench-temp sh -c "exec mysqldump -u root -proot ${DB_NAME}" >> mysql-bench/backup_$DB_NAME.sql
