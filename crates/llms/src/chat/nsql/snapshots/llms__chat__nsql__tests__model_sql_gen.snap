@@ -1,0 +1,38 @@
+---
+source: crates/llms/src/chat/nsql/mod.rs
+expression: req_str
+---
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Return JSON, with the requested SQL under 'sql'."
+    },
+    {
+      "role": "system",
+      "content": "```SQL\nCREATE TABLE IF NOT EXISTS documents (\n        location VARCHAR NOT NULL,\n        content TEXT NOT NULL\n    );```\nTask: Write a postgres SQL query to answer this question: _\"SELECT * FROM table\"_. Instruction: Return only valid SQL code, nothing additional."
+    }
+  ],
+  "model": "model_id",
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "sql_mode",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "StructuredNsqlOutput",
+        "type": "object"
+      },
+      "strict": true
+    }
+  }
+}
