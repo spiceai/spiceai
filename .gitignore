@@ -46,7 +46,6 @@ venv
 /test/tpc-bench/tmp/
 /test/tpc-bench/tpch-kit
 /test/tpc-bench/tpcds-kit
-/test/tpc-bench/tpch_queries.sql
 
 .vscode/settings.json
 
