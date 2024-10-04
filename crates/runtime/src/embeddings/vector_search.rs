@@ -225,8 +225,8 @@ pub fn table_to_matches(
         .distances
         .iter()
         .flat_map(|v| {
-            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float32Array>() {
-                col.iter().collect::<Vec<Option<f32>>>()
+            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                col.iter().collect::<Vec<Option<f64>>>()
             } else {
                 vec![]
             }
@@ -250,7 +250,7 @@ pub fn table_to_matches(
 
             Ok(Match {
                 value: value.clone(),
-                score: 1.0 / f64::from(*distance),
+                score: 1.0 - *distance,
                 dataset: tbl.to_string(),
                 primary_key: pks.get(i).cloned().unwrap_or_default(),
                 metadata: add_cols.get(i).cloned().unwrap_or_default(),
@@ -316,19 +316,19 @@ impl VectorSearch {
                     SELECT
                         {projection_str},
                         unnest({embedding_column}_offsets) as offsets,
-                        sqrt(array_distance(unnest({embedding_column}_embedding), {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME}
+                        cosine_distance(unnest({embedding_column}_embedding), {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
                     FROM {tbl}
                     {where_str}
-                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
                 ) LIMIT {n}", embed_col=quote_identifier(embedding_column).to_string())
         } else {
             format!(
                     "SELECT
                         {projection_str},
-                        sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME}
+                        cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
                     FROM {tbl}
                     {where_str}
-                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
                     LIMIT {n}"
                 )
         };
