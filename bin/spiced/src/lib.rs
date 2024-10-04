@@ -136,6 +136,10 @@ pub struct Args {
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 
+    /// Disable pods watcher.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub no_pods_watcher: bool,
+
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
@@ -148,7 +152,6 @@ pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let pods_watcher = PodsWatcher::new(current_dir.clone());
     let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
@@ -179,7 +182,7 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
 
-    let rt: Runtime = Runtime::builder()
+    let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
         // User configured extensions
         .with_extensions(extension_factories)
@@ -188,11 +191,15 @@ pub async fn run(args: Args) -> Result<()> {
             "spice_cloud".to_string(),
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
         )]))
-        .with_pods_watcher(pods_watcher)
         .with_datasets_health_monitor()
-        .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
-        .build()
-        .await;
+        .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
+
+    if !args.no_pods_watcher {
+        let pods_watcher = PodsWatcher::new(current_dir.clone());
+        builder = builder.with_pods_watcher(pods_watcher);
+    }
+
+    let rt = builder.build().await;
 
     spiced_tracing::init_tracing(
         &app,
