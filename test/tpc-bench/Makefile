@@ -26,8 +26,8 @@ tpch-init:
 
 tpcds-init:
 	@if [ ! -d "tpcds-kit" ]; then \
-		git clone https://github.com/gregrahn/tpcds-kit.git; \
-		cd tpcds-kit && git checkout 2ec45c5ed97cc860819ee630770231eac738097c; \
+		git clone https://github.com/spiceai/tpcds-kit.git; \
+		cd tpcds-kit && git checkout dd01f906992e1e39837526bffb3f5b759e83b3a8; \
 	fi
 	@OS=`uname`; \
 	if [ -z "$(OS)" ]; then \
