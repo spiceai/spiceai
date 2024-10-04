@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::AppBuilder;
 use runtime::Runtime;
+use spicepod::component::dataset::Dataset;
 
 use crate::results::BenchmarkResultsBuilder;
 
@@ -45,6 +47,34 @@ pub(crate) async fn run(
     }
 
     Ok(())
+}
+
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.customer",
+            "customer",
+        ))
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.lineitem",
+            "lineitem",
+        ))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.part", "part"))
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.partsupp",
+            "partsupp",
+        ))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.orders", "orders"))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.nation", "nation"))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.region", "region"))
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.supplier",
+            "supplier",
+        ))
+}
+
+fn make_spark_dataset(path: &str, name: &str) -> Dataset {
+    Dataset::new(format!("spark:{path}"), name.to_string())
 }
 
 fn get_test_queries() -> Vec<(&'static str, &'static str)> {

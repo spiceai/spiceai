@@ -40,7 +40,9 @@ var versionCmd = &cobra.Command{
 spice version
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		slog.Info(fmt.Sprintf("CLI version:     %s\n", version.Version()))
+
+		// Intentionally without structured logging
+		cmd.Printf("CLI version:     %s\n", version.Version())
 
 		var rtversion string
 		var err error
@@ -62,7 +64,8 @@ spice version
 			}
 		}
 
-		slog.Info(fmt.Sprintf("Runtime version: %s\n", rtversion))
+		// Intentionally without structured logging
+		cmd.Printf("Runtime version: %s\n", rtversion)
 
 		err = checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {

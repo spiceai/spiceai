@@ -44,7 +44,7 @@ arrow-ipc = "53"
 arrow-schema = "53"
 parquet = "53"
 arrow-odbc = "11.2.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "e8158e59d7a74e801cbf0148900e8d727bba235d" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "dc3a2d923cb94347579aaffb3ed64bd06cccba64" }
 async-stream = "0.3.5"
 async-trait = "0.1.77"
 base64 = "0.22.1"
@@ -126,7 +126,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "b1
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "b15debbc4b39614ca4af8564c930d994cbd4752e" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b9cfc4dfe7d328188ccc95312bc9233ef7f80e11" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "826814ab149aad8ee668454c83a0650fb8b18d60" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "5b98603705a381ceeb5cc371e4f606b7332b57ce" }
 
