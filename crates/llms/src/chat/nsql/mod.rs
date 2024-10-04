@@ -44,7 +44,6 @@ pub fn create_prompt(query: &str, create_table_statements: &[String]) -> String 
     )
 }
 
-
 #[cfg(test)]
 mod tests {
 
@@ -61,7 +60,9 @@ mod tests {
 
     #[test]
     fn test_default_create_request_for_query() {
-        let req = DefaultSqlGeneration{}.create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()]).expect("failed to create request");
+        let req = DefaultSqlGeneration {}
+            .create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()])
+            .expect("failed to create request");
         let req_str = serde_json::to_string_pretty(&req).expect("failed to serialize");
 
         insta::assert_snapshot!("sql_gen_default", req_str);
@@ -69,7 +70,9 @@ mod tests {
 
     #[test]
     fn test_json_create_request_for_query() {
-        let req = json::JsonSchemaSqlGeneration{}.create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()]).expect("failed to create request");
+        let req = json::JsonSchemaSqlGeneration {}
+            .create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()])
+            .expect("failed to create request");
         let req_str = serde_json::to_string_pretty(&req).expect("failed to serialize");
 
         insta::assert_snapshot!("sql_gen_json", req_str);
@@ -77,10 +80,11 @@ mod tests {
 
     #[test]
     fn test_structured_output_create_request_for_query() {
-        let req = structured_output::StructuredOutputSqlGeneration{}.create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()]).expect("failed to create request");
+        let req = structured_output::StructuredOutputSqlGeneration {}
+            .create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()])
+            .expect("failed to create request");
         let req_str = serde_json::to_string_pretty(&req).expect("failed to serialize");
 
         insta::assert_snapshot!("sql_gen_structured", req_str);
     }
-
 }

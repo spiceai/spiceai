@@ -40,12 +40,11 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         let prompt = create_prompt(query, create_table_statements);
 
-        let messages: Vec<ChatCompletionRequestMessage> = vec![
-            ChatCompletionRequestSystemMessageArgs::default()
+        let messages: Vec<ChatCompletionRequestMessage> =
+            vec![ChatCompletionRequestSystemMessageArgs::default()
                 .content(prompt)
                 .build()?
-                .into(),
-        ];
+                .into()];
 
         let mut structured_output_schema = serde_json::to_value(schema_for!(StructuredNsqlOutput))
             .map_err(|e| {

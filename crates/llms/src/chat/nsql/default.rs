@@ -51,11 +51,7 @@ impl SqlGeneration for DefaultSqlGeneration {
             .choices
             .iter()
             .find_map(|c| c.message.content.clone())
-            .map(|c| {
-                c.strip_prefix("```SQL")
-                    .unwrap_or(c.as_str())
-                    .to_string()
-            });
+            .map(|c| c.strip_prefix("```SQL").unwrap_or(c.as_str()).to_string());
 
         Ok(value)
     }
