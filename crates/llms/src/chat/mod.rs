@@ -356,7 +356,7 @@ pub trait Chat: Sync + Send {
 
         if let Err(e) = self
             .chat_request(CreateChatCompletionRequest {
-                max_tokens: None,
+                max_completion_tokens: None,
                 messages: vec![ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
                         name: None,

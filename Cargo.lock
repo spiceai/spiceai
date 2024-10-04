@@ -853,7 +853,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.24.1"
-source = "git+https://github.com/spiceai/async-openai?rev=e8158e59d7a74e801cbf0148900e8d727bba235d#e8158e59d7a74e801cbf0148900e8d727bba235d"
+source = "git+https://github.com/spiceai/async-openai?rev=dc3a2d923cb94347579aaffb3ed64bd06cccba64#dc3a2d923cb94347579aaffb3ed64bd06cccba64"
 dependencies = [
  "async-convert",
  "backoff",

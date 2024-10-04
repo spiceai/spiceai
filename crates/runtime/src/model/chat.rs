@@ -260,10 +260,16 @@ impl ChatWrapper {
                         .top_logprobs
                         .or_else(|| serde_json::from_value(value).ok());
                 }
-                "max_tokens" => {
-                    req.max_tokens = req
-                        .max_tokens
+                "max_completion_tokens" => {
+                    req.max_completion_tokens = req
+                        .max_completion_tokens
                         .or_else(|| serde_json::from_value(value).ok());
+                }
+                "store" => {
+                    req.store = req.store.or_else(|| serde_json::from_value(value).ok());
+                }
+                "metadata" => {
+                    req.metadata = req.metadata.or_else(|| serde_json::from_value(value).ok());
                 }
                 "n" => req.n = req.n.or_else(|| serde_json::from_value(value).ok()),
                 "presence_penalty" => {
@@ -350,6 +356,10 @@ impl Chat for ChatWrapper {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let req = self.prepare_req(req)?;
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
+
+        if let Some(metadata) = &req.metadata {
+            tracing::info!(target: "task_history", metadata = %metadata, "labels");
+        }
 
         match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(resp) => {
