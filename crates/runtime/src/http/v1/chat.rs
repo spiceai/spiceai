@@ -52,7 +52,7 @@ pub(crate) async fn post(
                         }
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
-                            tracing::debug!("Error from v1/chat: {e}");
+                            tracing::error!("Error from v1/chat: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
@@ -70,7 +70,7 @@ pub(crate) async fn post(
                         }
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
-                            tracing::debug!("Error from v1/chat: {e}");
+                            tracing::error!("Error from v1/chat: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
