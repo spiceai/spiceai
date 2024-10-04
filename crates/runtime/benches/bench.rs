@@ -192,7 +192,7 @@ async fn run_connector_bench(
     // TODO: Implement and enable connector TPCDS bench if it's required
     if bench_name == "tpcds" {
         return Err(
-            "TPCDS Benchmark not implemented for data connectors, please implement if needed"
+            "TPCDS Benchmark not implemented for data connectors"
                 .to_string(),
         );
     }
