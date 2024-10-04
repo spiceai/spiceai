@@ -483,7 +483,7 @@ impl Chat for MistralLlama {
                 Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
                 Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
-            max_len: req.max_tokens.map(|x| x as usize),
+            max_len: req.max_completion_tokens.map(|x| x as usize),
             // logits_bias: req.logit_bias,
             logits_bias: None,
             n_choices: req.n.unwrap_or(1) as usize,
