@@ -13,9 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 use crate::results::BenchmarkResultsBuilder;
+use app::AppBuilder;
 use runtime::Runtime;
+use spicepod::component::dataset::Dataset;
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -47,6 +48,22 @@ pub(crate) async fn run(
     }
 
     Ok(())
+}
+
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
+        .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
+        .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
+        .with_dataset(make_spiceai_dataset("tpch.part", "part"))
+        .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
+        .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
+        .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
+        .with_dataset(make_spiceai_dataset("tpch.region", "region"))
+        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"))
+}
+
+fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
+    Dataset::new(format!("spice.ai:{path}"), name.to_string())
 }
 
 fn get_test_queries() -> Vec<(&'static str, &'static str)> {
