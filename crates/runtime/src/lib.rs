@@ -798,21 +798,23 @@ impl Runtime {
 
         let source = catalog.provider;
         let params = catalog.params.clone();
-        let data_connector: Arc<dyn DataConnector> =
-            match self.get_dataconnector_from_source(&source, params).await {
-                Ok(data_connector) => data_connector,
-                Err(err) => {
-                    let catalog_name = &catalog.name;
-                    self.status
-                        .update_catalog(catalog_name, status::ComponentStatus::Error);
-                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: catalog_name.clone(),
-                    }
-                    .fail();
+        let data_connector: Arc<dyn DataConnector> = match self
+            .get_dataconnector_from_source(&source, params, None)
+            .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let catalog_name = &catalog.name;
+                self.status
+                    .update_catalog(catalog_name, status::ComponentStatus::Error);
+                metrics::catalogs::LOAD_ERROR.add(1, &[]);
+                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: catalog_name.clone(),
                 }
-            };
+                .fail();
+            }
+        };
 
         Ok(data_connector)
     }
@@ -822,25 +824,28 @@ impl Runtime {
 
         let source = ds.source();
         let params = ds.params.clone();
-        let data_connector: Arc<dyn DataConnector> =
-            match self.get_dataconnector_from_source(&source, params).await {
-                Ok(data_connector) => data_connector,
-                Err(err) => {
-                    let ds_name = &ds.name;
-                    self.status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(
-                        spaced_tracer,
-                        "Error initializing dataset {}. {err}",
-                        ds_name.table()
-                    );
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: ds.name.clone(),
-                    }
-                    .fail();
+        let metadata = ds.metadata.clone();
+        let data_connector: Arc<dyn DataConnector> = match self
+            .get_dataconnector_from_source(&source, params, Some(metadata))
+            .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let ds_name = &ds.name;
+                self.status
+                    .update_dataset(ds_name, status::ComponentStatus::Error);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
+                warn_spaced!(
+                    spaced_tracer,
+                    "Error initializing dataset {}. {err}",
+                    ds_name.table()
+                );
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
                 }
-            };
+                .fail();
+            }
+        };
 
         Ok(data_connector)
     }
@@ -1139,10 +1144,13 @@ impl Runtime {
         &self,
         source: &str,
         params: HashMap<String, String>,
+        metadata: Option<HashMap<String, String>>,
     ) -> Result<Arc<dyn DataConnector>> {
         let secret_map = self.get_params_with_secrets(&params).await;
 
-        match dataconnector::create_new_connector(source, secret_map, self.secrets()).await {
+        match dataconnector::create_new_connector(source, secret_map, self.secrets(), metadata)
+            .await
+        {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,

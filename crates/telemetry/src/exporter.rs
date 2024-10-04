@@ -34,7 +34,7 @@ pub struct AnonymousTelemetryExporter {
 
 impl AnonymousTelemetryExporter {
     pub async fn new(url: Arc<str>) -> Self {
-        let flight_client = match FlightClient::try_new(url, Credentials::anonymous()).await {
+        let flight_client = match FlightClient::try_new(url, Credentials::anonymous(), None).await {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!("Unable to initialize anonymous telemetry: {e}");

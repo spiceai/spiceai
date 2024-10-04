@@ -65,7 +65,7 @@ impl EmbeddingTable {
         base_table: Arc<dyn TableProvider>,
         embedded_columns: HashMap<String, String>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-        embed_chunker_config: HashMap<String, ChunkingConfig>,
+        embed_chunker_config: HashMap<String, ChunkingConfig<'_>>,
     ) -> Self {
         let sizes = Self::precompute_embedding_sizes(&embedded_columns, &embedding_models).await;
         let chunkers = Self::prepare_chunkers(
@@ -110,7 +110,7 @@ impl EmbeddingTable {
 
     /// For a given set of columns that should be chunked (i.e. keys of `cfgs`), prepare the chunkers based on the column's embedding model in [`EmbeddingModelStore`].
     async fn prepare_chunkers(
-        cfgs: HashMap<String, ChunkingConfig>,
+        cfgs: HashMap<String, ChunkingConfig<'_>>,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
         column_to_model: HashMap<String, String>,
     ) -> HashMap<String, Arc<dyn Chunker>> {

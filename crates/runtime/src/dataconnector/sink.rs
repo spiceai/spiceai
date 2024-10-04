@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
-use std::{any::Any, fmt, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, pin::Pin, sync::Arc};
 
 use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
@@ -70,6 +70,7 @@ impl DataConnectorFactory for SinkConnectorFactory {
     fn create(
         &self,
         _params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let schema = Schema::new(vec![Field::new("placeholder", DataType::Utf8, false)]);
