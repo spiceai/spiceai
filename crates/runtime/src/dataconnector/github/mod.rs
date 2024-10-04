@@ -18,7 +18,7 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use chrono::{offset::LocalResult, TimeZone, Utc};
+use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
@@ -36,7 +36,9 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use graphql_parser::query::{Definition, OperationDefinition, Query, SelectionSet};
+use graphql_parser::query::{
+    Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
+};
 use issues::IssuesTableArgs;
 use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
@@ -342,7 +344,11 @@ impl DataConnector for Github {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                 });
-                self.create_gql_table_provider(table_args, None).await
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                )
+                .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
                 let table_args = Arc::new(IssuesTableArgs {
@@ -404,13 +410,23 @@ pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
     Ok(Arc::new(glob_set))
 }
 
-struct GitHubPushdownSupport {
-    ops: Vec<Operator>,
-    remap: Option<&'static str>,
+enum GitHubFilterRemap {
+    Column(&'static str),
+    Operator((Operator, &'static str)),
 }
 
-// TODO: add support for LIKE and IN filters, to support columns like assignees, labels, etc
-// TODO: add support for date comparisons to support columns like updated_at, created_at, closed_at, etc
+struct GitHubPushdownSupport {
+    // which operators are permitted to be pushed down
+    ops: Vec<Operator>,
+    // if the column name needs to be changed for the query, include a remap
+    // remaps can be operator dependent. For example, the "since" and "until" operators for "committed_date"
+    remaps: Option<Vec<GitHubFilterRemap>>,
+    // Whether this query parameter permits the use of modifiers like <, >, -, etc
+    uses_modifiers: bool,
+}
+
+// TODO: add support for IN filters, to support columns like assignees, labels, etc.
+// Table currently doesn't support IN at all though, with or without pushdown, so that needs to be fixed first
 lazy_static! {
     static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
         let mut m = HashMap::new();
@@ -418,7 +434,8 @@ lazy_static! {
             "login",
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
-                remap: Some("author"),
+                remaps: Some(vec![GitHubFilterRemap::Column("author")]),
+                uses_modifiers: true
             },
         );
 
@@ -432,7 +449,8 @@ lazy_static! {
                     Operator::NotLikeMatch,
                     Operator::NotILikeMatch,
                 ],
-                remap: None,
+                remaps: None,
+                uses_modifiers: false
             },
         );
 
@@ -440,7 +458,8 @@ lazy_static! {
             "state",
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
-                remap: None,
+                remaps: None,
+                uses_modifiers: true
             },
         );
 
@@ -454,7 +473,8 @@ lazy_static! {
                     Operator::NotLikeMatch,
                     Operator::NotILikeMatch,
                 ],
-                remap: None,
+                remaps: None,
+                uses_modifiers: false
             },
         );
 
@@ -468,7 +488,8 @@ lazy_static! {
                     Operator::Gt,
                     Operator::GtEq,
                 ],
-                remap: Some("created"),
+                remaps: Some(vec![GitHubFilterRemap::Column("created")]),
+                uses_modifiers: true
             },
         );
 
@@ -482,7 +503,8 @@ lazy_static! {
                     Operator::Gt,
                     Operator::GtEq,
                 ],
-                remap: Some("updated"),
+                remaps: Some(vec![GitHubFilterRemap::Column("updated")]),
+                uses_modifiers: true
             },
         );
 
@@ -496,7 +518,8 @@ lazy_static! {
                     Operator::Gt,
                     Operator::GtEq,
                 ],
-                remap: Some("closed"),
+                remaps: Some(vec![GitHubFilterRemap::Column("closed")]),
+                uses_modifiers: true
             },
         );
 
@@ -510,7 +533,27 @@ lazy_static! {
                     Operator::Gt,
                     Operator::GtEq,
                 ],
-                remap: Some("merged"),
+                remaps: Some(vec![GitHubFilterRemap::Column("merged")]),
+                uses_modifiers: true
+            },
+        );
+
+        m.insert(
+            "committed_date",
+            GitHubPushdownSupport {
+                // e.g. committed_date > '2024-09-14'
+                ops: vec![
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                ],
+                remaps: Some(vec![
+                    GitHubFilterRemap::Operator((Operator::Gt, "since")),
+                    GitHubFilterRemap::Operator((Operator::GtEq, "since")),
+                    GitHubFilterRemap::Operator((Operator::Lt, "until")),
+                    GitHubFilterRemap::Operator((Operator::LtEq, "until"))]),
+                uses_modifiers: false
             },
         );
 
@@ -518,6 +561,7 @@ lazy_static! {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     let column_matches = match expr {
         Expr::BinaryExpr(binary_expr) => {
@@ -558,6 +602,26 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 };
             }
 
+            let column_name = if let Some(remaps) = &column_support.remaps {
+                let mut column_name: Option<&str> = None;
+                for remap in remaps {
+                    match remap {
+                        GitHubFilterRemap::Column(remap_column) => {
+                            column_name = Some(remap_column);
+                        }
+                        GitHubFilterRemap::Operator((remap_op, remap_column)) => {
+                            if *remap_op == op {
+                                column_name = Some(remap_column);
+                            }
+                        }
+                    }
+                }
+
+                column_name.unwrap_or(column.name.as_str())
+            } else {
+                column.name.as_str()
+            };
+
             let value = match value {
                 ScalarValue::Utf8(Some(v)) => {
                     if column.name == "state" {
@@ -578,7 +642,17 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 ScalarValue::TimestampMillisecond(Some(millis), _) => {
                     let dt = Utc.timestamp_millis_opt(millis);
                     match dt {
-                        LocalResult::Single(dt) => dt.to_rfc3339(),
+                        LocalResult::Single(dt) => match column_name {
+                            "updated" | "created" | "closed" | "merged" => dt.to_rfc3339(),
+                            "since" | "until" => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
+                            _ => {
+                                return FilterPushdownResult {
+                                    filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                                    expr: expr.clone(),
+                                    context: None,
+                                }
+                            }
+                        },
                         _ => {
                             return FilterPushdownResult {
                                 filter_pushdown: TableProviderFilterPushDown::Unsupported,
@@ -591,22 +665,16 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 _ => value.to_string(),
             };
 
-            let column_name = if let Some(remap) = column_support.remap {
-                remap
-            } else {
-                column.name.as_str()
-            };
-
             let neq = match op {
                 Operator::NotEq => "-",
                 _ => "",
             };
 
-            let modifier = match op {
-                Operator::LtEq => "<=",
-                Operator::Lt => "<",
-                Operator::GtEq => ">=",
-                Operator::Gt => ">",
+            let modifier = match (column_support.uses_modifiers, op) {
+                (true, Operator::LtEq) => "<=",
+                (true, Operator::Lt) => "<",
+                (true, Operator::GtEq) => ">=",
+                (true, Operator::Gt) => ">",
                 _ => "",
             };
 
@@ -631,57 +699,12 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     }
 }
 
-pub(crate) fn inject_parameters(
-    filters: &[FilterPushdownResult],
-    query: &mut GraphQLQuery<'_>,
+pub(crate) fn search_inject_parameters(
+    field: &mut graphql_parser::query::Field<'_, String>,
+    filters: &[&FilterPushdownResult],
 ) -> Result<(), datafusion::error::DataFusionError> {
-    if filters.is_empty() {
-        return Ok(());
-    }
-
-    // only inject filters that aren't unsupported
-    let filters: Vec<&FilterPushdownResult> = filters
-        .iter()
-        .filter(|f| f.filter_pushdown != TableProviderFilterPushDown::Unsupported)
-        .collect();
-
-    // find the search() field leaf in the AST
-    let search_field = query.ast
-            .definitions
-            .iter_mut()
-            .find_map(|def| match def {
-                Definition::Operation(OperationDefinition::Query(Query {
-                    selection_set, ..
-                })) => selection_set.items.iter_mut().find_map(|item| match item {
-                    graphql_parser::query::Selection::Field(field) => {
-                        if field.name == "search" {
-                            Some(field)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }),
-
-                Definition::Operation(OperationDefinition::SelectionSet(SelectionSet {
-                    items,
-                    ..
-                })) => items.iter_mut().find_map(|item| match item {
-                    graphql_parser::query::Selection::Field(field) => {
-                        if field.name == "search" {
-                            Some(field)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }),
-                _ => None,
-            })
-            .ok_or_else(|| DataFusionError::Execution("GitHub GraphQL query did not contain a 'search()' statement, when one was expected".to_string()))?;
-
     // get the query: argument from the search() field
-    let query_arg = search_field.arguments.iter_mut().find_map(|arg| {
+    let query_arg = field.arguments.iter_mut().find_map(|arg| {
             if arg.0 == "query" {
                 Some(arg)
             } else {
@@ -716,6 +739,111 @@ pub(crate) fn inject_parameters(
         query_arg.0.clone(),
         graphql_parser::query::Value::String(query_value),
     );
+
+    Ok(())
+}
+
+pub(crate) fn commits_inject_parameters(
+    field: &mut graphql_parser::query::Field<'_, String>,
+    filters: &[&FilterPushdownResult],
+) -> Result<(), datafusion::error::DataFusionError> {
+    for filter in filters {
+        if let Some(context) = &filter.context {
+            let Some((column, value)) = context.split_once(':') else {
+                return Err(DataFusionError::Execution(
+                    "GitHub GraphQL query argument was not in the expected format of '<column>:<value>'".to_string(),
+                ));
+            };
+
+            field.arguments.push((
+                column.to_string(),
+                graphql_parser::query::Value::String::<String>(value.to_string()),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn inject_parameters<F>(
+    target_field_name: &str,
+    field_modifier: F,
+    filters: &[FilterPushdownResult],
+    query: &mut GraphQLQuery<'_>,
+) -> Result<(), datafusion::error::DataFusionError>
+where
+    F: Fn(
+        &mut graphql_parser::query::Field<'_, String>,
+        &[&FilterPushdownResult],
+    ) -> Result<(), datafusion::error::DataFusionError>,
+{
+    if filters.is_empty() {
+        return Ok(());
+    }
+
+    // only inject filters that aren't unsupported
+    let filters: Vec<&FilterPushdownResult> = filters
+        .iter()
+        .filter(|f| f.filter_pushdown != TableProviderFilterPushDown::Unsupported)
+        .collect();
+
+    // find the history() field leaf in the AST
+    let mut all_selections: Vec<&mut Selection<'_, String>> = Vec::new();
+    for def in &mut query.ast.definitions {
+        let selections = match def {
+            Definition::Operation(OperationDefinition::Query(Query { selection_set, .. })) => {
+                &mut selection_set.items
+            }
+            Definition::Operation(OperationDefinition::SelectionSet(SelectionSet {
+                items,
+                ..
+            })) => items,
+            _ => continue,
+        };
+
+        all_selections.extend(selections.iter_mut());
+    }
+
+    let mut target_field = None;
+    // loop over inner selection sets to find the target field if it's deep in a nest
+    loop {
+        let Some(selection) = all_selections.pop() else {
+            break;
+        };
+
+        match selection {
+            graphql_parser::query::Selection::InlineFragment(InlineFragment {
+                selection_set,
+                ..
+            }) => {
+                selection_set
+                    .items
+                    .iter_mut()
+                    .for_each(|item| all_selections.push(item));
+            }
+            graphql_parser::query::Selection::Field(field) => {
+                if field.name == target_field_name {
+                    target_field = Some(field);
+                    break;
+                }
+
+                field
+                    .selection_set
+                    .items
+                    .iter_mut()
+                    .for_each(|item| all_selections.push(item));
+            }
+            graphql_parser::query::Selection::FragmentSpread(_) => continue,
+        }
+    }
+
+    let target_field = target_field.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "GitHub GraphQL query did not contain a '{target_field_name}()' statement, when one was expected"
+        ))
+    })?;
+
+    field_modifier(target_field, &filters)?;
 
     // update any change in JSON pointer and pagination parameters
     let (pagination_parameters, json_pointer) = PaginationParameters::parse(&query.ast);
