@@ -18,7 +18,7 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
+use chrono::{offset::LocalResult, NaiveDate, SecondsFormat, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
@@ -569,6 +569,50 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                 (Expr::Column(column), Expr::Literal(value))
                 | (Expr::Literal(value), Expr::Column(column)) => {
                     Some((column, value, binary_expr.op))
+                }
+                (Expr::Cast(left_cast), Expr::Cast(right_cast)) => {
+                    // we only support casts for Timestamps, anything else is an unsupported filter
+                    let (timestamp_cast, column) =
+                        match (*left_cast.expr.clone(), *right_cast.expr.clone()) {
+                            (Expr::Literal(_), Expr::Column(column)) => (left_cast, column),
+                            (Expr::Column(column), Expr::Literal(_)) => (right_cast, column),
+                            _ => {
+                                println!("{expr}");
+                                return FilterPushdownResult {
+                                    filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                                    expr: expr.clone(),
+                                    context: None,
+                                };
+                            }
+                        };
+
+                    match *timestamp_cast.expr.clone() {
+                        Expr::Literal(value) => {
+                            if let ScalarValue::Utf8(Some(v)) = value {
+                                // value is a string, we need to convert it to a timestamp
+                                println!("{v}");
+                                let dt = NaiveDate::parse_from_str(&v, "%m/%d/%Y");
+                                println!("{dt:?}");
+                                if let Ok(dt) = dt {
+                                    dt.and_hms_opt(0, 0, 0).map(|dt| {
+                                        (
+                                            column,
+                                            ScalarValue::TimestampMillisecond(
+                                                Some(dt.and_utc().timestamp_millis()),
+                                                None,
+                                            ),
+                                            binary_expr.op,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
                 }
                 _ => None,
             }
