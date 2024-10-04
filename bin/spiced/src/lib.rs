@@ -136,9 +136,9 @@ pub struct Args {
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 
-    /// Disable pods watcher.
-    #[arg(long, env, action = ArgAction::SetTrue)]
-    pub no_pods_watcher: bool,
+    /// Enable pods watcher (disabled by default).
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
+    pub pods_watcher_enabled: bool,
 
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -194,7 +194,7 @@ pub async fn run(args: Args) -> Result<()> {
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
 
-    if !args.no_pods_watcher {
+    if args.pods_watcher_enabled {
         let pods_watcher = PodsWatcher::new(current_dir.clone());
         builder = builder.with_pods_watcher(pods_watcher);
     }
