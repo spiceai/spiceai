@@ -24,19 +24,19 @@ jobs:
       - name: Install necessary tools
         run: sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
 
-      # - name: Initialize TPCH data
-      #   working-directory: ./test/tpc-bench
-      #   run: |
-      #     make tpch-init
-      #     for sf in 0.01 1; do
-      #       DB_NAME=tpch_sf${sf//./_}
-      #       DBGEN_SCALE=$sf make tpch-gen
-      #       DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME ADD_INDEXES=true make mysql-init
-      #       DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-load
-      #       echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-bench/backup_$DB_NAME.sql
-      #       echo "USE $DB_NAME;" >> mysql-bench/backup_$DB_NAME.sql
-      #       docker exec spice-mysql-bench-temp sh -c "exec mysqldump -u root -proot ${DB_NAME}" >> mysql-bench/backup_$DB_NAME.sql
-      #     done
+      - name: Initialize TPCH data
+        working-directory: ./test/tpc-bench
+        run: |
+          make tpch-init
+          for sf in 0.01 1; do
+            DB_NAME=tpch_sf${sf//./_}
+            DBGEN_SCALE=$sf make tpch-gen
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME ADD_INDEXES=true make mysql-init
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-load
+            echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-bench/backup_$DB_NAME.sql
+            echo "USE $DB_NAME;" >> mysql-bench/backup_$DB_NAME.sql
+            docker exec spice-mysql-bench-temp sh -c "exec mysqldump -u root -proot ${DB_NAME}" >> mysql-bench/backup_$DB_NAME.sql
+          done
 
       - name: Initialize TPCDS data
         working-directory: ./test/tpc-bench
