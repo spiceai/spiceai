@@ -33,8 +33,10 @@ tpcds-init:
 	if [ -z "$(OS)" ]; then \
 		if [ "$$OS" = "Linux" ]; then \
 			OS=LINUX; \
+			$(MAKE) -C CC=gcc-9 tpcds-kit/tools OS=$$OS; \
 		elif [ "$$OS" = "Darwin" ]; then \
 			OS=MACOS; \
+			$(MAKE) -C tpcds-kit/tools OS=$$OS; \
 		else \
 			echo "Unsupported operating system: $$OS."; \
 			exit 1; \
