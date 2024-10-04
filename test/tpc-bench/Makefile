@@ -33,7 +33,7 @@ tpcds-init:
 	if [ -z "$(OS)" ]; then \
 		if [ "$$OS" = "Linux" ]; then \
 			OS=LINUX; \
-			$(MAKE) -C CC=gcc-9 tpcds-kit/tools OS=$$OS; \
+			$(MAKE) -C tpcds-kit/tools CC=gcc-9 OS=$$OS; \
 		elif [ "$$OS" = "Darwin" ]; then \
 			OS=MACOS; \
 			$(MAKE) -C tpcds-kit/tools OS=$$OS; \
