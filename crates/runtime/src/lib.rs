@@ -400,7 +400,12 @@ impl Runtime {
             Arc::clone(&self.df),
             tls_config.clone(),
         ));
-        let pods_watcher_future = self.start_pods_watcher();
+
+        let pods_watcher_future = if self.pods_watcher.read().await.is_some() {
+            Some(self.start_pods_watcher())
+        } else {
+            None
+        };
 
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
@@ -438,7 +443,15 @@ impl Runtime {
                     }
                 }
             },
-            pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
+            pods_watcher_res = async {
+                if let Some(fut) = pods_watcher_future {
+                    fut.await
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                pods_watcher_res.context(UnableToInitializePodsWatcherSnafu)
+            },
             () = shutdown_signal() => {
                 tracing::info!("Goodbye!");
                 Ok(())

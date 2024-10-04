@@ -278,7 +278,10 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	spiceArgs := []string{"--metrics", "127.0.0.1:9090"}
+	spiceArgs := []string{
+		"--metrics", "127.0.0.1:9090",
+		"--pods-watcher-enabled",
+	}
 	args = append(spiceArgs, args...)
 
 	cmd := exec.Command(spiceCMD, args...)
