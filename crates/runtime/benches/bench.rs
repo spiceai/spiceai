@@ -191,10 +191,7 @@ async fn run_connector_bench(
 ) -> Result<(), String> {
     // TODO: Implement and enable connector TPCDS bench if it's required
     if bench_name == "tpcds" {
-        return Err(
-            "TPCDS Benchmark not implemented for data connectors"
-                .to_string(),
-        );
+        return Err("TPCDS Benchmark not implemented for data connectors".to_string());
     }
 
     let mut display_records = vec![];
