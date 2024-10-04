@@ -19,7 +19,7 @@ use async_openai::{
     },
 };
 
-use super::SqlGeneration;
+use super::{create_prompt, SqlGeneration};
 
 pub struct DefaultSqlGeneration;
 
@@ -30,10 +30,7 @@ impl SqlGeneration for DefaultSqlGeneration {
         query: &str,
         create_table_statements: &[String],
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = format!(
-            "```SQL\n{table_create_schemas}```\nTask: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional.",
-            table_create_schemas=create_table_statements.join("\n")
-        );
+        let prompt = create_prompt(query, create_table_statements);
 
         CreateChatCompletionRequestArgs::default()
             .model(model_id)
@@ -54,7 +51,11 @@ impl SqlGeneration for DefaultSqlGeneration {
             .choices
             .iter()
             .find_map(|c| c.message.content.clone())
-            .map(|c| c.strip_prefix("```SQL").unwrap_or(c.as_str()).to_string());
+            .map(|c| {
+                c.strip_prefix("```SQL")
+                    .unwrap_or(c.as_str())
+                    .to_string()
+            });
 
         Ok(value)
     }

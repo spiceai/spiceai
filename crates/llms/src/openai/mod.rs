@@ -91,10 +91,6 @@ impl Openai {
 impl Chat for Openai {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
-        tracing::error!(
-            "self.client.config().api_base() ={}",
-            self.client.config().api_base()
-        );
         if self.client.config().api_base() == OPENAI_API_BASE {
             Some(&StructuredOutputSqlGeneration {})
         } else {

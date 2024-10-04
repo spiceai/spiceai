@@ -20,7 +20,7 @@ use async_openai::{
     },
 };
 
-use super::SqlGeneration;
+use super::{create_prompt, SqlGeneration};
 
 /// Implementation for [`SqlGeneration`] for [`super::Chat`] models that support [`ResponseFormat::JsonObject`].
 pub struct JsonSchemaSqlGeneration;
@@ -40,17 +40,15 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
         query: &str,
         create_table_statements: &[String],
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = format!(
-            "```SQL\n{table_create_schemas}\n-- Using valid postgres SQL, without comments, answer the following questions for the tables provided above.\n-- {query}",
-            table_create_schemas=create_table_statements.join("\n")
-        );
+        let prompt = create_prompt(query, create_table_statements);
+
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
-                .content("Return JSON, with the requested SQL under 'sql'.")
+                .content(prompt)
                 .build()?
                 .into(),
             ChatCompletionRequestSystemMessageArgs::default()
-                .content(prompt)
+                .content("Response Format: JSON, with the postgres SQL under 'sql'.")
                 .build()?
                 .into(),
         ];
