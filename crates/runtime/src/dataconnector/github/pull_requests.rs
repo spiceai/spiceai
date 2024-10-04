@@ -86,7 +86,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                             closed_at: closedAt
                             number
                             reviews {{reviews_count: totalCount}}
-                            author {{ login }}
+                            author: author {{ author: login }}
                             additions
                             deletions
                             changed_files: changedFiles
@@ -125,7 +125,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                             closed_at: closedAt
                             number
                             reviews {{reviews_count: totalCount}}
-                            author {{ login }}
+                            author: author {{ author: login }}
                             additions
                             deletions
                             changed_files: changedFiles
@@ -160,6 +160,7 @@ fn gql_schema() -> SchemaRef {
             ))),
             true,
         ),
+        Field::new("author", DataType::Utf8, true),
         Field::new("body", DataType::Utf8, true),
         Field::new("changed_files", DataType::Int64, true),
         Field::new(
@@ -194,7 +195,6 @@ fn gql_schema() -> SchemaRef {
             ))),
             true,
         ),
-        Field::new("login", DataType::Utf8, true),
         Field::new(
             "merged_at",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),

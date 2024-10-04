@@ -431,10 +431,10 @@ lazy_static! {
     static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
         let mut m = HashMap::new();
         m.insert(
-            "login",
+            "author",
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
-                remaps: Some(vec![GitHubFilterRemap::Column("author")]),
+                remaps: None,
                 uses_modifiers: true
             },
         );
