@@ -20,7 +20,7 @@ use data_components::graphql::{client::GraphQLClient, provider::GraphQLTableProv
 use datafusion::datasource::TableProvider;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use snafu::ResultExt;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
@@ -73,6 +73,7 @@ impl DataConnectorFactory for GraphQLFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let graphql = GraphQL { params };

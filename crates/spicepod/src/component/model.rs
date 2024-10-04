@@ -87,7 +87,7 @@ impl TryFrom<&str> for ModelSource {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if value.starts_with("huggingface:huggingface.co") {
             Ok(ModelSource::HuggingFace)
-        } else if value.starts_with("file:") {
+        } else if value.starts_with("file") {
             Ok(ModelSource::File)
         } else if value.starts_with("openai") {
             Ok(ModelSource::OpenAi)
@@ -169,10 +169,10 @@ impl Model {
         match self.get_source() {
             Some(p) => {
                 let from = &self.from;
-                if let Some(stripped) = from.strip_prefix(&format!("{p}/")) {
+                if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
                     Some(stripped.to_string())
                 } else {
-                    from.strip_prefix(&format!("{p}:"))
+                    from.strip_prefix(&format!("{p}/"))
                         .map(std::string::ToString::to_string)
                 }
             }

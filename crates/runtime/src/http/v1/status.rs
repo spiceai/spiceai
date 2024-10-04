@@ -136,6 +136,7 @@ async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
     match FlightClient::try_new(
         format!("http://{flight_addr}").into(),
         Credentials::anonymous(),
+        None,
     )
     .await
     {
