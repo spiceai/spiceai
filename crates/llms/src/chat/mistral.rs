@@ -28,12 +28,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mistralrs::{
-    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
-    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder,
-    ModelDType, NormalLoaderBuilder, NormalRequest, Request as MistralRequest, RequestMessage,
-    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType,
+    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType
 };
-use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
+
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
@@ -127,15 +124,15 @@ impl MistralLlama {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        GGUFLoaderBuilder::new(
+        let bldr = GGUFLoaderBuilder::new(
             chat_template,
             None,
             model_id.to_string(),
             gguf_file,
             GGUFSpecificConfig::default(),
         )
-        .build()
-        .load_model_from_path(
+        .build();
+        let pipe = bldr.load_model_from_path(
             &paths,
             &ModelDType::Auto,
             device,
@@ -143,8 +140,9 @@ impl MistralLlama {
             DeviceMapMetadata::dummy(),
             None,
             None,
-        )
-        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        ); 
+
+        pipe.map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_ggml_pipeline(
@@ -241,7 +239,7 @@ impl MistralLlama {
         );
         let device = Self::get_device();
         let pipeline = builder
-            .build(loader_type)
+            .build(Some(loader_type))
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
@@ -286,7 +284,7 @@ impl MistralLlama {
     ) -> MistralRequest {
         MistralRequest::Normal(NormalRequest {
             messages: message,
-            sampling_params: sampling.unwrap_or_default(),
+            sampling_params: sampling.unwrap_or(SamplingParams::deterministic()),
             response: tx,
             return_logprobs: false,
             is_streaming,
@@ -427,6 +425,13 @@ impl Chat for MistralLlama {
                     },
                     MistralResponse::CompletionDone(cr) => {
                         yield Ok(Some(cr.choices[0].text.clone()));
+                        break;
+                    },
+                    MistralResponse::ImageGeneration(_) => {
+                        // Only reachable if message is [`RequestMessage::ImageGeneration`]. This function is using [`RequestMessage::Completion`].
+                        yield Err(ChatError::UnsupportedModalityType {
+                            modality: "ImageGeneration".into(),
+                        });
                         break;
                     },
                     MistralResponse::Done(_) => {
