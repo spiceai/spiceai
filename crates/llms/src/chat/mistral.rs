@@ -28,7 +28,11 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mistralrs::{
-    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType
+    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs,
+    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
+    TokenSource, Tool, ToolChoice, ToolType,
 };
 
 use snafu::ResultExt;
@@ -124,15 +128,15 @@ impl MistralLlama {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        let bldr = GGUFLoaderBuilder::new(
+        GGUFLoaderBuilder::new(
             chat_template,
             None,
             model_id.to_string(),
             gguf_file,
             GGUFSpecificConfig::default(),
         )
-        .build();
-        let pipe = bldr.load_model_from_path(
+        .build()
+        .load_model_from_path(
             &paths,
             &ModelDType::Auto,
             device,
@@ -140,9 +144,8 @@ impl MistralLlama {
             DeviceMapMetadata::dummy(),
             None,
             None,
-        ); 
-
-        pipe.map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        )
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_ggml_pipeline(
@@ -425,7 +428,6 @@ impl Chat for MistralLlama {
                         break;
                     },
                     MistralResponse::ImageGeneration(_) => {
-                        // Only reachable if message is [`RequestMessage::ImageGeneration`]. This function is using [`RequestMessage::Completion`].
                         yield Err(ChatError::UnsupportedModalityType {
                             modality: "ImageGeneration".into(),
                         });
