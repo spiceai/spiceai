@@ -137,7 +137,7 @@ pub struct Args {
     pub telemetry_enabled: Option<bool>,
 
     /// Disable pods watcher.
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(long, env, action = ArgAction::SetTrue)]
     pub no_pods_watcher: bool,
 
     #[arg(short, long, action = ArgAction::Count)]
