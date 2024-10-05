@@ -11,7 +11,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use text_splitter::{ChunkCapacity, ChunkConfig};
+use std::sync::Arc;
+
+use text_splitter::{Characters, ChunkCapacity, ChunkConfig, ChunkSizer};
+use tokenizers::Tokenizer;
+
+use tiktoken_rs::{
+    get_bpe_from_tokenizer,
+    tokenizer::{get_tokenizer, Tokenizer as OpenAITokenizer},
+    CoreBPE,
+};
 
 #[derive(Debug, Clone)]
 pub struct ChunkingConfig<'a> {
@@ -38,20 +47,22 @@ pub trait Chunker: Sync + Send {
     }
 }
 
-enum Splitter {
-    Markdown(text_splitter::MarkdownSplitter<text_splitter::Characters>),
-    Text(text_splitter::TextSplitter<text_splitter::Characters>),
+enum Splitter<Sizer: ChunkSizer> {
+    Markdown(text_splitter::MarkdownSplitter<Sizer>),
+    Text(text_splitter::TextSplitter<Sizer>),
 }
 
-pub struct CharacterSplittingChunker {
-    splitter: Splitter,
+pub struct RecursiveSplittingChunker<Sizer: ChunkSizer> {
+    splitter: Splitter<Sizer>,
 }
 
-impl CharacterSplittingChunker {
+impl<Sizer: ChunkSizer> RecursiveSplittingChunker<Sizer> {
     #[must_use]
-    pub fn new(cfg: &ChunkingConfig) -> Self {
-        let cfg_with_overlap = ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
-            .with_trim(cfg.trim_whitespace);
+    pub fn new(cfg: &ChunkingConfig, sizer: Sizer) -> Self {
+        let cfg_with_overlap: ChunkConfig<Sizer> =
+            ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
+                .with_trim(cfg.trim_whitespace)
+                .with_sizer(sizer);
 
         let splitter = match cfg.file_format {
             Some("md" | ".md") => {
@@ -64,7 +75,52 @@ impl CharacterSplittingChunker {
     }
 }
 
-impl Chunker for CharacterSplittingChunker {
+impl RecursiveSplittingChunker<Characters> {
+    #[must_use]
+    pub fn with_character_sizer(cfg: &ChunkingConfig) -> Self {
+        Self::new(cfg, Characters)
+    }
+}
+
+/// Basic wrapper around a [`Arc<Tokenizer>`], so as to be able to `impl ChunkSizer for TokenizerWrapper`.
+pub(crate) struct TokenizerWrapper(Arc<Tokenizer>);
+
+impl ChunkSizer for TokenizerWrapper {
+    fn size(&self, chunk: &str) -> usize {
+        self.0.as_ref().size(chunk)
+    }
+}
+
+impl From<Arc<Tokenizer>> for TokenizerWrapper {
+    fn from(tokenizer: Arc<Tokenizer>) -> Self {
+        TokenizerWrapper(tokenizer)
+    }
+}
+
+impl RecursiveSplittingChunker<TokenizerWrapper> {
+    #[must_use]
+    pub fn with_tokenizer_sizer(cfg: &ChunkingConfig, tokenizer: Arc<Tokenizer>) -> Self {
+        Self::new(cfg, tokenizer.into())
+    }
+}
+
+impl RecursiveSplittingChunker<CoreBPE> {
+    #[must_use]
+    pub fn for_openai_model(model_id: &str, cfg: &ChunkingConfig) -> Option<Self> {
+        match get_bpe_from_tokenizer(get_tokenizer(model_id).unwrap_or(OpenAITokenizer::Cl100kBase))
+        {
+            Ok(tok) => Some(Self::new(cfg, tok)),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to get BPE tokenizer for OpenAI model {model_id}. Error: {e}."
+                );
+                None
+            }
+        }
+    }
+}
+
+impl<Sizer: ChunkSizer + Send + Sync> Chunker for RecursiveSplittingChunker<Sizer> {
     fn chunk_indices<'a>(&self, text: &'a str) -> ChunkIndicesIter<'a> {
         let z: Vec<_> = match &self.splitter {
             Splitter::Markdown(splitter) => splitter.chunk_indices(text).collect(),

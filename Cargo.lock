@@ -1922,6 +1922,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40723b8fb387abc38f4f4a37c09073622e41dd12327033091ef8950659e6dc0c"
 dependencies = [
  "memchr",
+ "regex-automata 0.4.7",
  "serde",
 ]
 
@@ -2172,7 +2173,7 @@ dependencies = [
  "byteorder",
  "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "fancy-regex",
+ "fancy-regex 0.13.0",
  "num-traits",
  "rand 0.8.5",
  "rayon",
@@ -3907,6 +3908,16 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fancy-regex"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7493d4c459da9f84325ad297371a6b2b8a162800873a22e3b6b6512e61d18c05"
+dependencies = [
+ "bit-set",
+ "regex",
+]
 
 [[package]]
 name = "fancy-regex"
@@ -6074,7 +6085,8 @@ dependencies = [
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
  "text-splitter",
- "tokenizers",
+ "tiktoken-rs",
+ "tokenizers 0.20.0",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -6486,7 +6498,7 @@ dependencies = [
  "strum 0.26.3",
  "sysinfo",
  "thiserror",
- "tokenizers",
+ "tokenizers 0.19.1",
  "tokio",
  "tokio-rayon",
  "toml",
@@ -10435,8 +10447,8 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-backend-candle"
-version = "1.2.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
+version = "1.4.0"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
 dependencies = [
  "anyhow",
  "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -10449,14 +10461,14 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend-core",
  "thiserror",
- "tokenizers",
+ "tokenizers 0.20.0",
  "tracing",
 ]
 
 [[package]]
 name = "text-embeddings-backend-core"
-version = "1.2.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=dde326b330ecb609201110d4725928a6e977f0dd#dde326b330ecb609201110d4725928a6e977f0dd"
+version = "1.4.0"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
 dependencies = [
  "nohash-hasher",
  "thiserror",
@@ -10477,6 +10489,8 @@ dependencies = [
  "regex",
  "strum 0.26.3",
  "thiserror",
+ "tiktoken-rs",
+ "tokenizers 0.20.0",
  "unicode-segmentation",
 ]
 
@@ -10561,6 +10575,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiktoken-rs"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c314e7ce51440f9e8f5a497394682a57b7c323d0f4d0a6b1b13c429056e0e234"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "bstr",
+ "fancy-regex 0.12.0",
+ "lazy_static",
+ "parking_lot 0.12.3",
+ "rustc-hash 1.1.0",
+]
+
+[[package]]
 name = "time"
 version = "0.3.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10623,6 +10652,38 @@ name = "tokenizers"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e500fad1dd3af3d626327e6a3fe5050e664a6eaa4708b8ca92f1794aaf73e6fd"
+dependencies = [
+ "aho-corasick",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.2.15",
+ "indicatif",
+ "itertools 0.12.1",
+ "lazy_static",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand 0.8.5",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax 0.8.4",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
+name = "tokenizers"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8a24d7f7d6be5b9d1377418b893ab1808af0074f5d1bb2c64784452ddd2aa70"
 dependencies = [
  "aho-corasick",
  "derive_builder",
