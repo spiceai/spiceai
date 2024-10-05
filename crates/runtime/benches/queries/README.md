@@ -5,6 +5,7 @@
 ### Interval Arithmetic (date + 30 days) Not Supported
 
 **Limitation**: Queries using direct date arithmetic (e.g., date + 30 days) are not supported.
+
 **Solution**: Use the _INTERVAL_ data type for date arithmetic.
 
 ```sql
@@ -26,6 +27,7 @@ SELECT (now() + INTERVAL '30 days');
 ### DataFusion Supports Only Single SQL Statement per Query
 
 **Limitation**: DataFusion does not support multiple SQL statements within a single query.
+
 **Solution**: Ensure each query contains only one SQL statement.
 
 | **Affected queries**     |                          |
