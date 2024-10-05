@@ -153,7 +153,7 @@ fn general_cosine_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusio
     Ok(Arc::new(result) as ArrayRef)
 }
 
-fn compute_cosine_distance(
+pub(crate) fn compute_cosine_distance(
     arr1: Option<ArrayRef>,
     arr2: Option<ArrayRef>,
 ) -> DataFusionResult<Option<f64>> {

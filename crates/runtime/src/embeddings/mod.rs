@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 pub mod connector;
+pub mod array_distance;
 pub mod cosine_distance;
 pub mod execution_plan;
 pub mod table;

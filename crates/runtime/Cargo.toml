@@ -98,6 +98,7 @@ schemars = "0.8.19"
 secrecy.workspace = true
 serde = {workspace = true, features = ["derive"] }
 serde_json.workspace = true
+slatedb = "0.2.0"
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }

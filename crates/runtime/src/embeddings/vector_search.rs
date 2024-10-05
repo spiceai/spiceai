@@ -20,6 +20,7 @@ use app::App;
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
+use datafusion::common::cast::as_float32_array;
 use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
@@ -225,8 +226,8 @@ pub fn table_to_matches(
         .distances
         .iter()
         .flat_map(|v| {
-            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                col.iter().collect::<Vec<Option<f64>>>()
+            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float32Array>() {
+                col.iter().collect::<Vec<Option<f32>>>()
             } else {
                 vec![]
             }
@@ -250,7 +251,7 @@ pub fn table_to_matches(
 
             Ok(Match {
                 value: value.clone(),
-                score: 1.0 - *distance,
+                score: 1.0 - f64::from(*distance),
                 dataset: tbl.to_string(),
                 primary_key: pks.get(i).cloned().unwrap_or_default(),
                 metadata: add_cols.get(i).cloned().unwrap_or_default(),
@@ -316,7 +317,7 @@ impl VectorSearch {
                     SELECT
                         {projection_str},
                         unnest({embedding_column}_offsets) as offsets,
-                        cosine_distance(unnest({embedding_column}_embedding), {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
+                        array_distance(unnest({embedding_column}_embedding), {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
                     FROM {tbl}
                     {where_str}
                     ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
@@ -325,7 +326,7 @@ impl VectorSearch {
             format!(
                     "SELECT
                         {projection_str},
-                        cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
+                        array_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
                     FROM {tbl}
                     {where_str}
                     ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
