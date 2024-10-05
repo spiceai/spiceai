@@ -1,6 +1,6 @@
 # Spice.ai OSS Benchmarks
 
-## TPC-DS (Decision Support Benchmark) Limitations
+## TPC-DS (Decision Support Benchmark)
 
 ### Intervals like `date + 30 days` or `date + 5` are not supported
 
