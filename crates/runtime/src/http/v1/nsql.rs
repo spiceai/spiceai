@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, model::LLMModelStore};
 use async_openai::{
     error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseFormat, ChatCompletionResponseFormatType,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ResponseFormat, ResponseFormatJsonSchema,
     },
 };
 use axum::{
@@ -31,12 +32,12 @@ use llms::{
     chat::{Error as ChatError, Result as ChatResult},
     openai::MAX_COMPLETION_TOKENS,
 };
+use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use snafu::ResultExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, model::LLMModelStore};
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -62,6 +63,11 @@ fn default_model() -> String {
     "nql".to_string()
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StructuredNsqlOutput {
+    pub sql: String,
+}
+
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
@@ -80,8 +86,13 @@ pub(crate) async fn post(
     for t in &tables {
         match df.get_arrow_schema(t).await {
             Ok(schm) => {
-                let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
-                table_create_stms.push(c.build_sqlite());
+                tracing::trace!("Table {t} has CREATE STATEMENT='{schm}'.");
+
+                // Ensure compiling without `--features models` is successful.
+                #[cfg(feature = "models")]
+                table_create_stms.extend_from_slice(
+                    &CreateTableBuilder::new(Arc::new(schm), t).build_postgres(),
+                );
             }
             Err(e) => {
                 tracing::error!("Error getting table={t} schema: {e}");
@@ -149,16 +160,6 @@ pub(crate) async fn post(
     }
 }
 
-/// Convert the Json object returned when using a `{ "type": "json_object" } ` response format.
-/// Expected format is `"content": "{\"arbitrary_key\": \"arbitrary_value\"}"`
-pub fn convert_json_object_to_sql(raw_json: &str) -> ChatResult<Option<String>> {
-    let result: Value =
-        serde_json::from_str(raw_json).map_err(|source| ChatError::FailedToLoadModel {
-            source: Box::new(source),
-        })?;
-    Ok(result["sql"].as_str().map(std::string::ToString::to_string))
-}
-
 pub fn create_chat_request(
     model_id: String,
     prompt: &str,
@@ -174,13 +175,29 @@ pub fn create_chat_request(
             .into(),
     ];
 
+    let mut structured_output_schema = serde_json::to_value(schema_for!(StructuredNsqlOutput))
+        .map_err(|e| {
+            OpenAIError::InvalidArgument(format!(
+                "Failed to serialize structured output schema: {e}"
+            ))
+        })?;
+
+    // [`schemars:schema_for`] does not include the `additionalProperties` field when false. Explictly required by some providers (e.g. OpenAI).
+    structured_output_schema["additionalProperties"] = Value::Bool(false);
+
+    tracing::debug!("Structured output schema: {structured_output_schema}");
+
     CreateChatCompletionRequestArgs::default()
         .model(model_id)
-        .response_format(ChatCompletionResponseFormat {
-            r#type: ChatCompletionResponseFormatType::JsonObject,
+        .response_format(ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema {
+                name: "sql_mode".to_string(),
+                description: None,
+                strict: Some(true),
+                schema: Some(structured_output_schema),
+            },
         })
         .messages(messages)
-        .max_tokens(MAX_COMPLETION_TOKENS)
         .build()
 }
 
@@ -194,8 +211,20 @@ pub fn process_response(resp: CreateChatCompletionResponse) -> ChatResult<Option
         }
     }
 
-    match resp.choices.iter().find_map(|c| c.message.content.clone()) {
-        Some(json_resp) => convert_json_object_to_sql(&json_resp),
+    match resp
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_ref())
+    {
+        Some(message) => {
+            match serde_json::from_str(message).boxed() {
+                Ok(StructuredNsqlOutput { sql }) => Ok(Some(sql)),
+                Err(e) => {
+                    tracing::debug!("Failed to deserialize model response into `StructuredNsqlOutput`. Error: {e}");
+                    Err(ChatError::FailedToRunModel { source: e })
+                }
+            }
+        }
         None => Ok(None),
     }
 }

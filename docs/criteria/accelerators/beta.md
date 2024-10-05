@@ -1,0 +1,115 @@
+# Spice.ai OSS Data Accelerators - Beta Release Criteria
+
+This document defines the set of criteria that is required before a data accelerator is considered to be of Beta quality.
+
+All criteria must be met for the accelerator to be considered Beta, with exceptions only permitted in some circumstances (e.g. it would be technically infeasible to add a feature/fix a bug for a particular accelerator).
+
+## Beta Quality Accelerators
+
+| Accelerator | Beta Quality | DRI Sign-off |
+| - | - | - |
+| Arrow | ❌ |  |
+| DuckDB | ❌ |  |
+| SQLite | ❌ |  |
+| PostgreSQL | ❌ |  |
+
+## Beta Release Criteria
+
+### Definitions
+
+#### Major Bug
+
+A major bug is classified as a bug that:
+
+- Renders the accelerator completely inoperable (i.e. all queries on the accelerator fail, loading fails, etc), or;
+- Causes data inconsistency errors, or;
+- A bug that occurs in more than one accelerator, or;
+- A bug that is high impact or likely to be experienced in common use cases, and there is no viable workaround.
+
+#### Minor Bug
+
+A minor bug is any bug that cannot be classified as a major bug.
+
+#### Core Arrow Data Types
+
+Core Arrow Data Types consist of the following data types:
+
+- Null
+- Int/Float/Decimal
+- Time32/64
+- Timestamp/TimestampTZ
+- Date32/64
+- Duration
+- Interval
+- Binary/LargeBinary/FixedSizeBinary
+- Utf8/LargeUtf8
+- List/FixedSizeList/LargeList
+- Struct
+- Decimal128/Decimal256
+
+### Feature complete
+
+- [ ] Data is streamed when accelerating from source into this accelerator
+- [ ] Data is streamed when reading/performing queries from this accelerator
+- [ ] The accelerator supports primary keys and indexes
+- [ ] The accelerator supports full federation within a single dataset (e.g. `select * from my_dataset`)
+- [ ] The accelerator supports federation push down across multiple datasets within the same accelerator (e.g. `select * from first_dataset, second_dataset`)
+- [ ] The accelerator supports resolving on conflict behaviors (e.g. Drop/Upsert)
+- [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
+- [ ] [Core Arrow Data Types](#definitions) are supported
+- [ ] All known [Major Bugs](#definitions) are resolved
+
+### Test Coverage
+
+Beta quality accelerators should be able to run test packages derived from the following:
+
+- [TPC-H](https://www.tpc.org/TPC-H/)
+- [TPC-DS](https://www.tpc.org/TPC-DS/)
+- [ClickBench](https://github.com/ClickHouse/ClickBench)
+
+Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
+
+When referring to accelerator access modes, "all supported modes" identifies every possible way to use that accelerator. For example, for DuckDB this would be file and memory modes. For PostgreSQL, this would only be the direct database access mode.
+
+#### General
+
+- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](#definitions)
+- [ ] Integration tests to cover "On Conflict" behaviors.
+
+#### TPC-H
+
+- [ ] End-to-end test to cover accelerating TPC-H SF1 data from S3 and benchmarking TPC-H queries (official and simple).
+  - [ ] All supported modes should run all queries with no [Major Bugs](#definitions).
+- [ ] A test script exists that can load TPC-H SF10 and TPC-H SF100 data into this accelerator in all supported modes.
+- [ ] The accelerator can load TPC-H SF10 in all supported modes, and can run all queries with no [Major Bugs](#definitions).
+- [ ] The accelerator can load TPC-H SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](#definitions).
+
+#### TPC-DS
+
+- [ ] End-to-end test to cover accelerating TPC-DS SF1 data from S3 and benchmarking TPC-DS queries (official and simple).
+  - [ ] All supported modes should run all queries with no [Major Bugs](#definitions).
+- [ ] A test script exists that can load TPC-DS SF10 and TPC-DS SF100 data into this accelerator in all supported modes.
+- [ ] The accelerator can load TPC-DS SF10 in all supported modes, and can run all queries with no [Major Bugs](#definitions).
+- [ ] The accelerator can load TPC-DS SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](#definitions).
+
+#### ClickBench
+
+- [ ] A test script exists that can load ClickBench data into this accelerator in either file or direct database mode.
+- [ ] The accelerator can load ClickBench in either file or direct database mode, and all queries are attempted.
+  - [ ] All query failures should be logged as issues. No bug fixes are required for ClickBench
+
+#### Data correctness
+
+- [ ] TPC-H SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [ ] TPC-H SF100 loaded into file or direct database mode, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [ ] TPC-DS SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-DS queries and TPC-DS simple queries.
+- [ ] TPC-DS SF100 loaded into file or direct database mode, returned results are identical across source and accelerated queries for all TPC-DS queries and TPC-DS simple queries.
+
+### Documentation
+
+- [ ] Documentation includes all information and steps for a user to set up the accelerator.
+- [ ] Documentation includes all known issues/limitations for the accelerator.
+- [ ] Documentation includes any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [ ] The accelerator has an easy to follow quickstart.
+- [ ] All [Minor Bugs](#definitions) for TPC-DS and TPC-H are raised as issues.
+- [ ] All ClickBench bugs are raised as issues.

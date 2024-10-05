@@ -24,6 +24,7 @@ use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::{future::Future, sync::Arc};
 
@@ -71,6 +72,7 @@ impl DataConnectorFactory for FlightSQLFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params

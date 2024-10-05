@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -61,13 +61,13 @@ spice search --cloud
 
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
-			cmd.PrintErrln(err.Error())
+			slog.Error("could not list datasets", "error", err)
 		}
 
 		searchDatasets := make([]string, 0)
 		for _, dataset := range datasets {
 			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
-				cmd.PrintErrln(fmt.Sprintf("Warning: Dataset %s is not ready (%s) and will not be included in search.", dataset.Name, dataset.Status))
+				slog.Warn(fmt.Sprintf("Dataset %s is not ready (%s) and will not be included in search.", dataset.Name, dataset.Status))
 				continue
 			}
 			searchDatasets = append(searchDatasets, dataset.Name)
@@ -75,7 +75,7 @@ spice search --cloud
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("could not get http-endpoint flag", "error", err)
 			os.Exit(1)
 		}
 		if httpEndpoint != "" {
@@ -86,7 +86,7 @@ spice search --cloud
 
 		limit, err := cmd.Flags().GetUint(limitKeyFlag)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("could not get limit flag", "error", err)
 			os.Exit(1)
 		}
 
@@ -98,7 +98,7 @@ spice search --cloud
 			if err == liner.ErrPromptAborted {
 				break
 			} else if err != nil {
-				log.Print("Error reading line: ", err)
+				slog.Error("reading input line", "error", err)
 				continue
 			}
 
@@ -122,7 +122,7 @@ spice search --cloud
 					Limit:    limit,
 				})
 				if err != nil {
-					cmd.Printf("Error: %v\n", err)
+					slog.Error("failed to send search request to spiced", "error", err)
 					out <- nil
 				} else {
 					out <- response
@@ -138,13 +138,13 @@ spice search --cloud
 
 			raw, err := io.ReadAll(response.Body)
 			if err != nil {
-				cmd.Printf("Error: %v\n\n", err)
+				slog.Error("reading response from spiced", "error", err)
 				continue
 			}
 			var searchResponse SearchResponse = SearchResponse{}
 			err = json.Unmarshal([]byte(raw), &searchResponse)
 			if err != nil {
-				cmd.Printf("Error: %v\n\n", err)
+				slog.Error("parsing response from spiced", "error", err)
 				continue
 			}
 

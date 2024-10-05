@@ -17,10 +17,10 @@ package msal
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/public"
 	"github.com/pkg/browser"
@@ -65,7 +65,8 @@ func run_redirect_server(output_chan chan string) {
 	http.HandleFunc("/", construct_get_token(output_chan))
 
 	if err := server.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		slog.Error("fatal error on server", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -73,7 +74,8 @@ func construct_get_token(output chan string) func(http.ResponseWriter, *http.Req
 	return func(w http.ResponseWriter, r *http.Request) {
 		codes, ok := r.URL.Query()["code"]
 		if !ok || len(codes[0]) < 1 {
-			log.Fatal(errors.New("Authorization code missing"))
+			slog.Error("Authorization code missing")
+			os.Exit(1)
 		}
 
 		code := codes[0]

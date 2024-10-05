@@ -14,20 +14,97 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{
+    filter_pushdown, inject_parameters, search_inject_parameters, GitHubQueryMode, GitHubTableArgs,
+    GitHubTableGraphQLParams,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_components::graphql::{
+    client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer, Result,
+};
+use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
 pub struct PullRequestTableArgs {
     pub owner: String,
     pub repo: String,
+    pub query_mode: GitHubQueryMode,
+}
+
+impl GraphQLOptimizer for PullRequestTableArgs {
+    fn filter_pushdown(
+        &self,
+        expr: &Expr,
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
+        if self.query_mode == GitHubQueryMode::Auto {
+            return Ok(FilterPushdownResult {
+                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                expr: expr.clone(),
+                context: None,
+            });
+        }
+
+        Ok(filter_pushdown(expr))
+    }
+
+    fn inject_parameters(
+        &self,
+        filters: &[FilterPushdownResult],
+        query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        if self.query_mode == GitHubQueryMode::Auto {
+            return Ok(());
+        }
+
+        inject_parameters("search", search_inject_parameters, filters, query)
+    }
 }
 
 impl GitHubTableArgs for PullRequestTableArgs {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
-        let query = format!(
-            r#"
+        let query = match self.query_mode {
+            GitHubQueryMode::Search => {
+                format!(
+                    r#"{{
+                search(query:"repo:{owner}/{name} type:pr", first:100, type:ISSUE) {{
+                    pageInfo {{
+                        hasNextPage
+                        endCursor
+                    }}
+                    nodes {{
+                        ... on PullRequest {{
+                            title
+                            number
+                            id
+                            url
+                            body
+                            state
+                            created_at: createdAt
+                            updated_at: updatedAt
+                            merged_at: mergedAt
+                            closed_at: closedAt
+                            number
+                            reviews {{reviews_count: totalCount}}
+                            author: author {{ author: login }}
+                            additions
+                            deletions
+                            changed_files: changedFiles
+                            labels(first: 100) {{ labels: nodes {{ name }} }}
+                            comments(first: 100) {{comments_count: totalCount}}
+                            commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
+                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                        }}
+                    }}
+                }}
+            }}"#,
+                    owner = self.owner,
+                    name = self.repo,
+                )
+            }
+            GitHubQueryMode::Auto => {
+                format!(
+                    r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
                     pullRequests(first: 100) {{
@@ -48,10 +125,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                             closed_at: closedAt
                             number
                             reviews {{reviews_count: totalCount}}
-
-                            author {{
-                                login
-                            }}
+                            author: author {{ author: login }}
                             additions
                             deletions
                             changed_files: changedFiles
@@ -64,9 +138,11 @@ impl GitHubTableArgs for PullRequestTableArgs {
                 }}
             }}
             "#,
-            owner = self.owner,
-            name = self.repo,
-        );
+                    owner = self.owner,
+                    name = self.repo,
+                )
+            }
+        };
 
         GitHubTableGraphQLParams::new(query.into(), None, 1, Some(gql_schema()))
     }
@@ -84,6 +160,7 @@ fn gql_schema() -> SchemaRef {
             ))),
             true,
         ),
+        Field::new("author", DataType::Utf8, true),
         Field::new("body", DataType::Utf8, true),
         Field::new("changed_files", DataType::Int64, true),
         Field::new(
@@ -118,7 +195,6 @@ fn gql_schema() -> SchemaRef {
             ))),
             true,
         ),
-        Field::new("login", DataType::Utf8, true),
         Field::new(
             "merged_at",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),

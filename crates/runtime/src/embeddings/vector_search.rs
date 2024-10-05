@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::iter::zip;
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
@@ -43,6 +42,9 @@ use snafu::prelude::*;
 pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
+
+    #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
+    CannotVectorSearchDataset { data_source: TableReference },
 
     #[snafu(display("Error occurred interacting with datafusion: {}", source))]
     DataFusionError {
@@ -152,10 +154,12 @@ impl SearchRequest {
 
 pub type ModelKey = String;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct VectorSearchTableResult {
     pub primary_key: Vec<RecordBatch>,
-    pub embedded_column: Vec<RecordBatch>, // original data, not the embedding vector.
+
+    // original data, not the embedding vector.
+    pub embedded_column: Vec<RecordBatch>,
     pub additional_columns: Vec<RecordBatch>,
     pub distances: Vec<ArrayRef>,
 }
@@ -165,9 +169,14 @@ pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Match {
     value: String,
+
     score: f64,
     dataset: String,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     primary_key: HashMap<String, serde_json::Value>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -216,8 +225,8 @@ pub fn table_to_matches(
         .distances
         .iter()
         .flat_map(|v| {
-            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float32Array>() {
-                col.iter().collect::<Vec<Option<f32>>>()
+            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                col.iter().collect::<Vec<Option<f64>>>()
             } else {
                 vec![]
             }
@@ -229,15 +238,25 @@ pub fn table_to_matches(
         });
     };
 
-    Ok(zip(zip(zip(pks, add_cols), values), distances)
-        .map(|(((pks, add_cols), value), distance)| Match {
-            value,
-            score: 1.0 / f64::from(distance),
-            dataset: tbl.to_string(),
-            primary_key: pks,
-            metadata: add_cols,
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            let Some(distance) = distances.get(i) else {
+                return Err(Error::EmbeddingError {
+                    source: format!("No distance returned for {i}th result").into(),
+                });
+            };
+
+            Ok(Match {
+                value: value.clone(),
+                score: 1.0 - *distance,
+                dataset: tbl.to_string(),
+                primary_key: pks.get(i).cloned().unwrap_or_default(),
+                metadata: add_cols.get(i).cloned().unwrap_or_default(),
+            })
         })
-        .collect::<Vec<Match>>())
+        .collect::<Result<Vec<Match>>>()
 }
 
 pub fn to_matches(result: &VectorSearchResult) -> Result<Vec<Match>> {
@@ -270,6 +289,7 @@ impl VectorSearch {
         embedding: Vec<f32>,
         primary_keys: &[String],
         embedding_column: &str,
+        is_chunked: bool,
         additional_columns: &[String],
         where_cond: Option<&str>,
         n: usize,
@@ -279,16 +299,41 @@ impl VectorSearch {
             .cloned()
             .chain(Some(embedding_column.to_string()))
             .chain(additional_columns.iter().cloned())
+            .unique()
             .collect();
 
         let projection_str = projection.iter().map(|s| quote_identifier(s)).join(", ");
 
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
-        let query = format!(
-            "SELECT {projection_str}, sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME} FROM {tbl} {where_str} ORDER BY dist LIMIT {n}"
-        );
+        let query = if is_chunked {
+            format!(
+                "SELECT
+                    {projection_str},
+                    substring({embed_col}, offsets[1], offsets[2] - offsets[1]) as {embed_col}_chunk,
+                    {VECTOR_DISTANCE_COLUMN_NAME}
+                FROM (
+                    SELECT
+                        {projection_str},
+                        unnest({embedding_column}_offsets) as offsets,
+                        cosine_distance(unnest({embedding_column}_embedding), {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
+                    FROM {tbl}
+                    {where_str}
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
+                ) LIMIT {n}", embed_col=quote_identifier(embedding_column).to_string())
+        } else {
+            format!(
+                    "SELECT
+                        {projection_str},
+                        cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
+                    FROM {tbl}
+                    {where_str}
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
+                    LIMIT {n}"
+                )
+        };
         tracing::trace!("running SQL: {query}");
+
         let batches: Vec<RecordBatch> = self
             .df
             .query_builder(&query, Protocol::Internal)
@@ -303,10 +348,23 @@ impl VectorSearch {
             .boxed()
             .context(DataFusionSnafu)?;
 
-        let primary_key_projection = (0..primary_keys.len()).collect_vec();
-        let embedding_projection = (primary_keys.len()..=primary_keys.len()).collect_vec();
-        let additional_columns_projection =
-            (primary_keys.len() + 1..projection.len()).collect_vec();
+        let Some(first) = batches.first() else {
+            tracing::trace!("No results returned");
+            return Ok(VectorSearchTableResult::default());
+        };
+
+        let primary_key_projection = get_projection(first, primary_keys);
+        let additional_columns_projection = get_projection(first, additional_columns);
+
+        let embedding_column = if is_chunked {
+            format!(
+                "{embed_col}_chunk",
+                embed_col = quote_identifier(embedding_column)
+            )
+        } else {
+            quote_identifier(embedding_column).to_string()
+        };
+        let embedding_projection = get_projection(first, &[embedding_column]);
 
         let primary_keys_records = batches
             .iter()
@@ -318,7 +376,7 @@ impl VectorSearch {
             .map(|s| s.project(&embedding_projection))
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
             .context(RecordProcessingSnafu)?;
-        let primary_keys = batches
+        let additional_columns_records = batches
             .iter()
             .map(|s| s.project(&additional_columns_projection))
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
@@ -337,7 +395,7 @@ impl VectorSearch {
         Ok(VectorSearchTableResult {
             primary_key: primary_keys_records,
             embedded_column: embedding_records,
-            additional_columns: primary_keys,
+            additional_columns: additional_columns_records,
             distances,
         })
     }
@@ -399,11 +457,16 @@ impl VectorSearch {
                         data_source: vec![tbl.clone()],
                     })?;
 
-                let embedding_column = get_embedding_table(&table_provider)
-                    .and_then(|e| e.get_embedding_columns().first().cloned())
-                    .ok_or(Error::NoEmbeddingColumns {
-                        data_source: tbl.clone(),
-                    })?;
+                let Some(embedding_table) = get_embedding_table(&table_provider) else {
+                    return Err(Error::CannotVectorSearchDataset {
+                        data_source: tbl.clone()
+                    });
+                };
+
+                let embedding_column = embedding_table.get_embedding_columns().first().cloned().ok_or(Error::NoEmbeddingColumns {
+                    data_source: tbl.clone(),
+                })?;
+
 
                 if search_vectors.len() != 1 {
                     return Err(Error::IncorrectNumberOfEmbeddingColumns {
@@ -420,6 +483,7 @@ impl VectorSearch {
                                 embedding.clone(),
                                 &primary_keys,
                                 &embedding_column,
+                                embedding_table.is_chunked(&embedding_column),
                                 additional_columns,
                                 where_cond.as_deref(),
                                 *limit,
@@ -590,6 +654,19 @@ impl VectorSearch {
             })
             .collect())
     }
+}
+
+/// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
+fn get_projection(batch: &RecordBatch, column_names: &[String]) -> Vec<usize> {
+    column_names
+        .iter()
+        .filter_map(|name| {
+            batch
+                .schema()
+                .index_of(quote_identifier(name).to_string().as_str())
+                .ok()
+        })
+        .collect_vec()
 }
 
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].

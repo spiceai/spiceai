@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -157,17 +158,17 @@ func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
 	if c.ModelsFlavorInstalled() {
 		return
 	}
-	cmd.Print("This feature requires a runtime version with models enabled. Install (y/n)? ")
+	slog.Info("This feature requires a runtime version with models enabled. Install (y/n)? ")
 	var confirm string
 	_, _ = fmt.Scanf("%s", &confirm)
 	if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
-		cmd.Println("Models runtime not installed, exiting...")
+		slog.Warn("Models runtime not installed, exiting...")
 		os.Exit(0)
 	}
-	cmd.Println("Installing models runtime...")
+	slog.Info("Installing models runtime...")
 	err := c.InstallOrUpgradeRuntime("models")
 	if err != nil {
-		cmd.Println("Error installing models runtime", err)
+		slog.Error("installing models runtime", "error", err)
 		os.Exit(1)
 	}
 }
@@ -224,11 +225,11 @@ func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string) error {
 
 	runtimeVersion := release.TagName
 
-	fmt.Printf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion)
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion))
 
 	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir)
 	if err != nil {
-		fmt.Println("Error downloading Spice.ai runtime binaries.")
+		slog.Error("downloading Spice.ai runtime binaries", "error", err)
 		return err
 	}
 
@@ -236,11 +237,11 @@ func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string) error {
 
 	err = util.MakeFileExecutable(releaseFilePath)
 	if err != nil {
-		fmt.Println("Error downloading Spice runtime binaries.")
+		slog.Error("downloading Spice runtime binaries.", "error", err)
 		return err
 	}
 
-	fmt.Printf("Spice runtime installed into %s successfully.\n", c.spiceBinDir)
+	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
 
 	return nil
 }
@@ -277,7 +278,10 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	spiceArgs := []string{"--metrics", "127.0.0.1:9090"}
+	spiceArgs := []string{
+		"--metrics", "127.0.0.1:9090",
+		"--pods-watcher-enabled",
+	}
 	args = append(spiceArgs, args...)
 
 	cmd := exec.Command(spiceCMD, args...)

@@ -26,11 +26,14 @@ use runtime::{datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
+mod abfs;
 mod acceleration;
 mod catalog;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
+#[cfg(feature = "duckdb")]
+mod duckdb;
 mod federation;
 mod graphql;
 #[cfg(feature = "mysql")]

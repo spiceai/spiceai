@@ -18,7 +18,7 @@ package cmd
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +40,8 @@ var versionCmd = &cobra.Command{
 spice version
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+
+		// Intentionally without structured logging
 		cmd.Printf("CLI version:     %s\n", version.Version())
 
 		var rtversion string
@@ -48,7 +50,7 @@ spice version
 		rtcontext := context.NewContext()
 		err = rtcontext.Init()
 		if err != nil {
-			cmd.Println(err.Error())
+			slog.Error("initializing runtime context", "error", err)
 			os.Exit(1)
 		}
 
@@ -57,16 +59,17 @@ spice version
 		} else {
 			rtversion, err = rtcontext.Version()
 			if err != nil {
-				cmd.Printf("error getting runtime version: %s\n", err)
+				slog.Error(fmt.Sprintf("error getting runtime version: %s\n", err))
 				os.Exit(1)
 			}
 		}
 
+		// Intentionally without structured logging
 		cmd.Printf("Runtime version: %s\n", rtversion)
 
 		err = checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
-			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+			slog.Error(fmt.Sprintf("failed to check for latest CLI release version: %s\n", err.Error()))
 		}
 	},
 }
@@ -97,7 +100,7 @@ func checkLatestCliReleaseVersion() error {
 		}
 		err = os.WriteFile(versionFilePath, []byte(release.TagName+"\n"), 0644)
 		if err != nil && util.IsDebug() {
-			log.Printf("failed to write version file: %s\n", err.Error())
+			slog.Error(fmt.Sprintf("failed to write version file: %s\n", err.Error()))
 		}
 		latestReleaseVersion = release.TagName
 	}
@@ -107,7 +110,7 @@ func checkLatestCliReleaseVersion() error {
 	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "rc")
 
 	if !cliIsPreRelease && semver.Compare(cliVersion, latestReleaseVersion) < 0 {
-		fmt.Printf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion))
+		slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion)))
 	}
 
 	return nil

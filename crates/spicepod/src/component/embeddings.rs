@@ -96,10 +96,21 @@ impl Embeddings {
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_prefix() {
-            Some(p) => self
-                .from
-                .strip_prefix(&format!("{p}/"))
-                .map(ToString::to_string),
+            Some(EmbeddingPrefix::HuggingFace) => {
+                let from = &self.from;
+                from.strip_prefix("huggingface:huggingface.co/")
+                    .map(std::string::ToString::to_string)
+            }
+            Some(EmbeddingPrefix::OpenAi) => {
+                let from = &self.from;
+                from.strip_prefix("openai:")
+                    .map(std::string::ToString::to_string)
+            }
+            Some(EmbeddingPrefix::File) => {
+                let from = &self.from;
+                from.strip_prefix("file:")
+                    .map(std::string::ToString::to_string)
+            }
             None => None,
         }
     }
@@ -117,7 +128,7 @@ impl TryFrom<&str> for EmbeddingPrefix {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if value.starts_with("huggingface:huggingface.co") {
             Ok(EmbeddingPrefix::HuggingFace)
-        } else if value.starts_with("file:") {
+        } else if value.starts_with("file") {
             Ok(EmbeddingPrefix::File)
         } else if value.starts_with("openai") {
             Ok(EmbeddingPrefix::OpenAi)
@@ -132,9 +143,25 @@ impl Display for EmbeddingPrefix {
         match self {
             EmbeddingPrefix::OpenAi => write!(f, "openai"),
             EmbeddingPrefix::HuggingFace => write!(f, "huggingface:huggingface.co"),
-            EmbeddingPrefix::File => write!(f, "file:"),
+            EmbeddingPrefix::File => write!(f, "file"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct EmbeddingChunkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub target_chunk_size: usize,
+
+    #[serde(default)]
+    pub overlap_size: usize,
+
+    #[serde(default)]
+    pub trim_whitespace: bool,
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
@@ -148,4 +175,7 @@ pub struct ColumnEmbeddingConfig {
 
     #[serde(rename = "column_pk", skip_serializing_if = "Option::is_none")]
     pub primary_keys: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking: Option<EmbeddingChunkConfig>,
 }

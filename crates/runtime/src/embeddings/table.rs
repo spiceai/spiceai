@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{project_schema, Constraints, Statistics};
@@ -29,6 +30,7 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
+use llms::chunking::{Chunker, ChunkingConfig};
 use snafu::prelude::*;
 
 use tokio::sync::RwLock;
@@ -52,6 +54,10 @@ pub struct EmbeddingTable {
     // Precompute to avoid async lock waits from `embedding_models` data structure.
     // Mapping of column name to the expected size of its embedding.
     embedding_sizes: HashMap<String, i32>,
+
+    // Column name -> how to chunk the text for the embedding model.
+    // If None, no chunking is needed.
+    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
 }
 
 impl EmbeddingTable {
@@ -59,13 +65,22 @@ impl EmbeddingTable {
         base_table: Arc<dyn TableProvider>,
         embedded_columns: HashMap<String, String>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+        embed_chunker_config: HashMap<String, ChunkingConfig<'_>>,
     ) -> Self {
         let sizes = Self::precompute_embedding_sizes(&embedded_columns, &embedding_models).await;
+        let chunkers = Self::prepare_chunkers(
+            embed_chunker_config,
+            &embedding_models,
+            embedded_columns.clone(),
+        )
+        .await;
+
         Self {
             base_table,
             embedded_columns,
             embedding_models,
             embedding_sizes: sizes,
+            embedding_chunkers: chunkers,
         }
     }
 
@@ -73,6 +88,12 @@ impl EmbeddingTable {
     #[must_use]
     pub fn get_embedding_models_used(&self) -> Vec<String> {
         self.embedded_columns.values().cloned().collect()
+    }
+
+    /// Checks if a column has an embedding column associated with it, and should be chunked.
+    #[must_use]
+    pub fn is_chunked(&self, column: &str) -> bool {
+        self.embedding_chunkers.contains_key(column)
     }
 
     /// Get the names of the columns that are augmented with embeddings.
@@ -85,6 +106,42 @@ impl EmbeddingTable {
     #[must_use]
     pub fn get_base_table_schema(&self) -> SchemaRef {
         self.base_table.schema()
+    }
+
+    /// For a given set of columns that should be chunked (i.e. keys of `cfgs`), prepare the chunkers based on the column's embedding model in [`EmbeddingModelStore`].
+    async fn prepare_chunkers(
+        cfgs: HashMap<String, ChunkingConfig<'_>>,
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+        column_to_model: HashMap<String, String>,
+    ) -> HashMap<String, Arc<dyn Chunker>> {
+        let mut chunkers: HashMap<String, Arc<dyn Chunker>> = HashMap::new();
+
+        for (col, chunk_cfg) in cfgs {
+            let Some(model_name) = column_to_model.get(&col) else {
+                tracing::debug!(
+                    "No model specified for column '{}', skipping chunker setup.",
+                    col
+                );
+                continue;
+            };
+            let embedding_models_guard = embedding_models.read().await;
+            let Some(embed_model) = embedding_models_guard.get(model_name) else {
+                // Don't need warn, as we should have already checked/logged this.
+                tracing::debug!(
+                    "Expected model '{}' for column '{}', but it was not found in the model store.",
+                    model_name,
+                    col
+                );
+                continue;
+            };
+
+            if let Some(chunker) = embed_model.chunker(chunk_cfg) {
+                chunkers.insert(col, chunker);
+            } else {
+                tracing::warn!("Column '{}' expects to be chunked, but the model '{}' does not support chunking. Ignoring chunking config.", col, model_name);
+            }
+        }
+        chunkers
     }
 
     async fn precompute_embedding_sizes(
@@ -136,6 +193,50 @@ impl EmbeddingTable {
             }
         }
     }
+
+    /// For a given field in the base table, return the additional field(s) that should be added to the schema for the embedding.
+    /// For fields that shouldn't be embedded, an empty vector is returned.
+    ///
+    /// These fields should match produces in [`super::execution_plan::get_embedding_columns`].
+    fn embedding_fields(&self, field: &Field) -> Vec<Arc<Field>> {
+        let embedding_size = self
+            .embedding_sizes
+            .get(field.name())
+            .copied()
+            .unwrap_or_default();
+
+        if self.embedding_chunkers.contains_key(field.name()) {
+            vec![
+                Arc::new(Field::new_list(
+                    format!("{}_embedding", field.name()),
+                    Field::new_fixed_size_list(
+                        "item",
+                        Field::new("item", DataType::Float32, false),
+                        embedding_size,
+                        false,
+                    ),
+                    false,
+                )),
+                Arc::new(Field::new_list(
+                    format!("{}_offsets", field.name()),
+                    Field::new_fixed_size_list(
+                        "item",
+                        Field::new("item", DataType::Int32, false),
+                        2,
+                        false,
+                    ),
+                    false,
+                )),
+            ]
+        } else {
+            vec![Arc::new(Field::new_fixed_size_list(
+                format!("{}_embedding", field.name()),
+                Field::new("item", DataType::Float32, false),
+                embedding_size,
+                false,
+            ))]
+        }
+    }
 }
 
 #[async_trait]
@@ -152,20 +253,6 @@ impl TableProvider for EmbeddingTable {
         self.base_table.table_type()
     }
 
-    // fn get_table_definition(&self) -> Option<&str> {
-    //     self.base_table.get_table_definition()
-    // }
-
-    // fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-    //     let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
-    //     let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
-    //         .context(UnableToConstructLogicalPlanBuilderSnafu {})?
-    //         .build()
-    //         .context(UnableToBuildLogicalPlanSnafu {})?;
-
-    //     self.base_table.get_logical_plan()
-    // }
-
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.base_table.get_column_default(column)
     }
@@ -180,27 +267,12 @@ impl TableProvider for EmbeddingTable {
             .embedded_columns
             .keys()
             .sorted() // Important to be kept alphabetical for fast lookup
-            .filter_map(|k| match base_schema.column_with_name(k) {
-                Some((_, field)) => {
-                    let embedding_size = self
-                        .embedding_sizes
-                        .get(field.name())
-                        .copied()
-                        .unwrap_or_default();
-
-                    Some(Arc::new(
-                        field
-                            .clone()
-                            .with_data_type(DataType::new_fixed_size_list(
-                                DataType::Float32,
-                                embedding_size,
-                                false,
-                            ))
-                            .with_name(format!("{}_embedding", field.name())),
-                    ))
-                }
-                None => None,
+            .filter_map(|k| {
+                base_schema
+                    .column_with_name(k)
+                    .map(|(_, field)| self.embedding_fields(field))
             })
+            .flatten()
             .collect();
 
         base_fields.append(&mut embedding_fields);
@@ -279,6 +351,7 @@ impl TableProvider for EmbeddingTable {
             base_plan,
             scan_embed_columns,
             Arc::clone(&self.embedding_models),
+            self.embedding_chunkers.clone(),
         )) as Arc<dyn ExecutionPlan>)
     }
 
@@ -287,16 +360,7 @@ impl TableProvider for EmbeddingTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // let base_supports = self.base_table.supports_filters_pushdown(filters)?;
-        // let embed_keys = HashSet::from_iter(self.embedded_columns.keys().map(|x| format!("{x}_embedding")));
-
-        // Ok(filters.iter().enumerate().map(|(i, &f)| {
-        //     let is_standard = f.to_columns().map(|c| c.intersection(embed_keys).count() == 0).ok();
-        //     if let Some(true) = is_standard {
-        //         return base_supports[i];
-        //     }
-        //     TableProviderFilterPushDown::Unsupported
-        // }).collect_vec())
+        // TODO: Implement pushdown for filters that can be exact.
         Ok(vec![
             TableProviderFilterPushDown::Unsupported;
             filters.len()

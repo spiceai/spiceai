@@ -59,7 +59,7 @@ use url::{form_urlencoded, Url};
 use std::future::Future;
 
 use crate::object_store_registry::default_runtime_env;
-
+pub mod abfs;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
@@ -188,7 +188,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to get {dataconnector} data connector for dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
+        "Unable to load {dataconnector} dataset {dataset_name}. Table {table_name} not found. Verify the source table name in the Spicepod configuration."
     ))]
     InvalidTableName {
         dataconnector: String,
@@ -262,6 +262,7 @@ pub async fn create_new_connector(
     name: &str,
     params: HashMap<String, SecretString>,
     secrets: Arc<RwLock<Secrets>>,
+    metadata: Option<HashMap<String, String>>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -282,7 +283,7 @@ pub async fn create_new_connector(
         Err(e) => return Some(Err(e)),
     };
 
-    let result = factory.create(params).await;
+    let result = factory.create(params, metadata).await;
     Some(result)
 }
 
@@ -298,6 +299,7 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
     register_connector_factory("s3", s3::S3Factory::new_arc()).await;
+    register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
@@ -339,6 +341,7 @@ pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
         params: Parameters,
+        metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
     /// The prefix to use for parameters and secrets for this `DataConnector`.
@@ -786,6 +789,7 @@ mod tests {
         fn create(
             &self,
             params: Parameters,
+            _metadata: Option<HashMap<String, String>>,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
                 let connector = Self { params };

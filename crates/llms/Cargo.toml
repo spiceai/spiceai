@@ -25,6 +25,8 @@ serde = { workspace = true, features = ["derive"] }
 tokenizers = { version = "0.19.1" }
 tracing.workspace = true
 tracing-futures.workspace = true
+text-splitter = {version =  "0.16.1", features = ["markdown"]}
+pulldown-cmark = "0.12.1"
 
 ## `candle` feature packages
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8", optional = true }
@@ -32,7 +34,7 @@ mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cfc0fa7
 rand = "0.8.5"
 tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "dde326b330ecb609201110d4725928a6e977f0dd" }
 tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "dde326b330ecb609201110d4725928a6e977f0dd" }
-tempfile = "3.10.1"
+tempfile = "3.13.0"
 indexmap = "2.3.0"
 either = "1.13.0"
 
