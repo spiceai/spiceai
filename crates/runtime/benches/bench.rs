@@ -189,11 +189,6 @@ async fn run_connector_bench(
     upload_results_dataset: &Option<String>,
     bench_name: &str,
 ) -> Result<(), String> {
-    // TODO: Implement and enable connector TPCDS bench if it's required
-    if bench_name == "tpcds" {
-        return Err("TPCDS Benchmark not implemented for data connectors".to_string());
-    }
-
     let mut display_records = vec![];
 
     let (mut benchmark_results, mut rt) =
@@ -216,7 +211,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "mysql")]
         "mysql" => {
-            bench_mysql::run(&mut rt, &mut benchmark_results).await?;
+            bench_mysql::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {
