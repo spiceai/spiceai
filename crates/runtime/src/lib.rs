@@ -44,7 +44,10 @@ use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
 use llms::embeddings::Embed;
-use model::{try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore};
+use model::{
+    try_to_chat_model, try_to_embedding, EmbeddingModelStore, LLMModelStore,
+    ENABLE_MODEL_SUPPORT_MESSAGE,
+};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -397,7 +400,12 @@ impl Runtime {
             Arc::clone(&self.df),
             tls_config.clone(),
         ));
-        let pods_watcher_future = self.start_pods_watcher();
+
+        let pods_watcher_future = if self.pods_watcher.read().await.is_some() {
+            Some(self.start_pods_watcher())
+        } else {
+            None
+        };
 
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
@@ -435,7 +443,15 @@ impl Runtime {
                     }
                 }
             },
-            pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
+            pods_watcher_res = async {
+                if let Some(fut) = pods_watcher_future {
+                    fut.await
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                pods_watcher_res.context(UnableToInitializePodsWatcherSnafu)
+            },
             () = shutdown_signal() => {
                 tracing::info!("Goodbye!");
                 Ok(())
@@ -450,7 +466,6 @@ impl Runtime {
     pub async fn load_components(&self) {
         self.start_extensions().await;
 
-        #[cfg(feature = "models")]
         self.load_embeddings().await; // Must be loaded before datasets
 
         let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
@@ -464,9 +479,7 @@ impl Runtime {
             Box::pin(self.load_catalogs()),
         ];
 
-        if cfg!(feature = "models") {
-            futures.push(Box::pin(self.load_models()));
-        }
+        futures.push(Box::pin(self.load_models()));
 
         join_all(futures).await;
     }
@@ -1286,8 +1299,14 @@ impl Runtime {
 
     #[allow(dead_code)]
     async fn load_embeddings(&self) {
-        let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
+        let app_opt = self.app.read().await;
+
+        if !cfg!(feature = "models") && app_opt.as_ref().is_some_and(|s| !s.embeddings.is_empty()) {
+            tracing::error!("Cannot load embedding models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+            return;
+        };
+
+        if let Some(app) = app_opt.as_ref() {
             for in_embed in &app.embeddings {
                 self.status
                     .update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
@@ -1331,10 +1350,16 @@ impl Runtime {
     }
 
     async fn load_models(&self) {
+        let app_lock = self.app.read().await;
+
+        if !cfg!(feature = "models") && app_lock.as_ref().is_some_and(|s| !s.models.is_empty()) {
+            tracing::error!("Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+            return;
+        }
+
         // Load tools before loading models.
         self.load_tools().await;
 
-        let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
                 self.status
