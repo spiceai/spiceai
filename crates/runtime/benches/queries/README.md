@@ -2,15 +2,18 @@
 
 ## TPC-DS (Decision Support Benchmark) Limitations
 
-### Interval Arithmetic (date + 30 days) Not Supported
+### Intervals like `date + 30 days` or `date + 5` are not supported
 
-**Limitation**: Queries using direct date arithmetic (e.g., date + 30 days) are not supported.
+**Limitation**: Queries using direct date arithmetic (e.g., `date + 30 days` or `date + 5`) are not supported.
 
 **Solution**: Use the _INTERVAL_ data type for date arithmetic.
 
 ```sql
 # fail
 SELECT (now() + 30 days);
+
+# fail
+SELECT (now() + 30);
 
 # success
 SELECT (now() + INTERVAL '30 days');
@@ -23,6 +26,7 @@ SELECT (now() + INTERVAL '30 days');
 | [q21.sql](tpcds/q21.sql) | [q82.sql](tpcds/q82.sql) | [q32.sql](tpcds/q32.sql) |
 | [q37.sql](tpcds/q37.sql) | [q92.sql](tpcds/q92.sql) | [q40.sql](tpcds/q40.sql) |
 | [q94.sql](tpcds/q94.sql) | [q95.sql](tpcds/q95.sql) | [q98.sql](tpcds/q98.sql) |
+| [q72.sql](tpcds/q72.sql) |                          |                          |
 
 ### DataFusion Supports Only Single SQL Statement per Query
 
