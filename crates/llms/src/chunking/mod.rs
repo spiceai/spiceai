@@ -145,11 +145,26 @@ mod tests {
             trim_whitespace: true,
             file_format: None,
         };
-        
-        let chunker = Openai::default().chunker(cfg).expect("Failed to create OpenAI chunker");
-        let chunks: Vec<_> = chunker.chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1").collect();
 
-        assert_eq!(chunks, vec!["let cfg =", "ChunkingConfig", "{", "target_chunk_size", ": 3", "overlap_size:", "1"]);
+        let chunker = Openai::default()
+            .chunker(cfg)
+            .expect("Failed to create OpenAI chunker");
+        let chunks: Vec<_> = chunker
+            .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")
+            .collect();
+
+        assert_eq!(
+            chunks,
+            vec![
+                "let cfg =",
+                "ChunkingConfig",
+                "{",
+                "target_chunk_size",
+                ": 3",
+                "overlap_size:",
+                "1"
+            ]
+        );
     }
 
     #[test]
@@ -164,5 +179,4 @@ mod tests {
         let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg);
         assert!(matches!(chunker.splitter, Splitter::Markdown(_)));
     }
-
 }
