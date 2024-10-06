@@ -54,7 +54,7 @@ impl CharacterSplittingChunker {
             .with_trim(cfg.trim_whitespace);
 
         let splitter = match cfg.file_format {
-            Some("md" | ".md") => {
+            Some("md" | ".md" | "mdx" | ".mdx") => {
                 Splitter::Markdown(text_splitter::MarkdownSplitter::new(cfg_with_overlap))
             }
             _ => Splitter::Text(text_splitter::TextSplitter::new(cfg_with_overlap)),
