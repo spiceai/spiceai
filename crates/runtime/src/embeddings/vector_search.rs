@@ -281,6 +281,75 @@ impl VectorSearch {
         }
     }
 
+    fn construct_chunk_query(
+        primary_keys: &[String],
+        projection: &[String],
+        embedding_column: &str,
+        table_name: &TableReference,
+        embedding: &[f32],
+        where_cond: &str,
+        n: usize,
+    ) -> String {
+        let pks = if primary_keys.is_empty() {
+            // Only known key that is unique for the embedding table, is the embedding column.
+            quote_identifier(embedding_column).to_string()
+        } else {
+            primary_keys
+                .iter()
+                .map(|pk| quote_identifier(pk))
+                .join(", ")
+        };
+
+        let pk_conditions = if primary_keys.is_empty() {
+            format!(
+                "rd.{} = t.{}",
+                quote_identifier(embedding_column),
+                quote_identifier(embedding_column)
+            )
+        } else {
+            primary_keys
+                .iter()
+                .map(|pk| format!("rd.{p} = t.{p}", p = quote_identifier(pk)))
+                .join(" AND ")
+        };
+
+        let projection_str = projection
+            .iter()
+            .map(|s| format!("t.{p}", p = quote_identifier(s)))
+            .join(", ");
+
+        format!(
+            "WITH ranked_docs as (
+                SELECT {pks}, {VECTOR_DISTANCE_COLUMN_NAME}, offset FROM (
+                    SELECT
+                        {pks},
+                        offset,
+                        {VECTOR_DISTANCE_COLUMN_NAME},
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ({pks})
+                            ORDER BY dist ASC
+                        ) AS chunk_rank
+                    FROM (
+                        SELECT
+                            {pks},
+                            unnest({embed_col}_offsets) AS offset,
+                            cosine_distance(unnest({embed_col}_embedding), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                        FROM {table_name}
+                        {where_cond}
+                    )
+                )
+                WHERE chunk_rank = 1
+                LIMIT {n}
+            )
+            SELECT
+                substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {embed_col}_chunk,
+                {projection_str},
+                rd.{VECTOR_DISTANCE_COLUMN_NAME}
+            FROM ranked_docs rd
+            JOIN {table_name} t ON {pk_conditions}", embed_col=quote_identifier(embedding_column).to_string()
+        )
+    }
+
     /// Perform a single SQL query vector search.
     #[allow(clippy::too_many_arguments)]
     async fn individual_search(
@@ -300,27 +369,21 @@ impl VectorSearch {
             .chain(Some(embedding_column.to_string()))
             .chain(additional_columns.iter().cloned())
             .unique()
+            .map(|s| quote_identifier(&s).to_string())
             .collect();
-
-        let projection_str = projection.iter().map(|s| quote_identifier(s)).join(", ");
 
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
         let query = if is_chunked {
-            format!(
-                "SELECT
-                    {projection_str},
-                    substring({embed_col}, offsets[1], offsets[2] - offsets[1]) as {embed_col}_chunk,
-                    {VECTOR_DISTANCE_COLUMN_NAME}
-                FROM (
-                    SELECT
-                        {projection_str},
-                        unnest({embedding_column}_offsets) as offsets,
-                        cosine_distance(unnest({embedding_column}_embedding), {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
-                    FROM {tbl}
-                    {where_str}
-                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
-                ) LIMIT {n}", embed_col=quote_identifier(embedding_column).to_string())
+            Self::construct_chunk_query(
+                primary_keys,
+                &projection,
+                embedding_column,
+                tbl,
+                &embedding,
+                &where_str,
+                n,
+            )
         } else {
             format!(
                     "SELECT
@@ -329,7 +392,7 @@ impl VectorSearch {
                     FROM {tbl}
                     {where_str}
                     ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
-                    LIMIT {n}"
+                    LIMIT {n}", projection_str=projection.iter().join(", ")
                 )
         };
         tracing::trace!("running SQL: {query}");
