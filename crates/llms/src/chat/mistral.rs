@@ -28,7 +28,11 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mistralrs::{
-    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType
+    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs,
+    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
+    TokenSource, Tool, ToolChoice, ToolType,
 };
 
 use snafu::ResultExt;
@@ -428,9 +432,8 @@ impl Chat for MistralLlama {
                         break;
                     },
                     MistralResponse::ImageGeneration(_) => {
-                        // Only reachable if message is [`RequestMessage::ImageGeneration`]. This function is using [`RequestMessage::Completion`].
                         yield Err(ChatError::UnsupportedModalityType {
-                            modality: "ImageGeneration".into(),
+                            modality: "image generation".into(),
                         });
                         break;
                     },

@@ -94,8 +94,8 @@ pub enum Error {
     #[snafu(display("Invalid value for 'params.spice_tools'"))]
     UnsupportedSpiceToolUseParameterError {},
 
-    #[snafu(display("Runtime does not currently support {modality} modality"))]
-    UnsupportedModalityType { modality: String}
+    #[snafu(display("Runtime does not currently support the {modality} modality"))]
+    UnsupportedModalityType { modality: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -326,25 +326,24 @@ pub fn message_to_mistral(
                 map.insert("name".to_string(), Either::Left(name.clone()));
             }
             if let Some(tool_calls) = tool_calls {
-                let z: Vec<IndexMap<String, Value>> = tool_calls.iter().filter_map(|t| {
+                let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
+                    .iter()
+                    .filter_map(|t| {
+                        let Ok(function) = serde_json::to_value(&t.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                            return None;
+                        };
 
-                    let Ok(function) = serde_json::to_value(&t.function) else {
-                        tracing::warn!("Invalid function call: {:#?}", t.function);
-                        return None;
-                    };
+                        let mut map = IndexMap::new();
+                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("function".to_string(), function);
+                        map.insert("type".to_string(), Value::String("function".to_string()));
 
-                    let mut map = IndexMap::new();
-                    map.insert("id".to_string(), Value::String(t.id.to_string()));
-                    map.insert("function".to_string(), function);
-                    map.insert("type".to_string(), Value::String("function".to_string()));
-                    
-                    Some(map)
-                }).collect();
+                        Some(map)
+                    })
+                    .collect();
 
-                map.insert(
-                    "tool_calls".to_string(),
-                    Either::Right(z),
-                );
+                map.insert("tool_calls".to_string(), Either::Right(tool_call_results));
             }
             map
         }
