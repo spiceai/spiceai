@@ -15,8 +15,10 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
+use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 
 use async_openai::error::OpenAIError;
@@ -249,6 +251,18 @@ impl Embed for Openai {
             "text-embedding-3-large" => 3_072,
             "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
             _ => 0, // unreachable. If not a valid model, it won't create embeddings.
+        }
+    }
+
+    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        match RecursiveSplittingChunker::for_openai_model(&self.model, &cfg) {
+            None => {
+                tracing::warn!("Embedding model {} cannot use specialised chunk sizer, will use character sizer instead.", self.model);
+                Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
+                    &cfg,
+                )))
+            }
+            Some(chunker) => Some(Arc::new(chunker)),
         }
     }
 }
