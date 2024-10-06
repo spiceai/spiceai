@@ -429,7 +429,7 @@ impl Chat for MistralLlama {
                     },
                     MistralResponse::ImageGeneration(_) => {
                         yield Err(ChatError::UnsupportedModalityType {
-                            modality: "ImageGeneration".into(),
+                            modality: "image generation".into(),
                         });
                         break;
                     },

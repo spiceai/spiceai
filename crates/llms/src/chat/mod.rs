@@ -92,7 +92,7 @@ pub enum Error {
     #[snafu(display("Invalid value for 'params.spice_tools'"))]
     UnsupportedSpiceToolUseParameterError {},
 
-    #[snafu(display("Runtime does not currently support {modality} modality"))]
+    #[snafu(display("Runtime does not currently support the {modality} modality"))]
     UnsupportedModalityType { modality: String },
 }
 
