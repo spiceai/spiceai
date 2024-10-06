@@ -128,15 +128,15 @@ impl MistralLlama {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        let bldr = GGUFLoaderBuilder::new(
+        GGUFLoaderBuilder::new(
             chat_template,
             None,
             model_id.to_string(),
             gguf_file,
             GGUFSpecificConfig::default(),
         )
-        .build();
-        let pipe = bldr.load_model_from_path(
+        .build()
+        .load_model_from_path(
             &paths,
             &ModelDType::Auto,
             device,
@@ -144,9 +144,8 @@ impl MistralLlama {
             DeviceMapMetadata::dummy(),
             None,
             None,
-        ); 
-
-        pipe.map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        )
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_ggml_pipeline(
