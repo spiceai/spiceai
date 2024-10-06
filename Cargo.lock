@@ -6484,10 +6484,7 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 [[package]]
 name = "mistralrs"
 version = "0.3.1"
-<<<<<<< HEAD
-=======
 source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
->>>>>>> 73862ca0 (Fix issues parsing `messages[*].tool_calls` for local models (#2957))
 dependencies = [
  "anyhow",
  "candle-core 0.7.2",
