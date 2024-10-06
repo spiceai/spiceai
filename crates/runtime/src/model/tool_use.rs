@@ -26,10 +26,10 @@ use llms::chat::{Chat, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
 };
 
