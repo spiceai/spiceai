@@ -548,6 +548,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "as-any"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b8a30a44e99a1c83ccb2a6298c563c888952a1c9134953db26876528f84c93a"
+
+[[package]]
 name = "ascii"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2117,8 +2123,8 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.6.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=f706ef2#f706ef27666e77c5b5a6cdbd28f47c3205171d39"
+version = "0.7.2"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
 dependencies = [
  "byteorder",
  "gemm",
@@ -2141,7 +2147,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b006b30f66a0d94fc9cef0ac4de6ce510565f35ae2c6c35ce5d4aacfb0fc8eeb"
 dependencies = [
- "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.6.0",
  "half",
  "num-traits",
  "rayon",
@@ -2152,10 +2158,10 @@ dependencies = [
 
 [[package]]
 name = "candle-nn"
-version = "0.6.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=f706ef2#f706ef27666e77c5b5a6cdbd28f47c3205171d39"
+version = "0.7.2"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
 dependencies = [
- "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
+ "candle-core 0.7.2",
  "half",
  "num-traits",
  "rayon",
@@ -2171,8 +2177,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f0d4eb6a0d9279d5829b06b2bf3caa117904eefd6dcf879d16e687c4a84034c"
 dependencies = [
  "byteorder",
- "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.6.0",
+ "candle-nn 0.6.0",
  "fancy-regex 0.13.0",
  "num-traits",
  "rand 0.8.5",
@@ -3495,9 +3501,9 @@ dependencies = [
 
 [[package]]
 name = "derive-new"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d150dea618e920167e5973d70ae6ece4385b7164e0d799fe7c122dd0a5d912ad"
+checksum = "2cdc8d50f426189eef89dac62fabfa0abb27d5cc008f25bf4156a0203325becc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6430,11 +6436,11 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.2.5"
-source = "git+https://github.com/spiceai/mistral.rs?rev=cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8#cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8"
+version = "0.3.1"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
 dependencies = [
  "anyhow",
- "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
+ "candle-core 0.7.2",
  "either",
  "futures",
  "image 0.25.2",
@@ -6449,23 +6455,24 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.2.5"
-source = "git+https://github.com/spiceai/mistral.rs?rev=cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8#cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8"
+version = "0.3.1"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
 dependencies = [
  "akin",
  "anyhow",
+ "as-any",
  "async-trait",
  "base64 0.22.1",
  "buildstructor",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
- "candle-nn 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
+ "candle-core 0.7.2",
+ "candle-nn 0.7.2",
  "cfgrammar",
  "chrono",
  "clap",
  "csv",
- "derive-new 0.6.0",
+ "derive-new 0.7.0",
  "derive_more",
  "dirs",
  "either",
@@ -6491,9 +6498,11 @@ dependencies = [
  "regex-automata 0.4.7",
  "reqwest 0.12.7",
  "rustc-hash 2.0.0",
+ "safetensors",
  "schemars",
  "serde",
  "serde_json",
+ "serde_plain",
  "serde_yaml",
  "strum 0.26.3",
  "sysinfo",
@@ -6512,11 +6521,12 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.2.5"
-source = "git+https://github.com/spiceai/mistral.rs?rev=cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8#cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8"
+version = "0.3.1"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
 dependencies = [
- "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
- "candle-nn 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
+ "byteorder",
+ "candle-core 0.7.2",
+ "candle-nn 0.7.2",
  "half",
  "lazy_static",
  "paste",
@@ -6527,10 +6537,10 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.2.5"
-source = "git+https://github.com/spiceai/mistral.rs?rev=cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8#cfc0fa7ffaed0ca71cf86caff4dbd950d08626d8"
+version = "0.3.1"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
 dependencies = [
- "candle-core 0.6.0 (git+https://github.com/EricLBuehler/candle.git?rev=f706ef2)",
+ "candle-core 0.7.2",
  "image 0.25.2",
 ]
 
@@ -10451,8 +10461,8 @@ version = "1.4.0"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
 dependencies = [
  "anyhow",
- "candle-core 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.6.0",
+ "candle-nn 0.6.0",
  "candle-transformers",
  "memmap2",
  "nohash-hasher",
