@@ -291,32 +291,14 @@ impl VectorSearch {
         n: usize,
     ) -> String {
         let pks = if primary_keys.is_empty() {
-            // Only known key that is unique for the embedding table, is the embedding column.
-            quote_identifier(embedding_column).to_string()
+            // If the dataset has no true primary keys, the only known unique key is the embedding column.
+            vec![quote_identifier(embedding_column).to_string()]
         } else {
             primary_keys
                 .iter()
-                .map(|pk| quote_identifier(pk))
-                .join(", ")
+                .map(|s| quote_identifier(s).to_string())
+                .collect_vec()
         };
-
-        let pk_conditions = if primary_keys.is_empty() {
-            format!(
-                "rd.{} = t.{}",
-                quote_identifier(embedding_column),
-                quote_identifier(embedding_column)
-            )
-        } else {
-            primary_keys
-                .iter()
-                .map(|pk| format!("rd.{p} = t.{p}", p = quote_identifier(pk)))
-                .join(" AND ")
-        };
-
-        let projection_str = projection
-            .iter()
-            .map(|s| format!("t.{p}", p = quote_identifier(s)))
-            .join(", ");
 
         format!(
             "WITH ranked_docs as (
@@ -346,7 +328,16 @@ impl VectorSearch {
                 {projection_str},
                 rd.{VECTOR_DISTANCE_COLUMN_NAME}
             FROM ranked_docs rd
-            JOIN {table_name} t ON {pk_conditions}", embed_col=quote_identifier(embedding_column).to_string()
+            JOIN {table_name} t ON {join_on_conditions}",
+                embed_col=quote_identifier(embedding_column).to_string(),
+                pks = pks.iter().join(", "),
+                projection_str = projection.iter()
+                    .map(|s| format!("t.{s}"))
+                    .join(", "),
+                join_on_conditions = pks
+                    .iter()
+                    .map(|pk| format!("rd.{p} = t.{p}", p = quote_identifier(pk)))
+                    .join(" AND "),
         )
     }
 
