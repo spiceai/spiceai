@@ -53,7 +53,7 @@ pub(crate) async fn run(
     for (query_name, query) in test_queries {
         let verify_query_results = (matches!(
             bench_name.as_str(),
-            "s3" | "s3_arrow_memory" | "s3_sqlite_memory" | "s3_sqlite_file"
+            "s3" | "s3_arrow_memory" | "s3_sqlite_memory" | "s3_sqlite_file" | "s3_duckdb_memory"
         )) && query_name.starts_with("tpch_q");
 
         if let Err(e) = super::run_query_and_record_result(
