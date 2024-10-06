@@ -15,6 +15,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+
 use super::{
     Embed, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu,
     FailedToPrepareInputSnafu, Result,
@@ -169,6 +171,13 @@ impl Embed for CandleEmbedding {
 
     fn size(&self) -> i32 {
         self.model_cfg.hidden_size
+    }
+
+    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        Some(Arc::new(RecursiveSplittingChunker::with_tokenizer_sizer(
+            &cfg,
+            Arc::clone(&self.tok),
+        )))
     }
 }
 
