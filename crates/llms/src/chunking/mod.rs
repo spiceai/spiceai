@@ -129,3 +129,40 @@ impl<Sizer: ChunkSizer + Send + Sync> Chunker for RecursiveSplittingChunker<Size
         Box::new(z.into_iter())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::vec;
+
+    use super::*;
+    use crate::{embeddings::Embed, openai::Openai};
+
+    #[test]
+    fn test_openai_chunker() {
+        let cfg = ChunkingConfig {
+            target_chunk_size: 3,
+            overlap_size: 1,
+            trim_whitespace: true,
+            file_format: None,
+        };
+        
+        let chunker = Openai::default().chunker(cfg).expect("Failed to create OpenAI chunker");
+        let chunks: Vec<_> = chunker.chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1").collect();
+
+        assert_eq!(chunks, vec!["let cfg =", "ChunkingConfig", "{", "target_chunk_size", ": 3", "overlap_size:", "1"]);
+    }
+
+    #[test]
+    fn test_file_format() {
+        let cfg = ChunkingConfig {
+            target_chunk_size: 3,
+            overlap_size: 1,
+            trim_whitespace: true,
+            file_format: Some("md"),
+        };
+
+        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg);
+        assert!(matches!(chunker.splitter, Splitter::Markdown(_)));
+    }
+
+}
