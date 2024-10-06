@@ -40,7 +40,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
-use crate::tools::builtin::list_datasets::{get_dataset_elements, ListDatasetElement};
+use crate::tools::builtin::list_datasets::{
+    get_dataset_elements, ListDatasetElement, ListDatasetsTool,
+};
 use crate::tools::SpiceModelTool;
 use crate::Runtime;
 
@@ -114,22 +116,43 @@ impl ToolUsingChat {
         &self,
         req: &CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let content = format!(
-            "You have access to a runtime. {} {}",
-            self.available_tables_system_prompt()
-                .await
-                .unwrap_or_default(),
-            self.runtime_tool_system_prompt().unwrap_or_default(),
-        );
-
-        let message = ChatCompletionRequestSystemMessageArgs::default()
-            .content(content)
-            .build()?;
+        // Add previous messages to the request that pretend it has already asked to list the available datasets.
+        let mut list_dataset_messages = self.create_list_dataset_messages().await?;
+        list_dataset_messages.extend_from_slice(req.messages.as_slice());
 
         let mut req = req.clone();
-        req.messages
-            .insert(0, ChatCompletionRequestMessage::System(message));
+        req.messages = list_dataset_messages;
         Ok(req)
+    }
+
+    /// Create the messagges expected from a model if it has called the list_datasets tool, and recieved a response.
+    /// This is useful to prime the model as if it has already asked to list the available datasets.
+    async fn create_list_dataset_messages(
+        &self,
+    ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
+        let t = ListDatasetsTool::default();
+        let t_resp = t
+            .call("", Arc::<Runtime>::clone(&self.rt))
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        Ok(vec![
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![ChatCompletionMessageToolCall {
+                    id: "initial_list_datasets".to_string(),
+                    r#type: ChatCompletionToolType::Function,
+                    function: FunctionCall {
+                        name: t.name().to_string(),
+                        arguments: String::new(),
+                    },
+                }])
+                .build()?
+                .into(),
+            ChatCompletionRequestToolMessageArgs::default()
+                .content(t_resp.to_string())
+                .tool_call_id("initial_list_datasets".to_string())
+                .build()?
+                .into(),
+        ])
     }
 
     /// Check if a tool call is a spiced runtime tool.
