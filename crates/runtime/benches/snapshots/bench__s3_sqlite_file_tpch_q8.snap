@@ -1,0 +1,10 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++--------+------------+
+| o_year | mkt_share  |
++--------+------------+
+| 1995.0 | 0.03443589 |
+| 1996.0 | 0.04148552 |
++--------+------------+
