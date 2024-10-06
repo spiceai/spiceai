@@ -36,7 +36,9 @@ use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter, KeyEvent};
+use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
@@ -90,6 +92,49 @@ async fn send_nsql_request(
         .await
 }
 
+#[derive(Completer, Helper, Highlighter, Hinter)]
+struct ReplHelper;
+
+const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
+
+impl Validator for ReplHelper {
+    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        let input = ctx.input();
+        if SPECIAL_COMMANDS.contains(&input.to_ascii_lowercase().trim())
+            || input.trim().ends_with(';')
+        {
+            Ok(ValidationResult::Valid(None))
+        } else {
+            Ok(ValidationResult::Incomplete)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct KeyEventHandler;
+
+impl ConditionalEventHandler for KeyEventHandler {
+    fn handle(
+        &self,
+        evt: &rustyline::Event,
+        _n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        evt.get(0).and_then(|k| {
+            if *k == KeyEvent::ctrl('C') {
+                Some(if ctx.line().is_empty() {
+                    rustyline::Cmd::EndOfFile
+                } else {
+                    rustyline::Cmd::Interrupt
+                })
+            } else {
+                None
+            }
+        })
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -122,8 +167,16 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .max_decoding_message_size(500 * 1024 * 1024)
         .max_encoding_message_size(500 * 1024 * 1024);
 
-    let mut rl = DefaultEditor::new()?;
-
+    let mut rl = Editor::new()?;
+    let helper = ReplHelper {};
+    let key_handler = Box::new(KeyEventHandler {});
+    rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
+    rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
+    rl.bind_sequence(
+        KeyEvent::new('\t', Modifiers::NONE),
+        rustyline::Cmd::Insert(1, "\t".to_string()),
+    );
+    rl.set_helper(Some(helper));
     println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
 
@@ -135,7 +188,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let line_result = rl.readline(&prompt);
         let line = match line_result {
             Ok(line) => line,
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+            Err(ReadlineError::Interrupted) => {
+                // User canceled the current query
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
                 break;
             }
             Err(err) => {

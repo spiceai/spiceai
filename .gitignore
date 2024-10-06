@@ -14,7 +14,7 @@ spicepods
 
 *.parquet
 spicepod.yaml
-!test/tpch/tpch-spicepod/spicepod.yaml
+!test/tpc-bench/tpch-spicepod/spicepod.yaml
 
 target/
 
@@ -43,9 +43,9 @@ __pycache__
 venv
 .venv
 
-/test/tpch/tmp/
-/test/tpch/tpch-kit
-/test/tpch/tpch_queries.sql
+/test/tpc-bench/tmp/
+/test/tpc-bench/tpch-kit
+/test/tpc-bench/tpcds-kit
 
 .vscode/settings.json
 

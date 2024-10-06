@@ -1,0 +1,13 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-----------+---------------+
+| n_name    | revenue       |
++-----------+---------------+
+| INDONESIA | 55502041.1697 |
+| VIETNAM   | 55295086.9967 |
+| CHINA     | 53724494.2566 |
+| INDIA     | 52035512.0002 |
+| JAPAN     | 45410175.6954 |
++-----------+---------------+
