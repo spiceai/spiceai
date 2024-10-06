@@ -24,6 +24,37 @@ tpch-init:
 
 	@echo "Initialized successfully."
 
+tpcds-init:
+	@if [ ! -d "tpcds-kit" ]; then \
+		git clone https://github.com/spiceai/tpcds-kit.git; \
+		cd tpcds-kit && git checkout dd01f906992e1e39837526bffb3f5b759e83b3a8; \
+	fi
+	@OS=`uname`; \
+	if [ -z "$(OS)" ]; then \
+		if [ "$$OS" = "Linux" ]; then \
+			OS=LINUX; \
+			$(MAKE) -C tpcds-kit/tools CC=gcc-9 OS=$$OS; \
+		elif [ "$$OS" = "Darwin" ]; then \
+			OS=MACOS; \
+			$(MAKE) -C tpcds-kit/tools OS=$$OS; \
+		else \
+			echo "Unsupported operating system: $$OS."; \
+			exit 1; \
+		fi; \
+	fi; \
+	$(MAKE) -C tpcds-kit/tools OS=$$OS
+
+	@echo "Initialized successfully."
+
+tpcds-gen: tpch-init
+	@(cd tpcds-kit/tools && mkdir -p ./tmp/data)
+
+	@# Check if DBGEN_SCALE is set, else default to 1
+	$(eval DBGEN_SCALE ?= 1)
+	(cd tpcds-kit/tools && ./dsdgen -dir ./tmp/data -scale $(DBGEN_SCALE))
+
+	@echo "Test data is generated successfully."
+
 tpch-gen: tpch-init
 	@# Check if DBGEN_SCALE is set, else default to 1
 	$(eval DBGEN_SCALE ?= 1)
@@ -112,5 +143,35 @@ mysql-load:
 		echo "Loading $$table..."; \
 		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+	done
+	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
+
+# Example: DB_HOST=localhost DB_PORT=13306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-tpcds-init
+mysql-tpcds-init:
+	@echo "Checking if database '$(DB_NAME)' exists..."
+	@if mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -e "USE $(DB_NAME);" 2>/dev/null; then \
+		echo "Database '$(DB_NAME)' already exists, skipping creation."; \
+	else \
+		echo "Creating database '$(DB_NAME)'..."; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -e "CREATE DATABASE $(DB_NAME);"; \
+		echo "Database '$(DB_NAME)' created successfully."; \
+	fi
+
+	@echo "Dropping existing tables if they exist..."
+	@mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) -e "\
+		DROP TABLE IF EXISTS call_center, catalog_page, catalog_returns, catalog_sales, customer, customer_address, customer_demographics, date_dim, dbgen_version, household_demographics, income_band, inventory, item, promotion, reason, ship_mode, store, store_returns, store_sales, time_dim, warehouse, web_page, web_returns, web_sales, web_site;"
+
+	@echo "Creating tables from tpcds.sql..."
+	@mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) < ./tpcds-kit/tools/tpcds.sql
+
+	@echo "Database '$(DB_NAME)' has been successfully created or updated."
+
+# Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
+mysql-tpcds-load:
+	@mkdir -p ./tmp
+	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
+		echo "Loading $$table..."; \
+		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
