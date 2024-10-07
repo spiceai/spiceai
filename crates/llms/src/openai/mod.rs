@@ -17,10 +17,12 @@ limitations under the License.
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
+use crate::chat::nsql::{json::JsonSchemaSqlGeneration, SqlGeneration};
 use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
 use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
-
+use async_openai::config::{Config, OPENAI_API_BASE};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
@@ -89,6 +91,15 @@ impl Openai {
 
 #[async_trait]
 impl Chat for Openai {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        // Only use structured output schema for OpenAI, not openai compatible.
+        if self.client.config().api_base() == OPENAI_API_BASE {
+            Some(&StructuredOutputSqlGeneration {})
+        } else {
+            Some(&JsonSchemaSqlGeneration {})
+        }
+    }
+
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
         let span = tracing::Span::current();
 

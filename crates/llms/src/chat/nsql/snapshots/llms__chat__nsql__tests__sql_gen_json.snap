@@ -1,0 +1,20 @@
+---
+source: crates/llms/src/chat/nsql/mod.rs
+expression: req_str
+---
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "```SQL\nCREATE TABLE IF NOT EXISTS documents (\n        location VARCHAR NOT NULL,\n        content TEXT NOT NULL\n    );```\nTask: Write a postgres SQL query to answer this question: _\"SELECT * FROM table\"_. Instruction: Return only valid SQL code, nothing additional."
+    },
+    {
+      "role": "system",
+      "content": "Response Format: JSON, with the postgres SQL under 'sql'."
+    }
+  ],
+  "model": "model_id",
+  "response_format": {
+    "type": "json_object"
+  }
+}
