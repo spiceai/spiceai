@@ -14,11 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use arrow::error::ArrowError;
 use client::GraphQLQuery;
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use serde_json::Value;
 use snafu::Snafu;
 
+pub mod builder;
 pub mod client;
 pub mod provider;
 
@@ -81,14 +85,29 @@ pub struct FilterPushdownResult {
     pub context: Option<String>,
 }
 
+pub type ValuePreprocessor = Arc<dyn Fn(&mut Value) -> Result<()>>;
+
 pub trait GraphQLOptimizer: Send + Sync {
     fn filter_pushdown(
         &self,
         expr: &Expr,
-    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
+        Ok(FilterPushdownResult {
+            filter_pushdown: TableProviderFilterPushDown::Unsupported,
+            expr: expr.clone(),
+            context: None,
+        })
+    }
+
     fn inject_parameters(
         &self,
-        filters: &[FilterPushdownResult],
-        query: &mut GraphQLQuery<'_>,
-    ) -> Result<(), datafusion::error::DataFusionError>;
+        _filters: &[FilterPushdownResult],
+        _query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        Ok(())
+    }
+
+    fn preprocess_value(&self) -> Option<ValuePreprocessor> {
+        None
+    }
 }
