@@ -14,12 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use async_openai::{
     error::OpenAIError,
     types::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
 };
 use async_trait::async_trait;
-use llms::embeddings::{Embed, Result as EmbedResult};
+use llms::{
+    chunking::{Chunker, ChunkingConfig},
+    embeddings::{Embed, Result as EmbedResult},
+};
 use tracing::{Instrument, Span};
 
 pub struct TaskEmbed {
@@ -56,6 +61,10 @@ impl Embed for TaskEmbed {
 
     fn size(&self) -> i32 {
         self.inner.size()
+    }
+
+    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        self.inner.chunker(cfg)
     }
 
     #[allow(clippy::cast_possible_truncation)]
