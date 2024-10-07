@@ -24,7 +24,7 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use futures::Stream;
-use llms::chat::{Chat, Error as LlmError, Result as ChatResult};
+use llms::chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult};
 use llms::openai::DEFAULT_LLM_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
@@ -391,5 +391,9 @@ impl Chat for ChatWrapper {
         prompt: String,
     ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
         self.chat.stream(prompt).await
+    }
+
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        self.chat.as_sql()
     }
 }

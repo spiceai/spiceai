@@ -154,7 +154,9 @@ impl Runnable for Model {
                 (1, lookback_size, num_variates),
                 inp.into_iter().concat(),
             )
-            .context(ShapeSnafu)?
+            .map_err(|_| Error::ShapeError {
+                source: ndarray::ShapeError::from_kind(ndarray::ErrorKind::IncompatibleShape),
+            })?
             .into_tensor();
 
             let output = this.model.run(tvec!(small_vec
