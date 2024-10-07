@@ -1,0 +1,9 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------------+
+| avg_yearly        |
++-------------------+
+| 348406.0542857143 |
++-------------------+
