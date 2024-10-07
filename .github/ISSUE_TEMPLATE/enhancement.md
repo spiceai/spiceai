@@ -2,29 +2,29 @@
 name: Enhancement
 about: An enhancement
 title: 'Enhancement: <>'
-labels: kind/enhancement
+type: enhancement
 assignees: ''
 ---
 
-REMEMBER, BE **SMART**!
+\*REMEMBER, BE **SMART**!
 
 S: Specific
 M: Measurable
 A: Achievable
 R: Relevant
-T: Time-Bound
+T: Time-Bound\*
 
 ## Goal-State/What/Result
 
-A clear and concise description of what the enhancement is and the target goal-state.
+_A clear and concise description of what the enhancement is and the target goal-state._
 
 ## Why/Purpose
 
-Clear and concise answer to why this should be done now.
+_Clear and concise answer to why this should be done now._
 
 ## By When
 
-A target date for done-done completion of the entire enhancement.
+_A target date for done-done completion of the entire enhancement._
 
 **Issue/Spec written and reviewed:** <Target Date>
 **Done-Done:** <Target Date>
@@ -34,9 +34,10 @@ A target date for done-done completion of the entire enhancement.
 - [ ] [First Principles Driven](https://github.com/spiceai/spiceai/blob/trunk/docs/PRINCIPLES.md)
 - [ ] The Algorithm
 - [ ] PM/Design Review
-- [ ] UX Review
+- [ ] DX/UX Review
 - [ ] Threat Model / Security Review
 - [ ] Tests
+- [ ] Performance / Benchmarks
 - [ ] Documentation
 - [ ] Samples/Quickstarts/Tutorials
 - [ ] Release Notes
@@ -51,16 +52,18 @@ A target date for done-done completion of the entire enhancement.
 
 ## Spec
 
-Basic specification of the enhancement.
+_Basic specification of the enhancement._
 
-## How/MAP
+## How/Plan
 
-A clear and concise plan of how this should be implemented.
+_A clear and concise plan of how this should be implemented._
 
-### Implementation (issues)
+### Implementation (Sub Issues)
 
-- 
--
+- Sub Issue 1
+- Sub Issue 2
 
 ### QA
 
+- Sub Issue 1
+- Sub Issue 2

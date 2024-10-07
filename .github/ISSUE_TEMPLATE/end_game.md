@@ -2,18 +2,18 @@
 name: Milestone Endgame
 about: Ship a milestone!
 title: 'v0.x.x-beta endgame'
-labels: 'endgame'
+labels: 'kind/endgame'
 assignees: ''
 ---
 
 ## DRIs
 
-|         | DRI               |
-| ------- | ----------------- |
-| Endgame |                   |
-| QA      |                   |
-| Docs    |                   |
-| Comms   |                   |
+|         | DRI |
+| ------- | --- |
+| Endgame |     |
+| QA      |     |
+| Docs    |     |
+| Comms   |     |
 
 ## Milestone Release Timeline
 
@@ -46,47 +46,47 @@ assignees: ''
   - [ ] [Spice with spice.js sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
   - [ ] [Spice with spicepy sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
 - [ ] Full test pass and update if necessary over existing and new Quickstarts
-    - **Data Connectors:**
-    - [ ] [Apache Superset](https://github.com/spiceai/quickstarts/blob/trunk/superset/README.md)
-    - [ ] [AWS RDS Aurora (MySQL Compatible) Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/rds-aurora-mysql/README.md)
-    - [ ] [AWS RDS PostgreSQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/rds-postgresql/README.md)
-    - [ ] [Clickhouse Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/clickhouse/README.md)
-    - [ ] [Databricks Delta Lake Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/databricks/README.md)
-    - [ ] [Dremio Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/dremio/README.md)
-    - [ ] [DuckDB Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/duckdb/connector/README.md)
-    - [ ] [FTP Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/ftp/README.md)
-    - [ ] [File Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/file/README.md)
-    - [ ] [GitHub Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/github/README.md)
-    - [ ] [GraphQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/graphql/README.md)
-    - [ ] [MSSQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/mssql/README.md)
-    - [ ] [MySQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/mysql/README.md)
-    - [ ] [ODBC Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/odbc/README.md)
-    - [ ] [Planetscale Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/planetscale/README.md)
-    - [ ] [PostgreSQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/postgres/connector/README.md)
-    - [ ] [S3 Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/s3/README.md)
-    - [ ] [SharePoint Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/sharepoint/README.md)
-    - [ ] [Snowflake Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/snowflake/README.md)
-    - [ ] [Spark Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/spark/README.md)
-    - [ ] [Supabase Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/supabase/README.md)
-    - [ ] [Spice.ai Cloud Platform Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/spiceai/README.md)
-    - **Data Accelerators:**
-    - [ ] [DuckDB Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/duckdb/accelerator/README.md)
-    - [ ] [PostgreSQL Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/postgres/accelerator/README.md)
-    - [ ] [SQLite Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/sqlite/accelerator/README.md)
-    - **Catalog Connectors:**
-    - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/databricks/README.md)
-    - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
-    - [ ] [Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/unity_catalog/README.md)
-    - **Other Quickstarts:**
-    - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
-    - [ ] [Data Retention Policy](https://github.com/spiceai/quickstarts/blob/trunk/retention/README.md)
-    - [ ] [Deploying to Kubernetes](https://github.com/spiceai/quickstarts/blob/trunk/kubernetes/README.md)
-    - [ ] [Federated SQL Query](https://github.com/spiceai/quickstarts/blob/trunk/federation/README.md)
-    - [ ] [Indexes on Accelerated Data](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/indexes/README.md)
-    - [ ] [Refresh Data Window](https://github.com/spiceai/quickstarts/blob/trunk/refresh-data-window/README.md)
-    - [ ] [Results Caching](https://github.com/spiceai/quickstarts/blob/trunk/caching/README.md)
-    - [ ] [Securing data in transit via TLS](https://github.com/spiceai/quickstarts/blob/trunk/tls/README.md)
-    - [ ] [TPC-H Benchmarking](https://github.com/spiceai/quickstarts/blob/trunk/tpc-h/README.md)
+  - **Data Connectors:**
+  - [ ] [Apache Superset](https://github.com/spiceai/quickstarts/blob/trunk/superset/README.md)
+  - [ ] [AWS RDS Aurora (MySQL Compatible) Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/rds-aurora-mysql/README.md)
+  - [ ] [AWS RDS PostgreSQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/rds-postgresql/README.md)
+  - [ ] [Clickhouse Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/clickhouse/README.md)
+  - [ ] [Databricks Delta Lake Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/databricks/README.md)
+  - [ ] [Dremio Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/dremio/README.md)
+  - [ ] [DuckDB Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/duckdb/connector/README.md)
+  - [ ] [FTP Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/ftp/README.md)
+  - [ ] [File Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/file/README.md)
+  - [ ] [GitHub Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/github/README.md)
+  - [ ] [GraphQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/graphql/README.md)
+  - [ ] [MSSQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/mssql/README.md)
+  - [ ] [MySQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/mysql/README.md)
+  - [ ] [ODBC Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/odbc/README.md)
+  - [ ] [Planetscale Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/planetscale/README.md)
+  - [ ] [PostgreSQL Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/postgres/connector/README.md)
+  - [ ] [S3 Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/s3/README.md)
+  - [ ] [SharePoint Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/sharepoint/README.md)
+  - [ ] [Snowflake Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/snowflake/README.md)
+  - [ ] [Spark Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/spark/README.md)
+  - [ ] [Supabase Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/supabase/README.md)
+  - [ ] [Spice.ai Cloud Platform Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/spiceai/README.md)
+  - **Data Accelerators:**
+  - [ ] [DuckDB Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/duckdb/accelerator/README.md)
+  - [ ] [PostgreSQL Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/postgres/accelerator/README.md)
+  - [ ] [SQLite Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/sqlite/accelerator/README.md)
+  - **Catalog Connectors:**
+  - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/databricks/README.md)
+  - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
+  - [ ] [Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/unity_catalog/README.md)
+  - **Other Quickstarts:**
+  - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
+  - [ ] [Data Retention Policy](https://github.com/spiceai/quickstarts/blob/trunk/retention/README.md)
+  - [ ] [Deploying to Kubernetes](https://github.com/spiceai/quickstarts/blob/trunk/kubernetes/README.md)
+  - [ ] [Federated SQL Query](https://github.com/spiceai/quickstarts/blob/trunk/federation/README.md)
+  - [ ] [Indexes on Accelerated Data](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/indexes/README.md)
+  - [ ] [Refresh Data Window](https://github.com/spiceai/quickstarts/blob/trunk/refresh-data-window/README.md)
+  - [ ] [Results Caching](https://github.com/spiceai/quickstarts/blob/trunk/caching/README.md)
+  - [ ] [Securing data in transit via TLS](https://github.com/spiceai/quickstarts/blob/trunk/tls/README.md)
+  - [ ] [TPC-H Benchmarking](https://github.com/spiceai/quickstarts/blob/trunk/tpc-h/README.md)
 - [ ] Merge [Docs PRs](https://github.com/spiceai/docs/pulls)
   - [ ] Update spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docusaurus.config.ts#L60)
 - [ ] Merge [Samples PRs](https://github.com/spiceai/samples/pulls)
