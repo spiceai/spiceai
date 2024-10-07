@@ -44,9 +44,9 @@ arrow-ipc = "53"
 arrow-schema = "53"
 parquet = "53"
 arrow-odbc = "11.2.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "dc3a2d923cb94347579aaffb3ed64bd06cccba64" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "84d64f0431fa5c164207bf434eb4c0e18b5b4e7d" }
 async-stream = "0.3.5"
-async-trait = "0.1.77"
+async-trait = "0.1.83"
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
@@ -94,7 +94,7 @@ secrecy = "0.8.0"
 serde = { version = "1.0.209", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
-snafu = "0.8.0"
+snafu = "0.8.5"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f95bd4715b9b9e3eaa425d7a775b49e1dcbb1212" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
@@ -120,10 +120,10 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "b15debbc4b39614ca4af8564c930d994cbd4752e" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "b15debbc4b39614ca4af8564c930d994cbd4752e" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "b15debbc4b39614ca4af8564c930d994cbd4752e" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "b15debbc4b39614ca4af8564c930d994cbd4752e" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "826814ab149aad8ee668454c83a0650fb8b18d60" }

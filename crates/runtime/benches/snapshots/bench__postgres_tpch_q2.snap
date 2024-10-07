@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-----------+--------------------+----------------+-----------+----------------+----------------------------------------+-----------------+-----------------------------------------------------------------------------------------------+
+| s_acctbal | s_name             | n_name         | p_partkey | p_mfgr         | s_address                              | s_phone         | s_comment                                                                                     |
++-----------+--------------------+----------------+-----------+----------------+----------------------------------------+-----------------+-----------------------------------------------------------------------------------------------+
+| 9938.53   | Supplier#000005359 | UNITED KINGDOM | 185358    | Manufacturer#4 | QKuHYh,vZGiwu2FWEJoLDx04               | 33-429-790-6131 | uriously regular requests hag                                                                 |
+| 9937.84   | Supplier#000005969 | ROMANIA        | 108438    | Manufacturer#1 | ANDENSOSmk,miq23Xfb5RWt6dvUcvt6Qa      | 29-520-692-3537 | efully express instructions. regular requests against the slyly fin                           |
+| 9936.22   | Supplier#000005250 | UNITED KINGDOM | 249       | Manufacturer#4 | B3rqp0xbSEim4Mpy2RH J                  | 33-320-228-2957 | etect about the furiously final accounts. slyly ironic pinto beans sleep inside the furiously |
+| 9923.77   | Supplier#000002324 | GERMANY        | 29821     | Manufacturer#4 | y3OD9UywSTOk                           | 17-779-299-1839 | ackages boost blithely. blithely regular deposits c                                           |
+| 9871.22   | Supplier#000006373 | GERMANY        | 43868     | Manufacturer#5 | J8fcXWsTqM                             | 17-813-485-8637 | etect blithely bold asymptotes. fluffily ironic platelets wake furiously; blit                |
+| 9870.78   | Supplier#000001286 | GERMANY        | 81285     | Manufacturer#2 | YKA,E2fjiVd7eUrzp2Ef8j1QxGo2DFnosaTEH  | 17-516-924-4574 |  regular accounts. furiously unusual courts above the fi                                      |
+| 9870.78   | Supplier#000001286 | GERMANY        | 181285    | Manufacturer#4 | YKA,E2fjiVd7eUrzp2Ef8j1QxGo2DFnosaTEH  | 17-516-924-4574 |  regular accounts. furiously unusual courts above the fi                                      |
+| 9852.52   | Supplier#000008973 | RUSSIA         | 18972     | Manufacturer#2 | t5L67YdBYYH6o,Vz24jpDyQ9               | 32-188-594-7038 | rns wake final foxes. carefully unusual depende                                               |
+| 9847.83   | Supplier#000008097 | RUSSIA         | 130557    | Manufacturer#2 | xMe97bpE69NzdwLoX                      | 32-375-640-3593 |  the special excuses. silent sentiments serve carefully final ac                              |
+| 9847.57   | Supplier#000006345 | FRANCE         | 86344     | Manufacturer#1 | VSt3rzk3qG698u6ld8HhOByvrTcSTSvQlDQDag | 16-886-766-7945 | ges. slyly regular requests are. ruthless, express excuses cajole blithely across the unu     |
++-----------+--------------------+----------------+-----------+----------------+----------------------------------------+-----------------+-----------------------------------------------------------------------------------------------+

@@ -15,6 +15,7 @@ use async_openai::types::ChatCompletionRequestAssistantMessageContent;
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
+use nsql::SqlGeneration;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,7 @@ use async_openai::{
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
+pub mod nsql;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
 
@@ -91,6 +93,9 @@ pub enum Error {
 
     #[snafu(display("Invalid value for 'params.spice_tools'"))]
     UnsupportedSpiceToolUseParameterError {},
+
+    #[snafu(display("Runtime does not currently support the {modality} modality"))]
+    UnsupportedModalityType { modality: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -192,7 +197,7 @@ pub fn message_to_mistral(
         ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -206,15 +211,15 @@ pub fn message_to_mistral(
                     let v = array.iter().map(|p| {
                         match p {
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
-                                ("content".to_string(), t.text.clone())
+                                ("content".to_string(), Value::String(t.text.clone()))
                             }
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
-                                ("image_url".to_string(), i.image_url.url.clone())
+                                ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
                         }
 
                     }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, String> = v.into_iter().collect();
+                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -321,10 +326,24 @@ pub fn message_to_mistral(
                 map.insert("name".to_string(), Either::Left(name.clone()));
             }
             if let Some(tool_calls) = tool_calls {
-                map.insert(
-                    "tool_calls".to_string(),
-                    Either::Left(serde_json::to_string(&tool_calls).unwrap_or_default()),
-                );
+                let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
+                    .iter()
+                    .filter_map(|t| {
+                        let Ok(function) = serde_json::to_value(&t.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                            return None;
+                        };
+
+                        let mut map = IndexMap::new();
+                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("function".to_string(), function);
+                        map.insert("type".to_string(), Value::String("function".to_string()));
+
+                        Some(map)
+                    })
+                    .collect();
+
+                map.insert("tool_calls".to_string(), Either::Right(tool_call_results));
             }
             map
         }
@@ -344,6 +363,7 @@ pub fn message_to_mistral(
 
 #[async_trait]
 pub trait Chat: Sync + Send {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>>;
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
