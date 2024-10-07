@@ -37,7 +37,7 @@ _A target date for done-done completion of the entire enhancement._
 - [ ] DX/UX Review
 - [ ] Threat Model / Security Review
 - [ ] Tests
-- [ ] Peformance / Benchmarks
+- [ ] Performance / Benchmarks
 - [ ] Documentation
 - [ ] Samples/Quickstarts/Tutorials
 - [ ] Release Notes
