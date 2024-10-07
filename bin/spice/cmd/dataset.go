@@ -60,7 +60,7 @@ spice dataset configure
 		}
 
 		defaultDatasetName := path.Base(cwd)
-		slog.Info(fmt.Sprintf("dataset name: %s", defaultDatasetName))
+		cmd.Printf("dataset name: (%s) ", defaultDatasetName)
 		datasetName, err := reader.ReadString('\n')
 		if err != nil {
 			slog.Error("Error reading dataset name", "error", err)
@@ -142,7 +142,7 @@ spice dataset configure
 			}
 		}
 
-		slog.Info("locally accelerate (y/n)? (y) ")
+		cmd.Print("locally accelerate (y/n)? (y) ")
 		locallyAccelerateStr, err := reader.ReadString('\n')
 		if err != nil {
 			slog.Error("Error reading stdin", "error", err)
