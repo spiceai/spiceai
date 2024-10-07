@@ -142,7 +142,7 @@ spice dataset configure
 			}
 		}
 
-		slog.Info("locally accelerate (y/n)? (y) ")
+		cmd.Print("locally accelerate (y/n)? (y) ")
 		locallyAccelerateStr, err := reader.ReadString('\n')
 		if err != nil {
 			slog.Error("Error reading stdin", "error", err)
