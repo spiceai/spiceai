@@ -515,7 +515,12 @@ spice login delta_lake --google-service-account-path /path/to/service-account.js
 }
 
 func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConfig map[string]string) {
-	spiceEnv, _ := godotenv.Read(".env")
+	env_file := ".env"
+	if _, err := os.Stat(".env.local"); err == nil {
+		env_file = ".env.local"
+	}
+
+	spiceEnv, _ := godotenv.Read(env_file)
 	// Ignore any errors reading the file - we will write a new one later
 
 	for k, v := range updatedAuthConfig {
@@ -523,9 +528,9 @@ func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConf
 		spiceEnv[secretKey] = v
 	}
 
-	err := godotenv.Write(spiceEnv, ".env")
+	err := godotenv.Write(spiceEnv, env_file)
 	if err != nil {
-		slog.Error("Error writing .env file", "error", err)
+		slog.Error(fmt.Sprintf("Error writing %s file", env_file), "error", err)
 		os.Exit(1)
 	}
 }
