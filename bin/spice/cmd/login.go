@@ -530,8 +530,7 @@ func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConf
 
 	err := godotenv.Write(spiceEnv, env_file)
 	if err != nil {
-		error_msg := fmt.Sprintf("Error writing %s file", env_file)
-		slog.Error(error_msg, "error", err)
+		slog.Error(fmt.Sprintf("Error writing %s file", env_file), "error", err)
 		os.Exit(1)
 	}
 }
