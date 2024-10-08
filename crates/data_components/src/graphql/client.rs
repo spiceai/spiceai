@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{ArrowInternalSnafu, Error, GraphQLOptimizer, ReqwestInternalSnafu, Result};
+use super::{ArrowInternalSnafu, Error, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -605,7 +605,6 @@ pub struct GraphQLClient {
     unnest_parameters: UnnestParameters,
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
-    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
 }
 
 #[derive(Clone)]
@@ -676,7 +675,6 @@ impl GraphQLClient {
         pass: Option<String>,
         unnest_depth: usize,
         schema: Option<SchemaRef>,
-        optimizer: Option<Arc<dyn GraphQLOptimizer>>,
     ) -> Result<Self> {
         let auth = match (token, user, pass) {
             (Some(token), _, _) => Some(Auth::Bearer(token.to_string())),
@@ -698,7 +696,6 @@ impl GraphQLClient {
             unnest_parameters,
             auth,
             schema,
-            optimizer,
         })
     }
 
@@ -751,13 +748,6 @@ impl GraphQLClient {
 
         if self.unnest_parameters.depth > 0 {
             unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped)?;
-        }
-
-        if let Some(preprocessor) = self.optimizer.as_ref().and_then(|o| o.preprocess_value()) {
-            unwrapped
-                .iter_mut()
-                .map(|v| preprocessor(v))
-                .collect::<Result<Vec<_>>>()?;
         }
 
         let schema = get_json_schema(&self.schema, &schema, &unwrapped)?;

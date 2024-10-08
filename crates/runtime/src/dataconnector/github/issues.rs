@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use super::{
-    filter_pushdown, inject_parameters, preprocess_labels, search_inject_parameters,
-    GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams,
+    filter_pushdown, inject_parameters, search_inject_parameters, GitHubQueryMode, GitHubTableArgs,
+    GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::graphql::{
-    self, client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer, Result,
+    client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer, Result,
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
@@ -58,10 +58,6 @@ impl GraphQLOptimizer for IssuesTableArgs {
         }
 
         inject_parameters("search", search_inject_parameters, filters, query)
-    }
-
-    fn preprocess_value(&self) -> Option<graphql::ValuePreprocessor> {
-        Some(Arc::new(preprocess_labels))
     }
 }
 
@@ -166,7 +162,11 @@ fn gql_schema() -> SchemaRef {
         Field::new("milestone_title", DataType::Utf8, true),
         Field::new(
             "labels",
-            DataType::List(Arc::new(Field::new("name", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(vec![Field::new("name", DataType::Utf8, true)].into()),
+                true,
+            ))),
             true,
         ),
         Field::new("comments_count", DataType::Int64, true),

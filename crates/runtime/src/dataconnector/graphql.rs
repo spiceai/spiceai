@@ -156,7 +156,6 @@ impl GraphQL {
             pass,
             unnest_depth,
             None,
-            None,
         )
         .boxed()
         .context(super::InternalWithSourceSnafu {

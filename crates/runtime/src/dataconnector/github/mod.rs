@@ -23,7 +23,6 @@ use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
     graphql::{
-        self,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
@@ -45,7 +44,6 @@ use graphql_parser::query::{
 use issues::IssuesTableArgs;
 use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
-use serde_json::Value;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
@@ -103,7 +101,6 @@ impl Github {
     pub(crate) fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
-        optimizer: Option<Arc<dyn GraphQLOptimizer>>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
         let access_token = self.params.get("token").expose().ok().map(Arc::from);
 
@@ -122,7 +119,6 @@ impl Github {
         .with_token(access_token)
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
-        .with_optimizer(optimizer)
         .build(client)
         .boxed()
     }
@@ -132,11 +128,11 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         optimizer: Option<Arc<dyn GraphQLOptimizer>>,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self
-            .create_graphql_client(&table_args, optimizer.clone())
-            .context(super::UnableToGetReadProviderSnafu {
+        let client = self.create_graphql_client(&table_args).context(
+            super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
-            })?;
+            },
+        )?;
 
         let provider_builder = GraphQLTableProviderBuilder::new(client)
             .with_schema_transform(github_gql_raw_schema_cast);
@@ -876,35 +872,6 @@ where
     let (pagination_parameters, json_pointer) = PaginationParameters::parse(&query.ast);
     query.pagination_parameters = pagination_parameters;
     query.json_pointer = json_pointer.map(Arc::from);
-
-    Ok(())
-}
-
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn preprocess_labels(value: &mut Value) -> Result<(), graphql::Error> {
-    if let Value::Object(obj) = value {
-        let labels = obj.get("labels").map(|labels| {
-            if let Value::Array(labels) = labels {
-                labels
-                    .iter()
-                    .filter_map(|label| {
-                        if let Value::Object(label) = label {
-                            label.get("name").cloned()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<Value>>()
-            } else {
-                vec![]
-            }
-        });
-
-        obj.insert(
-            "labels".to_string(),
-            Value::Array(labels.unwrap_or_default()),
-        );
-    }
 
     Ok(())
 }
