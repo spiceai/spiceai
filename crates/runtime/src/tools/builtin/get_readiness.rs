@@ -38,7 +38,7 @@ impl SpiceModelTool for GetReadinessTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "get_readiness".to_string(),
-            description: "Retrieves the readiness status of all registered datasets, models, embeddings, views, and other primitives.".to_string(),
+            description: "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.".to_string(),
             ..Default::default()
         }
     }
