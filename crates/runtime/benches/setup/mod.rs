@@ -47,7 +47,7 @@ fn get_test_datafusion(status: Arc<RuntimeStatus>) -> Arc<DataFusion> {
         .config_mut()
         .options_mut()
         .execution
-        .target_partitions = 4;
+        .target_partitions = 1;
     let new_ctx = SessionContext::new_with_state(new_state);
 
     // Replace the old context with the modified one
