@@ -42,6 +42,7 @@ use std::fmt;
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
+use crate::{embedding_col, offset_col};
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -258,14 +259,14 @@ pub(crate) async fn get_embedding_columns(
         let list_array = if let Some(chunker) = embedding_chunkers.get(col) {
             let (vectors, offsets) =
                 get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
-            embed_arrays.insert(format!("{col}_offsets"), Arc::new(offsets) as ArrayRef);
+            embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = get_vectors(arr, &**model).await?;
             Arc::new(fixed_size_array) as ArrayRef
         };
-        embed_arrays.insert(format!("{col}_embedding"), list_array);
+        embed_arrays.insert(embedding_col!(col), list_array);
     }
     Ok(embed_arrays)
 }

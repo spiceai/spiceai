@@ -37,6 +37,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
+use crate::{embedding_col, offset_col};
 
 #[derive(Debug, Snafu)]
 pub enum Error {}
@@ -81,6 +82,59 @@ impl EmbeddingTable {
             embedding_models,
             embedding_sizes: sizes,
             embedding_chunkers: chunkers,
+        }
+    }
+
+    /// Check if the base table has a column that is augmented with an embedding.
+    /// For a base table with column, c, we expect:
+    ///  - `c` to be in the base schema.
+    ///  - `c_embedding` to be in the base schema. It needs to have a type compatible with [`Self::embedding_fields`].
+    ///  - If `c_embedding` has a doubly-nested list type, `c_offsets` should also be in the base schema. It should be a `List[FixedSizeList[Int32, 2]]`.
+    fn base_table_has_embedding_column(base_schema: SchemaRef, column: &str) -> bool {
+        // Check if the column is in the base schema.
+        let Some((_, _col)) = base_schema.column_with_name(column) else {
+            return false;
+        };
+
+        // Check if the embedding column is in the base schema.
+        let Some((_, embedding_col)) =
+            base_schema.column_with_name(embedding_col!(column).as_str())
+        else {
+            return false;
+        };
+
+        // Offset column may not be present.
+        let offset_col_opt = base_schema.column_with_name(offset_col!(column).as_str()).map(|(_, offset_col)| offset_col);
+
+        match embedding_col.data_type() {
+            DataType::List(inner)
+            | DataType::LargeList(inner)
+            | DataType::FixedSizeList(inner, _) => {
+                match inner.data_type() {
+                    // Doubly nested list, column is chunked
+                    DataType::FixedSizeList(scalar_field, _) => {
+                        if !(matches!(
+                            scalar_field.data_type(),
+                            DataType::Float16 | DataType::Float32 | DataType::Float64
+                        )) {
+                            return false;
+                        }
+
+                        // We expect an offset column. List[FixedSizeList[Float32, 2]]
+                        if let Some(DataType::List(f)) = offset_col_opt.map(Field::data_type) {
+                            if let DataType::FixedSizeList(ff, 2) = f.data_type() {
+                                return matches!(ff.data_type(), DataType::Int32);
+                            }
+                        }
+                        false
+                    }
+
+                    // Single nested list, column is not chunked.
+                    DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+                    _ => false,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -208,7 +262,7 @@ impl EmbeddingTable {
         if self.embedding_chunkers.contains_key(field.name()) {
             vec![
                 Arc::new(Field::new_list(
-                    format!("{}_embedding", field.name()),
+                    embedding_col!(field.name()),
                     Field::new_fixed_size_list(
                         "item",
                         Field::new("item", DataType::Float32, false),
@@ -218,7 +272,7 @@ impl EmbeddingTable {
                     false,
                 )),
                 Arc::new(Field::new_list(
-                    format!("{}_offsets", field.name()),
+                    offset_col!(field.name()),
                     Field::new_fixed_size_list(
                         "item",
                         Field::new("item", DataType::Int32, false),
@@ -230,7 +284,7 @@ impl EmbeddingTable {
             ]
         } else {
             vec![Arc::new(Field::new_fixed_size_list(
-                format!("{}_embedding", field.name()),
+                embedding_col!(field.name()),
                 Field::new("item", DataType::Float32, false),
                 embedding_size,
                 false,
@@ -378,5 +432,121 @@ impl TableProvider for EmbeddingTable {
         overwrite: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_schema::FieldRef;
+    use std::sync::Arc;
+
+    fn field(name: &str, data_type: DataType) -> FieldRef {
+        Arc::new(Field::new(name, data_type, false))
+    }
+
+    #[test]
+    fn test_base_column_missing() {
+        assert!(!EmbeddingTable::base_table_has_embedding_column(Arc::new(Schema::empty()), "c"));
+    }
+
+    #[test]
+    fn test_embedding_column_missing() {
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::new(vec![field("c", DataType::Utf8)])),
+            "c"
+        ));
+    }
+
+    #[test]
+    fn test_embedding_column_invalid_type() {
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::new(vec![
+                field("c", DataType::Utf8),
+                field("c_embedding", DataType::Int32),
+            ])),
+            "c"
+        ));
+    }
+
+    #[test]
+    fn test_single_nested_embedding() {
+        assert!(EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::new(vec![
+                field("c", DataType::Utf8),
+                field(
+                    "c_embedding",
+                    DataType::List(field("item", DataType::Float32)),
+                ),
+            ])),
+            "c"
+        ));
+    }
+
+    #[test]
+    fn test_doubly_nested_embedding_without_offsets() {
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::new(vec![
+                field("c", DataType::Utf8),
+                field(
+                    "c_embedding",
+                    DataType::List(field(
+                        "item",
+                        DataType::FixedSizeList(field("item", DataType::Float32), 4),
+                    )),
+                ),
+            ])),
+            "c"
+        ));
+    }
+
+    #[test]
+    fn test_doubly_nested_embedding_with_offsets() {
+        assert!(EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::new(vec![
+                field("c", DataType::Utf8),
+                field(
+                    "c_embedding",
+                    DataType::List(field(
+                        "item",
+                        DataType::FixedSizeList(field("item", DataType::Float32), 4),
+                    )),
+                ),
+                field(
+                    "c_offset",
+                    DataType::List(field(
+                        "item",
+                        DataType::FixedSizeList(field("item", DataType::Int32), 2)),
+                    ),
+                ),
+            ])),
+            "c"
+        ));
+    }
+
+    #[test]
+    fn test_doubly_nested_embedding_with_invalid_offsets() {
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::new(vec![
+                field("c", DataType::Utf8),
+                field(
+                    "c_embedding",
+                    DataType::List(field(
+                        "item",
+                        DataType::FixedSizeList(field("item", DataType::Float32), 4),
+                    )),
+                ),
+                // Offsets have invalid type (Utf8 instead of Int32)
+                field(
+                    "c_offset",
+                    DataType::List(field(
+                        "item",
+                        DataType::FixedSizeList(field("item", DataType::Utf8), 2),
+                    )),
+                ),
+            ])),
+            "c"
+        ));
     }
 }
