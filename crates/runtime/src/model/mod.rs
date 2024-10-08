@@ -29,6 +29,8 @@ pub use embed::{try_to_embedding, EmbeddingModelStore};
 
 use crate::DataFusion;
 
+pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
+
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
         .query_builder(

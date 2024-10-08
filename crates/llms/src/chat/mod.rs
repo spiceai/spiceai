@@ -11,9 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use async_openai::types::ChatCompletionRequestAssistantMessageContent;
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
+use nsql::SqlGeneration;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,7 @@ use async_openai::{
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
+pub mod nsql;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
 
@@ -90,6 +93,9 @@ pub enum Error {
 
     #[snafu(display("Invalid value for 'params.spice_tools'"))]
     UnsupportedSpiceToolUseParameterError {},
+
+    #[snafu(display("Runtime does not currently support the {modality} modality"))]
+    UnsupportedModalityType { modality: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -107,10 +113,10 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = array
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
+                        async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
-                        async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(
+                        async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
                             i,
                         ) => i.image_url.url.clone(),
                     })
@@ -121,15 +127,59 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
             content,
             ..
-        })
-        | ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+        }) => match content {
+            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
+            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
+                let x: Vec<_> = parts
+                    .iter()
+                    .map(|p| match p {
+                        async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                            t.text.clone()
+                        }
+                    })
+                    .collect();
+                x.join("\n")
+            }
+        },
+        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
-        }) => content.clone(),
+        }) => match content {
+            async_openai::types::ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
+            async_openai::types::ChatCompletionRequestToolMessageContent::Array(parts) => {
+                let x: Vec<_> = parts
+                    .iter()
+                    .map(|p| match p {
+                        async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
+                            t,
+                        ) => t.text.clone(),
+                    })
+                    .collect();
+                x.join("\n")
+            }
+        }
+        .clone(),
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
-        })
-        | ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
+        }) => match content {
+            Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => s.clone(),
+            Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
+                let x: Vec<_> = parts
+                        .iter()
+                        .map(|p| match p {
+                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                                t.text.clone()
+                            }
+                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                                i.refusal.clone()
+                            }
+                        })
+                        .collect();
+                x.join("\n")
+            }
+            None => todo!(),
+        },
+        ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
             ..
         }) => content.clone().unwrap_or_default(),
@@ -139,10 +189,15 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequesstMessage`] type.
 #[cfg(feature = "mistralrs")]
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
+    use async_openai::types::{
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
+    };
     use either::Either;
+    use serde_json::{json, Value};
 
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -155,16 +210,16 @@ pub fn message_to_mistral(
                 ChatCompletionRequestUserMessageContent::Array(array) => {
                     let v = array.iter().map(|p| {
                         match p {
-                            async_openai::types::ChatCompletionRequestMessageContentPart::Text(t) => {
-                                ("content".to_string(), t.text.clone())
+                            async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                                ("content".to_string(), Value::String(t.text.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestMessageContentPart::ImageUrl(i) => {
-                                ("image_url".to_string(), i.image_url.url.clone())
+                            async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
+                                ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
                         }
 
                     }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, String> = v.into_iter().collect();
+                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -174,52 +229,124 @@ pub fn message_to_mistral(
             ])
         }
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content,
+            content: ChatCompletionRequestSystemMessageContent::Text(text),
             ..
         }) => IndexMap::from([
             (String::from("role"), Either::Left(String::from("system"))),
-            (String::from("content"), Either::Left(content.clone())),
+            (String::from("content"), Either::Left(text.clone())),
         ]),
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Array(parts),
+            ..
+        }) => {
+            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
+            let content_json = parts
+                .iter()
+                .map(|p| match p {
+                    async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                        ("text".to_string(), t.text.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            IndexMap::from([
+                (String::from("role"), Either::Left(String::from("system"))),
+                (
+                    String::from("content"),
+                    Either::Left(json!(content_json).to_string()),
+                ),
+            ])
+        }
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content,
+            content: ChatCompletionRequestToolMessageContent::Text(text),
             tool_call_id,
         }) => IndexMap::from([
             (String::from("role"), Either::Left(String::from("tool"))),
-            (String::from("content"), Either::Left(content.clone())),
+            (String::from("content"), Either::Left(text.clone())),
             (
                 String::from("tool_call_id"),
                 Either::Left(tool_call_id.clone()),
             ),
         ]),
+        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+            content: ChatCompletionRequestToolMessageContent::Array(parts),
+            tool_call_id,
+        }) => {
+            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
+            let content_json = parts
+                .iter()
+                .map(|p| match p {
+                    async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                        ("text".to_string(), t.text.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            IndexMap::from([
+                (String::from("role"), Either::Left(String::from("tool"))),
+                (
+                    String::from("content"),
+                    Either::Left(json!(content_json).to_string()),
+                ),
+                (
+                    String::from("tool_call_id"),
+                    Either::Left(tool_call_id.clone()),
+                ),
+            ])
+        }
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             name,
             tool_calls,
             ..
-        }) => IndexMap::from([
-            (
-                String::from("role"),
-                Either::Left(String::from("assistant")),
-            ),
-            // TODO: don't include if None
-            (
-                "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default()),
-            ),
-            (
-                "name".to_string(),
-                Either::Left(name.clone().unwrap_or_default()),
-            ),
-            (
-                "tool_calls".to_string(),
-                Either::Left(
-                    tool_calls
-                        .clone()
-                        .map(|m| serde_json::to_string(&m).unwrap_or_default())
-                        .unwrap_or_default(),
-                ),
-            ),
-        ]),
+        }) => {
+            let mut map: IndexMap<String, MessageContent> = IndexMap::new();
+
+            match content {
+                Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
+                    map.insert("content".to_string(), Either::Left(s.clone()));
+                }
+                Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
+                    // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
+                    let content_json= parts.iter().map(|p| match p {
+                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                            ("text".to_string(), t.text.clone())
+                        }
+                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                            ("refusal".to_string(), i.refusal.clone())
+                        }
+                    }).collect::<Vec<_>>();
+                    map.insert(
+                        String::from("content"),
+                        Either::Left(json!(content_json).to_string()),
+                    );
+                }
+                None => {}
+            };
+            if let Some(name) = name {
+                map.insert("name".to_string(), Either::Left(name.clone()));
+            }
+            if let Some(tool_calls) = tool_calls {
+                let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
+                    .iter()
+                    .filter_map(|t| {
+                        let Ok(function) = serde_json::to_value(&t.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                            return None;
+                        };
+
+                        let mut map = IndexMap::new();
+                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("function".to_string(), function);
+                        map.insert("type".to_string(), Value::String("function".to_string()));
+
+                        Some(map)
+                    })
+                    .collect();
+
+                map.insert("tool_calls".to_string(), Either::Right(tool_call_results));
+            }
+            map
+        }
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
             name,
@@ -236,6 +363,7 @@ pub fn message_to_mistral(
 
 #[async_trait]
 pub trait Chat: Sync + Send {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>>;
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
@@ -245,7 +373,7 @@ pub trait Chat: Sync + Send {
 
         if let Err(e) = self
             .chat_request(CreateChatCompletionRequest {
-                max_tokens: None,
+                max_completion_tokens: None,
                 messages: vec![ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
                         name: None,
@@ -311,6 +439,7 @@ pub trait Chat: Sync + Send {
                         tool_calls: None,
                         role: Some(Role::System),
                         function_call: None,
+                        refusal: None,
                     },
                     index: i,
                     finish_reason: None,
@@ -325,6 +454,7 @@ pub trait Chat: Sync + Send {
                 system_fingerprint: None,
                 object: "list".to_string(),
                 usage: None,
+                service_tier: None,
             });
             i+=1;
         }};
@@ -367,6 +497,7 @@ pub trait Chat: Sync + Send {
                     tool_calls: None,
                     role: Role::System,
                     function_call: None,
+                    refusal: None,
                 },
                 index: 0,
                 finish_reason: None,
@@ -391,6 +522,7 @@ pub trait Chat: Sync + Send {
             system_fingerprint: None,
             object: "list".to_string(),
             usage: None,
+            service_tier: None,
         })
     }
 }

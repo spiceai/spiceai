@@ -14,14 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use super::{
+    commits_inject_parameters, filter_pushdown, inject_parameters, GitHubTableArgs,
+    GitHubTableGraphQLParams,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_components::graphql::{client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer};
+use datafusion::prelude::Expr;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
+}
+
+impl GraphQLOptimizer for CommitsTableArgs {
+    fn filter_pushdown(
+        &self,
+        expr: &Expr,
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
+        Ok(filter_pushdown(expr))
+    }
+
+    fn inject_parameters(
+        &self,
+        filters: &[FilterPushdownResult],
+        query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        inject_parameters("history", commits_inject_parameters, filters, query)
+    }
 }
 
 impl GitHubTableArgs for CommitsTableArgs {

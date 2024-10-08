@@ -225,8 +225,8 @@ pub fn table_to_matches(
         .distances
         .iter()
         .flat_map(|v| {
-            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float32Array>() {
-                col.iter().collect::<Vec<Option<f32>>>()
+            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                col.iter().collect::<Vec<Option<f64>>>()
             } else {
                 vec![]
             }
@@ -250,7 +250,7 @@ pub fn table_to_matches(
 
             Ok(Match {
                 value: value.clone(),
-                score: 1.0 / f64::from(*distance),
+                score: 1.0 - *distance,
                 dataset: tbl.to_string(),
                 primary_key: pks.get(i).cloned().unwrap_or_default(),
                 metadata: add_cols.get(i).cloned().unwrap_or_default(),
@@ -281,6 +281,66 @@ impl VectorSearch {
         }
     }
 
+    fn construct_chunk_query(
+        primary_keys: &[String],
+        projection: &[String],
+        embedding_column: &str,
+        table_name: &TableReference,
+        embedding: &[f32],
+        where_cond: &str,
+        n: usize,
+    ) -> String {
+        let pks = if primary_keys.is_empty() {
+            // If the dataset has no true primary keys, the only known unique key is the embedding column.
+            vec![quote_identifier(embedding_column).to_string()]
+        } else {
+            primary_keys
+                .iter()
+                .map(|s| quote_identifier(s).to_string())
+                .collect_vec()
+        };
+
+        format!(
+            "WITH ranked_docs as (
+                SELECT {pks}, {VECTOR_DISTANCE_COLUMN_NAME}, offset FROM (
+                    SELECT
+                        {pks},
+                        offset,
+                        {VECTOR_DISTANCE_COLUMN_NAME},
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ({pks})
+                            ORDER BY dist ASC
+                        ) AS chunk_rank
+                    FROM (
+                        SELECT
+                            {pks},
+                            unnest({embed_col}_offsets) AS offset,
+                            cosine_distance(unnest({embed_col}_embedding), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                        FROM {table_name}
+                        {where_cond}
+                    )
+                )
+                WHERE chunk_rank = 1
+                LIMIT {n}
+            )
+            SELECT
+                substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {embed_col}_chunk,
+                {projection_str},
+                rd.{VECTOR_DISTANCE_COLUMN_NAME}
+            FROM ranked_docs rd
+            JOIN {table_name} t ON {join_on_conditions}",
+                embed_col=quote_identifier(embedding_column).to_string(),
+                pks = pks.iter().join(", "),
+                projection_str = projection.iter()
+                    .map(|s| format!("t.{s}"))
+                    .join(", "),
+                join_on_conditions = pks
+                    .iter()
+                    .map(|pk| format!("rd.{p} = t.{p}", p = quote_identifier(pk)))
+                    .join(" AND "),
+        )
+    }
+
     /// Perform a single SQL query vector search.
     #[allow(clippy::too_many_arguments)]
     async fn individual_search(
@@ -300,36 +360,30 @@ impl VectorSearch {
             .chain(Some(embedding_column.to_string()))
             .chain(additional_columns.iter().cloned())
             .unique()
+            .map(|s| quote_identifier(&s).to_string())
             .collect();
-
-        let projection_str = projection.iter().map(|s| quote_identifier(s)).join(", ");
 
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
         let query = if is_chunked {
-            format!(
-                "SELECT
-                    {projection_str},
-                    substring({embed_col}, offsets[1], offsets[2] - offsets[1]) as {embed_col}_chunk,
-                    {VECTOR_DISTANCE_COLUMN_NAME}
-                FROM (
-                    SELECT
-                        {projection_str},
-                        unnest({embedding_column}_offsets) as offsets,
-                        sqrt(array_distance(unnest({embedding_column}_embedding), {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME}
-                    FROM {tbl}
-                    {where_str}
-                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
-                ) LIMIT {n}", embed_col=quote_identifier(embedding_column).to_string())
+            Self::construct_chunk_query(
+                primary_keys,
+                &projection,
+                embedding_column,
+                tbl,
+                &embedding,
+                &where_str,
+                n,
+            )
         } else {
             format!(
                     "SELECT
                         {projection_str},
-                        sqrt(array_distance({embedding_column}_embedding, {embedding:?})) as {VECTOR_DISTANCE_COLUMN_NAME}
+                        cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
                     FROM {tbl}
                     {where_str}
-                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME}
-                    LIMIT {n}"
+                    ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
+                    LIMIT {n}", projection_str=projection.iter().join(", ")
                 )
         };
         tracing::trace!("running SQL: {query}");

@@ -15,6 +15,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+
 use super::{
     Embed, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu,
     FailedToPrepareInputSnafu, Result,
@@ -22,15 +24,9 @@ use super::{
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     sync::{Arc, Mutex},
 };
-
-#[cfg(target_os = "windows")]
-use std::os::windows::fs::symlink_file as symlink;
-
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::fs::symlink;
 
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
@@ -73,6 +69,10 @@ impl CandleEmbedding {
         .collect();
 
         let model_root = link_files_into_tmp_dir(files)?;
+        tracing::trace!(
+            "Embedding model has files linked at location={:?}",
+            model_root
+        );
         Self::try_new(&model_root, F32_DTYPE)
     }
 
@@ -83,8 +83,14 @@ impl CandleEmbedding {
 
     /// Attempt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
     pub fn try_new(model_root: &Path, dtype: &str) -> Result<Self> {
+        tracing::trace!(
+            "Loading tokenizer from {:?}",
+            model_root.join("tokenizer.json")
+        );
         let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
+        tracing::trace!("Tokenizer loaded.");
+
         Ok(Self {
             backend: Arc::new(Mutex::new(
                 CandleBackend::new(
@@ -101,13 +107,22 @@ impl CandleEmbedding {
     }
 
     fn model_config(model_root: &Path) -> Result<ModelConfig> {
+        tracing::trace!(
+            "Loading model config from {:?}",
+            model_root.join("config.json")
+        );
         let config_str = fs::read_to_string(model_root.join("config.json"))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
+        tracing::trace!("Model config loaded.");
+
         let config: ModelConfig = serde_json::from_str(&config_str)
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
+
+        tracing::trace!("Model config parsed: {:?}", config);
+
         Ok(config)
     }
 }
@@ -156,6 +171,13 @@ impl Embed for CandleEmbedding {
 
     fn size(&self) -> i32 {
         self.model_cfg.hidden_size
+    }
+
+    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        Some(Arc::new(RecursiveSplittingChunker::with_tokenizer_sizer(
+            &cfg,
+            Arc::clone(&self.tok),
+        )))
     }
 }
 
@@ -227,7 +249,18 @@ fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
     for (name, file) in files {
-        symlink(file, temp_dir.path().join(name))
+        let Ok(abs_path) = path::absolute(file) else {
+            return Err(super::Error::FailedToCreateEmbedding {
+                source: format!(
+                    "Failed to get absolute path of provided file: {}",
+                    file.as_os_str().to_string_lossy()
+                )
+                .into(),
+            });
+        };
+
+        // Hard link so windows can handle it without developer mode.
+        std::fs::hard_link(abs_path, temp_dir.path().join(name))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
     }

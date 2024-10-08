@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use super::{
-    filter_pushdown, inject_parameters, GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams,
+    filter_pushdown, inject_parameters, search_inject_parameters, GitHubQueryMode, GitHubTableArgs,
+    GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::graphql::{
@@ -56,7 +57,7 @@ impl GraphQLOptimizer for PullRequestTableArgs {
             return Ok(());
         }
 
-        inject_parameters(filters, query)
+        inject_parameters("search", search_inject_parameters, filters, query)
     }
 }
 

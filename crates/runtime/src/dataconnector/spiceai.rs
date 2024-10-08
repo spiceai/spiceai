@@ -48,9 +48,11 @@ use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tonic::metadata::MetadataMap;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -118,12 +120,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("api_key").secret(),
     ParameterSpec::connector("token").secret(),
     ParameterSpec::connector("endpoint"),
+    ParameterSpec::connector("app_id").secret(),
 ];
 
 impl DataConnectorFactory for SpiceAIFactory {
     fn create(
         &self,
         params: Parameters,
+        metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".into()
@@ -148,12 +152,25 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .get("api_key")
                 .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
-            let credentials = Credentials::new("", api_key);
-            let flight_client = FlightClient::try_new(url, credentials)
+            let mut credentials = Credentials::new("", api_key);
+
+            let metadata_map = metadata
+                .as_ref()
+                .and_then(|m| m.get("spiceai_app_id"))
+                .and_then(|app_id| {
+                    app_id.parse().ok().map(|parsed_app_id| {
+                        let mut map = MetadataMap::new();
+                        map.insert("x-spiceai-app-id", parsed_app_id);
+                        credentials = Credentials::new(app_id, api_key);
+                        map
+                    })
+                });
+
+            let flight_client = FlightClient::try_new(url, credentials, metadata_map)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory = FlightFactory::new(
-                "spiceai",
+                "spice.ai",
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
             );
@@ -194,7 +211,7 @@ impl DataConnector for SpiceAI {
                     .await
                     .boxed()
                     .context(UnableToGetReadProviderSnafu {
-                        dataconnector: "spiceai",
+                        dataconnector: "spice.ai",
                     })?,
                 ));
             }
@@ -216,14 +233,14 @@ impl DataConnector for SpiceAI {
                 {
                     tracing::debug!("{e}");
                     return Err(DataConnectorError::UnableToGetSchema {
-                        dataconnector: "spiceai".to_string(),
+                        dataconnector: "spice.ai".to_string(),
                         dataset_name: dataset.name.to_string(),
                         table_name: table.clone(),
                     });
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "spiceai".to_string(),
+                    dataconnector: "spice.ai".to_string(),
                     source: e,
                 });
             }
@@ -241,7 +258,7 @@ impl DataConnector for SpiceAI {
         )
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
-            dataconnector: "spiceai",
+            dataconnector: "spice.ai",
         });
 
         Some(read_write_result)
@@ -277,7 +294,7 @@ impl DataConnector for SpiceAI {
         if catalog.catalog_id.is_some() {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "spiceai".into(),
+                    dataconnector: "spice.ai".into(),
                     message: "Catalog ID is not supported for SpiceAI data connector".into(),
                 },
             ));

@@ -10,7 +10,7 @@ on:
     branches:
       - trunk
     paths-ignore:
-      - './docs/**'
+      - 'docs/**'
       - 'README.md'
       - 'version.txt'
       - 'acknowledgements.md'
@@ -1001,31 +1001,31 @@ jobs:
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10"
+            query: "select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10;"
 
         - name: Run test query (pulls)
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10"
+            query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10;"
 
         - name: Run test query (commits)
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10"
+            query: "select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10;"
 
         - name: Run test query (files)
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select name, path, download_url, content from spiceai.files limit 1"
+            query: "select name, path, download_url, content from spiceai.files limit 1;"
 
         - name: Run test query (stargazers)
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select * from spiceai.stargazers limit 10"
+            query: "select * from spiceai.stargazers limit 10;"
     
         - name: Stop spice and check logs
           working-directory: test_app
@@ -1129,7 +1129,7 @@ jobs:
           uses: ./.github/actions/run-query
           with:
             fail-on-error: true
-            query: "select * from test_mssql_table"
+            query: "select * from test_mssql_table;"
     
         - name: Stop spice and check logs
           working-directory: test_app

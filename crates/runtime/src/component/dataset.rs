@@ -115,6 +115,7 @@ pub struct Dataset {
     pub name: TableReference,
     pub mode: Mode,
     pub params: HashMap<String, String>,
+    pub metadata: HashMap<String, String>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
@@ -164,6 +165,11 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
+            metadata: dataset
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect(),
             has_metadata_table: dataset
                 .has_metadata_table
                 .unwrap_or(Dataset::have_metadata_table_by_default()),
@@ -185,6 +191,7 @@ impl Dataset {
             name: Self::parse_table_reference(name)?,
             mode: Mode::default(),
             params: HashMap::default(),
+            metadata: HashMap::default(),
             has_metadata_table: Self::have_metadata_table_by_default(),
             replication: None,
             time_column: None,
@@ -256,7 +263,7 @@ impl Dataset {
     ///
     /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
     ///
-    /// assert_eq!(dataset.source(), "spiceai");
+    /// assert_eq!(dataset.source(), "spice.ai");
     /// ```
     #[must_use]
     pub fn source(&self) -> String {
@@ -267,7 +274,7 @@ impl Dataset {
             if self.from == "sink" || self.from.is_empty() {
                 return "sink".to_string();
             }
-            "spiceai".to_string()
+            "spice.ai".to_string()
         }
     }
 

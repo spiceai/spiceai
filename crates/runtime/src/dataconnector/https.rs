@@ -16,10 +16,10 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use snafu::prelude::*;
-use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{any::Any, collections::HashMap};
 use url::Url;
 
 use super::{
@@ -78,6 +78,7 @@ impl DataConnectorFactory for HttpsFactory {
     fn create(
         &self,
         params: Parameters,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(Https { params }) as Arc<dyn DataConnector>) })
     }

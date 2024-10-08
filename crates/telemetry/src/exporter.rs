@@ -34,10 +34,10 @@ pub struct AnonymousTelemetryExporter {
 
 impl AnonymousTelemetryExporter {
     pub async fn new(url: Arc<str>) -> Self {
-        let flight_client = match FlightClient::try_new(url, Credentials::anonymous()).await {
+        let flight_client = match FlightClient::try_new(url, Credentials::anonymous(), None).await {
             Ok(client) => Some(client),
             Err(e) => {
-                tracing::error!("Unable to initialize anonymous telemetry: {e}");
+                tracing::trace!("Unable to initialize anonymous telemetry: {e}");
                 None
             }
         };
@@ -68,7 +68,7 @@ impl otel_arrow::ArrowExporter for AnonymousTelemetryExporter {
         };
 
         if let Err(e) = flight_client.publish("oss_telemetry", vec![metrics]).await {
-            tracing::error!("Unable to publish anonymous telemetry: {e}");
+            tracing::trace!("Unable to publish anonymous telemetry: {e}");
         };
 
         Ok(())
