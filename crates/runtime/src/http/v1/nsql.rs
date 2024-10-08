@@ -19,11 +19,16 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use axum_extra::TypedHeader;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
+use headers_accept::Accept;
+
 use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+use super::ArrowFormat;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -45,6 +50,12 @@ pub struct Request {
     pub model: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct Params {
+    format: ArrowFormat,
+}
+
 fn default_model() -> String {
     "nql".to_string()
 }
@@ -52,8 +63,10 @@ fn default_model() -> String {
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    accept: Option<TypedHeader<Accept>>,
     Json(payload): Json<Request>,
 ) -> Response {
+
     // Get all public table CREATE TABLE statements to add to prompt.
     let tables = match df.get_public_table_names() {
         Ok(t) => t,
@@ -128,8 +141,13 @@ pub(crate) async fn post(
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
             tracing::trace!("Running query:\n{cleaned_query}");
-
-            sql_to_http_response(Arc::clone(&df), &cleaned_query, Some(&nsql_query)).await
+            sql_to_http_response(
+                Arc::clone(&df),
+                &cleaned_query,
+                Some(&nsql_query),
+                ArrowFormat::from_accept_header(&accept),
+            )
+            .await
         }
         Ok(None) => {
             tracing::trace!("No query produced from NSQL model");

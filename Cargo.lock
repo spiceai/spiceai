@@ -9027,6 +9027,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow",
+ "arrow-csv",
  "arrow-flight",
  "arrow-ipc",
  "arrow-json",
