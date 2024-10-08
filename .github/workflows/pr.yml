@@ -22,7 +22,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report 
   # a sucess when skipped).
   check_changes:
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
@@ -60,7 +60,7 @@ jobs:
 
   lint:
     name: Run Go & Rust Linters
-    runs-on: rust
+    runs-on: teraswitch-runners
     env:
       GOVER: 1.22.0
     needs: check_changes
@@ -109,7 +109,7 @@ jobs:
 
   build:
     name: Build Go & Rust
-    runs-on: rust
+    runs-on: teraswitch-runners
     env:
       GOVER: 1.22.0
     needs: check_changes
@@ -133,7 +133,7 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    runs-on: rust
+    runs-on: teraswitch-runners
     needs: check_changes
 
     steps:

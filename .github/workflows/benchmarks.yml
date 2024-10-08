@@ -52,7 +52,7 @@ env:
 jobs:
   build-database-bench-binary:
     name: Build Benchmark Test Binary
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     steps:
       - uses: actions/checkout@v4
 
@@ -78,7 +78,7 @@ jobs:
 
   run-database-bench:
     name: Run Connector/Accelerator Benchmark
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     needs: build-database-bench-binary
 
     services:

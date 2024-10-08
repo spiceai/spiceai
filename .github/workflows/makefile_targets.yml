@@ -22,7 +22,7 @@ concurrency:
 jobs:
   make_install:
     name: make install*
-    runs-on: ubuntu-latest-32-cores
+    runs-on: teraswitch-runners
     env:
       GOVER: 1.22.0
 

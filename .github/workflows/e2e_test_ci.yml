@@ -26,7 +26,7 @@ concurrency:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -39,7 +39,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "ubuntu-latest",
+                runner: "teraswitch-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
