@@ -79,7 +79,7 @@ jobs:
   run-database-bench:
     name: Run Connector/Accelerator Benchmark
     runs-on: ubuntu-latest
-    needs: build-database-bench-binary
+    # needs: build-database-bench-binary
 
     services:
       mysql:
