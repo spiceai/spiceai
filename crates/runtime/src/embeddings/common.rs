@@ -44,16 +44,18 @@ macro_rules! offset_col {
     };
 }
 
-
-fn is_float_type(dt: &DataType) -> bool {
-    matches!(dt, DataType::Float16 | DataType::Float32 | DataType::Float64)
+pub(crate) fn is_float_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    )
 }
 
-fn is_fixed_size_list_of_floats(dt: &DataType) -> bool {
+pub(crate) fn is_fixed_size_list_of_floats(dt: &DataType) -> bool {
     matches!(dt, DataType::FixedSizeList(field, _) if is_float_type(field.data_type()))
 }
 
-fn is_valid_embedding_type(dt: &DataType) -> bool {
+pub(crate) fn is_valid_embedding_type(dt: &DataType) -> bool {
     match dt {
         DataType::List(inner) | DataType::LargeList(inner) | DataType::FixedSizeList(inner, _) => {
             match inner.data_type() {
@@ -67,7 +69,7 @@ fn is_valid_embedding_type(dt: &DataType) -> bool {
     }
 }
 
-fn is_valid_offset_type(dt: &DataType) -> bool {
+pub(crate) fn is_valid_offset_type(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::List(inner) if matches!(

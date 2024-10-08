@@ -39,6 +39,8 @@ use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
 
+use super::common::{is_valid_embedding_type, is_valid_offset_type};
+
 #[derive(Debug, Snafu)]
 pub enum Error {}
 
@@ -91,51 +93,39 @@ impl EmbeddingTable {
     ///  - `c_embedding` to be in the base schema. It needs to have a type compatible with [`Self::embedding_fields`].
     ///  - If `c_embedding` has a doubly-nested list type, `c_offsets` should also be in the base schema. It should be a `List[FixedSizeList[Int32, 2]]`.
     fn base_table_has_embedding_column(base_schema: SchemaRef, column: &str) -> bool {
-        // Check if the column is in the base schema.
-        let Some((_, _col)) = base_schema.column_with_name(column) else {
+        // Check if the base column exists
+        if base_schema.column_with_name(column).is_none() {
             return false;
+        }
+
+        // Check if the embedding column exists and has a valid data type
+        let embedding_field = match base_schema.column_with_name(embedding_col!(column).as_str()) {
+            Some((_, field)) => field,
+            None => return false,
         };
 
-        // Check if the embedding column is in the base schema.
-        let Some((_, embedding_col)) =
-            base_schema.column_with_name(embedding_col!(column).as_str())
-        else {
+        if !is_valid_embedding_type(embedding_field.data_type()) {
             return false;
-        };
+        }
 
-        // Offset column may not be present.
-        let offset_col_opt = base_schema.column_with_name(offset_col!(column).as_str()).map(|(_, offset_col)| offset_col);
+        // If embedding is doubly nested, also check for the offsets column
+        if let DataType::List(inner)
+        | DataType::LargeList(inner)
+        | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
+        {
+            if let DataType::FixedSizeList(_, _) = inner.data_type() {
+                let offsets_field = match base_schema.column_with_name(offset_col!(column).as_str())
+                {
+                    Some((_, field)) => field,
+                    None => return false,
+                };
 
-        match embedding_col.data_type() {
-            DataType::List(inner)
-            | DataType::LargeList(inner)
-            | DataType::FixedSizeList(inner, _) => {
-                match inner.data_type() {
-                    // Doubly nested list, column is chunked
-                    DataType::FixedSizeList(scalar_field, _) => {
-                        if !(matches!(
-                            scalar_field.data_type(),
-                            DataType::Float16 | DataType::Float32 | DataType::Float64
-                        )) {
-                            return false;
-                        }
-
-                        // We expect an offset column. List[FixedSizeList[Float32, 2]]
-                        if let Some(DataType::List(f)) = offset_col_opt.map(Field::data_type) {
-                            if let DataType::FixedSizeList(ff, 2) = f.data_type() {
-                                return matches!(ff.data_type(), DataType::Int32);
-                            }
-                        }
-                        false
-                    }
-
-                    // Single nested list, column is not chunked.
-                    DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
-                    _ => false,
+                if !is_valid_offset_type(offsets_field.data_type()) {
+                    return false;
                 }
             }
-            _ => false,
         }
+        true
     }
 
     /// Get the names of the embedding models used by this table across its columns.
@@ -448,7 +438,10 @@ mod tests {
 
     #[test]
     fn test_base_column_missing() {
-        assert!(!EmbeddingTable::base_table_has_embedding_column(Arc::new(Schema::empty()), "c"));
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            Arc::new(Schema::empty()),
+            "c"
+        ));
     }
 
     #[test]
@@ -517,8 +510,8 @@ mod tests {
                     "c_offset",
                     DataType::List(field(
                         "item",
-                        DataType::FixedSizeList(field("item", DataType::Int32), 2)),
-                    ),
+                        DataType::FixedSizeList(field("item", DataType::Int32), 2)
+                    ),),
                 ),
             ])),
             "c"
