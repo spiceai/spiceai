@@ -32,10 +32,7 @@ use crate::{
     component::dataset::Dataset,
     datafusion::query::{Protocol, QueryBuilder},
 };
-use arrow::{
-    array::RecordBatch,
-    util::pretty::pretty_format_batches,
-};
+use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},

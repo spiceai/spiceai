@@ -50,12 +50,6 @@ pub struct Request {
     pub model: String,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-struct Params {
-    format: ArrowFormat,
-}
-
 fn default_model() -> String {
     "nql".to_string()
 }
@@ -66,7 +60,6 @@ pub(crate) async fn post(
     accept: Option<TypedHeader<Accept>>,
     Json(payload): Json<Request>,
 ) -> Response {
-
     // Get all public table CREATE TABLE statements to add to prompt.
     let tables = match df.get_public_table_names() {
         Ok(t) => t,
