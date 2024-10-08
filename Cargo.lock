@@ -532,7 +532,7 @@ dependencies = [
  "arrow",
  "bigdecimal",
  "chrono",
- "chrono-tz 0.8.6",
+ "chrono-tz 0.10.0",
  "clickhouse-rs",
  "datafusion-table-providers",
  "snafu",
@@ -5964,7 +5964,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -11428,7 +11428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
- "rand 0.8.5",
+ "rand 0.7.3",
  "static_assertions",
 ]
 
