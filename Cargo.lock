@@ -4089,6 +4089,7 @@ dependencies = [
  "futures",
  "llms",
  "prost 0.13.3",
+ "regex",
  "reqwest 0.12.8",
  "rustyline",
  "serde_json",
