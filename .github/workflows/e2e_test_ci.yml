@@ -84,7 +84,10 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - run: rustup toolchain install stable --profile minimal
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target.target_os }}
 
       - uses: Swatinem/rust-cache@v2
         with:

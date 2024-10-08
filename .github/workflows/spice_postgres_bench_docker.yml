@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    runs-on: teraswitch-runners
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -13,12 +13,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Set up make
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
 
       - name: Pull Postgres Docker image
         run: docker pull postgres:latest
