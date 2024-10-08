@@ -43,6 +43,9 @@ jobs:
       - name: Set up make
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:

@@ -32,6 +32,9 @@ jobs:
       - name: Set up make
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory 
       # this can re-use the existing build cache to go faster.
       - name: Build without default features

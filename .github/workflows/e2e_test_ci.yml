@@ -94,6 +94,10 @@ jobs:
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
+
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:

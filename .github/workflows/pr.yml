@@ -97,6 +97,9 @@ jobs:
       - name: Set up make
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
 

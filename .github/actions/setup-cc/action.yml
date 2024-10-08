@@ -1,0 +1,9 @@
+name: Installs the cc toolchain
+description: 'composite action'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install cc
+      shell: bash
+      run: sudo apt-get install -y build-essential

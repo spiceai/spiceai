@@ -67,6 +67,10 @@ jobs:
         if: matrix.target_os == 'linux'
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: matrix.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
+
       - name: Restore build cache (macOS)
         if: matrix.target_os == 'darwin'
         run: |
@@ -266,7 +270,7 @@ jobs:
           - target_os: windows
             target_arch: x86_64
 
-    runs-on: teraswitch-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
