@@ -14,11 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use arrow::error::ArrowError;
 use client::GraphQLQuery;
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use serde_json::Value;
 use snafu::Snafu;
 
+pub mod builder;
 pub mod client;
 pub mod provider;
 
@@ -81,14 +85,30 @@ pub struct FilterPushdownResult {
     pub context: Option<String>,
 }
 
+pub type ValuePreprocessor = Arc<dyn Fn(&mut Value) -> Result<()>>;
+
+/// A trait optionally provided to GraphQL ``TableProvider``s to alter the behavior of filter push down
 pub trait GraphQLOptimizer: Send + Sync {
+    /// A function executed for each filter push down requested from the ``TableProvider``
+    /// A custom implementation can override this function to implement custom filter pushdown logic
     fn filter_pushdown(
         &self,
         expr: &Expr,
-    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError>;
+    ) -> Result<FilterPushdownResult, datafusion::error::DataFusionError> {
+        Ok(FilterPushdownResult {
+            filter_pushdown: TableProviderFilterPushDown::Unsupported,
+            expr: expr.clone(),
+            context: None,
+        })
+    }
+
+    /// This function receives the ``FilterPushdownResult``s from the ``filter_pushdown`` function, before execution of the GraphQL query
+    /// A custom implementation can override this function to inject parameters for custom filter pushdown into the GraphQL query
     fn inject_parameters(
         &self,
-        filters: &[FilterPushdownResult],
-        query: &mut GraphQLQuery<'_>,
-    ) -> Result<(), datafusion::error::DataFusionError>;
+        _filters: &[FilterPushdownResult],
+        _query: &mut GraphQLQuery<'_>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        Ok(())
+    }
 }
