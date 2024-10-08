@@ -50,36 +50,36 @@ env:
   FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 jobs:
-  # build-database-bench-binary:
-  #   name: Build Benchmark Test Binary
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
+  build-database-bench-binary:
+    name: Build Benchmark Test Binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-  #     - name: Set up Rust
-  #       uses: ./.github/actions/setup-rust
-  #       with:
-  #         os: 'linux'
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
 
-  #     - name: Install Protoc
-  #       uses: arduino/setup-protoc@v3
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
 
-  #     - name: Build benchmark binary
-  #       run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
+      - name: Build benchmark binary
+        run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
 
-  #     - name: Find, move, and rename benchmark binary
-  #       run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
+      - name: Find, move, and rename benchmark binary
+        run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
 
-  #     - name: Upload benchmark binary
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: spice_bench
-  #         path: ./spice_bench
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: spice_bench
+          path: ./spice_bench
 
   run-database-bench:
     name: Run Connector/Accelerator Benchmark
     runs-on: ubuntu-latest
-    # needs: build-database-bench-binary
+    needs: build-database-bench-binary
 
     services:
       mysql:
@@ -189,13 +189,6 @@ jobs:
       - name: Checkout repository
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         uses: actions/checkout@v4
-
-      - name: Debug Inputs
-        run: |
-          echo "Selected Benchmark: ${{ github.event.inputs.selected_benchmark }}"
-          echo "Bench Name: ${{ github.event.inputs.bench_name }}"
-          echo "Matrix Name: ${{ matrix.name }}"
-          echo "Matrix Bench: ${{ matrix.bench }}"
 
       - name: Set up Spice.ai API Key
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
