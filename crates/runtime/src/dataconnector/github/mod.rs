@@ -609,7 +609,6 @@ fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     let column_matches = expr_to_match(expr);
 
