@@ -87,7 +87,10 @@ pub struct FilterPushdownResult {
 
 pub type ValuePreprocessor = Arc<dyn Fn(&mut Value) -> Result<()>>;
 
+/// A trait optionally provided to GraphQL ``TableProvider``s to alter the behavior of filter push down
 pub trait GraphQLOptimizer: Send + Sync {
+    /// A function executed for each filter push down requested from the ``TableProvider``
+    /// A custom implementation can override this function to implement custom filter pushdown logic
     fn filter_pushdown(
         &self,
         expr: &Expr,
@@ -99,15 +102,13 @@ pub trait GraphQLOptimizer: Send + Sync {
         })
     }
 
+    /// This function receives the ``FilterPushdownResult``s from the ``filter_pushdown`` function, before execution of the GraphQL query
+    /// A custom implementation can override this function to inject parameters for custom filter pushdown into the GraphQL query
     fn inject_parameters(
         &self,
         _filters: &[FilterPushdownResult],
         _query: &mut GraphQLQuery<'_>,
     ) -> Result<(), datafusion::error::DataFusionError> {
         Ok(())
-    }
-
-    fn preprocess_value(&self) -> Option<ValuePreprocessor> {
-        None
     }
 }
