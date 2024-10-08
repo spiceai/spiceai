@@ -39,18 +39,21 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "teraswitch-runners",
+                builder: "teraswitch-runners",
+                runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
+                builder: "macos-14",
                 runner: "macos-14",
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64"
               }, {
                 name: "macOS x64 (Intel)",
+                builder: "macos-13",
                 runner: "macos-13",
                 target_os: "darwin",
                 target_arch: "x86_64",
@@ -62,7 +65,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target.name }} binaries
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
     env:
       GOVER: 1.22.0
