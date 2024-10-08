@@ -90,6 +90,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
+      - name: Set up make
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-make
+
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:

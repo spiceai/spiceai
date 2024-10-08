@@ -18,6 +18,9 @@ jobs:
 
       - run: rustup toolchain install stable --profile minimal
 
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
       - name: Generate Acknowledgements
         shell: bash
         run: |

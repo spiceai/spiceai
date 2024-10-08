@@ -17,6 +17,9 @@ jobs:
 
     - run: rustup toolchain install stable --profile minimal
 
+    - name: Set up make
+      uses: ./.github/actions/setup-make
+
     - name: Build Cargo project
       run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 

@@ -94,6 +94,9 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
 
@@ -127,6 +130,9 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
 
       - run: make ci test
         if: needs.check_changes.outputs.relevant_changes == 'true'

@@ -63,6 +63,10 @@ jobs:
         with:
           os: ${{ matrix.target_os }}
 
+      - name: Set up make
+        if: matrix.target_os == 'linux'
+        uses: ./.github/actions/setup-make
+
       - name: Restore build cache (macOS)
         if: matrix.target_os == 'darwin'
         run: |
