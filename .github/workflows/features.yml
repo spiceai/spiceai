@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build:
     name: Features Check
-    runs-on: rust
+    runs-on: teraswitch-runners
 
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +28,12 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
 
       # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory 
       # this can re-use the existing build cache to go faster.
