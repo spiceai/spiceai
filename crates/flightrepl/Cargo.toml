@@ -23,3 +23,6 @@ reqwest.workspace = true
 rustyline = { version="14.0.0", features=["custom-bindings", "with-dirs", "with-file-history", "derive"] }
 serde_json.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+
+[dev-dependencies]
+regex.workspace = true
