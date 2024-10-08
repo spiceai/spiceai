@@ -23,12 +23,14 @@ use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
     graphql::{
+        builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
         FilterPushdownResult, GraphQLOptimizer,
     },
 };
 use datafusion::{
+    common::Column,
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{Operator, TableProviderFilterPushDown},
@@ -100,7 +102,7 @@ impl Github {
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
-        let access_token = self.params.get("token").expose().ok();
+        let access_token = self.params.get("token").expose().ok().map(Arc::from);
 
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err("Github 'endpoint' not provided".into());
@@ -110,16 +112,14 @@ impl Github {
 
         let gql_client_params = tbl.get_graphql_values();
 
-        GraphQLClient::new(
-            client,
+        GraphQLClientBuilder::new(
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
-            gql_client_params.json_pointer,
-            access_token,
-            None,
-            None,
             gql_client_params.unnest_depth,
-            gql_client_params.schema,
         )
+        .with_token(access_token)
+        .with_json_pointer(gql_client_params.json_pointer)
+        .with_schema(gql_client_params.schema)
+        .build(client)
         .boxed()
     }
 
@@ -557,13 +557,18 @@ lazy_static! {
             },
         );
 
+        m.insert("labels", GitHubPushdownSupport {
+            ops: vec![Operator::LikeMatch],
+            remaps: Some(vec![GitHubFilterRemap::Column("label")]),
+            uses_modifiers: false
+        });
+
         m
     };
 }
 
-#[allow(clippy::too_many_lines)]
-pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
-    let column_matches = match expr {
+fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
+    match expr {
         Expr::BinaryExpr(binary_expr) => {
             match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
                 (Expr::Column(column), Expr::Literal(value))
@@ -587,8 +592,25 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             }
             _ => None,
         },
+        Expr::ScalarFunction(func) => {
+            if func.args.len() != 2 || !func.func.aliases().contains(&"list_contains".to_string()) {
+                None
+            } else {
+                match (func.args[0].clone(), func.args[1].clone()) {
+                    (Expr::Column(column), Expr::Literal(value))
+                    | (Expr::Literal(value), Expr::Column(column)) => {
+                        Some((column, value, Operator::LikeMatch))
+                    }
+                    _ => None,
+                }
+            }
+        }
         _ => None,
-    };
+    }
+}
+
+pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
+    let column_matches = expr_to_match(expr);
 
     if let Some((column, value, op)) = column_matches {
         if let Some(column_support) = GITHUB_FILTER_PUSHDOWNS_SUPPORTED.get(column.name.as_str()) {
