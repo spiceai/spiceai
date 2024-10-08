@@ -94,7 +94,7 @@ pub async fn start(spicepod_name: &str) {
         .set(GlobalMeterProvider::new(provider))
         .is_err()
     {
-        tracing::error!("Failed to set global meter provider for the anonymous telemetry, already set by another codepath?");
+        tracing::trace!("Failed to set global meter provider for the anonymous telemetry, already set by another codepath?");
     }
 
     // Send an initial telemetry event to indicate the start of telemetry collection
@@ -106,17 +106,17 @@ pub async fn start(spicepod_name: &str) {
     };
 
     if let Err(err) = initial_reader.collect(&mut rm) {
-        tracing::error!("Failed to collect initial telemetry: {:?}", err);
+        tracing::trace!("Failed to collect initial telemetry: {:?}", err);
     };
 
     oss_telemetry_exporter
         .export(&mut rm)
         .await
         .unwrap_or_else(|err| {
-            tracing::error!("Failed to export initial telemetry: {:?}", err);
+            tracing::trace!("Failed to export initial telemetry: {:?}", err);
         });
 
-    tracing::debug!("Started anonymous telemetry collection to {}", *ENDPOINT);
+    tracing::trace!("Started anonymous telemetry collection to {}", *ENDPOINT);
 }
 
 #[derive(Debug, Clone)]
