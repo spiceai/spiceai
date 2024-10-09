@@ -226,7 +226,7 @@ fn get_bool_param(app: &Option<Arc<App>>, param: &str, default_value: bool) -> b
     match value.parse::<bool>() {
         Ok(b) => b,
         Err(_) => {
-            tracing::warn!(
+            eprintln!(
                 "runtime.params.{param} is not a valid boolean, defaulting to {default_value}"
             );
             default_value
