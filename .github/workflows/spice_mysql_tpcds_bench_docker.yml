@@ -1,7 +1,9 @@
 name: spice-mysql-tpcds-bench docker
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - qianqian/mysql-tune
 
 jobs:
   build:
