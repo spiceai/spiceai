@@ -21,12 +21,18 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
+use axum_extra::TypedHeader;
+use headers_accept::Accept;
 
 use crate::datafusion::DataFusion;
 
-use super::sql_to_http_response;
+use super::{sql_to_http_response, ArrowFormat};
 
-pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes) -> Response {
+pub(crate) async fn post(
+    Extension(df): Extension<Arc<DataFusion>>,
+    accept: Option<TypedHeader<Accept>>,
+    body: Bytes,
+) -> Response {
     let query = match String::from_utf8(body.to_vec()) {
         Ok(query) => query,
         Err(e) => {
@@ -35,5 +41,5 @@ pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes)
         }
     };
 
-    sql_to_http_response(df, &query, None).await
+    sql_to_http_response(df, &query, None, ArrowFormat::from_accept_header(&accept)).await
 }

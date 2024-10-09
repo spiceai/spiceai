@@ -6,7 +6,7 @@ on:
 jobs:
   generate:
     name: Generate Acknowledgements
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     permissions:
       pull-requests: write
       contents: write
@@ -17,6 +17,9 @@ jobs:
       - uses: actions/setup-go@v5
 
       - run: rustup toolchain install stable --profile minimal
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
 
       - name: Generate Acknowledgements
         shell: bash

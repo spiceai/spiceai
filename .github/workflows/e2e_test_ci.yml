@@ -26,7 +26,7 @@ concurrency:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -39,18 +39,21 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
+                builder: "teraswitch-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
+                builder: "macos-14",
                 runner: "macos-14",
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64"
               }, {
                 name: "macOS x64 (Intel)",
+                builder: "macos-13",
                 runner: "macos-13",
                 target_os: "darwin",
                 target_arch: "x86_64",
@@ -62,7 +65,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target.name }} binaries
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
     env:
       GOVER: 1.22.0
@@ -84,11 +87,22 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - run: rustup toolchain install stable --profile minimal
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target.target_os }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Set up make
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
