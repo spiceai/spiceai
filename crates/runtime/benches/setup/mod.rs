@@ -85,7 +85,7 @@ pub(crate) async fn setup_benchmark(
     let benchmark_results =
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
 
-    (benchmark_results, rt)
+    Ok((benchmark_results, rt))
 }
 
 async fn runtime_ready_check(rt: &Runtime) {
