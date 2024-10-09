@@ -50,8 +50,8 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
-    Ok(app_builder
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
         .with_dataset(make_spark_dataset(
             "spiceai_sandbox.tpch.customer",
             "customer",
@@ -71,7 +71,7 @@ pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
         .with_dataset(make_spark_dataset(
             "spiceai_sandbox.tpch.supplier",
             "supplier",
-        )))
+        ))
 }
 
 fn make_spark_dataset(path: &str, name: &str) -> Dataset {

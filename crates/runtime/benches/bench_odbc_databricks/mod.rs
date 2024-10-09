@@ -50,8 +50,8 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
-    Ok(app_builder
+pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
+    app_builder
         .with_dataset(make_dataset("spiceai_sandbox.tpch.customer", "customer"))
         .with_dataset(make_dataset("spiceai_sandbox.tpch.lineitem", "lineitem"))
         .with_dataset(make_dataset("spiceai_sandbox.tpch.part", "part"))
@@ -59,7 +59,7 @@ pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
         .with_dataset(make_dataset("spiceai_sandbox.tpch.orders", "orders"))
         .with_dataset(make_dataset("spiceai_sandbox.tpch.nation", "nation"))
         .with_dataset(make_dataset("spiceai_sandbox.tpch.region", "region"))
-        .with_dataset(make_dataset("spiceai_sandbox.tpch.supplier", "supplier")))
+        .with_dataset(make_dataset("spiceai_sandbox.tpch.supplier", "supplier"))
 }
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
