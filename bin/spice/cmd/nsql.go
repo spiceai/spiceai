@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -47,17 +47,17 @@ spice nsql --cloud
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("getting model flag", "error", err)
 			os.Exit(1)
 		}
 		if model == "" {
 			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
 			if err != nil {
-				cmd.PrintErrln(err.Error())
+				slog.Error("listing spiced models", "error", err)
 				os.Exit(1)
 			}
 			if len(models) == 0 {
-				cmd.Println("No models found")
+				slog.Error("no models found")
 				os.Exit(1)
 			}
 
@@ -81,14 +81,13 @@ spice nsql --cloud
 				}
 			}
 
-			fmt.Println("Using model:", selectedModel)
-			fmt.Println()
+			fmt.Println("Using model:\n", selectedModel)
 			model = selectedModel
 		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {
-			cmd.Println(err)
+			slog.Error("getting http-endpoint flag", "error", err)
 			os.Exit(1)
 		}
 		if httpEndpoint != "" {
@@ -103,7 +102,7 @@ spice nsql --cloud
 			if err == liner.ErrPromptAborted {
 				break
 			} else if err != nil {
-				log.Print("Error reading line: ", err)
+				slog.Error("reading line", "error", err)
 				continue
 			}
 
@@ -119,15 +118,15 @@ spice nsql --cloud
 			}()
 
 			responses := make(chan *http.Response)
+			start := time.Now()
 			go func(out chan *http.Response) {
 				defer close(out)
 				response, err := sendNsqlRequest(rtcontext, &NsqlRequest{
 					Query: message,
 					Model: model,
 				})
-				log.Printf("Response: %v\n", response)
 				if err != nil {
-					cmd.Printf("Error: %v\n", err)
+					slog.Error("sending nsql request", "error", err)
 					out <- nil
 				} else {
 					out <- response
@@ -135,6 +134,7 @@ spice nsql --cloud
 			}(responses)
 
 			response := <-responses
+			time := time.Since(start).Seconds()
 			done <- true
 			if response == nil {
 				// Error already printed in goroutine
@@ -143,17 +143,22 @@ spice nsql --cloud
 
 			raw, err := io.ReadAll(response.Body)
 			if err != nil {
-				cmd.Printf("Error: %v\n\n", err)
-				continue
-			}
-			var searchResponse SearchResponse = SearchResponse{}
-			err = json.Unmarshal([]byte(raw), &searchResponse)
-			if err != nil {
-				cmd.Printf("Error: %v\n\n", err)
+				slog.Error("reading response body", "error", err)
 				continue
 			}
 
-			cmd.Printf("Time: %s. %d results.\n\n", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
+			output := string(raw)
+
+			// Three newlines are from the header, and two spacing +-------------+` to form table.
+			numberRows := strings.Count(output, "\n") - 3
+
+			if output == "++\n++" {
+				cmd.Printf("No results.\n")
+			} else if response.StatusCode != 200 {
+				cmd.Printf("\033[31mQueryError\033[0m %s\n", output)
+			} else {
+				cmd.Printf("%s\n\nTime: %f seconds. %d rows.\n", output, time, numberRows)
+			}
 		}
 	},
 }
@@ -171,6 +176,7 @@ func sendNsqlRequest(rtcontext *context.RuntimeContext, body *NsqlRequest) (*htt
 	}
 
 	request.Header = rtcontext.GetHeaders()
+	request.Header.Set("Accept", "text/plain")
 
 	response, err := rtcontext.Client().Do(request)
 	if err != nil {
