@@ -46,6 +46,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 #### [Unstructured Connectors](../definitions.md)
 
 - [ ] The connector supports filter federation within a single dataset for common use case columns (e.g. `select * from my_dataset where id = 1`)
+  - Common use case should be determined at the discretion of the DRI for the connector.
   - For example, the GitHub connector should support filter federation for the author, state and title of issues.
 
 ### Test Coverage
