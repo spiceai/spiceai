@@ -83,7 +83,7 @@ jobs:
 
     services:
       mysql:
-        image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
+        image: ${{ matrix.name == 'mysql connector' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
           --health-cmd="mysqladmin ping -uroot -proot --silent"
           --health-interval 10s
@@ -137,6 +137,9 @@ jobs:
           - cmd: '-c mysql'
             name: 'mysql connector'
             bench: 'tpch'
+          - cmd: '-c mysql -b tpcds'
+            name: 'mysql connector'
+            bench: 'tpcds'
           - cmd: '-c odbc-databricks'
             name: 'odbc-databricks connector'
             bench: 'tpch'
@@ -193,6 +196,16 @@ jobs:
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
+      - name: Increase swapfile
+        run: |
+          df -h
+          sudo swapoff -a
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo swapon --show
+
       - name: Download benchmark binary
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         uses: actions/download-artifact@v4
@@ -242,7 +255,8 @@ jobs:
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
           MYSQL_BENCHMARK_MYSQL_USER: root
           MYSQL_BENCHMARK_MYSQL_PASS: root
-          MYSQL_BENCHMARK_MYSQL_DB: tpch_sf1
+          MYSQL_TPCH_BENCHMARK_MYSQL_DB: tpch_sf1
+          MYSQL_TPCDS_BENCHMARK_MYSQL_DB: tpcds_sf1
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}

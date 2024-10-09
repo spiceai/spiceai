@@ -87,13 +87,19 @@ impl Openai {
             model,
         }
     }
+
+    /// Returns true if the `OpenAI` compatible model supports [structured outputs](https://platform.openai.com/docs/guides/structured-outputs/).
+    /// This is only supported for GPT-4o models from `OpenAI` (i.e not any other compatible servers).
+    fn supports_structured_output(&self) -> bool {
+        self.client.config().api_base() == OPENAI_API_BASE && self.model.starts_with("gpt-4o")
+    }
 }
 
 #[async_trait]
 impl Chat for Openai {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
-        if self.client.config().api_base() == OPENAI_API_BASE {
+        if self.supports_structured_output() {
             Some(&StructuredOutputSqlGeneration {})
         } else {
             Some(&JsonSchemaSqlGeneration {})

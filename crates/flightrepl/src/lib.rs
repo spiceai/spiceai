@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,6 +27,7 @@ use arrow_flight::{
 };
 
 use clap::Parser;
+use config::get_user_agent;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
@@ -40,8 +42,12 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter, KeyEvent};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::metadata::AsciiMetadataKey;
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
+
+mod config;
 
 #[derive(Parser)]
 #[clap(about = "Spice.ai SQL REPL")]
@@ -82,6 +88,7 @@ async fn send_nsql_request(
     client
         .post(format!("{base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
+        .header("X-Spice-User-Agent", get_user_agent())
         .json(&json!({
             "query": query,
             "model": runtime,
@@ -293,7 +300,16 @@ async fn get_records(
     let Some(ticket) = endpoint.ticket else {
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
-    let request = ticket.into_request();
+    let mut request = ticket.into_request();
+    let user_agent_key = AsciiMetadataKey::from_str("x-spice-user-agent")
+        .map_err(|e| FlightError::ExternalError(e.into()))?;
+    let user_agent_value = get_user_agent()
+        .parse()
+        .map_err(|e: InvalidMetadataValue| FlightError::ExternalError(e.into()))?;
+
+    request
+        .metadata_mut()
+        .insert(user_agent_key, user_agent_value);
 
     let response = client.do_get(request).await?;
     let from_cache = response

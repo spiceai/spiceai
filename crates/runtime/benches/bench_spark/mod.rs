@@ -24,17 +24,18 @@ pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
 ) -> Result<(), String> {
-    let test_queries = get_test_queries();
+    let test_queries = get_tpch_test_queries();
 
     let mut errors = Vec::new();
     for (query_name, query) in test_queries {
+        let verify_query_results = query_name.starts_with("tpch_q");
         if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
             "spark",
             query_name,
             query,
-            false,
+            verify_query_results,
         )
         .await
         {
@@ -77,7 +78,7 @@ fn make_spark_dataset(path: &str, name: &str) -> Dataset {
     Dataset::new(format!("spark:{path}"), name.to_string())
 }
 
-fn get_test_queries() -> Vec<(&'static str, &'static str)> {
+fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
