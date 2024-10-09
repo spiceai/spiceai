@@ -51,29 +51,27 @@ pub(crate) async fn run(
 }
 
 pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
-    Ok(
-        app_builder
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.customer",
-                "customer",
-            ))
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.lineitem",
-                "lineitem",
-            ))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.part", "part"))
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.partsupp",
-                "partsupp",
-            ))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.orders", "orders"))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.nation", "nation"))
-            .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.region", "region"))
-            .with_dataset(make_spark_dataset(
-                "spiceai_sandbox.tpch.supplier",
-                "supplier",
-            ))
-    )
+    Ok(app_builder
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.customer",
+            "customer",
+        ))
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.lineitem",
+            "lineitem",
+        ))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.part", "part"))
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.partsupp",
+            "partsupp",
+        ))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.orders", "orders"))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.nation", "nation"))
+        .with_dataset(make_spark_dataset("spiceai_sandbox.tpch.region", "region"))
+        .with_dataset(make_spark_dataset(
+            "spiceai_sandbox.tpch.supplier",
+            "supplier",
+        )))
 }
 
 fn make_spark_dataset(path: &str, name: &str) -> Dataset {
