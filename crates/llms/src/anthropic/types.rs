@@ -49,11 +49,26 @@ pub struct MessageParam {
     pub role: MessageRole,
 }
 
+impl MessageParam {
+    pub fn User(content: Vec<ContentBlock>) -> Self {
+        Self {
+            content: ContentParam::Blocks(content),
+            role: MessageRole::User,
+        }
+    }
+    pub fn Assistant(content: Vec<ContentBlock>) -> Self {
+        Self {
+            content: ContentParam::Blocks(content),
+            role: MessageRole::Assistant,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ContentParam {
     String(String),
-    Blocks(Vec<ContentBlockZ>),
+    Blocks(Vec<ContentBlock>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,11 +80,17 @@ pub enum MessageRole {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum ContentBlockZ {
+pub enum ContentBlock {
     Text(TextBlockParam),
     Image(ImageBlockParam),
     ToolUse(ToolUseBlockParam),
     ToolResult(ToolResultBlockParam),
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum ResponseContentBlock {
+    Text(TextBlockParam),
+    ToolUse(ToolUseBlockParam),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,6 +106,14 @@ pub struct TextBlockParam {
     pub text: String,
     #[serde(rename = "type")]
     pub block_type: String, // Always "text"
+}
+impl TextBlockParam {
+    pub fn new(text: String) -> Self {
+        Self {
+            text,
+            block_type: "text".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,6 +146,19 @@ pub struct ImageBlockParam {
     pub block_type: String, // Always "image"
 }
 
+impl ImageBlockParam {
+    pub fn new(data: String, media_type: MediaType) -> Self {
+        Self {
+            source: Source {
+                data,
+                media_type,
+                source_type: SourceType::Base64,
+            },
+            block_type: "image".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ToolUseBlockParam {
     pub id: String,
@@ -124,6 +166,17 @@ pub struct ToolUseBlockParam {
     pub name: String,
     #[serde(rename = "type")]
     pub block_type: String, // Always "tool_use"
+}
+
+impl ToolUseBlockParam {
+    pub fn new(id: String, input: serde_json::Value, name: String) -> Self {
+        Self {
+            id,
+            input,
+            name,
+            block_type: "tool_use".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,9 +189,20 @@ pub struct ToolResultBlockParam {
     pub is_error: Option<bool>,
 }
 
+impl ToolResultBlockParam {
+    pub fn new(tool_use_id: String, content: ContentParam) -> Self {
+        Self {
+            tool_use_id,
+            block_type: "tool_result".to_string(),
+            content,
+            is_error: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum ContentBlock {
+pub enum BetaContentBlock {
     Text(BetaTextBlock),
     ToolUse(BetaToolUseBlock),
 }
@@ -253,6 +317,21 @@ impl std::str::FromStr for ModelVariant {
     }
 }
 
+impl ToString for ModelVariant {
+    fn to_string(&self) -> String {
+        match self {
+            ModelVariant::Claude35Sonnet20240620 => "claude-35-sonnet-2024-06-20",
+            ModelVariant::Claude3Opus20240229 => "claude-3-opus-2024-02-29",
+            ModelVariant::Claude3Sonnet20240229 => "claude-3-sonnet-2024-02-29",
+            ModelVariant::Claude3Haiku20240307 => "claude-3-haiku-2024-03-07",
+            ModelVariant::Claude21 => "claude-2-1",
+            ModelVariant::Claude20 => "claude-2-0",
+            ModelVariant::ClaudeInstant12 => "claude-instant-1-2",
+        }
+        .to_string()
+    }
+}
+
 impl ModelVariant {
     pub fn default_max_tokens(&self) -> u32 {
         match self {
@@ -265,4 +344,40 @@ impl ModelVariant {
             ModelVariant::ClaudeInstant12 => 4096,
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MessageCreateResponse {
+    pub id: String,
+    pub content: Vec<ResponseContentBlock>,
+    pub model: ModelVariant,
+    pub role: MessageRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
+    #[serde(rename = "type")]
+    pub message_type: MessageType,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    MaxTokens,
+    StopSequence,
+    ToolUse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum MessageType {
+    #[serde(rename = "message")]
+    Message,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
 }
