@@ -312,6 +312,7 @@ fn get_current_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
@@ -361,11 +362,14 @@ async fn run_query_and_record_result(
                         .iter()
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
-                    let limited_records = records
+
+                    let limited_records: Vec<_> = records
                         .iter()
-                        .take(1)
-                        .map(|x| x.slice(0, x.num_rows().min(10)))
-                        .collect::<Vec<_>>();
+                        .flat_map(|batch: &RecordBatch| {
+                            (0..batch.num_rows()).map(move |i| batch.slice(i, 1))
+                        })
+                        .take(10)
+                        .collect();
 
                     let records_pretty =
                         arrow::util::pretty::pretty_format_batches(&limited_records)

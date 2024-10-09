@@ -38,15 +38,19 @@ env:
 jobs:
   license-check-rust:
     name: Check Rust Licenses
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
       - name: Check Rust Licenses
         run: make dep-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
   license-check-go:
     name: Check Golang Licenses
-    runs-on: ubuntu-latest
+    runs-on: teraswitch-runners
     env:
       GOVER: 1.22.0
 

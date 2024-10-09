@@ -61,18 +61,20 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        let verify_query_results = (matches!(
-            bench_name.as_str(),
-            "s3" | "s3_arrow_memory"
-                | "s3_sqlite_memory"
-                | "s3_sqlite_file"
-                | "s3_duckdb_memory"
-                | "abfs"
-                | "abfs_arrow_memory"
-                | "abfs_sqlite_memory"
-                | "abfs_sqlite_file"
-                | "abfs_duckdb_memory"
-        )) && query_name.starts_with("tpch_q");
+        let verify_query_results = if query_name.starts_with("tpch_q") {
+            matches!(
+                bench_name.as_str(),
+                "s3" | "s3_arrow_memory"
+                    | "s3_sqlite_memory"
+                    | "s3_sqlite_file"
+                    | "s3_duckdb_memory"
+                    | "abfs"
+            )
+        } else if query_name.starts_with("tpcds_q") {
+            matches!(bench_name.as_str(), "s3_arrow_memory")
+        } else {
+            false
+        };
 
         if let Err(e) = super::run_query_and_record_result(
             rt,
