@@ -75,7 +75,10 @@ pub(crate) async fn run(
                     | "abfs"
             )
         } else if query_name.starts_with("tpcds_q") {
-            matches!(bench_name.as_str(), "s3_arrow_memory")
+            matches!(
+                bench_name.as_str(),
+                "s3_postgres_memory" | "s3_arrow_memory"
+            )
         } else {
             false
         };
