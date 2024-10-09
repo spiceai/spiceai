@@ -80,6 +80,11 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Builds the DataFusion instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DataFusion instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut state = SessionStateBuilder::new()
