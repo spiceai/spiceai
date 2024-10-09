@@ -26,7 +26,7 @@ use datafusion::{
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
     },
     prelude::Expr,
 };
