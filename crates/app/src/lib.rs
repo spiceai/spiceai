@@ -177,6 +177,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_runtime_params(mut self, params: HashMap<String, String>) -> AppBuilder {
+        self.runtime.params = params;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
