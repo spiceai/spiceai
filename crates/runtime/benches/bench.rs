@@ -302,6 +302,7 @@ fn get_current_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
