@@ -265,8 +265,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
-    ParameterSpec::connector("app_id")
-        .description("The Github App ID.")
+    ParameterSpec::connector("client_id")
+        .description("The Github App Client ID.")
         .secret(),
     ParameterSpec::connector("private_key")
         .description("The Github App private key.")
@@ -294,17 +294,17 @@ impl DataConnectorFactory for GithubFactory {
         _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let token = params.get("token").expose().ok();
-        let app_id = params.get("app_id").expose().ok();
+        let client_id = params.get("client_id").expose().ok();
         let private_key = params.get("private_key").expose().ok();
         let installation_id = params.get("installation_id").expose().ok();
 
         let token_wrapper: Option<Arc<dyn TokenWrapper>> =
-            match (token, app_id, private_key, installation_id) {
+            match (token, client_id, private_key, installation_id) {
                 (Some(token), _, _, _) => Some(Arc::new(DefaultTokenWrapper::new(token.into()))),
 
-                (None, Some(app_id), Some(private_key), Some(installation_id)) => {
+                (None, Some(client_id), Some(private_key), Some(installation_id)) => {
                     Some(Arc::new(GitHubAppTokenWrapper::new(
-                        Arc::from(app_id),
+                        Arc::from(client_id),
                         Arc::from(private_key),
                         Arc::from(installation_id),
                     )))
