@@ -248,12 +248,10 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![&self.input_exec]
     }
 
-    /// Enforces a 1-1 relationship between `BytesProcessedExec` and its input,
-    /// preventing the introduction of `RepartitionExec` and ensuring that the input
-    /// is not split into sub-inputs. This guarantees that the input is processed
-    /// as a single stream, preserving the order of the data.
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel. 
+    /// This guarantees that the input is processed as a single stream, preserving the order of the data.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
     }
 
     fn with_new_children(
