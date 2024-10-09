@@ -20,7 +20,7 @@ use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput
+    CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
 };
 
 use async_trait::async_trait;
@@ -32,7 +32,6 @@ use super::Openai;
 pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
-
 
 #[async_trait]
 impl Embed for Openai {

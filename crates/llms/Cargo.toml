@@ -22,10 +22,14 @@ schemars  = "0.8.19"
 futures = { workspace = true }
 insta = { workspace = true, features = ["filters"] }
 hf-hub = { version = "0.3.0", features = ["tokio"] }
+reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+secrecy.workspace = true
 tokenizers = { version = "0.20.0" }
 tracing.workspace = true
 tracing-futures.workspace = true
+
+
 
 ## For Chunking
 text-splitter = {version =  "0.17.0", features = ["markdown", "tokenizers", "tiktoken-rs"]}

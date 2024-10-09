@@ -25,7 +25,7 @@ use async_openai::types::{
 };
 
 use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, CreateChatCompletionRequestArgs
+    ChatCompletionRequestSystemMessageArgs, CreateChatCompletionRequestArgs,
 };
 use async_stream::stream;
 use async_trait::async_trait;

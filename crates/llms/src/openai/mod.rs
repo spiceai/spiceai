@@ -16,10 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_openai::config::{Config, OPENAI_API_BASE};
-use async_openai::{
-    config::OpenAIConfig,
-    Client,
-};
+use async_openai::{config::OpenAIConfig, Client};
 
 pub mod chat;
 pub mod embed;
