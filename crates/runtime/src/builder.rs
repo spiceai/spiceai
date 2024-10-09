@@ -135,7 +135,13 @@ impl RuntimeBuilder {
 
         let df = match self.datafusion {
             Some(df) => df,
-            None => Arc::new(DataFusion::new(Arc::clone(&status))),
+            None => {
+                let builder = DataFusion::builder(Arc::clone(&status)).keep_partition_by_columns(
+                    get_bool_param(&self.app, "sql_query_keep_partition_by_columns", true),
+                );
+
+                Arc::new(builder.build())
+            }
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -203,5 +209,70 @@ impl RuntimeBuilder {
 impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Get a boolean parameter from the app's runtime params, with a default value if the parameter is not set or is not a valid boolean.
+///
+/// Returns `default_value` if the parameter is not set or is not a valid boolean.
+///
+/// If the parameter is set but is not a valid boolean, logs a warning and returns `default_value`.
+fn get_bool_param(app: &Option<Arc<App>>, param: &str, default_value: bool) -> bool {
+    let value = match app.as_ref().and_then(|app| app.runtime.params.get(param)) {
+        Some(value) => value,
+        None => return default_value,
+    };
+
+    match value.parse::<bool>() {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::warn!(
+                "runtime.params.{param} is not a valid boolean, defaulting to {default_value}"
+            );
+            default_value
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use app::AppBuilder;
+
+    use super::*;
+    use std::collections::HashMap;
+
+    fn create_app_with_params(params: HashMap<String, String>) -> Arc<App> {
+        Arc::new(AppBuilder::new("test").with_runtime_params(params).build())
+    }
+
+    #[test]
+    fn test_get_bool_param() {
+        // Test case 1: Parameter is not set
+        let app = Some(create_app_with_params(HashMap::new()));
+        assert!(get_bool_param(&app, "test_param", true));
+        assert!(!get_bool_param(&app, "test_param", false));
+
+        // Test case 2: Parameter is set to "true"
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "true".to_string());
+        let app = Some(create_app_with_params(params));
+        assert!(get_bool_param(&app, "test_param", false));
+
+        // Test case 3: Parameter is set to "false"
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "false".to_string());
+        let app = Some(create_app_with_params(params));
+        assert!(!get_bool_param(&app, "test_param", true));
+
+        // Test case 4: Parameter is set to an invalid boolean value
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "not_a_bool".to_string());
+        let app = Some(create_app_with_params(params));
+        assert!(get_bool_param(&app, "test_param", true));
+        assert!(!get_bool_param(&app, "test_param", false));
+
+        // Test case 5: App is None
+        assert!(get_bool_param(&None, "test_param", true));
+        assert!(!get_bool_param(&None, "test_param", false));
     }
 }
