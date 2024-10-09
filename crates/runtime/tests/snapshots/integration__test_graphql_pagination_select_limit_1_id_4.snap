@@ -10,8 +10,8 @@ description: "Query: SELECT * FROM test_graphql where id = '4' limit 1"
 |               |     Filter: test_graphql.id = Utf8("4")                    |
 |               |       TableScan: test_graphql projection=[id, name, posts] |
 | physical_plan | GlobalLimitExec: skip=0, fetch=1                           |
-|               |   BytesProcessedExec                                       |
-|               |     CoalescePartitionsExec                                 |
+|               |   CoalescePartitionsExec                                   |
+|               |     BytesProcessedExec                                     |
 |               |       CoalesceBatchesExec: target_batch_size=8192          |
 |               |         FilterExec: id@0 = 4                               |
 |               |           MemoryExec: partitions=2, partition_sizes=[2, 2] |
