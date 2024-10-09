@@ -49,16 +49,18 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
-    app_builder
-        .with_dataset(make_dataset("tpch.customer", "customer"))
-        .with_dataset(make_dataset("tpch.lineitem", "lineitem"))
-        .with_dataset(make_dataset("tpch.part", "part"))
-        .with_dataset(make_dataset("tpch.partsupp", "partsupp"))
-        .with_dataset(make_dataset("tpch.orders", "orders"))
-        .with_dataset(make_dataset("tpch.nation", "nation"))
-        .with_dataset(make_dataset("tpch.region", "region"))
-        .with_dataset(make_dataset("tpch.supplier", "supplier"))
+pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
+    Ok(
+        app_builder
+            .with_dataset(make_dataset("tpch.customer", "customer"))
+            .with_dataset(make_dataset("tpch.lineitem", "lineitem"))
+            .with_dataset(make_dataset("tpch.part", "part"))
+            .with_dataset(make_dataset("tpch.partsupp", "partsupp"))
+            .with_dataset(make_dataset("tpch.orders", "orders"))
+            .with_dataset(make_dataset("tpch.nation", "nation"))
+            .with_dataset(make_dataset("tpch.region", "region"))
+            .with_dataset(make_dataset("tpch.supplier", "supplier"))
+    )
 }
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
