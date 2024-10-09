@@ -32,13 +32,16 @@ use crate::{
     component::dataset::Dataset,
     datafusion::query::{Protocol, QueryBuilder},
 };
-use arrow::array::RecordBatch;
+use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use axum_extra::TypedHeader;
 use csv::Writer;
+use headers_accept::Accept;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
@@ -50,6 +53,33 @@ pub enum Format {
     #[default]
     Json,
     Csv,
+}
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+/// The various formats that the Arrow data can be converted and returned from HTTP requests.
+pub enum ArrowFormat {
+    #[default]
+    Json,
+    Csv,
+    Plain,
+}
+
+impl ArrowFormat {
+    pub fn from_accept_header(accept: &Option<TypedHeader<Accept>>) -> ArrowFormat {
+        accept.as_ref().map_or(ArrowFormat::default(), |header| {
+            header
+                .0
+                .media_types()
+                .find_map(|h| match h.to_string().as_str() {
+                    "application/json" => Some(ArrowFormat::Json),
+                    "text/csv" => Some(ArrowFormat::Csv),
+                    "text/plain" => Some(ArrowFormat::Plain),
+                    _ => None,
+                })
+                .unwrap_or(ArrowFormat::default())
+        })
+    }
 }
 
 fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn std::error::Error>> {
@@ -70,7 +100,12 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 }
 
 // Runs query and converts query results to HTTP response (as JSON).
-pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, nsql: Option<&str>) -> Response {
+pub async fn sql_to_http_response(
+    df: Arc<DataFusion>,
+    sql: &str,
+    nsql: Option<&str>,
+    format: ArrowFormat,
+) -> Response {
     let query = QueryBuilder::new(sql, Arc::clone(&df), Protocol::Http)
         .use_restricted_sql_options()
         .nsql(nsql)
@@ -94,23 +129,16 @@ pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, nsql: Option<&
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
-    let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
 
-    if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
-        tracing::debug!("Error converting results to JSON: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    if let Err(e) = writer.finish() {
-        tracing::debug!("Error finishing JSON conversion: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
+    let res = match format {
+        ArrowFormat::Json => arrow_to_json(&data),
+        ArrowFormat::Csv => arrow_to_csv(&data),
+        ArrowFormat::Plain => arrow_to_plain(&data),
+    };
 
-    let buf = writer.into_inner();
-    let res = match String::from_utf8(buf) {
-        Ok(res) => res,
+    let body = match res {
+        Ok(body) => body,
         Err(e) => {
-            tracing::debug!("Error converting JSON buffer to string: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
@@ -130,5 +158,38 @@ pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, nsql: Option<&
         }
         None => {}
     };
-    (StatusCode::OK, headers, res).into_response()
+    (StatusCode::OK, headers, body).into_response()
+}
+
+/// Converts a vector of `RecordBatch` to a JSON string.
+fn arrow_to_json(data: &[RecordBatch]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(buf);
+
+    writer
+        .write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
+        .boxed()?;
+    writer.finish().boxed()?;
+
+    String::from_utf8(writer.into_inner()).boxed()
+}
+
+/// Converts a vector of `RecordBatch` to a CSV string.
+fn arrow_to_csv(data: &[RecordBatch]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let output = Vec::new();
+    let mut writer = arrow_csv::Writer::new(output);
+
+    for d in data {
+        writer.write(d).boxed()?;
+    }
+
+    String::from_utf8(writer.into_inner()).boxed()
+}
+
+/// Converts a vector of `RecordBatch` to a pretty formatted string.
+/// This is equivalent to [`datafusion::dataframe::DataFrame::show`].
+fn arrow_to_plain(
+    data: &[RecordBatch],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pretty_format_batches(data).map(|d| format!("{d}")).boxed()
 }
