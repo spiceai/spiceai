@@ -17,7 +17,6 @@ limitations under the License.
 use app::AppBuilder;
 use spicepod::component::{dataset::Dataset, params::Params};
 
-#[allow(clippy::too_many_lines)]
 pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
     match bench_name {
         "tpch" => app_builder
