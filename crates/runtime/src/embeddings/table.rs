@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
@@ -513,11 +513,37 @@ impl TableProvider for EmbeddingTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // TODO: Implement pushdown for filters that can be exact.
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        let base_field_names: HashSet<String> = self
+            .base_table
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+
+        let push_downs = filters
+            .iter()
+            .map(|&f| {
+                // If all columns in the filter are in the base table, we can push down the filter
+                // dependent on the [`EmbeddingTable::base_table`]'s [`supports_filters_pushdown`].
+                let additional_fields_count = f
+                    .column_refs()
+                    .iter()
+                    .filter(|c| !base_field_names.contains(c.name()))
+                    .count();
+
+                if additional_fields_count == 0 {
+                    self.base_table.supports_filters_pushdown(&[f]).map(|v| {
+                        v.first()
+                            .cloned()
+                            .unwrap_or(TableProviderFilterPushDown::Unsupported)
+                    })
+                } else {
+                    Ok(TableProviderFilterPushDown::Unsupported)
+                }
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        Ok(push_downs)
     }
 
     fn statistics(&self) -> Option<Statistics> {
