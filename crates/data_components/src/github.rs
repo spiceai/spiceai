@@ -18,7 +18,7 @@ use futures::future;
 use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
 
-use crate::arrow::write::MemTable;
+use crate::{arrow::write::MemTable, token_wrapper::TokenWrapper};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -160,7 +160,7 @@ impl TableProvider for GithubFilesTableProvider {
 
 pub struct GithubRestClient {
     client: reqwest::Client,
-    token: Arc<str>,
+    token: Arc<dyn TokenWrapper>,
 }
 
 static SPICE_USER_AGENT: &str = "spice";
@@ -168,12 +168,9 @@ const NUM_FILE_CONTENT_DOWNLOAD_WORKERS: usize = 10;
 
 impl GithubRestClient {
     #[must_use]
-    pub fn new(token: &str) -> Self {
+    pub fn new(token: Arc<dyn TokenWrapper>) -> Self {
         let client = reqwest::Client::new();
-        GithubRestClient {
-            client,
-            token: token.into(),
-        }
+        GithubRestClient { client, token }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -276,7 +273,9 @@ impl GithubRestClient {
             HeaderValue::from_static("application/vnd.github.v3+json"),
         );
 
-        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token)) {
+        let token = self.token.get_token().await?;
+
+        if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
             headers.insert(AUTHORIZATION, header);
         }
 
@@ -334,7 +333,10 @@ impl GithubRestClient {
 
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
-        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token)) {
+
+        let token = self.token.get_token().await?;
+
+        if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
             headers.insert(AUTHORIZATION, header);
         }
 

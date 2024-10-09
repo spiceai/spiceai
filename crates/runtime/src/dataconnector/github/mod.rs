@@ -164,11 +164,15 @@ impl Github {
     pub(crate) fn create_rest_client(
         &self,
     ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(access_token) = self.params.get("token").expose().ok() else {
-            return Err("Github token not provided".into());
-        };
+        let token = self
+            .token
+            .as_ref()
+            .map(|token| Arc::clone(token) as Arc<dyn TokenWrapper>);
 
-        Ok(GithubRestClient::new(access_token))
+        match token {
+            Some(token) => Ok(GithubRestClient::new(token)),
+            None => Err("Github token not provided".into()),
+        }
     }
 
     async fn create_files_table_provider(
