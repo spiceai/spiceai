@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - name: "Linux x64"
-            runner: "ubuntu-latest"
+            runner: "teraswitch-runners"
             target_os: "linux"
             target_arch: "x86_64"
             target_arch_go: "amd64"
@@ -38,6 +38,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
