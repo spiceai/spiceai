@@ -8,25 +8,25 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 | Connector | [Connector Type](../definitions.md) | RC Quality | DRI Sign-off |
 | - | - | - | - |
-| Clickhouse   | Relational | ❌ |  |
-| Databricks   | Relational |❌ |  |
-| Delta Lake   | Relational | ❌ |  |
-| Dremio       | Relational | ❌ |  |
-| File         | Non-Relational | ❌ |  |
-| FTP/SFTP     | Non-Relational | ❌ |  |
-| GraphQL      | Non-Relational | ❌ |  |
-| GitHub       | Non-Relational | ❌ |  |
-| HTTP/HTTPS   | Non-Relational | ❌ |  |
-| MS SQL       | Relational | ❌ |  |
-| MySQL        | Relational | ❌ |  |
-| ODBC         | Relational | ❌ |  |
-| PostgreSQL   | Relational | ❌ |  |
-| Sharepoint   | Non-Relational | ❌ |  |
-| Snowflake    | Relational | ❌ |  |
-| Spice.AI     | Relational | ❌ |  |
-| S3           | Non-Relational | ❌ |  |
-| Azure BlobFS | Non-Relational | ❌ |  |
-| Spark        | Relational | ❌ |  |
+| Clickhouse   | Structured | ❌ |  |
+| Databricks   | Structured |❌ |  |
+| Delta Lake   | Structured | ❌ |  |
+| Dremio       | Structured | ❌ |  |
+| File         | Unstructured | ❌ |  |
+| FTP/SFTP     | Unstructured | ❌ |  |
+| GraphQL      | Unstructured | ❌ |  |
+| GitHub       | Unstructured | ❌ |  |
+| HTTP/HTTPS   | Unstructured | ❌ |  |
+| MS SQL       | Structured | ❌ |  |
+| MySQL        | Structured | ❌ |  |
+| ODBC         | Structured | ❌ |  |
+| PostgreSQL   | Structured | ❌ |  |
+| Sharepoint   | Unstructured | ❌ |  |
+| Snowflake    | Structured | ❌ |  |
+| Spice.AI     | Structured | ❌ |  |
+| S3           | Unstructured | ❌ |  |
+| Azure BlobFS | Unstructured | ❌ |  |
+| Spark        | Structured | ❌ |  |
 
 ## RC Release Criteria
 
@@ -37,15 +37,16 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 - [ ] [Core Arrow Data Types](../definitions.md) are supported
 - [ ] All known [Major Bugs](../definitions.md) are resolved
 
-#### [Relational Connectors](../definitions.md)
+#### [Structured Connectors](../definitions.md)
 
 - [ ] Data is streamed when reading/performing queries from this connector
 - [ ] The connector supports full federation within a single dataset (e.g. `select * from my_dataset`)
 - [ ] The connector supports federation push down across multiple datasets within the same connection source (e.g. `select * from first_dataset, second_dataset`)
 
-#### [Non-Relational Connectors](../definitions.md)
+#### [Unstructured Connectors](../definitions.md)
 
-- [ ] The connector supports some level of filter federation within a single dataset (e.g. `select * from my_dataset where id = 1`)
+- [ ] The connector supports filter federation within a single dataset for common use case columns (e.g. `select * from my_dataset where id = 1`)
+  - For example, the GitHub connector should support filter federation for the author, state and title of issues.
 
 ### Test Coverage
 
@@ -53,17 +54,24 @@ RC quality connectors should be able to run test packages derived from the follo
 
 | [Connector Type](../definitions.md) | Test Package (Scale Factor) |
 | - | - |
-| Relational | [TPC-H](https://www.tpc.org/TPC-H/) (100) |
-| Relational | [TPC-DS](https://www.tpc.org/TPC-DS/) (100) |
-| Relational | [ClickBench](https://github.com/ClickHouse/ClickBench) (1) |
-| Non-Relational | [TPC-H](https://www.tpc.org/TPC-H/) (1) |
-| Non-Relational | [TPC-DS](https://www.tpc.org/TPC-DS/) (0.5) |
+| Structured | [TPC-H](https://www.tpc.org/TPC-H/) (100) |
+| Structured | [TPC-DS](https://www.tpc.org/TPC-DS/) (100) |
+| Structured | [ClickBench](https://github.com/ClickHouse/ClickBench) (1) |
+| Unstructured | [TPC-H](https://www.tpc.org/TPC-H/) (1) |
+| Unstructured | [TPC-DS](https://www.tpc.org/TPC-DS/) (0.5) |
+
+Some [Unstructured Connectors](../definitions.md) are unable to support TPC derived test packages due to their nature (e.g. GitHub Issues).
+These connectors are exempt from running the TPC derived test packages, and rely instead on their general integration test:
+
+- GitHub
+- Sharepoint
+- GraphQL
 
 Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
 
 #### General
 
-- [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server.
+- [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server, reading latest GitHub issues, etc.
 
 #### TPC-H
 

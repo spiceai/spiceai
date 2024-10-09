@@ -8,9 +8,9 @@ Acronym for "Release Candidate". Identifies a version that is eligible for gener
 
 A major bug is classified as a bug that:
 
-- Renders the accelerator completely inoperable (i.e. all queries on the accelerator fail, loading fails, etc), or;
+- Renders the component completely inoperable (i.e. all queries on an accelerator fail, accelerator loading fails, all connector queries fail, etc), or;
 - Causes data inconsistency errors, or;
-- A bug that occurs in more than one accelerator, or;
+- A bug that occurs in more than one instance of the component (i.e. more than one accelerator, more than one connector), or;
 - A bug that is high impact or likely to be experienced in common use cases, and there is no viable workaround.
 
 ## Minor Bug
@@ -34,10 +34,10 @@ Core Arrow Data Types consist of the following data types:
 - Struct
 - Decimal128/Decimal256
 
-## Relational Connector
+## Structured Connector
 
 A connector that could be considered a relational database. Usually has some concept of rows, and natively supports some variant of SQL.
 
-## Non-Relational Connector
+## Unstructured Connector
 
 A connector that could not be considered a relational database, and usually does not have a concept of rows. Does not natively support SQL execution, and instead is accessed through APIs, file downloads, etc.
