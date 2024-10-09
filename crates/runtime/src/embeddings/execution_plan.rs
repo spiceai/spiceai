@@ -224,27 +224,31 @@ fn construct_record_batch(
 ///         each string, these offsets map the substrings used for each embeddding vector.
 ///
 /// For columns that are in the base table, no additional columns are calculated.
-/// 
+///
 /// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
 pub(crate) async fn compute_additional_embedding_columns(
     rb: &RecordBatch,
     embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
+    let additional_embedding_columns: HashMap<_, _> = embedded_columns
+        .iter()
+        .filter(|(_, cfg)| !cfg.in_base_table)
+        .collect();
 
-    let additional_embedding_columns: HashMap<_, _> = embedded_columns.iter().filter(|(_, cfg)| {
-        !cfg.in_base_table
-    }).collect();
-
-    let mut embed_arrays: HashMap<String, ArrayRef> =
-        HashMap::with_capacity(
-            additional_embedding_columns.len() + 
-            additional_embedding_columns.values().filter(|cfg| cfg.chunker.is_some()).count()
-        );
+    let mut embed_arrays: HashMap<String, ArrayRef> = HashMap::with_capacity(
+        additional_embedding_columns.len()
+            + additional_embedding_columns
+                .values()
+                .filter(|cfg| cfg.chunker.is_some())
+                .count(),
+    );
 
     for (col, cfg) in embedded_columns {
-        let EmbeddingColumnConfig{
-            model_name, chunker: chunker_opt, ..
+        let EmbeddingColumnConfig {
+            model_name,
+            chunker: chunker_opt,
+            ..
         } = cfg;
         let read_guard = embedding_models.read().await;
         let Some(model) = read_guard.get(model_name) else {

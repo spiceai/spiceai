@@ -35,9 +35,9 @@ use snafu::prelude::*;
 
 use tokio::sync::RwLock;
 
+use crate::embeddings::common::base_col;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
-use crate::embeddings::common::base_col;
 use crate::{embedding_col, offset_col};
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
@@ -91,8 +91,8 @@ impl EmbeddingTable {
                     "Column '{column}' has needed embeddings in base table. Will not augment."
                 );
 
-                if chunking_config_opt.is_none() {
-                    tracing::warn!("Column '{}' has embeddings in base table, but no chunking config was provided. Chunking will be determined by base table.", column);
+                if chunking_config_opt.is_some() {
+                    tracing::warn!("Column '{}' is an embedding from the base table, but chunking config was provided. It will not be used. Chunking will be determined by base table config.", column);
                 }
 
                 let Some(vector_length) =
@@ -161,7 +161,11 @@ impl EmbeddingTable {
         }
 
         // Check if the embedding column exists and has a valid data type
-        let Some((_, embedding_field)) = base_schema.column_with_name(embedding_col!(column).as_str()) else { return false };
+        let Some((_, embedding_field)) =
+            base_schema.column_with_name(embedding_col!(column).as_str())
+        else {
+            return false;
+        };
 
         if !is_valid_embedding_type(embedding_field.data_type()) {
             return false;
@@ -173,7 +177,11 @@ impl EmbeddingTable {
         | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
         {
             if let DataType::FixedSizeList(_, _) = inner.data_type() {
-                let Some((_, offsets_field)) = base_schema.column_with_name(offset_col!(column).as_str()) else { return false };
+                let Some((_, offsets_field)) =
+                    base_schema.column_with_name(offset_col!(column).as_str())
+                else {
+                    return false;
+                };
 
                 if !is_valid_offset_type(offsets_field.data_type()) {
                     return false;
@@ -184,18 +192,11 @@ impl EmbeddingTable {
     }
 
     /// Get the names of the embedding models used by this table across its columns.
-    /// This does not include columns with embeddings in the base table.
     #[must_use]
     pub fn get_embedding_models_used(&self) -> Vec<String> {
         self.embedded_columns
             .values()
-            .filter_map(|cfg| {
-                if cfg.in_base_table {
-                    None
-                } else {
-                    Some(cfg.model_name.clone())
-                }
-            })
+            .map(|cfg| cfg.model_name.clone())
             .collect()
     }
 
@@ -245,19 +246,17 @@ impl EmbeddingTable {
     /// If the column is not in the table, returns false.
     #[must_use]
     pub fn is_chunked(&self, column: &str) -> bool {
-        self.embedded_columns
-            .get(column)
-            .is_some_and(|cfg| {
-                if cfg.in_base_table {
-                    self.base_table
-                        .schema()
-                        .column_with_name(offset_col!(column).as_str())
-                        .is_some()
-                } else {
-                    // Cheaper to check then looking at schema (which is created dynamically).
-                    cfg.chunker.is_some()
-                }
-            })
+        self.embedded_columns.get(column).is_some_and(|cfg| {
+            if cfg.in_base_table {
+                self.base_table
+                    .schema()
+                    .column_with_name(offset_col!(column).as_str())
+                    .is_some()
+            } else {
+                // Cheaper to check then looking at schema (which is created dynamically).
+                cfg.chunker.is_some()
+            }
+        })
     }
 
     /// Get the names of the columns that are augmented with embeddings.
@@ -320,9 +319,6 @@ impl EmbeddingTable {
     ///
     /// The order of the additionally-generated embedding columns in [`Self::Schema`] is alphabetical.
     fn columns_to_embed(&self, projection: Option<&Vec<usize>>) -> Vec<String> {
-        // TODO: Filter out embedding columns that are in base table.
-        // TODO: How does this handle just asking for offsets?
-
         // Order of embedding columns in [`Self::Schema`] is alphabetical.
         match projection {
             None => self.get_additional_embedding_columns_sorted(),
@@ -334,7 +330,9 @@ impl EmbeddingTable {
                     .iter()
                     .filter_map(|&c| {
                         if c >= base_cols {
-                            additional_fields.get(c - base_cols).and_then(|c| base_col(c))
+                            additional_fields
+                                .get(c - base_cols)
+                                .and_then(|col| base_col(col))
                         } else {
                             None
                         }

@@ -59,7 +59,9 @@ macro_rules! offset_col {
 /// );
 /// ```
 pub(crate) fn base_col(col: &str) -> Option<String> {
-    col.strip_suffix("_embedding").or(col.strip_suffix("_offset")).map(ToString::to_string)
+    col.strip_suffix("_embedding")
+        .or(col.strip_suffix("_offset"))
+        .map(ToString::to_string)
 }
 
 pub(crate) fn is_float_type(dt: &DataType) -> bool {
