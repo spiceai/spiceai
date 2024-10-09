@@ -14,21 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use async_openai::error::OpenAIError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MessageCreateParamsBase {
-    pub max_tokens: i32,
+pub struct MessageCreateParams {
+    pub max_tokens: u32,
     pub messages: Vec<MessageParam>,
-    pub model: ModelParam,
-    pub stream: bool,
+    pub model: ModelVariant,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<MetadataParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<SystemParam>,
+    pub system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,7 +38,7 @@ pub struct MessageCreateParamsBase {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolParam>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<i32>,
+    pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 }
@@ -59,13 +61,6 @@ pub enum ContentParam {
 pub enum MessageRole {
     User,
     Assistant,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SystemParam {
-    String(String),
-    Blocks(Vec<TextBlockParam>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -189,17 +184,17 @@ pub struct ToolParam {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum ToolChoiceParam {
-    Auto(ToolChoiceAutoParam),
-    Any(ToolChoiceAnyParam),
-    Tool(ToolChoiceToolParam),
+pub enum ToolChoiceType {
+    Auto,
+    Any,
+    Tool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ToolChoiceToolParam {
-    pub name: String,
+pub struct ToolChoiceParam {
     #[serde(rename = "type")]
-    pub choice_type: String, // Always "tool"
+    pub choice_type: ToolChoiceType,
+    pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_parallel_tool_use: Option<bool>,
 }
@@ -227,13 +222,6 @@ pub struct MetadataParam {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ModelParam {
-    String(String),
-    Variant(ModelVariant),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelVariant {
     Claude35Sonnet20240620,
@@ -243,4 +231,38 @@ pub enum ModelVariant {
     Claude21,
     Claude20,
     ClaudeInstant12,
+}
+
+impl std::str::FromStr for ModelVariant {
+    type Err = OpenAIError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "claude-35-sonnet-2024-06-20" => Ok(ModelVariant::Claude35Sonnet20240620),
+            "claude-3-opus-2024-02-29" => Ok(ModelVariant::Claude3Opus20240229),
+            "claude-3-sonnet-2024-02-29" => Ok(ModelVariant::Claude3Sonnet20240229),
+            "claude-3-haiku-2024-03-07" => Ok(ModelVariant::Claude3Haiku20240307),
+            "claude-2-1" => Ok(ModelVariant::Claude21),
+            "claude-2-0" => Ok(ModelVariant::Claude20),
+            "claude-instant-1-2" => Ok(ModelVariant::ClaudeInstant12),
+            _ => Err(OpenAIError::InvalidArgument(format!(
+                "Unknown model variant: {}",
+                s
+            ))),
+        }
+    }
+}
+
+impl ModelVariant {
+    pub fn default_max_tokens(&self) -> u32 {
+        match self {
+            ModelVariant::Claude35Sonnet20240620 => 8192,
+            ModelVariant::Claude3Opus20240229 => 8192,
+            ModelVariant::Claude3Sonnet20240229 => 4096,
+            ModelVariant::Claude3Haiku20240307 => 4096,
+            ModelVariant::Claude21 => 4096,
+            ModelVariant::Claude20 => 4096,
+            ModelVariant::ClaudeInstant12 => 4096,
+        }
+    }
 }

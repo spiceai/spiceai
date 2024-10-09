@@ -18,6 +18,8 @@ use async_openai::{config::Config, Client};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use secrecy::{ExposeSecret, Secret};
 use std::sync::LazyLock;
+
+mod chat;
 mod types;
 
 pub struct Anthropic {
@@ -49,7 +51,6 @@ impl Default for AnthropicConfig {
 }
 
 impl AnthropicConfig {
-
     #[must_use]
     pub fn new() -> Self {
         AnthropicConfig::default()
