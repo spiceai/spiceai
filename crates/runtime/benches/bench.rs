@@ -352,7 +352,6 @@ async fn run_query_and_record_result(
                         .iter()
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
-
                     let limited_records: Vec<_> = records
                         .iter()
                         .flat_map(|batch: &RecordBatch| {
@@ -360,11 +359,9 @@ async fn run_query_and_record_result(
                         })
                         .take(10)
                         .collect();
-
                     let records_pretty =
                         arrow::util::pretty::pretty_format_batches(&limited_records)
                             .map_err(|e| e.to_string())?;
-
                     tracing::info!(
                     "Query `{connector}` `{query_name}` returned {num_rows} rows:\n{records_pretty}",
                 );
@@ -395,9 +392,7 @@ async fn run_query_and_record_result(
             }
         }
     }
-
     let end_time = get_current_unix_ms();
-
     // Both query failure and snapshot test failure will cause the result to be written as Status::Failed
     benchmark_results.record_result(
         start_time,

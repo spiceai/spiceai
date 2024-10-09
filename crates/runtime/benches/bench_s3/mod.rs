@@ -58,6 +58,7 @@ pub(crate) async fn run(
                     | "s3_sqlite_memory"
                     | "s3_sqlite_file"
                     | "s3_duckdb_memory"
+                    | "s3_duckdb_file"
             )
         } else if query_name.starts_with("tpcds_q") {
             matches!(
