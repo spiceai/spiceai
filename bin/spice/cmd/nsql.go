@@ -95,7 +95,7 @@ nsql> How much money have i made in each country?
 			model = selectedModel
 		}
 
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
+		httpEndpoint, err := cmd.Flags().GetString(httpEndpointKeyFlag)
 		if err != nil {
 			slog.Error("getting http-endpoint flag", "error", err)
 			os.Exit(1)
@@ -202,7 +202,6 @@ func init() {
 	nsqlCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for nsql (default: false)")
 	nsqlCmd.Flags().String(modelKeyFlag, "", "Model to use for nsql")
 	nsqlCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for nsql (default: http://localhost:8090)")
-	nsqlCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of results")
 
 	RootCmd.AddCommand(nsqlCmd)
 }
