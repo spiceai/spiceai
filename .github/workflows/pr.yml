@@ -2,6 +2,8 @@
 name: pr
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches:
       - trunk
@@ -36,6 +38,9 @@ jobs:
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "base_ref=${{ github.base_ref }}" >> $GITHUB_OUTPUT
             echo "head_ref=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            echo "base_ref=${{ github.event.merge_group.base_ref }}" >> $GITHUB_OUTPUT
+            echo "head_ref=${{ github.event.merge_group.head_sha }}" >> $GITHUB_OUTPUT
           else
             echo "base_ref=${{ github.event.inputs.base_ref }}" >> $GITHUB_OUTPUT
             echo "head_ref=${{ github.sha }}" >> $GITHUB_OUTPUT
