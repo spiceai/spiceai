@@ -71,9 +71,9 @@ pub trait Embed: Sync + Send {
         Ok(())
     }
 
-    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
         Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
-            &cfg,
+            cfg,
         )))
     }
 

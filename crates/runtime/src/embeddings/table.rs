@@ -37,9 +37,10 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
+use crate::embeddings::common::base_col;
 use crate::{embedding_col, offset_col};
 
-use super::common::{is_valid_embedding_type, is_valid_offset_type};
+use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
 
 #[derive(Debug, Snafu)]
 pub enum Error {}
@@ -49,41 +50,102 @@ pub enum Error {}
 pub struct EmbeddingTable {
     base_table: Arc<dyn TableProvider>,
 
-    // A mapping of columns names from [`base_table`] to the embedding's `name` to use.
-    embedded_columns: HashMap<String, String>,
+    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
 
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+}
 
-    // Precompute to avoid async lock waits from `embedding_models` data structure.
-    // Mapping of column name to the expected size of its embedding.
-    embedding_sizes: HashMap<String, i32>,
+#[derive(Clone)]
+pub struct EmbeddingColumnConfig {
+    /// The name of the embedding model to use for this column.
+    /// Can be used as a key into [`EmbeddingModelStore`] for [`EmbeddingTable`].
+    pub model_name: String,
 
-    // Column name -> how to chunk the text for the embedding model.
-    // If None, no chunking is needed.
-    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
+    /// Expected size of its embedding. precompute to avoid async lock waits from `embedding_models` data structure.
+    pub vector_size: i32,
+
+    /// If `true`, assume embedding column is in the base table and does not need to be generated at query time.
+    pub in_base_table: bool,
+
+    // If None, either no chunking is needed, or [`in_base_table`] is true.
+    pub chunker: Option<Arc<dyn Chunker>>,
 }
 
 impl EmbeddingTable {
+    /// When creating a new [`EmbeddingTable`], the provided columns (in `embedded_column_to_model`) must be checked to see if they are already in the base table.
+    /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
     pub async fn new(
         base_table: Arc<dyn TableProvider>,
-        embedded_columns: HashMap<String, String>,
+        embedded_column_to_model: HashMap<String, String>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         embed_chunker_config: HashMap<String, ChunkingConfig<'_>>,
     ) -> Self {
-        let sizes = Self::precompute_embedding_sizes(&embedded_columns, &embedding_models).await;
-        let chunkers = Self::prepare_chunkers(
-            embed_chunker_config,
-            &embedding_models,
-            embedded_columns.clone(),
-        )
-        .await;
+        let base_schema = base_table.schema();
+        let mut embedded_columns: HashMap<String, EmbeddingColumnConfig> = HashMap::new();
+
+        for (column, model) in embedded_column_to_model {
+            let chunking_config_opt = embed_chunker_config.get(&column);
+
+            if Self::base_table_has_embedding_column(&base_schema, &column) {
+                tracing::debug!(
+                    "Column '{column}' has needed embeddings in base table. Will not augment."
+                );
+
+                if chunking_config_opt.is_none() {
+                    tracing::warn!("Column '{}' has embeddings in base table, but no chunking config was provided. Chunking will be determined by base table.", column);
+                }
+
+                let Some(vector_length) =
+                    Self::embedding_size_from_base_table(&column, &base_schema)
+                else {
+                    tracing::warn!("Column '{}' has embeddings in base table, but the vector length could not be determined. Ignoring column.", column);
+                    continue;
+                };
+
+                embedded_columns.insert(
+                    column,
+                    EmbeddingColumnConfig {
+                        model_name: model,
+                        vector_size: vector_length,
+                        in_base_table: true,
+                        chunker: None, // Don't need chunking since it is done in base table.
+                    },
+                );
+            } else {
+                tracing::debug!("Column '{column}' does not have needed embeddings in base table. Will augment with model {model}.");
+
+                let Some(vector_length) =
+                    Self::embedding_size_from_models(&model, &embedding_models).await
+                else {
+                    tracing::warn!("For column '{column}', cannot precompute vector length from model '{model}'. Ignoring column.");
+                    continue;
+                };
+
+                let mut chunker = None;
+                if let Some(chunking_config) = chunking_config_opt {
+                    chunker =
+                        Self::construct_chunker(&model, chunking_config, &embedding_models).await;
+                    if chunker.is_none() {
+                        tracing::warn!("Column '{}' expects to be chunked, but the model '{}' does not support chunking. Ignoring chunking config.", column, model);
+                    }
+                }
+
+                embedded_columns.insert(
+                    column,
+                    EmbeddingColumnConfig {
+                        model_name: model,
+                        vector_size: vector_length,
+                        in_base_table: false,
+                        chunker,
+                    },
+                );
+            }
+        }
 
         Self {
             base_table,
             embedded_columns,
             embedding_models,
-            embedding_sizes: sizes,
-            embedding_chunkers: chunkers,
         }
     }
 
@@ -92,17 +154,14 @@ impl EmbeddingTable {
     ///  - `c` to be in the base schema.
     ///  - `c_embedding` to be in the base schema. It needs to have a type compatible with [`Self::embedding_fields`].
     ///  - If `c_embedding` has a doubly-nested list type, `c_offsets` should also be in the base schema. It should be a `List[FixedSizeList[Int32, 2]]`.
-    fn base_table_has_embedding_column(base_schema: SchemaRef, column: &str) -> bool {
+    fn base_table_has_embedding_column(base_schema: &SchemaRef, column: &str) -> bool {
         // Check if the base column exists
         if base_schema.column_with_name(column).is_none() {
             return false;
         }
 
         // Check if the embedding column exists and has a valid data type
-        let embedding_field = match base_schema.column_with_name(embedding_col!(column).as_str()) {
-            Some((_, field)) => field,
-            None => return false,
-        };
+        let Some((_, embedding_field)) = base_schema.column_with_name(embedding_col!(column).as_str()) else { return false };
 
         if !is_valid_embedding_type(embedding_field.data_type()) {
             return false;
@@ -114,11 +173,7 @@ impl EmbeddingTable {
         | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
         {
             if let DataType::FixedSizeList(_, _) = inner.data_type() {
-                let offsets_field = match base_schema.column_with_name(offset_col!(column).as_str())
-                {
-                    Some((_, field)) => field,
-                    None => return false,
-                };
+                let Some((_, offsets_field)) = base_schema.column_with_name(offset_col!(column).as_str()) else { return false };
 
                 if !is_valid_offset_type(offsets_field.data_type()) {
                     return false;
@@ -129,15 +184,80 @@ impl EmbeddingTable {
     }
 
     /// Get the names of the embedding models used by this table across its columns.
+    /// This does not include columns with embeddings in the base table.
     #[must_use]
     pub fn get_embedding_models_used(&self) -> Vec<String> {
-        self.embedded_columns.values().cloned().collect()
+        self.embedded_columns
+            .values()
+            .filter_map(|cfg| {
+                if cfg.in_base_table {
+                    None
+                } else {
+                    Some(cfg.model_name.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// Get the names of the embedding columns that must be augmented (i.e. not in the base table).
+    ///
+    /// These are the underlying columns, not the embedding columns (e.g. `content`, not `content_embedding` or `content_offset`).
+    ///
+    /// The columns are sorted alphabetically.
+    #[must_use]
+    fn get_additional_embedding_columns_sorted(&self) -> Vec<String> {
+        self.embedded_columns
+            .iter()
+            .filter_map(|(c, cfg)| {
+                if cfg.in_base_table {
+                    None
+                } else {
+                    Some(c.clone())
+                }
+            })
+            .sorted()
+            .collect()
+    }
+
+    /// Get the names of the additional fields that should be added to the schema for the embedding.
+    ///
+    /// These are the embedding columns, not the underlying columns (e.g. `content_embedding` or `content_offset`, not `content`).
+    ///
+    /// The columns are sorted alphabetically.
+    fn get_additional_embedding_field_names(&self) -> Vec<String> {
+        self.get_additional_embedding_columns_sorted()
+            .iter()
+            .flat_map(|col| {
+                let Some(cfg) = self.embedded_columns.get(col) else {
+                    return vec![];
+                };
+
+                if cfg.chunker.is_some() {
+                    vec![embedding_col!(col), offset_col!(col)]
+                } else {
+                    vec![embedding_col!(col)]
+                }
+            })
+            .collect()
     }
 
     /// Checks if a column has an embedding column associated with it, and should be chunked.
+    /// If the column is not in the table, returns false.
     #[must_use]
     pub fn is_chunked(&self, column: &str) -> bool {
-        self.embedding_chunkers.contains_key(column)
+        self.embedded_columns
+            .get(column)
+            .is_some_and(|cfg| {
+                if cfg.in_base_table {
+                    self.base_table
+                        .schema()
+                        .column_with_name(offset_col!(column).as_str())
+                        .is_some()
+                } else {
+                    // Cheaper to check then looking at schema (which is created dynamically).
+                    cfg.chunker.is_some()
+                }
+            })
     }
 
     /// Get the names of the columns that are augmented with embeddings.
@@ -152,111 +272,102 @@ impl EmbeddingTable {
         self.base_table.schema()
     }
 
-    /// For a given set of columns that should be chunked (i.e. keys of `cfgs`), prepare the chunkers based on the column's embedding model in [`EmbeddingModelStore`].
-    async fn prepare_chunkers(
-        cfgs: HashMap<String, ChunkingConfig<'_>>,
+    /// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
+    async fn construct_chunker(
+        model_name: &str,
+        chunk_config: &ChunkingConfig<'_>,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-        column_to_model: HashMap<String, String>,
-    ) -> HashMap<String, Arc<dyn Chunker>> {
-        let mut chunkers: HashMap<String, Arc<dyn Chunker>> = HashMap::new();
-
-        for (col, chunk_cfg) in cfgs {
-            let Some(model_name) = column_to_model.get(&col) else {
-                tracing::debug!(
-                    "No model specified for column '{}', skipping chunker setup.",
-                    col
-                );
-                continue;
-            };
-            let embedding_models_guard = embedding_models.read().await;
-            let Some(embed_model) = embedding_models_guard.get(model_name) else {
-                // Don't need warn, as we should have already checked/logged this.
-                tracing::debug!(
-                    "Expected model '{}' for column '{}', but it was not found in the model store.",
-                    model_name,
-                    col
-                );
-                continue;
-            };
-
-            if let Some(chunker) = embed_model.chunker(chunk_cfg) {
-                chunkers.insert(col, chunker);
-            } else {
-                tracing::warn!("Column '{}' expects to be chunked, but the model '{}' does not support chunking. Ignoring chunking config.", col, model_name);
-            }
-        }
-        chunkers
+    ) -> Option<Arc<dyn Chunker>> {
+        let embedding_models_guard = embedding_models.read().await;
+        let Some(embed_model) = embedding_models_guard.get(model_name) else {
+            // Don't need warn, as we should have already checked/logged this.
+            tracing::debug!("Unexpectedly did not find model '{model_name}' in the model store.");
+            return None;
+        };
+        embed_model.chunker(chunk_config)
     }
 
-    async fn precompute_embedding_sizes(
-        embedded_columns: &HashMap<String, String>,
-        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    ) -> HashMap<String, i32> {
-        let mut model_sizes: HashMap<String, i32> = HashMap::new();
-        for (col, model_name) in embedded_columns {
-            if let Some(model) = embedding_models.read().await.get(model_name) {
-                model_sizes.insert(col.clone(), model.size());
-            }
-        }
-        model_sizes
+    fn embedding_size_from_base_table(column: &str, base_schema: &SchemaRef) -> Option<i32> {
+        let (_, embedding_field) = base_schema.column_with_name(embedding_col!(column).as_str())?;
+        vector_length(embedding_field.data_type())
     }
 
-    /// For a given projection of the entire [`Schema`], find which [`Self::embedded_columns`] need to be computed.
+    async fn embedding_size_from_models(
+        model_name: &str,
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+    ) -> Option<i32> {
+        let embedding_models_guard = embedding_models.read().await;
+        embedding_models_guard
+            .get(model_name)
+            .map(|model| model.size())
+    }
+
+    /// For a given projection on the entire [`Schema`], find which [`Self::embedded_columns`] need to be computed.
     /// If `projection.is_none()`, all embedding columns are in projection, and therefore needed.
+    ///
+    /// Any embedding column that is in the base table does not need to be computed.
     ///
     /// Any project index (in `projection`) that is greater than the number of columns in the base
     /// table is an embedding column. The relation of underlying column to embedding column is, for example, as follows:
     ///
-    /// | projection idx | 0 | 1 | 2 | 3 | 4 | 5 |      6      |      7      |
-    /// |  column name   | A | B | C | D | E | F | `B_embedding` | `E_embedding` |
+    /// | projection idx | 0 | 1 | 2 | 3 | 4 | 5 |      6        |      7     |       8       |
+    /// |  column name   | A | B | C | D | E | F | `B_embedding` | `B_offset` | `E_embedding` |
     ///
     ///     - 6 Base columns A, B, C, D, E, F
     ///     - 2 Embedding columns B_embedding, E_embedding
+    ///     - 1 Offset column B_offset
     ///     - Any projection index >=6 is an embedding column.
     ///
-    /// The order of embedding columns in [`Self::Schema`] is alphabetical.
+    /// The order of the additionally-generated embedding columns in [`Self::Schema`] is alphabetical.
     fn columns_to_embed(&self, projection: Option<&Vec<usize>>) -> Vec<String> {
-        match projection {
-            None => self.embedded_columns.keys().cloned().collect_vec(),
-            Some(column_idx) => {
-                let base_cols = self.base_table.schema().fields.len();
-                let x: Vec<_> = self.embedded_columns.keys().sorted().collect();
+        // TODO: Filter out embedding columns that are in base table.
+        // TODO: How does this handle just asking for offsets?
 
-                // Order of embedding columns in [`Self::Schema`] is alphabetical.
+        // Order of embedding columns in [`Self::Schema`] is alphabetical.
+        match projection {
+            None => self.get_additional_embedding_columns_sorted(),
+            Some(column_idx) => {
+                let additional_fields = self.get_additional_embedding_field_names();
+                let base_cols = self.base_table.schema().fields.len();
+
                 column_idx
                     .iter()
                     .filter_map(|&c| {
                         if c >= base_cols {
-                            x.get(c - base_cols).copied()
+                            additional_fields.get(c - base_cols).and_then(|c| base_col(c))
                         } else {
                             None
                         }
                     })
-                    .cloned()
+                    .unique()
                     .collect()
             }
         }
     }
 
     /// For a given field in the base table, return the additional field(s) that should be added to the schema for the embedding.
-    /// For fields that shouldn't be embedded, an empty vector is returned.
+    /// For fields that shouldn't be embedded, or embeddings already exist in the base table, an empty vector is returned.
     ///
     /// These fields should match produces in [`super::execution_plan::get_embedding_columns`].
     fn embedding_fields(&self, field: &Field) -> Vec<Arc<Field>> {
-        let embedding_size = self
-            .embedding_sizes
-            .get(field.name())
-            .copied()
-            .unwrap_or_default();
+        // [`Field`] not an embedding column
+        let Some(cfg) = self.embedded_columns.get(field.name()) else {
+            return vec![];
+        };
 
-        if self.embedding_chunkers.contains_key(field.name()) {
+        // No new fields needed
+        if cfg.in_base_table {
+            return vec![];
+        }
+
+        if cfg.chunker.is_some() {
             vec![
                 Arc::new(Field::new_list(
                     embedding_col!(field.name()),
                     Field::new_fixed_size_list(
                         "item",
                         Field::new("item", DataType::Float32, false),
-                        embedding_size,
+                        cfg.vector_size,
                         false,
                     ),
                     false,
@@ -276,7 +387,7 @@ impl EmbeddingTable {
             vec![Arc::new(Field::new_fixed_size_list(
                 embedding_col!(field.name()),
                 Field::new("item", DataType::Float32, false),
-                embedding_size,
+                cfg.vector_size,
                 false,
             ))]
         }
@@ -307,10 +418,10 @@ impl TableProvider for EmbeddingTable {
             .filter_map(|i| base_schema.fields.get(i).cloned())
             .collect();
 
+        // Important to be kept alphabetical for fast lookup in [`EmbeddingTable::columns_to_embed`]
         let mut embedding_fields: Vec<_> = self
-            .embedded_columns
-            .keys()
-            .sorted() // Important to be kept alphabetical for fast lookup
+            .get_additional_embedding_columns_sorted()
+            .iter()
             .filter_map(|k| {
                 base_schema
                     .column_with_name(k)
@@ -356,7 +467,8 @@ impl TableProvider for EmbeddingTable {
         }
 
         let schema = &self.schema();
-        let scan_embed_columns: HashMap<String, String> = self
+
+        let scan_embed_columns: HashMap<String, EmbeddingColumnConfig> = self
             .embedded_columns
             .iter()
             .filter(|(c, _m)| columns_to_embed.contains(c))
@@ -395,7 +507,6 @@ impl TableProvider for EmbeddingTable {
             base_plan,
             scan_embed_columns,
             Arc::clone(&self.embedding_models),
-            self.embedding_chunkers.clone(),
         )) as Arc<dyn ExecutionPlan>)
     }
 
@@ -439,7 +550,7 @@ mod tests {
     #[test]
     fn test_base_column_missing() {
         assert!(!EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::empty()),
+            &Arc::new(Schema::empty()),
             "c"
         ));
     }
@@ -447,7 +558,7 @@ mod tests {
     #[test]
     fn test_embedding_column_missing() {
         assert!(!EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::new(vec![field("c", DataType::Utf8)])),
+            &Arc::new(Schema::new(vec![field("c", DataType::Utf8)])),
             "c"
         ));
     }
@@ -455,7 +566,7 @@ mod tests {
     #[test]
     fn test_embedding_column_invalid_type() {
         assert!(!EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::new(vec![
+            &Arc::new(Schema::new(vec![
                 field("c", DataType::Utf8),
                 field("c_embedding", DataType::Int32),
             ])),
@@ -466,7 +577,7 @@ mod tests {
     #[test]
     fn test_single_nested_embedding() {
         assert!(EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::new(vec![
+            &Arc::new(Schema::new(vec![
                 field("c", DataType::Utf8),
                 field(
                     "c_embedding",
@@ -480,7 +591,7 @@ mod tests {
     #[test]
     fn test_doubly_nested_embedding_without_offsets() {
         assert!(!EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::new(vec![
+            &Arc::new(Schema::new(vec![
                 field("c", DataType::Utf8),
                 field(
                     "c_embedding",
@@ -497,7 +608,7 @@ mod tests {
     #[test]
     fn test_doubly_nested_embedding_with_offsets() {
         assert!(EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::new(vec![
+            &Arc::new(Schema::new(vec![
                 field("c", DataType::Utf8),
                 field(
                     "c_embedding",
@@ -521,7 +632,7 @@ mod tests {
     #[test]
     fn test_doubly_nested_embedding_with_invalid_offsets() {
         assert!(!EmbeddingTable::base_table_has_embedding_column(
-            Arc::new(Schema::new(vec![
+            &Arc::new(Schema::new(vec![
                 field("c", DataType::Utf8),
                 field(
                     "c_embedding",

@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::datatypes::DataType;
 
 #[macro_export]
 /// Generate the name of the embedding column for a given column
@@ -44,6 +44,24 @@ macro_rules! offset_col {
     };
 }
 
+/// Generate the base name of the column from the embedding or offset column name.
+///
+/// It assumes that the input is correctly formatted, i.e. ends with "_embedding" or "_offset".
+///
+/// ```rust
+/// assert_eq!(
+///     base_col!("temperature_embedding"),
+///     "temperature"
+/// );
+/// assert_eq!(
+///     base_col!("temperature_offset"),
+///     "temperature"
+/// );
+/// ```
+pub(crate) fn base_col(col: &str) -> Option<String> {
+    col.strip_suffix("_embedding").or(col.strip_suffix("_offset")).map(ToString::to_string)
+}
+
 pub(crate) fn is_float_type(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -66,6 +84,28 @@ pub(crate) fn is_valid_embedding_type(dt: &DataType) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Parses the length of a vector from a [`DataType`], given it is a valid embedding type.
+/// For nested lists, the vector length is the size of the inner list.
+pub(crate) fn vector_length(dt: &DataType) -> Option<i32> {
+    match dt {
+        // Single nested list
+        DataType::FixedSizeList(inner, flat_size) if is_float_type(inner.data_type()) => {
+            Some(*flat_size)
+        }
+
+        // Doubly nested list
+        DataType::List(inner) | DataType::LargeList(inner) | DataType::FixedSizeList(inner, _) => {
+            match inner.data_type() {
+                DataType::FixedSizeList(field, size) if is_float_type(field.data_type()) => {
+                    Some(*size)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

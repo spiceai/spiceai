@@ -265,12 +265,12 @@ impl Embed for Openai {
         }
     }
 
-    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
-        match RecursiveSplittingChunker::for_openai_model(&self.model, &cfg) {
+    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        match RecursiveSplittingChunker::for_openai_model(&self.model, cfg) {
             None => {
                 tracing::warn!("Embedding model {} cannot use specialised chunk sizer, will use character sizer instead.", self.model);
                 Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
-                    &cfg,
+                    cfg,
                 )))
             }
             Some(chunker) => Some(Arc::new(chunker)),
