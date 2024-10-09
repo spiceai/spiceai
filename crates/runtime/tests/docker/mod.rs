@@ -193,7 +193,7 @@ impl<'a> ContainerRunner<'a> {
                 break;
             }
 
-            if start_time.elapsed().as_secs() > 30 {
+            if start_time.elapsed().as_secs() > 60 {
                 return Err(anyhow::anyhow!("Container failed to start"));
             }
 
