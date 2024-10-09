@@ -9082,6 +9082,7 @@ dependencies = [
  "indexmap 2.6.0",
  "insta",
  "itertools 0.13.0",
+ "jsonwebtoken",
  "keyring",
  "lazy_static",
  "llms",

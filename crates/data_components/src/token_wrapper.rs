@@ -1,14 +1,30 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use snafu::prelude::*;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to get token: {source}"))]
+    UnableToGetToken {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to refresh token: {source}"))]
+    UnableToRefreshToken {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait TokenWrapper: Send + Sync {
     fn is_refreshable(&self) -> bool;
 
-    async fn get_token(&self) -> String;
+    async fn get_token(&self) -> Result<String>;
 
-    async fn refresh_token(&self);
+    async fn refresh_token(&self) -> Result<()>;
 }
 
 pub struct DefaultTokenWrapper {
@@ -28,9 +44,11 @@ impl TokenWrapper for DefaultTokenWrapper {
         false
     }
 
-    async fn get_token(&self) -> String {
-        self.token.to_string()
+    async fn get_token(&self) -> Result<String> {
+        Ok(self.token.to_string())
     }
 
-    async fn refresh_token(&self) {}
+    async fn refresh_token(&self) -> Result<()> {
+        Ok(())
+    }
 }

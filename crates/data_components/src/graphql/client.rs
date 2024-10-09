@@ -845,8 +845,10 @@ async fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>)
     match &auth {
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
         Some(Auth::Bearer(token_wrapper)) => {
-            let token = token_wrapper.get_token().await;
-            request_builder.bearer_auth(&token)
+            if let Ok(token) = token_wrapper.get_token().await {
+                return request_builder.bearer_auth(&token);
+            }
+            request_builder
         }
         _ => request_builder,
     }
