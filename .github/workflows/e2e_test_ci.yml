@@ -6,9 +6,6 @@ on:
       - trunk
       - release-*
 
-  merge_group:
-    types: [checks_requested]
-
   pull_request:
     branches:
       - trunk
@@ -64,7 +61,7 @@ jobs:
               }
             ];
 
-            return context.eventName === 'pull_request' || context.eventName === 'merge_group' ? matrix.slice(0, 1) : matrix;
+            return context.eventName === 'pull_request' ? matrix.slice(0, 1) : matrix;
 
   build:
     name: Build ${{ matrix.target.name }} binaries
