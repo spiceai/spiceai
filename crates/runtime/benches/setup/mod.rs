@@ -132,7 +132,7 @@ fn build_app(
 
     app_builder = match connector {
         "spice.ai" => crate::bench_spicecloud::build_app(app_builder),
-        "s3" => crate::bench_s3::build_app(app_builder, bench_name),
+        "s3" | "abfs" => crate::bench_object_store::build_app(connector, app_builder, bench_name),
         #[cfg(feature = "spark")]
         "spark" => crate::bench_spark::build_app(app_builder),
         #[cfg(feature = "postgres")]

@@ -109,10 +109,16 @@ async fn run_queries() -> Result<(), anyhow::Error> {
     );
     emulator_dataset.params = Some(emulator_params);
 
-    let mut abfs_dataset = Dataset::new("abfs://data/taxi_small_samples/taxi_sample.csv", "abfs_prefix");
+    let mut abfs_dataset = Dataset::new(
+        "abfs://data/taxi_small_samples/taxi_sample.csv",
+        "abfs_prefix",
+    );
     let abfs_params = DatasetParams::from_string_map(
         vec![
-            ("abfs_account".to_string(), "spiceaidemodatasets".to_string()),
+            (
+                "abfs_account".to_string(),
+                "spiceaidemodatasets".to_string(),
+            ),
             // `skip_signature` is required for Anonymous blob access
             ("abfs_skip_signature".to_string(), "true".to_string()),
         ]

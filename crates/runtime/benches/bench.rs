@@ -44,7 +44,7 @@ use spicepod::component::params::Params;
 mod results;
 mod setup;
 
-mod bench_s3;
+mod bench_object_store;
 mod bench_spicecloud;
 
 #[cfg(feature = "delta_lake")]
@@ -105,6 +105,7 @@ async fn main() -> Result<(), String> {
             let connectors = vec![
                 "spice.ai",
                 "s3",
+                "abfs",
                 #[cfg(feature = "spark")]
                 "spark",
                 #[cfg(feature = "postgres")]
@@ -203,8 +204,16 @@ async fn run_connector_bench(
         "spice.ai" => {
             bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
-        "s3" => {
-            bench_s3::run(&mut rt, &mut benchmark_results, None, None, "tpch").await?;
+        "s3" | "abfs" => {
+            bench_object_store::run(
+                connector,
+                &mut rt,
+                &mut benchmark_results,
+                None,
+                None,
+                "tpch",
+            )
+            .await?;
         }
         #[cfg(feature = "spark")]
         "spark" => {
@@ -259,7 +268,8 @@ async fn run_accelerator_bench(
     let (mut benchmark_results, mut rt) =
         setup::setup_benchmark(upload_results_dataset, "s3", Some(accelerator), bench_name).await;
 
-    bench_s3::run(
+    bench_object_store::run(
+        "s3",
         &mut rt,
         &mut benchmark_results,
         engine,
