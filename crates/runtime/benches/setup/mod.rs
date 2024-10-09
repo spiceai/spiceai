@@ -60,10 +60,10 @@ pub(crate) async fn setup_benchmark(
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
-) -> (BenchmarkResultsBuilder, Runtime) {
+) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
     init_tracing();
 
-    let app = build_app(upload_results_dataset, connector, acceleration, bench_name);
+    let app = build_app(upload_results_dataset, connector, acceleration, bench_name)?;
 
     let status = status::RuntimeStatus::new();
     let rt = Runtime::builder()
@@ -127,7 +127,7 @@ fn build_app(
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
-) -> App {
+) -> Result<App, String> {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test");
 
     app_builder = match connector {
@@ -145,8 +145,8 @@ fn build_app(
         "odbc-athena" => crate::bench_odbc_athena::build_app(app_builder),
         #[cfg(feature = "delta_lake")]
         "delta_lake" => crate::bench_delta::build_app(app_builder),
-        _ => app_builder,
-    };
+        _ => Err(format!("Unknown connector: {}", connector)),
+    }?;
 
     if let Some(upload_results_dataset) = upload_results_dataset {
         app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
@@ -170,7 +170,7 @@ fn build_app(
         });
     }
 
-    app
+    Ok(app)
 }
 
 #[allow(clippy::too_many_lines)]

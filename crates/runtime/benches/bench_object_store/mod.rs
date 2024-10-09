@@ -22,11 +22,11 @@ use spicepod::component::dataset::acceleration::Mode;
 pub(crate) mod abfs;
 pub(crate) mod s3;
 
-pub(crate) fn build_app(connector: &str, app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
+pub(crate) fn build_app(connector: &str, app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
     match connector {
-        "s3" => s3::build_app(app_builder, bench_name),
-        "abfs" => abfs::build_app(app_builder, bench_name),
-        _ => app_builder,
+        "s3" => Ok(s3::build_app(app_builder, bench_name)),
+        "abfs" => Ok(abfs::build_app(app_builder, bench_name)),
+        _ => Err(format!("Unsupported connector {connector}")),
     }
 }
 

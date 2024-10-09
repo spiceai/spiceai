@@ -198,7 +198,7 @@ async fn run_connector_bench(
     let mut display_records = vec![];
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(upload_results_dataset, connector, None, bench_name).await;
+        setup::setup_benchmark(upload_results_dataset, connector, None, bench_name).await?;
 
     match connector {
         "spice.ai" => {
@@ -266,7 +266,7 @@ async fn run_accelerator_bench(
     let mode = accelerator.mode.clone();
 
     let (mut benchmark_results, mut rt) =
-        setup::setup_benchmark(upload_results_dataset, "s3", Some(accelerator), bench_name).await;
+        setup::setup_benchmark(upload_results_dataset, "s3", Some(accelerator), bench_name).await?;
 
     bench_object_store::run(
         "s3",

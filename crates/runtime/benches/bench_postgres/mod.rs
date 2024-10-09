@@ -47,16 +47,18 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
-    app_builder
-        .with_dataset(make_dataset("customer", "customer"))
-        .with_dataset(make_dataset("lineitem", "lineitem"))
-        .with_dataset(make_dataset("part", "part"))
-        .with_dataset(make_dataset("partsupp", "partsupp"))
-        .with_dataset(make_dataset("orders", "orders"))
-        .with_dataset(make_dataset("nation", "nation"))
-        .with_dataset(make_dataset("region", "region"))
-        .with_dataset(make_dataset("supplier", "supplier"))
+pub fn build_app(app_builder: AppBuilder) -> Result<AppBuilder, String> {
+    Ok(
+        app_builder
+            .with_dataset(make_dataset("customer", "customer"))
+            .with_dataset(make_dataset("lineitem", "lineitem"))
+            .with_dataset(make_dataset("part", "part"))
+            .with_dataset(make_dataset("partsupp", "partsupp"))
+            .with_dataset(make_dataset("orders", "orders"))
+            .with_dataset(make_dataset("nation", "nation"))
+            .with_dataset(make_dataset("region", "region"))
+            .with_dataset(make_dataset("supplier", "supplier"))
+    )
 }
 
 pub(crate) fn get_postgres_params(is_acc: bool) -> Params {
