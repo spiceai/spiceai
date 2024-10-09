@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::token_wrapper::TokenWrapper;
+
 use super::{client::GraphQLClient, Result};
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ pub struct GraphQLClientBuilder {
     endpoint: Url,
     json_pointer: Option<Arc<str>>,
     unnest_depth: usize,
-    token: Option<Arc<str>>,
+    wrapper: Option<Arc<dyn TokenWrapper>>,
     user: Option<String>,
     pass: Option<String>,
     schema: Option<SchemaRef>,
@@ -37,7 +39,7 @@ impl GraphQLClientBuilder {
             endpoint,
             unnest_depth,
             json_pointer: None,
-            token: None,
+            wrapper: None,
             user: None,
             pass: None,
             schema: None,
@@ -51,8 +53,8 @@ impl GraphQLClientBuilder {
     }
 
     #[must_use]
-    pub fn with_token(mut self, token: Option<Arc<str>>) -> Self {
-        self.token = token;
+    pub fn with_token(mut self, wrapper: Option<Arc<dyn TokenWrapper>>) -> Self {
+        self.wrapper = wrapper;
         self
     }
 
@@ -79,7 +81,7 @@ impl GraphQLClientBuilder {
             client,
             self.endpoint,
             self.json_pointer.as_deref(),
-            self.token.as_deref(),
+            self.wrapper,
             self.user,
             self.pass,
             self.unnest_depth,

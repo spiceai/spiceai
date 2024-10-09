@@ -28,6 +28,7 @@ use data_components::{
         provider::GraphQLTableProviderBuilder,
         FilterPushdownResult, GraphQLOptimizer,
     },
+    token_wrapper::{DefaultTokenWrapper, TokenWrapper},
 };
 use datafusion::{
     common::Column,
@@ -37,6 +38,7 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use github_app_token_wrapper::GitHubAppTokenWrapper;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
@@ -56,12 +58,14 @@ use super::{
 };
 
 mod commits;
+mod github_app_token_wrapper;
 mod issues;
 mod pull_requests;
 mod stargazers;
 
 pub struct Github {
     params: Parameters,
+    token: Option<Arc<dyn TokenWrapper>>,
 }
 
 pub struct GitHubTableGraphQLParams {
@@ -102,11 +106,14 @@ impl Github {
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
-        let access_token = self.params.get("token").expose().ok().map(Arc::from);
-
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err("Github 'endpoint' not provided".into());
         };
+
+        let token = self
+            .token
+            .as_ref()
+            .map(|token| Arc::clone(token) as Arc<dyn TokenWrapper>);
 
         let client = default_spice_client("application/json").boxed()?;
 
@@ -116,7 +123,7 @@ impl Github {
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
             gql_client_params.unnest_depth,
         )
-        .with_token(access_token)
+        .with_token(token)
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
         .build(client)
@@ -254,6 +261,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
+    ParameterSpec::connector("app_id")
+        .description("The Github App ID.")
+        .secret(),
+    ParameterSpec::connector("private_key")
+        .description("The Github App private key.")
+        .secret(),
+    ParameterSpec::connector("installation_id")
+        .description("The Github App installation ID.")
+        .secret(),
     ParameterSpec::connector("query_mode")
         .description(
             "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
@@ -273,7 +289,32 @@ impl DataConnectorFactory for GithubFactory {
         params: Parameters,
         _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Github { params }) as Arc<dyn DataConnector>) })
+        let token = params.get("token").expose().ok();
+        let app_id = params.get("app_id").expose().ok();
+        let private_key = params.get("private_key").expose().ok();
+        let installation_id = params.get("installation_id").expose().ok();
+
+        let token_wrapper: Option<Arc<dyn TokenWrapper>> =
+            match (token, app_id, private_key, installation_id) {
+                (Some(token), _, _, _) => Some(Arc::new(DefaultTokenWrapper::new(token.into()))),
+
+                (None, Some(app_id), Some(private_key), Some(installation_id)) => {
+                    Some(Arc::new(GitHubAppTokenWrapper::new(
+                        Arc::from(app_id),
+                        Arc::from(private_key),
+                        Arc::from(installation_id),
+                    )))
+                }
+
+                _ => None,
+            };
+
+        Box::pin(async move {
+            Ok(Arc::new(Github {
+                params,
+                token: token_wrapper,
+            }) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {

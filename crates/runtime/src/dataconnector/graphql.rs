@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder};
+use data_components::{
+    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
+    token_wrapper::{DefaultTokenWrapper, TokenWrapper},
+};
 use datafusion::datasource::TableProvider;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use snafu::ResultExt;
@@ -102,7 +105,10 @@ pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Resul
 
 impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
-        let token = self.params.get("auth_token").expose().ok();
+        let token =
+            self.params.get("auth_token").expose().ok().map(|token| {
+                Arc::new(DefaultTokenWrapper::new(token.into())) as Arc<dyn TokenWrapper>
+            });
 
         let user = self
             .params

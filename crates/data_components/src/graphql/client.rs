@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::token_wrapper::TokenWrapper;
+
 use super::{ArrowInternalSnafu, Error, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
@@ -35,7 +37,7 @@ use url::Url;
 
 pub enum Auth {
     Basic(String, Option<String>),
-    Bearer(String),
+    Bearer(Arc<dyn TokenWrapper>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -670,15 +672,15 @@ impl GraphQLClient {
         client: reqwest::Client,
         endpoint: Url,
         json_pointer: Option<&str>,
-        token: Option<&str>,
+        token: Option<Arc<dyn TokenWrapper>>,
         user: Option<String>,
         pass: Option<String>,
         unnest_depth: usize,
         schema: Option<SchemaRef>,
     ) -> Result<Self> {
         let auth = match (token, user, pass) {
-            (Some(token), _, _) => Some(Auth::Bearer(token.to_string())),
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
+            (Some(token), _, _) => Some(Auth::Bearer(token)),
             _ => None,
         };
 
@@ -711,7 +713,7 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
-        request = request_with_auth(request, &self.auth);
+        request = request_with_auth(request, &self.auth).await;
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let status = response.status();
@@ -839,10 +841,13 @@ fn get_json_schema(
     Ok(Arc::new(schema))
 }
 
-fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> RequestBuilder {
+async fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> RequestBuilder {
     match &auth {
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
-        Some(Auth::Bearer(token)) => request_builder.bearer_auth(token),
+        Some(Auth::Bearer(token_wrapper)) => {
+            let token = token_wrapper.get_token().await;
+            request_builder.bearer_auth(&token)
+        }
         _ => request_builder,
     }
 }
