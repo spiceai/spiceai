@@ -44,6 +44,7 @@ pub struct DataFusionBuilder {
 }
 
 impl DataFusionBuilder {
+    #[must_use]
     pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
@@ -80,11 +81,11 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Builds the DataFusion instance.
+    /// Builds the `DataFusion` instance.
     ///
     /// # Panics
     ///
-    /// Panics if the DataFusion instance cannot be built due to errors in registering functions or schemas.
+    /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut state = SessionStateBuilder::new()

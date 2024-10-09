@@ -133,15 +133,14 @@ impl RuntimeBuilder {
             None => status::RuntimeStatus::new(),
         };
 
-        let df = match self.datafusion {
-            Some(df) => df,
-            None => {
-                let builder = DataFusion::builder(Arc::clone(&status)).keep_partition_by_columns(
-                    get_bool_param(&self.app, "sql_query_keep_partition_by_columns", true),
-                );
+        let df = if let Some(df) = self.datafusion {
+            df
+        } else {
+            let builder = DataFusion::builder(Arc::clone(&status)).keep_partition_by_columns(
+                get_bool_param(&self.app, "sql_query_keep_partition_by_columns", true),
+            );
 
-                Arc::new(builder.build())
-            }
+            Arc::new(builder.build())
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -218,19 +217,15 @@ impl Default for RuntimeBuilder {
 ///
 /// If the parameter is set but is not a valid boolean, logs a warning and returns `default_value`.
 fn get_bool_param(app: &Option<Arc<App>>, param: &str, default_value: bool) -> bool {
-    let value = match app.as_ref().and_then(|app| app.runtime.params.get(param)) {
-        Some(value) => value,
-        None => return default_value,
+    let Some(value) = app.as_ref().and_then(|app| app.runtime.params.get(param)) else {
+        return default_value;
     };
 
-    match value.parse::<bool>() {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!(
-                "runtime.params.{param} is not a valid boolean, defaulting to {default_value}"
-            );
-            default_value
-        }
+    if let Ok(b) = value.parse::<bool>() {
+        b
+    } else {
+        eprintln!("runtime.params.{param} is not a valid boolean, defaulting to {default_value}");
+        default_value
     }
 }
 
