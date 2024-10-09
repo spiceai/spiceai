@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use data_components::token_wrapper::{Error, Result, TokenWrapper};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -36,8 +37,15 @@ struct Claims {
     iss: String,
 }
 
+#[derive(Deserialize, Debug)]
+struct InstallationTokenResponse {
+    token: String,
+    expires_at: String,
+}
+
 pub struct GitHubAppTokenWrapper {
     token: Arc<RwLock<String>>,
+    expires_at: Arc<RwLock<String>>,
     app_client_id: Arc<str>,
     private_key: Arc<str>,
     installation_id: Arc<str>,
@@ -48,6 +56,7 @@ impl GitHubAppTokenWrapper {
     pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {
         Self {
             token: Arc::new(RwLock::new(String::new())),
+            expires_at: Arc::new(RwLock::new(String::new())),
             app_client_id,
             private_key,
             installation_id,
@@ -78,7 +87,7 @@ impl GitHubAppTokenWrapper {
 
         let client = reqwest::Client::new();
 
-        let token = client
+        let response = client
             .post(format!(
                 "https://api.github.com/app/installations/{}/access_tokens",
                 self.installation_id
@@ -86,14 +95,22 @@ impl GitHubAppTokenWrapper {
             .header("Accept", "application/vnd.github+json")
             .header("Authorization", format!("Bearer {jwt_token}"))
             .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "spice")
             .send()
             .await
-            .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?
-            .text()
+            .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
+
+        let token_response: InstallationTokenResponse = response
+            .json()
             .await
             .context(UnableToGetGitHubInstallationAccessTokenBodySnafu {})?;
 
-        Ok(token)
+        self.expires_at
+            .write()
+            .await
+            .clone_from(&token_response.expires_at);
+
+        Ok(token_response.token)
     }
 }
 
@@ -104,22 +121,39 @@ impl TokenWrapper for GitHubAppTokenWrapper {
     }
 
     async fn get_token(&self) -> Result<String> {
-        match self.token.read().await.clone() {
-            token if !token.is_empty() => Ok(token),
-            _ => {
-                let token =
-                    self.generate_token()
-                        .await
-                        .map_err(|e| Error::UnableToRefreshToken {
-                            source: Box::new(e),
-                        })?;
+        let token = {
+            let read_guard = self.token.read().await;
+            read_guard.clone()
+        };
 
-                let mut lock = self.token.write().await;
-                lock.clone_from(&token);
+        let expires_at = {
+            let read_guard = self.expires_at.read().await;
+            DateTime::parse_from_rfc3339(read_guard.as_str())
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        };
 
-                Ok(token)
+        // If the token is not empty and not expired, return it
+        if let Some(expires_at) = expires_at {
+            if !token.is_empty() && Utc::now() < expires_at {
+                return Ok(token);
             }
         }
+
+        // Otherwise, refresh the token
+        let new_token = self
+            .generate_token()
+            .await
+            .map_err(|e| Error::UnableToRefreshToken {
+                source: Box::new(e),
+            })?;
+
+        {
+            let mut write_guard = self.token.write().await;
+            write_guard.clone_from(&new_token);
+        }
+
+        Ok(new_token)
     }
 
     async fn refresh_token(&self) -> Result<()> {
