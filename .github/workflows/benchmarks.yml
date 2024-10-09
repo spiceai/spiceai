@@ -119,6 +119,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - cmd: '-c spice.ai'

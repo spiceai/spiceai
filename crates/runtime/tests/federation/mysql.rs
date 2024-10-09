@@ -16,7 +16,10 @@ limitations under the License.
 //! Runs federation integration tests for `MySQL`.
 //!
 //! Expects a Docker daemon to be running.
-use crate::mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
+use crate::{
+    mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
+    runtime_ready_check,
+};
 use std::sync::Arc;
 
 use super::*;
@@ -178,6 +181,8 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         }
         () = rt.load_components() => {}
     }
+
+    runtime_ready_check(&rt).await;
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 

@@ -1,0 +1,9 @@
+name: Installs the make tool
+description: 'composite action'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install make
+      shell: bash
+      run: sudo apt-get install -y make
