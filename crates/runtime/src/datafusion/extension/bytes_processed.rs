@@ -26,7 +26,7 @@ use datafusion::{
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
     },
     prelude::Expr,
 };
@@ -246,6 +246,14 @@ impl ExecutionPlan for BytesProcessedExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input_exec]
+    }
+
+    /// Enforces a 1-1 relationship between `BytesProcessedExec` and its input,
+    /// preventing the introduction of `RepartitionExec` and ensuring that the input
+    /// is not split into sub-inputs. This guarantees that the input is processed
+    /// as a single stream, preserving the order of the data.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
     }
 
     fn with_new_children(
