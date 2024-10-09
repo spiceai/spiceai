@@ -21,7 +21,7 @@ pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
 ) -> Result<(), String> {
-    let test_queries = get_test_queries();
+    let test_queries = get_tpch_test_queries();
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
@@ -88,7 +88,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-fn get_test_queries() -> Vec<(&'static str, &'static str)> {
+fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch/q2.sql")),

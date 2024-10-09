@@ -28,7 +28,7 @@ pub(crate) fn build_app(
     bench_name: &str,
 ) -> Result<AppBuilder, String> {
     match connector {
-        "s3" => Ok(s3::build_app(app_builder, bench_name)),
+        "s3" => s3::build_app(app_builder, bench_name),
         "abfs" => Ok(abfs::build_app(app_builder, bench_name)),
         _ => Err(format!("Unsupported connector {connector}")),
     }
@@ -43,7 +43,7 @@ pub(crate) async fn run(
     bench_name: &str,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
-        "tpch" => get_test_queries(),
+        "tpch" => get_tpch_test_queries(),
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             if engine.clone().unwrap_or_default().as_str() == "postgres" {
@@ -73,6 +73,7 @@ pub(crate) async fn run(
                     | "s3_sqlite_file"
                     | "s3_duckdb_memory"
                     | "abfs"
+                    | "s3_duckdb_file"
             )
         } else if query_name.starts_with("tpcds_q") {
             matches!(
@@ -104,7 +105,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-fn get_test_queries() -> Vec<(&'static str, &'static str)> {
+fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch/q2.sql")),

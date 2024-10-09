@@ -139,7 +139,7 @@ fn build_app(
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder),
         #[cfg(feature = "mysql")]
-        "mysql" => crate::bench_mysql::build_app(app_builder),
+        "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
         "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder),
         #[cfg(feature = "odbc")]

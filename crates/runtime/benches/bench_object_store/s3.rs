@@ -19,9 +19,9 @@ use app::AppBuilder;
 use spicepod::component::{dataset::Dataset, params::Params};
 
 #[allow(clippy::too_many_lines)]
-pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
+pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
     match bench_name {
-        "tpch" => app_builder
+        "tpch" => Ok(app_builder
             .with_dataset(make_dataset(
                 "spiceai-demo-datasets/tpch/customer/",
                 "customer",
@@ -41,8 +41,8 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
             .with_dataset(make_dataset(
                 "spiceai-demo-datasets/tpch/supplier/",
                 "supplier",
-            )),
-        "tpcds" => app_builder
+            ))),
+        "tpcds" => Ok(app_builder
             .with_dataset(make_dataset(
                 "spiceai-public-datasets/tpcds/call_center/",
                 "call_center",
@@ -135,8 +135,8 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
             .with_dataset(make_dataset(
                 "spiceai-public-datasets/tpcds/web_site/",
                 "web_site",
-            )),
-        _ => panic!("Only tpcds or tpch benchmark suites are supported"),
+            ))),
+        _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
 
