@@ -38,7 +38,9 @@ Welcome to the Spice.ai NSQL REPL!
 
 Using model:
  openai
-nsql> How much money have i made in each country?
+
+Enter a query in natural language.
+nsql> How much money have I made in each country?
 +-------------+--------------------+
 | country     | total_sales        |
 +-------------+--------------------+
@@ -50,6 +52,8 @@ nsql> How much money have i made in each country?
 +-------------+--------------------+
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		cmd.Println("Welcome to the Spice.ai NSQL REPL!")
+
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 
@@ -104,7 +108,8 @@ nsql> How much money have i made in each country?
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
-		cmd.Println("Welcome to the Spice.ai NSQL REPL!")
+		cmd.Println("")
+		cmd.Println("Enter a query in natural language.")
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
