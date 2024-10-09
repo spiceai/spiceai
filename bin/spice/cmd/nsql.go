@@ -33,11 +33,21 @@ var nsqlCmd = &cobra.Command{
 	Use:   "nsql",
 	Short: "Text-to-SQL REPL",
 	Example: `
-# Start a text-to-sql REPL session with local spiced instance
-spice nsql
+$ spice nsql
+Welcome to the Spice.ai NSQL REPL!
 
-# Start a text-to-sql REPL session with spiced instance in spice.ai cloud
-spice nsql --cloud
+Using model:
+ openai
+nsql> How much money have i made in each country?
++-------------+--------------------+
+| country     | total_sales        |
++-------------+--------------------+
+| USA         | 3627982.83         |
+| Spain       | 1215686.9200000009 |
+| France      | 1110916.5199999993 |
+| Australia   | 630623.1000000001  |
+| UK          | 478880.4600000001  |
++-------------+--------------------+
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
@@ -94,6 +104,8 @@ spice nsql --cloud
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
+		cmd.Println("Welcome to the Spice.ai NSQL REPL!")
+
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer line.Close()
@@ -107,7 +119,7 @@ spice nsql --cloud
 			}
 
 			if strings.Trim(message, " ") == "" {
-				cmd.Println("Please enter a No-SQL query.")
+				cmd.Println("Enter a No-SQL (natural language) query.")
 				continue
 			}
 
