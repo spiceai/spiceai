@@ -27,7 +27,7 @@ pub trait TokenProvider: Send + Sync {
     async fn refresh_token(&self) -> Result<()>;
 }
 
-pub struct DefaultTokenWrapper {
+pub struct StaticTokenProvider {
     token: Arc<str>,
 }
 
