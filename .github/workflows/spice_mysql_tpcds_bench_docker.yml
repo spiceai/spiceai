@@ -58,7 +58,7 @@ jobs:
 
       - name: Start temporary MySQL server
         run: |
-          docker run --name spice-mysql-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d mysql:latest --local-infile=1
+          docker run --name spice-mysql-tpcds-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d mysql:latest --local-infile=1
 
       - name: Install necessary tools
         run: sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
@@ -72,9 +72,9 @@ jobs:
             DBGEN_SCALE=$sf make tpcds-gen
             DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-init
             DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-load
-            echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-bench/backup_$DB_NAME.sql
-            echo "USE $DB_NAME;" >> mysql-bench/backup_$DB_NAME.sql
-            docker exec spice-mysql-bench-temp sh -c "exec mysqldump -u root -proot ${DB_NAME}" >> mysql-bench/backup_$DB_NAME.sql
+            echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-tpcds-bench/backup_$DB_NAME.sql
+            echo "USE $DB_NAME;" >> mysql-tpcds-bench/backup_$DB_NAME.sql
+            docker exec spice-mysql-tpcds-bench-temp sh -c "exec mysqldump -u root -proot ${DB_NAME}" >> mysql-tpcds-bench/backup_$DB_NAME.sql
           done
 
       - name: Login to GHCR
