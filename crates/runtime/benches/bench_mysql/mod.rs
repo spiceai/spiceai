@@ -57,9 +57,9 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
+pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
     match bench_name {
-        "tpch" => app_builder
+        "tpch" => Ok(app_builder
             .with_dataset(make_dataset("customer", "customer", bench_name))
             .with_dataset(make_dataset("lineitem", "lineitem", bench_name))
             .with_dataset(make_dataset("part", "part", bench_name))
@@ -67,8 +67,8 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
             .with_dataset(make_dataset("orders", "orders", bench_name))
             .with_dataset(make_dataset("nation", "nation", bench_name))
             .with_dataset(make_dataset("region", "region", bench_name))
-            .with_dataset(make_dataset("supplier", "supplier", bench_name)),
-        "tpcds" => app_builder
+            .with_dataset(make_dataset("supplier", "supplier", bench_name))),
+        "tpcds" => Ok(app_builder
             .with_dataset(make_dataset("call_center", "call_center", bench_name))
             .with_dataset(make_dataset("catalog_page", "catalog_page", bench_name))
             .with_dataset(make_dataset("catalog_sales", "catalog_sales", bench_name))
@@ -108,8 +108,8 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
             .with_dataset(make_dataset("time_dim", "time_dim", bench_name))
             .with_dataset(make_dataset("warehouse", "warehouse", bench_name))
             .with_dataset(make_dataset("web_page", "web_page", bench_name))
-            .with_dataset(make_dataset("web_site", "web_site", bench_name)),
-        _ => panic!("Only tpcds or tpch benchmark suites are supported"),
+            .with_dataset(make_dataset("web_site", "web_site", bench_name))),
+        _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
 

@@ -1,0 +1,9 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------------+
+| promo_revenue     |
++-------------------+
+| 16.38077862639554 |
++-------------------+
