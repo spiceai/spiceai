@@ -88,8 +88,7 @@ impl TokenGenerator for GitHubTokenGenerator {
 
         let response = client
             .post(format!(
-                "https://api.github.com/app/installations/{}/access_tokens",
-                installation_id
+                "https://api.github.com/app/installations/{installation_id}/access_tokens",
             ))
             .header("Accept", "application/vnd.github+json")
             .header("Authorization", format!("Bearer {jwt_token}"))
