@@ -9,11 +9,6 @@ pub enum Error {
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("Unable to refresh token: {source}"))]
-    UnableToRefreshToken {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -21,8 +16,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait TokenProvider: Send + Sync {
     async fn get_token(&self) -> Result<String>;
-
-    async fn refresh_token(&self) -> Result<()>;
 }
 
 pub struct StaticTokenProvider {
@@ -40,9 +33,5 @@ impl StaticTokenProvider {
 impl TokenProvider for StaticTokenProvider {
     async fn get_token(&self) -> Result<String> {
         Ok(self.token.to_string())
-    }
-
-    async fn refresh_token(&self) -> Result<()> {
-        Ok(())
     }
 }

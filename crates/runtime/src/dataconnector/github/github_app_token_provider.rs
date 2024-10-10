@@ -38,32 +38,31 @@ struct Claims {
 }
 
 #[derive(Deserialize, Debug)]
-struct InstallationTokenResponse {
+struct TokenResponse {
     token: String,
     expires_at: String,
 }
 
-pub struct GitHubAppTokenProvider {
-    token: Arc<RwLock<String>>,
-    expires_at: Arc<RwLock<String>>,
-    app_client_id: Arc<str>,
-    private_key: Arc<str>,
-    installation_id: Arc<str>,
+#[async_trait]
+trait TokenGenerator: Send + Sync {
+    async fn generate_token(
+        &self,
+        app_client_id: Arc<str>,
+        private_key: Arc<str>,
+        installation_id: Arc<str>,
+    ) -> Result<TokenResponse, GitHubAppError>;
 }
 
-impl GitHubAppTokenProvider {
-    #[must_use]
-    pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {
-        Self {
-            token: Arc::new(RwLock::new(String::new())),
-            expires_at: Arc::new(RwLock::new(String::new())),
-            app_client_id,
-            private_key,
-            installation_id,
-        }
-    }
+struct GitHubTokenGenerator {}
 
-    async fn generate_token(&self) -> Result<String, GitHubAppError> {
+#[async_trait]
+impl TokenGenerator for GitHubTokenGenerator {
+    async fn generate_token(
+        &self,
+        app_client_id: Arc<str>,
+        private_key: Arc<str>,
+        installation_id: Arc<str>,
+    ) -> Result<TokenResponse, GitHubAppError> {
         let iat = usize::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -76,9 +75,9 @@ impl GitHubAppTokenProvider {
         let claims = Claims {
             iat,
             exp,
-            iss: self.app_client_id.to_string(),
+            iss: app_client_id.to_string(),
         };
-        let private_key = self.private_key.as_ref();
+        let private_key = private_key.as_ref();
         let encoding_key =
             EncodingKey::from_rsa_pem(private_key.as_bytes()).context(InvalidPrivateKeySnafu {})?;
 
@@ -90,7 +89,7 @@ impl GitHubAppTokenProvider {
         let response = client
             .post(format!(
                 "https://api.github.com/app/installations/{}/access_tokens",
-                self.installation_id
+                installation_id
             ))
             .header("Accept", "application/vnd.github+json")
             .header("Authorization", format!("Bearer {jwt_token}"))
@@ -100,17 +99,40 @@ impl GitHubAppTokenProvider {
             .await
             .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
-        let token_response: InstallationTokenResponse = response
+        let token_response: TokenResponse = response
             .json()
             .await
             .context(UnableToGetGitHubInstallationAccessTokenBodySnafu {})?;
 
-        self.expires_at
-            .write()
-            .await
-            .clone_from(&token_response.expires_at);
+        // self.expires_at
+        //     .write()
+        //     .await
+        //     .clone_from(&token_response.expires_at);
 
-        Ok(token_response.token)
+        Ok(token_response)
+    }
+}
+
+pub struct GitHubAppTokenProvider {
+    token: Arc<RwLock<String>>,
+    expires_at: Arc<RwLock<String>>,
+    app_client_id: Arc<str>,
+    private_key: Arc<str>,
+    installation_id: Arc<str>,
+    token_generator: Arc<dyn TokenGenerator>,
+}
+
+impl GitHubAppTokenProvider {
+    #[must_use]
+    pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {
+        Self {
+            token: Arc::new(RwLock::new(String::new())),
+            expires_at: Arc::new(RwLock::new(String::new())),
+            app_client_id,
+            private_key,
+            installation_id,
+            token_generator: Arc::new(GitHubTokenGenerator {}),
+        }
     }
 }
 
@@ -137,32 +159,137 @@ impl TokenProvider for GitHubAppTokenProvider {
         }
 
         // Otherwise, refresh the token
-        let new_token = self
-            .generate_token()
+        let token_response = self
+            .token_generator
+            .generate_token(
+                Arc::clone(&self.app_client_id),
+                Arc::clone(&self.private_key),
+                Arc::clone(&self.installation_id),
+            )
             .await
-            .map_err(|e| Error::UnableToRefreshToken {
+            .map_err(|e| Error::UnableToGetToken {
                 source: Box::new(e),
             })?;
 
-        {
-            let mut write_guard = self.token.write().await;
-            write_guard.clone_from(&new_token);
-        }
+        let mut write_guard = self.token.write().await;
+        write_guard.clone_from(&token_response.token);
 
-        Ok(new_token)
+        self.expires_at
+            .write()
+            .await
+            .clone_from(&token_response.expires_at);
+
+        Ok(token_response.token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockTokenGenerator {
+        counter: Arc<RwLock<usize>>,
     }
 
-    async fn refresh_token(&self) -> Result<()> {
-        let token = self
-            .generate_token()
-            .await
-            .map_err(|e| Error::UnableToRefreshToken {
-                source: Box::new(e),
-            })?;
+    impl MockTokenGenerator {
+        fn new() -> Self {
+            Self {
+                counter: Arc::new(RwLock::new(0)),
+            }
+        }
+    }
 
-        let mut lock = self.token.write().await;
-        lock.clone_from(&token);
+    #[async_trait]
+    impl TokenGenerator for MockTokenGenerator {
+        async fn generate_token(
+            &self,
+            _app_client_id: Arc<str>,
+            _private_key: Arc<str>,
+            _installation_id: Arc<str>,
+        ) -> Result<TokenResponse, GitHubAppError> {
+            let mut counter = self.counter.write().await;
+            *counter += 1;
+            let token = format!("token_{}", *counter);
+            Ok(TokenResponse {
+                token,
+                expires_at: (Utc::now() + chrono::Duration::seconds(5)).to_rfc3339(),
+            })
+        }
+    }
 
-        Ok(())
+    #[tokio::test]
+    async fn test_get_token_refresh() {
+        let app_client_id = Arc::from("app_client_id".to_string());
+        let private_key = Arc::from("private_key".to_string());
+        let installation_id = Arc::from("installation_id".to_string());
+        let token_generator = Arc::new(MockTokenGenerator::new());
+
+        let token_provider = GitHubAppTokenProvider {
+            token: Arc::new(RwLock::new(String::new())),
+            expires_at: Arc::new(RwLock::new(String::new())),
+            app_client_id,
+            private_key,
+            installation_id,
+            token_generator,
+        };
+
+        // First call to get_token should generate a new token
+        let token = token_provider.get_token().await.unwrap();
+        assert_eq!(token, "token_1");
+
+        // Second call to get_token should return the same token
+        let token = token_provider.get_token().await.unwrap();
+        assert_eq!(token, "token_1");
+
+        // sleep 5 seconds to expire the token
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        // Third call to get_token should generate a new token
+        let token = token_provider.get_token().await.unwrap();
+        assert_eq!(token, "token_2");
+    }
+
+    #[tokio::test]
+    async fn test_get_token_concurrent() {
+        let app_client_id = Arc::from("app_client_id".to_string());
+        let private_key = Arc::from("private_key".to_string());
+        let installation_id = Arc::from("installation_id".to_string());
+        let token_generator = Arc::new(MockTokenGenerator::new());
+
+        let token_provider = Arc::new(GitHubAppTokenProvider {
+            token: Arc::new(RwLock::new(String::new())),
+            expires_at: Arc::new(RwLock::new(String::new())),
+            app_client_id,
+            private_key,
+            installation_id,
+            token_generator,
+        });
+
+        // First call to get_token should generate a new token
+        let token = token_provider.get_token().await.unwrap();
+        assert_eq!(token, "token_1");
+
+        // sleep 5 seconds to expire the token
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        let mut handles = vec![];
+
+        // Spawn 10 concurrent tasks to get the token
+        for _ in 0..10 {
+            let token_provider_clone = Arc::clone(&token_provider);
+            let handle =
+                tokio::spawn(async move { token_provider_clone.get_token().await.unwrap() });
+            handles.push(handle);
+        }
+
+        let mut tokens = vec![];
+        for handle in handles {
+            tokens.push(handle.await.unwrap());
+        }
+
+        // Assert that only first call refreshed the token
+        for token in tokens {
+            assert_eq!(token, "token_2");
+        }
     }
 }
