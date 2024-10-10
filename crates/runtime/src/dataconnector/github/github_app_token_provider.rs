@@ -232,18 +232,27 @@ mod tests {
         };
 
         // First call to get_token should generate a new token
-        let token = token_provider.get_token().await.unwrap();
+        let token = token_provider
+            .get_token()
+            .await
+            .expect("Failed to get token");
         assert_eq!(token, "token_1");
 
         // Second call to get_token should return the same token
-        let token = token_provider.get_token().await.unwrap();
+        let token = token_provider
+            .get_token()
+            .await
+            .expect("Failed to get token");
         assert_eq!(token, "token_1");
 
         // sleep 3 seconds to expire the token
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         // Third call to get_token should generate a new token
-        let token = token_provider.get_token().await.unwrap();
+        let token = token_provider
+            .get_token()
+            .await
+            .expect("Failed to get token");
         assert_eq!(token, "token_2");
     }
 
@@ -290,7 +299,7 @@ mod tests {
 
      */
     #[tokio::test]
-    async fn test_get_token_concurrent() {
+    async fn test_get_token_concurrent() -> Result<()> {
         let app_client_id = Arc::from("app_client_id".to_string());
         let private_key = Arc::from("private_key".to_string());
         let installation_id = Arc::from("installation_id".to_string());
@@ -312,22 +321,28 @@ mod tests {
             let token_provider_clone = Arc::clone(&token_provider);
             let handle = tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(i * 500)).await;
-                token_provider_clone.get_token().await.unwrap()
+                token_provider_clone
+                    .get_token()
+                    .await
+                    .expect("Failed to get token")
             });
             handles.push(handle);
         }
 
         let mut tokens = vec![];
         for handle in handles {
-            tokens.push(handle.await.unwrap());
+            let token = handle.await.expect("Failed to get token");
+            tokens.push(token);
         }
 
-        for i in 0..10 {
+        for (i, token) in tokens.iter().enumerate().take(10) {
             if i < 7 {
-                assert_eq!(tokens[i], "token_1");
+                assert_eq!(token, "token_1");
             } else {
-                assert_eq!(tokens[i], "token_2");
+                assert_eq!(token, "token_2");
             }
         }
+
+        Ok(())
     }
 }
