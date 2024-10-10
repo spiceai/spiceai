@@ -533,6 +533,7 @@ pub fn create_hf_model(
     model_weights: &Option<String>,
     _tokenizer: &Option<String>,
     _tokenizer_config: &Option<String>,
+    hf_token_literal: Option<String>,
 ) -> Result<Box<dyn Chat>> {
     if model_type.is_none() && model_weights.is_none() {
         return Err(Error::FailedToLoadModel {
@@ -545,6 +546,7 @@ pub fn create_hf_model(
         mistral::MistralLlama::from_hf(
             model_id,
             &model_type.unwrap_or_default(),
+            hf_token_literal,
             // TODO: Support HF models with non-standard paths.
             // model_weights,
             // tokenizer,
