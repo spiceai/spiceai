@@ -70,7 +70,7 @@ jobs:
           for sf in 1; do
             DB_NAME=tpcds_sf${sf//./_}
             DBGEN_SCALE=$sf make tpcds-gen
-            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-init
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME ADD_INDEXES=true make mysql-tpcds-init
             DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-load
             echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-tpcds-bench/backup_$DB_NAME.sql
             echo "USE $DB_NAME;" >> mysql-tpcds-bench/backup_$DB_NAME.sql
