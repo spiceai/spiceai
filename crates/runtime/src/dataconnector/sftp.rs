@@ -23,8 +23,8 @@ use std::{any::Any, collections::HashMap};
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
-    Parameters,
+    listing::{self, ListingTableConnector},
+    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
 };
 
 #[derive(Debug, Snafu)]
@@ -122,7 +122,7 @@ impl ListingTableConnector for SFTP {
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
-        ftp_url.set_fragment(Some(&super::build_fragments(
+        ftp_url.set_fragment(Some(&listing::build_fragments(
             &self.params,
             vec!["port", "user", "pass", "client_timeout"],
         )));

@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
-    Parameters,
+    listing::{self, ListingTableConnector},
+    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -165,7 +165,7 @@ impl ListingTableConnector for S3 {
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
-        s3_url.set_fragment(Some(&super::build_fragments(
+        s3_url.set_fragment(Some(&listing::build_fragments(
             &self.params,
             vec![
                 "region",
