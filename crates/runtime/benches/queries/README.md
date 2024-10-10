@@ -28,6 +28,79 @@ SELECT (now() + INTERVAL '30 days');
 | [q94.sql](tpcds/q94.sql) | [q95.sql](tpcds/q95.sql) | [q98.sql](tpcds/q98.sql) |
 | [q72.sql](tpcds/q72.sql) |                          |                          |
 
+### `EXCEPT` and `INTERSECT` keywords are not supported
+
+**Limitation**: There is an error `syntax error at or near "ANTI"` when `EXCEPT` is used, and a `syntax error at or near "SEMI"` in the case of `INTERSECT`
+**Solution**: Use `DISTINCT` and `IN`/`NOT IN` instead
+
+```sql
+# fail
+SELECT ws_item_sk FROM web_sales
+INTERSECT
+SELECT ss_item_sk FROM store_sales;
+
+# success
+SELECT DISTINCT ws_item_sk FROM web_sales
+WHERE ws_item_sk IN (
+    SELECT DISTINCT ss_item_sk FROM store_sales
+);
+
+# fail
+SELECT ws_item_sk FROM web_sales
+EXCEPT
+SELECT ss_item_sk FROM store_sales;
+
+# success
+SELECT DISTINCT ws_item_sk FROM web_sales
+WHERE ws_item_sk NOT IN (
+    SELECT DISTINCT ss_item_sk FROM store_sales
+);
+```
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q8.sql](tpcds/q8.sql)   | [q38.sql](tpcds/q38.sql) |
+| [q14.sql](tpcds/q14.sql) | [q87.sql](tpcds/q87.sql) |
+
+### Projections require unique expression names
+
+**Limitation**: When performing multiple operations on the same column, each result must have a unique name. If multiple expressions produce identical names in the SELECT clause, the query will fail
+**Solution**: Use aliases for duplicate duplicate expression names
+
+```sql
+# fail
+SELECT
+  cd_gender,
+  cd_dep_count,
+  STDDEV_SAMP(cd_dep_count),
+  STDDEV_SAMP(cd_dep_count)
+FROM
+  customer_demographics
+GROUP BY
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count
+LIMIT 100;
+
+# success
+SELECT
+  cd_gender,
+  cd_dep_count,
+  STDDEV_SAMP(cd_dep_count) AS stddev_dep_count_1,
+  STDDEV_SAMP(cd_dep_count) AS stddev_dep_count_2
+FROM
+  customer_demographics
+GROUP BY
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count
+LIMIT 100;
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q35.sql](tpcds/q35.sql) | |
+
+
 ### DataFusion Supports Only Single SQL Statement per Query
 
 **Limitation**: DataFusion does not support multiple SQL statements within a single query.
