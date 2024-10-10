@@ -248,6 +248,12 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![&self.input_exec]
     }
 
+    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
+    /// This guarantees that the input is processed as a single stream, preserving the order of the data.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
