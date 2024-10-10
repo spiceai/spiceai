@@ -306,21 +306,26 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                         dataconnector: format!("{self}"),
                     })?;
 
-                if table_path.is_collection() {
+                // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
+                if dataset.get_param("hive_infer_partitions", true) && table_path.is_collection() {
                     let inferred_partitions =
-                        infer_partitions_with_types(&ctx.state(), &table_path, &extension)
-                            .await
-                            .ok();
-                    if let Some(partitions) = inferred_partitions {
-                        tracing::debug!(
-                            "Inferred partitions for {:?}: {:?}",
-                            table_path,
-                            partitions
-                                .iter()
-                                .map(|(k, _)| k.as_str())
-                                .collect::<Vec<_>>()
-                        );
-                        options = options.with_table_partition_cols(partitions);
+                        infer_partitions_with_types(&ctx.state(), &table_path, &extension).await;
+                    match inferred_partitions {
+                        Ok(partitions) => {
+                            tracing::debug!(
+                                "Inferred partitions for {:?}: {:?}",
+                                table_path,
+                                partitions
+                                    .iter()
+                                    .map(|(k, _)| k.as_str())
+                                    .collect::<Vec<_>>()
+                            );
+                            options = options.with_table_partition_cols(partitions);
+                        }
+                        Err(e) => {
+                            // This might not be an error, it could be that the table is not partitioned.
+                            tracing::debug!("Failed to infer partitions for {:?}: {e}", table_path);
+                        }
                     }
                 }
 
