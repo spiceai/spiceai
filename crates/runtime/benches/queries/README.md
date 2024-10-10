@@ -30,6 +30,7 @@ SELECT (now() + INTERVAL '30 days');
 
 ### `EXCEPT` and `INTERSECT` keywords are not supported
 
+**Limitation**: There is an error `syntax error at or near "ANTI"` when `EXCEPT` is used, and a `syntax error at or near "SEMI"` in the case of `INTERSECT`
 **Solution**: Use `DISTINCT` and `IN`/`NOT IN` instead
 
 ```sql
