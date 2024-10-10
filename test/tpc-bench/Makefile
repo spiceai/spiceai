@@ -164,6 +164,12 @@ mysql-tpcds-init:
 	@echo "Creating tables from tpcds.sql..."
 	@mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) < ./tpcds-kit/tools/tpcds.sql
 
+	@if [ "$(ADD_INDEXES)" = "true" ] || [ "$(ADD_INDEXES)" = "1" ]; then \
+        echo "Applying indexes from tpcds_index.sql..."; \
+        mysql -h$(DB_HOST) -u$(DB_USER)  -p$(DB_PASS) -P$(DB_PORT) $(DB_NAME) < tpcds_index.sql; \
+        echo "Indexes applied successfully."; \
+    fi
+
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpcds make mysql-tpcds-load
