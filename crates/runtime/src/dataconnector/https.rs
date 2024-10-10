@@ -23,8 +23,9 @@ use std::{any::Any, collections::HashMap};
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,
-    ListingTableConnector, ParameterSpec, Parameters,
+    listing::{self, ListingTableConnector},
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec,
+    Parameters,
 };
 
 pub struct Https {
@@ -147,7 +148,7 @@ impl ListingTableConnector for Https {
             };
         }
 
-        u.set_fragment(Some(&super::build_fragments(
+        u.set_fragment(Some(&listing::build_fragments(
             &self.params,
             vec!["client_timeout"],
         )));
