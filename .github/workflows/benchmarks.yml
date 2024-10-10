@@ -50,36 +50,36 @@ env:
   FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 jobs:
-  build-database-bench-binary:
-    name: Build Benchmark Test Binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  # build-database-bench-binary:
+  #   name: Build Benchmark Test Binary
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
+  #     - name: Set up Rust
+  #       uses: ./.github/actions/setup-rust
+  #       with:
+  #         os: 'linux'
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+  #     - name: Install Protoc
+  #       uses: arduino/setup-protoc@v3
 
-      - name: Build benchmark binary
-        run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
+  #     - name: Build benchmark binary
+  #       run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
 
-      - name: Find, move, and rename benchmark binary
-        run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
+  #     - name: Find, move, and rename benchmark binary
+  #       run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
 
-      - name: Upload benchmark binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: spice_bench
-          path: ./spice_bench
+  #     - name: Upload benchmark binary
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: spice_bench
+  #         path: ./spice_bench
 
   run-database-bench:
     name: Run Connector/Accelerator Benchmark
     runs-on: ubuntu-latest
-    needs: build-database-bench-binary
+    # needs: build-database-bench-binary
 
     services:
       mysql_tpch:
