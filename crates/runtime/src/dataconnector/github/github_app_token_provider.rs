@@ -104,11 +104,6 @@ impl TokenGenerator for GitHubTokenGenerator {
             .await
             .context(UnableToGetGitHubInstallationAccessTokenBodySnafu {})?;
 
-        // self.expires_at
-        //     .write()
-        //     .await
-        //     .clone_from(&token_response.expires_at);
-
         Ok(token_response)
     }
 }
