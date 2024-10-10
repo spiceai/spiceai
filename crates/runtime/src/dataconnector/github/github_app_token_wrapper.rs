@@ -43,7 +43,7 @@ struct InstallationTokenResponse {
     expires_at: String,
 }
 
-pub struct GitHubAppTokenWrapper {
+pub struct GitHubAppTokenProvider {
     token: Arc<RwLock<String>>,
     expires_at: Arc<RwLock<String>>,
     app_client_id: Arc<str>,
