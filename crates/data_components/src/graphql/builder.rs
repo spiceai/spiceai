@@ -26,7 +26,7 @@ pub struct GraphQLClientBuilder {
     endpoint: Url,
     json_pointer: Option<Arc<str>>,
     unnest_depth: usize,
-    wrapper: Option<Arc<dyn TokenWrapper>>,
+    token_provider: Option<Arc<dyn TokenWrapper>>,
     user: Option<String>,
     pass: Option<String>,
     schema: Option<SchemaRef>,
