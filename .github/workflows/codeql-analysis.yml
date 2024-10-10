@@ -12,7 +12,7 @@ on:
 jobs:
   analyze:
     name: Analyze
-    runs-on: teraswitch-runners
+    runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read

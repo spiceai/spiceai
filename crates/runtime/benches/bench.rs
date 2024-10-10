@@ -189,11 +189,6 @@ async fn run_connector_bench(
     upload_results_dataset: &Option<String>,
     bench_name: &str,
 ) -> Result<(), String> {
-    // TODO: Implement and enable connector TPCDS bench if it's required
-    if bench_name == "tpcds" {
-        return Err("TPCDS Benchmark not implemented for data connectors".to_string());
-    }
-
     let mut display_records = vec![];
 
     let (mut benchmark_results, mut rt) =
@@ -216,7 +211,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "mysql")]
         "mysql" => {
-            bench_mysql::run(&mut rt, &mut benchmark_results).await?;
+            bench_mysql::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {
@@ -302,6 +297,7 @@ fn get_current_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
@@ -351,16 +347,16 @@ async fn run_query_and_record_result(
                         .iter()
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
-                    let limited_records = records
+                    let limited_records: Vec<_> = records
                         .iter()
-                        .take(1)
-                        .map(|x| x.slice(0, x.num_rows().min(10)))
-                        .collect::<Vec<_>>();
-
+                        .flat_map(|batch: &RecordBatch| {
+                            (0..batch.num_rows()).map(move |i| batch.slice(i, 1))
+                        })
+                        .take(10)
+                        .collect();
                     let records_pretty =
                         arrow::util::pretty::pretty_format_batches(&limited_records)
                             .map_err(|e| e.to_string())?;
-
                     tracing::info!(
                     "Query `{connector}` `{query_name}` returned {num_rows} rows:\n{records_pretty}",
                 );
@@ -391,9 +387,7 @@ async fn run_query_and_record_result(
             }
         }
     }
-
     let end_time = get_current_unix_ms();
-
     // Both query failure and snapshot test failure will cause the result to be written as Status::Failed
     benchmark_results.record_result(
         start_time,

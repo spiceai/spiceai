@@ -39,7 +39,7 @@ const ITERATIONS: i32 = 5;
 ///
 /// 1) Sets the number of `target_partitions` to 4, by default its the number of CPU cores available.
 fn get_test_datafusion(status: Arc<RuntimeStatus>) -> Arc<DataFusion> {
-    let mut df = DataFusion::new(status);
+    let mut df = DataFusion::builder(status).build();
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -138,7 +138,7 @@ fn build_app(
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder),
         #[cfg(feature = "mysql")]
-        "mysql" => crate::bench_mysql::build_app(app_builder),
+        "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
         "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder),
         #[cfg(feature = "odbc")]

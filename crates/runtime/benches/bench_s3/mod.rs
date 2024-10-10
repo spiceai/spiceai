@@ -31,7 +31,7 @@ pub(crate) async fn run(
     bench_name: &str,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
-        "tpch" => get_test_queries(),
+        "tpch" => get_tpch_test_queries(),
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             if engine.clone().unwrap_or_default().as_str() == "postgres" {
@@ -51,10 +51,23 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        let verify_query_results = (matches!(
-            bench_name.as_str(),
-            "s3" | "s3_arrow_memory" | "s3_sqlite_memory" | "s3_sqlite_file" | "s3_duckdb_memory"
-        )) && query_name.starts_with("tpch_q");
+        let verify_query_results = if query_name.starts_with("tpch_q") {
+            matches!(
+                bench_name.as_str(),
+                "s3" | "s3_arrow_memory"
+                    | "s3_sqlite_memory"
+                    | "s3_sqlite_file"
+                    | "s3_duckdb_memory"
+                    | "s3_duckdb_file"
+            )
+        } else if query_name.starts_with("tpcds_q") {
+            matches!(
+                bench_name.as_str(),
+                "s3_postgres_memory" | "s3_arrow_memory"
+            )
+        } else {
+            false
+        };
 
         if let Err(e) = super::run_query_and_record_result(
             rt,
@@ -209,7 +222,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-fn get_test_queries() -> Vec<(&'static str, &'static str)> {
+fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
