@@ -53,7 +53,7 @@ impl GraphQLClientBuilder {
     }
 
     #[must_use]
-    pub fn with_token(mut self, wrapper: Option<Arc<dyn TokenWrapper>>) -> Self {
+    pub fn with_token_provider(mut self, wrapper: Option<Arc<dyn TokenWrapper>>) -> Self {
         self.wrapper = wrapper;
         self
     }
