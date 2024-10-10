@@ -76,8 +76,12 @@ impl CandleEmbedding {
         Self::try_new(&model_root, F32_DTYPE)
     }
 
-    pub fn from_hf(model_id: &str, revision: Option<&str>) -> Result<Self> {
-        let model_root = download_hf_artifacts(model_id, revision)?;
+    pub fn from_hf(
+        model_id: &str,
+        revision: Option<&str>,
+        hf_token: Option<String>,
+    ) -> Result<Self> {
+        let model_root = download_hf_artifacts(model_id, revision, hf_token)?;
         Self::try_new(&model_root, F32_DTYPE)
     }
 
@@ -182,9 +186,14 @@ impl Embed for CandleEmbedding {
 }
 
 /// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
-pub fn download_hf_artifacts(model_id: &str, revision: Option<&str>) -> Result<PathBuf> {
+pub fn download_hf_artifacts(
+    model_id: &str,
+    revision: Option<&str>,
+    hf_token: Option<String>,
+) -> Result<PathBuf> {
     let api = ApiBuilder::new()
         .with_progress(false)
+        .with_token(hf_token)
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
