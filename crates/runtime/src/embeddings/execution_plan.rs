@@ -275,8 +275,6 @@ pub(crate) async fn compute_additional_embedding_columns(
             continue;
         };
 
-        tracing::trace!("Inputting strings for col {col}, of length {}", arr.len());
-
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
                 get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;

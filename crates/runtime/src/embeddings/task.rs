@@ -29,12 +29,10 @@ use tracing::{Instrument, Span};
 
 pub struct TaskEmbed {
     inner: Box<dyn Embed>,
-    size: i32,
+    vector_size: i32,
 }
 
 impl TaskEmbed {
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub async fn new(inner: Box<dyn Embed>) -> EmbedResult<Self> {
         let size = match inner.size() {
             size if size > -1 => size,
@@ -42,33 +40,36 @@ impl TaskEmbed {
                 tracing::trace!(
                     "Size of embedding vectors not known in advance, attempting to infer"
                 );
-                match inner
-                    .embed(EmbeddingInput::String("infer_size".to_string()))
-                    .await
-                {
-                    Ok(vec) => match vec.first() {
-                        Some(first) => {
-                            tracing::trace!(
-                                "Inferred size of embedding model vectors={}",
-                                first.len()
-                            );
-                            first.len() as i32
-                        }
-                        None => {
-                            return Err(EmbedError::FailedToCreateEmbedding {
-                                source: "Failed to infer size of embedding model, empty response"
-                                    .into(),
-                            });
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!("Failed to infer size of embedding model");
-                        return Err(e);
-                    }
-                }
+                Self::infer_size(inner.as_ref()).await?
             }
         };
-        Ok(Self { inner, size })
+        Ok(Self {
+            inner,
+            vector_size: size,
+        })
+    }
+
+    /// Infer the size of the embedding vectors produced by the inner embedding model by calling [`Embed::embed`].
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    async fn infer_size(inner: &dyn Embed) -> EmbedResult<i32> {
+        match inner
+            .embed(EmbeddingInput::String("infer_size".to_string()))
+            .await
+        {
+            Ok(vec) => match vec.first() {
+                Some(first) => {
+                    tracing::trace!("Inferred size of embedding model vectors={}", first.len());
+                    Ok(first.len() as i32)
+                }
+                None => Err(EmbedError::FailedToCreateEmbedding {
+                    source: "Failed to infer size of embedding model, empty response".into(),
+                }),
+            },
+            Err(e) => {
+                tracing::warn!("Failed to infer size of embedding model");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -94,7 +95,7 @@ impl Embed for TaskEmbed {
     }
 
     fn size(&self) -> i32 {
-        self.size
+        self.vector_size
     }
 
     fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
