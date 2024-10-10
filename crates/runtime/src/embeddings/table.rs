@@ -445,6 +445,7 @@ impl TableProvider for EmbeddingTable {
 
         // No embedding work is needed.
         if columns_to_embed.is_empty() {
+            tracing::trace!("For `EmbeddingTable`, no additional embedding columns to compute. Forwarding entirely to base table.");
             return self
                 .base_table
                 .scan(
@@ -463,7 +464,9 @@ impl TableProvider for EmbeddingTable {
                 )
                 .await;
         }
-
+        tracing::trace!(
+            "For `EmbeddingTable`, additional embedding columns to compute: {columns_to_embed:?}"
+        );
         let schema = &self.schema();
 
         let scan_embed_columns: HashMap<String, EmbeddingColumnConfig> = self

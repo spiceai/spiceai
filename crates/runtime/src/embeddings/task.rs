@@ -23,18 +23,52 @@ use async_openai::{
 use async_trait::async_trait;
 use llms::{
     chunking::{Chunker, ChunkingConfig},
-    embeddings::{Embed, Result as EmbedResult},
+    embeddings::{Embed, Error as EmbedError, Result as EmbedResult},
 };
 use tracing::{Instrument, Span};
 
 pub struct TaskEmbed {
     inner: Box<dyn Embed>,
+    size: i32,
 }
 
 impl TaskEmbed {
-    #[must_use]
-    pub fn new(inner: Box<dyn Embed>) -> Self {
-        Self { inner }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub async fn new(inner: Box<dyn Embed>) -> EmbedResult<Self> {
+        let size = match inner.size() {
+            size if size > -1 => size,
+            _ => {
+                tracing::trace!(
+                    "Size of embedding vectors not known in advance, attempting to infer"
+                );
+                match inner
+                    .embed(EmbeddingInput::String("infer_size".to_string()))
+                    .await
+                {
+                    Ok(vec) => match vec.first() {
+                        Some(first) => {
+                            tracing::trace!(
+                                "Inferred size of embedding model vectors={}",
+                                first.len()
+                            );
+                            first.len() as i32
+                        }
+                        None => {
+                            return Err(EmbedError::FailedToCreateEmbedding {
+                                source: "Failed to infer size of embedding model, empty response"
+                                    .into(),
+                            });
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to infer size of embedding model");
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        Ok(Self { inner, size })
     }
 }
 
@@ -60,7 +94,7 @@ impl Embed for TaskEmbed {
     }
 
     fn size(&self) -> i32 {
-        self.inner.size()
+        self.size
     }
 
     fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {

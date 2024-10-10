@@ -236,6 +236,12 @@ pub(crate) async fn compute_additional_embedding_columns(
         .filter(|(_, cfg)| !cfg.in_base_table)
         .collect();
 
+    tracing::trace!(
+        "Of embedding columns: {:?}, only need to create embeddings for columns: {:?}",
+        embedded_columns.keys().collect::<Vec<_>>(),
+        additional_embedding_columns.keys().collect::<Vec<_>>()
+    );
+
     let mut embed_arrays: HashMap<String, ArrayRef> = HashMap::with_capacity(
         additional_embedding_columns.len()
             + additional_embedding_columns
@@ -250,6 +256,7 @@ pub(crate) async fn compute_additional_embedding_columns(
             chunker: chunker_opt,
             ..
         } = cfg;
+        tracing::trace!("Embedding column '{col}' with model {model_name}");
         let read_guard = embedding_models.read().await;
         let Some(model) = read_guard.get(model_name) else {
             tracing::debug!(
@@ -268,14 +275,18 @@ pub(crate) async fn compute_additional_embedding_columns(
             continue;
         };
 
+        tracing::trace!("Inputting strings for col {col}, of length {}", arr.len());
+
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
                 get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
+            tracing::trace!("Successfully embedded column '{col}' with chunking");
             embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = get_vectors(arr, &**model).await?;
+            tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
         embed_arrays.insert(embedding_col!(col), list_array);

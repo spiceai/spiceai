@@ -77,7 +77,7 @@ pub trait Embed: Sync + Send {
         )))
     }
 
-    /// Returns the size of the embedding vector returned by the model.
+    /// Returns the size of the embedding vector returned by the model. Return -1 if the size should be inferred from [`Embed::embed`] method.
     fn size(&self) -> i32;
 
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
