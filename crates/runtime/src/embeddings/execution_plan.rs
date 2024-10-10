@@ -42,6 +42,9 @@ use std::fmt;
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
+use crate::{embedding_col, offset_col};
+
+use super::table::EmbeddingColumnConfig;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -51,9 +54,8 @@ pub struct EmbeddingTableExec {
 
     base_plan: Arc<dyn ExecutionPlan>,
 
-    embedded_columns: HashMap<String, String>,
+    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
 }
 
 impl std::fmt::Debug for EmbeddingTableExec {
@@ -105,7 +107,6 @@ impl ExecutionPlan for EmbeddingTableExec {
             Arc::clone(&self.base_plan).with_new_children(children)?,
             self.embedded_columns.clone(),
             Arc::clone(&self.embedding_models),
-            self.embedding_chunkers.clone(),
         )) as Arc<dyn ExecutionPlan>)
     }
 
@@ -122,7 +123,6 @@ impl ExecutionPlan for EmbeddingTableExec {
                 Arc::clone(&self.projected_schema),
                 self.embedded_columns.clone(),
                 Arc::clone(&self.embedding_models),
-                self.embedding_chunkers.clone(),
             ),
         )))
     }
@@ -135,9 +135,8 @@ impl EmbeddingTableExec {
         filters: &[Expr],
         limit: Option<usize>,
         base_plan: Arc<dyn ExecutionPlan>,
-        embedded_columns: HashMap<String, String>,
+        embedded_columns: HashMap<String, EmbeddingColumnConfig>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-        embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(projected_schema),
@@ -147,7 +146,6 @@ impl EmbeddingTableExec {
             base_plan,
             embedded_columns,
             embedding_models,
-            embedding_chunkers,
         }
     }
 
@@ -165,15 +163,14 @@ impl EmbeddingTableExec {
 fn to_sendable_stream(
     mut base_stream: SendableRecordBatchStream,
     projected_schema: SchemaRef,
-    embedded_columns: HashMap<String, String>,
+    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-    embedding_chunkers: HashMap<String, Arc<dyn Chunker>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
         while let Some(batch_result) = base_stream.next().await {
             match batch_result {
                 Ok(batch) => {
-                    match get_embedding_columns(&batch, &embedded_columns, Arc::clone(&embedding_models), &embedding_chunkers).await {
+                    match compute_additional_embedding_columns(&batch, &embedded_columns, Arc::clone(&embedding_models)).await {
                         Ok(embeddings) => {
 
                             match construct_record_batch(
@@ -223,20 +220,43 @@ fn construct_record_batch(
 
 /// Get the additional, embedding, columns to add to the [`RecordBatch`]. The columns are
 ///     1. Embedding vectors for each column in `embedded_columns`.
-///     2. If a [`Chunker`] is provided for a given column, an additional column of offsets. For
+///     2. If a [`Chunker`] is provided for a given column's [`EmbeddingColumnConfig`], an additional column of offsets. For
 ///         each string, these offsets map the substrings used for each embeddding vector.
 ///
+/// For columns that are in the base table, no additional columns are calculated.
+///
 /// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
-pub(crate) async fn get_embedding_columns(
+pub(crate) async fn compute_additional_embedding_columns(
     rb: &RecordBatch,
-    embedded_columns: &HashMap<String, String>,
+    embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-    embedding_chunkers: &HashMap<String, Arc<dyn Chunker>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut embed_arrays: HashMap<String, ArrayRef> =
-        HashMap::with_capacity(embedded_columns.len() + embedding_chunkers.len());
+    let additional_embedding_columns: HashMap<_, _> = embedded_columns
+        .iter()
+        .filter(|(_, cfg)| !cfg.in_base_table)
+        .collect();
 
-    for (col, model_name) in embedded_columns {
+    tracing::trace!(
+        "Of embedding columns: {:?}, only need to create embeddings for columns: {:?}",
+        embedded_columns.keys().collect::<Vec<_>>(),
+        additional_embedding_columns.keys().collect::<Vec<_>>()
+    );
+
+    let mut embed_arrays: HashMap<String, ArrayRef> = HashMap::with_capacity(
+        additional_embedding_columns.len()
+            + additional_embedding_columns
+                .values()
+                .filter(|cfg| cfg.chunker.is_some())
+                .count(),
+    );
+
+    for (col, cfg) in embedded_columns {
+        let EmbeddingColumnConfig {
+            model_name,
+            chunker: chunker_opt,
+            ..
+        } = cfg;
+        tracing::trace!("Embedding column '{col}' with model {model_name}");
         let read_guard = embedding_models.read().await;
         let Some(model) = read_guard.get(model_name) else {
             tracing::debug!(
@@ -255,17 +275,19 @@ pub(crate) async fn get_embedding_columns(
             continue;
         };
 
-        let list_array = if let Some(chunker) = embedding_chunkers.get(col) {
+        let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
                 get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
-            embed_arrays.insert(format!("{col}_offsets"), Arc::new(offsets) as ArrayRef);
+            tracing::trace!("Successfully embedded column '{col}' with chunking");
+            embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = get_vectors(arr, &**model).await?;
+            tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
-        embed_arrays.insert(format!("{col}_embedding"), list_array);
+        embed_arrays.insert(embedding_col!(col), list_array);
     }
     Ok(embed_arrays)
 }

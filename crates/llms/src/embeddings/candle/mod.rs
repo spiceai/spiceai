@@ -177,9 +177,9 @@ impl Embed for CandleEmbedding {
         self.model_cfg.hidden_size
     }
 
-    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
         Some(Arc::new(RecursiveSplittingChunker::with_tokenizer_sizer(
-            &cfg,
+            cfg,
             Arc::clone(&self.tok),
         )))
     }
