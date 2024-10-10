@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use data_components::token_wrapper::{Error, Result, TokenWrapper};
+use data_components::token_provider::{Error, Result, TokenProvider};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -51,7 +51,7 @@ pub struct GitHubAppTokenProvider {
     installation_id: Arc<str>,
 }
 
-impl GitHubAppTokenWrapper {
+impl GitHubAppTokenProvider {
     #[must_use]
     pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {
         Self {
@@ -115,11 +115,7 @@ impl GitHubAppTokenWrapper {
 }
 
 #[async_trait]
-impl TokenWrapper for GitHubAppTokenWrapper {
-    fn is_refreshable(&self) -> bool {
-        true
-    }
-
+impl TokenProvider for GitHubAppTokenProvider {
     async fn get_token(&self) -> Result<String> {
         let token = {
             let read_guard = self.token.read().await;

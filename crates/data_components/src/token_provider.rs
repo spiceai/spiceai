@@ -20,8 +20,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait TokenProvider: Send + Sync {
-    fn is_refreshable(&self) -> bool;
-
     async fn get_token(&self) -> Result<String>;
 
     async fn refresh_token(&self) -> Result<()>;
@@ -31,7 +29,7 @@ pub struct StaticTokenProvider {
     token: Arc<str>,
 }
 
-impl DefaultTokenWrapper {
+impl StaticTokenProvider {
     #[must_use]
     pub fn new(token: Arc<str>) -> Self {
         Self { token }
@@ -39,11 +37,7 @@ impl DefaultTokenWrapper {
 }
 
 #[async_trait]
-impl TokenWrapper for DefaultTokenWrapper {
-    fn is_refreshable(&self) -> bool {
-        false
-    }
-
+impl TokenProvider for StaticTokenProvider {
     async fn get_token(&self) -> Result<String> {
         Ok(self.token.to_string())
     }

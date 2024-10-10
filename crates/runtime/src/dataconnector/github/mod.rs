@@ -28,7 +28,7 @@ use data_components::{
         provider::GraphQLTableProviderBuilder,
         FilterPushdownResult, GraphQLOptimizer,
     },
-    token_wrapper::{DefaultTokenWrapper, TokenWrapper},
+    token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::{
     common::Column,
@@ -38,7 +38,7 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use github_app_token_wrapper::GitHubAppTokenWrapper;
+use github_app_token_provider::GitHubAppTokenProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
@@ -58,14 +58,14 @@ use super::{
 };
 
 mod commits;
-mod github_app_token_wrapper;
+mod github_app_token_provider;
 mod issues;
 mod pull_requests;
 mod stargazers;
 
 pub struct Github {
     params: Parameters,
-    token: Option<Arc<dyn TokenWrapper>>,
+    token: Option<Arc<dyn TokenProvider>>,
 }
 
 pub struct GitHubTableGraphQLParams {
@@ -113,7 +113,7 @@ impl Github {
         let token = self
             .token
             .as_ref()
-            .map(|token| Arc::clone(token) as Arc<dyn TokenWrapper>);
+            .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
         let client = default_spice_client("application/json").boxed()?;
 
@@ -123,7 +123,7 @@ impl Github {
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
             gql_client_params.unnest_depth,
         )
-        .with_token(token)
+        .with_token_provider(token)
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
         .build(client)
@@ -167,7 +167,7 @@ impl Github {
         let token = self
             .token
             .as_ref()
-            .map(|token| Arc::clone(token) as Arc<dyn TokenWrapper>);
+            .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
         match token {
             Some(token) => Ok(GithubRestClient::new(token)),
@@ -298,12 +298,12 @@ impl DataConnectorFactory for GithubFactory {
         let private_key = params.get("private_key").expose().ok();
         let installation_id = params.get("installation_id").expose().ok();
 
-        let token_wrapper: Option<Arc<dyn TokenWrapper>> =
+        let token_provider: Option<Arc<dyn TokenProvider>> =
             match (token, client_id, private_key, installation_id) {
-                (Some(token), _, _, _) => Some(Arc::new(DefaultTokenWrapper::new(token.into()))),
+                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.into()))),
 
                 (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                    Some(Arc::new(GitHubAppTokenWrapper::new(
+                    Some(Arc::new(GitHubAppTokenProvider::new(
                         Arc::from(client_id),
                         Arc::from(private_key),
                         Arc::from(installation_id),
@@ -316,7 +316,7 @@ impl DataConnectorFactory for GithubFactory {
         Box::pin(async move {
             Ok(Arc::new(Github {
                 params,
-                token: token_wrapper,
+                token: token_provider,
             }) as Arc<dyn DataConnector>)
         })
     }

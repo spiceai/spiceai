@@ -18,7 +18,7 @@ use futures::future;
 use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
 
-use crate::{arrow::write::MemTable, token_wrapper::TokenWrapper};
+use crate::{arrow::write::MemTable, token_provider::TokenProvider};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -160,7 +160,7 @@ impl TableProvider for GithubFilesTableProvider {
 
 pub struct GithubRestClient {
     client: reqwest::Client,
-    token: Arc<dyn TokenWrapper>,
+    token: Arc<dyn TokenProvider>,
 }
 
 static SPICE_USER_AGENT: &str = "spice";
@@ -168,7 +168,7 @@ const NUM_FILE_CONTENT_DOWNLOAD_WORKERS: usize = 10;
 
 impl GithubRestClient {
     #[must_use]
-    pub fn new(token: Arc<dyn TokenWrapper>) -> Self {
+    pub fn new(token: Arc<dyn TokenProvider>) -> Self {
         let client = reqwest::Client::new();
         GithubRestClient { client, token }
     }

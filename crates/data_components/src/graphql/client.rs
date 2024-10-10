@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::token_wrapper::TokenWrapper;
+use crate::token_provider::TokenProvider;
 
 use super::{ArrowInternalSnafu, Error, ReqwestInternalSnafu, Result};
 use arrow::{
@@ -37,7 +37,7 @@ use url::Url;
 
 pub enum Auth {
     Basic(String, Option<String>),
-    Bearer(Arc<dyn TokenWrapper>),
+    Bearer(Arc<dyn TokenProvider>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -672,7 +672,7 @@ impl GraphQLClient {
         client: reqwest::Client,
         endpoint: Url,
         json_pointer: Option<&str>,
-        token: Option<Arc<dyn TokenWrapper>>,
+        token: Option<Arc<dyn TokenProvider>>,
         user: Option<String>,
         pass: Option<String>,
         unnest_depth: usize,
@@ -844,8 +844,8 @@ fn get_json_schema(
 async fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> RequestBuilder {
     match &auth {
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
-        Some(Auth::Bearer(token_wrapper)) => {
-            if let Ok(token) = token_wrapper.get_token().await {
+        Some(Auth::Bearer(token_provider)) => {
+            if let Ok(token) = token_provider.get_token().await {
                 return request_builder.bearer_auth(&token);
             }
             request_builder

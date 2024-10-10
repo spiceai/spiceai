@@ -18,7 +18,7 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::{
     graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
-    token_wrapper::{DefaultTokenWrapper, TokenWrapper},
+    token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::datasource::TableProvider;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -105,10 +105,9 @@ pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Resul
 
 impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
-        let token =
-            self.params.get("auth_token").expose().ok().map(|token| {
-                Arc::new(DefaultTokenWrapper::new(token.into())) as Arc<dyn TokenWrapper>
-            });
+        let token = self.params.get("auth_token").expose().ok().map(|token| {
+            Arc::new(StaticTokenProvider::new(token.into())) as Arc<dyn TokenProvider>
+        });
 
         let user = self
             .params
