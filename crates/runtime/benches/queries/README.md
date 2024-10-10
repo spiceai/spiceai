@@ -111,3 +111,27 @@ LIMIT 100;
 | ------------------------ | ------------------------ |
 | [q14.sql](tpcds/q14.sql) | [q23.sql](tpcds/q23.sql) |
 | [q24.sql](tpcds/q24.sql) | [q39.sql](tpcds/q39.sql) |
+
+### Runtime worker has overflowed its stack
+
+**Limitation**: On some platforms (e.g. Linux kernel 6.9.3), the Runtime will encounter a stack overflow when running certain queries.
+
+**Solution**: Increase the stack size when running `spiced`, with `RUST_MIN_STACK=8388608 spiced` to set an 8MB minimum stack size.
+
+Some platforms default to a lower minimum stack size, like 2MB, which is too small when running certain queries.
+
+**Example Error**:
+
+```bash
+thread 'tokio-runtime-worker' has overflowed its stack
+fatal runtime error: stack overflow
+[1]    77809 IOT instruction (core dumped)
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q25.sql](tpcds/q25.sql) | [q29.sql](tpcds/q29.sql) |
+| [q30.sql](tpcds/q30.sql) | [q31.sql](tpcds/q31.sql) |
+| [q33.sql](tpcds/q33.sql) | [q34.sql](tpcds/q34.sql) |
+| [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
+| [q49.sql](tpcds/q49.sql) | [q49.sql](tpcds/q49.sql) |
