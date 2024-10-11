@@ -25,6 +25,7 @@ use headers_accept::Accept;
 
 use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
+use tracing_futures::Instrument;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -60,6 +61,8 @@ pub(crate) async fn post(
     accept: Option<TypedHeader<Accept>>,
     Json(payload): Json<Request>,
 ) -> Response {
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
+
     // Get all public table CREATE TABLE statements to add to prompt.
     let tables = match df.get_public_table_names() {
         Ok(t) => t,
@@ -68,6 +71,7 @@ pub(crate) async fn post(
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
+
 
     let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
     for t in &tables {
@@ -88,22 +92,11 @@ pub(crate) async fn post(
         }
     }
 
-    // Construct prompt
-    let nsql_query = format!(
-            "```SQL\n{table_create_schemas}\n-- Using valid postgres SQL, without comments, answer the following questions for the tables provided above.\n-- {user_query}",
-            user_query=payload.query,
-            table_create_schemas=table_create_stms.join("\n")
-        );
-
-    tracing::trace!("Running prompt: {nsql_query}");
-
-    let model_id = payload.model.clone();
-
-    let sql_query_result = match llms.read().await.get(&model_id) {
+    let sql_query_result = match llms.read().await.get(&payload.model) {
         Some(nql_model) => {
             let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
             let Ok(req) =
-                sql_gen.create_request_for_query(&model_id, &payload.query, &table_create_stms)
+                sql_gen.create_request_for_query(&payload.model, &payload.query, &table_create_stms)
             else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,7 +104,7 @@ pub(crate) async fn post(
                 )
                     .into_response();
             };
-            let resp = match nql_model.chat_request(req).await {
+            let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Error running NQL model: {e}");
@@ -137,9 +130,9 @@ pub(crate) async fn post(
             sql_to_http_response(
                 Arc::clone(&df),
                 &cleaned_query,
-                Some(&nsql_query),
                 ArrowFormat::from_accept_header(&accept),
             )
+            .instrument(span.clone())
             .await
         }
         Ok(None) => {
