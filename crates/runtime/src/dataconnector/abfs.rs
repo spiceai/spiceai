@@ -14,10 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector, ParameterSpec,
-    Parameters,
-};
+use super::listing::{build_fragments, ListingTableConnector};
+use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters};
 
 use crate::component::dataset::Dataset;
 use snafu::prelude::*;
@@ -221,7 +219,7 @@ impl ListingTableConnector for AzureBlobFS {
                     message: format!("{} is not a valid URL", &dataset.from),
                 })?;
 
-        let params = super::build_fragments(
+        let params = build_fragments(
             &self.params,
             vec![
                 "account",

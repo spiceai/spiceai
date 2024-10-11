@@ -23,7 +23,7 @@ use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
 use crate::dataaccelerator::get_accelerator_engine;
 
@@ -443,6 +443,31 @@ impl Dataset {
 
         false
     }
+
+    /// Get a parameter from the dataset's params, with a default value if the parameter is not set or is not valid.
+    ///
+    /// Returns `default_value` if the parameter is not set or is not valid.
+    ///
+    /// If the parameter is set but is not valid, logs a warning and returns `default_value`.
+    #[must_use]
+    pub fn get_param<T>(&self, param: &str, default_value: T) -> T
+    where
+        T: Display + FromStr,
+    {
+        let Some(value) = self.params.get(param) else {
+            return default_value;
+        };
+
+        if let Ok(parsed_value) = value.parse::<T>() {
+            parsed_value
+        } else {
+            tracing::warn!(
+                "Dataset {}: params.{param} is not valid, defaulting to {default_value}",
+                self.name
+            );
+            default_value
+        }
+    }
 }
 
 pub mod acceleration;
@@ -471,6 +496,7 @@ mod tests {
     use datafusion_table_providers::util::column_reference::ColumnReference;
 
     use super::acceleration::{Acceleration, IndexType};
+    use super::*;
 
     #[test]
     fn test_indexes_roundtrip() {
@@ -541,5 +567,45 @@ mod tests {
             err.to_string(),
             "The column reference \"(foo,bar\" is missing a closing parenthensis."
         );
+    }
+
+    fn create_dataset_with_params(params: HashMap<String, String>) -> Dataset {
+        let mut dataset: Dataset =
+            spicepod::component::dataset::Dataset::new("test".to_string(), "test".to_string())
+                .try_into()
+                .expect("valid dataset");
+        dataset.params = params;
+        dataset
+    }
+
+    #[test]
+    fn test_get_dataset_param() {
+        // Test case 1: Parameter is not set
+        let dataset = create_dataset_with_params(HashMap::new());
+        assert!(dataset.get_param("test_param", true));
+        assert!(!dataset.get_param("test_param", false));
+
+        // Test case 2: Parameter is set to "true"
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "true".to_string());
+        let dataset = create_dataset_with_params(params);
+        assert!(dataset.get_param("test_param", false));
+
+        // Test case 3: Parameter is set to "false"
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "false".to_string());
+        let dataset = create_dataset_with_params(params);
+        assert!(!dataset.get_param("test_param", true));
+
+        // Test case 4: Parameter is set to an invalid boolean value
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "not_a_bool".to_string());
+        let dataset = create_dataset_with_params(params);
+        assert!(dataset.get_param("test_param", true));
+        assert!(!dataset.get_param("test_param", false));
+
+        // Test case 5: App is None
+        assert!(dataset.get_param("test_param", true));
+        assert!(!dataset.get_param("test_param", false));
     }
 }

@@ -14,16 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
+use spicepod::component::dataset::acceleration::Mode;
 
-use crate::results::BenchmarkResultsBuilder;
-use spicepod::component::{
-    dataset::{acceleration::Mode, Dataset},
-    params::Params,
-};
+pub(crate) mod abfs;
+pub(crate) mod s3;
+
+pub(crate) fn build_app(
+    connector: &str,
+    app_builder: AppBuilder,
+    bench_name: &str,
+) -> Result<AppBuilder, String> {
+    match connector {
+        "s3" => s3::build_app(app_builder, bench_name),
+        "abfs" => Ok(abfs::build_app(app_builder, bench_name)),
+        _ => Err(format!("Unsupported connector {connector}")),
+    }
+}
 
 pub(crate) async fn run(
+    connector: &str,
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     engine: Option<String>,
@@ -31,7 +43,7 @@ pub(crate) async fn run(
     bench_name: &str,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
-        "tpch" => get_test_queries(),
+        "tpch" => get_tpch_test_queries(),
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             if engine.clone().unwrap_or_default().as_str() == "postgres" {
@@ -44,17 +56,33 @@ pub(crate) async fn run(
     };
 
     let bench_name = match mode {
-        Some(mode) => format!("s3_{}_{}", engine.unwrap_or_default(), mode).to_lowercase(),
-        None => "s3".to_string(),
+        Some(mode) => {
+            format!("{}_{}_{}", connector, engine.unwrap_or_default(), mode).to_lowercase()
+        }
+        None => connector.to_string(),
     };
 
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        let verify_query_results = (matches!(
-            bench_name.as_str(),
-            "s3" | "s3_arrow_memory" | "s3_sqlite_memory" | "s3_sqlite_file" | "s3_duckdb_memory"
-        )) && query_name.starts_with("tpch_q");
+        let verify_query_results = if query_name.starts_with("tpch_q") {
+            matches!(
+                bench_name.as_str(),
+                "s3" | "s3_arrow_memory"
+                    | "s3_sqlite_memory"
+                    | "s3_sqlite_file"
+                    | "s3_duckdb_memory"
+                    | "abfs"
+                    | "s3_duckdb_file"
+            )
+        } else if query_name.starts_with("tpcds_q") {
+            matches!(
+                bench_name.as_str(),
+                "s3_postgres_memory" | "s3_arrow_memory"
+            )
+        } else {
+            false
+        };
 
         if let Err(e) = super::run_query_and_record_result(
             rt,
@@ -77,139 +105,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> AppBuilder {
-    match bench_name {
-        "tpch" => app_builder
-            .with_dataset(make_dataset(
-                "spiceai-demo-datasets/tpch/customer/",
-                "customer",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-demo-datasets/tpch/lineitem/",
-                "lineitem",
-            ))
-            .with_dataset(make_dataset("spiceai-demo-datasets/tpch/part/", "part"))
-            .with_dataset(make_dataset(
-                "spiceai-demo-datasets/tpch/partsupp/",
-                "partsupp",
-            ))
-            .with_dataset(make_dataset("spiceai-demo-datasets/tpch/orders/", "orders"))
-            .with_dataset(make_dataset("spiceai-demo-datasets/tpch/nation/", "nation"))
-            .with_dataset(make_dataset("spiceai-demo-datasets/tpch/region/", "region"))
-            .with_dataset(make_dataset(
-                "spiceai-demo-datasets/tpch/supplier/",
-                "supplier",
-            )),
-        "tpcds" => app_builder
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/call_center/",
-                "call_center",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/catalog_page/",
-                "catalog_page",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/catalog_sales/",
-                "catalog_sales",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/catalog_returns/",
-                "catalog_returns",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/income_band/",
-                "income_band",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/inventory/",
-                "inventory",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/store_sales/",
-                "store_sales",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/store_returns/",
-                "store_returns",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/web_sales/",
-                "web_sales",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/web_returns/",
-                "web_returns",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/customer/",
-                "customer",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/customer_address/",
-                "customer_address",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/customer_demographics/",
-                "customer_demographics",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/date_dim/",
-                "date_dim",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/household_demographics/",
-                "household_demographics",
-            ))
-            .with_dataset(make_dataset("spiceai-public-datasets/tpcds/item/", "item"))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/promotion/",
-                "promotion",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/reason/",
-                "reason",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/ship_mode/",
-                "ship_mode",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/store/",
-                "store",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/time_dim/",
-                "time_dim",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/warehouse/",
-                "warehouse",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/web_page/",
-                "web_page",
-            ))
-            .with_dataset(make_dataset(
-                "spiceai-public-datasets/tpcds/web_site/",
-                "web_site",
-            )),
-        _ => panic!("Only tpcds or tpch benchmark suites are supported"),
-    }
-}
-
-fn make_dataset(path: &str, name: &str) -> Dataset {
-    let mut dataset = Dataset::new(format!("s3://{path}"), name.to_string());
-    dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "parquet".to_string())]
-            .into_iter()
-            .collect(),
-    ));
-    dataset
-}
-
-fn get_test_queries() -> Vec<(&'static str, &'static str)> {
+fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
         ("tpch_q2", include_str!("../queries/tpch/q2.sql")),

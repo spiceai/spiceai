@@ -87,13 +87,19 @@ impl Openai {
             model,
         }
     }
+
+    /// Returns true if the `OpenAI` compatible model supports [structured outputs](https://platform.openai.com/docs/guides/structured-outputs/).
+    /// This is only supported for GPT-4o models from `OpenAI` (i.e not any other compatible servers).
+    fn supports_structured_output(&self) -> bool {
+        self.client.config().api_base() == OPENAI_API_BASE && self.model.starts_with("gpt-4o")
+    }
 }
 
 #[async_trait]
 impl Chat for Openai {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
-        if self.client.config().api_base() == OPENAI_API_BASE {
+        if self.supports_structured_output() {
             Some(&StructuredOutputSqlGeneration {})
         } else {
             Some(&JsonSchemaSqlGeneration {})
@@ -261,16 +267,16 @@ impl Embed for Openai {
         match self.model.as_str() {
             "text-embedding-3-large" => 3_072,
             "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
-            _ => 0, // unreachable. If not a valid model, it won't create embeddings.
+            _ => -1, // unreachable. Will be inferred.
         }
     }
 
-    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
-        match RecursiveSplittingChunker::for_openai_model(&self.model, &cfg) {
+    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        match RecursiveSplittingChunker::for_openai_model(&self.model, cfg) {
             None => {
                 tracing::warn!("Embedding model {} cannot use specialised chunk sizer, will use character sizer instead.", self.model);
                 Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
-                    &cfg,
+                    cfg,
                 )))
             }
             Some(chunker) => Some(Arc::new(chunker)),

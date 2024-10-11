@@ -3057,7 +3057,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=7c69f7bc5d4f67469aaa215650e89000941d6915#7c69f7bc5d4f67469aaa215650e89000941d6915"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=f1e7b17755d96b30bafb4d185467ca4c55f85aec#f1e7b17755d96b30bafb4d185467ca4c55f85aec"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -3069,7 +3069,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=7c69f7bc5d4f67469aaa215650e89000941d6915#7c69f7bc5d4f67469aaa215650e89000941d6915"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=f1e7b17755d96b30bafb4d185467ca4c55f85aec#f1e7b17755d96b30bafb4d185467ca4c55f85aec"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -3312,7 +3312,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=826814ab149aad8ee668454c83a0650fb8b18d60#826814ab149aad8ee668454c83a0650fb8b18d60"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c058f1e1fe4391a47b985c485eee91b3b41e1172#c058f1e1fe4391a47b985c485eee91b3b41e1172"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4094,6 +4094,7 @@ dependencies = [
  "rustyline",
  "serde_json",
  "tonic",
+ "winver",
 ]
 
 [[package]]
@@ -5097,7 +5098,7 @@ checksum = "f9c7c7c8ac16c798734b8a24560c1362120597c40d5e1459f09498f8f6c8f2ba"
 dependencies = [
  "cfg-if",
  "libc",
- "windows",
+ "windows 0.52.0",
 ]
 
 [[package]]
@@ -9028,6 +9029,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow",
+ "arrow-csv",
  "arrow-flight",
  "arrow-ipc",
  "arrow-json",
@@ -9080,6 +9082,7 @@ dependencies = [
  "indexmap 2.6.0",
  "insta",
  "itertools 0.13.0",
+ "jsonwebtoken",
  "keyring",
  "lazy_static",
  "llms",
@@ -10408,7 +10411,7 @@ dependencies = [
  "ntapi",
  "once_cell",
  "rayon",
- "windows",
+ "windows 0.52.0",
 ]
 
 [[package]]
@@ -10545,9 +10548,9 @@ dependencies = [
 
 [[package]]
 name = "text-splitter"
-version = "0.16.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f280573deec490e745c503ecc1d0e17104e98936eaefd7b0aa4b1422c74b317"
+checksum = "18de70043bbcea07a78e6228e5a406157171b23633afe7fc9fade1003bb8dae9"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
@@ -11963,6 +11966,15 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e686886bc078bc1b0b600cac0147aadb815089b6e4da64016cbd754b6342700f"
+dependencies = [
+ "windows-targets 0.48.5",
+]
+
+[[package]]
+name = "windows"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e48a53791691ab099e5e2ad123536d0fff50652600abaf43bbf952894110d0be"
@@ -12290,6 +12302,15 @@ checksum = "524e57b2c537c0f9b1e69f1965311ec12182b4122e45035b1508cd24d2adadb1"
 dependencies = [
  "cfg-if",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "winver"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e0e7162b9e282fd75a0a832cce93994bdb21208d848a418cd05a5fdd9b9ab33"
+dependencies = [
+ "windows 0.48.0",
 ]
 
 [[package]]

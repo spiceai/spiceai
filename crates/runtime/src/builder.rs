@@ -135,7 +135,7 @@ impl RuntimeBuilder {
 
         let df = match self.datafusion {
             Some(df) => df,
-            None => Arc::new(DataFusion::new(Arc::clone(&status))),
+            None => Arc::new(DataFusion::builder(Arc::clone(&status)).build()),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {

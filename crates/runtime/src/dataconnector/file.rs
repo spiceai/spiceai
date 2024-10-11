@@ -32,8 +32,8 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
-    ListingTableConnector, ParameterSpec, Parameters,
+    listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
+    InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
 pub struct File {

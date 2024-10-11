@@ -23,18 +23,22 @@ use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
     graphql::{
+        builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
         FilterPushdownResult, GraphQLOptimizer,
     },
+    token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::{
+    common::Column,
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{Operator, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
 };
+use github_app_token_provider::GitHubAppTokenProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
@@ -54,12 +58,14 @@ use super::{
 };
 
 mod commits;
+mod github_app_token_provider;
 mod issues;
 mod pull_requests;
 mod stargazers;
 
 pub struct Github {
     params: Parameters,
+    token: Option<Arc<dyn TokenProvider>>,
 }
 
 pub struct GitHubTableGraphQLParams {
@@ -100,26 +106,27 @@ impl Github {
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
-        let access_token = self.params.get("token").expose().ok();
-
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err("Github 'endpoint' not provided".into());
         };
+
+        let token = self
+            .token
+            .as_ref()
+            .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
         let client = default_spice_client("application/json").boxed()?;
 
         let gql_client_params = tbl.get_graphql_values();
 
-        GraphQLClient::new(
-            client,
+        GraphQLClientBuilder::new(
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
-            gql_client_params.json_pointer,
-            access_token,
-            None,
-            None,
             gql_client_params.unnest_depth,
-            gql_client_params.schema,
         )
+        .with_token_provider(token)
+        .with_json_pointer(gql_client_params.json_pointer)
+        .with_schema(gql_client_params.schema)
+        .build(client)
         .boxed()
     }
 
@@ -157,11 +164,15 @@ impl Github {
     pub(crate) fn create_rest_client(
         &self,
     ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(access_token) = self.params.get("token").expose().ok() else {
-            return Err("Github token not provided".into());
-        };
+        let token = self
+            .token
+            .as_ref()
+            .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
-        Ok(GithubRestClient::new(access_token))
+        match token {
+            Some(token) => Ok(GithubRestClient::new(token)),
+            None => Err("Github token not provided".into()),
+        }
     }
 
     async fn create_files_table_provider(
@@ -254,6 +265,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token")
         .description("A Github token.")
         .secret(),
+    ParameterSpec::connector("client_id")
+        .description("The Github App Client ID.")
+        .secret(),
+    ParameterSpec::connector("private_key")
+        .description("The Github App private key.")
+        .secret(),
+    ParameterSpec::connector("installation_id")
+        .description("The Github App installation ID.")
+        .secret(),
     ParameterSpec::connector("query_mode")
         .description(
             "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
@@ -273,7 +293,32 @@ impl DataConnectorFactory for GithubFactory {
         params: Parameters,
         _metadata: Option<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(Github { params }) as Arc<dyn DataConnector>) })
+        let token = params.get("token").expose().ok();
+        let client_id = params.get("client_id").expose().ok();
+        let private_key = params.get("private_key").expose().ok();
+        let installation_id = params.get("installation_id").expose().ok();
+
+        let token_provider: Option<Arc<dyn TokenProvider>> =
+            match (token, client_id, private_key, installation_id) {
+                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.into()))),
+
+                (None, Some(client_id), Some(private_key), Some(installation_id)) => {
+                    Some(Arc::new(GitHubAppTokenProvider::new(
+                        Arc::from(client_id),
+                        Arc::from(private_key),
+                        Arc::from(installation_id),
+                    )))
+                }
+
+                _ => None,
+            };
+
+        Box::pin(async move {
+            Ok(Arc::new(Github {
+                params,
+                token: token_provider,
+            }) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {
@@ -557,13 +602,18 @@ lazy_static! {
             },
         );
 
+        m.insert("labels", GitHubPushdownSupport {
+            ops: vec![Operator::LikeMatch],
+            remaps: Some(vec![GitHubFilterRemap::Column("label")]),
+            uses_modifiers: false
+        });
+
         m
     };
 }
 
-#[allow(clippy::too_many_lines)]
-pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
-    let column_matches = match expr {
+fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
+    match expr {
         Expr::BinaryExpr(binary_expr) => {
             match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
                 (Expr::Column(column), Expr::Literal(value))
@@ -587,8 +637,25 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             }
             _ => None,
         },
+        Expr::ScalarFunction(func) => {
+            if func.args.len() != 2 || !func.func.aliases().contains(&"list_contains".to_string()) {
+                None
+            } else {
+                match (func.args[0].clone(), func.args[1].clone()) {
+                    (Expr::Column(column), Expr::Literal(value))
+                    | (Expr::Literal(value), Expr::Column(column)) => {
+                        Some((column, value, Operator::LikeMatch))
+                    }
+                    _ => None,
+                }
+            }
+        }
         _ => None,
-    };
+    }
+}
+
+pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
+    let column_matches = expr_to_match(expr);
 
     if let Some((column, value, op)) = column_matches {
         if let Some(column_support) = GITHUB_FILTER_PUSHDOWNS_SUPPORTED.get(column.name.as_str()) {
@@ -625,16 +692,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             let value = match value {
                 ScalarValue::Utf8(Some(v)) => {
                     if column.name == "state" {
-                        // "state" in GitHub search is odd
-                        // it returns values for CLOSED, MERGED and OPEN
-                        // but you can only search with either closed or open (in lowercase as well)
-                        if v.to_lowercase() == "merged" {
-                            "closed".to_string() // so merged gets remapped to closed
-                                                 // and because the filter is Inexact, we expect the Memtable to do the final filter to find only MERGED items
-                                                 // not the best, but its better filtering than nothing
-                        } else {
-                            v.to_lowercase()
-                        }
+                        v.to_lowercase()
                     } else {
                         v
                     }
@@ -681,6 +739,9 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             let parameter = match column_name {
                 "title" => format!("{value} in:title"),
                 "body" => format!("{value} in:body"),
+                "state" => format!("is:{value}"), // is:merged, is:closed, is:open provides more granular results than state:closed
+                // state:closed returns both closed and merged PRs, but is:merged returns only merged PRs
+                // is:closed still returns both closed and merged PRs
                 _ => format!("{neq}{column_name}:{modifier}{value}"),
             };
 
