@@ -53,7 +53,6 @@ impl DataFusionBuilder {
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
-        df_config.options_mut().execution.keep_partition_by_columns = true;
         df_config
             .options_mut()
             .execution
@@ -69,15 +68,6 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_cache_provider(mut self, cache_provider: Arc<QueryResultsCacheProvider>) -> Self {
         self.cache_provider = Some(cache_provider);
-        self
-    }
-
-    #[must_use]
-    pub fn keep_partition_by_columns(mut self, keep_partition_by_columns: bool) -> Self {
-        self.config
-            .options_mut()
-            .execution
-            .keep_partition_by_columns = keep_partition_by_columns;
         self
     }
 

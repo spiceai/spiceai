@@ -34,6 +34,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::query::{write_to_json_string, Protocol};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
+use crate::{embedding_col, offset_col};
 
 use super::table::EmbeddingTable;
 use snafu::prelude::*;
@@ -281,7 +282,7 @@ impl VectorSearch {
         }
     }
 
-    fn construct_chunk_query(
+    fn construct_chunk_query_sql(
         primary_keys: &[String],
         projection: &[String],
         embedding_column: &str,
@@ -314,8 +315,8 @@ impl VectorSearch {
                     FROM (
                         SELECT
                             {pks},
-                            unnest({embed_col}_offsets) AS offset,
-                            cosine_distance(unnest({embed_col}_embedding), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                            unnest({embed_col_offset}) AS offset,
+                            cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
                         FROM {table_name}
                         {where_cond}
                     )
@@ -330,6 +331,8 @@ impl VectorSearch {
             FROM ranked_docs rd
             JOIN {table_name} t ON {join_on_conditions}",
                 embed_col=quote_identifier(embedding_column).to_string(),
+                embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
+                embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string()),
                 pks = pks.iter().join(", "),
                 projection_str = projection.iter()
                     .map(|s| format!("t.{s}"))
@@ -366,7 +369,7 @@ impl VectorSearch {
         let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
 
         let query = if is_chunked {
-            Self::construct_chunk_query(
+            Self::construct_chunk_query_sql(
                 primary_keys,
                 &projection,
                 embedding_column,
@@ -688,7 +691,7 @@ impl VectorSearch {
 
         // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
         let mut embedded_inputs: HashMap<ModelKey, Vec<f32>> = HashMap::new();
-        for model in embeddings_to_run.values().flatten() {
+        for model in embeddings_to_run.values().flatten().unique() {
             let result = self
                 .embed(&query, model)
                 .await

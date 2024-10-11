@@ -267,16 +267,16 @@ impl Embed for Openai {
         match self.model.as_str() {
             "text-embedding-3-large" => 3_072,
             "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
-            _ => 0, // unreachable. If not a valid model, it won't create embeddings.
+            _ => -1, // unreachable. Will be inferred.
         }
     }
 
-    fn chunker(&self, cfg: ChunkingConfig) -> Option<Arc<dyn Chunker>> {
-        match RecursiveSplittingChunker::for_openai_model(&self.model, &cfg) {
+    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+        match RecursiveSplittingChunker::for_openai_model(&self.model, cfg) {
             None => {
                 tracing::warn!("Embedding model {} cannot use specialised chunk sizer, will use character sizer instead.", self.model);
                 Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
-                    &cfg,
+                    cfg,
                 )))
             }
             Some(chunker) => Some(Arc::new(chunker)),

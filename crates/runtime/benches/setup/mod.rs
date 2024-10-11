@@ -60,10 +60,10 @@ pub(crate) async fn setup_benchmark(
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
-) -> (BenchmarkResultsBuilder, Runtime) {
+) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
     init_tracing();
 
-    let app = build_app(upload_results_dataset, connector, acceleration, bench_name);
+    let app = build_app(upload_results_dataset, connector, acceleration, bench_name)?;
 
     let status = status::RuntimeStatus::new();
     let rt = Runtime::builder()
@@ -85,7 +85,7 @@ pub(crate) async fn setup_benchmark(
     let benchmark_results =
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
 
-    (benchmark_results, rt)
+    Ok((benchmark_results, rt))
 }
 
 async fn runtime_ready_check(rt: &Runtime) {
@@ -127,26 +127,27 @@ fn build_app(
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
-) -> App {
+) -> Result<App, String> {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test");
 
     app_builder = match connector {
-        "spice.ai" => crate::bench_spicecloud::build_app(app_builder),
-        "s3" => crate::bench_s3::build_app(app_builder, bench_name),
+        "spice.ai" => Ok(crate::bench_spicecloud::build_app(app_builder)),
+        // Run both S3, ABFS and any other object store benchmarks
+        "s3" | "abfs" => crate::bench_object_store::build_app(connector, app_builder, bench_name),
         #[cfg(feature = "spark")]
-        "spark" => crate::bench_spark::build_app(app_builder),
+        "spark" => Ok(crate::bench_spark::build_app(app_builder)),
         #[cfg(feature = "postgres")]
-        "postgres" => crate::bench_postgres::build_app(app_builder),
+        "postgres" => Ok(crate::bench_postgres::build_app(app_builder)),
         #[cfg(feature = "mysql")]
         "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
-        "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder),
+        "odbc-databricks" => Ok(crate::bench_odbc_databricks::build_app(app_builder)),
         #[cfg(feature = "odbc")]
-        "odbc-athena" => crate::bench_odbc_athena::build_app(app_builder),
+        "odbc-athena" => Ok(crate::bench_odbc_athena::build_app(app_builder)),
         #[cfg(feature = "delta_lake")]
-        "delta_lake" => crate::bench_delta::build_app(app_builder),
-        _ => app_builder,
-    };
+        "delta_lake" => Ok(crate::bench_delta::build_app(app_builder)),
+        _ => Err(format!("Unknown connector: {connector}")),
+    }?;
 
     if let Some(upload_results_dataset) = upload_results_dataset {
         app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
@@ -170,7 +171,7 @@ fn build_app(
         });
     }
 
-    app
+    Ok(app)
 }
 
 #[allow(clippy::too_many_lines)]

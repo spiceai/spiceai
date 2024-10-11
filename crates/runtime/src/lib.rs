@@ -1284,7 +1284,7 @@ impl Runtime {
 
     #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
-    async fn load_embedding(&self, in_embed: &Embeddings) -> Result<Box<dyn Embed>> {
+    async fn load_embedding(&self, in_embed: &Embeddings) -> Result<TaskEmbed> {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
 
         let l = try_to_embedding(in_embed, &params_with_secrets)
@@ -1294,7 +1294,11 @@ impl Runtime {
             .await
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
-        Ok(l)
+
+        TaskEmbed::new(l)
+            .await
+            .boxed()
+            .context(UnableToInitializeEmbeddingModelSnafu)
     }
 
     #[allow(dead_code)]
@@ -1314,8 +1318,7 @@ impl Runtime {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
 
-                        let m = Box::new(TaskEmbed::new(e)) as Box<dyn Embed>;
-                        embeds_map.insert(in_embed.name.clone(), m);
+                        embeds_map.insert(in_embed.name.clone(), Box::new(e) as Box<dyn Embed>);
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
                         metrics::embeddings::COUNT.add(

@@ -118,6 +118,7 @@ url = "2.5.0"
 util = { path = "../util" }
 uuid.workspace = true
 x509-certificate.workspace = true
+jsonwebtoken = "9.3.0"
 
 [dev-dependencies]
 anyhow = "1.0.86"

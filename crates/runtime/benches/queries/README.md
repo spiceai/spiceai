@@ -28,6 +28,79 @@ SELECT (now() + INTERVAL '30 days');
 | [q94.sql](tpcds/q94.sql) | [q95.sql](tpcds/q95.sql) | [q98.sql](tpcds/q98.sql) |
 | [q72.sql](tpcds/q72.sql) |                          |                          |
 
+### `EXCEPT` and `INTERSECT` keywords are not supported
+
+**Limitation**: There is an error `syntax error at or near "ANTI"` when `EXCEPT` is used, and a `syntax error at or near "SEMI"` in the case of `INTERSECT`
+**Solution**: Use `DISTINCT` and `IN`/`NOT IN` instead
+
+```sql
+# fail
+SELECT ws_item_sk FROM web_sales
+INTERSECT
+SELECT ss_item_sk FROM store_sales;
+
+# success
+SELECT DISTINCT ws_item_sk FROM web_sales
+WHERE ws_item_sk IN (
+    SELECT DISTINCT ss_item_sk FROM store_sales
+);
+
+# fail
+SELECT ws_item_sk FROM web_sales
+EXCEPT
+SELECT ss_item_sk FROM store_sales;
+
+# success
+SELECT DISTINCT ws_item_sk FROM web_sales
+WHERE ws_item_sk NOT IN (
+    SELECT DISTINCT ss_item_sk FROM store_sales
+);
+```
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q8.sql](tpcds/q8.sql)   | [q38.sql](tpcds/q38.sql) |
+| [q14.sql](tpcds/q14.sql) | [q87.sql](tpcds/q87.sql) |
+
+### Projections require unique expression names
+
+**Limitation**: When performing multiple operations on the same column, each result must have a unique name. If multiple expressions produce identical names in the SELECT clause, the query will fail
+**Solution**: Use aliases for duplicate duplicate expression names
+
+```sql
+# fail
+SELECT
+  cd_gender,
+  cd_dep_count,
+  STDDEV_SAMP(cd_dep_count),
+  STDDEV_SAMP(cd_dep_count)
+FROM
+  customer_demographics
+GROUP BY
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count
+LIMIT 100;
+
+# success
+SELECT
+  cd_gender,
+  cd_dep_count,
+  STDDEV_SAMP(cd_dep_count) AS stddev_dep_count_1,
+  STDDEV_SAMP(cd_dep_count) AS stddev_dep_count_2
+FROM
+  customer_demographics
+GROUP BY
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count
+LIMIT 100;
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q35.sql](tpcds/q35.sql) | |
+
+
 ### DataFusion Supports Only Single SQL Statement per Query
 
 **Limitation**: DataFusion does not support multiple SQL statements within a single query.
@@ -38,3 +111,27 @@ SELECT (now() + INTERVAL '30 days');
 | ------------------------ | ------------------------ |
 | [q14.sql](tpcds/q14.sql) | [q23.sql](tpcds/q23.sql) |
 | [q24.sql](tpcds/q24.sql) | [q39.sql](tpcds/q39.sql) |
+
+### Runtime worker has overflowed its stack
+
+**Limitation**: On some platforms (e.g. Linux kernel 6.9.3), the Runtime will encounter a stack overflow when running certain queries.
+
+**Solution**: Increase the stack size when running `spiced`, with `RUST_MIN_STACK=8388608 spiced` to set an 8MB minimum stack size.
+
+Some platforms default to a lower minimum stack size, like 2MB, which is too small when running certain queries.
+
+**Example Error**:
+
+```bash
+thread 'tokio-runtime-worker' has overflowed its stack
+fatal runtime error: stack overflow
+[1]    77809 IOT instruction (core dumped)
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q25.sql](tpcds/q25.sql) | [q29.sql](tpcds/q29.sql) |
+| [q30.sql](tpcds/q30.sql) | [q31.sql](tpcds/q31.sql) |
+| [q33.sql](tpcds/q33.sql) | [q34.sql](tpcds/q34.sql) |
+| [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
+| [q49.sql](tpcds/q49.sql) | [q49.sql](tpcds/q49.sql) |

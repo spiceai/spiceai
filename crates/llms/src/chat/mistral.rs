@@ -225,7 +225,7 @@ impl MistralLlama {
         Device::cuda_if_available(0).unwrap_or(default_device)
     }
 
-    pub fn from_hf(model_id: &str, arch: &str) -> Result<Self> {
+    pub fn from_hf(model_id: &str, arch: &str, hf_token_literal: Option<String>) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
         let loader_type = mistralrs::NormalLoaderType::from_str(arch).map_err(|_| {
@@ -241,12 +241,15 @@ impl MistralLlama {
             Some(model_parts[0].to_string()),
         );
         let device = Self::get_device();
+
+        let token_source = hf_token_literal.map_or(TokenSource::CacheToken, TokenSource::Literal);
+
         let pipeline = builder
             .build(Some(loader_type))
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
-                TokenSource::CacheToken,
+                token_source,
                 &ModelDType::Auto,
                 &device,
                 false,
