@@ -137,22 +137,17 @@ fatal runtime error: stack overflow
 | [q49.sql](tpcds/q49.sql) | [q49.sql](tpcds/q49.sql) |
 
 
-### PostgreSQL does not support a column alias in a CASE statement
+### PostgreSQL does not support using a column alias in a CASE statement
 
-**Limitation**: PostgreSQL does not support a column alias to be referenced in a `CASE` statement, for example `case when lochierarchy = 0 then i_category end,`, where `lochierarchy` is defined as `SELECT grouping(i_category)+grouping(i_class) as lochierarchy`
-**Solution**: Replace the alias with the actual column name or expression from the SELECT statement
+**Limitation**: PostgreSQL does not allow a column alias to be referenced in a `CASE` statement. For example, `CASE WHEN lochierarchy = 0 THEN i_category END`, where `lochierarchy` is defined as `SELECT GROUPING(i_category) + GROUPING(i_class) AS lochierarchy`.
+**Solution**: Replace the alias with the actual column name or expression from the `SELECT` statement
 
 ```sql
 # fail
 select
-    sum(ws_net_paid) as total_sum
-   ,i_category
+  i_category
    ,i_class
    ,grouping(i_category)+grouping(i_class) as lochierarchy
-   ,rank() over (
- 	partition by grouping(i_category)+grouping(i_class),
- 	case when grouping(i_class) = 0 then i_category end
- 	order by sum(ws_net_paid) desc) as rank_within_parent
  from
     web_sales
    ,date_dim       d1
@@ -164,21 +159,16 @@ select
  group by rollup(i_category,i_class)
  order by
    lochierarchy desc,
-   case when lochierarchy = 0 then i_category end,
-   rank_within_parent
+   case when lochierarchy = 0 then i_category end
   LIMIT 100;
 ```
 
 ```sql
+# success
 select
-    sum(ws_net_paid) as total_sum
-   ,i_category
+  i_category
    ,i_class
    ,grouping(i_category)+grouping(i_class) as lochierarchy
-   ,rank() over (
- 	partition by grouping(i_category)+grouping(i_class),
- 	case when grouping(i_class) = 0 then i_category end
- 	order by sum(ws_net_paid) desc) as rank_within_parent
  from
     web_sales
    ,date_dim       d1
@@ -190,8 +180,7 @@ select
  group by rollup(i_category,i_class)
  order by
    lochierarchy desc,
-   case when grouping(i_category)+grouping(i_class) = 0 then i_category end,
-   rank_within_parent
+   case when grouping(i_category)+grouping(i_class) = 0 then i_category end
   LIMIT 100;
 ```
 
