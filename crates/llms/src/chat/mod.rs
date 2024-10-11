@@ -11,7 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::ChatCompletionRequestAssistantMessageContent;
+use async_openai::types::{
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageArgs,
+    CreateChatCompletionRequestArgs,
+};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -19,7 +22,7 @@ use nsql::SqlGeneration;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
@@ -364,7 +367,36 @@ pub fn message_to_mistral(
 #[async_trait]
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
-    async fn run(&self, prompt: String) -> Result<Option<String>>;
+    async fn run(&self, prompt: String) -> Result<Option<String>> {
+        let span = tracing::Span::current();
+
+        async move {
+            let req = CreateChatCompletionRequestArgs::default()
+                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                    .content(prompt)
+                    .build()
+                    .boxed()
+                    .context(FailedToLoadTokenizerSnafu)?
+                    .into()])
+                .build()
+                .boxed()
+                .context(FailedToLoadModelSnafu)?;
+
+            let resp = self
+                .chat_request(req)
+                .await
+                .boxed()
+                .context(FailedToRunModelSnafu)?;
+
+            Ok(resp
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content))
+        }
+        .instrument(span)
+        .await
+    }
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
@@ -377,9 +409,7 @@ pub trait Chat: Sync + Send {
                 messages: vec![ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
                         name: None,
-                        content: ChatCompletionRequestUserMessageContent::Text(
-                            "ping.".to_string(),
-                        ),
+                        content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
                     },
                 )],
                 ..Default::default()

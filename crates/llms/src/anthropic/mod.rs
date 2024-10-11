@@ -22,15 +22,16 @@ use std::sync::LazyLock;
 
 mod chat;
 mod types;
+mod types_stream;
 
 pub use types::AnthropicModelVariant;
 
 pub struct Anthropic {
     client: Client<AnthropicConfig>,
     model: AnthropicModelVariant,
-    
+
     // The name of the model as known in the spice runtime (not the anthropic model).
-    name: String
+    name: String,
 }
 
 static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
@@ -39,11 +40,15 @@ static ANTHROPIC_API_VERSION: &str = "2023-06-01";
 static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(String::new()));
 
 impl Anthropic {
-    pub fn new<S: Into<AnthropicModelVariant>>(config: AnthropicConfig, model: S, name: &str) -> Self {
+    pub fn new<S: Into<AnthropicModelVariant>>(
+        config: AnthropicConfig,
+        model: S,
+        name: &str,
+    ) -> Self {
         Self {
             client: Client::<AnthropicConfig>::with_config(config),
             model: model.into(),
-            name: name.to_string()
+            name: name.to_string(),
         }
     }
 }

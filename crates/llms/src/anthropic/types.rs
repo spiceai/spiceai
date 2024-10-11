@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_openai::error::OpenAIError;
-use serde::{Serialize, Serializer, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fmt, str::FromStr};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,11 +71,21 @@ pub enum ContentParam {
     Blocks(Vec<ContentBlock>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     User,
     Assistant,
+}
+
+impl MessageRole {
+    pub fn from_opt(r: &str) -> Option<Self> {
+        match r {
+            "user" => Some(MessageRole::User),
+            "assistant" => Some(MessageRole::Assistant),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

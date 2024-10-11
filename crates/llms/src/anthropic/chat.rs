@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use core::panic;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -22,31 +25,22 @@ use crate::chat::nsql::SqlGeneration;
 use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionToolType, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall, Role,
-    Stop,
+    ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall, Role, Stop
 };
 
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use mistralrs::ChatCompletionResponse;
 use snafu::ResultExt;
 use tracing_futures::Instrument;
 
 use super::types::{
-    ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse, MessageParam,
-    MessageRole, MetadataParam, AnthropicModelVariant, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolResultBlockParam, ToolUseBlockParam,
+    AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
+    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
+    ToolResultBlockParam, ToolUseBlockParam, Usage,
 };
+use super::types_stream::{ContentBlock as StreamContentBlock, ContentBlockToolUse, MessageCreateStreamResponse, MessageDelta, MessageStartMessage};
 use super::Anthropic;
 
 #[async_trait]
@@ -55,38 +49,155 @@ impl Chat for Anthropic {
         None
     }
 
-    async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
-        Err(ChatError::UnsupportedModalityType {
-            modality: "run".to_string(),
-        })
-    }
-
-    async fn stream<'a>(
-        &self,
-        prompt: String,
-    ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
-        Err(ChatError::UnsupportedModalityType {
-            modality: "stream".to_string(),
-        })
-    }
-
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        Err(OpenAIError::InvalidArgument("()".to_string()))
+        if req.stream.is_some_and(|b| !b) {
+            return Err(OpenAIError::InvalidArgument(
+                "When stream is false, use Chat::create".into(),
+            ));
+        }
+
+
+
+        let mut anth_req = MessageCreateParams::try_from((self.model.clone(), req))?;
+        anth_req.stream = Some(true);
+
+        let stream: Pin<
+            Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>,
+        > = self.client.post_stream("/messages", anth_req).await;
+
+        let mut id: Option<String> = None;
+        let mut role: Option<MessageRole> = None;
+        let mut usage: Option<CompletionUsage> = None;
+        let model = self.name.to_string();
+
+        // Anthropic only provides the index of the tool call parts and tool details with the first tool delta, not any subsequent.
+        // Format:
+        //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
+        //  Subsequent Messages: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}
+        // 
+        // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
+        // Map `.index` to `.content_block`
+        let mut tool_id_to_content_block = HashMap::<u32, ContentBlockToolUse>::new();
+
+        // Map `.index` to incremental position of tool delta
+        let mut tool_id_to_tool_delta_idx = HashMap::<u32, i32>::new();
+
+        let transformed_stream = stream.map_ok(|o| match o {
+            MessageCreateStreamResponse::MessageStart {
+                message:
+                    MessageStartMessage {
+                        id: inner_id,
+                        role: inner_role,
+                        stop_sequence,
+                        usage: inner_usage,
+                        content,
+                        stop_reason,..
+                    },
+            } => {
+                role = MessageRole::from_opt(&inner_role);
+                id = Some(inner_id);
+                usage = Some(CompletionUsage {
+                    prompt_tokens: inner_usage.input_tokens,
+                    completion_tokens: inner_usage.output_tokens,
+                    total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
+                });
+
+                return CreateChatCompletionStreamResponse {
+                    id: id.clone().unwrap_or_default(),
+                    created: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as u32,
+                    model: model.clone(),
+                    service_tier: None,
+                    system_fingerprint: None,
+                    object: "chat.completion.chunk".to_string(),
+                    usage: None,
+                    choices: vec![],
+                }
+            },
+            MessageCreateStreamResponse::ContentBlockStart { index, content_block } => {
+                if let StreamContentBlock::ToolUse(t) = content_block {
+                    tool_id_to_content_block.insert(index, t);
+                    tool_id_to_tool_delta_idx.insert(index, 0);
+                };
+                return CreateChatCompletionStreamResponse {
+                    id: id.clone().unwrap_or_default(),
+                    created: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as u32,
+                    model: model.clone(),
+                    service_tier: None,
+                    system_fingerprint: None,
+                    object: "chat.completion.chunk".to_string(),
+                    usage: None,
+                    choices: vec![ChatChoiceStream{ index, delta: content_block.into_completion(), finish_reason: None, logprobs: None }],
+                }
+            },
+            MessageCreateStreamResponse::ContentBlockDelta{ index, delta } => {
+                let tool_idx = match tool_id_to_tool_delta_idx.get(&index) {
+                    Some(i) => *i,
+                    None => 0,
+                };
+                tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
+
+                return CreateChatCompletionStreamResponse {
+                    id: id.clone().unwrap_or_default(),
+                    created: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as u32,
+                    model: model.clone(),
+                    service_tier: None,
+                    system_fingerprint: None,
+                    object: "chat.completion.chunk".to_string(),
+                    usage: None,
+                    choices: vec![ChatChoiceStream{
+                        index,
+                        logprobs: None,
+                        finish_reason: None,
+                        delta: delta.into_completion(role.clone().unwrap(), tool_id_to_content_block.get(&index).map(|b| (tool_idx, b.clone()))),
+                    }],
+                }
+            },
+            MessageCreateStreamResponse::MessageDelta { delta: MessageDelta {stop_reason, ..}, usage: inner_usage } => {
+
+                // OpenAI expects full usage for the final message. Anthropic provides prompt tokens in first message. 
+                let usage = usage.clone().map(|mut u| {
+                    u.prompt_tokens += inner_usage.input_tokens;
+                    u.completion_tokens += inner_usage.output_tokens;
+                    u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+                    u
+                });
+                return CreateChatCompletionStreamResponse {
+                    id: id.clone().unwrap_or_default(),
+                    created: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as u32,
+                    model: model.clone(),
+                    service_tier: None,
+                    system_fingerprint: None,
+                    object: "chat.completion.chunk".to_string(),
+                    usage,
+                    choices: vec![ChatChoiceStream{
+                        index: 0,
+                        logprobs: None,
+                        finish_reason: match stop_reason {
+                            Some(StopReason::EndTurn) => Some(FinishReason::Stop),
+                            Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                            Some(StopReason::StopSequence) => Some(FinishReason::Stop),
+                            Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                            None => None,
+                        },
+                        delta: ChatCompletionStreamResponseDelta{ content: None, function_call: None, tool_calls: None, role: None, refusal: None },
+                    }],
+                }
+            },
+            MessageCreateStreamResponse::Ping | MessageCreateStreamResponse::ContentBlockStop{index: _} | MessageCreateStreamResponse::MessageStop => panic!("Unexpected message type"),
+        });
+
+        Ok(Box::pin(transformed_stream))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut inner_req = req.clone();
-        inner_req.model = self.model.to_string();
-                
-        let anth_req = MessageCreateParams::try_from(inner_req)?;
-        println!("inner_req: {:?}", anth_req);
-        
+        let anth_req = MessageCreateParams::try_from((self.model.clone(), req))?;
+
         let inner_resp: MessageCreateResponse = self.client.post("/messages", anth_req).await?;
 
         let mut resp = CreateChatCompletionResponse::try_from(inner_resp)?;
@@ -279,10 +390,12 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
     }
 }
 
-impl TryFrom<CreateChatCompletionRequest> for MessageCreateParams {
+impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCreateParams {
     type Error = OpenAIError;
-    fn try_from(value: CreateChatCompletionRequest) -> Result<Self, Self::Error> {
-        let model = AnthropicModelVariant::from_str(value.model.as_str())?;
+    fn try_from(
+        pair: (AnthropicModelVariant, CreateChatCompletionRequest),
+    ) -> Result<Self, Self::Error> {
+        let (model, value) = pair;
 
         let messages = value
             .messages
