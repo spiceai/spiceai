@@ -64,6 +64,7 @@ This table defines the required features and/or tests for each connector:
 These requirements are imposed on every connector, regardless of the selected features/tests in the above table.
 
 - [ ] [Core Arrow Data Types](../definitions.md) are supported
+- [ ] For exceptions where a [Core Arrow Data Type](../definitions.md) is not supported, print a warning and ignore the column instead of crashing or failing the query.
 - [ ] All known [Major Bugs](../definitions.md) are resolved
 
 #### Documentation
