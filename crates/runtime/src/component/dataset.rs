@@ -27,6 +27,8 @@ use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Dur
 
 use crate::dataaccelerator::get_accelerator_engine;
 
+use super::validate_identifier;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -153,6 +155,8 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
+
+        validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
 
