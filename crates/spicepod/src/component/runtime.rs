@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{error::Error, sync::Arc};
+use std::{collections::HashMap, error::Error, sync::Arc};
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -35,6 +35,10 @@ pub struct Runtime {
     pub tracing: Option<TracingConfig>,
 
     pub telemetry: Option<TelemetryConfig>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub params: HashMap<String, String>,
 
     #[serde(default)]
     pub task_history: TaskHistory,

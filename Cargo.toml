@@ -61,7 +61,7 @@ datafusion-common = "42"
 datafusion-expr = "42"
 datafusion-execution = "42"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f1e7b17755d96b30bafb4d185467ca4c55f85aec" }
 datafusion-functions-json = "0.42"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
@@ -125,8 +125,8 @@ datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c69f7bc5d4f67469aaa215650e89000941d6915" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "826814ab149aad8ee668454c83a0650fb8b18d60" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f1e7b17755d96b30bafb4d185467ca4c55f85aec" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c058f1e1fe4391a47b985c485eee91b3b41e1172" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "5b98603705a381ceeb5cc371e4f606b7332b57ce" }
 
