@@ -333,24 +333,26 @@ impl Chat for ChatWrapper {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
         let req = self.prepare_req(req)?;
 
-        let span2 = span.clone();
+        if let Some(metadata) = &req.metadata {
+            tracing::info!(target: "task_history", metadata = %metadata, "labels");
+        }
+
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
-                let logged_stream = resp.instrument(span.clone()).inspect(move |item| {
+                let stream_span = span.clone();
+                let logged_stream = resp.instrument(stream_span.clone()).inspect(move |item| {
                     if let Ok(item) = item {
-                        
-                        let sspan = span.clone();
-                        // not incremental; provider only emits usage on last chunk.
 
+                        // not incremental; provider only emits usage on last chunk.
                         if let Some(usage) = item.usage.clone() {
-                            tracing::info!(target: "task_history", parent: &sspan, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
+                            tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                         }
                     }
                 });
                 Ok(Box::pin(logged_stream))
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span2, "Failed to run chat model: {}", e);
+                tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
                 Err(e)
             }
         }
@@ -362,7 +364,6 @@ impl Chat for ChatWrapper {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
-        span.enter();
         let req = self.prepare_req(req)?;
 
         if let Some(metadata) = &req.metadata {

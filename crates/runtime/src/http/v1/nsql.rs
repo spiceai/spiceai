@@ -25,9 +25,9 @@ use headers_accept::Accept;
 
 use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
-use tracing_futures::Instrument;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing_futures::Instrument;
 
 use super::ArrowFormat;
 
@@ -72,7 +72,6 @@ pub(crate) async fn post(
         }
     };
 
-
     let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
     for t in &tables {
         match df.get_arrow_schema(t).await {
@@ -95,9 +94,11 @@ pub(crate) async fn post(
     let sql_query_result = match llms.read().await.get(&payload.model) {
         Some(nql_model) => {
             let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
-            let Ok(req) =
-                sql_gen.create_request_for_query(&payload.model, &payload.query, &table_create_stms)
-            else {
+            let Ok(req) = sql_gen.create_request_for_query(
+                &payload.model,
+                &payload.query,
+                &table_create_stms,
+            ) else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error preparing data for NQL model".to_string(),

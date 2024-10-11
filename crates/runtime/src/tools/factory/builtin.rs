@@ -21,7 +21,8 @@ use spicepod::component::tool::Tool;
 
 use crate::tools::{
     builtin::{
-        document_similarity::DocumentSimilarityTool, list_datasets::ListDatasetsTool, sample_data::SampleDataTool, sql::SqlTool, table_schema::TableSchemaTool
+        document_similarity::DocumentSimilarityTool, list_datasets::ListDatasetsTool,
+        sample_data::SampleDataTool, sql::SqlTool, table_schema::TableSchemaTool,
     },
     SpiceModelTool,
 };
