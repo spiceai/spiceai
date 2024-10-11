@@ -147,7 +147,7 @@ mod tests {
         };
 
         let chunker = Openai::default()
-            .chunker(cfg)
+            .chunker(&cfg)
             .expect("Failed to create OpenAI chunker");
         let chunks: Vec<_> = chunker
             .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")

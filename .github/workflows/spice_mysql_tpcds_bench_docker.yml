@@ -1,0 +1,94 @@
+name: spice-mysql-tpcds-bench docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check disk space
+        run: df . -h
+
+      - name: Free disk space
+        run: |
+          sudo docker rmi $(docker image ls -aq) >/dev/null 2>&1 || true
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
+            /usr/lib/jvm || true
+          echo "some directories deleted"
+          sudo apt install aptitude -y >/dev/null 2>&1
+          sudo aptitude purge aria2 ansible azure-cli shellcheck rpm xorriso zsync \
+            esl-erlang firefox gfortran-8 gfortran-9 google-chrome-stable \
+            google-cloud-sdk imagemagick \
+            libmagickcore-dev libmagickwand-dev libmagic-dev ant ant-optional kubectl \
+            mercurial apt-transport-https mono-complete libmysqlclient \
+            unixodbc-dev yarn chrpath libssl-dev libxft-dev \
+            libfreetype6 libfreetype6-dev libfontconfig1 libfontconfig1-dev \
+            snmp pollinate libpq-dev postgresql-client powershell ruby-full \
+            sphinxsearch subversion mongodb-org azure-cli microsoft-edge-stable \
+            -y -f >/dev/null 2>&1
+          sudo aptitude purge google-cloud-sdk -f -y >/dev/null 2>&1
+          sudo aptitude purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
+          sudo apt purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
+          sudo aptitude purge '~n ^php' -f -y >/dev/null 2>&1
+          sudo aptitude purge '~n ^dotnet' -f -y >/dev/null 2>&1
+          sudo apt-get autoremove -y >/dev/null 2>&1
+          sudo apt-get autoclean -y >/dev/null 2>&1
+          echo "some packages purged"
+
+      - name: Check disk space
+        run: |
+          sudo dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -nr | head
+          df . -h
+          sudo du /usr/ -hx -d 4 --threshold=1G | sort -hr | head
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull MySQL Docker image
+        run: docker pull mysql:latest
+
+      - name: Start temporary MySQL server
+        run: |
+          docker run --name spice-mysql-tpcds-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d mysql:latest --local-infile=1
+
+      - name: Install necessary tools
+        run: sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
+
+      - name: Initialize TPCDS data
+        working-directory: ./test/tpc-bench
+        run: |
+          make tpcds-init
+          for sf in 1; do
+            DB_NAME=tpcds_sf${sf//./_}
+            DBGEN_SCALE=$sf make tpcds-gen
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME ADD_INDEXES=true make mysql-tpcds-init
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=$DB_NAME make mysql-tpcds-load
+            echo "CREATE DATABASE IF NOT EXISTS $DB_NAME;" >mysql-tpcds-bench/backup_$DB_NAME.sql
+            echo "USE $DB_NAME;" >> mysql-tpcds-bench/backup_$DB_NAME.sql
+            docker exec spice-mysql-tpcds-bench-temp sh -c "exec mysqldump -u root -proot ${DB_NAME}" >> mysql-tpcds-bench/backup_$DB_NAME.sql
+          done
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./test/tpc-bench/mysql-tpcds-bench
+          file: ./test/tpc-bench/mysql-tpcds-bench/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/spiceai/spice-mysql-tpcds-bench:latest
+            ghcr.io/spiceai/spice-mysql-tpcds-bench:${{ github.sha }}

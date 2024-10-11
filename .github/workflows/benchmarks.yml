@@ -33,6 +33,7 @@ on:
           - ''
           - 'spice.ai connector'
           - 's3 connector'
+          - 'abfs connector'
           - 'spark connector'
           - 'postgres connector'
           - 'mysql connector'
@@ -82,9 +83,21 @@ jobs:
     needs: build-database-bench-binary
 
     services:
-      mysql:
-        image: ${{ matrix.name == 'mysql connector' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
+      mysql_tpch:
+        image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
+          --health-cmd="mysqladmin ping -uroot -proot --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
+      mysql_tpcds:
+        image: ${{ matrix.cmd == '-c mysql -b tpcds' && 'ghcr.io/spiceai/spice-mysql-tpcds-bench:latest' || '' }}
+        options: >-
+          --shm-size=10gb
           --health-cmd="mysqladmin ping -uroot -proot --silent"
           --health-interval 10s
           --health-timeout 5s
@@ -127,6 +140,9 @@ jobs:
             bench: 'tpch'
           - cmd: '-c s3'
             name: 's3 connector'
+            bench: 'tpch'
+          - cmd: '-c abfs'
+            name: 'abfs connector'
             bench: 'tpch'
           - cmd: '-c spark'
             name: 'spark connector'
