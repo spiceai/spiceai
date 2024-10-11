@@ -19,7 +19,7 @@ use snafu::prelude::*;
 use spicepod::component::view as spicepod_view;
 use std::fs;
 
-use super::dataset::Dataset;
+use super::{dataset::Dataset, validate_identifier};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
@@ -31,6 +31,8 @@ impl TryFrom<spicepod_view::View> for View {
     type Error = crate::Error;
 
     fn try_from(view: spicepod_view::View) -> Result<Self, Self::Error> {
+        validate_identifier(&view.name).context(crate::ComponentSnafu)?;
+
         let table_reference = Dataset::parse_table_reference(&view.name)?;
 
         let sql = if let Some(view_sql) = &view.sql {

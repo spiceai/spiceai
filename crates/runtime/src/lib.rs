@@ -273,6 +273,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create directory: {source}"))]
     UnableToCreateDirectory { source: std::io::Error },
+
+    #[snafu(display("{source}"))]
+    ComponentError { source: component::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
