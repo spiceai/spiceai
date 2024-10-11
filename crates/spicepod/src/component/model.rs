@@ -75,6 +75,7 @@ impl WithDependsOn<Model> for Model {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ModelSource {
     OpenAi,
+    Anthropic,
     HuggingFace,
     SpiceAI,
     File,
@@ -89,6 +90,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::HuggingFace)
         } else if value.starts_with("file") {
             Ok(ModelSource::File)
+        } else if value.starts_with("anthropic") {
+            Ok(ModelSource::Anthropic)
         } else if value.starts_with("openai") {
             Ok(ModelSource::OpenAi)
         } else if value.starts_with("spiceai") {
@@ -104,6 +107,7 @@ impl Display for ModelSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModelSource::OpenAi => write!(f, "openai"),
+            ModelSource::Anthropic => write!(f, "anthropic"),
             ModelSource::HuggingFace => write!(f, "huggingface:huggingface.co"),
             ModelSource::File => write!(f, "file:"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
@@ -195,7 +199,7 @@ impl Model {
         };
 
         // OpenAI and SpiceAi only support Llm and Ml respectively.
-        if source == ModelSource::OpenAi {
+        if source == ModelSource::OpenAi || source == ModelSource::Anthropic {
             return Some(ModelType::Llm);
         };
         if source == ModelSource::SpiceAI {

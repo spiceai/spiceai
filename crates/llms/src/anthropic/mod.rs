@@ -17,19 +17,36 @@ limitations under the License.
 use async_openai::{config::Config, Client};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use secrecy::{ExposeSecret, Secret};
+// use types::AnthropicModelVariant;
 use std::sync::LazyLock;
 
 mod chat;
 mod types;
 
+pub use types::AnthropicModelVariant;
+
 pub struct Anthropic {
     client: Client<AnthropicConfig>,
-    model: String,
+    model: AnthropicModelVariant,
+    
+    // The name of the model as known in the spice runtime (not the anthropic model).
+    name: String
 }
 
-static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
+static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
+pub static DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-sonnet-20240620";
 static ANTHROPIC_API_VERSION: &str = "2023-06-01";
 static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(String::new()));
+
+impl Anthropic {
+    pub fn new<S: Into<AnthropicModelVariant>>(config: AnthropicConfig, model: S, name: &str) -> Self {
+        Self {
+            client: Client::<AnthropicConfig>::with_config(config),
+            model: model.into(),
+            name: name.to_string()
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AnthropicConfig {

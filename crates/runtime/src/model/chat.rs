@@ -24,11 +24,11 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use futures::Stream;
-use llms::chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult};
+use llms::{anthropic::{Anthropic, AnthropicConfig, AnthropicModelVariant, DEFAULT_ANTHROPIC_MODEL}, chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult}};
 use llms::openai::DEFAULT_LLM_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
-use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::collections::HashMap;
+use spicepod::component::model::{self, Model, ModelFileType, ModelSource};
+use std::{collections::HashMap, str::FromStr};
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing_futures::Instrument;
@@ -134,6 +134,40 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
             from: "spiceai".into(),
             task: "llm".into(),
         }),
+        ModelSource::Anthropic => {
+            let api_base = params.get("endpoint").map(Secret::expose_secret).cloned();
+            let api_key = params
+                .get("anthropic_api_key")
+                .map(Secret::expose_secret)
+                .cloned();
+            let auth_token = params
+                .get("anthropic_auth_token")
+                .map(Secret::expose_secret)
+                .cloned();
+
+            let mut cfg = AnthropicConfig::default();
+
+            if let Some(api_key) = api_key {
+                cfg = cfg.with_api_key(api_key);
+            } else if let Some(auth_token) = auth_token {
+                cfg = cfg.with_auth_token(auth_token);
+            } else {
+                return Err(LlmError::FailedToLoadModel {
+                    source: "Anthropic models require one of following params: 'anthropic_auth_token', 'anthropic_api_key'.".into(),
+                });
+            }
+            if let Some(api_base) = api_base {
+                cfg = cfg.with_base_url(api_base);
+            }
+            println!("Creating Anthropic model={model_id:?}");
+
+            let model_id = AnthropicModelVariant::from_str(&model_id.clone().unwrap_or(DEFAULT_ANTHROPIC_MODEL.to_string())).map_err(|_| 
+                LlmError::FailedToLoadModel {
+                    source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+                })?;
+
+            Ok(Box::new(Anthropic::new(cfg, model_id, &component.name)) as Box<dyn Chat>)
+        }
         ModelSource::OpenAi => {
             let api_base = params.get("endpoint").map(Secret::expose_secret).cloned();
             let api_key = params

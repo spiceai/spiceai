@@ -15,14 +15,14 @@ limitations under the License.
 */
 
 use async_openai::error::OpenAIError;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Serialize, Serializer, Deserialize, Deserializer};
+use std::{collections::HashMap, fmt, str::FromStr};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageCreateParams {
     pub max_tokens: u32,
     pub messages: Vec<MessageParam>,
-    pub model: ModelVariant,
+    pub model: AnthropicModelVariant,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +88,7 @@ pub enum ContentBlock {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum ResponseContentBlock {
     Text(TextBlockParam),
     ToolUse(ToolUseBlockParam),
@@ -285,9 +286,8 @@ pub struct MetadataParam {
     pub user_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ModelVariant {
+#[derive(Clone, Debug)]
+pub enum AnthropicModelVariant {
     Claude35Sonnet20240620,
     Claude3Opus20240229,
     Claude3Sonnet20240229,
@@ -297,18 +297,18 @@ pub enum ModelVariant {
     ClaudeInstant12,
 }
 
-impl std::str::FromStr for ModelVariant {
+impl std::str::FromStr for AnthropicModelVariant {
     type Err = OpenAIError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "claude-35-sonnet-2024-06-20" => Ok(ModelVariant::Claude35Sonnet20240620),
-            "claude-3-opus-2024-02-29" => Ok(ModelVariant::Claude3Opus20240229),
-            "claude-3-sonnet-2024-02-29" => Ok(ModelVariant::Claude3Sonnet20240229),
-            "claude-3-haiku-2024-03-07" => Ok(ModelVariant::Claude3Haiku20240307),
-            "claude-2-1" => Ok(ModelVariant::Claude21),
-            "claude-2-0" => Ok(ModelVariant::Claude20),
-            "claude-instant-1-2" => Ok(ModelVariant::ClaudeInstant12),
+            "claude-3-5-sonnet-20240620" => Ok(AnthropicModelVariant::Claude35Sonnet20240620),
+            "claude-3-opus-20240229" => Ok(AnthropicModelVariant::Claude3Opus20240229),
+            "claude-3-sonnet-20240229" => Ok(AnthropicModelVariant::Claude3Sonnet20240229),
+            "claude-3-haiku-20240307" => Ok(AnthropicModelVariant::Claude3Haiku20240307),
+            "claude-2.1" => Ok(AnthropicModelVariant::Claude21),
+            "claude-2.0" => Ok(AnthropicModelVariant::Claude20),
+            "claude-instant-1.2" => Ok(AnthropicModelVariant::ClaudeInstant12),
             _ => Err(OpenAIError::InvalidArgument(format!(
                 "Unknown model variant: {}",
                 s
@@ -317,31 +317,52 @@ impl std::str::FromStr for ModelVariant {
     }
 }
 
-impl ToString for ModelVariant {
+impl ToString for AnthropicModelVariant {
     fn to_string(&self) -> String {
-        match self {
-            ModelVariant::Claude35Sonnet20240620 => "claude-35-sonnet-2024-06-20",
-            ModelVariant::Claude3Opus20240229 => "claude-3-opus-2024-02-29",
-            ModelVariant::Claude3Sonnet20240229 => "claude-3-sonnet-2024-02-29",
-            ModelVariant::Claude3Haiku20240307 => "claude-3-haiku-2024-03-07",
-            ModelVariant::Claude21 => "claude-2-1",
-            ModelVariant::Claude20 => "claude-2-0",
-            ModelVariant::ClaudeInstant12 => "claude-instant-1-2",
-        }
-        .to_string()
+        let z = match self {
+            AnthropicModelVariant::Claude35Sonnet20240620 => "claude-3-5-sonnet-20240620",
+            AnthropicModelVariant::Claude3Opus20240229 => "claude-3-opus-20240229",
+            AnthropicModelVariant::Claude3Sonnet20240229 => "claude-3-sonnet-20240229",
+            AnthropicModelVariant::Claude3Haiku20240307 => "claude-3-haiku-20240307",
+            AnthropicModelVariant::Claude21 => "claude-2.1",
+            AnthropicModelVariant::Claude20 => "claude-2.0",
+            AnthropicModelVariant::ClaudeInstant12 => "claude-instant-1.2",
+        };
+
+        z.to_string()
     }
 }
 
-impl ModelVariant {
+impl Serialize for AnthropicModelVariant {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+// Custom Deserialize implementation to use from_str() for deserialization
+impl<'de> Deserialize<'de> for AnthropicModelVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        AnthropicModelVariant::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl AnthropicModelVariant {
     pub fn default_max_tokens(&self) -> u32 {
         match self {
-            ModelVariant::Claude35Sonnet20240620 => 8192,
-            ModelVariant::Claude3Opus20240229 => 8192,
-            ModelVariant::Claude3Sonnet20240229 => 4096,
-            ModelVariant::Claude3Haiku20240307 => 4096,
-            ModelVariant::Claude21 => 4096,
-            ModelVariant::Claude20 => 4096,
-            ModelVariant::ClaudeInstant12 => 4096,
+            AnthropicModelVariant::Claude35Sonnet20240620 => 8192,
+            AnthropicModelVariant::Claude3Opus20240229 => 8192,
+            AnthropicModelVariant::Claude3Sonnet20240229 => 4096,
+            AnthropicModelVariant::Claude3Haiku20240307 => 4096,
+            AnthropicModelVariant::Claude21 => 4096,
+            AnthropicModelVariant::Claude20 => 4096,
+            AnthropicModelVariant::ClaudeInstant12 => 4096,
         }
     }
 }
@@ -350,7 +371,7 @@ impl ModelVariant {
 pub struct MessageCreateResponse {
     pub id: String,
     pub content: Vec<ResponseContentBlock>,
-    pub model: ModelVariant,
+    pub model: AnthropicModelVariant,
     pub role: MessageRole,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,

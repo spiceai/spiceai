@@ -378,7 +378,7 @@ pub trait Chat: Sync + Send {
                     ChatCompletionRequestUserMessage {
                         name: None,
                         content: ChatCompletionRequestUserMessageContent::Text(
-                            "health".to_string(),
+                            "ping.".to_string(),
                         ),
                     },
                 )],

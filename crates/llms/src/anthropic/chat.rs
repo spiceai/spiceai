@@ -44,7 +44,7 @@ use tracing_futures::Instrument;
 
 use super::types::{
     ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse, MessageParam,
-    MessageRole, MetadataParam, ModelVariant, ResponseContentBlock, StopReason, TextBlockParam,
+    MessageRole, MetadataParam, AnthropicModelVariant, ResponseContentBlock, StopReason, TextBlockParam,
     ToolResultBlockParam, ToolUseBlockParam,
 };
 use super::Anthropic;
@@ -81,11 +81,18 @@ impl Chat for Anthropic {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let inner_req = MessageCreateParams::try_from(req)?;
+        let mut inner_req = req.clone();
+        inner_req.model = self.model.to_string();
+                
+        let anth_req = MessageCreateParams::try_from(inner_req)?;
+        println!("inner_req: {:?}", anth_req);
+        
+        let inner_resp: MessageCreateResponse = self.client.post("/messages", anth_req).await?;
 
-        let resp: MessageCreateResponse = self.client.post("/messages", inner_req).await?;
+        let mut resp = CreateChatCompletionResponse::try_from(inner_resp)?;
 
-        CreateChatCompletionResponse::try_from(resp)
+        resp.model = self.name.to_string();
+        Ok(resp)
     }
 }
 
@@ -275,7 +282,7 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
 impl TryFrom<CreateChatCompletionRequest> for MessageCreateParams {
     type Error = OpenAIError;
     fn try_from(value: CreateChatCompletionRequest) -> Result<Self, Self::Error> {
-        let model = ModelVariant::from_str(value.model.as_str())?;
+        let model = AnthropicModelVariant::from_str(value.model.as_str())?;
 
         let messages = value
             .messages
