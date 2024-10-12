@@ -136,6 +136,58 @@ fatal runtime error: stack overflow
 | [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
 | [q49.sql](tpcds/q49.sql) | [q49.sql](tpcds/q49.sql) |
 
+
+### PostgreSQL does not support using a column alias in a CASE statement
+
+**Limitation**: PostgreSQL does not allow a column alias to be referenced in a `CASE` statement. For example, `CASE WHEN lochierarchy = 0 THEN i_category END`, where `lochierarchy` is defined as `SELECT GROUPING(i_category) + GROUPING(i_class) AS lochierarchy`.
+**Solution**: Replace the alias with the actual column name or expression from the `SELECT` statement
+
+```sql
+# fail
+select
+  i_category
+   ,i_class
+   ,grouping(i_category)+grouping(i_class) as lochierarchy
+ from
+    web_sales
+   ,date_dim       d1
+   ,item
+ where
+    d1.d_month_seq between 1205 and 1205+11
+ and d1.d_date_sk = ws_sold_date_sk
+ and i_item_sk  = ws_item_sk
+ group by rollup(i_category,i_class)
+ order by
+   lochierarchy desc,
+   case when lochierarchy = 0 then i_category end
+  LIMIT 100;
+```
+
+```sql
+# success
+select
+  i_category
+   ,i_class
+   ,grouping(i_category)+grouping(i_class) as lochierarchy
+ from
+    web_sales
+   ,date_dim       d1
+   ,item
+ where
+    d1.d_month_seq between 1205 and 1205+11
+ and d1.d_date_sk = ws_sold_date_sk
+ and i_item_sk  = ws_item_sk
+ group by rollup(i_category,i_class)
+ order by
+   lochierarchy desc,
+   case when grouping(i_category)+grouping(i_class) = 0 then i_category end
+  LIMIT 100;
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q36.sql](tpcds/q36.sql)   | [q86.sql](tpcds/q86.sql) |
+
 ## MySQL does not support FULL JOIN
 
 **Limitation**: The MySQL connector does not support `FULL JOIN` or `FULL OUTER JOIN` statements.
