@@ -21,6 +21,7 @@ use list_datasets::ListDatasetsTool;
 use spicepod::component::tool::Tool;
 use sql::SqlTool;
 use table_schema::TableSchemaTool;
+use get_readiness::GetReadinessTool;
 
 use super::SpiceModelTool;
 
@@ -28,6 +29,7 @@ pub mod document_similarity;
 pub mod list_datasets;
 pub mod sql;
 pub mod table_schema;
+pub mod get_readiness;
 
 pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
     vec![
@@ -35,6 +37,7 @@ pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
         Arc::new(TableSchemaTool::default()),
         Arc::new(SqlTool::default()),
         Arc::new(ListDatasetsTool::default()),
+        Arc::new(GetReadinessTool::default()),
     ]
 }
 
@@ -45,5 +48,6 @@ pub fn get_builtin_tool_spec() -> Vec<Tool> {
         TableSchemaTool::default().into(),
         SqlTool::default().into(),
         ListDatasetsTool::default().into(),
+        GetReadinessTool::default().into(),
     ]
 }
