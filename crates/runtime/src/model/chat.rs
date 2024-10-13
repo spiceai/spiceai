@@ -104,6 +104,8 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 .clone()
                 .or(component.find_any_file_path(ModelFileType::Weights));
 
+            let hf_token = params.get("hf_token").map(Secret::expose_secret).cloned();
+
             match model_id {
                 Some(id) => {
                     llms::chat::create_hf_model(
@@ -112,6 +114,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                         &weights_path,
                         &tokenizer_path,
                         &tokenizer_config_path, // TODO handle inline chat templates
+                        hf_token,
                     )
                 }
                 None => Err(LlmError::FailedToLoadModel {

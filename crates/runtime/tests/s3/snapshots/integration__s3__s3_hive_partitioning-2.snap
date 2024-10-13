@@ -1,0 +1,58 @@
+---
+source: crates/runtime/tests/s3/mod.rs
+expression: partition_not_inferred
+---
++----+---------+
+| id | value   |
++----+---------+
+| 0  | value_0 |
+| 1  | value_1 |
+| 2  | value_2 |
+| 3  | value_3 |
+| 4  | value_4 |
+| 5  | value_5 |
+| 6  | value_6 |
+| 7  | value_7 |
+| 8  | value_8 |
+| 9  | value_9 |
+| 10 | value_0 |
+| 11 | value_1 |
+| 12 | value_2 |
+| 13 | value_3 |
+| 14 | value_4 |
+| 15 | value_5 |
+| 16 | value_6 |
+| 17 | value_7 |
+| 18 | value_8 |
+| 19 | value_9 |
+| 20 | value_0 |
+| 21 | value_1 |
+| 22 | value_2 |
+| 23 | value_3 |
+| 24 | value_4 |
+| 25 | value_5 |
+| 26 | value_6 |
+| 27 | value_7 |
+| 28 | value_8 |
+| 29 | value_9 |
+| 30 | value_0 |
+| 31 | value_1 |
+| 32 | value_2 |
+| 33 | value_3 |
+| 34 | value_4 |
+| 35 | value_5 |
+| 36 | value_6 |
+| 37 | value_7 |
+| 38 | value_8 |
+| 39 | value_9 |
+| 40 | value_0 |
+| 41 | value_1 |
+| 42 | value_2 |
+| 43 | value_3 |
+| 44 | value_4 |
+| 45 | value_5 |
+| 46 | value_6 |
+| 47 | value_7 |
+| 48 | value_8 |
+| 49 | value_9 |
++----+---------+
