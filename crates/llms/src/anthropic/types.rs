@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_openai::error::OpenAIError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{collections::HashMap, fmt::Display, str::FromStr};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageCreateParams {
@@ -50,13 +50,13 @@ pub struct MessageParam {
 }
 
 impl MessageParam {
-    pub fn User(content: Vec<ContentBlock>) -> Self {
+    pub fn user(content: Vec<ContentBlock>) -> Self {
         Self {
             content: ContentParam::Blocks(content),
             role: MessageRole::User,
         }
     }
-    pub fn Assistant(content: Vec<ContentBlock>) -> Self {
+    pub fn assistant(content: Vec<ContentBlock>) -> Self {
         Self {
             content: ContentParam::Blocks(content),
             role: MessageRole::Assistant,
@@ -132,16 +132,23 @@ pub struct Source {
     pub data: String, // Base64 encoded string
     pub media_type: MediaType,
     #[serde(rename = "type")]
-    pub source_type: SourceType,
+    pub r#type: SourceType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaType {
-    ImageJpeg,
-    ImagePng,
-    ImageGif,
-    ImageWebp,
+    #[serde(rename = "image_jpeg")]
+    Jpeg,
+
+    #[serde(rename = "image_png")]
+    Png,
+
+    #[serde(rename = "image_gif")]
+    Gif,
+
+    #[serde(rename = "image_webp")]
+    Webp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,19 +162,6 @@ pub struct ImageBlockParam {
     pub source: Source,
     #[serde(rename = "type")]
     pub block_type: String, // Always "image"
-}
-
-impl ImageBlockParam {
-    pub fn new(data: String, media_type: MediaType) -> Self {
-        Self {
-            source: Source {
-                data,
-                media_type,
-                source_type: SourceType::Base64,
-            },
-            block_type: "image".to_string(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -320,15 +314,14 @@ impl std::str::FromStr for AnthropicModelVariant {
             "claude-2.0" => Ok(AnthropicModelVariant::Claude20),
             "claude-instant-1.2" => Ok(AnthropicModelVariant::ClaudeInstant12),
             _ => Err(OpenAIError::InvalidArgument(format!(
-                "Unknown model variant: {}",
-                s
+                "Unknown model variant: {s}"
             ))),
         }
     }
 }
 
-impl ToString for AnthropicModelVariant {
-    fn to_string(&self) -> String {
+impl Display for AnthropicModelVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let z = match self {
             AnthropicModelVariant::Claude35Sonnet20240620 => "claude-3-5-sonnet-20240620",
             AnthropicModelVariant::Claude3Opus20240229 => "claude-3-opus-20240229",
@@ -338,8 +331,7 @@ impl ToString for AnthropicModelVariant {
             AnthropicModelVariant::Claude20 => "claude-2.0",
             AnthropicModelVariant::ClaudeInstant12 => "claude-instant-1.2",
         };
-
-        z.to_string()
+        write!(f, "{z}")
     }
 }
 
@@ -364,15 +356,16 @@ impl<'de> Deserialize<'de> for AnthropicModelVariant {
 }
 
 impl AnthropicModelVariant {
+    #[must_use]
     pub fn default_max_tokens(&self) -> u32 {
         match self {
-            AnthropicModelVariant::Claude35Sonnet20240620 => 8192,
-            AnthropicModelVariant::Claude3Opus20240229 => 8192,
-            AnthropicModelVariant::Claude3Sonnet20240229 => 4096,
-            AnthropicModelVariant::Claude3Haiku20240307 => 4096,
-            AnthropicModelVariant::Claude21 => 4096,
-            AnthropicModelVariant::Claude20 => 4096,
-            AnthropicModelVariant::ClaudeInstant12 => 4096,
+            AnthropicModelVariant::Claude35Sonnet20240620
+            | AnthropicModelVariant::Claude3Opus20240229 => 8192,
+            AnthropicModelVariant::Claude3Sonnet20240229
+            | AnthropicModelVariant::Claude3Haiku20240307
+            | AnthropicModelVariant::Claude21
+            | AnthropicModelVariant::Claude20
+            | AnthropicModelVariant::ClaudeInstant12 => 4096,
         }
     }
 }

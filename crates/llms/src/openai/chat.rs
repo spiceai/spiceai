@@ -14,24 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::pin::Pin;
 
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{json::JsonSchemaSqlGeneration, SqlGeneration};
-use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
+use crate::chat::Chat;
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
 };
-
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, CreateChatCompletionRequestArgs,
-};
-use async_stream::stream;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
-use snafu::ResultExt;
-use tracing_futures::Instrument;
 
 use super::Openai;
 

@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(deprecated)]
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -23,9 +23,9 @@ use async_openai::{
     },
 };
 use futures::{Stream, StreamExt};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, str::FromStr, time::SystemTime};
+use std::{collections::HashMap, fmt, pin::Pin, time::SystemTime};
 
 use super::types::{MessageRole, StopReason, Usage};
 use async_stream::stream;
@@ -121,7 +121,7 @@ pub(crate) enum Delta {
 impl Delta {
     pub fn into_completion(
         self,
-        role: MessageRole,
+        role: &Option<MessageRole>,
         tool_content: Option<(i32, ContentBlockToolUse)>,
     ) -> ChatCompletionStreamResponseDelta {
         match (self, tool_content) {
@@ -131,13 +131,14 @@ impl Delta {
                 tool_calls: None,
                 refusal: None,
                 role: match role {
-                    MessageRole::Assistant => Some(Role::Assistant),
-                    MessageRole::User => Some(Role::User),
+                    Some(MessageRole::Assistant) => Some(Role::Assistant),
+                    Some(MessageRole::User) => Some(Role::User),
+                    None => None,
                 },
             },
             (
                 Delta::InputJsonDelta { partial_json },
-                Some((index, ContentBlockToolUse { id, name, input })),
+                Some((index, ContentBlockToolUse { id, name, .. })),
             ) => ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
@@ -152,8 +153,9 @@ impl Delta {
                 }]),
                 refusal: None,
                 role: match role {
-                    MessageRole::Assistant => Some(Role::Assistant),
-                    MessageRole::User => Some(Role::User),
+                    Some(MessageRole::Assistant) => Some(Role::Assistant),
+                    Some(MessageRole::User) => Some(Role::User),
+                    None => None,
                 },
             },
 
@@ -165,8 +167,9 @@ impl Delta {
                     tool_calls: None,
                     refusal: None,
                     role: match role {
-                        MessageRole::Assistant => Some(Role::Assistant),
-                        MessageRole::User => Some(Role::User),
+                        Some(MessageRole::Assistant) => Some(Role::Assistant),
+                        Some(MessageRole::User) => Some(Role::User),
+                        None => None,
                     },
                 }
             }
@@ -212,7 +215,7 @@ impl From<serde_json::Error> for AnthropicStreamError {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ErrorPayload {
+pub struct ErrorPayload {
     #[serde(rename = "type")]
     error_type: String,
     message: String,
@@ -224,12 +227,12 @@ pub struct MessageDelta {
     pub stop_sequence: Option<String>,
 }
 
-/// Convert the stream of Anthropic [`MessageCreateStreamResponse`] into a stream of OpenAi compatible [`async_openai::types::CreateChatCompletionStreamResponse`].
+/// Convert the stream of Anthropic [`MessageCreateStreamResponse`] into a stream of `OpenAI` compatible [`async_openai::types::CreateChatCompletionStreamResponse`].
 ///
 /// Except for differences in the stream packet formats, the core difference are:
 ///
 ///  +---------------------------------------------------------+---------------------------------------------------------+
-///  | Anthropic                                               | OpenAI                                                  |
+///  | Anthropic                                               | `OpenAI`                                                  |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///  | Only first packet for a specific tool has tool metadata | All packets for a tool have tool metadata               |
 ///  |                                                         |                                                         |
@@ -239,6 +242,7 @@ pub struct MessageDelta {
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
+#[allow(clippy::too_many_lines)]
 pub fn transform_stream(
     mut stream: Pin<
         Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
@@ -304,7 +308,7 @@ pub fn transform_stream(
                             logprobs: None,
                             finish_reason: None,
                             delta: delta.into_completion(
-                                role.clone().unwrap(),
+                                &role,
                                 tool_id_to_content_block
                                     .get(&index)
                                     .map(|b| (tool_idx, b.clone())),
@@ -325,9 +329,8 @@ pub fn transform_stream(
                         index: 0,
                         logprobs: None,
                         finish_reason: match stop_reason {
-                            Some(StopReason::EndTurn) => Some(FinishReason::Stop),
+                            Some(StopReason::EndTurn | StopReason::StopSequence) => Some(FinishReason::Stop),
                             Some(StopReason::MaxTokens) => Some(FinishReason::Length),
-                            Some(StopReason::StopSequence) => Some(FinishReason::Stop),
                             Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
                             None => None,
                         },
@@ -364,6 +367,7 @@ pub fn transform_stream(
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
+#[allow(clippy::cast_possible_truncation)]
 fn create_stream_response(
     id: &str,
     model: &str,
@@ -378,7 +382,8 @@ fn create_stream_response(
         id: id.to_string(),
         created: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))
+            .expect("Failed to get time")
             .as_secs() as u32,
         model: model.to_string(),
         service_tier: None,

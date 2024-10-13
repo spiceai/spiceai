@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(deprecated)]
 #![allow(clippy::missing_errors_doc)]
 use std::pin::Pin;
 use std::time::SystemTime;
@@ -27,20 +28,12 @@ use async_openai::types::{
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
-    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, Role, Stop,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionResponseStream, ChatCompletionToolType, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall, Role,
+    Stop,
 };
-
-use async_stream::stream;
-use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
-use mistralrs::ChatCompletionResponse;
-use snafu::ResultExt;
-use tracing_futures::Instrument;
 
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
@@ -49,6 +42,8 @@ use super::types::{
 };
 use super::types_stream::{transform_stream, AnthropicStreamError, MessageCreateStreamResponse};
 use super::Anthropic;
+use async_trait::async_trait;
+use futures::Stream;
 
 #[async_trait]
 impl Chat for Anthropic {
@@ -96,6 +91,7 @@ impl Chat for Anthropic {
 impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
     type Error = OpenAIError;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn try_from(value: MessageCreateResponse) -> Result<Self, Self::Error> {
         Ok(CreateChatCompletionResponse {
             id: value.id,
@@ -107,7 +103,7 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
             }),
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
+                .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
                 .as_secs() as u32,
             service_tier: None,
             system_fingerprint: None,
@@ -116,20 +112,21 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
                 index: 0,
                 logprobs: None,
                 finish_reason: match value.stop_reason {
-                    Some(StopReason::EndTurn) => Some(FinishReason::Stop),
+                    Some(StopReason::StopSequence | StopReason::EndTurn) => {
+                        Some(FinishReason::Stop)
+                    }
                     Some(StopReason::MaxTokens) => Some(FinishReason::Length),
-                    Some(StopReason::StopSequence) => Some(FinishReason::Stop),
                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
                     None => None,
                 },
-                message: create_completion_message(value.content, &value.role)?,
+                message: create_completion_message(&value.content, &value.role)?,
             }],
         })
     }
 }
 
 fn create_completion_message(
-    blocks: Vec<ResponseContentBlock>,
+    blocks: &[ResponseContentBlock],
     role: &MessageRole,
 ) -> Result<ChatCompletionResponseMessage, OpenAIError> {
     let mut content = String::new();
@@ -139,12 +136,11 @@ fn create_completion_message(
         .iter()
         .filter_map(|b| match b {
             ResponseContentBlock::ToolUse(t) => {
-                let arguments = match serde_json::to_string(&t.input)
-                    .map_err(|e| OpenAIError::JSONDeserialize(e))
-                {
-                    Ok(a) => a,
-                    Err(e) => return Some(Err(e)),
-                };
+                let arguments =
+                    match serde_json::to_string(&t.input).map_err(OpenAIError::JSONDeserialize) {
+                        Ok(a) => a,
+                        Err(e) => return Some(Err(e)),
+                    };
                 Some(Ok(ChatCompletionMessageToolCall {
                     id: t.id.clone(),
                     r#type: ChatCompletionToolType::Function,
@@ -187,13 +183,13 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
             ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
                 content: ChatCompletionRequestToolMessageContent::Text(text),
                 tool_call_id,
-            }) => Ok(MessageParam::User(vec![ContentBlock::ToolResult(
+            }) => Ok(MessageParam::user(vec![ContentBlock::ToolResult(
                 ToolResultBlockParam::new(tool_call_id, super::types::ContentParam::String(text)),
             )])),
             ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
                 content: ChatCompletionRequestToolMessageContent::Array(parts),
                 tool_call_id,
-            }) => Ok(MessageParam::User(vec![ContentBlock::ToolResult(
+            }) => Ok(MessageParam::user(vec![ContentBlock::ToolResult(
                 ToolResultBlockParam::new(
                     tool_call_id,
                     ContentParam::Blocks(
@@ -211,7 +207,7 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(t),
                 ..
-            }) => Ok(MessageParam::User(vec![ContentBlock::Text(
+            }) => Ok(MessageParam::user(vec![ContentBlock::Text(
                 TextBlockParam::new(t),
             )])),
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -230,7 +226,7 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
                     })
                     .collect::<Result<Vec<_>, OpenAIError>>()?;
 
-                Ok(MessageParam::User(blocks))
+                Ok(MessageParam::user(blocks))
             }
             ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
                 content,
@@ -259,18 +255,19 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
                     Some(calls) => calls
                         .iter()
                         .map(|call| {
-                            ContentBlock::ToolUse(ToolUseBlockParam::new(
+                            Ok(ContentBlock::ToolUse(ToolUseBlockParam::new(
                                 call.id.clone(),
-                                serde_json::from_str(&call.function.arguments).unwrap(),
+                                serde_json::from_str(&call.function.arguments)
+                                    .map_err(OpenAIError::JSONDeserialize)?,
                                 call.function.name.clone(),
-                            ))
+                            )))
                         })
-                        .collect(),
+                        .collect::<Result<_, OpenAIError>>()?,
                     None => vec![],
                 };
 
                 content_blocks.extend(tool_blocks);
-                Ok(MessageParam::Assistant(content_blocks))
+                Ok(MessageParam::assistant(content_blocks))
             }
         }
     }
@@ -301,12 +298,10 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             metadata: value
                 .metadata
                 .and_then(|m| m.get("user_id").cloned())
-                .and_then(|id| {
-                    Some(MetadataParam {
-                        user_id: id.as_str().map(String::from),
-                    })
+                .map(|id| MetadataParam {
+                    user_id: id.as_str().map(String::from),
                 }),
-            model: model,
+            model,
             stop_sequences: value.stop.map(|s| match s {
                 Stop::String(s) => vec![s],
                 Stop::StringArray(a) => a,
@@ -333,11 +328,10 @@ fn system_message_from_messages(messages: &[ChatCompletionRequestMessage]) -> Op
                 ChatCompletionRequestSystemMessageContent::Array(a) => {
                     let elements: Vec<_> = a
                         .iter()
-                        .filter_map(|part| match part {
+                        .map(|part| match part {
                             ChatCompletionRequestSystemMessageContentPart::Text(
                                 ChatCompletionRequestMessageContentPartText { text },
-                            ) => Some(text),
-                            _ => None,
+                            ) => text,
                         })
                         .cloned()
                         .collect();

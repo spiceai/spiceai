@@ -77,28 +77,41 @@ impl AnthropicConfig {
         AnthropicConfig::default()
     }
 
-    pub fn with_api_key<S: Into<String>>(mut self, api_key: S) -> Self {
-        self.auth = Some(AnthropicAuthMechanism::ApiKey(Secret::new(api_key.into())));
+    #[must_use]
+    pub fn with_api_key<S: Into<String>>(mut self, api_key: Option<S>) -> Self {
+        if let Some(api_key) = api_key {
+            self.auth = Some(AnthropicAuthMechanism::ApiKey(Secret::new(api_key.into())));
+        }
         self
     }
 
-    pub fn with_auth_token<S: Into<String>>(mut self, auth_token: S) -> Self {
-        self.auth = Some(AnthropicAuthMechanism::AuthToken(Secret::new(
-            auth_token.into(),
-        )));
+    #[must_use]
+    pub fn with_auth_token<S: Into<String>>(mut self, auth_token: Option<S>) -> Self {
+        if let Some(auth_token) = auth_token {
+            self.auth = Some(AnthropicAuthMechanism::AuthToken(Secret::new(
+                auth_token.into(),
+            )));
+        }
         self
     }
 
-    pub fn with_base_url<S: Into<String>>(mut self, base_url: S) -> Self {
-        self.base_url = base_url.into();
+    #[must_use]
+    pub fn with_base_url<S: Into<String>>(mut self, base_url: Option<S>) -> Self {
+        if let Some(base_url) = base_url {
+            self.base_url = base_url.into();
+        }
         self
     }
 
-    pub fn with_version<S: Into<String>>(mut self, version: S) -> Self {
-        self.version = version.into();
+    #[must_use]
+    pub fn with_version<S: Into<String>>(mut self, version: Option<S>) -> Self {
+        if let Some(version) = version {
+            self.version = version.into();
+        }
         self
     }
 
+    #[must_use]
     pub fn with_beta(mut self, beta: Vec<String>) -> Self {
         self.beta = Some(beta);
         self
@@ -118,7 +131,7 @@ impl Config for AnthropicConfig {
             Some(AnthropicAuthMechanism::ApiKey(api_key)) => {
                 headers.insert(
                     "x-api-key",
-                    HeaderValue::from_str(api_key.expose_secret()).unwrap(),
+                    HeaderValue::from_str(api_key.expose_secret()).expect("Invalid API key"),
                 );
             }
             Some(AnthropicAuthMechanism::AuthToken(auth_token)) => {
@@ -127,7 +140,7 @@ impl Config for AnthropicConfig {
                     HeaderValue::from_str(
                         format!("Bearer {}", auth_token.expose_secret()).as_str(),
                     )
-                    .unwrap(),
+                    .expect("Invalid auth token"),
                 );
             }
             None => {}
@@ -136,12 +149,12 @@ impl Config for AnthropicConfig {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
             "anthropic-version",
-            HeaderValue::from_str(self.version.as_str()).unwrap(),
+            HeaderValue::from_str(self.version.as_str()).expect("Invalid version"),
         );
         if let Some(beta) = &self.beta {
             headers.insert(
                 "anthropic-beta",
-                HeaderValue::from_str(beta.join(",").as_str()).unwrap(),
+                HeaderValue::from_str(beta.join(",").as_str()).expect("Invalid anthropic-beta"),
             );
         }
         headers
