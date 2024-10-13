@@ -14,18 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use core::panic;
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::time::SystemTime;
 
 use crate::chat::nsql::SqlGeneration;
-use crate::chat::{Chat, Error as ChatError, Result as ChatResult};
+use crate::chat::Chat;
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall, Role, Stop
+    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, Role, Stop,
 };
 
 use async_stream::stream;
@@ -38,7 +45,7 @@ use tracing_futures::Instrument;
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
     MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolResultBlockParam, ToolUseBlockParam
+    ToolResultBlockParam, ToolUseBlockParam,
 };
 use super::types_stream::{transform_stream, AnthropicStreamError, MessageCreateStreamResponse};
 use super::Anthropic;
@@ -63,7 +70,9 @@ impl Chat for Anthropic {
         anth_req.stream = Some(true);
 
         let stream: Pin<
-            Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
+            Box<
+                dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send,
+            >,
         > = self.client.post_stream("/messages", anth_req).await;
 
         Ok(transform_stream(stream, self.name.to_string()))

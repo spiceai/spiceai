@@ -409,6 +409,8 @@ pub enum MessageType {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default)]
     pub input_tokens: u32,
+    #[serde(default)]
     pub output_tokens: u32,
 }

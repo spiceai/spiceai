@@ -14,14 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{error::OpenAIError, types::{ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage, CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role}};
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
+    },
+};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::{collections::HashMap, fmt, pin::Pin, str::FromStr, time::SystemTime};
 
-use async_stream::stream;
 use super::types::{MessageRole, StopReason, Usage};
+use async_stream::stream;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -39,6 +46,7 @@ pub enum MessageCreateStreamResponse {
     ContentBlockDelta { index: u32, delta: Delta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: u32 },
+
     #[serde(rename = "message_delta")]
     MessageDelta { delta: MessageDelta, usage: Usage },
     #[serde(rename = "message_stop")]
@@ -69,26 +77,31 @@ pub enum ContentBlock {
 impl ContentBlock {
     pub fn into_completion(self) -> ChatCompletionStreamResponseDelta {
         match self {
-            ContentBlock::Text { text } => ChatCompletionStreamResponseDelta{
+            ContentBlock::Text { text } => ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
                 refusal: None,
-                role: None
+                role: None,
             },
-            ContentBlock::ToolUse(tool_use) => ChatCompletionStreamResponseDelta{
+            ContentBlock::ToolUse(tool_use) => ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
-                tool_calls: Some(vec![
-                    ChatCompletionMessageToolCallChunk{ index: 0, id: Some(tool_use.id), r#type: Some(ChatCompletionToolType::Function), function: Some(FunctionCallStream{name: Some(tool_use.name), arguments: None}) }
-                ]),
+                tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                    index: 0,
+                    id: Some(tool_use.id),
+                    r#type: Some(ChatCompletionToolType::Function),
+                    function: Some(FunctionCallStream {
+                        name: Some(tool_use.name),
+                        arguments: None,
+                    }),
+                }]),
                 refusal: None,
-                role: None
-            }
+                role: None,
+            },
         }
     }
 }
-
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContentBlockToolUse {
@@ -106,9 +119,13 @@ pub(crate) enum Delta {
     InputJsonDelta { partial_json: String },
 }
 impl Delta {
-    pub fn into_completion(self, role: MessageRole, tool_content: Option<(i32, ContentBlockToolUse)>) -> ChatCompletionStreamResponseDelta {
+    pub fn into_completion(
+        self,
+        role: MessageRole,
+        tool_content: Option<(i32, ContentBlockToolUse)>,
+    ) -> ChatCompletionStreamResponseDelta {
         match (self, tool_content) {
-            (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta{
+            (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -116,30 +133,41 @@ impl Delta {
                 role: match role {
                     MessageRole::Assistant => Some(Role::Assistant),
                     MessageRole::User => Some(Role::User),
-                }
+                },
             },
-            (Delta::InputJsonDelta { partial_json }, Some((index, ContentBlockToolUse{id, name, input}))) => ChatCompletionStreamResponseDelta{
+            (
+                Delta::InputJsonDelta { partial_json },
+                Some((index, ContentBlockToolUse { id, name, input })),
+            ) => ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
-                tool_calls: Some(vec![
-                    ChatCompletionMessageToolCallChunk{ index, id: Some(id), r#type: Some(ChatCompletionToolType::Function), function: Some(FunctionCallStream{name: Some(name), arguments: Some(partial_json)}) }
-                ]),
+                tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                    index,
+                    id: Some(id),
+                    r#type: Some(ChatCompletionToolType::Function),
+                    function: Some(FunctionCallStream {
+                        name: Some(name),
+                        arguments: Some(partial_json),
+                    }),
+                }]),
                 refusal: None,
                 role: match role {
                     MessageRole::Assistant => Some(Role::Assistant),
                     MessageRole::User => Some(Role::User),
-                }
+                },
             },
 
             // This should never happen, but we need to handle it as an 'empty' response.
-            (Delta::InputJsonDelta{partial_json: _}, None) => ChatCompletionStreamResponseDelta{
-                content: None,
-                function_call: None,
-                tool_calls: None,
-                refusal: None,
-                role: match role {
-                    MessageRole::Assistant => Some(Role::Assistant),
-                    MessageRole::User => Some(Role::User),
+            (Delta::InputJsonDelta { partial_json: _ }, None) => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
+                    refusal: None,
+                    role: match role {
+                        MessageRole::Assistant => Some(Role::Assistant),
+                        MessageRole::User => Some(Role::User),
+                    },
                 }
             }
         }
@@ -148,7 +176,6 @@ impl Delta {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicStreamError {
-
     #[serde(rename = "type")]
     pub event_type: String,
     pub error: ErrorPayload,
@@ -198,22 +225,24 @@ pub struct MessageDelta {
 }
 
 /// Convert the stream of Anthropic [`MessageCreateStreamResponse`] into a stream of OpenAi compatible [`async_openai::types::CreateChatCompletionStreamResponse`].
-/// 
+///
 /// Except for differences in the stream packet formats, the core difference are:
-/// 
+///
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///  | Anthropic                                               | OpenAI                                                  |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///  | Only first packet for a specific tool has tool metadata | All packets for a tool have tool metadata               |
 ///  |                                                         |                                                         |
-///  | Initial message has initial usage details. Last message | Last message has usage details.                         | 
+///  | Initial message has initial usage details. Last message | Last message has usage details.                         |
 ///  | has additional usage details.                           |                                                         |
 ///  |                                                         |                                                         |
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
-/// 
+///
 pub fn transform_stream(
-    mut stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>>,
+    mut stream: Pin<
+        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
+    >,
     model: String,
 ) -> ChatCompletionResponseStream {
     let transformed_stream = stream! {
@@ -222,11 +251,11 @@ pub fn transform_stream(
         let mut role: Option<MessageRole> = None;
         let mut usage: Option<CompletionUsage> = None;
 
-        // As mentioned above, only first tool packet has tool metadata. 
+        // As mentioned above, only first tool packet has tool metadata.
         // Format:
         //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
         //  Subsequent Messages: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}
-        // 
+        //
         // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
         // Map `.index` to `.content_block`
         let mut tool_id_to_content_block = HashMap::<u32, ContentBlockToolUse>::new();
@@ -313,15 +342,15 @@ pub fn transform_stream(
                 },
                 Ok(MessageCreateStreamResponse::Ping) => {
                     tracing::trace!("Received a ping stream packet");
-                    continue; 
+                    continue;
                 },
                 | Ok(MessageCreateStreamResponse::ContentBlockStop { .. })  => {
                     tracing::trace!("Received a content block stop packet");
-                    continue; 
+                    continue;
                 },
                 Ok(MessageCreateStreamResponse::MessageStop) => {
                     tracing::trace!("Received a stop stream packet");
-                    continue; 
+                    continue;
                 },
                 Err(e) => {
                     tracing::debug!("Received an anthropic error stream packet: {:?}", e);
