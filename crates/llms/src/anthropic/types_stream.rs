@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{error::OpenAIError, types::{ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta, ChatCompletionToolType, FunctionCallStream, Role}};
+use async_openai::{error::OpenAIError, types::{ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage, CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role}};
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{collections::HashMap, fmt, pin::Pin, str::FromStr, time::SystemTime};
 
+use async_stream::stream;
 use super::types::{MessageRole, StopReason, Usage};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -97,7 +99,7 @@ pub struct ContentBlockToolUse {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
-enum Delta {
+pub(crate) enum Delta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
@@ -145,7 +147,215 @@ impl Delta {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct AnthropicStreamError {
+
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub error: ErrorPayload,
+}
+
+impl fmt::Display for AnthropicStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "AnthropicStreamError: {:?}", self.error)
+    }
+}
+
+impl From<reqwest_eventsource::Error> for AnthropicStreamError {
+    fn from(e: reqwest_eventsource::Error) -> Self {
+        AnthropicStreamError {
+            event_type: "error".to_string(),
+            error: ErrorPayload {
+                error_type: "reqwest_eventsource_error".to_string(),
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
+impl From<serde_json::Error> for AnthropicStreamError {
+    fn from(e: serde_json::Error) -> Self {
+        AnthropicStreamError {
+            event_type: "error".to_string(),
+            error: ErrorPayload {
+                error_type: "serde_json_error".to_string(),
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ErrorPayload {
+    #[serde(rename = "type")]
+    error_type: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
     pub stop_sequence: Option<String>,
+}
+
+/// Convert the stream of Anthropic [`MessageCreateStreamResponse`] into a stream of OpenAi compatible [`async_openai::types::CreateChatCompletionStreamResponse`].
+/// 
+/// Except for differences in the stream packet formats, the core difference are:
+/// 
+///  +---------------------------------------------------------+---------------------------------------------------------+
+///  | Anthropic                                               | OpenAI                                                  |
+///  +---------------------------------------------------------+---------------------------------------------------------+
+///  | Only first packet for a specific tool has tool metadata | All packets for a tool have tool metadata               |
+///  |                                                         |                                                         |
+///  | Initial message has initial usage details. Last message | Last message has usage details.                         | 
+///  | has additional usage details.                           |                                                         |
+///  |                                                         |                                                         |
+///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
+///  +---------------------------------------------------------+---------------------------------------------------------+
+/// 
+pub fn transform_stream(
+    mut stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>>,
+    model: String,
+) -> ChatCompletionResponseStream {
+    let transformed_stream = stream! {
+        // Initialize mutable variables here
+        let mut id: Option<String> = None;
+        let mut role: Option<MessageRole> = None;
+        let mut usage: Option<CompletionUsage> = None;
+
+        // As mentioned above, only first tool packet has tool metadata. 
+        // Format:
+        //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
+        //  Subsequent Messages: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}
+        // 
+        // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
+        // Map `.index` to `.content_block`
+        let mut tool_id_to_content_block = HashMap::<u32, ContentBlockToolUse>::new();
+
+        // Map `.index` to incremental position of tool delta
+        let mut tool_id_to_tool_delta_idx = HashMap::<u32, i32>::new();
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MessageCreateStreamResponse::MessageStart {
+                    message:
+                        MessageStartMessage {
+                            id: inner_id,
+                            role: inner_role,
+                            usage: inner_usage,
+                            ..
+                        },
+                }) => {
+                    role = MessageRole::from_opt(&inner_role);
+                    id = Some(inner_id);
+                    usage = Some(CompletionUsage {
+                        prompt_tokens: inner_usage.input_tokens,
+                        completion_tokens: inner_usage.output_tokens,
+                        total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
+                    });
+                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, None, None))
+                },
+                Ok(MessageCreateStreamResponse::ContentBlockStart { index, content_block }) => {
+                    if let ContentBlock::ToolUse(t) = &content_block {
+                        tool_id_to_content_block.insert(index, t.clone());
+                        tool_id_to_tool_delta_idx.insert(index, 0);
+                    };
+                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
+                            index: 0,
+                            delta: content_block.into_completion(),
+                            finish_reason: None,
+                            logprobs: None,
+                        })))
+                },
+                Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
+                    let tool_idx = *tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
+                    tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
+
+                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
+                            index: 0,
+                            logprobs: None,
+                            finish_reason: None,
+                            delta: delta.into_completion(
+                                role.clone().unwrap(),
+                                tool_id_to_content_block
+                                    .get(&index)
+                                    .map(|b| (tool_idx, b.clone())),
+                            ),
+                        })))
+                },
+                Ok(MessageCreateStreamResponse::MessageDelta {
+                    delta: MessageDelta { stop_reason, .. },
+                    usage: inner_usage,
+                }) => {
+                    // Update usage
+                    if let Some(ref mut u) = usage {
+                        u.prompt_tokens += inner_usage.input_tokens;
+                        u.completion_tokens += inner_usage.output_tokens;
+                        u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+                    }
+                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, usage.clone(), Some(ChatChoiceStream {
+                        index: 0,
+                        logprobs: None,
+                        finish_reason: match stop_reason {
+                            Some(StopReason::EndTurn) => Some(FinishReason::Stop),
+                            Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                            Some(StopReason::StopSequence) => Some(FinishReason::Stop),
+                            Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                            None => None,
+                        },
+                        delta: ChatCompletionStreamResponseDelta {
+                            content: None,
+                            function_call: None,
+                            tool_calls: None,
+                            role: None,
+                            refusal: None,
+                        },
+                    })))
+                },
+                Ok(MessageCreateStreamResponse::Ping) => {
+                    tracing::trace!("Received a ping stream packet");
+                    continue; 
+                },
+                | Ok(MessageCreateStreamResponse::ContentBlockStop { .. })  => {
+                    tracing::trace!("Received a content block stop packet");
+                    continue; 
+                },
+                Ok(MessageCreateStreamResponse::MessageStop) => {
+                    tracing::trace!("Received a stop stream packet");
+                    continue; 
+                },
+                Err(e) => {
+                    tracing::debug!("Received an anthropic error stream packet: {:?}", e);
+                    yield Err(OpenAIError::StreamError(e.to_string()))
+                },
+            }
+        }
+    };
+
+    Box::pin(transformed_stream)
+}
+
+/// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
+fn create_stream_response(
+    id: &str,
+    model: &str,
+    usage: Option<CompletionUsage>,
+    choice: Option<ChatChoiceStream>,
+) -> CreateChatCompletionStreamResponse {
+    let choices = match choice {
+        Some(c) => vec![c],
+        None => vec![],
+    };
+    CreateChatCompletionStreamResponse {
+        id: id.to_string(),
+        created: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32,
+        model: model.to_string(),
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_string(),
+        usage,
+        choices,
+    }
 }

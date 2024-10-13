@@ -17,7 +17,6 @@ limitations under the License.
 use async_openai::{config::Config, Client};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use secrecy::{ExposeSecret, Secret};
-// use types::AnthropicModelVariant;
 use std::sync::LazyLock;
 
 mod chat;

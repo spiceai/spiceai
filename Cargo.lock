@@ -859,7 +859,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.24.1"
-source = "git+https://github.com/spiceai/async-openai?rev=15ca84078d34590336ac1e50457e03adbcd9df71#15ca84078d34590336ac1e50457e03adbcd9df71"
+source = "git+https://github.com/spiceai/async-openai?rev=4c9ed31d58d6a715dba9feffa1111e66e1032ed5#4c9ed31d58d6a715dba9feffa1111e66e1032ed5"
 dependencies = [
  "async-convert",
  "backoff",
@@ -6134,6 +6134,7 @@ dependencies = [
  "pulldown-cmark",
  "rand 0.8.5",
  "reqwest 0.12.8",
+ "reqwest-eventsource",
  "schemars",
  "secrecy",
  "serde",

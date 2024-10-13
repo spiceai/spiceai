@@ -23,6 +23,7 @@ futures = { workspace = true }
 insta = { workspace = true, features = ["filters"] }
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 reqwest.workspace = true
+reqwest-eventsource = "0.6.0"
 serde = { workspace = true, features = ["derive"] }
 secrecy.workspace = true
 tokenizers = { version = "0.20.0" }
