@@ -146,16 +146,16 @@ impl CandleEmbedding {
         encoding.get_ids().iter().take_while(|&&x| x != 0).count()
     }
 
-    fn _embed(&self, input: EmbeddingInput) -> Result<(Vec<Vec<f32>>, usize)> {
-        let add_special_tokens = true;
+    fn encode(&self, inp: String) -> Result<Encoding> {
+        self.tok
+            .encode::<String>(inp, true)
+            .context(FailedToPrepareInputSnafu)
+    }
 
+    fn _embed(&self, input: EmbeddingInput) -> Result<(Vec<Vec<f32>>, usize)> {
         let (encodings, input_tokens): (Vec<Encoding>, usize) = match input {
             EmbeddingInput::String(s) => {
-                let encoding = self
-                    .tok
-                    .encode::<String>(s, add_special_tokens)
-                    .context(FailedToPrepareInputSnafu)?;
-                println!("Encoding: {encoding:#?}");
+                let encoding = self.encode(s)?;
                 let tokens = Self::tokens_in_encoding(&encoding);
                 (vec![encoding], tokens)
             }
@@ -163,10 +163,7 @@ impl CandleEmbedding {
                 let (encodings, tokens): (Vec<Encoding>, Vec<usize>) = arr
                     .into_iter()
                     .map(|s| {
-                        let enc = self
-                            .tok
-                            .encode::<String>(s, add_special_tokens)
-                            .context(FailedToPrepareInputSnafu)?;
+                        let enc = self.encode(s)?;
                         let tokens = Self::tokens_in_encoding(&enc);
                         Ok((enc, tokens))
                     })
@@ -186,15 +183,19 @@ impl CandleEmbedding {
         let pooled_idx = (0..=encodings.len()).map(|i| i as u32).collect::<Vec<_>>();
         let b = batch(encodings, pooled_idx, vec![]);
 
-        let (pooled_embeddings, _raw_embeddings) = match self.backend.lock() {
-            Ok(r) => sort_embeddings(r.embed(b).boxed().context(FailedToCreateEmbeddingSnafu)?),
-            Err(e) => {
-                tracing::error!("Failed to lock backend: {:?}", e);
-                return Err(super::Error::FailedToCreateEmbedding {
-                    source: "Failed to lock backend".into(),
-                });
-            }
-        };
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|e| super::Error::FailedToCreateEmbedding {
+                source: format!("Failed to lock backend: {e:?}").into(),
+            })?;
+
+        let (pooled_embeddings, _) = sort_embeddings(
+            backend
+                .embed(b)
+                .boxed()
+                .context(FailedToCreateEmbeddingSnafu)?,
+        );
 
         Ok((pooled_embeddings, input_tokens))
     }
