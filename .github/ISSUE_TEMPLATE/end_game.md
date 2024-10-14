@@ -69,10 +69,12 @@ assignees: ''
   - [ ] [Spark Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/spark/README.md)
   - [ ] [Supabase Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/supabase/README.md)
   - [ ] [Spice.ai Cloud Platform Data Connector](https://github.com/spiceai/quickstarts/blob/trunk/spiceai/README.md)
+  - [ ] Update the RC status of any connectors based on the [criteria](/docs/criteria/connectors/rc.md)
   - **Data Accelerators:**
   - [ ] [DuckDB Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/duckdb/accelerator/README.md)
   - [ ] [PostgreSQL Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/postgres/accelerator/README.md)
   - [ ] [SQLite Data Accelerator](https://github.com/spiceai/quickstarts/blob/trunk/sqlite/accelerator/README.md)
+  - [ ] Update the Beta status of any accelerators based on the [criteria](/docs/criteria/accelerators/beta.md)
   - **Catalog Connectors:**
   - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/databricks/README.md)
   - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
