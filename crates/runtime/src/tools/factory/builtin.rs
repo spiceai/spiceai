@@ -21,8 +21,8 @@ use spicepod::component::tool::Tool;
 
 use crate::tools::{
     builtin::{
-        document_similarity::DocumentSimilarityTool, list_datasets::ListDatasetsTool, sql::SqlTool,
-        table_schema::TableSchemaTool,
+        document_similarity::DocumentSimilarityTool, list_datasets::ListDatasetsTool,
+        sample_data::SampleDataTool, sql::SqlTool, table_schema::TableSchemaTool,
     },
     SpiceModelTool,
 };
@@ -52,6 +52,7 @@ impl ToolFactory for BuiltinToolFactory {
             "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(&name, description))),
             "table_schema" => Ok(Arc::new(TableSchemaTool::new(&name, description))),
             "sql" => Ok(Arc::new(SqlTool::new(&name, description))),
+            "sample_data" => Ok(Arc::new(SampleDataTool::new(&name, description))),
             "list_datasets" => {
                 let table_allowlist: Option<Vec<&str>> = component
                     .params

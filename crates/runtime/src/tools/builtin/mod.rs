@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use document_similarity::DocumentSimilarityTool;
 use list_datasets::ListDatasetsTool;
+use sample_data::SampleDataTool;
 use spicepod::component::tool::Tool;
 use sql::SqlTool;
 use table_schema::TableSchemaTool;
@@ -26,6 +27,7 @@ use super::SpiceModelTool;
 
 pub mod document_similarity;
 pub mod list_datasets;
+pub mod sample_data;
 pub mod sql;
 pub mod table_schema;
 
@@ -35,6 +37,7 @@ pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
         Arc::new(TableSchemaTool::default()),
         Arc::new(SqlTool::default()),
         Arc::new(ListDatasetsTool::default()),
+        Arc::new(SampleDataTool::default()),
     ]
 }
 
@@ -45,5 +48,6 @@ pub fn get_builtin_tool_spec() -> Vec<Tool> {
         TableSchemaTool::default().into(),
         SqlTool::default().into(),
         ListDatasetsTool::default().into(),
+        SampleDataTool::default().into(),
     ]
 }
