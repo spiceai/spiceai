@@ -469,7 +469,7 @@ impl VectorSearch {
         let tables: Vec<TableReference> = data_source.iter().map(TableReference::from).collect();
         let tables_not_found: Vec<TableReference> = tables
             .iter()
-            .filter(|&t| !self.df.table_exists(t.clone()))
+            .filter(|&t| self.df.table_exists(t.clone()))
             .cloned()
             .collect();
 
