@@ -15,6 +15,38 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 ## Beta Release Criteria
 
+### Definitions
+
+#### Major Bug
+
+A major bug is classified as a bug that:
+
+- Renders the accelerator completely inoperable (i.e. all queries on the accelerator fail, loading fails, etc), or;
+- Causes data inconsistency errors, or;
+- A bug that occurs in more than one accelerator, or;
+- A bug that is high impact or likely to be experienced in common use cases, and there is no viable workaround.
+
+#### Minor Bug
+
+A minor bug is any bug that cannot be classified as a major bug.
+
+#### Core Arrow Data Types
+
+Core Arrow Data Types consist of the following data types:
+
+- Null
+- Int/Float/Decimal
+- Time32/64
+- Timestamp/TimestampTZ
+- Date32/64
+- Duration
+- Interval
+- Binary/LargeBinary/FixedSizeBinary
+- Utf8/LargeUtf8
+- List/FixedSizeList/LargeList
+- Struct
+- Decimal128/Decimal256
+
 ### Feature complete
 
 - [ ] Data is streamed when accelerating from source into this accelerator
@@ -24,8 +56,8 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 - [ ] The accelerator supports federation push down across multiple datasets within the same accelerator (e.g. `select * from first_dataset, second_dataset`)
 - [ ] The accelerator supports resolving on conflict behaviors (e.g. Drop/Upsert)
 - [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
-- [ ] [Core Arrow Data Types](../definitions.md) are supported
-- [ ] All known [Major Bugs](../definitions.md) are resolved
+- [ ] [Core Arrow Data Types](#definitions) are supported
+- [ ] All known [Major Bugs](#definitions) are resolved
 
 ### Test Coverage
 
@@ -41,24 +73,24 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 
 #### General
 
-- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](../definitions.md)
+- [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](#definitions)
 - [ ] Integration tests to cover "On Conflict" behaviors.
 
 #### TPC-H
 
 - [ ] End-to-end test to cover accelerating TPC-H SF1 data from S3 and benchmarking TPC-H queries (official and simple).
-  - [ ] All supported modes should run all queries with no [Major Bugs](../definitions.md).
+  - [ ] All supported modes should run all queries with no [Major Bugs](#definitions).
 - [ ] A test script exists that can load TPC-H SF10 and TPC-H SF100 data into this accelerator in all supported modes.
-- [ ] The accelerator can load TPC-H SF10 in all supported modes, and can run all queries with no [Major Bugs](../definitions.md).
-- [ ] The accelerator can load TPC-H SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](../definitions.md).
+- [ ] The accelerator can load TPC-H SF10 in all supported modes, and can run all queries with no [Major Bugs](#definitions).
+- [ ] The accelerator can load TPC-H SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](#definitions).
 
 #### TPC-DS
 
 - [ ] End-to-end test to cover accelerating TPC-DS SF1 data from S3 and benchmarking TPC-DS queries (official and simple).
-  - [ ] All supported modes should run all queries with no [Major Bugs](../definitions.md).
+  - [ ] All supported modes should run all queries with no [Major Bugs](#definitions).
 - [ ] A test script exists that can load TPC-DS SF10 and TPC-DS SF100 data into this accelerator in all supported modes.
-- [ ] The accelerator can load TPC-DS SF10 in all supported modes, and can run all queries with no [Major Bugs](../definitions.md).
-- [ ] The accelerator can load TPC-DS SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](../definitions.md).
+- [ ] The accelerator can load TPC-DS SF10 in all supported modes, and can run all queries with no [Major Bugs](#definitions).
+- [ ] The accelerator can load TPC-DS SF100 in either file or direct database mode, and can run all queries with no [Major Bugs](#definitions).
 
 #### ClickBench
 
@@ -79,5 +111,5 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 - [ ] Documentation includes all known issues/limitations for the accelerator.
 - [ ] Documentation includes any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
 - [ ] The accelerator has an easy to follow quickstart.
-- [ ] All [Minor Bugs](../definitions.md) for TPC-DS and TPC-H are raised as issues.
+- [ ] All [Minor Bugs](#definitions) for TPC-DS and TPC-H are raised as issues.
 - [ ] All ClickBench bugs are raised as issues.
