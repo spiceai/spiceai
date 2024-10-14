@@ -28,7 +28,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use async_openai::types::EmbeddingInput;
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::{
+        CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
+    },
+};
 use async_trait::async_trait;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
@@ -129,26 +134,44 @@ impl CandleEmbedding {
 
         Ok(config)
     }
-}
 
-#[async_trait]
-impl Embed for CandleEmbedding {
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
-        let add_special_tokens = true;
+    /// Count the number of tokens in an encoding, excluding padding tokens.
+    /// An encoding is a sequence of token ids, with a 0 indicating padding at the end of the sequence.
+    ///
+    /// Example:
+    /// ```
+    /// Encoding{ id: [101, 2023, 2003, 12943, 102, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+    /// ```
+    fn tokens_in_encoding(encoding: &Encoding) -> usize {
+        encoding.get_ids().iter().take_while(|&&x| x != 0).count()
+    }
 
-        let encodings: Vec<Encoding> = match input {
-            EmbeddingInput::String(s) => vec![self
-                .tok
-                .encode::<String>(s, add_special_tokens)
-                .context(FailedToPrepareInputSnafu)?],
-            EmbeddingInput::StringArray(arr) => arr
-                .into_iter()
-                .map(|s| {
-                    self.tok
-                        .encode::<String>(s, add_special_tokens)
-                        .context(FailedToPrepareInputSnafu)
-                })
-                .collect::<Result<Vec<_>>>()?,
+    fn encode(&self, inp: String) -> Result<Encoding> {
+        self.tok
+            .encode::<String>(inp, true)
+            .context(FailedToPrepareInputSnafu)
+    }
+
+    fn _embed(&self, input: EmbeddingInput) -> Result<(Vec<Vec<f32>>, usize)> {
+        let (encodings, input_tokens): (Vec<Encoding>, usize) = match input {
+            EmbeddingInput::String(s) => {
+                let encoding = self.encode(s)?;
+                let tokens = Self::tokens_in_encoding(&encoding);
+                (vec![encoding], tokens)
+            }
+            EmbeddingInput::StringArray(arr) => {
+                let (encodings, tokens): (Vec<Encoding>, Vec<usize>) = arr
+                    .into_iter()
+                    .map(|s| {
+                        let enc = self.encode(s)?;
+                        let tokens = Self::tokens_in_encoding(&enc);
+                        Ok((enc, tokens))
+                    })
+                    .collect::<Result<Vec<(Encoding, usize)>>>()?
+                    .into_iter()
+                    .unzip();
+                (encodings, tokens.iter().sum())
+            }
             _ => {
                 return Err(super::Error::FailedToPrepareInput {
                     source: "Unsupported input type".into(),
@@ -160,17 +183,61 @@ impl Embed for CandleEmbedding {
         let pooled_idx = (0..=encodings.len()).map(|i| i as u32).collect::<Vec<_>>();
         let b = batch(encodings, pooled_idx, vec![]);
 
-        let (pooled_embeddings, _raw_embeddings) = match self.backend.lock() {
-            Ok(r) => sort_embeddings(r.embed(b).boxed().context(FailedToCreateEmbeddingSnafu)?),
-            Err(e) => {
-                tracing::error!("Failed to lock backend: {:?}", e);
-                return Err(super::Error::FailedToCreateEmbedding {
-                    source: "Failed to lock backend".into(),
-                });
-            }
-        };
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|e| super::Error::FailedToCreateEmbedding {
+                source: format!("Failed to lock backend: {e:?}").into(),
+            })?;
 
-        Ok(pooled_embeddings)
+        let (pooled_embeddings, _) = sort_embeddings(
+            backend
+                .embed(b)
+                .boxed()
+                .context(FailedToCreateEmbeddingSnafu)?,
+        );
+
+        Ok((pooled_embeddings, input_tokens))
+    }
+}
+
+#[async_trait]
+impl Embed for CandleEmbedding {
+    #[allow(clippy::cast_possible_truncation)]
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let (encodings, token_inputs) = self._embed(req.input).map_err(|e| {
+            OpenAIError::ApiError(ApiError {
+                message: e.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })
+        })?;
+
+        Ok(CreateEmbeddingResponse {
+            object: "list".to_string(),
+            model: req.model.clone(),
+            data: encodings
+                .iter()
+                .enumerate()
+                .map(|(i, emb)| Embedding {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: emb.clone(),
+                })
+                .collect(),
+            usage: EmbeddingUsage {
+                prompt_tokens: token_inputs as u32,
+                total_tokens: token_inputs as u32,
+            },
+        })
+    }
+
+    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        self._embed(input).map(|(embeddings, _usage)| embeddings)
     }
 
     fn size(&self) -> i32 {
