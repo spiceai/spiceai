@@ -28,7 +28,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use async_openai::types::EmbeddingInput;
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::{
+        CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
+    },
+};
 use async_trait::async_trait;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
@@ -129,26 +134,47 @@ impl CandleEmbedding {
 
         Ok(config)
     }
-}
 
-#[async_trait]
-impl Embed for CandleEmbedding {
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    /// Count the number of tokens in an encoding, excluding padding tokens.
+    /// An encoding is a sequence of token ids, with a 0 indicating padding at the end of the sequence.
+    ///
+    /// Example:
+    /// ```
+    /// Encoding{ id: [101, 2023, 2003, 12943, 102, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+    /// ```
+    fn tokens_in_encoding(encoding: &Encoding) -> usize {
+        encoding.get_ids().iter().take_while(|&&x| x != 0).count()
+    }
+
+    fn _embed(&self, input: EmbeddingInput) -> Result<(Vec<Vec<f32>>, usize)> {
         let add_special_tokens = true;
 
-        let encodings: Vec<Encoding> = match input {
-            EmbeddingInput::String(s) => vec![self
-                .tok
-                .encode::<String>(s, add_special_tokens)
-                .context(FailedToPrepareInputSnafu)?],
-            EmbeddingInput::StringArray(arr) => arr
-                .into_iter()
-                .map(|s| {
-                    self.tok
-                        .encode::<String>(s, add_special_tokens)
-                        .context(FailedToPrepareInputSnafu)
-                })
-                .collect::<Result<Vec<_>>>()?,
+        let (encodings, input_tokens): (Vec<Encoding>, usize) = match input {
+            EmbeddingInput::String(s) => {
+                let encoding = self
+                    .tok
+                    .encode::<String>(s, add_special_tokens)
+                    .context(FailedToPrepareInputSnafu)?;
+                println!("Encoding: {encoding:#?}");
+                let tokens = Self::tokens_in_encoding(&encoding);
+                (vec![encoding], tokens)
+            }
+            EmbeddingInput::StringArray(arr) => {
+                let (encodings, tokens): (Vec<Encoding>, Vec<usize>) = arr
+                    .into_iter()
+                    .map(|s| {
+                        let enc = self
+                            .tok
+                            .encode::<String>(s, add_special_tokens)
+                            .context(FailedToPrepareInputSnafu)?;
+                        let tokens = Self::tokens_in_encoding(&enc);
+                        Ok((enc, tokens))
+                    })
+                    .collect::<Result<Vec<(Encoding, usize)>>>()?
+                    .into_iter()
+                    .unzip();
+                (encodings, tokens.iter().sum())
+            }
             _ => {
                 return Err(super::Error::FailedToPrepareInput {
                     source: "Unsupported input type".into(),
@@ -170,7 +196,47 @@ impl Embed for CandleEmbedding {
             }
         };
 
-        Ok(pooled_embeddings)
+        Ok((pooled_embeddings, input_tokens))
+    }
+}
+
+#[async_trait]
+impl Embed for CandleEmbedding {
+    #[allow(clippy::cast_possible_truncation)]
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let (encodings, token_inputs) = self._embed(req.input).map_err(|e| {
+            OpenAIError::ApiError(ApiError {
+                message: e.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })
+        })?;
+
+        Ok(CreateEmbeddingResponse {
+            object: "list".to_string(),
+            model: req.model.clone(),
+            data: encodings
+                .iter()
+                .enumerate()
+                .map(|(i, emb)| Embedding {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: emb.clone(),
+                })
+                .collect(),
+            usage: EmbeddingUsage {
+                prompt_tokens: token_inputs as u32,
+                total_tokens: token_inputs as u32,
+            },
+        })
+    }
+
+    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        self._embed(input).map(|(embeddings, _usage)| embeddings)
     }
 
     fn size(&self) -> i32 {
