@@ -38,8 +38,8 @@ use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct SampleDataToolParams {
-    /// The SQL datasets to sample data from
-    datasets: Vec<String>,
+    /// The SQL datasets to sample data from. If None, search across all public datasets.
+    datasets: Option<Vec<String>>,
 
     /// The number of rows, each with distinct values per column, to sample.
     n: usize,
@@ -185,12 +185,16 @@ impl SpiceModelTool for SampleDataTool {
 
             let mut results = serde_json::Map::new();
 
-            for ds in req.datasets {
-                let tbl = TableReference::from(ds.clone());
+            let tables = req
+                .datasets
+                .map(|ds| ds.iter().map(TableReference::from).collect_vec())
+                .unwrap_or(rt.datafusion().get_user_table_names());
+
+            for tbl in tables {
                 let result = Self::sample(rt.datafusion(), &tbl, req.n).await?;
 
                 let serial = pretty_format_batches(&[result]).boxed()?;
-                results.insert(ds, Value::String(format!("{serial}")));
+                results.insert(tbl.to_string(), Value::String(format!("{serial}")));
             }
 
             Ok(Value::Object(results))
