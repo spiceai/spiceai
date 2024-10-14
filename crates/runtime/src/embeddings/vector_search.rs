@@ -471,7 +471,7 @@ impl VectorSearch {
             .map(|ts| {
                 ts.iter()
                     .map(TableReference::from)
-                    .filter(|t| !self.df.table_exists(t.clone()))
+                    .filter(|t| self.df.table_exists(t.clone()))
                     .collect()
             })
             .clone()
