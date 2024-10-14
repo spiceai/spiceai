@@ -55,6 +55,7 @@ pub(crate) fn routes(
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
+        .route("/v1/datasets/:name/sample", get(v1::datasets::sample))
         .route(
             "/v1/datasets/:name/acceleration/refresh",
             post(v1::datasets::refresh),

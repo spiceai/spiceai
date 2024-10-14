@@ -27,7 +27,6 @@ pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
     query_id: Uuid,
-    nsql: Option<&'a str>,
     restricted_sql_options: bool,
     protocol: Protocol,
 }
@@ -38,16 +37,9 @@ impl<'a> QueryBuilder<'a> {
             df,
             sql,
             query_id: Uuid::new_v4(),
-            nsql: None,
             restricted_sql_options: false,
             protocol,
         }
-    }
-
-    #[must_use]
-    pub fn nsql(mut self, nsql: Option<&'a str>) -> Self {
-        self.nsql = nsql;
-        self
     }
 
     #[must_use]
@@ -77,7 +69,6 @@ impl<'a> QueryBuilder<'a> {
             restricted_sql_options: self.restricted_sql_options,
             tracker: QueryTracker {
                 schema: None,
-                nsql: self.nsql.map(Into::into),
                 query_duration_secs: None,
                 query_execution_duration_secs: None,
                 rows_produced: 0,

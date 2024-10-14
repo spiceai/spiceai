@@ -16,7 +16,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset, LogErrors, Runtime,
+    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
+    tools::builtin::sample_data::SampleDataTool, LogErrors, Runtime,
 };
 use app::App;
 use axum::{
@@ -26,14 +27,20 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
+use headers_accept::Accept;
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
-use super::{convert_entry_to_csv, dataset_status, Format};
+use super::{
+    arrow_to_csv, arrow_to_json, arrow_to_plain, convert_entry_to_csv, dataset_status, ArrowFormat,
+    Format,
+};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DatasetFilter {
@@ -228,5 +235,43 @@ pub(crate) async fn acceleration(
             }),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SampleQueryParams {
+    #[serde(default = "SampleQueryParams::default_n")]
+    n: usize,
+}
+
+impl SampleQueryParams {
+    fn default_n() -> usize {
+        3
+    }
+}
+
+pub(crate) async fn sample(
+    Extension(df): Extension<Arc<DataFusion>>,
+    Path(dataset_name): Path<String>,
+    accept: Option<TypedHeader<Accept>>,
+    Query(params): Query<SampleQueryParams>,
+) -> Response {
+    let tbl = TableReference::parse_str(&dataset_name);
+    let sample = match SampleDataTool::sample(Arc::clone(&df), &tbl, params.n).await {
+        Ok(sample) => sample,
+        Err(e) => {
+            return (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let res = match ArrowFormat::from_accept_header(&accept) {
+        ArrowFormat::Json => arrow_to_json(&[sample]),
+        ArrowFormat::Csv => arrow_to_csv(&[sample]),
+        ArrowFormat::Plain => arrow_to_plain(&[sample]),
+    };
+
+    match res {
+        Ok(body) => (StatusCode::OK, body).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
