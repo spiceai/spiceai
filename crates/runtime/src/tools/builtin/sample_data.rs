@@ -192,7 +192,6 @@ impl SpiceModelTool for SampleDataTool {
 
             for tbl in tables {
                 let result = Self::sample(rt.datafusion(), &tbl, req.n).await?;
-
                 let serial = pretty_format_batches(&[result]).boxed()?;
                 results.insert(tbl.to_string(), Value::String(format!("{serial}")));
             }
