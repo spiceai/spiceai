@@ -142,6 +142,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("The character separating values within a row."),
     ParameterSpec::runtime("file_compression_type")
         .description("The type of compression used on the file. Supported types are: gzip, bzip2, xz, zstd, uncompressed"),
+    ParameterSpec::runtime("hive_infer_partitions")
+        .description("Infer the partition columns for hive-style partitioning from the folder structure. Defaults to true."),
 ];
 
 impl DataConnectorFactory for AzureBlobFSFactory {
