@@ -134,16 +134,10 @@ impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count();
-        let span = match &self.tracker.nsql {
-            Some(nsql) => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
-            }
-            None => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
-            }
-        };
 
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
         let inner_span = span.clone();
+
         let query_result = async {
             let mut session = self.df.ctx.state();
 
