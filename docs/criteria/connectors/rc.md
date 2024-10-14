@@ -43,20 +43,20 @@ This table defines the required features and/or tests for each connector:
 | Databricks    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Delta Lake    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Dremio        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| File          | ✅ (1) | ✅ (0.5) | ❌ | ❌ | ❌ | ❌ |
+| File          | ✅ (1) | ✅ (0.5) | ❌ | ❌ | ✅ | ❌ |
 | FTP/SFTP      | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | GraphQL       | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| GitHub        | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ |
+| GitHub        | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
 | HTTP/HTTPS    | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | MS SQL        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | MySQL         | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | ODBC          | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | PostgreSQL    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| Sharepoint    | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ |
+| Sharepoint    | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
 | Snowflake     | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Spice.AI      | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| S3            | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ❌ | ❌ |
-| Azure BlobFS  | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ❌ | ❌ |
+| S3            | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ✅ | ❌ |
+| Azure BlobFS  | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ✅ | ❌ |
 | Spark         | ✅ (1) | ✅ (0.5) | ✅ | ✅ | ✅ | ✅ |
 
 ### All Connectors
@@ -88,7 +88,23 @@ The following features/tests are dependent on the required features/tests for th
 
 #### Schema Inference
 
+Support for schema inference in a connector is classified as:
+
+- ✅: Full coverage. The connector supports native schema inference.
+- ⚠️: Partial coverage. The connector does not support native schema inference, but it requires no inference (e.g. static schema, etc).
+- ❌: No coverage. The connector does not support native schema inference, and typically infers schema from the first row of results.
+
+##### Full Coverage
+
 - [ ] The schema for data returned from queries is determined using a native CLI/library method provided by the connector.
+
+##### Partial Coverage
+
+- [ ] The connector does not support native schema inference, but it requires no inference.
+
+##### No Coverage
+
+- [ ] The connector does not support native schema inference.
 
 #### Federation
 
