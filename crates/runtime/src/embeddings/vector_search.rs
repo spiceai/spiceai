@@ -503,7 +503,7 @@ impl VectorSearch {
                 .await?;
 
             let table_primary_keys = self
-                .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.as_slice())
+                .get_primary_keys_with_overrides(&self.explicit_primary_keys, tables.clone())
                 .await?;
 
             let mut response: VectorSearchResult = HashMap::new();
@@ -635,7 +635,7 @@ impl VectorSearch {
     async fn get_primary_keys_with_overrides(
         &self,
         explicit_primary_keys: &HashMap<TableReference, Vec<String>>,
-        tables: &[TableReference],
+        tables: Vec<TableReference>,
     ) -> Result<HashMap<TableReference, Vec<String>>> {
         let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
 
