@@ -89,6 +89,7 @@ fn into_tool_message(
         .build()
 }
 
+/// Create subsequent Assistant and Tool messages simulating a model requesting to use the `sample_data` tool, then receiving the result.
 async fn sample_messages(
     sample_from: &[String],
     df: Arc<DataFusion>,
