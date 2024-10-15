@@ -22,9 +22,8 @@ use crate::{
 use async_openai::{
     error::OpenAIError,
     types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
         ChatCompletionRequestToolMessageContent, ChatCompletionToolType, FunctionCall,
     },
 };
@@ -57,39 +56,10 @@ fn clean_model_based_sql(input: &str) -> String {
     one_query.trim().to_string()
 }
 
-/// Convert the [`SampleDataToolParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
-fn into_assistant_message(
-    id: &str,
-    params: SampleDataToolParams,
-) -> Result<ChatCompletionRequestAssistantMessage, OpenAIError> {
-    ChatCompletionRequestAssistantMessageArgs::default()
-        .tool_calls(vec![ChatCompletionMessageToolCall {
-            id: id.to_string(),
-            r#type: ChatCompletionToolType::Function,
-            function: FunctionCall {
-                name: "sample_data".to_string(),
-                arguments: serde_json::to_value(params)
-                    .map_err(OpenAIError::JSONDeserialize)?
-                    .to_string(),
-            },
-        }])
-        .build()
-}
-
-/// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
-fn into_tool_message(
-    id: &str,
-    result: &serde_json::Value,
-) -> Result<ChatCompletionRequestToolMessage, OpenAIError> {
-    ChatCompletionRequestToolMessageArgs::default()
-        .tool_call_id(id.to_string())
-        .content(ChatCompletionRequestToolMessageContent::Text(
-            result.to_string(),
-        ))
-        .build()
-}
-
 /// Create subsequent Assistant and Tool messages simulating a model requesting to use the `sample_data` tool, then receiving the result.
+///
+/// Convert the [`SampleDataToolParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
+/// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
 async fn sample_messages(
     sample_from: &[String],
     df: Arc<DataFusion>,
@@ -101,8 +71,26 @@ async fn sample_messages(
     let result = SampleDataTool::default()
         .call_tool(&params, Arc::clone(&df))
         .await?;
-    let req = into_assistant_message("sample_data-nsql", params).boxed()?;
-    let resp = into_tool_message("sample_data-nsql", &result).boxed()?;
+    let req = ChatCompletionRequestAssistantMessageArgs::default()
+        .tool_calls(vec![ChatCompletionMessageToolCall {
+            id: "sample_data-nsql".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "sample_data".to_string(),
+                arguments: serde_json::to_value(params)
+                    .map_err(OpenAIError::JSONDeserialize)?
+                    .to_string(),
+            },
+        }])
+        .build()
+        .boxed()?;
+    let resp = ChatCompletionRequestToolMessageArgs::default()
+        .tool_call_id("sample_data-nsql".to_string())
+        .content(ChatCompletionRequestToolMessageContent::Text(
+            result.to_string(),
+        ))
+        .build()
+        .boxed()?;
 
     Ok(vec![req.into(), resp.into()])
 }
