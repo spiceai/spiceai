@@ -113,9 +113,9 @@ pub struct SearchRequest {
     /// The text to search documents for similarity
     pub text: String,
 
-    /// The datasets to search for similarity. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
+    /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
     #[serde(default)]
-    pub datasets: Vec<String>,
+    pub datasets: Option<Vec<String>>,
 
     /// Number of documents to return for each dataset
     #[serde(default = "default_limit")]
@@ -138,14 +138,14 @@ impl SearchRequest {
     #[must_use]
     pub fn new(
         text: String,
-        data_source: Vec<String>,
+        datasets: Option<Vec<String>>,
         limit: usize,
         where_cond: Option<String>,
         additional_columns: Vec<String>,
     ) -> Self {
         SearchRequest {
             text,
-            datasets: data_source,
+            datasets,
             limit,
             where_cond,
             additional_columns,
@@ -460,22 +460,29 @@ impl VectorSearch {
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let SearchRequest {
             text: query,
-            datasets: data_source,
+            datasets: data_source_opt,
             limit,
             where_cond,
             additional_columns,
         } = req;
 
-        let tables: Vec<TableReference> = data_source.iter().map(TableReference::from).collect();
-        let tables_not_found: Vec<TableReference> = tables
-            .iter()
-            .filter(|&t| !self.df.table_exists(t.clone()))
-            .cloned()
-            .collect();
+        let tables = data_source_opt
+            .as_ref()
+            .map(|ts| {
+                ts.iter()
+                    .map(TableReference::from)
+                    .filter(|t| self.df.table_exists(t.clone()))
+                    .collect()
+            })
+            .clone()
+            .unwrap_or(self.df.get_user_table_names());
 
-        if !tables_not_found.is_empty() {
+        if tables.is_empty() {
             return Err(Error::DataSourcesNotFound {
-                data_source: tables_not_found,
+                data_source: data_source_opt
+                    .as_ref()
+                    .map(|ts| ts.iter().map(TableReference::from).collect())
+                    .unwrap_or_default(),
             });
         }
 
