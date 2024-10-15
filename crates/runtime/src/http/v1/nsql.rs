@@ -13,7 +13,21 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, model::LLMModelStore};
+use crate::{
+    datafusion::DataFusion,
+    http::v1::sql_to_http_response,
+    model::LLMModelStore,
+    tools::builtin::sample_data::{SampleDataTool, SampleDataToolParams},
+};
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestToolMessageContent, ChatCompletionToolType, FunctionCall,
+    },
+};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -25,6 +39,7 @@ use headers_accept::Accept;
 
 use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_futures::Instrument;
@@ -42,6 +57,55 @@ fn clean_model_based_sql(input: &str) -> String {
     one_query.trim().to_string()
 }
 
+/// Convert the [`SampleDataToolParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
+fn into_assistant_message(
+    id: &str,
+    params: SampleDataToolParams,
+) -> Result<ChatCompletionRequestAssistantMessage, OpenAIError> {
+    ChatCompletionRequestAssistantMessageArgs::default()
+        .tool_calls(vec![ChatCompletionMessageToolCall {
+            id: id.to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "sample_data".to_string(),
+                arguments: serde_json::to_value(params)
+                    .map_err(OpenAIError::JSONDeserialize)?
+                    .to_string(),
+            },
+        }])
+        .build()
+}
+
+/// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
+fn into_tool_message(
+    id: &str,
+    result: &serde_json::Value,
+) -> Result<ChatCompletionRequestToolMessage, OpenAIError> {
+    ChatCompletionRequestToolMessageArgs::default()
+        .tool_call_id(id.to_string())
+        .content(ChatCompletionRequestToolMessageContent::Text(
+            result.to_string(),
+        ))
+        .build()
+}
+
+async fn sample_messages(
+    sample_from: &[String],
+    df: Arc<DataFusion>,
+) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    let params = SampleDataToolParams {
+        datasets: Some(sample_from.to_vec()),
+        n: 3,
+    };
+    let result = SampleDataTool::default()
+        .call_tool(&params, Arc::clone(&df))
+        .await?;
+    let req = into_assistant_message("sample_data-nsql", params).boxed()?;
+    let resp = into_tool_message("sample_data-nsql", &result).boxed()?;
+
+    Ok(vec![req.into(), resp.into()])
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct Request {
@@ -49,6 +113,8 @@ pub struct Request {
 
     #[serde(default = "default_model")]
     pub model: String,
+
+    pub sample_from: Option<Vec<String>>,
 }
 
 fn default_model() -> String {
@@ -91,10 +157,22 @@ pub(crate) async fn post(
         }
     }
 
+    // Create sample data assistant/tool messages if user wants to sample from dataset(s).
+    let tool_use_messages = match payload.sample_from {
+        Some(sample_from) => match sample_messages(&sample_from, Arc::clone(&df)).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("Error sampling datasets for NSQL messages: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        },
+        None => vec![],
+    };
+
     let sql_query_result = match llms.read().await.get(&payload.model) {
         Some(nql_model) => {
             let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
-            let Ok(req) = sql_gen.create_request_for_query(
+            let Ok(mut req) = sql_gen.create_request_for_query(
                 &payload.model,
                 &payload.query,
                 &table_create_stms,
@@ -105,6 +183,9 @@ pub(crate) async fn post(
                 )
                     .into_response();
             };
+
+            req.messages.extend(tool_use_messages);
+
             let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
                 Ok(r) => r,
                 Err(e) => {

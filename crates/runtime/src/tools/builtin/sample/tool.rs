@@ -87,7 +87,7 @@ impl SpiceModelTool for SampleDataTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = arg);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = arg, sample_method = self.params.name());
 
         async {
             let req = serde_json::from_str::<SampleTableParams>(arg)?;
