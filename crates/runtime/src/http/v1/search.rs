@@ -35,7 +35,11 @@ pub(crate) async fn post(
     let start_time = Instant::now();
 
     // For now, force the user to specify which data.
-    if payload.datasets.is_empty() {
+    if payload
+        .datasets
+        .as_ref()
+        .is_some_and(std::vec::Vec::is_empty)
+    {
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
