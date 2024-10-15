@@ -27,12 +27,12 @@ use snafu::ResultExt;
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct TopSamplesParams {
     /// The SQL dataset to sample data from.
-    tbl: String,
+    pub tbl: String,
     /// The number of rows, each with distinct values per column, to sample.
-    limit: usize,
+    pub limit: usize,
 
     /// How to order the samples before retrieving the top N.
-    order_by: String,
+    pub order_by: String,
 }
 
 impl SampleFrom for TopSamplesParams {

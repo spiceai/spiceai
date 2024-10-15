@@ -27,9 +27,9 @@ use snafu::ResultExt;
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct RandomSampleParams {
     /// The SQL dataset to sample data from.
-    tbl: String,
+    pub tbl: String,
     /// The number of rows, each with distinct values per column, to sample.
-    limit: usize,
+    pub limit: usize,
 }
 
 impl SampleFrom for RandomSampleParams {

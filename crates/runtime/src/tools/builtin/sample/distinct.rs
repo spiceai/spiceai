@@ -30,12 +30,12 @@ use super::SampleFrom;
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct DistinctColumnsParams {
     /// The SQL dataset to sample data from.
-    tbl: String,
+    pub tbl: String,
     /// The number of rows, each with distinct values per column, to sample.
-    limit: usize,
+    pub limit: usize,
 
     /// The columns to sample distinct values from. If None, all columns are sampled.
-    cols: Option<Vec<String>>,
+    pub cols: Option<Vec<String>>,
 }
 
 impl DistinctColumnsParams {
@@ -51,8 +51,10 @@ impl DistinctColumnsParams {
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure that we still get `n` rows when `len(distinct(col)) < n`, whilst
         // stilling getting all possible distinct values.
-        let query = format!(
-            "SELECT {col} FROM (
+        Self::_sample_col(
+            Arc::clone(&df),
+            &format!(
+                "SELECT {col} FROM (
                 SELECT {col}, 1 as priority
                 FROM (SELECT DISTINCT {col} FROM {tbl})
                 UNION ALL
@@ -61,10 +63,30 @@ impl DistinctColumnsParams {
             ) combined
             ORDER BY priority, {col}
             LIMIT {n}"
-        );
+            ),
+        )
+        .await
+    }
 
+    async fn sample_from_column(
+        df: Arc<DataFusion>,
+        tbl: &TableReference,
+        col: &str,
+        n: usize,
+    ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+        Self::_sample_col(
+            Arc::clone(&df),
+            &format!("SELECT {col} FROM {tbl} LIMIT {n}"),
+        )
+        .await
+    }
+
+    async fn _sample_col(
+        df: Arc<DataFusion>,
+        query: &str,
+    ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let result = df
-            .query_builder(&query, Protocol::Internal)
+            .query_builder(query, Protocol::Internal)
             .build()
             .run()
             .await
@@ -102,16 +124,19 @@ impl SampleFrom for DistinctColumnsParams {
             .fields()
             .iter()
             .map(|f| f.name().clone())
-            // Filter columns if a set of columns specified
-            .filter(|col| self.cols.as_ref().map_or(true, |cols| cols.contains(col)))
             .collect::<Vec<String>>();
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
         for (i, column) in columns.iter().enumerate() {
-            let column_data =
-                Self::sample_distinct_from_column(Arc::clone(&df), &tbl, column, self.limit)
-                    .await?;
+            // Only sample distinctly from columns that are specified in the `cols` field, or if `cols` is None.
+            let column_data = if self.cols.is_none()
+                || self.cols.as_ref().is_some_and(|cols| cols.contains(column))
+            {
+                Self::sample_distinct_from_column(Arc::clone(&df), &tbl, column, self.limit).await?
+            } else {
+                Self::sample_from_column(Arc::clone(&df), &tbl, column, self.limit).await?
+            };
             result.insert(i, column_data);
         }
 

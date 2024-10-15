@@ -26,14 +26,14 @@ use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::{
-    distinct::DistinctColumnsParams, ExploreTableMethod, ExploreTableParams, RandomSampleParams,
-    SampleFrom, TopSamplesParams,
+    distinct::DistinctColumnsParams, RandomSampleParams, SampleFrom, SampleTableMethod,
+    SampleTableParams, TopSamplesParams,
 };
 
 /// A tool to sample data from a table in a variety of ways. How data is sampled is determined by
 /// the [`ExploreTableMethod`] and the corresponding [`SampleFrom`].
 pub struct SampleDataTool {
-    params: ExploreTableMethod,
+    params: SampleTableMethod,
 
     // Overrides
     name: Option<String>,
@@ -42,7 +42,7 @@ pub struct SampleDataTool {
 
 impl SampleDataTool {
     #[must_use]
-    pub fn new(params: ExploreTableMethod) -> Self {
+    pub fn new(params: SampleTableMethod) -> Self {
         Self {
             params,
             name: None,
@@ -76,9 +76,9 @@ impl SpiceModelTool for SampleDataTool {
 
     fn parameters(&self) -> Option<Value> {
         match &self.params {
-            ExploreTableMethod::DistinctColumns => parameters::<DistinctColumnsParams>(),
-            ExploreTableMethod::RandomSample => parameters::<RandomSampleParams>(),
-            ExploreTableMethod::TopNSample => parameters::<TopSamplesParams>(),
+            SampleTableMethod::DistinctColumns => parameters::<DistinctColumnsParams>(),
+            SampleTableMethod::RandomSample => parameters::<RandomSampleParams>(),
+            SampleTableMethod::TopNSample => parameters::<TopSamplesParams>(),
         }
     }
 
@@ -90,7 +90,7 @@ impl SpiceModelTool for SampleDataTool {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = arg);
 
         async {
-            let req = serde_json::from_str::<ExploreTableParams>(arg)?;
+            let req = serde_json::from_str::<SampleTableParams>(arg)?;
 
             let batch = req.sample(rt.datafusion()).await?;
             let serial = pretty_format_batches(&[batch]).boxed()?;

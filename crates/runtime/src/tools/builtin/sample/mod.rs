@@ -30,56 +30,69 @@ pub mod tool;
 pub mod top_samples;
 
 pub trait SampleFrom: Send + Sync {
-    /// Given the parameters for sampling data, return a RecordBatch with the sampled data.
-    async fn sample(
+    /// Given the parameters for sampling data, return a [`RecordBatch`] with the sampled data.
+    fn sample(
         &self,
         df: Arc<DataFusion>,
-    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> impl std::future::Future<
+        Output = Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>,
+    > + Send;
 }
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ExploreTableMethod {
+pub enum SampleTableMethod {
+    #[serde(rename = "distinct")]
     DistinctColumns,
+
+    #[serde(rename = "random")]
     RandomSample,
+
+    #[serde(rename = "top_n")]
     TopNSample,
 }
 
-impl ExploreTableMethod {
+impl SampleTableMethod {
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            ExploreTableMethod::DistinctColumns => "sample_distinct_columns",
-            ExploreTableMethod::RandomSample => "random_sample",
-            ExploreTableMethod::TopNSample => "top_n_sample",
+            SampleTableMethod::DistinctColumns => "sample_distinct_columns",
+            SampleTableMethod::RandomSample => "random_sample",
+            SampleTableMethod::TopNSample => "top_n_sample",
         }
     }
 
+    #[must_use]
     pub fn description(&self) -> &str {
         match self {
-            ExploreTableMethod::DistinctColumns => "Sample distinct values from a table.",
-            ExploreTableMethod::RandomSample => "Sample random rows from a table.",
-            ExploreTableMethod::TopNSample => "Sample the top N rows from a table.",
+            SampleTableMethod::DistinctColumns => {
+                "Generate synthetic data by sampling distinct column values from a table."
+            }
+            SampleTableMethod::RandomSample => "Sample random rows from a table.",
+            SampleTableMethod::TopNSample => {
+                "Sample the top N rows from a table based on a specified ordering"
+            }
         }
     }
 }
 
+/// The unique parameters for sampling data for a given [`SampleTableMethod`] tool.
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum ExploreTableParams {
+pub enum SampleTableParams {
+    TopNSample(TopSamplesParams),
     DistinctColumns(DistinctColumnsParams),
     RandomSample(RandomSampleParams),
-    TopNSample(TopSamplesParams),
 }
 
-impl SampleFrom for ExploreTableParams {
+impl SampleFrom for SampleTableParams {
     async fn sample(
         &self,
         df: Arc<DataFusion>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            ExploreTableParams::DistinctColumns(params) => params.sample(df).await,
-            ExploreTableParams::RandomSample(params) => params.sample(df).await,
-            ExploreTableParams::TopNSample(params) => params.sample(df).await,
+            SampleTableParams::DistinctColumns(params) => params.sample(df).await,
+            SampleTableParams::RandomSample(params) => params.sample(df).await,
+            SampleTableParams::TopNSample(params) => params.sample(df).await,
         }
     }
 }

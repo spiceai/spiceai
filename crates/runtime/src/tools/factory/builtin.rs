@@ -23,7 +23,7 @@ use crate::tools::{
     builtin::{
         document_similarity::DocumentSimilarityTool,
         list_datasets::ListDatasetsTool,
-        sample::{tool::SampleDataTool, ExploreTableMethod},
+        sample::{tool::SampleDataTool, SampleTableMethod},
         sql::SqlTool,
         table_schema::TableSchemaTool,
     },
@@ -56,15 +56,15 @@ impl ToolFactory for BuiltinToolFactory {
             "table_schema" => Ok(Arc::new(TableSchemaTool::new(&name, description))),
             "sql" => Ok(Arc::new(SqlTool::new(&name, description))),
             "sample_distinct_columns" => Ok(Arc::new(
-                SampleDataTool::new(ExploreTableMethod::DistinctColumns)
+                SampleDataTool::new(SampleTableMethod::DistinctColumns)
                     .with_overrides(Some(name.as_str()), description.as_deref()),
             )),
             "random_sample" => Ok(Arc::new(
-                SampleDataTool::new(ExploreTableMethod::RandomSample)
+                SampleDataTool::new(SampleTableMethod::RandomSample)
                     .with_overrides(Some(name.as_str()), description.as_deref()),
             )),
             "top_n_sample" => Ok(Arc::new(
-                SampleDataTool::new(ExploreTableMethod::TopNSample)
+                SampleDataTool::new(SampleTableMethod::TopNSample)
                     .with_overrides(Some(name.as_str()), description.as_deref()),
             )),
             "list_datasets" => {
