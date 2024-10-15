@@ -71,6 +71,7 @@ async fn sample_messages(
     let result = SampleDataTool::default()
         .call_tool(&params, Arc::clone(&df))
         .await?;
+
     let req = ChatCompletionRequestAssistantMessageArgs::default()
         .tool_calls(vec![ChatCompletionMessageToolCall {
             id: "sample_data-nsql".to_string(),
