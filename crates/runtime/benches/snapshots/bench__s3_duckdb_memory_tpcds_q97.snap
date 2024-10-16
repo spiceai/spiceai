@@ -1,0 +1,9 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------+--------------+-------------------+
+| store_only | catalog_only | store_and_catalog |
++------------+--------------+-------------------+
+| 532651     | 285222       | 142               |
++------------+--------------+-------------------+

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use document_similarity::DocumentSimilarityTool;
 use list_datasets::ListDatasetsTool;
-use sample_data::SampleDataTool;
+use sample::{tool::SampleDataTool, SampleTableMethod};
 use spicepod::component::tool::Tool;
 use sql::SqlTool;
 use table_schema::TableSchemaTool;
@@ -27,7 +27,7 @@ use super::SpiceModelTool;
 
 pub mod document_similarity;
 pub mod list_datasets;
-pub mod sample_data;
+pub mod sample;
 pub mod sql;
 pub mod table_schema;
 
@@ -37,7 +37,9 @@ pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
         Arc::new(TableSchemaTool::default()),
         Arc::new(SqlTool::default()),
         Arc::new(ListDatasetsTool::default()),
-        Arc::new(SampleDataTool::default()),
+        Arc::new(SampleDataTool::new(SampleTableMethod::RandomSample)),
+        Arc::new(SampleDataTool::new(SampleTableMethod::DistinctColumns)),
+        Arc::new(SampleDataTool::new(SampleTableMethod::TopNSample)),
     ]
 }
 
@@ -48,6 +50,8 @@ pub fn get_builtin_tool_spec() -> Vec<Tool> {
         TableSchemaTool::default().into(),
         SqlTool::default().into(),
         ListDatasetsTool::default().into(),
-        SampleDataTool::default().into(),
+        SampleDataTool::new(SampleTableMethod::RandomSample).into(),
+        SampleDataTool::new(SampleTableMethod::DistinctColumns).into(),
+        SampleDataTool::new(SampleTableMethod::TopNSample).into(),
     ]
 }
