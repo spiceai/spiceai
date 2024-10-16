@@ -157,7 +157,7 @@ impl EmbeddingTable {
     fn base_table_has_embedding_column(base_schema: &SchemaRef, column: &str) -> bool {
         // Check if the base column exists
         if base_schema.column_with_name(column).is_none() {
-            tracing::warn!("Column '{column}' does not exist in the base table. Cannot use it create an embeddings");
+            tracing::warn!("No column '{column}' in the base table. Cannot use it to create embeddings");
             return false;
         }
 
