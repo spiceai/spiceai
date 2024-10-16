@@ -382,11 +382,19 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: postgres, params: { pg_host: localhost, pg_port: 5432, pg_db: testdb, pg_user: postgres, pg_pass: postgres, pg_sslmode: disable } },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL
+        if: matrix.acceleration.engine == 'postgres' 
+        uses: ./.github/actions/install-postgres
+        with:
+          os: ${{ matrix.target.target_os }}
+          pg-db: testdb
 
       - name: Install MySQL (Linux)
         if: matrix.target.target_os == 'linux'
@@ -460,6 +468,16 @@ jobs:
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
+          fi
+
+          # add params if present
+          PARAMS=$(echo '${{ toJson(matrix.acceleration.params) }}')
+          if [[ "$PARAMS" != "null" ]]; then
+            echo "      params:" >> spicepod.yaml
+            for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
+              value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              echo "        $key: $value" >> spicepod.yaml
+            done
           fi
 
           cat spicepod.yaml

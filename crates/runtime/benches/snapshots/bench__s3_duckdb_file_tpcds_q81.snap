@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+--------------+----------------+----------+--------+---------------+---------------+------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | ca_street_number | ca_street_name | ca_street_type | ca_suite_number | ca_city      | ca_county      | ca_state | ca_zip | ca_country    | ca_gmt_offset | ca_location_type | ctr_total_return |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+--------------+----------------+----------+--------+---------------+---------------+------------------+------------------+
+| AAAAAAAAAADLAAAA |              |              |             | 251              | 7th            | RD             | Suite X         | Edgewood     | Cooke County   | TX       | 70069  | United States | -6.00         | condo            | 1774.03          |
+| AAAAAAAAAEMKAAAA | Mrs.         | Charlotte    | Harvey      | 342              | Green Madison  | Court          | Suite H         | Riverside    | Aransas County | TX       | 79231  | United States | -6.00         | condo            | 3776.13          |
+| AAAAAAAAAENGBAAA | Mrs.         | Allyson      | Chavez      | 905              | Valley South   | Ave            | Suite L         | White Oak    | Crosby County  | TX       | 76668  | United States | -6.00         | single family    | 2440.92          |
+| AAAAAAAAAEPGBAAA | Dr.          | Pamela       | Connor      | 797              | Maple          | Ave            | Suite D         | Cedar Grove  | Kaufman County | TX       | 70411  | United States | -6.00         | apartment        | 3220.02          |
+| AAAAAAAAAFCGAAAA | Mr.          | Jordan       | West        | 529              | Third Fourth   | Parkway        | Suite V         | Bethesda     | Orange County  | TX       | 75980  | United States | -6.00         | condo            | 1939.01          |
+| AAAAAAAAAGFFBAAA | Dr.          | Joe          | Rogers      | 374              | Seventh        | Ct.            | Suite 330       | Sunnyside    | Houston County | TX       | 71952  | United States | -6.00         | apartment        | 2780.94          |
+| AAAAAAAAAGMKAAAA | Dr.          | Jerry        | Harris      | 155              | East           | Boulevard      | Suite Y         | Clifton      | Brown County   | TX       | 78014  | United States | -6.00         | apartment        | 9241.27          |
+| AAAAAAAAAGPGAAAA | Sir          | Joe          | Irving      | 262              | Sixth          | Blvd           | Suite 360       | Providence   | Martin County  | TX       | 76614  | United States | -6.00         | apartment        | 4618.25          |
+| AAAAAAAAAHHEBAAA | Mrs.         | Laura        | Kaufman     | 39               | 9th Woodland   | Boulevard      | Suite 390       | Walnut Grove | Refugio County | TX       | 77752  | United States | -6.00         | condo            | 8621.05          |
+| AAAAAAAAAHNEBAAA | Dr.          | William      | Soto        | 163              | Park Highland  | Ct.            | Suite 60        | Union        | Donley County  | TX       | 78721  | United States | -6.00         | apartment        | 5151.03          |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+--------------+----------------+----------+--------+---------------+---------------+------------------+------------------+
