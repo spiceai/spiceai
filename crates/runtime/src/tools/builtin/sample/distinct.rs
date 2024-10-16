@@ -29,6 +29,7 @@ use super::SampleFrom;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct DistinctColumnsParams {
+    #[serde(rename = "dataset")]
     /// The SQL dataset to sample data from.
     pub tbl: String,
     /// The number of rows, each with distinct values per column, to sample.
