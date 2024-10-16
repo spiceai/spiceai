@@ -43,6 +43,7 @@ This table defines the required features and/or tests for each connector:
 | Databricks    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Delta Lake    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Dremio        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| DuckDB        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | File          | ✅ (1) | ✅ (0.5) | ❌ | ❌ | ✅ | ❌ |
 | FTP/SFTP      | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | GraphQL       | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -136,6 +137,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-H data at the [designated scale factor](#rc-release-criteria) into this connector.
 - [ ] The connector can load TPC-H at the [designated scale factor](#rc-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-H are raised as issues.
+- [ ] TPC-H queries pass with a success rate equal or greater than TPC-H execution on Datafusion.
 
 ##### TPC-DS
 
@@ -144,6 +146,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-DS data at the [designated scale factor](#rc-release-criteria) into this connector.
 - [ ] The connector can load TPC-DS at the [designated scale factor](#rc-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-DS are raised as issues.
+- [ ] TPC-DS queries pass with a success rate equal or greater than TPC-DS execution on Datafusion.
 
 ##### ClickBench
 
