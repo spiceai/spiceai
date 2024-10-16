@@ -64,7 +64,9 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - DuckDB Data Connector (Stable)
 - GitHub Data Connector (Stable)
 - GraphQL Data Connector (Stable)
-- Dremio Data Connector (Stable)
+- MS SQL data connector (Stable)
+- File data connector (Stable)
+- Dremio data connector (Stable)
 - FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
@@ -85,6 +87,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `github`        | Stable |
 | `graphql`       | Stable |
 | `dremio`        | Stable |
+| `mssql`        | Stable |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |
