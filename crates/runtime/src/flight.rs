@@ -20,6 +20,7 @@ use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
 use crate::timing::TimeMeasurement;
 use crate::tls::TlsConfig;
+use crate::user_agent_util::extract_user_agent;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -32,6 +33,7 @@ use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use opentelemetry::KeyValue;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -75,17 +77,20 @@ impl FlightService for Service {
 
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        metrics::HANDSHAKE_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+
+        metrics::HANDSHAKE_REQUESTS.add(1, &labels);
         handshake::handle()
     }
 
     async fn list_flights(
         &self,
-        _request: Request<Criteria>,
+        request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        metrics::LIST_FLIGHTS_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::LIST_FLIGHTS_REQUESTS.add(1, &labels);
         tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
@@ -94,8 +99,9 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let _guard = TimeMeasurement::new(&metrics::GET_FLIGHT_INFO_REQUEST_DURATION_MS, vec![]);
-        metrics::GET_FLIGHT_INFO_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        let _guard = TimeMeasurement::new(&metrics::GET_FLIGHT_INFO_REQUEST_DURATION_MS, &labels);
+        metrics::GET_FLIGHT_INFO_REQUESTS.add(1, &labels);
         Box::pin(get_flight_info::handle(self, request)).await
     }
 
@@ -110,7 +116,8 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        metrics::GET_SCHEMA_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::GET_SCHEMA_REQUESTS.add(1, &labels);
         get_schema::handle(self, request).await
     }
 
@@ -118,7 +125,8 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        metrics::DO_GET_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::DO_GET_REQUESTS.add(1, &labels);
         Box::pin(do_get::handle(self, request)).await
     }
 
@@ -126,7 +134,8 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        metrics::DO_PUT_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::DO_PUT_REQUESTS.add(1, &labels);
         do_put::handle(self, request).await
     }
 
@@ -134,7 +143,8 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        metrics::DO_EXCHANGE_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::DO_EXCHANGE_REQUESTS.add(1, &labels);
         do_exchange::handle(self, request).await
     }
 
@@ -142,15 +152,17 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        metrics::DO_ACTION_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::DO_ACTION_REQUESTS.add(1, &labels);
         Box::pin(actions::do_action(self, request)).await
     }
 
     async fn list_actions(
         &self,
-        _request: Request<arrow_flight::Empty>,
+        request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        metrics::LIST_ACTIONS_REQUESTS.add(1, &[]);
+        let labels = Service::get_user_agent(&request);
+        metrics::LIST_ACTIONS_REQUESTS.add(1, &labels);
         Ok(actions::list())
     }
 }
@@ -240,6 +252,19 @@ impl Service {
         let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
 
         Ok((flights_stream.boxed(), query_result.from_cache))
+    }
+
+    fn get_user_agent<T>(req: &Request<T>) -> [KeyValue; 3] {
+        let user_agent = req
+            .metadata()
+            .get("x-spice-user-agent")
+            .map(|ua| ua.to_str().unwrap_or(""));
+        let (user_agent, agent_version, agent_os) = extract_user_agent(user_agent);
+        [
+            KeyValue::new("user-agent", user_agent),
+            KeyValue::new("user-agent-version", agent_version),
+            KeyValue::new("user-agent-os", agent_os),
+        ]
     }
 }
 
