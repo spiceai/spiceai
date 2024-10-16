@@ -470,13 +470,10 @@ jobs:
            fi
           fi
 
-          # Add params if present
+          # add params if present
           PARAMS=$(echo '${{ toJson(matrix.acceleration.params) }}')
-
           if [[ "$PARAMS" != "null" ]]; then
             echo "      params:" >> spicepod.yaml
-
-            # Loop through params and append to yaml
             for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
               value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
               echo "        $key: $value" >> spicepod.yaml
