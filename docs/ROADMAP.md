@@ -87,7 +87,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `github`        | Stable |
 | `graphql`       | Stable |
 | `dremio`        | Stable |
-| `mssql`        | Stable |
+| `mssql`         | Stable |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |
