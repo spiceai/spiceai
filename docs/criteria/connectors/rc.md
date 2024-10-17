@@ -44,7 +44,7 @@ This table defines the required features and/or tests for each connector:
 | Delta Lake    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Dremio        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | DuckDB        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| File          | ✅ (1) | ✅ (0.5) | ❌ | ❌ | ✅ | ❌ |
+| File          | ✅ (1) | ✅ (1) | ❌ | ❌ | ✅ | ❌ |
 | FTP/SFTP      | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | GraphQL       | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | GitHub        | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
@@ -56,9 +56,9 @@ This table defines the required features and/or tests for each connector:
 | Sharepoint    | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
 | Snowflake     | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
 | Spice.AI      | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| S3            | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ✅ | ❌ |
-| Azure BlobFS  | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ✅ | ❌ |
-| Spark         | ✅ (1) | ✅ (0.5) | ✅ | ✅ | ✅ | ✅ |
+| S3            | ✅ (1) | ✅ (1) | ⚠️ | ❌ | ✅ | ❌ |
+| Azure BlobFS  | ✅ (1) | ✅ (1) | ⚠️ | ❌ | ✅ | ❌ |
+| Spark         | ✅ (1) | ✅ (1) | ✅ | ✅ | ✅ | ✅ |
 
 ### All Connectors
 
