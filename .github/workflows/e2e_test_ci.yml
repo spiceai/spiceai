@@ -333,7 +333,7 @@ jobs:
           PGPASSWORD: postgres
         run: |
           psql -h localhost -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
-          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'\
+          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
 
       - name: Create Postgres Accelerator Test Database
         if: matrix.acceleration.engine == 'postgres'
