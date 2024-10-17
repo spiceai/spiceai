@@ -56,7 +56,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
   - Spicepod publish to [spicerack.org](https://spicerack.org)
 - Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
 - Model Providers: OpenAI, Hugging Face (Stable)
-- Unity Catalog (Stable)
+- Catalog Providers: Unity Catalog, Spice.AI Cloud Platform (Stable)
 - Databricks DeltaLake data connector (Stable)
 - Spice.ai Cloud Platform data connector (Stable)
 - S3 data connector (Stable)
@@ -70,6 +70,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - File data connector (Stable)
 - Dremio data connector (Stable)
 - Model Providers: Anthropic, File (Beta)
+- Catalog Providers: Databricks (Beta)
 - FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
@@ -108,6 +109,23 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `duckdb`     | Stable |
 | `sqlite`     | Stable |
 | `postgresql` | Stable |
+
+### v1.0-stable Catalog Provider Support
+
+| Name         | Status |
+| ------------ | ------ |
+| `unity_catalog`| Stable |
+| `spice.ai`     | Stable |
+| `databricks`   | Beta   |
+
+### v1.0-stable Model Provider Support
+
+| Name         | Status |
+| ------------ | ------ |
+| `openai`      | Stable |
+| `huggingface` | Stable |
+| `anthropic`   | Beta   |
+| `file`        | Beta   |
 
 ## v1.1
 
