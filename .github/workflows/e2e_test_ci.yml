@@ -340,7 +340,7 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          createdb testdb_acc
+          createdb -h localhost -U postgres testdb_acc
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
