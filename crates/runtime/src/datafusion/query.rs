@@ -311,6 +311,7 @@ impl Query {
     }
 
     fn handle_schema_error(self, e: &DataFusionError) {
+        // If there is an error getting the schema, we still want to track it in task history
         let span = tracing::span!(
             target: "task_history",
             tracing::Level::INFO,
