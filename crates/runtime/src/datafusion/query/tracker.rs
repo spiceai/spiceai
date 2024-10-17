@@ -25,7 +25,6 @@ use super::{error_code::ErrorCode, metrics, Protocol};
 
 pub(crate) struct QueryTracker {
     pub(crate) schema: Option<SchemaRef>,
-    pub(crate) nsql: Option<Arc<str>>,
     pub(crate) query_duration_secs: Option<f32>,
     pub(crate) query_execution_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
