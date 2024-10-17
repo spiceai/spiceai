@@ -17,13 +17,17 @@ use crate::{
     datafusion::DataFusion,
     http::v1::sql_to_http_response,
     model::LLMModelStore,
-    tools::builtin::sample_data::{SampleDataTool, SampleDataToolParams},
+    tools::builtin::sample::{
+        distinct::DistinctColumnsParams, random::RandomSampleParams, tool::SampleDataTool,
+        SampleTableParams,
+    },
 };
 use async_openai::{
     error::OpenAIError,
     types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
         ChatCompletionRequestToolMessageContent, ChatCompletionToolType, FunctionCall,
     },
 };
@@ -56,44 +60,77 @@ fn clean_model_based_sql(input: &str) -> String {
     one_query.trim().to_string()
 }
 
-/// Create subsequent Assistant and Tool messages simulating a model requesting to use the `sample_data` tool, then receiving the result.
+/// Create subsequent Assistant and Tool messages simulating a model requesting to use the `sample_data` tool, then receiving the result for the following sampling methods:
+///  - Distinct columns
+///  - Random sample
 ///
-/// Convert the [`SampleDataToolParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
+/// Convert the [`SampleTableParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
 /// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
 async fn sample_messages(
     sample_from: &[String],
     df: Arc<DataFusion>,
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
-    let params = SampleDataToolParams {
-        datasets: Some(sample_from.to_vec()),
-        n: 3,
-    };
-    let result = SampleDataTool::default()
-        .call_tool(&params, Arc::clone(&df))
+    let mut messages = Vec::with_capacity(4 * sample_from.len());
+
+    for dataset in sample_from {
+        for params in [
+            SampleTableParams::DistinctColumns(DistinctColumnsParams {
+                tbl: dataset.clone(),
+                limit: 3,
+                cols: None,
+            }),
+            SampleTableParams::RandomSample(RandomSampleParams {
+                tbl: dataset.clone(),
+                limit: 3,
+            }),
+        ] {
+            let (req, resp) = call_sample_and_create_messages(Arc::clone(&df), &params).await?;
+            messages.push(req.into());
+            messages.push(resp.into());
+        }
+    }
+    Ok(messages)
+}
+
+/// Call the `sample_data` tool with the given parameters and create associated Assistant and Tool messages.
+async fn call_sample_and_create_messages(
+    df: Arc<DataFusion>,
+    params: &SampleTableParams,
+) -> Result<
+    (
+        ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestToolMessage,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let ds = params.dataset();
+    let result = SampleDataTool::new(params.into())
+        .call_with(params, Arc::clone(&df))
         .await?;
 
     let req = ChatCompletionRequestAssistantMessageArgs::default()
         .tool_calls(vec![ChatCompletionMessageToolCall {
-            id: "sample_data-nsql".to_string(),
+            id: format!("distinct-{ds}-nsql"),
             r#type: ChatCompletionToolType::Function,
             function: FunctionCall {
                 name: "sample_data".to_string(),
-                arguments: serde_json::to_value(params)
+                arguments: serde_json::to_string(&params)
                     .map_err(OpenAIError::JSONDeserialize)?
                     .to_string(),
             },
         }])
         .build()
         .boxed()?;
+
     let resp = ChatCompletionRequestToolMessageArgs::default()
-        .tool_call_id("sample_data-nsql".to_string())
+        .tool_call_id(format!("distinct-{ds}-nsql"))
         .content(ChatCompletionRequestToolMessageContent::Text(
             result.to_string(),
         ))
         .build()
         .boxed()?;
 
-    Ok(vec![req.into(), resp.into()])
+    Ok((req, resp))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

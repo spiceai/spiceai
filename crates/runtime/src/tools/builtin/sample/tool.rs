@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
+    datafusion::DataFusion,
     tools::{parameters, SpiceModelTool},
     Runtime,
 };
@@ -33,7 +34,7 @@ use super::{
 /// A tool to sample data from a table in a variety of ways. How data is sampled is determined by
 /// the [`ExploreTableMethod`] and the corresponding [`SampleFrom`].
 pub struct SampleDataTool {
-    params: SampleTableMethod,
+    method: SampleTableMethod,
 
     // Overrides
     name: Option<String>,
@@ -42,9 +43,9 @@ pub struct SampleDataTool {
 
 impl SampleDataTool {
     #[must_use]
-    pub fn new(params: SampleTableMethod) -> Self {
+    pub fn new(method: SampleTableMethod) -> Self {
         Self {
-            params,
+            method,
             name: None,
             description: None,
         }
@@ -56,6 +57,27 @@ impl SampleDataTool {
         self.description = description.map(ToString::to_string);
         self
     }
+
+    pub async fn call_with(
+        &self,
+        params: &SampleTableParams,
+        df: Arc<DataFusion>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        if SampleTableMethod::from(params) != self.method {
+            return Err(format!("Invalid parameters for {} tool.", self.method.name()).into());
+        };
+
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = format!("{params}"), sample_method = self.method.name());
+
+        async {
+            let batch = params.sample(df).await?;
+            let serial = pretty_format_batches(&[batch]).boxed()?;
+
+            Ok(Value::String(format!("{serial}")))
+        }
+        .instrument(span.clone())
+        .await
+    }
 }
 
 #[async_trait]
@@ -63,19 +85,19 @@ impl SpiceModelTool for SampleDataTool {
     fn name(&self) -> &str {
         match self.name {
             Some(ref name) => name,
-            None => self.params.name(),
+            None => self.method.name(),
         }
     }
 
     fn description(&self) -> Option<&str> {
         match self.description {
             Some(ref desc) => Some(desc.as_str()),
-            None => Some(self.params.description()),
+            None => Some(self.method.description()),
         }
     }
 
     fn parameters(&self) -> Option<Value> {
-        match &self.params {
+        match &self.method {
             SampleTableMethod::DistinctColumns => parameters::<DistinctColumnsParams>(),
             SampleTableMethod::RandomSample => parameters::<RandomSampleParams>(),
             SampleTableMethod::TopNSample => parameters::<TopSamplesParams>(),
@@ -87,17 +109,10 @@ impl SpiceModelTool for SampleDataTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = arg, sample_method = self.params.name());
-
-        async {
-            let req = serde_json::from_str::<SampleTableParams>(arg)?;
-
-            let batch = req.sample(rt.datafusion()).await?;
-            let serial = pretty_format_batches(&[batch]).boxed()?;
-
-            Ok(Value::String(format!("{serial}")))
-        }
-        .instrument(span.clone())
+        self.call_with(
+            &serde_json::from_str::<SampleTableParams>(arg)?,
+            rt.datafusion(),
+        )
         .await
     }
 }
