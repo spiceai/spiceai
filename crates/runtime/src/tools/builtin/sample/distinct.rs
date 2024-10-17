@@ -115,7 +115,7 @@ impl SampleFrom for DistinctColumnsParams {
         df: Arc<DataFusion>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let tbl = TableReference::from(self.tbl.clone());
-        let Some(provider) = df.get_table(tbl.clone()).await else {
+        let Some(provider) = df.get_table(&tbl).await else {
             return Err("Table not found".into());
         };
 

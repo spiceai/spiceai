@@ -69,7 +69,7 @@ pub(crate) async fn handle(
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    let Some(table_provider) = flight_svc.datafusion.get_table(data_path.clone()).await else {
+    let Some(table_provider) = flight_svc.datafusion.get_table(&data_path).await else {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
