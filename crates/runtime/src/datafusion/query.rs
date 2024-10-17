@@ -294,9 +294,34 @@ impl Query {
 
     pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
         let session = self.df.ctx.state();
-        let plan = session.create_logical_plan(&self.sql).await?;
-        RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))?;
+        let plan = match session.create_logical_plan(&self.sql).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.handle_schema_error(&e);
+                return Err(e);
+            }
+        };
+
+        // Verify the plan against the restricted options
+        if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
+            self.handle_schema_error(&e);
+            return Err(e);
+        }
         Ok(plan.schema().as_arrow().clone())
+    }
+
+    fn handle_schema_error(self, e: &DataFusionError) {
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query",
+            input = %self.sql,
+            runtime_query = false
+        );
+        let error_code = ErrorCode::from(e);
+        span.in_scope(|| {
+            self.finish_with_error(e.to_string(), error_code);
+        });
     }
 }
 
