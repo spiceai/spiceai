@@ -54,7 +54,9 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Bugfixes and performance improvements
 - CLI
   - Spicepod publish to [spicerack.org](https://spicerack.org)
-- Data accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
+- Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
+- Model Providers: OpenAI, Hugging Face (Stable)
+- Unity Catalog (Stable)
 - Databricks DeltaLake data connector (Stable)
 - Spice.ai Cloud Platform data connector (Stable)
 - S3 data connector (Stable)
@@ -67,6 +69,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MS SQL data connector (Stable)
 - File data connector (Stable)
 - Dremio data connector (Stable)
+- Model Providers: Anthropic, File (Beta)
 - FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
