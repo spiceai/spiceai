@@ -290,7 +290,7 @@ jobs:
           cat spice.log
 
   test_quickstart_data_postgres:
-    name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -362,7 +362,7 @@ jobs:
         run: |
           echo "datasets:" >> spicepod.yaml
           echo "  - name: test_postgresql_table" >> spicepod.yaml
-          echo "    from: mysql:test_postgresql_table" >> spicepod.yaml
+          echo "    from: postgres:test_postgresql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
           echo "      pg_port: 5432" >> spicepod.yaml
