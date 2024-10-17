@@ -30,7 +30,7 @@ tracing-futures.workspace = true
 ## For Chunking
 text-splitter = {version =  "0.17.0", features = ["markdown", "tokenizers", "tiktoken-rs"]}
 pulldown-cmark = "0.12.1"
-tiktoken-rs = "0.5.9"
+tiktoken-rs = "0.6.0"
 
 ## `candle` feature packages
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "60e9375b6049eead77cbda7cb3d3d83187f501a2", optional = true }
