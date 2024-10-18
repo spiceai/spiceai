@@ -265,7 +265,8 @@ jobs:
           PG_BENCHMARK_PG_USER: postgres
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
-          PG_BENCHMARK_PG_DBNAME: tpch_sf1
+          PG_TPCH_BENCHMARK_PG_DBNAME: tpch_sf1
+          PG_TPCDS_BENCHMARK_PG_DBNAME: tpcds_sf1
           PG_BENCHMARK_ACC_PG_DBNAME: postgres
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
           MYSQL_BENCHMARK_MYSQL_HOST: localhost
