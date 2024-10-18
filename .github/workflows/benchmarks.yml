@@ -106,8 +106,20 @@ jobs:
           - 3306:3306
         env:
           MYSQL_ROOT_PASSWORD: root
-      postgres_conn:
+      postgres_tpch:
         image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+      postgres_tpcds:
+        image: ${{ matrix.cmd == '-c postgres -b tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
