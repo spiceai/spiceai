@@ -367,7 +367,7 @@ pub fn transform_stream(
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::expect_used)]
 fn create_stream_response(
     id: &str,
     model: &str,

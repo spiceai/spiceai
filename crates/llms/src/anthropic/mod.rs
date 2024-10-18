@@ -124,6 +124,7 @@ pub enum AnthropicAuthMechanism {
     AuthToken(Secret<String>),
 }
 
+#[allow(clippy::expect_used)]
 impl Config for AnthropicConfig {
     fn headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
