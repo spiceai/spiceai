@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use crate::datafusion::DataFusion;
 use arrow::array::RecordBatch;
@@ -39,7 +42,7 @@ pub trait SampleFrom: Send + Sync {
     > + Send;
 }
 
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub enum SampleTableMethod {
     #[serde(rename = "distinct")]
     DistinctColumns,
@@ -82,6 +85,36 @@ pub enum SampleTableParams {
     TopNSample(TopSamplesParams),
     DistinctColumns(DistinctColumnsParams),
     RandomSample(RandomSampleParams),
+}
+
+impl From<&SampleTableParams> for SampleTableMethod {
+    fn from(params: &SampleTableParams) -> Self {
+        match params {
+            SampleTableParams::DistinctColumns(_) => SampleTableMethod::DistinctColumns,
+            SampleTableParams::RandomSample(_) => SampleTableMethod::RandomSample,
+            SampleTableParams::TopNSample(_) => SampleTableMethod::TopNSample,
+        }
+    }
+}
+impl SampleTableParams {
+    #[must_use]
+    pub fn dataset(&self) -> &str {
+        match self {
+            SampleTableParams::DistinctColumns(params) => &params.tbl,
+            SampleTableParams::RandomSample(params) => &params.tbl,
+            SampleTableParams::TopNSample(params) => &params.tbl,
+        }
+    }
+}
+
+impl Display for SampleTableParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SampleTableParams::DistinctColumns(params) => write!(f, "DistinctColumns({params})"),
+            SampleTableParams::RandomSample(params) => write!(f, "RandomSample({params})"),
+            SampleTableParams::TopNSample(params) => write!(f, "TopNSample({params})"),
+        }
+    }
 }
 
 impl SampleFrom for SampleTableParams {
