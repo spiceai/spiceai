@@ -1,0 +1,58 @@
+name: spice-postgres-tpcds-bench docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull Postgres Docker image
+        run: docker pull postgres:latest
+
+      - name: Start temporary Postgres server
+        run: |
+          docker run --name spice-postgres-bench-temp -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:latest
+          sleep 10
+
+      - name: Install necessary tools
+        run: sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
+
+      - name: Initialize TPCDS data
+        working-directory: ./test/tpc-bench
+        run: |
+          make tpcds-init
+          export PGPASSWORD='postgres'
+          for sf in 1; do
+            DB_NAME=tpcds_sf${sf//./_}
+            DBGEN_SCALE=$sf make tpcds-gen
+
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME ADD_INDEXES=true make pg-tpcds-init
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
+            docker exec spice-postgres-bench-temp sh -c "exec pg_dump -U postgres ${DB_NAME}" >> postgres-tpcds-bench/backup_$DB_NAME.sql
+          done
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./test/tpc-bench/postgres-tpcds-bench
+          file: ./test/tpc-bench/postgres-tpcds-bench/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/spiceai/spice-postgres-tpcds-bench:latest
+            ghcr.io/spiceai/spice-postgres-tpcds-bench:${{ github.sha }}
