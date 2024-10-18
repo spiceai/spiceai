@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| c_last_name | c_first_name | ca_city       | bought_city    | ss_ticket_number | extended_price | extended_tax | list_price |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| Abbott      | Joseph       | Greenfield    | Midway         | 62751            | 37795.50       | 1086.40      | 53385.17   |
+| Abbott      | Harriet      | Wesley        | Forest Hills   | 84405            | 23666.36       | 1274.86      | 45689.64   |
+| Abney       | Louis        | Gladstone     | Green Acres    | 140967           | 20698.82       | 491.86       | 48086.21   |
+| Acosta      | Johnnie      | Centerville   | Enterprise     | 69183            | 21688.97       | 1059.74      | 34387.30   |
+| Adair       | Kimberly     | Centerville   | Forest Hills   | 157619           | 20277.95       | 929.31       | 44425.20   |
+| Adams       | Jonathon     | Highland Park | Pleasant Grove | 26218            | 21246.49       | 611.03       | 51453.82   |
+| Adams       | Michelle     | Unionville    | Hillcrest      | 55515            | 31090.74       | 1174.85      | 51510.85   |
+| Adams       | Genevieve    | Enterprise    | Union Hill     | 109910           | 32666.21       | 1432.96      | 61189.81   |
+| Adams       | David        | Bridgeport    | Antioch        | 213366           | 12990.48       | 225.47       | 28512.17   |
+| Adkins      | Daniel       | Wilson        | Providence     | 131164           | 11376.01       | 508.57       | 34817.21   |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+--------------+-----------------------+------------------+-----+
+| c_last_name | c_first_name | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt |
++-------------+--------------+--------------+-----------------------+------------------+-----+
+| Acosta      | Victor       | Mr.          | N                     | 156807           | 15  |
+| Adams       | Willie       | Sir          | N                     | 88285            | 15  |
+| Alston      | Jesus        | Sir          | Y                     | 52608            | 15  |
+| Anderson    | Chad         | Dr.          | Y                     | 56316            | 15  |
+| Anderson    | Charlotte    | Ms.          | N                     | 33001            | 15  |
+| Anderson    | Kari         | Miss         | Y                     | 78089            | 15  |
+| Anderson    | Norma        | Miss         | Y                     | 132983           | 16  |
+| Andrews     | Cindy        | Miss         | Y                     | 132595           | 16  |
+| Andrews     | Robert       | Sir          | Y                     | 30467            | 15  |
+| Appleton    | Ivan         | Dr.          | Y                     | 74586            | 15  |
++-------------+--------------+--------------+-----------------------+------------------+-----+
