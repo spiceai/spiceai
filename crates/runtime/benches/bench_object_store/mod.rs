@@ -78,7 +78,7 @@ pub(crate) async fn run(
         } else if query_name.starts_with("tpcds_q") {
             matches!(
                 bench_name.as_str(),
-                "s3_postgres_memory" | "s3_arrow_memory" | "s3_duckdb_file"
+                "s3" | "s3_postgres_memory" | "s3_arrow_memory" | "s3_duckdb_file"
             )
         } else {
             false
