@@ -1,3 +1,5 @@
+-- TODO: Add Postgres BOOLEAN[] type back when DucKDB support accelerating Arrow Boolean List Type
+-- Issue: https://github.com/spiceai/spiceai/issues/3138
 CREATE TABLE test_postgresql_table (
   id SERIAL PRIMARY KEY,
   int2_column SMALLINT,
@@ -17,8 +19,7 @@ CREATE TABLE test_postgresql_table (
   int8_array_column BIGINT[],
   float4_array_column REAL[],
   float8_array_column DOUBLE PRECISION[],
-  text_array_column TEXT[],
-  bool_array_column BOOLEAN[]
+  text_array_column TEXT[]
 );
 
 INSERT INTO test_postgresql_table (
@@ -39,8 +40,7 @@ INSERT INTO test_postgresql_table (
   int8_array_column, 
   float4_array_column, 
   float8_array_column, 
-  text_array_column, 
-  bool_array_column
+  text_array_column
 ) VALUES (
   1, 
   2, 
@@ -59,10 +59,8 @@ INSERT INTO test_postgresql_table (
   ARRAY[5, 6], 
   ARRAY[7.0, 8.0], 
   ARRAY[9.0, 10.0], 
-  ARRAY['test1', 'test2'], 
-  ARRAY[true, false]
+  ARRAY['test1', 'test2']
 ), (
-  NULL,
   NULL,
   NULL,
   NULL,
