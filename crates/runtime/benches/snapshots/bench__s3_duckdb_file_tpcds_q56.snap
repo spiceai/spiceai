@@ -5,14 +5,14 @@ expression: records_pretty
 +------------------+-------------+
 | i_item_id        | total_sales |
 +------------------+-------------+
-| AAAAAAAAAADEAAAA | 0.00        |
-| AAAAAAAAAAHBAAAA | 0.00        |
-| AAAAAAAAAKGAAAAA | 0.00        |
 | AAAAAAAAGHDAAAAA | 0.00        |
-| AAAAAAAAHFICAAAA | 0.00        |
-| AAAAAAAAKEFAAAAA | 0.00        |
-| AAAAAAAAOLCEAAAA | 0.00        |
 | AAAAAAAAIDDAAAAA | 2.04        |
-| AAAAAAAAAAEDAAAA | 3.63        |
-| AAAAAAAAEJECAAAA | 10.40       |
+| AAAAAAAAGEJAAAAA | 13.70       |
+| AAAAAAAAEOPCAAAA | 15.24       |
+| AAAAAAAACOKDAAAA | 25.41       |
+| AAAAAAAAIKOAAAAA | 27.20       |
+| AAAAAAAAKANAAAAA | 38.28       |
+| AAAAAAAAGPICAAAA | 41.14       |
+| AAAAAAAAALEEAAAA | 57.89       |
+| AAAAAAAAKNDDAAAA | 62.88       |
 +------------------+-------------+
