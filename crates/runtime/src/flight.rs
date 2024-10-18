@@ -182,7 +182,6 @@ impl Service {
         protocol: Protocol,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion), protocol)
-            .use_restricted_sql_options()
             .protocol(protocol)
             .build();
 

@@ -27,7 +27,6 @@ pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
     query_id: Uuid,
-    restricted_sql_options: bool,
     protocol: Protocol,
 }
 
@@ -37,7 +36,6 @@ impl<'a> QueryBuilder<'a> {
             df,
             sql,
             query_id: Uuid::new_v4(),
-            restricted_sql_options: false,
             protocol,
         }
     }
@@ -45,12 +43,6 @@ impl<'a> QueryBuilder<'a> {
     #[must_use]
     pub fn query_id(mut self, query_id: Uuid) -> Self {
         self.query_id = query_id;
-        self
-    }
-
-    #[must_use]
-    pub fn use_restricted_sql_options(mut self) -> Self {
-        self.restricted_sql_options = true;
         self
     }
 
@@ -66,7 +58,6 @@ impl<'a> QueryBuilder<'a> {
         Query {
             df: Arc::clone(&self.df),
             sql: Arc::clone(&sql),
-            restricted_sql_options: self.restricted_sql_options,
             tracker: QueryTracker {
                 schema: None,
                 query_duration_secs: None,
