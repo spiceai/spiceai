@@ -45,9 +45,6 @@ type DatasetRefreshApiRequest struct {
 
 func constructRequest(sql string, mode string, max_jitter string) (*string, error) {
 	r := DatasetRefreshApiRequest{}
-	if sql == "" && mode == "" && max_jitter == "" {
-		return nil, nil
-	}
 	if sql != "" {
 		r.RefreshSQL = &sql
 	}
@@ -57,8 +54,8 @@ func constructRequest(sql string, mode string, max_jitter string) (*string, erro
 	if max_jitter != "" {
 		r.MaxJitter = &max_jitter
 	}
-	bytz, err := json.Marshal(r)
-	s := string(bytz)
+	bytes, err := json.Marshal(r)
+	s := string(bytes)
 
 	return &s, err
 }
@@ -99,6 +96,7 @@ spice refresh taxi_trips
 			slog.Error("constructing request", "error", err)
 			return
 		}
+
 		res, err := api.PostRuntime[DatasetRefreshApiResponse](rtcontext, url, body)
 		if err != nil {
 			slog.Error("refreshing dataset", "error", err)
