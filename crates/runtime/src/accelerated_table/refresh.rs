@@ -79,10 +79,14 @@ pub struct RefreshOverrides {
     #[serde(default, rename = "refresh_sql")]
     pub sql: Option<String>,
 
-    #[serde(rename = "refresh_mode")]
+    #[serde(default, rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
 
-    #[serde(rename = "refresh_jitter_max", deserialize_with = "parse_max_jitter")]
+    #[serde(
+        default,
+        rename = "refresh_jitter_max",
+        deserialize_with = "parse_max_jitter"
+    )]
     pub max_jitter: Option<Duration>,
 }
 
