@@ -46,8 +46,26 @@ async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
         .exec(
             "
 CREATE TABLE test (
-    id VARCHAR(36) PRIMARY KEY,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  id SERIAL PRIMARY KEY,
+  col_bit BIT(1),
+  col_tiny TINYINT,
+  col_short SMALLINT,
+  col_long INT,
+  col_longlong BIGINT,
+  col_float FLOAT,
+  col_double DOUBLE,
+  col_timestamp TIMESTAMP,
+  col_date DATE,
+  col_time TIME,
+  col_blob BLOB,
+  col_varchar VARCHAR(255),
+  col_string TEXT,
+  col_var_string VARCHAR(255),
+  col_decimal DECIMAL(10, 2),
+  col_unsigned_int INT UNSIGNED,
+  col_char CHAR(3),
+  col_set SET('apple', 'banana', 'cherry'),
+  col_json JSON
 );",
             Params::Empty,
         )
@@ -55,7 +73,95 @@ CREATE TABLE test (
 
     let _: Vec<Row> = conn
         .exec(
-            "INSERT INTO test (id, created_at) VALUES ('5ea5a3ac-07a0-4d4d-b201-faff68d8356c', '2023-05-02 10:30:00-04:00');", Params::Empty
+            "INSERT INTO test (
+  col_bit,
+  col_tiny,
+  col_short,
+  col_long,
+  col_longlong,
+  col_float,
+  col_double,
+  col_timestamp,
+  col_date,
+  col_time,
+  col_blob,
+  col_varchar,
+  col_string,
+  col_var_string,
+  col_decimal,
+  col_unsigned_int,
+  col_char,
+  col_set,
+  col_json
+) VALUES (
+  1,
+  1,
+  1,
+  1,
+  1,
+  1.1,
+  1.1,
+  '2019-01-01 00:00:00',
+  '2019-01-01',
+  '12:34:56',
+  'blob',
+  'varchar',
+  'string',
+  'var_string',
+  1.11,
+  10,
+  'USA',
+  'apple,banana',
+  '{\"name\": \"John\", \"age\": 30, \"is_active\": true, \"balance\": 1234.56}'
+);",
+            Params::Empty,
+        )
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "INSERT INTO test (
+  col_bit,
+  col_tiny,
+  col_short,
+  col_long,
+  col_longlong,
+  col_float,
+  col_double,
+  col_timestamp,
+  col_date,
+  col_time,
+  col_blob,
+  col_varchar,
+  col_string,
+  col_var_string,
+  col_decimal,
+  col_unsigned_int,
+  col_char,
+  col_set,
+  col_json
+) VALUES (
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);",
+            Params::Empty,
         )
         .await?;
 
@@ -100,12 +206,12 @@ async fn mysql_integration_test() -> Result<(), String> {
     }
 
     let queries: QueryTests = vec![(
-        "SELECT * FROM test LIMIT 1",
-        "select_limit_1",
+        "SELECT * FROM test",
+        "select",
         Some(Box::new(|result_batches| {
             for batch in &result_batches {
-                assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
-                assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
             }
 
             // snapshot the values of the results
@@ -116,7 +222,7 @@ async fn mysql_integration_test() -> Result<(), String> {
                 omit_expression => true,
                 snapshot_path => "../snapshots"
             }, {
-                insta::assert_snapshot!(format!("mysql_integration_test_select_limit_1"), results);
+                insta::assert_snapshot!(format!("mysql_integration_test_select"), results);
             });
         })),
     )];
