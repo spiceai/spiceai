@@ -30,8 +30,6 @@ tokenizers = { version = "0.20.0" }
 tracing.workspace = true
 tracing-futures.workspace = true
 
-
-
 ## For Chunking
 text-splitter = {version =  "0.17.0", features = ["markdown", "tokenizers", "tiktoken-rs"]}
 pulldown-cmark = "0.12.1"

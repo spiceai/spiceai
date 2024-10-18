@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::error::OpenAIError;
+use async_openai::{error::OpenAIError, types::ChatCompletionTool};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, fmt::Display, str::FromStr};
+use serde_json::Value;
+use std::{fmt::Display, str::FromStr};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageCreateParams {
@@ -206,46 +207,9 @@ impl ToolResultBlockParam {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum BetaContentBlock {
-    Text(BetaTextBlock),
-    ToolUse(BetaToolUseBlock),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BetaTextBlock {
-    pub text: String,
-    #[serde(rename = "type")]
-    pub block_type: String, // Always "text"
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BetaToolUseBlock {
-    pub id: String,
-    pub input: serde_json::Value, // Using serde_json::Value for generic object
-    pub name: String,
-    #[serde(rename = "type")]
-    pub block_type: String, // Always "tool_use"
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InputSchemaTyped {
-    #[serde(rename = "type")]
-    pub schema_type: String, // Always "object"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub properties: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum InputSchema {
-    Typed(InputSchemaTyped),
-    Dict(HashMap<String, serde_json::Value>),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ToolParam {
-    pub input_schema: InputSchema,
+    #[serde(rename = "input_schema")]
+    pub json_schema: serde_json::Value,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -263,25 +227,58 @@ pub enum ToolChoiceType {
 pub struct ToolChoiceParam {
     #[serde(rename = "type")]
     pub choice_type: ToolChoiceType,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disable_parallel_tool_use: Option<bool>,
+    pub name: Option<String>,
+    pub disable_parallel_tool_use: bool,
+}
+
+impl ToolChoiceParam {
+    pub fn auto(disable_parallel_tool_use: bool) -> Self {
+        Self {
+            choice_type: ToolChoiceType::Auto,
+            name: None,
+            disable_parallel_tool_use,
+        }
+    }
+
+    pub fn any(disable_parallel_tool_use: bool) -> Self {
+        Self {
+            choice_type: ToolChoiceType::Any,
+            name: None,
+            disable_parallel_tool_use,
+        }
+    }
+
+    pub fn tool(name: String, disable_parallel_tool_use: bool) -> Self {
+        Self {
+            choice_type: ToolChoiceType::Tool,
+            name: Some(name),
+            disable_parallel_tool_use,
+        }
+    }
+}
+
+impl From<&ChatCompletionTool> for ToolParam {
+    fn from(val: &ChatCompletionTool) -> Self {
+        ToolParam {
+            name: val.function.name.clone(),
+            description: val.function.description.clone(),
+            json_schema: val.function.parameters.clone().unwrap_or(Value::Null),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ToolChoiceAutoParam {
     #[serde(rename = "type")]
     pub choice_type: String, // Always "auto"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disable_parallel_tool_use: Option<bool>,
+    pub disable_parallel_tool_use: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ToolChoiceAnyParam {
     #[serde(rename = "type")]
     pub choice_type: String, // Always "any"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disable_parallel_tool_use: Option<bool>,
+    pub disable_parallel_tool_use: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

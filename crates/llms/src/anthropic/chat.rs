@@ -22,23 +22,23 @@ use crate::chat::nsql::SqlGeneration;
 use crate::chat::Chat;
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionToolType, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall, Role,
-    Stop,
+    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolChoiceOption,
+    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, Role, Stop,
 };
 
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
     MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolResultBlockParam, ToolUseBlockParam,
+    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam,
 };
 use super::types_stream::{transform_stream, AnthropicStreamError, MessageCreateStreamResponse};
 use super::Anthropic;
@@ -309,9 +309,23 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             system: system_message_from_messages(&value.messages),
             messages,
 
-            // TODO: Implement these
-            tool_choice: None,
-            tools: None,
+            tool_choice: value.tool_choice.and_then(|t| match t {
+                ChatCompletionToolChoiceOption::Auto => Some(ToolChoiceParam::auto(
+                    !value.parallel_tool_calls.unwrap_or_default(),
+                )),
+                ChatCompletionToolChoiceOption::None => None,
+                ChatCompletionToolChoiceOption::Required => Some(ToolChoiceParam::any(
+                    !value.parallel_tool_calls.unwrap_or_default(),
+                )),
+                ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+                    function: FunctionName { name },
+                    ..
+                }) => Some(ToolChoiceParam::tool(
+                    name,
+                    !value.parallel_tool_calls.unwrap_or_default(),
+                )),
+            }),
+            tools: value.tools.map(|t| t.iter().map(Into::into).collect()),
         })
     }
 }
