@@ -231,7 +231,7 @@ Query Error Execution error: Unable to query arrow: Server error: `ERROR 42000 (
 ```sql
 SELECT
   CASE 
-    WHEN count(t1_id) / count(t2_id) = 0 THEN 0
+    WHEN count(t1_id) / count(t2_id) IS NULL THEN 0
     ELSE count(t1_id) / count(t2_id)
 FROM t1, t2
 ```
