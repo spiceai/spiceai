@@ -152,6 +152,12 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
             let api_key = extract_secret!(params, "anthropic_api_key");
             let auth_token = extract_secret!(params, "anthropic_auth_token");
 
+            if api_key.is_none() && auth_token.is_none() {
+                return Err(LlmError::FailedToLoadModel {
+                    source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+                });
+            }
+
             let cfg = AnthropicConfig::default()
                 .with_api_key(api_key)
                 .with_auth_token(auth_token)

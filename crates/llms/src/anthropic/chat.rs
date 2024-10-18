@@ -20,7 +20,7 @@ use std::time::SystemTime;
 
 use crate::chat::nsql::SqlGeneration;
 use crate::chat::Chat;
-use async_openai::error::OpenAIError;
+use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
@@ -82,7 +82,6 @@ impl Chat for Anthropic {
         let inner_resp: MessageCreateResponse = self.client.post("/messages", anth_req).await?;
 
         let mut resp = CreateChatCompletionResponse::try_from(inner_resp)?;
-
         resp.model = self.name.to_string();
         Ok(resp)
     }
@@ -119,7 +118,14 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
                     None => None,
                 },
-                message: create_completion_message(&value.content, &value.role)?,
+                message: create_completion_message(&value.content, &value.role).map_err(|e| {
+                    OpenAIError::ApiError(ApiError {
+                        message: e.to_string(),
+                        r#type: Some("AnthropicConversionError".to_string()),
+                        param: None,
+                        code: None,
+                    })
+                })?,
             }],
         })
     }
@@ -128,7 +134,7 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
 fn create_completion_message(
     blocks: &[ResponseContentBlock],
     role: &MessageRole,
-) -> Result<ChatCompletionResponseMessage, OpenAIError> {
+) -> Result<ChatCompletionResponseMessage, Box<dyn std::error::Error + Send + Sync>> {
     let mut content = String::new();
 
     // Convert tool calls and add message text to `content`
@@ -136,11 +142,16 @@ fn create_completion_message(
         .iter()
         .filter_map(|b| match b {
             ResponseContentBlock::ToolUse(t) => {
-                let arguments =
-                    match serde_json::to_string(&t.input).map_err(OpenAIError::JSONDeserialize) {
-                        Ok(a) => a,
-                        Err(e) => return Some(Err(e)),
-                    };
+                let arguments = match serde_json::to_string(&t.input) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Some(Err(format!(
+                            "Failed to serialize tool use argument {}. Error: {e}",
+                            t.input
+                        )
+                        .into()))
+                    }
+                };
                 Some(Ok(ChatCompletionMessageToolCall {
                     id: t.id.clone(),
                     r#type: ChatCompletionToolType::Function,
@@ -155,7 +166,7 @@ fn create_completion_message(
                 None
             }
         })
-        .collect::<Result<Vec<_>, OpenAIError>>()?;
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
     Ok(ChatCompletionResponseMessage {
         tool_calls: Some(tool_calls),
@@ -255,10 +266,29 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
                     Some(calls) => calls
                         .iter()
                         .map(|call| {
+                            let input = if call.function.arguments.is_empty() {
+                                Ok(json!(
+                                    {
+                                        "$schema": "http://json-schema.org/draft-07/schema#",
+                                        "properties": {},
+                                        "required": [],
+                                        "title": "RandomSampleParams",
+                                        "type": "object"
+                                    }
+                                ))
+                            } else {
+                                serde_json::from_str(&call.function.arguments)
+                            };
                             Ok(ContentBlock::ToolUse(ToolUseBlockParam::new(
                                 call.id.clone(),
-                                serde_json::from_str(&call.function.arguments)
-                                    .map_err(OpenAIError::JSONDeserialize)?,
+                                input.map_err(|e| {
+                                    OpenAIError::ApiError(ApiError {
+                                        message: e.to_string(),
+                                        r#type: Some("AnthropicConversionError".to_string()),
+                                        param: None,
+                                        code: None,
+                                    })
+                                })?,
                                 call.function.name.clone(),
                             )))
                         })
@@ -309,22 +339,22 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             system: system_message_from_messages(&value.messages),
             messages,
 
-            tool_choice: value.tool_choice.and_then(|t| match t {
-                ChatCompletionToolChoiceOption::Auto => Some(ToolChoiceParam::auto(
+            tool_choice: match value.tool_choice {
+                Some(ChatCompletionToolChoiceOption::Auto) => Some(ToolChoiceParam::auto(
                     !value.parallel_tool_calls.unwrap_or_default(),
                 )),
-                ChatCompletionToolChoiceOption::None => None,
-                ChatCompletionToolChoiceOption::Required => Some(ToolChoiceParam::any(
+                None | Some(ChatCompletionToolChoiceOption::None) => None,
+                Some(ChatCompletionToolChoiceOption::Required) => Some(ToolChoiceParam::any(
                     !value.parallel_tool_calls.unwrap_or_default(),
                 )),
-                ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+                Some(ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
                     function: FunctionName { name },
                     ..
-                }) => Some(ToolChoiceParam::tool(
+                })) => Some(ToolChoiceParam::tool(
                     name,
                     !value.parallel_tool_calls.unwrap_or_default(),
                 )),
-            }),
+            },
             tools: value.tools.map(|t| t.iter().map(Into::into).collect()),
         })
     }

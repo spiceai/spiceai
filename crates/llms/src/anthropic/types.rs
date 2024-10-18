@@ -16,10 +16,10 @@ limitations under the License.
 
 use async_openai::{error::OpenAIError, types::ChatCompletionTool};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::json;
 use std::{fmt::Display, str::FromStr};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageCreateParams {
     pub max_tokens: u32,
     pub messages: Vec<MessageParam>,
@@ -44,7 +44,7 @@ pub struct MessageCreateParams {
     pub top_p: Option<f32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageParam {
     pub content: ContentParam,
     pub role: MessageRole,
@@ -65,14 +65,14 @@ impl MessageParam {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ContentParam {
     String(String),
     Blocks(Vec<ContentBlock>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     User,
@@ -89,7 +89,7 @@ impl MessageRole {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     Text(TextBlockParam),
@@ -98,14 +98,14 @@ pub enum ContentBlock {
     ToolResult(ToolResultBlockParam),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponseContentBlock {
     Text(TextBlockParam),
     ToolUse(ToolUseBlockParam),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BetaRawContentBlockStartEvent {
     pub content_block: ContentBlock,
     pub index: i32,
@@ -113,7 +113,7 @@ pub struct BetaRawContentBlockStartEvent {
     pub event_type: String, // Always "content_block_start"
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TextBlockParam {
     pub text: String,
     #[serde(rename = "type")]
@@ -128,7 +128,7 @@ impl TextBlockParam {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Source {
     pub data: String, // Base64 encoded string
     pub media_type: MediaType,
@@ -136,7 +136,7 @@ pub struct Source {
     pub r#type: SourceType,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaType {
     #[serde(rename = "image_jpeg")]
@@ -152,20 +152,20 @@ pub enum MediaType {
     Webp,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
     Base64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ImageBlockParam {
     pub source: Source,
     #[serde(rename = "type")]
     pub block_type: String, // Always "image"
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolUseBlockParam {
     pub id: String,
     pub input: serde_json::Value, // Using serde_json::Value for generic object
@@ -185,7 +185,7 @@ impl ToolUseBlockParam {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolResultBlockParam {
     pub tool_use_id: String,
     #[serde(rename = "type")]
@@ -206,7 +206,7 @@ impl ToolResultBlockParam {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolParam {
     #[serde(rename = "input_schema")]
     pub json_schema: serde_json::Value,
@@ -215,18 +215,19 @@ pub struct ToolParam {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ToolChoiceType {
     Auto,
     Any,
     Tool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolChoiceParam {
     #[serde(rename = "type")]
     pub choice_type: ToolChoiceType,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub disable_parallel_tool_use: bool,
 }
@@ -262,32 +263,40 @@ impl From<&ChatCompletionTool> for ToolParam {
         ToolParam {
             name: val.function.name.clone(),
             description: val.function.description.clone(),
-            json_schema: val.function.parameters.clone().unwrap_or(Value::Null),
+            json_schema: val.function.parameters.clone().unwrap_or(json!(
+                {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "properties": {},
+                    "required": [],
+                    "title": "RandomSampleParams",
+                    "type": "object"
+                }
+            )),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolChoiceAutoParam {
     #[serde(rename = "type")]
     pub choice_type: String, // Always "auto"
     pub disable_parallel_tool_use: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolChoiceAnyParam {
     #[serde(rename = "type")]
     pub choice_type: String, // Always "any"
     pub disable_parallel_tool_use: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MetadataParam {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AnthropicModelVariant {
     Claude35Sonnet20240620,
     Claude3Opus20240229,
@@ -367,7 +376,7 @@ impl AnthropicModelVariant {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct MessageCreateResponse {
     pub id: String,
     pub content: Vec<ResponseContentBlock>,
@@ -382,7 +391,7 @@ pub struct MessageCreateResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
@@ -391,13 +400,13 @@ pub enum StopReason {
     ToolUse,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MessageType {
     #[serde(rename = "message")]
     Message,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u32,
