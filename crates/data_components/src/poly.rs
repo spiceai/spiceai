@@ -72,8 +72,8 @@ impl FederationProvider for PolyTableProvider {
             .and_then(|f| f.compute_context())
     }
 
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
-        self.get_federation_provider().and_then(|f| f.analyzer())
+    fn optimizer(&self) -> Option<Arc<datafusion::optimizer::Optimizer>> {
+        self.get_federation_provider().and_then(|f| f.optimizer())
     }
 }
 

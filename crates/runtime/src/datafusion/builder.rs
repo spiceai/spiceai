@@ -25,7 +25,7 @@ use datafusion::{
     execution::SessionStateBuilder,
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::FederationAnalyzerRule;
+use datafusion_federation::FederationOptimizerRule;
 use tokio::sync::RwLock as TokioRwLock;
 
 use crate::{embeddings, object_store_registry::default_runtime_env, status};
@@ -90,7 +90,8 @@ impl DataFusionBuilder {
         };
 
         let ctx = SessionContext::new_with_state(state);
-        ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
+        //ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
+        ctx.add_optimizer_rule(Arc::new(FederationOptimizerRule::new()));
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
         ctx.register_udf(embeddings::cosine_distance::CosineDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
