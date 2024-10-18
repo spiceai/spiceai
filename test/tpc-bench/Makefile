@@ -181,3 +181,36 @@ mysql-tpcds-load:
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
+
+
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-init
+pg-tpcds-init:
+	@echo "Checking if database '$(DB_NAME)' exists..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -tAc "SELECT 1 FROM pg_database WHERE datname='$(DB_NAME)'" | grep -q 1 && \
+		(echo "Database '$(DB_NAME)' already exists, skipping creation.") || \
+		(createdb -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) && echo "Database '$(DB_NAME)' created successfully.")
+
+	@echo "Dropping existing tables if they exist..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\
+		DROP TABLE IF EXISTS call_center, catalog_page, catalog_returns, catalog_sales, customer, customer_address, customer_demographics, date_dim, dbgen_version, household_demographics, income_band, inventory, item, promotion, reason, ship_mode, store, store_returns, store_sales, time_dim, warehouse, web_page, web_returns, web_sales, web_site;"
+
+	@echo "Creating tables from tpcds.sql..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f ./tpcds-kit/tools/tpcds.sql
+
+	@if [ "$(ADD_INDEXES)" = "true" ] || [ "$(ADD_INDEXES)" = "1" ]; then \
+		echo "Applying indexes from tpcds_index.sql..."; \
+		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql; \
+		echo "Indexes applied successfully."; \
+	fi
+
+	@echo "Database '$(DB_NAME)' has been successfully created or updated."
+
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
+pg-tpcds-load:
+	@mkdir -p ./tmp
+	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
+		echo "Loading $$table..."; \
+		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
+		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.dat' CSV DELIMITER '|';"; \
+	done
+	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
