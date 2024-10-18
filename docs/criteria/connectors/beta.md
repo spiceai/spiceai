@@ -74,6 +74,10 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 - [ ] Documentation includes any exceptions made to allow this connector to reach RC quality (e.g. if a particular data type cannot be supported by the connector).
 - [ ] The connector has an easy to follow quickstart.
 
+#### Testing
+
+- [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server, reading latest GitHub issues, etc.
+
 ### Conditional Criteria
 
 The following features/tests are dependent on the required features/tests for the specified connector, from the [Connector criteria table](#beta-release-criteria)
