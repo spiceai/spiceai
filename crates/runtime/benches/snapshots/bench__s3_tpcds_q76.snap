@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++---------+---------------------+--------+-------+-------------+-----------+-----------+
+| channel | col_name            | d_year | d_qoy | i_category  | sales_cnt | sales_amt |
++---------+---------------------+--------+-------+-------------+-----------+-----------+
+| catalog | cs_bill_customer_sk | 1998   | 1     | Books       | 11        | 831.89    |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Children    | 12        | 19265.11  |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Electronics | 16        | 6008.82   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Home        | 9         | 9927.12   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Jewelry     | 10        | 30472.71  |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Men         | 7         | 6998.10   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Music       | 13        | 1292.12   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Shoes       | 10        | 929.61    |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Sports      | 9         | 157.76    |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Women       | 9         | 22636.20  |
++---------+---------------------+--------+-------+-------------+-----------+-----------+

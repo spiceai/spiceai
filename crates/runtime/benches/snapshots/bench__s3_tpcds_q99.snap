@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name       | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
+| Conventional childr                                   | EXPRESS   | Mid Atlantic  | 1267    | 1327       | 1250       | 0           | 0         |
+| Conventional childr                                   | EXPRESS   | NY Metro      | 1269    | 1263       | 1266       | 0           | 0         |
+| Conventional childr                                   | EXPRESS   | North Midwest | 1173    | 1253       | 1342       | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | Mid Atlantic  | 940     | 952        | 950        | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | NY Metro      | 944     | 958        | 951        | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | North Midwest | 930     | 910        | 958        | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | Mid Atlantic  | 1231    | 1246       | 1335       | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | NY Metro      | 1239    | 1236       | 1268       | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | North Midwest | 1245    | 1268       | 1364       | 0           | 0         |
+| Conventional childr                                   | OVERNIGHT | Mid Atlantic  | 878     | 961        | 934        | 0           | 0         |
++-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+

@@ -199,7 +199,18 @@ async fn run_connector_bench(
         "spice.ai" => {
             bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
-        "s3" | "abfs" => {
+        "s3" => {
+            bench_object_store::run(
+                connector,
+                &mut rt,
+                &mut benchmark_results,
+                None,
+                None,
+                bench_name,
+            )
+            .await?;
+        }
+        "abfs" => {
             bench_object_store::run(
                 connector,
                 &mut rt,
