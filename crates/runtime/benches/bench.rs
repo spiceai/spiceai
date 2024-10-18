@@ -133,7 +133,7 @@ async fn main() -> Result<(), String> {
                 #[cfg(feature = "sqlite")]
                 create_acceleration("sqlite", acceleration::Mode::File, None),
                 #[cfg(feature = "postgres")]
-                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true))),
+                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true, &args.bench_name))),
             ];
             for accelerator in accelerators {
                 run_accelerator_bench(accelerator.clone(), &upload_results_dataset, "tpch").await?;
@@ -156,7 +156,7 @@ async fn main() -> Result<(), String> {
                 #[cfg(feature = "postgres")]
                 {
                     if accelerator == "postgres" {
-                        Some(get_postgres_params(true))
+                        Some(get_postgres_params(true, &args.bench_name))
                     } else {
                         None
                     }
@@ -216,7 +216,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "postgres")]
         "postgres" => {
-            bench_postgres::run(&mut rt, &mut benchmark_results).await?;
+            bench_postgres::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "mysql")]
         "mysql" => {

@@ -137,7 +137,7 @@ fn build_app(
         #[cfg(feature = "spark")]
         "spark" => Ok(crate::bench_spark::build_app(app_builder)),
         #[cfg(feature = "postgres")]
-        "postgres" => Ok(crate::bench_postgres::build_app(app_builder)),
+        "postgres" => crate::bench_postgres::build_app(app_builder, bench_name),
         #[cfg(feature = "mysql")]
         "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
