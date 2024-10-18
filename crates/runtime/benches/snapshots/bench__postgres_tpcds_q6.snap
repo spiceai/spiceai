@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------+-----+
+| state | cnt |
++-------+-----+
+| AZ    | 10  |
+| NV    | 11  |
+| MD    | 13  |
+| VT    | 14  |
+| ME    | 20  |
+| NJ    | 21  |
+| WY    | 23  |
+| OR    | 25  |
+| ID    | 27  |
+| UT    | 30  |
++-------+-----+

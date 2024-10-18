@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++--------+-------------+-------------------------------+
+| ca_zip | ca_city     | sum(web_sales.ws_sales_price) |
++--------+-------------+-------------------------------+
+| 08283  | Green Acres | 7.20                          |
+| 08438  | Oak Hill    | 5.69                          |
+| 20191  | Belmont     | 100.44                        |
+| 29303  | Springfield | 22.91                         |
+| 34975  | Kingston    | 45.42                         |
+| 41675  | Waterloo    | 51.88                         |
+| 53788  | Barnes      | 27.89                         |
+| 66192  | Fairfield   | 142.79                        |
+| 70069  | Edgewood    | 62.89                         |
+| 70534  | Crossroads  | 164.91                        |
++--------+-------------+-------------------------------+

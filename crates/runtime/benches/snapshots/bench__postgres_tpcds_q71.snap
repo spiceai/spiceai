@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++----------+---------------------+--------+----------+-----------+
+| brand_id | brand               | t_hour | t_minute | ext_price |
++----------+---------------------+--------+----------+-----------+
+| 2001002  | amalgimporto #2     | 18     | 36       |           |
+| 3004001  | edu packscholar #2  | 19     | 15       |           |
+| 3004002  | edu packexporti #2  | 17     | 49       |           |
+| 4002001  | scholarmaxi #6      | 17     | 27       |           |
+| 4004002  | edu packedu pack #2 | 19     | 35       |           |
+| 5001001  | brandunivamalg #11  | 18     | 45       |           |
+| 5004002  | edu packscholar #2  | 19     | 25       |           |
+| 5004002  | edu packscholar #2  | 17     | 5        |           |
+| 5004002  | edu packscholar #2  | 17     | 47       |           |
+| 7014003  | edu packcorp #2     | 19     | 11       |           |
++----------+---------------------+--------+----------+-----------+

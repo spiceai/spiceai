@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+--------------------------------------+------------------+----------+-----------+
+| c_last_name | c_first_name | substr(ms.s_city,Int64(1),Int64(30)) | ss_ticket_number | amt      | profit    |
++-------------+--------------+--------------------------------------+------------------+----------+-----------+
+| Abbott      | Harriet      | Midway                               | 111376           | 11356.28 | -16716.92 |
+| Abel        | Ida          | Fairview                             | 130398           | 1046.14  | -17343.25 |
+| Abrams      | Fannie       | Midway                               | 177397           | 222.18   | -2529.63  |
+| Ackerman    | Jeffrey      | Midway                               | 198943           | 977.78   | -6460.69  |
+| Adams       | Beth         | Midway                               | 73934            | 2148.45  | -9147.51  |
+| Adams       | Farrah       | Midway                               | 65201            | 795.59   | -7961.47  |
+| Adams       | Juan         | Fairview                             | 216356           | 3018.49  | -14897.52 |
+| Adams       | Juan         | Fairview                             | 216356           |          | -2267.74  |
+| Adams       | Kimberly     | Midway                               | 42898            | 4424.69  | -23837.28 |
+| Adams       | Lashawn      | Fairview                             | 3833             | 4228.27  | -10956.01 |
++-------------+--------------+--------------------------------------+------------------+----------+-----------+

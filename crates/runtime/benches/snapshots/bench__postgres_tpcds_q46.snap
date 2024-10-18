@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+--------------+-------------+------------------+---------+-----------+
+| c_last_name | c_first_name | ca_city      | bought_city | ss_ticket_number | amt     | profit    |
++-------------+--------------+--------------+-------------+------------------+---------+-----------+
+| Aaron       | Charles      | Jamestown    | Red Hill    | 183217           | 2067.37 | -8054.03  |
+| Aaron       | George       | Forest Hills | Woodville   | 6922             | 533.49  | 380.69    |
+| Abbott      | Frederick    | Green Acres  | Oakland     | 7247             | 518.63  | -13290.67 |
+| Abbott      | Genevieve    | Lebanon      | Union Hill  | 222904           | 172.93  | 240.97    |
+| Abbott      | Kathlyn      | Highland     | Providence  | 102224           | 8806.61 | -19167.57 |
+| Abel        | Etta         | Wildwood     | Newport     | 180836           | 903.54  | -2298.17  |
+| Abernathy   | Helen        | Forest Hills | Fairview    | 235211           | 2126.47 | -7349.93  |
+| Abner       | Lane         | Liberty      | Greenville  | 9171             | 370.56  | -11330.10 |
+| Abraham     | Carolyn      | Shiloh       | Ashland     | 132084           | 105.29  | 6341.52   |
+| Abraham     | Michael      | Kingston     | Clifton     | 14263            | 1582.72 | -8885.02  |
++-------------+--------------+--------------+-------------+------------------+---------+-----------+
