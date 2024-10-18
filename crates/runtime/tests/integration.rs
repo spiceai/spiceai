@@ -36,6 +36,7 @@ mod docker;
 mod duckdb;
 mod federation;
 mod graphql;
+mod metrics;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]
