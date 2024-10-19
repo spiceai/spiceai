@@ -58,7 +58,7 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode > 200 && resp.StatusCode < 400 {
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		var result T
 		if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			return *new(T), fmt.Errorf("error decoding response: %w", err)
