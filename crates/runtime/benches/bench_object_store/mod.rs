@@ -47,13 +47,18 @@ pub(crate) async fn run(
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             #[cfg(feature = "postgres")]
-            if engine.clone().unwrap_or_default().as_str() == "postgres" {
-                super::bench_postgres::get_tpcds_test_queries()
-            } else {
-                get_tpcds_test_queries()
+            {
+                if engine.clone().unwrap_or_default().as_str() == "postgres" {
+                    super::bench_postgres::get_tpcds_test_queries()
+                } else {
+                    get_tpcds_test_queries()
+                }
             }
 
-            get_tpcds_test_queries()
+            #[cfg(not(feature = "postgres"))]
+            {
+                get_tpcds_test_queries()
+            }
         }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
