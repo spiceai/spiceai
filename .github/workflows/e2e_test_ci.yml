@@ -372,7 +372,7 @@ jobs:
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
         with:
-          name: eth_recent_blocks
+          name: test_parquet_table
 
       - name: Stop spice and check logs
         working-directory: test_app
