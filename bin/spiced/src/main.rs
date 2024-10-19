@@ -30,7 +30,7 @@ fn main() {
             println!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata());
         } else {
             print!(
-                "v{}-rc.{}",
+                "v{}-build.{}",
                 env!("CARGO_PKG_VERSION"),
                 env!("GIT_COMMIT_HASH")
             );
