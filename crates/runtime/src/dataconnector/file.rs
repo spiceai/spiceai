@@ -76,7 +76,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_compression_type")
         .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
     ParameterSpec::runtime("hive_infer_partitions")
-        .description("Infer the partition columns for hive-style partitioning from the folder structure. Defaults to true."),
+        .description("Infer the partition columns for hive-style partitioning from the folder structure. Defaults to false."),
 ];
 
 impl DataConnectorFactory for FileFactory {

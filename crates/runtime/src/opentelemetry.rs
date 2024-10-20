@@ -424,9 +424,9 @@ fn attributes_to_fields_and_columns(
     for (i, inner_attributes) in attributes.iter().enumerate() {
         for attribute in *inner_attributes {
             let key_str = attribute.key.as_str();
-            match &attribute.value {
-                Some(any_value) => match &any_value.value {
-                    Some(value) => match value {
+            if let Some(any_value) = &attribute.value {
+                if let Some(value) = &any_value.value {
+                    match value {
                         any_value::Value::StringValue(string_value) => {
                             append_attribute!(
                                 columns,
@@ -489,20 +489,18 @@ fn attributes_to_fields_and_columns(
                             );
                             append_null(&mut fields, &mut columns, key_str);
                         }
-                    },
-                    None => {
-                        tracing::warn!(
-                            "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
-                        );
-                        append_null(&mut fields, &mut columns, key_str);
                     }
-                },
-                None => {
+                } else {
                     tracing::warn!(
                         "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
                     );
                     append_null(&mut fields, &mut columns, key_str);
                 }
+            } else {
+                tracing::warn!(
+                    "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
+                );
+                append_null(&mut fields, &mut columns, key_str);
             };
         }
 

@@ -106,8 +106,20 @@ jobs:
           - 3306:3306
         env:
           MYSQL_ROOT_PASSWORD: root
-      postgres_conn:
+      postgres_tpch:
         image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+      postgres_tpcds:
+        image: ${{ matrix.cmd == '-c postgres -b tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || '' }}
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
@@ -141,6 +153,9 @@ jobs:
           - cmd: '-c s3'
             name: 's3 connector'
             bench: 'tpch'
+          - cmd: '-c s3 -b tpcds'
+            name: 's3 connector'
+            bench: 'tpcds'
           - cmd: '-c abfs'
             name: 'abfs connector'
             bench: 'tpch'
@@ -150,6 +165,9 @@ jobs:
           - cmd: '-c postgres'
             name: 'postgres connector'
             bench: 'tpch'
+          - cmd: '-c postgres -b tpcds'
+            name: 'postgres connector'
+            bench: 'tpcds'
           - cmd: '-c mysql'
             name: 'mysql connector'
             bench: 'tpch'
@@ -204,11 +222,11 @@ jobs:
 
     steps:
       - name: Checkout repository
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         uses: actions/checkout@v4
 
       - name: Set up Spice.ai API Key
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
@@ -223,13 +241,13 @@ jobs:
           sudo swapon --show
 
       - name: Download benchmark binary
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         uses: actions/download-artifact@v4
         with:
           name: spice_bench
 
       - name: 'Restart accelerator service container with customize configurations'
-        if: ( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        if: ( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "shared_buffers=1GB" >> /var/lib/postgresql/data/postgresql.conf'
           docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "work_mem=256MB" >> /var/lib/postgresql/data/postgresql.conf'
@@ -237,7 +255,7 @@ jobs:
           docker kill --signal=SIGHUP ${{ job.services.postgres_acc.id }}
 
       - name: Install Databricks ODBC driver
-        if: matrix.cmd == '-c odbc-databricks' && ((github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        if: matrix.cmd == '-c odbc-databricks' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
@@ -245,18 +263,18 @@ jobs:
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
 
       - name: Install Athena ODBC driver
-        if: matrix.cmd == '-c odbc-athena' && ((github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        if: matrix.cmd == '-c odbc-athena' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           sudo apt-get install alien -y
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
 
       - name: Make benchmark binary executable
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: chmod +x ./spice_bench
 
       - name: Run benchmark with ${{ matrix.name }}
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.events.inputs.bench_name == matrix.bench || github.events.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
@@ -265,7 +283,8 @@ jobs:
           PG_BENCHMARK_PG_USER: postgres
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
-          PG_BENCHMARK_PG_DBNAME: tpch_sf1
+          PG_TPCH_BENCHMARK_PG_DBNAME: tpch_sf1
+          PG_TPCDS_BENCHMARK_PG_DBNAME: tpcds_sf1
           PG_BENCHMARK_ACC_PG_DBNAME: postgres
           SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
           MYSQL_BENCHMARK_MYSQL_HOST: localhost

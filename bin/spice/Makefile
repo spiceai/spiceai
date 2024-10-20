@@ -9,11 +9,11 @@ ifdef REL_VERSION
 	SPICE_VERSION := $(REL_VERSION)
 	SPICED_FEATURES := --features release
 else
-	SPICE_VERSION := $(if $(FILE_VERSION),$(FILE_VERSION)-rc.$(GIT_SHA),local)
+	SPICE_VERSION := $(if $(FILE_VERSION),$(FILE_VERSION)-build.$(GIT_SHA),local)
 endif
 
 ifdef DEV
-	SPICE_VERSION := $(if $(FILE_VERSION),$(FILE_VERSION)-rc.$(GIT_SHA)-dev,local-dev)
+	SPICE_VERSION := $(if $(FILE_VERSION),$(FILE_VERSION)-build.$(GIT_SHA)-dev,local-dev)
 endif
 
 LDFLAGS:="-X $(BASE_PACKAGE_NAME)/bin/spice/pkg/version.version=$(SPICE_VERSION)"
