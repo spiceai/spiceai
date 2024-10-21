@@ -12,3 +12,7 @@ Example terminal output:
 │ c.spicepod.yml                                                                                                                                                                                                                │
 │ b.spicepod.yml                                                                                                                                                                                                                │
 ```
+
+## Installation
+
+Requires `prompt-toolkit`. Install the script system wide (or venv wide) with `pip install .`. Once installed, can be ran with `spice-switch`.
