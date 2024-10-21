@@ -146,16 +146,19 @@ impl CandleEmbedding {
         encoding.get_ids().iter().take_while(|&&x| x != 0).count()
     }
 
-    fn encode(&self, inp: String) -> Result<Encoding> {
-        self.tok
-            .encode::<String>(inp, true)
+    fn encode(tok: &Arc<Tokenizer>, inp: String) -> Result<Encoding> {
+        tok.encode::<String>(inp, true)
             .context(FailedToPrepareInputSnafu)
     }
 
-    fn _embed(&self, input: EmbeddingInput) -> Result<(Vec<Vec<f32>>, usize)> {
+    fn _embed(
+        backend: &Arc<Mutex<CandleBackend>>,
+        tok: &Arc<Tokenizer>,
+        input: EmbeddingInput,
+    ) -> Result<(Vec<Vec<f32>>, usize)> {
         let (encodings, input_tokens): (Vec<Encoding>, usize) = match input {
             EmbeddingInput::String(s) => {
-                let encoding = self.encode(s)?;
+                let encoding = Self::encode(tok, s)?;
                 let tokens = Self::tokens_in_encoding(&encoding);
                 (vec![encoding], tokens)
             }
@@ -163,7 +166,7 @@ impl CandleEmbedding {
                 let (encodings, tokens): (Vec<Encoding>, Vec<usize>) = arr
                     .into_iter()
                     .map(|s| {
-                        let enc = self.encode(s)?;
+                        let enc = Self::encode(tok, s)?;
                         let tokens = Self::tokens_in_encoding(&enc);
                         Ok((enc, tokens))
                     })
@@ -183,8 +186,7 @@ impl CandleEmbedding {
         let pooled_idx = (0..=encodings.len()).map(|i| i as u32).collect::<Vec<_>>();
         let b = batch(encodings, pooled_idx, vec![]);
 
-        let backend = self
-            .backend
+        let backend = backend
             .lock()
             .map_err(|e| super::Error::FailedToCreateEmbedding {
                 source: format!("Failed to lock backend: {e:?}").into(),
@@ -208,14 +210,14 @@ impl Embed for CandleEmbedding {
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
-        let (encodings, token_inputs) = self._embed(req.input).map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
+        let backend = Arc::clone(&self.backend);
+        let tok = Arc::clone(&self.tok);
+        // This needs to be blocking to avoid starving other async tasks in the runtime, since this blocks for long periods of time.
+        let (encodings, token_inputs) =
+            tokio::task::spawn_blocking(move || Self::_embed(&backend, &tok, req.input))
+                .await
+                .map_err(to_openai_error)? // JoinHandle error
+                .map_err(to_openai_error)?; // Embed error
 
         Ok(CreateEmbeddingResponse {
             object: "list".to_string(),
@@ -237,7 +239,15 @@ impl Embed for CandleEmbedding {
     }
 
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
-        self._embed(input).map(|(embeddings, _usage)| embeddings)
+        // This needs to be blocking to avoid starving other async tasks in the runtime, since this blocks for long periods of time.
+        let backend = Arc::clone(&self.backend);
+        let tok = Arc::clone(&self.tok);
+        tokio::task::spawn_blocking(move || {
+            Self::_embed(&backend, &tok, input).map(|(embeddings, _usage)| embeddings)
+        })
+        .await
+        .boxed()
+        .context(FailedToCreateEmbeddingSnafu)?
     }
 
     fn size(&self) -> i32 {
@@ -342,4 +352,13 @@ fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
     }
 
     Ok(temp_dir.into_path())
+}
+
+fn to_openai_error(e: impl std::fmt::Display) -> OpenAIError {
+    OpenAIError::ApiError(ApiError {
+        message: e.to_string(),
+        r#type: None,
+        param: None,
+        code: None,
+    })
 }
