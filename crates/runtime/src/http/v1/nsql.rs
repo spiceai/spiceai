@@ -37,6 +37,7 @@ use axum::{
     Extension, Json,
 };
 use axum_extra::TypedHeader;
+use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
 use headers_accept::Accept;
 
@@ -67,7 +68,7 @@ fn clean_model_based_sql(input: &str) -> String {
 /// Convert the [`SampleTableParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
 /// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
 async fn sample_messages(
-    sample_from: &[String],
+    sample_from: &[TableReference],
     df: Arc<DataFusion>,
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
     let mut messages = Vec::with_capacity(4 * sample_from.len());
@@ -75,12 +76,12 @@ async fn sample_messages(
     for dataset in sample_from {
         for params in [
             SampleTableParams::DistinctColumns(DistinctColumnsParams {
-                tbl: dataset.clone(),
+                tbl: dataset.to_string(),
                 limit: 3,
                 cols: None,
             }),
             SampleTableParams::RandomSample(RandomSampleParams {
-                tbl: dataset.clone(),
+                tbl: dataset.to_string(),
                 limit: 3,
             }),
         ] {
@@ -141,7 +142,15 @@ pub struct Request {
     #[serde(default = "default_model")]
     pub model: String,
 
-    pub sample_from: Option<Vec<String>>,
+    #[serde(default = "default_sample_data_enabled")]
+    pub sample_data_enabled: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datasets: Option<Vec<String>>,
+}
+
+fn default_sample_data_enabled() -> bool {
+    true
 }
 
 fn default_model() -> String {
@@ -157,24 +166,19 @@ pub(crate) async fn post(
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
 
     // Get all public table CREATE TABLE statements to add to prompt.
-    let tables = match df.get_public_table_names() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("Error getting tables: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    };
+    let tables = df.get_user_table_names();
 
     let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
-    for t in &tables {
-        match df.get_arrow_schema(t).await {
+    for tbl in &tables {
+        let t = tbl.to_quoted_string();
+        match df.get_arrow_schema(&t).await {
             Ok(schm) => {
                 tracing::trace!("Table {t} has CREATE STATEMENT='{schm}'.");
 
                 // Ensure compiling without `--features models` is successful.
                 #[cfg(feature = "models")]
                 table_create_stms.extend_from_slice(
-                    &CreateTableBuilder::new(Arc::new(schm), t).build_postgres(),
+                    &CreateTableBuilder::new(Arc::new(schm), &t).build_postgres(),
                 );
             }
             Err(e) => {
@@ -185,15 +189,25 @@ pub(crate) async fn post(
     }
 
     // Create sample data assistant/tool messages if user wants to sample from dataset(s).
-    let tool_use_messages = match payload.sample_from {
-        Some(sample_from) => match sample_messages(&sample_from, Arc::clone(&df)).await {
+    let tool_use_messages = if payload.sample_data_enabled {
+        let sample_from = payload
+            .datasets
+            .map(|ds| {
+                ds.iter()
+                    .map(|d| TableReference::from(d.to_string()))
+                    .collect::<Vec<TableReference>>()
+            })
+            .unwrap_or(tables);
+
+        match sample_messages(&sample_from, Arc::clone(&df)).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("Error sampling datasets for NSQL messages: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
-        },
-        None => vec![],
+        }
+    } else {
+        vec![]
     };
 
     let sql_query_result = match llms.read().await.get(&payload.model) {

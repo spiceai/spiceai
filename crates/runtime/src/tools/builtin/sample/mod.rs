@@ -96,6 +96,7 @@ impl From<&SampleTableParams> for SampleTableMethod {
         }
     }
 }
+
 impl SampleTableParams {
     #[must_use]
     pub fn dataset(&self) -> &str {
