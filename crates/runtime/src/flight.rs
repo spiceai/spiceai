@@ -254,7 +254,7 @@ impl Service {
         Ok((flights_stream.boxed(), query_result.from_cache))
     }
 
-    fn get_user_agent<T>(req: &Request<T>) -> [KeyValue; 3] {
+    fn get_request_labels<T>(req: &Request<T>) -> [KeyValue; 3] {
         let user_agent = req
             .metadata()
             .get("x-spice-user-agent")
