@@ -21,8 +21,11 @@ use app::{
     App,
 };
 use futures::future::BoxFuture;
+use opentelemetry::global::Error as OtelError;
+use opentelemetry::trace::TraceError;
 use opentelemetry_sdk::{
     export::trace::{ExportResult, SpanData, SpanExporter},
+    runtime::TrySendError,
     trace::{Config, TracerProvider},
     Resource,
 };
@@ -103,6 +106,10 @@ pub(crate) async fn init_tracing(
         );
 
     tracing::subscriber::set_global_default(subscriber)?;
+
+    if let Err(e) = opentelemetry::global::set_error_handler(handle_opentelemetry_error) {
+        tracing::debug!("Failed to set OpenTelemetry error handler: {e}");
+    }
 
     Ok(())
 }
@@ -247,5 +254,35 @@ impl SpanExporter for OtelExportMultiplexer {
         for exporter in &mut self.exporters {
             exporter.set_resource(resource);
         }
+    }
+}
+
+fn handle_opentelemetry_error(e: OtelError) {
+    if let OtelError::Trace(trace_error) = e {
+        handle_trace_error(trace_error);
+    } else {
+        tracing::error!("OpenTelemetry error occurred: {e}");
+    }
+}
+
+fn handle_trace_error(e: TraceError) {
+    if let TraceError::Other(other) = e {
+        handle_trace_other_error(other);
+    } else {
+        tracing::error!("OpenTelemetry trace error occurred: {e}");
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn handle_trace_other_error(other: Box<dyn std::error::Error + Send + Sync>) {
+    if let Some(send_error) = other.downcast_ref::<TrySendError>() {
+        if let TrySendError::ChannelClosed = send_error {
+            // This is expected to happen when the runtime is shutting down
+            tracing::trace!("OpenTelemetry trace channel closed");
+        } else {
+            tracing::error!("OpenTelemetry trace error occurred: {other}");
+        }
+    } else {
+        tracing::error!("OpenTelemetry trace error occurred: {other}");
     }
 }
