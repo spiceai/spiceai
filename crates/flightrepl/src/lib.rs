@@ -158,7 +158,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             .connect()
             .await
     } else {
-        Channel::from_shared(repl_flight_endpoint.clone())?.connect().await
+        Channel::from_shared(repl_flight_endpoint.clone())?
+            .connect()
+            .await
     };
 
     // Set up the Flight client
