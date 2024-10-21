@@ -22,7 +22,7 @@ use async_openai::{
         CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
     },
 };
-use futures::{Stream, StreamExt};
+use futures::{future, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fmt, pin::Pin, time::SystemTime};
@@ -244,7 +244,6 @@ pub struct MessageDelta {
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
 #[allow(clippy::too_many_lines)]
-
 pub fn transform_stream(
     stream: Pin<
         Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
@@ -275,142 +274,142 @@ pub fn transform_stream(
         tool_id_to_tool_delta_idx: HashMap::new(),
     };
 
-    let transformed_stream = stream.scan(initial_state, move |state, item| {
-        let model = model.clone();
-        let mut state = state.clone();
-        async move {
-            match item {
-                Ok(MessageCreateStreamResponse::MessageStart {
-                    message:
-                        MessageStartMessage {
-                            id: inner_id,
-                            role: inner_role,
-                            usage: inner_usage,
-                            ..
-                        },
-                }) => {
-                    state.role = MessageRole::from_opt(&inner_role);
-                    state.id = Some(inner_id);
-                    state.usage = Some(CompletionUsage {
-                        prompt_tokens: inner_usage.input_tokens,
-                        completion_tokens: inner_usage.output_tokens,
-                        total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
-                    });
-                    let response = create_stream_response(
-                        &state.id.clone().unwrap_or_default(),
-                        &model,
-                        None,
-                        None,
-                    );
-                    Some(response)
-                }
-                Ok(MessageCreateStreamResponse::ContentBlockStart {
-                    index,
-                    content_block,
-                }) => {
-                    if let ContentBlock::ToolUse(t) = &content_block {
-                        state.tool_id_to_content_block.insert(index, t.clone());
-                        state.tool_id_to_tool_delta_idx.insert(index, 0);
-                    };
-                    let response = create_stream_response(
-                        &state.id.clone().unwrap_or_default(),
-                        &model,
-                        None,
-                        Some(ChatChoiceStream {
-                            index: 0,
-                            delta: content_block.into_completion(),
-                            finish_reason: None,
-                            logprobs: None,
-                        }),
-                    );
-                    Some(response)
-                }
-                Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
-                    let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
-                    state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
-
-                    let response = create_stream_response(
-                        &state.id.clone().unwrap_or_default(),
-                        &model,
-                        None,
-                        Some(ChatChoiceStream {
-                            index: 0,
-                            logprobs: None,
-                            finish_reason: None,
-                            delta: delta.into_completion(
-                                &state.role,
-                                state
-                                    .tool_id_to_content_block
-                                    .get(&index)
-                                    .map(|b| (tool_idx, b.clone())),
-                            ),
-                        }),
-                    );
-                    Some(response)
-                }
-                Ok(MessageCreateStreamResponse::MessageDelta {
-                    delta: MessageDelta { stop_reason, .. },
-                    usage: inner_usage,
-                }) => {
-                    // Update usage
-                    if let Some(ref mut u) = state.usage {
-                        u.prompt_tokens += inner_usage.input_tokens;
-                        u.completion_tokens += inner_usage.output_tokens;
-                        u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+    let transformed_stream = stream
+        // Must filter out unneeded messages early to avoid the below [`Stream::scan`] returning early
+        .filter(|m| {
+            future::ready(!matches!(
+                m,
+                Ok(MessageCreateStreamResponse::Ping
+                    | MessageCreateStreamResponse::ContentBlockStop { .. }
+                    | MessageCreateStreamResponse::MessageStop)
+            ))
+        })
+        .scan(initial_state, move |state, item| {
+            let mut state = state.clone();
+            let model = model.clone();
+            async move {
+                match item {
+                    Ok(MessageCreateStreamResponse::MessageStart {
+                        message:
+                            MessageStartMessage {
+                                id: inner_id,
+                                role: inner_role,
+                                usage: inner_usage,
+                                ..
+                            },
+                    }) => {
+                        state.role = MessageRole::from_opt(&inner_role);
+                        state.id = Some(inner_id);
+                        state.usage = Some(CompletionUsage {
+                            prompt_tokens: inner_usage.input_tokens,
+                            completion_tokens: inner_usage.output_tokens,
+                            total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
+                        });
+                        let response = create_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &model,
+                            None,
+                            None,
+                        );
+                        Some(response)
                     }
-                    let response = create_stream_response(
-                        &state.id.clone().unwrap_or_default(),
-                        &model,
-                        state.usage.clone(),
-                        Some(ChatChoiceStream {
-                            index: 0,
-                            logprobs: None,
-                            finish_reason: match stop_reason {
-                                Some(StopReason::EndTurn | StopReason::StopSequence) => {
-                                    Some(FinishReason::Stop)
-                                }
-                                Some(StopReason::MaxTokens) => Some(FinishReason::Length),
-                                Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
-                                None => None,
-                            },
-                            delta: ChatCompletionStreamResponseDelta {
-                                content: None,
-                                function_call: None,
-                                tool_calls: None,
-                                role: None,
-                                refusal: None,
-                            },
-                        }),
-                    );
-                    Some(response)
-                }
-                Ok(MessageCreateStreamResponse::Ping) => {
-                    tracing::trace!("Received a ping stream packet");
-                    // Skip emitting an item
-                    None
-                }
-                Ok(MessageCreateStreamResponse::ContentBlockStop { .. }) => {
-                    tracing::trace!("Received a content block stop packet");
-                    // Skip emitting an item
-                    None
-                }
-                Ok(MessageCreateStreamResponse::MessageStop) => {
-                    tracing::trace!("Received a stop stream packet");
-                    // Skip emitting an item
-                    None
-                }
-                Err(e) => {
-                    tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                    Some(Err(OpenAIError::ApiError(ApiError {
-                        message: e.to_string(),
-                        r#type: Some("AnthropicStreamError".to_string()),
-                        param: None,
-                        code: None,
-                    })))
+                    Ok(MessageCreateStreamResponse::ContentBlockStart {
+                        index,
+                        content_block,
+                    }) => {
+                        if let ContentBlock::ToolUse(t) = &content_block {
+                            state.tool_id_to_content_block.insert(index, t.clone());
+                            state.tool_id_to_tool_delta_idx.insert(index, 0);
+                        };
+                        let response = create_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &model,
+                            None,
+                            Some(ChatChoiceStream {
+                                index: 0,
+                                delta: content_block.into_completion(),
+                                finish_reason: None,
+                                logprobs: None,
+                            }),
+                        );
+                        Some(response)
+                    }
+                    Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
+                        let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
+                        state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
+
+                        let response = create_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &model,
+                            None,
+                            Some(ChatChoiceStream {
+                                index: 0,
+                                logprobs: None,
+                                finish_reason: None,
+                                delta: delta.into_completion(
+                                    &state.role,
+                                    state
+                                        .tool_id_to_content_block
+                                        .get(&index)
+                                        .map(|b| (tool_idx, b.clone())),
+                                ),
+                            }),
+                        );
+                        Some(response)
+                    }
+                    Ok(MessageCreateStreamResponse::MessageDelta {
+                        delta: MessageDelta { stop_reason, .. },
+                        usage: inner_usage,
+                    }) => {
+                        // Update usage
+                        if let Some(ref mut u) = state.usage {
+                            u.prompt_tokens += inner_usage.input_tokens;
+                            u.completion_tokens += inner_usage.output_tokens;
+                            u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+                        }
+                        let response = create_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &model,
+                            state.usage.clone(),
+                            Some(ChatChoiceStream {
+                                index: 0,
+                                logprobs: None,
+                                finish_reason: match stop_reason {
+                                    Some(StopReason::EndTurn | StopReason::StopSequence) => {
+                                        Some(FinishReason::Stop)
+                                    }
+                                    Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                                    Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                    None => None,
+                                },
+                                delta: ChatCompletionStreamResponseDelta {
+                                    content: None,
+                                    function_call: None,
+                                    tool_calls: None,
+                                    role: None,
+                                    refusal: None,
+                                },
+                            }),
+                        );
+                        Some(response)
+                    }
+                    Ok(
+                        MessageCreateStreamResponse::Ping
+                        | MessageCreateStreamResponse::ContentBlockStop { .. }
+                        | MessageCreateStreamResponse::MessageStop,
+                    ) => unreachable!("Filtered out"),
+                    Err(e) => {
+                        tracing::debug!("Received an anthropic error stream packet: {:?}", e);
+                        Some(Err(OpenAIError::ApiError(ApiError {
+                            message: e.to_string(),
+                            r#type: Some("AnthropicStreamError".to_string()),
+                            param: None,
+                            code: None,
+                        })))
+                    }
                 }
             }
-        }
-    });
+        });
 
     Box::pin(transformed_stream)
 }
