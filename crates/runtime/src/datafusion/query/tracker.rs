@@ -126,7 +126,7 @@ impl QueryTracker {
     }
 }
 
-fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
+fn trace_query(query_tracker: &QueryTracker, captured_output: &str) {
     if let Some(error_code) = &query_tracker.error_code {
         tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
@@ -156,5 +156,5 @@ fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
         .collect::<Vec<String>>()
         .join(",");
     tracing::info!(target: "task_history", protocol = ?query_tracker.protocol, datasets = datasets_str, "labels");
-    tracing::info!(target: "task_history", truncated_output = %truncated_output);
+    tracing::info!(target: "task_history", captured_output = %captured_output);
 }

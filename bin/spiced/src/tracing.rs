@@ -26,7 +26,9 @@ use opentelemetry_sdk::{
     trace::{Config, TracerProvider},
     Resource,
 };
+use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
+use std::time::Duration;
 use tracing::Subscriber;
 use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
 
@@ -65,7 +67,7 @@ impl From<LogVerbosity> for EnvFilter {
     }
 }
 
-pub(crate) fn init_tracing(
+pub(crate) async fn init_tracing(
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
@@ -91,7 +93,7 @@ pub(crate) fn init_tracing(
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(datafusion_task_history_tracing(df, app, config)?)
+        .with(datafusion_task_history_tracing(df, app, config).await?)
         .with(
             fmt::layer()
                 .with_ansi(true)
@@ -105,7 +107,7 @@ pub(crate) fn init_tracing(
     Ok(())
 }
 
-fn datafusion_task_history_tracing<S>(
+async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
@@ -126,7 +128,7 @@ where
         task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
     )];
 
-    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config) {
+    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config).await {
         exporters.push(zipkin_exporter);
     }
 
@@ -149,7 +151,7 @@ where
     Ok(layer)
 }
 
-fn zipkin_task_history_otel_exporter(
+async fn zipkin_task_history_otel_exporter(
     app_name: Option<String>,
     config: Option<&TracingConfig>,
 ) -> Result<Option<Box<dyn SpanExporter>>, Box<dyn std::error::Error>> {
@@ -164,6 +166,13 @@ fn zipkin_task_history_otel_exporter(
         return Err("zipkin_endpoint is required when zipkin_enabled is true".into());
     };
 
+    if !is_zipkin_endpoint_reachable(zipkin_endpoint).await {
+        eprintln!(
+            "Zipkin endpoint '{zipkin_endpoint}' is not reachable. Skipping Zipkin exporter initialization."
+        );
+        return Ok(None);
+    }
+
     let service_name: Cow<'static, str> = match app_name {
         Some(name) => Cow::Owned(name),
         None => Cow::Borrowed("Spice.ai"),
@@ -173,9 +182,21 @@ fn zipkin_task_history_otel_exporter(
         opentelemetry_zipkin::new_pipeline()
             .with_service_name(service_name)
             .with_collector_endpoint(zipkin_endpoint)
-            .with_http_client(reqwest::Client::new())
+            .with_http_client(Client::new())
             .init_exporter()?,
     )))
+}
+
+async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
+    let client = Client::new();
+    let timeout = Duration::from_secs(5);
+
+    let url = format!("{endpoint}?serviceName=test");
+
+    match client.get(&url).timeout(timeout).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug)]
