@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(deprecated)]
+#![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -74,6 +74,7 @@ pub enum ContentBlock {
     #[serde(rename = "tool_use")]
     ToolUse(ContentBlockToolUse),
 }
+
 impl ContentBlock {
     pub fn into_completion(self) -> ChatCompletionStreamResponseDelta {
         match self {
@@ -118,6 +119,7 @@ pub(crate) enum Delta {
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
 }
+
 impl Delta {
     pub fn into_completion(
         self,
@@ -285,25 +287,25 @@ pub fn transform_stream(
                         completion_tokens: inner_usage.output_tokens,
                         total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
                     });
-                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, None, None))
+                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, None, None)
                 },
                 Ok(MessageCreateStreamResponse::ContentBlockStart { index, content_block }) => {
                     if let ContentBlock::ToolUse(t) = &content_block {
                         tool_id_to_content_block.insert(index, t.clone());
                         tool_id_to_tool_delta_idx.insert(index, 0);
                     };
-                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
+                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
                             index: 0,
                             delta: content_block.into_completion(),
                             finish_reason: None,
                             logprobs: None,
-                        })))
+                        }))
                 },
                 Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
                     let tool_idx = *tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
                     tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
-                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
+                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
                             index: 0,
                             logprobs: None,
                             finish_reason: None,
@@ -313,7 +315,7 @@ pub fn transform_stream(
                                     .get(&index)
                                     .map(|b| (tool_idx, b.clone())),
                             ),
-                        })))
+                        }))
                 },
                 Ok(MessageCreateStreamResponse::MessageDelta {
                     delta: MessageDelta { stop_reason, .. },
@@ -325,7 +327,7 @@ pub fn transform_stream(
                         u.completion_tokens += inner_usage.output_tokens;
                         u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
                     }
-                    yield Ok(create_stream_response(&id.clone().unwrap_or_default(), &model, usage.clone(), Some(ChatChoiceStream {
+                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, usage.clone(), Some(ChatChoiceStream {
                         index: 0,
                         logprobs: None,
                         finish_reason: match stop_reason {
@@ -341,7 +343,7 @@ pub fn transform_stream(
                             role: None,
                             refusal: None,
                         },
-                    })))
+                    }))
                 },
                 Ok(MessageCreateStreamResponse::Ping) => {
                     tracing::trace!("Received a ping stream packet");
@@ -367,29 +369,30 @@ pub fn transform_stream(
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
-#[allow(clippy::cast_possible_truncation, clippy::expect_used)]
+#[allow(clippy::cast_possible_truncation)]
 fn create_stream_response(
     id: &str,
     model: &str,
     usage: Option<CompletionUsage>,
     choice: Option<ChatChoiceStream>,
-) -> CreateChatCompletionStreamResponse {
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
     let choices = match choice {
         Some(c) => vec![c],
         None => vec![],
     };
-    CreateChatCompletionStreamResponse {
+    let created = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
+        .as_secs() as u32;
+
+    Ok(CreateChatCompletionStreamResponse {
         id: id.to_string(),
-        created: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))
-            .expect("Failed to get time")
-            .as_secs() as u32,
+        created,
         model: model.to_string(),
         service_tier: None,
         system_fingerprint: None,
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    }
+    })
 }

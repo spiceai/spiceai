@@ -268,7 +268,7 @@ impl From<&ChatCompletionTool> for ToolParam {
                     "$schema": "http://json-schema.org/draft-07/schema#",
                     "properties": {},
                     "required": [],
-                    "title": "RandomSampleParams",
+                    "title": "",
                     "type": "object"
                 }
             )),

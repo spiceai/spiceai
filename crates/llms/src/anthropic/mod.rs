@@ -124,6 +124,9 @@ pub enum AnthropicAuthMechanism {
     AuthToken(Secret<String>),
 }
 
+// Requires `.expect(` to maintain `Config` trait's method signature.
+// Expectation is that values in `AnthropicAuthMechanism` are valid headers, see:
+// `<https://github.com/hyperium/http/blob/761d36acb069ed335d2f9dfd7a568b8735ec7fec/src/header/value.rs#L605>`
 #[allow(clippy::expect_used)]
 impl Config for AnthropicConfig {
     fn headers(&self) -> HeaderMap {

@@ -86,7 +86,7 @@ impl ToolUsingChat {
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         // Add previous messages to the request that pretend it has already asked to list the available datasets.
         let mut list_dataset_messages = self.create_list_dataset_messages().await?;
-        // list_dataset_messages.extend_from_slice(req.messages.as_slice());
+        list_dataset_messages.extend_from_slice(req.messages.as_slice());
 
         let mut req = req.clone();
         req.messages = list_dataset_messages;

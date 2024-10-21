@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(deprecated)]
+#![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 #![allow(clippy::missing_errors_doc)]
 use std::pin::Pin;
 use std::time::SystemTime;
@@ -34,6 +34,7 @@ use async_openai::types::{
     ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, Role, Stop,
 };
+use serde_json::json;
 
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
@@ -55,12 +56,6 @@ impl Chat for Anthropic {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        if req.stream.is_some_and(|b| !b) {
-            return Err(OpenAIError::InvalidArgument(
-                "When stream is false, use Chat::create".into(),
-            ));
-        }
-
         let mut anth_req = MessageCreateParams::try_from((self.model.clone(), req))?;
         anth_req.stream = Some(true);
 
@@ -272,7 +267,7 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
                                         "$schema": "http://json-schema.org/draft-07/schema#",
                                         "properties": {},
                                         "required": [],
-                                        "title": "RandomSampleParams",
+                                        "title": "",
                                         "type": "object"
                                     }
                                 ))
