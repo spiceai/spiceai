@@ -10,11 +10,15 @@ jobs:
     permissions:
       pull-requests: write
       contents: write
+    env:
+      GOVER: 1.22.0
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
 
       - run: rustup toolchain install stable --profile minimal
 
