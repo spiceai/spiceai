@@ -44,7 +44,6 @@ fn init_metrics(df: Arc<DataFusion>, registry: prometheus::Registry) -> Result<(
 }
 
 #[tokio::test]
-#[allow(clippy::clone_on_ref_ptr)]
 async fn test_http_metrics() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("debug"));
 
