@@ -271,11 +271,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -363,11 +363,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -495,11 +495,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -649,11 +649,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -747,11 +747,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -829,11 +829,11 @@ jobs:
           # time to initialize added dataset
           sleep 5
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: duckdb-app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -940,11 +940,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Manually refresh dataset
         working-directory: test_app
@@ -1027,11 +1027,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
@@ -1180,11 +1180,11 @@ jobs:
           # time to accelerate added datasets
           sleep 20
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ok" ]]; do sleep 1; done
 
       - name: Run test query (issues)
         uses: ./.github/actions/run-query
@@ -1303,7 +1303,7 @@ jobs:
           # time to accelerate added datasets
           sleep 20
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
