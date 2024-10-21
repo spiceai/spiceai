@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------------+---------------------+--------------------+
+| customer_id      | customer_first_name | customer_last_name |
++------------------+---------------------+--------------------+
+| AAAAAAAALJHFBAAA | Charles             | Aaron              |
+| AAAAAAAAADOBBAAA | Phillip             | Abbott             |
+| AAAAAAAACHHBBAAA | Eduardo             | Abernathy          |
+| AAAAAAAADBHDBAAA | Bridget             | Abney              |
+| AAAAAAAAMOGNAAAA | Eric                | Abney              |
+| AAAAAAAALAGGAAAA | Marcia              | Abrams             |
+| AAAAAAAAHKNABAAA | Sharon              | Acevedo            |
+| AAAAAAAAANIHAAAA | Victor              | Acosta             |
+| AAAAAAAAJOOJAAAA | Daniel              | Adame              |
+| AAAAAAAAHGAFBAAA | Brenda              | Adams              |
++------------------+---------------------+--------------------+

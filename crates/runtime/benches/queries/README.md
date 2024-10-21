@@ -136,7 +136,6 @@ fatal runtime error: stack overflow
 | [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
 | [q49.sql](tpcds/q49.sql) | [q49.sql](tpcds/q49.sql) |
 
-
 ### PostgreSQL does not support using a column alias in a CASE statement
 
 **Limitation**: PostgreSQL does not allow a column alias to be referenced in a `CASE` statement. For example, `CASE WHEN lochierarchy = 0 THEN i_category END`, where `lochierarchy` is defined as `SELECT GROUPING(i_category) + GROUPING(i_class) AS lochierarchy`.
@@ -222,3 +221,29 @@ Query Error Execution error: Unable to query arrow: Server error: `ERROR 42000 (
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
 | [q97.sql](tpcds/q97.sql) | |
+
+## MySQL returns NULL on division by zero
+
+**Limitation**: The MySQL connector does not support queries that divide by zero.
+
+**Solution**: Rewrite your query to handle division by zero:
+
+```sql
+SELECT
+  CASE 
+    WHEN count(t1_id) / count(t2_id) IS NULL THEN 0
+    ELSE count(t1_id) / count(t2_id)
+FROM t1, t2
+```
+
+MySQL does not return a syntax error when dividing by zero, instead returning `NULL`.
+
+**Example Error**:
+
+```bash
+Query Error Unable to convert record batch: Invalid argument error: Column 'am_pm_ratio' is declared as non-nullable but contains null values
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q90.sql](tpcds/q90.sql) | |
