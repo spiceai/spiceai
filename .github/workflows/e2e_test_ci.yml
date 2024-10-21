@@ -734,7 +734,7 @@ jobs:
         run: |
           echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
           # configure clickhouse credentials
-          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
+          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
           cat spicepod.yaml
           cat ./datasets/test_clickhouse_table/dataset.yaml
 
