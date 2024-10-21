@@ -11,7 +11,7 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 | Arrow      | ❌ |  |
 | DuckDB     | ❌ |  |
 | SQLite     | ❌ |  |
-| PostgreSQL | ✅ |  |
+| PostgreSQL | ✅ | @sgrebnov  |
 
 ## Beta Release Criteria
 
