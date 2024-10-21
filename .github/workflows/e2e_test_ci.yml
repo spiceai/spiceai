@@ -667,103 +667,105 @@ jobs:
           killall spice || true
           cat spice.log
 
-  test_quickstart_clickhouse:
-    name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    runs-on: ${{ matrix.target.runner }}
-    needs:
-      - build
-      - setup-matrix
+  # TODO: Renable clickhouse when bugs are fixed
+  # Issue: https://github.com/spiceai/spiceai/issues/3184
+  # test_quickstart_clickhouse:
+  #   name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+  #   runs-on: ${{ matrix.target.runner }}
+  #   needs:
+  #     - build
+  #     - setup-matrix
 
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+  #   strategy:
+  #     matrix:
+  #       target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
-    steps:
-      - uses: actions/checkout@v4
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Install Clickhouse
-        if: matrix.target.target_os == 'linux'
-        run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
-          sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          sleep 5
-          clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
-          clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
-          clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
+  #     - name: Install Clickhouse
+  #       if: matrix.target.target_os == 'linux'
+  #       run: |
+  #         curl https://clickhouse.com/ | sh
+  #         sudo ./clickhouse install
+  #         sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
+  #         sleep 5
+  #         clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
+  #         clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
+  #         clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
 
-      - name: Install Clickhouse
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
-          sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          sleep 5
-          clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
-          clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
-          clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
+  #     - name: Install Clickhouse
+  #       if: matrix.target.target_os == 'darwin'
+  #       run: |
+  #         curl https://clickhouse.com/ | sh
+  #         sudo ./clickhouse install
+  #         sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
+  #         sleep 5
+  #         clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
+  #         clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
+  #         clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
 
-      - name: Wait for Clickhouse to start
-        run: sleep 10
+  #     - name: Wait for Clickhouse to start
+  #       run: sleep 10
 
-      - name: Check Clickhouse
-        run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
+  #     - name: Check Clickhouse
+  #       run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
 
-      - name: Prepare Clickhouse dataset
-        run: |
-          clickhouse client --port 9001 -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
-          clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
+  #     - name: Prepare Clickhouse dataset
+  #       run: |
+  #         clickhouse client --port 9001 -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
+  #         clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
-      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v4
-        with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: ./build
+  #     - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+  #         path: ./build
 
-      - name: Install spice
-        uses: ./.github/actions/install-spice
-        with:
-          build-path: ./build
+  #     - name: Install spice
+  #       uses: ./.github/actions/install-spice
+  #       with:
+  #         build-path: ./build
 
-      - name: Init spice app
-        run: |
-          spice init test_app
+  #     - name: Init spice app
+  #       run: |
+  #         spice init test_app
 
-      - name: Spice dataset configure
-        working-directory: test_app
-        run: |
-          echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
-          # configure clickhouse credentials
-          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
-          cat spicepod.yaml
-          cat ./datasets/test_clickhouse_table/dataset.yaml
+  #     - name: Spice dataset configure
+  #       working-directory: test_app
+  #       run: |
+  #         echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
+  #         # configure clickhouse credentials
+  #         echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
+  #         cat spicepod.yaml
+  #         cat ./datasets/test_clickhouse_table/dataset.yaml
 
-      - name: Start spice runtime
-        env:
-          SPICE_CLICKHOUSE_PASS: password
-        working-directory: test_app
-        run: |
-          spice run &> spice.log &
-          # time to initialize added dataset
-          sleep 10
+  #     - name: Start spice runtime
+  #       env:
+  #         SPICE_CLICKHOUSE_PASS: password
+  #       working-directory: test_app
+  #       run: |
+  #         spice run &> spice.log &
+  #         # time to initialize added dataset
+  #         sleep 10
 
-      - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+  #     - name: Wait for dataset to be ready
+  #       working-directory: test_app
+  #       timeout-minutes: 1
+  #       run: |
+  #         while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
-      - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
-        with:
-          name: test_clickhouse_table
+  #     - name: Verify dataset
+  #       uses: ./.github/actions/verify-dataset
+  #       with:
+  #         name: test_clickhouse_table
 
-      - name: Stop spice and check logs
-        working-directory: test_app
-        if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+  #     - name: Stop spice and check logs
+  #       working-directory: test_app
+  #       if: always()
+  #       run: |
+  #         killall spice || true
+  #         cat spice.log
 
   test_quickstart_duckdb:
     env:
