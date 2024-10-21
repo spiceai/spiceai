@@ -111,8 +111,7 @@ spice chat --model <model> --cloud
 				}
 			}
 
-			slog.Info(fmt.Sprintf("Using model: %s\n", selectedModel))
-			fmt.Println()
+			cmd.Printf("Using model: %s\n", selectedModel)
 			model = selectedModel
 		}
 

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name       | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
+| Bad cards must make.                                  | EXPRESS   | Mid Atlantic  | 1225    | 1210       | 1221       | 0           | 0         |
+| Bad cards must make.                                  | EXPRESS   | North Midwest | 1243    | 1310       | 1248       | 0           | 0         |
+| Bad cards must make.                                  | EXPRESS   | NY Metro      | 1213    | 1244       | 1297       | 0           | 0         |
+| Bad cards must make.                                  | LIBRARY   | Mid Atlantic  | 891     | 990        | 985        | 0           | 0         |
+| Bad cards must make.                                  | LIBRARY   | North Midwest | 975     | 992        | 935        | 0           | 0         |
+| Bad cards must make.                                  | LIBRARY   | NY Metro      | 913     | 983        | 1038       | 0           | 0         |
+| Bad cards must make.                                  | NEXT DAY  | Mid Atlantic  | 1248    | 1234       | 1300       | 0           | 0         |
+| Bad cards must make.                                  | NEXT DAY  | North Midwest | 1296    | 1287       | 1278       | 0           | 0         |
+| Bad cards must make.                                  | NEXT DAY  | NY Metro      | 1252    | 1251       | 1315       | 0           | 0         |
+| Bad cards must make.                                  | OVERNIGHT | Mid Atlantic  | 920     | 915        | 964        | 0           | 0         |
++-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+

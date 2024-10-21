@@ -8,25 +8,25 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 | Connector | RC Quality | DRI Sign-off |
 | - | - | - |
-| Clickhouse    | ❌ |  |
-| Databricks    | ❌ |  |
-| Delta Lake    | ❌ |  |
-| Dremio        | ❌ |  |
-| File          | ❌ |  |
-| FTP/SFTP      | ❌ |  |
-| GraphQL       | ❌ |  |
-| GitHub        | ❌ |  |
-| HTTP/HTTPS    | ❌ |  |
-| MS SQL        | ❌ |  |
-| MySQL         | ❌ |  |
-| ODBC          | ❌ |  |
-| PostgreSQL    | ❌ |  |
-| Sharepoint    | ❌ |  |
-| Snowflake     | ❌ |  |
-| Spice.AI      | ❌ |  |
-| S3            | ❌ |  |
-| Azure BlobFS  | ❌ |  |
-| Spark         | ❌ |  |
+| Clickhouse              | ❌ |  |
+| Databricks              | ❌ |  |
+| Delta Lake              | ❌ |  |
+| Dremio                  | ❌ |  |
+| File                    | ❌ |  |
+| FTP/SFTP                | ❌ |  |
+| GraphQL                 | ❌ |  |
+| GitHub                  | ❌ |  |
+| HTTP/HTTPS              | ❌ |  |
+| MS SQL                  | ❌ |  |
+| MySQL                   | ❌ |  |
+| ODBC                    | ❌ |  |
+| PostgreSQL              | ❌ |  |
+| Sharepoint              | ❌ |  |
+| Snowflake               | ❌ |  |
+| Spice.AI Cloud Platform | ❌ |  |
+| S3                      | ❌ |  |
+| Azure BlobFS            | ❌ |  |
+| Spark                   | ❌ |  |
 
 ## RC Release Criteria
 
@@ -37,46 +37,46 @@ These connectors are exempt from running the TPC derived test packages, and rely
 
 This table defines the required features and/or tests for each connector:
 
-| Connector     | [TPC-H Derived Tests (Scale Factor)](#tpc-h) | [TPC-DS Derived Tests (Scale Factor)](#tpc-ds) | [Federation](#federation) | [Data Correctness](#data-correctness) | [Streaming](#streaming) | [Native Schema Inference](#schema-inference) |
-| ------------- | - | - | - | - | - | - |
-| Clickhouse    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| Databricks    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| Delta Lake    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| Dremio        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| File          | ✅ (1) | ✅ (0.5) | ❌ | ❌ | ✅ | ❌ |
-| FTP/SFTP      | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| GraphQL       | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| GitHub        | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
-| HTTP/HTTPS    | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| MS SQL        | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| MySQL         | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| ODBC          | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| PostgreSQL    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| Sharepoint    | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
-| Snowflake     | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| Spice.AI      | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
-| S3            | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ✅ | ❌ |
-| Azure BlobFS  | ✅ (1) | ✅ (0.5) | ⚠️ | ❌ | ✅ | ❌ |
-| Spark         | ✅ (1) | ✅ (0.5) | ✅ | ✅ | ✅ | ✅ |
+| Connector | [TPC-H Derived Tests (Scale Factor)](#tpc-h) | [TPC-DS Derived Tests (Scale Factor)](#tpc-ds) | [Federation](#federation) | [Data Correctness](#data-correctness) | [Streaming](#streaming) | [Native Schema Inference](#schema-inference) |
+| - | - | - | - | - | - | - |
+| Clickhouse              | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| Databricks              | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| Delta Lake              | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| Dremio                  | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| DuckDB                  | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| File                    | ✅ (1) | ✅ (1) | ❌ | ❌ | ✅ | ❌ |
+| FTP/SFTP                | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| GraphQL                 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| GitHub                  | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
+| HTTP/HTTPS              | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| MS SQL                  | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| MySQL                   | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| ODBC                    | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| PostgreSQL              | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| Sharepoint              | ❌ | ❌ | ⚠️ | ❌ | ❌ | ⚠️ |
+| Snowflake               | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| Spice.AI Cloud Platform | ✅ (100) | ✅ (100) | ✅ | ✅ | ✅ | ✅ |
+| S3                      | ✅ (1) | ✅ (1) | ⚠️ | ❌ | ✅ | ❌ |
+| Azure BlobFS            | ✅ (1) | ✅ (1) | ⚠️ | ❌ | ✅ | ❌ |
+| Spark                   | ✅ (1) | ✅ (1) | ✅ | ✅ | ✅ | ✅ |
 
 ### All Connectors
 
 These requirements are imposed on every connector, regardless of the selected features/tests in the above table.
 
-- [ ] [Core Arrow Data Types](../definitions.md) are supported
-- [ ] For exceptions where a [Core Arrow Data Type](../definitions.md) is not supported, print a warning and ignore the column instead of crashing or failing the query.
-- [ ] All known [Major Bugs](../definitions.md) are resolved
+The RC release criteria expand on and require that all [Beta release criteria](./beta.md) continue to pass for the connector.
+
+- [ ] All [Beta release criteria](./beta.md) pass for this connector.
+- [ ] For exceptions where a [Core Connector Data Type](../definitions.md) is not supported, print a warning and ignore the column instead of crashing or failing the query.
+- [ ] All known [Major Bugs](../definitions.md) are resolved.
 
 #### Documentation
 
 - [ ] Documentation includes all information and steps for a user to set up the connector.
+- [ ] Documentation includes any mappings from [Core Connector Data Types](../definitions.md) to [Core Arrow Data Types](../definitions.md) types.
 - [ ] Documentation includes all known issues/limitations for the connector.
 - [ ] Documentation includes any exceptions made to allow this connector to reach RC quality (e.g. if a particular data type cannot be supported by the connector).
 - [ ] The connector has an easy to follow quickstart.
-
-#### Testing
-
-- [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server, reading latest GitHub issues, etc.
 
 ### Conditional Criteria
 
@@ -136,6 +136,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-H data at the [designated scale factor](#rc-release-criteria) into this connector.
 - [ ] The connector can load TPC-H at the [designated scale factor](#rc-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-H are raised as issues.
+- [ ] TPC-H queries that execute successfully on Datafusion, should execute successfully on the connector.
 
 ##### TPC-DS
 
@@ -144,6 +145,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-DS data at the [designated scale factor](#rc-release-criteria) into this connector.
 - [ ] The connector can load TPC-DS at the [designated scale factor](#rc-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-DS are raised as issues.
+- [ ] TPC-DS queries that execute successfully on Datafusion, should execute successfully on the connector.
 
 ##### ClickBench
 
@@ -151,9 +153,11 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] All queries are attempted on this connector. No bug fixes are required for ClickBench.
 - [ ] All ClickBench bugs are raised as issues.
 
-#### Data correctness
+#### Data Correctness
 
-Data correctness can only be validated where the connector has a native CLI to replicate identical results. For connectors that do not have a native CLI to generate identical results, skip these tests:
+Data correctness can only be validated where the connector has a native CLI to replicate identical results. For connectors that do not have a native CLI to generate identical results, skip these tests.
+
+Connectors that are excluded from these tests does not indicate that data is incorrect - it indicates only that we do not perform *automated* testing of data correctness.
 
 - [ ] TPC-H queries at the [designated scale factor](#rc-release-criteria) return identical results in Spice and the native connector CLI.
 - [ ] TPC-DS queries at the [designated scale factor](#rc-release-criteria) return identical results in Spice and the native connector CLI.

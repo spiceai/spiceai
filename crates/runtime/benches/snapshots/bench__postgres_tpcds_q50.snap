@@ -1,0 +1,14 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++--------------+--------------+-----------------+---------------+---------------+----------------+----------+-------------------+---------+-------+---------+------------+------------+-------------+-----------+
+| s_store_name | s_company_id | s_street_number | s_street_name | s_street_type | s_suite_number | s_city   | s_county          | s_state | s_zip | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++--------------+--------------+-----------------+---------------+---------------+----------------+----------+-------------------+---------+-------+---------+------------+------------+-------------+-----------+
+| able         | 1            | 255             | Sycamore      | Dr.           | Suite 410      | Midway   | Williamson County | TN      | 31904 | 60      | 48         | 56         | 53          | 104       |
+| ation        | 1            | 811             | Lee           | Circle        | Suite T        | Midway   | Williamson County | TN      | 31904 | 65      | 65         | 56         | 75          | 127       |
+| bar          | 1            | 175             | 4th           | Court         | Suite C        | Midway   | Williamson County | TN      | 31904 | 55      | 49         | 43         | 49          | 105       |
+| eing         | 1            | 226             | 12th          | Lane          | Suite D        | Fairview | Williamson County | TN      | 35709 | 58      | 50         | 64         | 44          | 109       |
+| ese          | 1            | 27              | Lake          | Ln            | Suite 260      | Midway   | Williamson County | TN      | 31904 | 94      | 45         | 59         | 61          | 124       |
+| ought        | 1            | 767             | Spring        | Wy            | Suite 250      | Midway   | Williamson County | TN      | 31904 | 88      | 56         | 51         | 61          | 107       |
++--------------+--------------+-----------------+---------------+---------------+----------------+----------+-------------------+---------+-------+---------+------------+------------+-------------+-----------+

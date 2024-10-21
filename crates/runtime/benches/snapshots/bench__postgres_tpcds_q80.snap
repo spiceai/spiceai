@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-----------------+------------------------------+----------+---------+-----------+
+| channel         | id                           | sales    | returns | profit    |
++-----------------+------------------------------+----------+---------+-----------+
+| catalog channel | catalog_pageAAAAAAAAAAPBAAAA | 36100.26 | 0.00    | 2561.07   |
+| catalog channel | catalog_pageAAAAAAAAABPBAAAA | 38591.90 | 0.00    | 8286.08   |
+| catalog channel | catalog_pageAAAAAAAAACBCAAAA | 493.12   | 0.00    | -103.04   |
+| catalog channel | catalog_pageAAAAAAAAACPBAAAA | 33635.96 | 0.00    | -11800.25 |
+| catalog channel | catalog_pageAAAAAAAAADPBAAAA | 25319.79 | 907.80  | 174.45    |
+| catalog channel | catalog_pageAAAAAAAAAEBCAAAA | 2413.32  | 0.00    | 917.28    |
+| catalog channel | catalog_pageAAAAAAAAAEPBAAAA | 14631.04 | 1246.06 | -5116.27  |
+| catalog channel | catalog_pageAAAAAAAAAFPBAAAA | 1841.94  | 0.00    | -3388.28  |
+| catalog channel | catalog_pageAAAAAAAAAGBCAAAA | 2329.95  | 0.00    | 685.66    |
+| catalog channel | catalog_pageAAAAAAAAAGPBAAAA | 6278.10  | 0.00    | 896.42    |
++-----------------+------------------------------+----------+---------+-----------+

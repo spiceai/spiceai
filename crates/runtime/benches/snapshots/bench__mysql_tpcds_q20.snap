@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+
+| i_item_id        | i_item_desc                                                                                                                                           | i_category | i_class | i_current_price | itemrevenue | revenueratio |
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+
+| AAAAAAAAJGJBAAAA | Urban, powerful concepts should discern efficiently others. Far other activities should not see politically politica                                  | Children   |         | 4.42            | 4995.00     | 19.942150    |
+| AAAAAAAAAAGEAAAA | Commercial errors wish perfectly; available, equal names explain awkwar                                                                               | Children   | infants | 4.51            | 6409.19     | 0.802131     |
+| AAAAAAAAAIBBAAAA | Popular, mad proposals could handle outside enough working times. Largely foreign powers believe even members. Just tender shapes find never          | Children   | infants | 1.52            | 14267.05    | 1.785568     |
+| AAAAAAAAAIEEAAAA | Heavily ready computers write real rights. Secondary sites melt. British, european creditors mean most. British, new fingers go simply exciting polic | Children   | infants | 2.25            | 9376.44     | 1.173492     |
+| AAAAAAAAAJBDAAAA | Directly head parts will find then now identical issues. Books clear in a players. Local activities guess judicia                                     | Children   | infants | 1.29            | 694.20      | 0.086881     |
+| AAAAAAAAAKABAAAA | Stages would not see then of course large lands; p                                                                                                    | Children   | infants | 1.73            | 13939.65    | 1.744593     |
+| AAAAAAAAAKBCAAAA | Even southern orders think british, poor committees. Successful, poor books ought to deny real others. There neces                                    | Children   | infants | 8.87            | 1235.44     | 0.154619     |
+| AAAAAAAAAKKCAAAA | Problems save simply main, short weeks. Anyway practical orders may rule tiny, complicated patterns; existing, economic horses take ye                | Children   | infants | 8.67            | 0.00        | 0.000000     |
+| AAAAAAAAAKNAAAAA | Crucial, safe rights used to endure also nuclear days. Able members reply                                                                             | Children   | infants | 12.53           | 498.20      | 0.062351     |
+| AAAAAAAAALCEAAAA | Different, soft farms meet on the implications. Even dark stations pay all rarely nice facts; daughters may                                           | Children   | infants | 4.50            | 818.91      | 0.102489     |
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+

@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+---------------------+--------------------+------------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address             |
++------------------+---------------------+--------------------+------------------------------------+
+| AAAAAAAAAGEJAAAA | Michael             | Tolbert            | Michael.Tolbert@D8O5R.com          |
+| AAAAAAAAAGOLAAAA | Lawrence            | Reed               | Lawrence.Reed@4tUSGo1o.org         |
+| AAAAAAAAAHAGBAAA | Nilda               | Bernal             | Nilda.Bernal@afeQH6HuLAeQt.org     |
+| AAAAAAAAAIFBBAAA | Juana               | Giles              | Juana.Giles@D0JsFLeloECaxb.com     |
+| AAAAAAAAAJNGBAAA | Roger               | Kaufman            | Roger.Kaufman@rMosVj1GQS.org       |
+| AAAAAAAAAKOBBAAA | William             | Alderman           | William.Alderman@LHfDRblj.edu      |
+| AAAAAAAAALDHBAAA | Lori                | Barrett            | Lori.Barrett@XpjxdL.edu            |
+| AAAAAAAABAPIAAAA | Rona                | Jordan             | Rona.Jordan@9N0JqyMFax8eJmm9pB.edu |
+| AAAAAAAABFJGAAAA | Willie              | Ott                |                                    |
+| AAAAAAAABFOMAAAA | Robert              | Pickard            | Robert.Pickard@8b2YLMoYDldS2.edu   |
++------------------+---------------------+--------------------+------------------------------------+

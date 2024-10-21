@@ -1539,7 +1539,7 @@ impl Runtime {
     async fn register_metrics_table(&self, metrics_enabled: bool) -> Result<()> {
         if metrics_enabled {
             let table_reference = get_metrics_table_reference();
-            let metrics_table = self.df.get_table(table_reference).await;
+            let metrics_table = self.df.get_table(&table_reference).await;
 
             if metrics_table.is_none() {
                 tracing::debug!("Registering local metrics table");
