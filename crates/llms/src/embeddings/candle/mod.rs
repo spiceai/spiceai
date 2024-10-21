@@ -39,6 +39,8 @@ use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use snafu::ResultExt;
+mod tei;
+use tei::{pool_from_str, pooling_from_pooling_config};
 use tei_backend_core::{Backend, ModelType, Pool};
 use tei_candle::{batch, sort_embeddings, CandleBackend};
 use tempfile::tempdir;
@@ -63,10 +65,18 @@ impl CandleEmbedding {
         model_path: &Path,
         config_path: &Path,
         tokenizer_path: &Path,
+        pooling: Option<String>,
     ) -> Result<Self> {
+        let model_filename = model_path
+            .file_name()
+            .ok_or("".into())
+            .context(FailedToCreateEmbeddingSnafu)?
+            .to_string_lossy()
+            .to_string();
+
         // `text-embeddings-inference` expects the model artifacts to to be in a single folder with specific filenames.
         let files: HashMap<String, &Path> = vec![
-            ("model.safetensors".to_string(), model_path),
+            (model_filename, model_path),
             ("config.json".to_string(), config_path),
             ("tokenizer.json".to_string(), tokenizer_path),
         ]
@@ -78,20 +88,57 @@ impl CandleEmbedding {
             "Embedding model has files linked at location={:?}",
             model_root
         );
-        Self::try_new(&model_root, F32_DTYPE)
+
+        // Check if user provided pooling is valid, and only default to mean if no user-pooling provided
+        let pool = if let Some(pooling) = pooling {
+            match pool_from_str(&pooling) {
+                Some(pool) => pool,
+                None => {
+                    return Err(super::Error::FailedToCreateEmbedding {
+                        source: format!("Invalid pooling mode: {pooling}").into(),
+                    });
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Embedding pooling mode not specified by user. Defaulting to mean pooling."
+            );
+            Pool::Mean
+        };
+
+        Self::try_new(&model_root, F32_DTYPE, Some(pool))
     }
 
     pub fn from_hf(
         model_id: &str,
         revision: Option<&str>,
         hf_token: Option<String>,
+        pooling_overwrite: Option<String>,
     ) -> Result<Self> {
+        // Only error if user-provided value is incorrect.
+        let pool = pooling_overwrite
+            .map(|pp| {
+                let p = pool_from_str(&pp);
+                if p.is_none() {
+                    return Err(super::Error::FailedToCreateEmbedding {
+                        source: format!("Invalid pooling mode: {pp}").into(),
+                    });
+                }
+                Ok(p)
+            })
+            .transpose()?
+            .flatten();
+
         let model_root = download_hf_artifacts(model_id, revision, hf_token)?;
-        Self::try_new(&model_root, F32_DTYPE)
+        Self::try_new(&model_root, F32_DTYPE, pool)
     }
 
     /// Attempt to create a new `CandleEmbedding` instance. Requires all model artifacts to be within a single folder.
-    pub fn try_new(model_root: &Path, dtype: &str) -> Result<Self> {
+    pub fn try_new(
+        model_root: &Path,
+        dtype: &str,
+        pooling_overwrite: Option<Pool>,
+    ) -> Result<Self> {
         tracing::trace!(
             "Loading tokenizer from {:?}",
             model_root.join("tokenizer.json")
@@ -100,39 +147,27 @@ impl CandleEmbedding {
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
         tracing::trace!("Tokenizer loaded.");
 
+        let pooling_opt = pooling_from_pooling_config(model_root)
+            .context(FailedToCreateEmbeddingSnafu)?
+            .or(pooling_overwrite);
+
+        if pooling_opt.is_none() {
+            tracing::warn!("Embedding pooling mode both not found in model files, and not specified by user. Defaulting to mean pooling.");
+        }
+
         Ok(Self {
             backend: Arc::new(Mutex::new(
                 CandleBackend::new(
                     model_root.to_path_buf(),
                     dtype.to_string(),
-                    ModelType::Embedding(Pool::Cls),
+                    ModelType::Embedding(pooling_opt.unwrap_or(Pool::Mean)),
                 )
                 .boxed()
                 .context(FailedToInstantiateEmbeddingModelSnafu)?,
             )),
             tok: Arc::new(tokenizer),
-            model_cfg: Self::model_config(model_root)?,
+            model_cfg: tei::model_config(model_root)?,
         })
-    }
-
-    fn model_config(model_root: &Path) -> Result<ModelConfig> {
-        tracing::trace!(
-            "Loading model config from {:?}",
-            model_root.join("config.json")
-        );
-        let config_str = fs::read_to_string(model_root.join("config.json"))
-            .boxed()
-            .context(FailedToInstantiateEmbeddingModelSnafu)?;
-
-        tracing::trace!("Model config loaded.");
-
-        let config: ModelConfig = serde_json::from_str(&config_str)
-            .boxed()
-            .context(FailedToInstantiateEmbeddingModelSnafu)?;
-
-        tracing::trace!("Model config parsed: {:?}", config);
-
-        Ok(config)
     }
 
     /// Count the number of tokens in an encoding, excluding padding tokens.
@@ -190,12 +225,28 @@ impl CandleEmbedding {
                 source: format!("Failed to lock backend: {e:?}").into(),
             })?;
 
-        let (pooled_embeddings, _) = sort_embeddings(
+        let (mut pooled_embeddings, _) = sort_embeddings(
             backend
                 .embed(b)
                 .boxed()
                 .context(FailedToCreateEmbeddingSnafu)?,
         );
+
+        // Normalize embeddings
+        for ele in &mut pooled_embeddings {
+            let scale = 1.0
+                / ele
+                    .iter()
+                    .map(|v| {
+                        let v = *v;
+                        v * v
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+            for v in ele.iter_mut() {
+                *v *= scale;
+            }
+        }
 
         Ok((pooled_embeddings, input_tokens))
     }
@@ -283,6 +334,15 @@ pub fn download_hf_artifacts(
         .get("tokenizer.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
+
+    tracing::trace!("Downloading '1_Pooling/config.json' for {}", repo.url());
+    if let Err(e) = api_repo.get("1_Pooling/config.json") {
+        // May not be an issue, will be checked later.
+        tracing::trace!(
+            "`1_Pooling/config.json` not found for {model_id}@{revision}. Error: {e}",
+            revision = revision.unwrap_or_default()
+        );
+    }
 
     tracing::trace!("Downloading 'model.safetensors' for {}", repo.url());
     let model = if let Ok(p) = api_repo.get("model.safetensors") {
