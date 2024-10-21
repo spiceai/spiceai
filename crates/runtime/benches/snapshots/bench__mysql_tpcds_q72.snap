@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------+------------+----------+-------+-----------+
+| i_item_desc                                                                                                                                                                                          | w_warehouse_name     | d_week_seq | no_promo | promo | total_cnt |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------+------------+----------+-------+-----------+
+| Anxious investments shi                                                                                                                                                                              |                      | 5217       | 0        | 2     | 2         |
+| As other folk can remain quickly methods. Easy, othe                                                                                                                                                 | Bad cards must make. | 5185       | 0        | 2     | 2         |
+| Asian, large-scale plans shall not talk. Old issues lobby furthermore random features. At least theoretical organisations use evidently guns. Courts form rich criteria; just succ                   | Important issues liv | 5185       | 0        | 2     | 2         |
+| Available, northern lines ensure in a plants. Situations may return powerful, reasonable projects. New committees use all. Old books run remarks. Great, ancient purpose                             | Doors canno          | 5212       | 0        | 2     | 2         |
+| Average, mean unions include. Cold ways shall work particularly from no rights. Already crucial agencies get very professional days. Perhaps huge methods rule financially awful arms. Strong vehicl |                      | 5212       | 0        | 2     | 2         |
+| Bad, various p                                                                                                                                                                                       | Bad cards must make. | 5217       | 0        | 2     | 2         |
+| Basic lectures can achieve. Separate purposes might help. N                                                                                                                                          | Important issues liv | 5217       | 0        | 2     | 2         |
+| Big,                                                                                                                                                                                                 | Bad cards must make. | 5213       | 0        | 2     | 2         |
+| Boats return small, right words. Hours say generally hostile, hard firms. Other, bri                                                                                                                 | Conventional childr  | 5201       | 0        | 2     | 2         |
+| British groups will not extend. Friends ought to divert views. Decisive clothes generate. Bl                                                                                                         | Bad cards must make. | 5217       | 0        | 2     | 2         |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------+------------+----------+-------+-----------+

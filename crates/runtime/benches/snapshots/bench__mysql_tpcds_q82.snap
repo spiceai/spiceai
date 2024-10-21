@@ -1,0 +1,12 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+----------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| i_item_id        | i_item_desc                                                                                                                      | i_current_price |
++------------------+----------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| AAAAAAAABMGDAAAA | Only technical visitors shall talk also bonds.                                                                                   | 72.60           |
+| AAAAAAAADNADAAAA | Fast black days fight for a publishers; most other thoughts could suit circumstances; elections learn. Hot, black figures invite | 91.62           |
+| AAAAAAAAEEMCAAAA | Extra, annual kinds produce other lights. Successful pp. should not tell home in a husbands. Centres ho                          | 87.93           |
++------------------+----------------------------------------------------------------------------------------------------------------------------------+-----------------+

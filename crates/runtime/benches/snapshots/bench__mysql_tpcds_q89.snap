@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
+| i_category | i_class   | i_brand            | s_store_name | s_company_name | d_moy | sum_sales | avg_monthly_sales |
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 2     | 3161.66   | 7867.865833       |
+| Music      | classical | edu packscholar #2 | ese          | Unknown        | 3     | 2977.05   | 7672.410833       |
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 6     | 3658.03   | 7867.865833       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 3     | 3473.83   | 7453.667500       |
+| Music      | classical | edu packscholar #2 | ese          | Unknown        | 7     | 3934.84   | 7672.410833       |
+| Children   | infants   | importoexporti #2  | ought        | Unknown        | 6     | 2856.15   | 6572.165833       |
+| Music      | classical | edu packscholar #2 | ation        | Unknown        | 5     | 3737.74   | 7415.289167       |
+| Music      | classical | edu packscholar #2 | ation        | Unknown        | 3     | 3737.86   | 7415.289167       |
+| Children   | infants   | importoexporti #2  | able         | Unknown        | 2     | 3209.98   | 6870.858333       |
+| Children   | infants   | importoexporti #2  | ation        | Unknown        | 2     | 3145.09   | 6789.123333       |
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
