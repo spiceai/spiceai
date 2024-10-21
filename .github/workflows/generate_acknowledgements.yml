@@ -20,7 +20,10 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - run: rustup toolchain install stable --profile minimal
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: "linux"
 
       - name: Set up make
         uses: ./.github/actions/setup-make
