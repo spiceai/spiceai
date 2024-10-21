@@ -10084,6 +10084,7 @@ dependencies = [
  "runtime",
  "rustls 0.23.14",
  "rustls-pemfile 2.2.0",
+ "serde_json",
  "snafu",
  "snmalloc-rs",
  "spice-cloud",

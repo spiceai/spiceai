@@ -89,7 +89,7 @@ impl SpiceModelTool for ListDatasetsTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
 
         let elements = get_dataset_elements(Arc::clone(&rt), self.table_allowlist.as_deref())
             .await
@@ -97,6 +97,9 @@ impl SpiceModelTool for ListDatasetsTool {
             .map(serde_json::value::to_value)
             .collect::<Result<Vec<Value>, _>>()
             .boxed()?;
+
+        let captured_output_json = serde_json::to_string(&elements).boxed()?;
+        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
 
         Ok(Value::Array(elements))
     }
