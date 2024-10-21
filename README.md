@@ -102,6 +102,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `debezium`    | Debezium CDC                                                                                   | Alpha  | Kafka + JSON                                                                                       |
 | `sharepoint`  | Microsoft SharePoint                                                                           | Alpha  | Unstructured UTF-8 documents                                                                       |
 | `mssql`       | Microsoft SQL Server                                                                           | Alpha  | Tabular Data Stream (TDS)                                                                          |
+| `abfs`        | Azure BlobFS                                                                                   | Alpha  | Parquet, CSV                                                                                       |
 
 ### Supported Data Stores/Accelerators
 
