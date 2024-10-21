@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++--------+----------+--------------------+-----------+
+| d_year | brand_id | brand              | sum_agg   |
++--------+----------+--------------------+-----------+
+| 1998   | 7003004  | exportibrand #4    | -1445.10  |
+| 1998   | 10016001 | corpamalgamalg #1  | -2616.31  |
+| 1998   | 1004002  | edu packamalg #2   | -2950.32  |
+| 1998   | 3001002  | amalgexporti #2    | -4889.11  |
+| 1998   | 3003001  | exportiexporti #1  | -6844.08  |
+| 1998   | 3004001  | edu packexporti #1 | -7210.76  |
+| 1998   | 5004001  | edu packscholar #1 | -10021.47 |
+| 1998   | 8001003  | amalgnameless #3   | -20569.07 |
+| 1999   | 5004001  | edu packscholar #1 | -745.07   |
+| 1999   | 3004001  | edu packexporti #1 | -3250.66  |
++--------+----------+--------------------+-----------+

@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+--------------+
+| customer_id      | customername |
++------------------+--------------+
+| AAAAAAAAAENGBAAA | 0            |
+| AAAAAAAABLEPAAAA | 0            |
+| AAAAAAAADLECBAAA | 0            |
+| AAAAAAAAEFEBBAAA | 0            |
+| AAAAAAAAEFPDBAAA | 0            |
+| AAAAAAAAEGPDAAAA | 0            |
+| AAAAAAAAFFOGBAAA | 0            |
+| AAAAAAAAGLFBAAAA | 0            |
+| AAAAAAAAIEPNAAAA | 0            |
+| AAAAAAAAIGBPAAAA | 0            |
++------------------+--------------+
