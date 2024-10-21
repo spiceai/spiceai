@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 use async_openai::{
-    error::OpenAIError,
+    error::{ApiError, OpenAIError},
     types::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
@@ -28,7 +28,6 @@ use serde_json::Value;
 use std::{collections::HashMap, fmt, pin::Pin, time::SystemTime};
 
 use super::types::{MessageRole, StopReason, Usage};
-use async_stream::stream;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -245,31 +244,41 @@ pub struct MessageDelta {
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
 #[allow(clippy::too_many_lines)]
+
 pub fn transform_stream(
-    mut stream: Pin<
+    stream: Pin<
         Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
     >,
     model: String,
 ) -> ChatCompletionResponseStream {
-    let transformed_stream = stream! {
-        // Initialize mutable variables here
-        let mut id: Option<String> = None;
-        let mut role: Option<MessageRole> = None;
-        let mut usage: Option<CompletionUsage> = None;
+    // As mentioned above, only first tool packet has tool metadata.
+    // Format:
+    //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
+    //  Subsequent Messages: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}
+    //
+    // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
+    // Map `.index` to `.content_block`
+    #[derive(Clone)]
+    struct StreamState {
+        id: Option<String>,
+        role: Option<MessageRole>,
+        usage: Option<CompletionUsage>,
+        tool_id_to_content_block: HashMap<u32, ContentBlockToolUse>,
+        tool_id_to_tool_delta_idx: HashMap<u32, i32>,
+    }
 
-        // As mentioned above, only first tool packet has tool metadata.
-        // Format:
-        //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
-        //  Subsequent Messages: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}
-        //
-        // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
-        // Map `.index` to `.content_block`
-        let mut tool_id_to_content_block = HashMap::<u32, ContentBlockToolUse>::new();
+    let initial_state = StreamState {
+        id: None,
+        role: None,
+        usage: None,
+        tool_id_to_content_block: HashMap::new(),
+        tool_id_to_tool_delta_idx: HashMap::new(),
+    };
 
-        // Map `.index` to incremental position of tool delta
-        let mut tool_id_to_tool_delta_idx = HashMap::<u32, i32>::new();
-
-        while let Some(item) = stream.next().await {
+    let transformed_stream = stream.scan(initial_state, move |state, item| {
+        let model = model.clone();
+        let mut state = state.clone();
+        async move {
             match item {
                 Ok(MessageCreateStreamResponse::MessageStart {
                     message:
@@ -280,90 +289,128 @@ pub fn transform_stream(
                             ..
                         },
                 }) => {
-                    role = MessageRole::from_opt(&inner_role);
-                    id = Some(inner_id);
-                    usage = Some(CompletionUsage {
+                    state.role = MessageRole::from_opt(&inner_role);
+                    state.id = Some(inner_id);
+                    state.usage = Some(CompletionUsage {
                         prompt_tokens: inner_usage.input_tokens,
                         completion_tokens: inner_usage.output_tokens,
                         total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
                     });
-                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, None, None)
-                },
-                Ok(MessageCreateStreamResponse::ContentBlockStart { index, content_block }) => {
+                    let response = create_stream_response(
+                        &state.id.clone().unwrap_or_default(),
+                        &model,
+                        None,
+                        None,
+                    );
+                    Some(response)
+                }
+                Ok(MessageCreateStreamResponse::ContentBlockStart {
+                    index,
+                    content_block,
+                }) => {
                     if let ContentBlock::ToolUse(t) = &content_block {
-                        tool_id_to_content_block.insert(index, t.clone());
-                        tool_id_to_tool_delta_idx.insert(index, 0);
+                        state.tool_id_to_content_block.insert(index, t.clone());
+                        state.tool_id_to_tool_delta_idx.insert(index, 0);
                     };
-                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
+                    let response = create_stream_response(
+                        &state.id.clone().unwrap_or_default(),
+                        &model,
+                        None,
+                        Some(ChatChoiceStream {
                             index: 0,
                             delta: content_block.into_completion(),
                             finish_reason: None,
                             logprobs: None,
-                        }))
-                },
+                        }),
+                    );
+                    Some(response)
+                }
                 Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
-                    let tool_idx = *tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
-                    tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
+                    let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
+                    state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
-                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, None, Some(ChatChoiceStream {
+                    let response = create_stream_response(
+                        &state.id.clone().unwrap_or_default(),
+                        &model,
+                        None,
+                        Some(ChatChoiceStream {
                             index: 0,
                             logprobs: None,
                             finish_reason: None,
                             delta: delta.into_completion(
-                                &role,
-                                tool_id_to_content_block
+                                &state.role,
+                                state
+                                    .tool_id_to_content_block
                                     .get(&index)
                                     .map(|b| (tool_idx, b.clone())),
                             ),
-                        }))
-                },
+                        }),
+                    );
+                    Some(response)
+                }
                 Ok(MessageCreateStreamResponse::MessageDelta {
                     delta: MessageDelta { stop_reason, .. },
                     usage: inner_usage,
                 }) => {
                     // Update usage
-                    if let Some(ref mut u) = usage {
+                    if let Some(ref mut u) = state.usage {
                         u.prompt_tokens += inner_usage.input_tokens;
                         u.completion_tokens += inner_usage.output_tokens;
                         u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
                     }
-                    yield create_stream_response(&id.clone().unwrap_or_default(), &model, usage.clone(), Some(ChatChoiceStream {
-                        index: 0,
-                        logprobs: None,
-                        finish_reason: match stop_reason {
-                            Some(StopReason::EndTurn | StopReason::StopSequence) => Some(FinishReason::Stop),
-                            Some(StopReason::MaxTokens) => Some(FinishReason::Length),
-                            Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
-                            None => None,
-                        },
-                        delta: ChatCompletionStreamResponseDelta {
-                            content: None,
-                            function_call: None,
-                            tool_calls: None,
-                            role: None,
-                            refusal: None,
-                        },
-                    }))
-                },
+                    let response = create_stream_response(
+                        &state.id.clone().unwrap_or_default(),
+                        &model,
+                        state.usage.clone(),
+                        Some(ChatChoiceStream {
+                            index: 0,
+                            logprobs: None,
+                            finish_reason: match stop_reason {
+                                Some(StopReason::EndTurn | StopReason::StopSequence) => {
+                                    Some(FinishReason::Stop)
+                                }
+                                Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                                Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                None => None,
+                            },
+                            delta: ChatCompletionStreamResponseDelta {
+                                content: None,
+                                function_call: None,
+                                tool_calls: None,
+                                role: None,
+                                refusal: None,
+                            },
+                        }),
+                    );
+                    Some(response)
+                }
                 Ok(MessageCreateStreamResponse::Ping) => {
                     tracing::trace!("Received a ping stream packet");
-                    continue;
-                },
-                | Ok(MessageCreateStreamResponse::ContentBlockStop { .. })  => {
+                    // Skip emitting an item
+                    None
+                }
+                Ok(MessageCreateStreamResponse::ContentBlockStop { .. }) => {
                     tracing::trace!("Received a content block stop packet");
-                    continue;
-                },
+                    // Skip emitting an item
+                    None
+                }
                 Ok(MessageCreateStreamResponse::MessageStop) => {
                     tracing::trace!("Received a stop stream packet");
-                    continue;
-                },
+                    // Skip emitting an item
+                    None
+                }
                 Err(e) => {
                     tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                    yield Err(OpenAIError::StreamError(e.to_string()))
-                },
+                    Some(Err(OpenAIError::ApiError(ApiError {
+                        message: e.to_string(),
+                        r#type: Some("AnthropicStreamError".to_string()),
+                        param: None,
+                        code: None,
+                    })))
+                }
             }
         }
-    };
+    });
 
     Box::pin(transformed_stream)
 }
