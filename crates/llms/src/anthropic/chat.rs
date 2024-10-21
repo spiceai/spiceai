@@ -234,68 +234,76 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
 
                 Ok(MessageParam::user(blocks))
             }
-            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                content,
-                tool_calls,
-                ..
-            }) => {
-                let mut content_blocks: Vec<ContentBlock> = match content {
-                    Some(ChatCompletionRequestAssistantMessageContent::Text(text)) => {
-                        vec![ContentBlock::Text(TextBlockParam::new(text))]
-                    }
-                    Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts
-                        .iter()
-                        .map(|p| match p {
-                            ChatCompletionRequestAssistantMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText { text },
-                            ) => Ok(ContentBlock::Text(TextBlockParam::new(text.clone()))),
-                            ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => Err(
-                                OpenAIError::InvalidArgument("Refusal not supported".to_string()),
-                            ),
-                        })
-                        .collect::<Result<Vec<_>, OpenAIError>>()?,
-                    None => vec![],
-                };
-
-                let tool_blocks = match tool_calls {
-                    Some(calls) => calls
-                        .iter()
-                        .map(|call| {
-                            let input = if call.function.arguments.is_empty() {
-                                Ok(json!(
-                                    {
-                                        "$schema": "http://json-schema.org/draft-07/schema#",
-                                        "properties": {},
-                                        "required": [],
-                                        "title": "",
-                                        "type": "object"
-                                    }
-                                ))
-                            } else {
-                                serde_json::from_str(&call.function.arguments)
-                            };
-                            Ok(ContentBlock::ToolUse(ToolUseBlockParam::new(
-                                call.id.clone(),
-                                input.map_err(|e| {
-                                    OpenAIError::ApiError(ApiError {
-                                        message: e.to_string(),
-                                        r#type: Some("AnthropicConversionError".to_string()),
-                                        param: None,
-                                        code: None,
-                                    })
-                                })?,
-                                call.function.name.clone(),
-                            )))
-                        })
-                        .collect::<Result<_, OpenAIError>>()?,
-                    None => vec![],
-                };
-
-                content_blocks.extend(tool_blocks);
-                Ok(MessageParam::assistant(content_blocks))
+            ChatCompletionRequestMessage::Assistant(msg) => {
+                assistant_messages_to_content_blocks(msg)
             }
         }
     }
+}
+
+fn assistant_messages_to_content_blocks(
+    msg: ChatCompletionRequestAssistantMessage,
+) -> Result<MessageParam, OpenAIError> {
+    let ChatCompletionRequestAssistantMessage {
+        content,
+        tool_calls,
+        ..
+    } = msg;
+
+    let mut content_blocks: Vec<ContentBlock> = match content {
+        Some(ChatCompletionRequestAssistantMessageContent::Text(text)) => {
+            vec![ContentBlock::Text(TextBlockParam::new(text))]
+        }
+        Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts
+            .iter()
+            .map(|p| match p {
+                ChatCompletionRequestAssistantMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text },
+                ) => Ok(ContentBlock::Text(TextBlockParam::new(text.clone()))),
+                ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => Err(
+                    OpenAIError::InvalidArgument("Refusal not supported".to_string()),
+                ),
+            })
+            .collect::<Result<Vec<_>, OpenAIError>>()?,
+        None => vec![],
+    };
+
+    let tool_blocks = match tool_calls {
+        Some(calls) => calls
+            .iter()
+            .map(|call| {
+                let input = if call.function.arguments.is_empty() {
+                    Ok(json!(
+                        {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "properties": {},
+                            "required": [],
+                            "title": "",
+                            "type": "object"
+                        }
+                    ))
+                } else {
+                    serde_json::from_str(&call.function.arguments)
+                };
+                Ok(ContentBlock::ToolUse(ToolUseBlockParam::new(
+                    call.id.clone(),
+                    input.map_err(|e| {
+                        OpenAIError::ApiError(ApiError {
+                            message: e.to_string(),
+                            r#type: Some("AnthropicConversionError".to_string()),
+                            param: None,
+                            code: None,
+                        })
+                    })?,
+                    call.function.name.clone(),
+                )))
+            })
+            .collect::<Result<_, OpenAIError>>()?,
+        None => vec![],
+    };
+
+    content_blocks.extend(tool_blocks);
+    Ok(MessageParam::assistant(content_blocks))
 }
 
 impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCreateParams {
