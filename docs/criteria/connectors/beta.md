@@ -65,7 +65,7 @@ This table defines the required features and/or tests for each connector:
 The Beta release criteria expand on and require that all [Alpha release criteria](./alpha.md) continue to pass for the connector.
 
 - [ ] All [Alpha release criteria](./alpha.md) pass for this connector.
-- [ ] [Common Arrow Data Types](../definitions.md) are supported.
+- [ ] [Core Connector Data Types](../definitions.md) are supported.
 
 #### Documentation
 

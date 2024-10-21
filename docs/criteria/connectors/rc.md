@@ -67,13 +67,13 @@ These requirements are imposed on every connector, regardless of the selected fe
 The RC release criteria expand on and require that all [Beta release criteria](./beta.md) continue to pass for the connector.
 
 - [ ] All [Beta release criteria](./beta.md) pass for this connector.
-- [ ] For exceptions where a [Core Arrow Data Type](../definitions.md) is not supported, print a warning and ignore the column instead of crashing or failing the query.
+- [ ] For exceptions where a [Core Connector Data Type](../definitions.md) is not supported, print a warning and ignore the column instead of crashing or failing the query.
 - [ ] All known [Major Bugs](../definitions.md) are resolved.
 
 #### Documentation
 
 - [ ] Documentation includes all information and steps for a user to set up the connector.
-- [ ] Documentation includes any mappings from Native data types to Arrow data types (if applicable).
+- [ ] Documentation includes any mappings from [Core Connector Data Types](../definitions.md) to [Core Arrow Data Types](../definitions.md) types.
 - [ ] Documentation includes all known issues/limitations for the connector.
 - [ ] Documentation includes any exceptions made to allow this connector to reach RC quality (e.g. if a particular data type cannot be supported by the connector).
 - [ ] The connector has an easy to follow quickstart.
