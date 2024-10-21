@@ -69,7 +69,7 @@ impl CandleEmbedding {
     ) -> Result<Self> {
         let model_filename = model_path
             .file_name()
-            .ok_or("".into())
+            .ok_or("model path must be a file".into())
             .context(FailedToCreateEmbeddingSnafu)?
             .to_string_lossy()
             .to_string();
@@ -89,7 +89,7 @@ impl CandleEmbedding {
             model_root
         );
 
-        // Check if user provided pooling is valid, and only default to mean if no user-pooling provided
+        // Check if user provided pooling is valid, and only default to mean when user doesn't provide one.
         let pool = if let Some(pooling) = pooling {
             match pool_from_str(&pooling) {
                 Some(pool) => pool,
@@ -355,6 +355,7 @@ pub fn download_hf_artifacts(
         tracing::warn!("`model.safetensors` not found. Using `pytorch_model.bin` instead. Model loading will be significantly slower.");
         p
     };
+
     Ok(model
         .parent()
         .ok_or("".into())

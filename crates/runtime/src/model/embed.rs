@@ -93,6 +93,7 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
         EmbeddingPrefix::HuggingFace => {
             let hf_token = params.get("hf_token").map(Secret::expose_secret).cloned();
             let pooling = params.get("pooling").map(Secret::expose_secret).cloned();
+
             if let Some(id) = model_id {
                 Ok(Box::new(CandleEmbedding::from_hf(
                     &id, None, hf_token, pooling,
