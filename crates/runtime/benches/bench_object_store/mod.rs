@@ -46,9 +46,17 @@ pub(crate) async fn run(
         "tpch" => get_tpch_test_queries(),
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
-            if engine.clone().unwrap_or_default().as_str() == "postgres" {
-                super::bench_postgres::get_tpcds_test_queries()
-            } else {
+            #[cfg(feature = "postgres")]
+            {
+                if engine.clone().unwrap_or_default().as_str() == "postgres" {
+                    super::bench_postgres::get_tpcds_test_queries()
+                } else {
+                    get_tpcds_test_queries()
+                }
+            }
+
+            #[cfg(not(feature = "postgres"))]
+            {
                 get_tpcds_test_queries()
             }
         }
@@ -78,7 +86,7 @@ pub(crate) async fn run(
         } else if query_name.starts_with("tpcds_q") {
             matches!(
                 bench_name.as_str(),
-                "s3_postgres_memory" | "s3_arrow_memory" | "s3_duckdb_file"
+                "s3" | "s3_postgres_memory" | "s3_arrow_memory" | "s3_duckdb_file"
             )
         } else {
             false
