@@ -124,42 +124,38 @@ pub enum AnthropicAuthMechanism {
     AuthToken(Secret<String>),
 }
 
-// Requires `.expect(` to maintain `Config` trait's method signature.
-// Expectation is that values in `AnthropicAuthMechanism` are valid headers, see:
-// `<https://github.com/hyperium/http/blob/761d36acb069ed335d2f9dfd7a568b8735ec7fec/src/header/value.rs#L605>`
-#[allow(clippy::expect_used)]
 impl Config for AnthropicConfig {
     fn headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         match &self.auth {
             Some(AnthropicAuthMechanism::ApiKey(api_key)) => {
-                headers.insert(
-                    "x-api-key",
-                    HeaderValue::from_str(api_key.expose_secret()).expect("Invalid API key"),
-                );
+                let Ok(value) = HeaderValue::from_str(api_key.expose_secret()) else {
+                    panic!("Invalid Anthropic API key");
+                };
+                headers.insert("x-api-key", value);
             }
             Some(AnthropicAuthMechanism::AuthToken(auth_token)) => {
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(
-                        format!("Bearer {}", auth_token.expose_secret()).as_str(),
-                    )
-                    .expect("Invalid auth token"),
-                );
+                let Ok(value) = HeaderValue::from_str(
+                    format!("Bearer {}", auth_token.expose_secret()).as_str(),
+                ) else {
+                    panic!("Invalid Anthropic auth token");
+                };
+                headers.insert(AUTHORIZATION, value);
             }
             None => {}
         }
 
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_str(self.version.as_str()).expect("Invalid version"),
-        );
+        let Ok(version) = HeaderValue::from_str(self.version.as_str()) else {
+            panic!("Invalid `anthropic-version` header");
+        };
+        headers.insert("anthropic-version", version);
+
         if let Some(beta) = &self.beta {
-            headers.insert(
-                "anthropic-beta",
-                HeaderValue::from_str(beta.join(",").as_str()).expect("Invalid anthropic-beta"),
-            );
+            let Ok(value) = HeaderValue::from_str(beta.join(",").as_str()) else {
+                panic!("Invalid `anthropic-beta` header");
+            };
+            headers.insert("anthropic-beta", value);
         }
         headers
     }
