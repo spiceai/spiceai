@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++----------+----------------------+---------------+----------------+-----------+
+| brand_id | brand                | i_manufact_id | i_manufact     | ext_price |
++----------+----------------------+---------------+----------------+-----------+
+| 5001002  | amalgscholar #2      | 124           | eseableought   | 60599.51  |
+| 9013005  | exportiunivamalg #5  | 362           | ablecallypri   | 56623.61  |
+| 1004001  | edu packamalg #1     | 507           | ationbaranti   | 48684.15  |
+| 10012006 | importoamalgamalg #6 | 162           | ablecallyought | 45553.04  |
+| 4004001  | edu packedu pack #1  | 257           | ationantiable  | 43243.34  |
+| 2004001  | edu packimporto #1   | 584           | eseeinganti    | 38941.98  |
+| 2002001  | importoimporto #1    | 525           | antiableanti   | 34269.30  |
+| 4001001  | amalgedu pack #1     | 236           | callypriable   | 34158.86  |
+| 9005011  | scholarmaxi #11      | 349           | n stesepri     | 33263.83  |
+| 4001001  | amalgedu pack #1     | 379           | n stationpri   | 32585.02  |
++----------+----------------------+---------------+----------------+-----------+

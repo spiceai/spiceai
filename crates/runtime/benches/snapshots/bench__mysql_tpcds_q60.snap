@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+-------------+
+| i_item_id        | total_sales |
++------------------+-------------+
+| AAAAAAAAAABEAAAA | 10456.75    |
+| AAAAAAAAAACAAAAA | 8159.63     |
+| AAAAAAAAAACDAAAA | 10361.35    |
+| AAAAAAAAAAEAAAAA | 14928.38    |
+| AAAAAAAAAAFAAAAA | 9253.48     |
+| AAAAAAAAAAGBAAAA | 3432.06     |
+| AAAAAAAAAAHDAAAA | 300.80      |
+| AAAAAAAAAAICAAAA | 2241.60     |
+| AAAAAAAAAAIDAAAA | 19612.82    |
+| AAAAAAAAAAKAAAAA | 12031.56    |
++------------------+-------------+

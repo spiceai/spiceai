@@ -1,0 +1,10 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------------------+
+| sum(store_sales.ss_quantity) |
++------------------------------+
+| 29035                        |
++------------------------------+

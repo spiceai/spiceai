@@ -39,7 +39,8 @@ version = "1.0.0-rc.1"
 arrow = "53"
 arrow-buffer = "53"
 arrow-flight = "53"
-arrow-json = "53"
+# Use published version once https://github.com/apache/arrow-rs/pull/6606 is released
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6013498d7d4d59f7b16d0e28b3e0b379732fbf07" }
 arrow-ipc = "53"
 arrow-schema = "53"
 parquet = "53"

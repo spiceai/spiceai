@@ -134,7 +134,7 @@ fatal runtime error: stack overflow
 | [q30.sql](tpcds/q30.sql) | [q31.sql](tpcds/q31.sql) |
 | [q33.sql](tpcds/q33.sql) | [q34.sql](tpcds/q34.sql) |
 | [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
-| [q49.sql](tpcds/q49.sql) | [q49.sql](tpcds/q49.sql) |
+| [q49.sql](tpcds/q49.sql) | |
 
 ### PostgreSQL does not support using a column alias in a CASE statement
 
@@ -220,7 +220,7 @@ Query Error Execution error: Unable to query arrow: Server error: `ERROR 42000 (
 
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
-| [q97.sql](tpcds/q97.sql) | |
+| [q97.sql](tpcds/q97.sql) | [q51.sql](tpcds/q51.sql) |
 
 ## MySQL returns NULL on division by zero
 

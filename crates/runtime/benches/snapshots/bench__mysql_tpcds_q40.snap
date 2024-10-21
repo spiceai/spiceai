@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++---------+------------------+--------------+-------------+
+| w_state | i_item_id        | sales_before | sales_after |
++---------+------------------+--------------+-------------+
+| TN      | AAAAAAAAAAABAAAA | 102.14       | 0.00        |
+| TN      | AAAAAAAAAAKBAAAA | 94.45        | 56.35       |
+| TN      | AAAAAAAAABBAAAAA | 131.08       | 0.00        |
+| TN      | AAAAAAAAABECAAAA | 17.61        | 2.78        |
+| TN      | AAAAAAAAACIBAAAA | 0.00         | 284.43      |
+| TN      | AAAAAAAAADBEAAAA | -13.80       | 36.15       |
+| TN      | AAAAAAAAADKAAAAA | 71.67        | 0.00        |
+| TN      | AAAAAAAAADLCAAAA | 0.00         | -63.73      |
+| TN      | AAAAAAAAAEBDAAAA | 85.99        | 30.86       |
+| TN      | AAAAAAAAAEHAAAAA | 0.00         | 45.31       |
++---------+------------------+--------------+-------------+

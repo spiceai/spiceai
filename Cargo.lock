@@ -277,7 +277,7 @@ dependencies = [
  "arrow-csv",
  "arrow-data",
  "arrow-ipc",
- "arrow-json",
+ "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
@@ -428,6 +428,25 @@ name = "arrow-json"
 version = "53.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b198b9c6fcf086501730efbbcb483317b39330a116125af7bb06467d04b352a3"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-schema",
+ "chrono",
+ "half",
+ "indexmap 2.6.0",
+ "lexical-core",
+ "num",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "arrow-json"
+version = "53.1.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=6013498d7d4d59f7b16d0e28b3e0b379732fbf07#6013498d7d4d59f7b16d0e28b3e0b379732fbf07"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3059,7 +3078,7 @@ name = "datafusion-federation"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690#ce1ce6158ce03f88c67cde25fca00f436c3e1690"
 dependencies = [
- "arrow-json",
+ "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "async-stream",
  "async-trait",
  "datafusion",
@@ -3315,7 +3334,7 @@ version = "0.1.0"
 source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=2bcf481b4abe9d0bd6bb2479ce49020df66ff97f#2bcf481b4abe9d0bd6bb2479ce49020df66ff97f"
 dependencies = [
  "arrow",
- "arrow-json",
+ "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "async-stream",
  "async-trait",
  "bb8",
@@ -3398,7 +3417,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
- "arrow-json",
+ "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -4084,7 +4103,7 @@ version = "1.0.0-rc.1"
 dependencies = [
  "ansi_term",
  "arrow-flight",
- "arrow-json",
+ "arrow-json 53.1.0 (git+https://github.com/spiceai/arrow-rs.git?rev=6013498d7d4d59f7b16d0e28b3e0b379732fbf07)",
  "clap",
  "datafusion",
  "futures",
@@ -9028,7 +9047,7 @@ dependencies = [
  "arrow-csv",
  "arrow-flight",
  "arrow-ipc",
- "arrow-json",
+ "arrow-json 53.1.0 (git+https://github.com/spiceai/arrow-rs.git?rev=6013498d7d4d59f7b16d0e28b3e0b379732fbf07)",
  "arrow-schema",
  "arrow_sql_gen",
  "arrow_tools",
@@ -10068,6 +10087,7 @@ dependencies = [
  "runtime",
  "rustls 0.23.14",
  "rustls-pemfile 2.2.0",
+ "serde_json",
  "snafu",
  "snmalloc-rs",
  "spice-cloud",
