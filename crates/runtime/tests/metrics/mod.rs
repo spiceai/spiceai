@@ -61,7 +61,7 @@ async fn test_http_metrics() -> Result<(), anyhow::Error> {
     tracing::info!("Starting runtime");
     let rt_arc = Arc::new(rt);
 
-    let rt_arc_ref = rt_arc.clone();
+    let rt_arc_ref = Arc::clone(&rt_arc);
     tokio::spawn(async move { rt_arc_ref.start_servers(Config::default(), None).await });
     tracing::info!("Runtime started");
     init_metrics(rt_arc.datafusion(), registry.clone().expect("No registry"))?;
