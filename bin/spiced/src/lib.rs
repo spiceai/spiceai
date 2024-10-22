@@ -211,6 +211,7 @@ pub async fn run(args: Args) -> Result<()> {
             "SPICED_LOG",
         ),
     )
+    .await
     .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {

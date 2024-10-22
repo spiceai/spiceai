@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+---------------+------------------+----------+--------+---------------+---------------+------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | ca_street_number | ca_street_name | ca_street_type | ca_suite_number | ca_city       | ca_county        | ca_state | ca_zip | ca_country    | ca_gmt_offset | ca_location_type | ctr_total_return |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+---------------+------------------+----------+--------+---------------+---------------+------------------+------------------+
+| AAAAAAAAABGMAAAA | Miss         | Bess         | Lewis       | 233              | Woodland       | Blvd           | Suite 420       | Lakeside      | Lee County       | TX       | 79532  | United States | -6.00         | condo            | 2763.72          |
+| AAAAAAAAACMKAAAA | Dr.          | Jean         | Lee         | 379              | Smith          | Cir.           | Suite G         | Five Forks    | Briscoe County   | TX       | 72293  | United States | -6.00         | single family    | 5564.96          |
+| AAAAAAAAAEIDAAAA | Dr.          | Caleb        | Keyes       | 320              | South Chestnut | Pkwy           | Suite 0         | Lincoln       | Bexar County     | TX       | 71289  | United States | -6.00         | apartment        | 6499.71          |
+| AAAAAAAAAEIGBAAA | Sir          | Henry        | Gonzales    | 723              | Laurel Forest  | Ln             | Suite 100       | Georgetown    | Upshur County    | TX       | 77057  | United States | -6.00         | single family    | 2365.81          |
+| AAAAAAAAAEMIAAAA | Miss         | Melissa      | Smith       | 906              | Poplar         | Dr.            | Suite E         | Mountain View | Harris County    | TX       | 74466  | United States | -6.00         | single family    | 6585.94          |
+| AAAAAAAAAFCGAAAA | Mr.          | Jordan       | West        | 529              | Third Fourth   | Parkway        | Suite V         | Bethesda      | Orange County    | TX       | 75980  | United States | -6.00         | condo            | 2601.48          |
+| AAAAAAAAAGBIAAAA | Sir          | Fred         | Williams    | 59               | College Park   | Pkwy           | Suite 320       | Hillcrest     | Glasscock County | TX       | 73003  | United States | -6.00         | single family    | 2398.35          |
+| AAAAAAAAAIHEAAAA | Dr.          | Sarah        | Head        | 646              | Main West      | Street         | Suite K         | Bethel        | Hall County      | TX       | 75281  | United States | -6.00         | single family    | 2262.82          |
+| AAAAAAAAAIKCBAAA | Dr.          | Rosemarie    | Munoz       | 437              | 2nd            | Court          | Suite 60        | Lone Pine     | Hansford County  | TX       | 77441  | United States | -6.00         | apartment        | 4604.16          |
+| AAAAAAAAAKKGBAAA | Mr.          | John         | Hoffman     | 550              | South          | ST             | Suite 380       | Cedar Grove   | Crockett County  | TX       | 70411  | United States | -6.00         | apartment        | 1782.86          |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+---------------+------------------+----------+--------+---------------+---------------+------------------+------------------+

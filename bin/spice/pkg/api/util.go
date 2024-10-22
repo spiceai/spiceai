@@ -58,16 +58,11 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode > 200 && resp.StatusCode < 400 {
-		var result T
-		if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return *new(T), fmt.Errorf("error decoding response: %w", err)
-		}
-
-		return result, nil
-	} else {
-		return *new(T), fmt.Errorf("error response from runtime: %s", resp.Status)
+	var result T
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return *new(T), fmt.Errorf("error decoding response: %w", err)
 	}
+	return result, nil
 }
 
 func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T, error) {

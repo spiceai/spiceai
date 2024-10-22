@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -53,15 +53,17 @@ pub enum Error {
 pub struct ClickhouseConnection {
     pub conn: Arc<Mutex<ClientHandle>>,
     pool: Arc<Pool>,
+    db: Arc<str>,
 }
 
 impl ClickhouseConnection {
     // We need to pass the pool to the connection so that we can get a new connection handle
     // This needs to be done because the query_owned consumes the connection handle
-    pub fn new(conn: ClientHandle, pool: Arc<Pool>) -> Self {
+    pub fn new(conn: ClientHandle, pool: Arc<Pool>, db: Arc<str>) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             pool,
+            db,
         }
     }
 }
@@ -79,9 +81,6 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
         Some(self)
     }
 }
-
-static DEFAULT_DATABASE: &str = "default";
-static DEFAULT_DATABASE_ARC: LazyLock<Arc<str>> = LazyLock::new(|| DEFAULT_DATABASE.into());
 
 // Clickhouse doesn't have a params in signature. So just setting to `dyn Sync`.
 // Looks like we don't actually pass any params to query_arrow.
@@ -103,7 +102,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         let (database, table) = match table_reference {
             TableReference::Full { schema, table, .. }
             | TableReference::Partial { schema, table } => (schema, table),
-            TableReference::Bare { table } => (&DEFAULT_DATABASE_ARC as &Arc<_>, table),
+            TableReference::Bare { table } => (&self.db, table),
         };
 
         let query = format!(
