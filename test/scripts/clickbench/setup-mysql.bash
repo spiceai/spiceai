@@ -4,7 +4,7 @@ set -o pipefail
 
 # Initialize variables
 mysql_host=127.0.0.1
-mysql_port=5432
+mysql_port=3306
 mysql_user=root
 mysql_pass=root
 mysql_sslmode=disable
