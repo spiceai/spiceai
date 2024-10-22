@@ -2197,7 +2197,7 @@ dependencies = [
  "byteorder",
  "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-nn 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "fancy-regex 0.13.0",
+ "fancy-regex",
  "num-traits",
  "rand 0.8.5",
  "rayon",
@@ -3944,16 +3944,6 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
-name = "fancy-regex"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7493d4c459da9f84325ad297371a6b2b8a162800873a22e3b6b6512e61d18c05"
-dependencies = [
- "bit-set",
- "regex",
-]
 
 [[package]]
 name = "fancy-regex"
@@ -6153,7 +6143,7 @@ dependencies = [
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
  "text-splitter",
- "tiktoken-rs 0.5.9",
+ "tiktoken-rs",
  "tokenizers 0.20.0",
  "tokio",
  "tracing",
@@ -10574,7 +10564,7 @@ dependencies = [
  "regex",
  "strum 0.26.3",
  "thiserror",
- "tiktoken-rs 0.6.0",
+ "tiktoken-rs",
  "tokenizers 0.20.0",
  "unicode-segmentation",
 ]
@@ -10661,21 +10651,6 @@ dependencies = [
 
 [[package]]
 name = "tiktoken-rs"
-version = "0.5.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c314e7ce51440f9e8f5a497394682a57b7c323d0f4d0a6b1b13c429056e0e234"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "bstr",
- "fancy-regex 0.12.0",
- "lazy_static",
- "parking_lot 0.12.3",
- "rustc-hash 1.1.0",
-]
-
-[[package]]
-name = "tiktoken-rs"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44075987ee2486402f0808505dd65692163d243a337fc54363d49afac41087f6"
@@ -10683,7 +10658,7 @@ dependencies = [
  "anyhow",
  "base64 0.21.7",
  "bstr",
- "fancy-regex 0.13.0",
+ "fancy-regex",
  "lazy_static",
  "parking_lot 0.12.3",
  "regex",
