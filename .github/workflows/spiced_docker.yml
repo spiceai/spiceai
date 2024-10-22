@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     name: Build Spice linux_amd64/linux_arm64 Docker image
-    runs-on: teraswitch-runners
+    runs-on: ubuntu-latest-16-cores
 
     steps:
       - uses: actions/checkout@v4
