@@ -102,7 +102,7 @@ pub fn track_query_execution_duration(duration: Duration, protocol: Arc<str>) {
 pub static HISTOGRAM_BOUNDARIES_PRECISE_FLOAT: LazyLock<Vec<f64>> = LazyLock::new(|| {
     vec![
         0.0, 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-        5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+        5.0, 10.0,
     ]
 });
 
