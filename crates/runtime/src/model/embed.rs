@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use llms::embeddings::{candle::CandleEmbedding, Embed, Error as EmbedError};
+use llms::embeddings::{candle::tei::TeiEmbed, Embed, Error as EmbedError};
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -82,7 +82,7 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
                     source: "No 'tokenizer_path' parameter provided".into(),
                 })?
                 .clone();
-            Ok(Box::new(CandleEmbedding::from_local(
+            Ok(Box::new(TeiEmbed::from_local(
                 Path::new(&weights_path),
                 Path::new(&config_path),
                 Path::new(&tokenizer_path),
@@ -92,7 +92,7 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
             let hf_token = params.get("hf_token").map(Secret::expose_secret).cloned();
 
             if let Some(id) = model_id {
-                Ok(Box::new(CandleEmbedding::from_hf(&id, None, hf_token)?))
+                Ok(Box::new(TeiEmbed::from_hf(&id, None, hf_token)?))
             } else {
                 Err(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: format!("Failed to load model from: {}", component.from).into(),
