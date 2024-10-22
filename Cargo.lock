@@ -6153,7 +6153,7 @@ dependencies = [
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
  "text-splitter",
- "tiktoken-rs",
+ "tiktoken-rs 0.5.9",
  "tokenizers 0.20.0",
  "tokio",
  "tracing",
@@ -10561,9 +10561,9 @@ dependencies = [
 
 [[package]]
 name = "text-splitter"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18de70043bbcea07a78e6228e5a406157171b23633afe7fc9fade1003bb8dae9"
+checksum = "3d0d870d12e32f8d773b36ef94515a3e5a80ab55990976cd289a47b9f156ba3f"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
@@ -10574,7 +10574,7 @@ dependencies = [
  "regex",
  "strum 0.26.3",
  "thiserror",
- "tiktoken-rs",
+ "tiktoken-rs 0.6.0",
  "tokenizers 0.20.0",
  "unicode-segmentation",
 ]
@@ -10671,6 +10671,22 @@ dependencies = [
  "fancy-regex 0.12.0",
  "lazy_static",
  "parking_lot 0.12.3",
+ "rustc-hash 1.1.0",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44075987ee2486402f0808505dd65692163d243a337fc54363d49afac41087f6"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "bstr",
+ "fancy-regex 0.13.0",
+ "lazy_static",
+ "parking_lot 0.12.3",
+ "regex",
  "rustc-hash 1.1.0",
 ]
 
