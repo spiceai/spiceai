@@ -782,6 +782,12 @@
           "format": "uint",
           "minimum": 0.0
         },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "results_cache": {
           "default": {
             "cache_max_size": null,
