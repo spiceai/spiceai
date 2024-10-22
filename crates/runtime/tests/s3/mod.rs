@@ -41,7 +41,7 @@ pub fn get_s3_hive_partitioned_dataset(name: &str, infer_partitions: bool) -> Da
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
             (
-                "hive_infer_partitions".to_string(),
+                "hive_partitioning_enabled".to_string(),
                 infer_partitions.to_string(),
             ),
         ]

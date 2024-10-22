@@ -6,7 +6,7 @@ on:
 jobs:
   generate:
     name: Generate Acknowledgements
-    runs-on: teraswitch-runners
+    runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: write
