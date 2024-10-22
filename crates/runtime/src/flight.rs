@@ -79,7 +79,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
 
         metrics::HANDSHAKE_REQUESTS.add(1, &labels);
         handshake::handle()
@@ -89,7 +89,7 @@ impl FlightService for Service {
         &self,
         request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::LIST_FLIGHTS_REQUESTS.add(1, &labels);
         tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
@@ -99,7 +99,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         let _guard = TimeMeasurement::new(&metrics::GET_FLIGHT_INFO_REQUEST_DURATION_MS, &labels);
         metrics::GET_FLIGHT_INFO_REQUESTS.add(1, &labels);
         Box::pin(get_flight_info::handle(self, request)).await
@@ -116,7 +116,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::GET_SCHEMA_REQUESTS.add(1, &labels);
         get_schema::handle(self, request).await
     }
@@ -125,7 +125,7 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::DO_GET_REQUESTS.add(1, &labels);
         Box::pin(do_get::handle(self, request)).await
     }
@@ -134,7 +134,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::DO_PUT_REQUESTS.add(1, &labels);
         do_put::handle(self, request).await
     }
@@ -143,7 +143,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::DO_EXCHANGE_REQUESTS.add(1, &labels);
         do_exchange::handle(self, request).await
     }
@@ -152,7 +152,7 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::DO_ACTION_REQUESTS.add(1, &labels);
         Box::pin(actions::do_action(self, request)).await
     }
@@ -161,7 +161,7 @@ impl FlightService for Service {
         &self,
         request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let labels = Service::get_user_agent(&request);
+        let labels = Service::get_request_labels(&request);
         metrics::LIST_ACTIONS_REQUESTS.add(1, &labels);
         Ok(actions::list())
     }
