@@ -16,22 +16,30 @@ limitations under the License.
 
 pub fn extract_user_agent(ua_header: Option<&str>) -> (String, String, String) {
     let ua_header = ua_header.unwrap_or("");
-    let parts:Vec<&str> = ua_header.splitn(3, ' ').collect();
+    let parts: Vec<&str> = ua_header.splitn(3, ' ').collect();
     if parts.len() == 3 {
         tracing::trace!("Client user agent: {ua_header}");
-        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+        (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        )
     } else {
         tracing::trace!("Could not parse user agent: {ua_header}");
-        ("unknown".to_string(), "unknown".to_string(), "unknown".to_string())
+        (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "unknown".to_string(),
+        )
     }
 }
 
 #[cfg(test)]
-mod test
-{
+mod test {
     #[test]
     fn test_ua_extraction() {
-        let (agent, version, os_str) = super::extract_user_agent(Some("gospice 0.1.0 (Pop!_OS 22.04 LTS)"));
+        let (agent, version, os_str) =
+            super::extract_user_agent(Some("gospice 0.1.0 (Pop!_OS 22.04 LTS)"));
         assert_eq!(agent, "gospice");
         assert_eq!(version, "0.1.0");
         assert_eq!(os_str, "(Pop!_OS 22.04 LTS)");
