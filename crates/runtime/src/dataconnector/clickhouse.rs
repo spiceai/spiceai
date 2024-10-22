@@ -395,7 +395,7 @@ mod tests {
         ];
 
         for (url_str, expected_db) in test_cases {
-            match get_database_from_url(&url_str) {
+            match get_database_from_url(url_str) {
                 Some(db) => assert_eq!(
                     db,
                     expected_db.expect("Expected a database name"),
