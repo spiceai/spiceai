@@ -95,6 +95,17 @@ pub fn track_query_execution_duration(duration: Duration, protocol: Arc<str>) {
     QUERY_EXECUTION_DURATION.record(duration.as_secs_f64() * 1000.0, &dimensions);
 }
 
+/// This set of boundaries enhances precision for tracking smaller values compared to the default boundaries (below).
+/// It includes additional buckets for better granularity in the lower range.
+///
+/// Default: [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0]
+pub static HISTOGRAM_BOUNDARIES_PRECISE_FLOAT: LazyLock<Vec<f64>> = LazyLock::new(|| {
+    vec![
+        0.0, 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+        5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+    ]
+});
+
 fn create_dimensions(protocol: Arc<str>) -> [KeyValue; 1] {
     [KeyValue::new("protocol", protocol)]
 }

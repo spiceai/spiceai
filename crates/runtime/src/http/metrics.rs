@@ -30,5 +30,6 @@ pub(crate) static REQUESTS_DURATION_SECONDS: LazyLock<Histogram<f64>> = LazyLock
     METER
         .f64_histogram("http_requests_duration_seconds")
         .with_unit("s")
+        .with_boundaries(telemetry::HISTOGRAM_BOUNDARIES_PRECISE_FLOAT.clone())
         .init()
 });
