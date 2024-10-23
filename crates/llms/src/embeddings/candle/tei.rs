@@ -54,6 +54,8 @@ pub struct TeiEmbed {
 }
 
 impl TeiEmbed {
+    const DEFAULT_POOLING_OPERATOR: Pool = Pool::Mean;
+
     pub fn from_local(
         model_path: &Path,
         config_path: &Path,
@@ -96,7 +98,7 @@ impl TeiEmbed {
             tracing::warn!(
                 "Embedding pooling mode not specified by user. Defaulting to mean pooling."
             );
-            Pool::Mean
+            Self::DEFAULT_POOLING_OPERATOR
         };
 
         Self::from_dir(&model_root, Some(pool))
@@ -146,7 +148,8 @@ impl TeiEmbed {
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
-        let model_type = ModelType::Embedding(pooling_overwrite.unwrap_or(Pool::Mean));
+        let model_type =
+            ModelType::Embedding(pooling_overwrite.unwrap_or(Self::DEFAULT_POOLING_OPERATOR));
 
         // Last 3 parameters are not used (since we are using `candle` feature flag).
         let backend = Backend::new(
