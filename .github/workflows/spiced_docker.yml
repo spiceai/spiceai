@@ -148,7 +148,7 @@ jobs:
             CARGO_FEATURES=release,models
 
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
@@ -158,9 +158,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: /tmp
+          merge-multiple: true
+
+      - name: Verify artifacts
+        run: |
+          ls -l /tmp
+          ls -l /tmp/images-amd64
+          ls -l /tmp/images-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -191,7 +198,9 @@ jobs:
             fi
             
             # Load both architecture images
+            echo "Loading AMD64 image"
             docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
+            echo "Loading ARM64 image"
             docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
             
             if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
