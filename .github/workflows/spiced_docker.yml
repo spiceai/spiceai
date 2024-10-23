@@ -38,7 +38,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=spiceai/spiceai:${{ needs.setup.outputs.rel_version }}-slim-amd64,dest=/tmp/image-amd64-slim.tar
+          outputs: type=docker,name=localhost:5000/spiceai:slim-amd64,dest=/tmp/image-amd64-slim.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -51,7 +51,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=spiceai/spiceai:${{ needs.setup.outputs.rel_version }}-full-amd64,dest=/tmp/image-amd64-full.tar
+          outputs: type=docker,name=localhost:5000/spiceai:full-amd64,dest=/tmp/image-amd64-full.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -64,7 +64,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=spiceai/spiceai:${{ needs.setup.outputs.rel_version }}-models-amd64,dest=/tmp/image-amd64-models.tar
+          outputs: type=docker,name=localhost:5000/spiceai:models-amd64,dest=/tmp/image-amd64-models.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -114,7 +114,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=docker,name=spiceai/spiceai:${{ needs.setup.outputs.rel_version }}-slim-arm64,dest=/tmp/image-arm64-slim.tar
+          outputs: type=docker,name=localhost:5000/spiceai:slim-arm64,dest=/tmp/image-arm64-slim.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -127,7 +127,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=docker,name=spiceai/spiceai:${{ needs.setup.outputs.rel_version }}-full-arm64,dest=/tmp/image-arm64-full.tar
+          outputs: type=docker,name=localhost:5000/spiceai:full-arm64,dest=/tmp/image-arm64-full.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -140,7 +140,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=docker,name=spiceai/spiceai:${{ needs.setup.outputs.rel_version }}-models-arm64,dest=/tmp/image-arm64-models.tar
+          outputs: type=docker,name=localhost:5000/spiceai:models-arm64,dest=/tmp/image-arm64-models.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -206,15 +206,10 @@ jobs:
             echo "Loading ARM64 image"
             docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
             
-            # Tag images for local registry
-            echo "Tagging images for local registry"
-            docker tag spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-amd64 localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-amd64
-            docker tag spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-arm64 localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-arm64
-
             # Push images to local registry
             echo "Pushing images to local registry"
-            docker push localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-amd64
-            docker push localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-arm64
+            docker push localhost:5000/spiceai:${variant}-amd64
+            docker push localhost:5000/spiceai:${variant}-arm64
 
             if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
               # Push to GitHub Container Registry
@@ -222,16 +217,16 @@ jobs:
               docker buildx imagetools create \
                 -t ghcr.io/spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
                 -t ghcr.io/spiceai/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-amd64 \
-                localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-arm64
+                localhost:5000/spiceai:${variant}-amd64 \
+                localhost:5000/spiceai:${variant}-arm64
               
               # Push to DockerHub
               echo "Pushing to DockerHub"
               docker buildx imagetools create \
                 -t spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
                 -t spiceai/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-amd64 \
-                localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-arm64
+                localhost:5000/spiceai:${variant}-amd64 \
+                localhost:5000/spiceai:${variant}-arm64
               
               echo "Verifying GHCR image:"
               docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}
@@ -242,10 +237,10 @@ jobs:
               echo "Skipping push for non-tag build"
               echo "Creating local manifest for testing:"
               docker buildx imagetools create \
-                -t localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
-                localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-amd64 \
-                localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}-arm64
+                -t localhost:5000/spiceai:latest${suffix} \
+                localhost:5000/spiceai:${variant}-amd64 \
+                localhost:5000/spiceai:${variant}-arm64
               
-              docker buildx imagetools inspect localhost:5000/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}
+              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
             fi
           done
