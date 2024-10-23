@@ -38,7 +38,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=oci,dest=/tmp/image-amd64-slim.tar
+          outputs: type=docker,dest=/tmp/image-amd64-slim.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -51,7 +51,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=oci,dest=/tmp/image-amd64-full.tar
+          outputs: type=docker,dest=/tmp/image-amd64-full.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -64,7 +64,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=oci,dest=/tmp/image-amd64-models.tar
+          outputs: type=docker,dest=/tmp/image-amd64-models.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -191,7 +191,6 @@ jobs:
         run: |
           variants=("slim" "full" "models")
           for variant in "${variants[@]}"; do
-            # Set suffix based on variant
             suffix=""
             if [ "$variant" != "full" ]; then
               suffix="-${variant}"
@@ -205,6 +204,7 @@ jobs:
             
             if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
               # Push to GitHub Container Registry
+              echo "Pushing to GHCR"
               docker buildx imagetools create --push \
                 -t ghcr.io/spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
                 -t ghcr.io/spiceai/spiceai:latest${suffix} \
@@ -212,6 +212,7 @@ jobs:
                 /tmp/images-arm64/image-arm64-${variant}.tar
               
               # Push to DockerHub
+              echo "Pushing to DockerHub"
               docker buildx imagetools create --push \
                 -t spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
                 -t spiceai/spiceai:latest${suffix} \
