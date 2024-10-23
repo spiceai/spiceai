@@ -20,14 +20,14 @@ use opentelemetry::metrics::MetricsError;
 use opentelemetry_sdk::metrics::{
     data::{ResourceMetrics, Temporality},
     exporter::PushMetricsExporter,
-    reader::{AggregationSelector, TemporalitySelector},
-    Aggregation, InstrumentKind,
+    reader::TemporalitySelector,
+    InstrumentKind,
 };
 
 use crate::converter::OtelToArrowConverter;
 
 #[async_trait]
-pub trait ArrowExporter: AggregationSelector + TemporalitySelector + Send + Sync + 'static {
+pub trait ArrowExporter: TemporalitySelector + Send + Sync + 'static {
     async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError>;
 
     async fn force_flush(&self) -> Result<(), MetricsError>;
@@ -61,12 +61,6 @@ impl<E: ArrowExporter> OtelArrowExporter<E> {
 impl<E: ArrowExporter> TemporalitySelector for OtelArrowExporter<E> {
     fn temporality(&self, kind: InstrumentKind) -> Temporality {
         self.exporter.temporality(kind)
-    }
-}
-
-impl<E: ArrowExporter> AggregationSelector for OtelArrowExporter<E> {
-    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
-        self.exporter.aggregation(kind)
     }
 }
 

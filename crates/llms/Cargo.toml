@@ -31,9 +31,9 @@ tracing.workspace = true
 tracing-futures.workspace = true
 
 ## For Chunking
-text-splitter = {version =  "0.17.0", features = ["markdown", "tokenizers", "tiktoken-rs"]}
+text-splitter = {version =  "0.18.0", features = ["markdown", "tokenizers", "tiktoken-rs"]}
 pulldown-cmark = "0.12.1"
-tiktoken-rs = "0.5.9"
+tiktoken-rs = "0.6.0"
 
 ## `candle` feature packages
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "60e9375b6049eead77cbda7cb3d3d83187f501a2", optional = true }
@@ -41,6 +41,9 @@ mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "60e9375
 rand = "0.8.5"
 tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "afbb039cc50354e9c591d9126d08c1647429151d" }
 tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "afbb039cc50354e9c591d9126d08c1647429151d" }
+tei_core = { package = "text-embeddings-core",  git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "afbb039cc50354e9c591d9126d08c1647429151d" }
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "afbb039cc50354e9c591d9126d08c1647429151d", features = ["candle"] }
+
 tempfile = "3.13.0"
 indexmap = "2.3.0"
 either = "1.13.0"
