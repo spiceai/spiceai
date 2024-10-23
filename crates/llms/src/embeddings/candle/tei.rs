@@ -134,7 +134,7 @@ impl TeiEmbed {
 
         // Load [`Tokenization`]
         let position_offset = position_offset(&config);
-        // `max_input_length` should take into account overwrite files like `sentence_bert_config.json`.
+        // TODO: `max_input_length` should take into account overwrite files like `sentence_bert_config.json`.
         // See `<https://github.com/huggingface/text-embeddings-inference/blob/cb1e594709fb1caea674ed460b6e426b2b4a531b/router/src/lib.rs#L189>`
         let max_input_length = config.max_position_embeddings - position_offset;
         let token = Tokenization::new(
