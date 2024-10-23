@@ -114,7 +114,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=oci,dest=/tmp/image-arm64-slim.tar
+          outputs: type=docker,dest=/tmp/image-arm64-slim.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -127,7 +127,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=oci,dest=/tmp/image-arm64-full.tar
+          outputs: type=docker,dest=/tmp/image-arm64-full.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -140,7 +140,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=oci,dest=/tmp/image-arm64-models.tar
+          outputs: type=docker,dest=/tmp/image-arm64-models.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
