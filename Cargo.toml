@@ -137,5 +137,5 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-# Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183 to be merged 
+# Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183
 opentelemetry-prometheus = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "e91138351a689cd21923c15eb48f5fbc95ded807" }
