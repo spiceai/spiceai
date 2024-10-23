@@ -14,20 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
-use opentelemetry::{
-    global::GlobalMeterProvider,
-    metrics::{noop::NoopMeterProvider, Meter, MeterProvider},
-};
+use opentelemetry::metrics::{noop::NoopMeterProvider, Meter, MeterProvider};
 
-pub(crate) static METER_PROVIDER_ONCE: OnceLock<GlobalMeterProvider> = OnceLock::new();
+pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
+    OnceLock::new();
 
 /// If the meter provider isn't initialized for anonymous telemetry, use a `NoopMeterProvider`.
 ///
 /// This allows the instrumented code to not require any changes when anonymous telemetry is disabled/compiled out.
-static METER_PROVIDER: LazyLock<&'static GlobalMeterProvider> = LazyLock::new(|| {
-    METER_PROVIDER_ONCE.get_or_init(|| GlobalMeterProvider::new(NoopMeterProvider::new()))
-});
+static METER_PROVIDER: LazyLock<&'static Arc<dyn MeterProvider + Send + Sync>> =
+    LazyLock::new(|| METER_PROVIDER_ONCE.get_or_init(|| Arc::new(NoopMeterProvider::new())));
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("oss_telemetry"));

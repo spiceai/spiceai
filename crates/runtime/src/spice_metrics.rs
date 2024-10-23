@@ -22,10 +22,8 @@ use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use opentelemetry::metrics::MetricsError;
 use opentelemetry_sdk::metrics::data::Temporality;
-use opentelemetry_sdk::metrics::reader::{
-    AggregationSelector, DefaultAggregationSelector, TemporalitySelector,
-};
-use opentelemetry_sdk::metrics::{Aggregation, InstrumentKind};
+use opentelemetry_sdk::metrics::reader::TemporalitySelector;
+use opentelemetry_sdk::metrics::InstrumentKind;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -50,21 +48,11 @@ pub enum Error {
 
 pub struct SpiceMetricsExporter {
     datafusion: Arc<DataFusion>,
-    aggregation_selector: DefaultAggregationSelector,
 }
 
 impl SpiceMetricsExporter {
     pub fn new(datafusion: Arc<DataFusion>) -> Self {
-        SpiceMetricsExporter {
-            datafusion,
-            aggregation_selector: DefaultAggregationSelector::new(),
-        }
-    }
-}
-
-impl AggregationSelector for SpiceMetricsExporter {
-    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
-        self.aggregation_selector.aggregation(kind)
+        SpiceMetricsExporter { datafusion }
     }
 }
 
