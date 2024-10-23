@@ -79,7 +79,7 @@ jobs:
 
   build-arm64:
     needs: setup
-    runs-on: hosted-linux-arm-runner
+    runs-on: hosted-linux-arm-runner-16-cores
     steps:
       - uses: actions/checkout@v4
 
