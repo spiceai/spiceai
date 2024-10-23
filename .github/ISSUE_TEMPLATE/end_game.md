@@ -102,16 +102,20 @@ assignees: ''
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
 - [ ] Create a new branch `release-v[semver]` for the release from trunk. E.g. `release-v0.17.0-beta`
-- [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.17.0-beta`
+- [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.17.0-beta`. Leave the release note empty; the automation will fill it in from the checked in release note.
 - [ ] Release any docs updates by creating a `v[semver]` tag.
+      **Note**: Docs should be released only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml).
 - [ ] Trigger algolia search crawler [workflow](https://github.com/spiceai/docs/actions/workflows/trigger_search_reindex.yml), to reindex updated docs.
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) version (image.tag version & chart version). Ensure [docker build](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) for the tag from the release branch completed (~2 hours) and trigger the [Release Chart](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) workflow.
+      **Note**: Release chart workflow should be triggered only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) and [docker image have finished building](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml).
 - [ ] Final test pass on released binaries
 - [ ] Run [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
 - [ ] Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
-- [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
+- [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai).
+      **Note**: Ensure that the Homebrew taps are updated only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml).
 - [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
+- [ ] Set the [release](https://github.com/spiceai/spiceai/releases) as latest release.
 
 ## Announcement Checklist
 

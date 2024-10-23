@@ -8,12 +8,16 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 | Accelerator | Beta Quality | DRI Sign-off |
 | - | - | - |
-| Arrow | ❌ |  |
-| DuckDB | ❌ |  |
-| SQLite | ❌ |  |
-| PostgreSQL | ❌ |  |
+| Arrow      | ❌ |  |
+| DuckDB     | ❌ |  |
+| SQLite     | ❌ |  |
+| PostgreSQL | ✅ | @sgrebnov  |
 
 ## Beta Release Criteria
+
+The Beta release criteria expand on and require that all [Alpha release criteria](./alpha.md) continue to pass for the accelerator.
+
+- [ ] All [Alpha release criteria](./alpha.md) pass for this accelerator.
 
 ### Feature complete
 

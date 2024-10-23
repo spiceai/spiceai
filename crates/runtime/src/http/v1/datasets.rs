@@ -139,7 +139,10 @@ pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
-    overrides: Json<RefreshOverrides>,
+    overrides_opt: Option<Json<RefreshOverrides>>,
+    // When this is an Option<Json>, Json rejections are silenced
+    // This means malformed Json, etc, will simply return None
+    // To get around this, we would need to implement a custom extractor
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
@@ -172,7 +175,13 @@ pub(crate) async fn refresh(
             .into_response();
     };
 
-    match df.refresh_table(&dataset.name, Some(overrides.0)).await {
+    match df
+        .refresh_table(
+            &dataset.name,
+            overrides_opt.map(|Json(overrides)| overrides),
+        )
+        .await
+    {
         Ok(()) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {

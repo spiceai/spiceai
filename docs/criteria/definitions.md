@@ -33,3 +33,13 @@ Core Arrow Data Types consist of the following data types:
 - List/FixedSizeList/LargeList
 - Struct
 - Decimal128/Decimal256
+
+## Core Connector Data Types
+
+Core Connector Data Types depend on the specific connector, but in general can be abstracted as (non-exhaustive) types like:
+
+- String: VARCHAR, CHAR, TEXT
+- Number: INTEGER, BIGINT, TINYINT, DECIMAL, FLOAT, DOUBLE
+- Date: DATETIME, TIMESTAMP, TIME, DATE
+- Binary: BLOB, BINARY, CLOB
+- Structures: SET, ENUM
