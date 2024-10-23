@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use super::SampleFrom;
 use crate::datafusion::{query::Protocol, DataFusion};
@@ -34,6 +37,15 @@ pub struct TopSamplesParams {
 
     /// How to order the samples before retrieving the top N.
     pub order_by: String,
+}
+
+impl Display for TopSamplesParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(s) => write!(f, "{s}"),
+            Err(_) => Err(std::fmt::Error),
+        }
+    }
 }
 
 impl SampleFrom for TopSamplesParams {
