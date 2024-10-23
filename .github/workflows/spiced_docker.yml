@@ -98,6 +98,11 @@ jobs:
           sudo systemctl start docker
           sudo systemctl status docker
 
+      # Add current user to docker group
+      - name: Add current user to docker group
+        run: |
+          sudo usermod -aG docker $USER
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
