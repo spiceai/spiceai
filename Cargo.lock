@@ -1744,6 +1744,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen_cuda"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f8489af5b7d17a81bffe37e0f4d6e1e4de87c87329d05447f22c35d95a1227d"
+dependencies = [
+ "glob",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
+name = "bindgen_cuda"
+version = "0.1.6"
+source = "git+https://github.com/guoqingbao/bindgen_cuda.git#fb7ed75f3901b146aa1ba460baaeed5b494f2e0d"
+dependencies = [
+ "glob",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1809,6 +1830,12 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
 ]
+
+[[package]]
+name = "block"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
 
 [[package]]
 name = "block-buffer"
@@ -2125,9 +2152,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e1a39b963e261c58017edf2007e5b63425ad21538aaaf51fe23d1da41703701"
 dependencies = [
  "byteorder",
+ "candle-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-metal-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cudarc 0.12.1",
  "gemm",
  "half",
  "memmap2",
+ "metal",
  "num-traits",
  "num_cpus",
  "rand 0.8.5",
@@ -2145,9 +2176,13 @@ version = "0.7.2"
 source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
 dependencies = [
  "byteorder",
+ "candle-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "cudarc 0.12.1",
  "gemm",
  "half",
  "memmap2",
+ "metal",
  "num-traits",
  "num_cpus",
  "rand 0.8.5",
@@ -2160,13 +2195,77 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-cublaslt"
+version = "0.2.2"
+source = "git+https://github.com/huggingface/candle-cublaslt?rev=cf789b7dd6d4abb19b03b9556442f94f0588b4a0#cf789b7dd6d4abb19b03b9556442f94f0588b4a0"
+dependencies = [
+ "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cudarc 0.10.0",
+ "half",
+]
+
+[[package]]
+name = "candle-kernels"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "539cbfbf2d1d68a6ed97115e579c77c98f8ed0cfe7edbc6d7d30d2ac0c9e3d50"
+dependencies = [
+ "bindgen_cuda 0.1.5",
+]
+
+[[package]]
+name = "candle-kernels"
+version = "0.7.2"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
+dependencies = [
+ "bindgen_cuda 0.1.5",
+]
+
+[[package]]
+name = "candle-layer-norm"
+version = "0.0.1"
+source = "git+https://github.com/huggingface/candle-layer-norm?rev=94c2add7d94c2d63aebde77f7534614e04dbaea1#94c2add7d94c2d63aebde77f7534614e04dbaea1"
+dependencies = [
+ "anyhow",
+ "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "half",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
+name = "candle-metal-kernels"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "166a92826d615d98b205e346e52128fa0439f2ab3302587403fdc558b4219e19"
+dependencies = [
+ "metal",
+ "once_cell",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "candle-metal-kernels"
+version = "0.7.2"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
+dependencies = [
+ "metal",
+ "once_cell",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "candle-nn"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "898f8d21b8bdf559a1c8635e2db8386b2134015cd3003c18c1a30a22a67daec6"
 dependencies = [
  "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-metal-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "half",
+ "metal",
  "num-traits",
  "rayon",
  "safetensors",
@@ -2180,12 +2279,25 @@ version = "0.7.2"
 source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
 dependencies = [
  "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
  "half",
+ "metal",
  "num-traits",
  "rayon",
  "safetensors",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "candle-rotary"
+version = "0.0.1"
+source = "git+https://github.com/huggingface/candle-rotary?rev=0a718a0856569a92f3112e64f10d07e4447822e8#0a718a0856569a92f3112e64f10d07e4447822e8"
+dependencies = [
+ "anyhow",
+ "bindgen_cuda 0.1.5",
+ "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "half",
 ]
 
 [[package]]
@@ -2759,6 +2871,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
  "cipher",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.10.0"
+source = "git+https://github.com/coreylowman/cudarc?rev=c388e724af93a3e8fbe484f5ded2d8b3c1badd8e#c388e724af93a3e8fbe484f5ded2d8b3c1badd8e"
+dependencies = [
+ "half",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
+dependencies = [
+ "half",
+ "libloading",
 ]
 
 [[package]]
@@ -6314,6 +6444,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8dd856d451cc0da70e2ef2ce95a18e39a93b7558bedf10201ad28503f918568"
 
 [[package]]
+name = "malloc_buf"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6398,6 +6537,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "metal"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c43f73953f8cbe511f021b58f18c3ce1c3d1ae13fe953293e13345bf83217f25"
+dependencies = [
+ "bitflags 2.6.0",
+ "block",
+ "core-graphics-types",
+ "foreign-types 0.5.0",
+ "log",
+ "objc",
+ "paste",
 ]
 
 [[package]]
@@ -6530,6 +6684,7 @@ dependencies = [
  "as-any",
  "async-trait",
  "base64 0.22.1",
+ "bindgen_cuda 0.1.5",
  "buildstructor",
  "bytemuck",
  "bytemuck_derive",
@@ -6554,6 +6709,7 @@ dependencies = [
  "lrtable",
  "minijinja",
  "minijinja-contrib",
+ "mistralrs-paged-attn",
  "mistralrs-quant",
  "mistralrs-vision",
  "once_cell",
@@ -6587,10 +6743,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mistralrs-paged-attn"
+version = "0.3.1"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
+dependencies = [
+ "anyhow",
+ "bindgen_cuda 0.1.6",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "half",
+]
+
+[[package]]
 name = "mistralrs-quant"
 version = "0.3.1"
 source = "git+https://github.com/spiceai/mistral.rs?rev=60e9375b6049eead77cbda7cb3d3d83187f501a2#60e9375b6049eead77cbda7cb3d3d83187f501a2"
 dependencies = [
+ "bindgen_cuda 0.1.5",
  "byteorder",
  "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
  "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
@@ -7127,6 +7295,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
+name = "objc"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
+dependencies = [
+ "malloc_buf",
+ "objc_exception",
+]
+
+[[package]]
 name = "objc-sys"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7327,6 +7505,15 @@ dependencies = [
  "objc2",
  "objc2-core-location",
  "objc2-foundation",
+]
+
+[[package]]
+name = "objc_exception"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad970fb455818ad6cba4c122ad012fae53ae8b4795f86378bce65e4f6bab2ca4"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -10588,7 +10775,10 @@ source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb0
 dependencies = [
  "anyhow",
  "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-cublaslt",
+ "candle-layer-norm",
  "candle-nn 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-rotary",
  "candle-transformers",
  "memmap2",
  "nohash-hasher",

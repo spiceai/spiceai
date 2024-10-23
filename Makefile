@@ -109,6 +109,12 @@ install: build
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
 
+install-with-models-metal:
+	make install SPICED_NON_DEFAULT_FEATURES="models,metal"
+
+install-with-models-cuda:
+	make install SPICED_NON_DEFAULT_FEATURES="models,cuda"
+
 .PHONY: install-with-odbc
 install-with-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
