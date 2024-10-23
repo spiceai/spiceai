@@ -72,7 +72,7 @@ jobs:
             CARGO_FEATURES=release,models
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
