@@ -2,7 +2,11 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .Release.Name }}-config
+  labels:
+    {{- include "spiceai.labels" . | indent 4 }}
+    app: {{ .Release.Name }}
+  name: {{ template "spiceai.fullname" .  }}
+  namespace: {{ template "spiceai.namespace" . }}
 data:
   spicepod.yaml: |
     {{- toYaml .Values.spicepod | nindent 4 }}
