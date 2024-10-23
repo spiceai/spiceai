@@ -23,12 +23,11 @@ use std::{
 use crate::embeddings::{
     candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, Result,
 };
-use async_openai::{
-    error::{ApiError, OpenAIError},
-    types::EmbeddingInput,
-};
+use async_openai::types::EmbeddingInput;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use serde::Deserialize;
 use snafu::ResultExt;
+use tei_backend::Pool;
 use tei_core::tokenization::EncodingInput;
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
@@ -131,6 +130,16 @@ pub(crate) fn download_hf_artifacts(
         tracing::warn!("`model.safetensors` not found. Using `pytorch_model.bin` instead. Model loading will be significantly slower.");
         p
     };
+
+    tracing::trace!("Downloading '1_Pooling/config.json' for {}", repo.url());
+    if let Err(e) = api_repo.get("1_Pooling/config.json") {
+        // May not be an issue, will be checked later.
+        tracing::trace!(
+            "`1_Pooling/config.json` not found for {model_id}@{revision}. Error: {e}",
+            revision = revision.unwrap_or_default()
+        );
+    }
+
     Ok(model
         .parent()
         .ok_or("".into())
@@ -180,11 +189,35 @@ pub(crate) fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<P
     Ok(temp_dir.into_path())
 }
 
-pub(crate) fn to_openai_error(e: impl std::fmt::Display) -> OpenAIError {
-    OpenAIError::ApiError(ApiError {
-        message: e.to_string(),
-        r#type: None,
-        param: None,
-        code: None,
-    })
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PoolConfig {
+    pooling_mode_cls_token: bool,
+    pooling_mode_mean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_lasttoken: bool,
+}
+
+impl From<PoolConfig> for Option<Pool> {
+    fn from(value: PoolConfig) -> Self {
+        if value.pooling_mode_cls_token {
+            return Some(Pool::Cls);
+        }
+        if value.pooling_mode_mean_tokens {
+            return Some(Pool::Mean);
+        }
+        if value.pooling_mode_lasttoken {
+            return Some(Pool::LastToken);
+        }
+        None
+    }
+}
+
+pub(crate) fn pool_from_str(p: &str) -> Option<Pool> {
+    match p {
+        "cls" => Some(Pool::Cls),
+        "mean" => Some(Pool::Mean),
+        "splade" => Some(Pool::Splade),
+        "last_token" => Some(Pool::LastToken),
+        _ => None,
+    }
 }

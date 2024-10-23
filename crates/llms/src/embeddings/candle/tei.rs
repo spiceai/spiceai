@@ -37,13 +37,14 @@ use tokenizers::Tokenizer;
 use crate::{
     chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
     embeddings::{
-        candle::util::link_files_into_tmp_dir, Embed, Error,
+        candle::util::link_files_into_tmp_dir, Embed, Error, FailedToCreateEmbeddingSnafu,
         FailedToInstantiateEmbeddingModelSnafu, Result,
     },
 };
 
 use super::util::{
-    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer, position_offset,
+    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer, pool_from_str,
+    position_offset,
 };
 
 pub struct TeiEmbed {
@@ -57,10 +58,18 @@ impl TeiEmbed {
         model_path: &Path,
         config_path: &Path,
         tokenizer_path: &Path,
+        pooling: Option<String>,
     ) -> Result<Self> {
+        let model_filename = model_path
+            .file_name()
+            .ok_or("model path must be a file".into())
+            .context(FailedToCreateEmbeddingSnafu)?
+            .to_string_lossy()
+            .to_string();
+
         // `text-embeddings-inference` expects the model artifacts to to be in a single folder with specific filenames.
         let files: HashMap<String, &Path> = vec![
-            ("model.safetensors".to_string(), model_path),
+            (model_filename, model_path),
             ("config.json".to_string(), config_path),
             ("tokenizer.json".to_string(), tokenizer_path),
         ]
@@ -72,20 +81,52 @@ impl TeiEmbed {
             "Embedding model has files linked at location={:?}",
             model_root
         );
-        Self::from_dir(&model_root)
+
+        // Check if user provided pooling is valid, and only default to mean when user doesn't provide one.
+        let pool = if let Some(pooling) = pooling {
+            match pool_from_str(&pooling) {
+                Some(pool) => pool,
+                None => {
+                    return Err(Error::FailedToCreateEmbedding {
+                        source: format!("Invalid pooling mode: {pooling}").into(),
+                    });
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Embedding pooling mode not specified by user. Defaulting to mean pooling."
+            );
+            Pool::Mean
+        };
+
+        Self::from_dir(&model_root, Some(pool))
     }
 
     pub fn from_hf(
         model_id: &str,
         revision: Option<&str>,
         hf_token: Option<String>,
+        pooling_overwrite: Option<String>,
     ) -> Result<Self> {
+        // Only error if user-provided value is incorrect.
+        let pool = pooling_overwrite
+            .map(|pp| {
+                let p = pool_from_str(&pp);
+                if p.is_none() {
+                    return Err(Error::FailedToCreateEmbedding {
+                        source: format!("Invalid pooling mode: {pp}").into(),
+                    });
+                }
+                Ok(p)
+            })
+            .transpose()?
+            .flatten();
         let model_root = download_hf_artifacts(model_id, revision, hf_token)?;
-        Self::from_dir(&model_root)
+        Self::from_dir(&model_root, pool)
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
-    pub fn from_dir(root: &Path) -> Result<Self> {
+    pub fn from_dir(root: &Path, pooling_overwrite: Option<Pool>) -> Result<Self> {
         let tokenizer = load_tokenizer(root)?;
         let config = load_config(root)?;
 
@@ -105,7 +146,7 @@ impl TeiEmbed {
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
-        let model_type = ModelType::Embedding(Pool::Mean);
+        let model_type = ModelType::Embedding(pooling_overwrite.unwrap_or(Pool::Mean));
 
         // Last 3 parameters are not used (since we are using `candle` feature flag).
         let backend = Backend::new(
