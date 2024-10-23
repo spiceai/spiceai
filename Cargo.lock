@@ -1711,7 +1711,7 @@ dependencies = [
  "bitflags 2.6.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.12.1",
  "lazy_static",
  "lazycell",
  "log",
@@ -1734,7 +1734,7 @@ dependencies = [
  "bitflags 2.6.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -2885,8 +2885,8 @@ dependencies = [
  "chrono",
  "clickhouse-rs",
  "datafusion",
- "datafusion-federation",
- "datafusion-federation-sql",
+ "datafusion-federation 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690)",
+ "datafusion-federation-sql 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690)",
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
@@ -3086,13 +3086,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-federation"
+version = "0.1.6"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=f1e7b17755d96b30bafb4d185467ca4c55f85aec#f1e7b17755d96b30bafb4d185467ca4c55f85aec"
+dependencies = [
+ "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "futures",
+]
+
+[[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690#ce1ce6158ce03f88c67cde25fca00f436c3e1690"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690)",
+ "futures",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "datafusion-federation-sql"
+version = "0.1.6"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=f1e7b17755d96b30bafb4d185467ca4c55f85aec#f1e7b17755d96b30bafb4d185467ca4c55f85aec"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-federation 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=f1e7b17755d96b30bafb4d185467ca4c55f85aec)",
  "futures",
  "tokio",
  "tracing",
@@ -3331,7 +3356,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=2bcf481b4abe9d0bd6bb2479ce49020df66ff97f#2bcf481b4abe9d0bd6bb2479ce49020df66ff97f"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=fd8a082057db0d8a08ebbd4bd5c79cd24a47ca2b#fd8a082057db0d8a08ebbd4bd5c79cd24a47ca2b"
 dependencies = [
  "arrow",
  "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3343,8 +3368,8 @@ dependencies = [
  "byteorder",
  "chrono",
  "datafusion",
- "datafusion-federation",
- "datafusion-federation-sql",
+ "datafusion-federation 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690)",
+ "datafusion-federation-sql 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=f1e7b17755d96b30bafb4d185467ca4c55f85aec)",
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
@@ -5223,7 +5248,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.4.10",
+ "socket2 0.5.7",
  "tokio",
  "tower-service",
  "tracing",
@@ -5967,7 +5992,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -7105,7 +7130,7 @@ version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af1844ef2428cc3e1cb900be36181049ef3d3193c63e43026cfe202983b27a56"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.2.0",
  "proc-macro2",
  "quote",
  "syn 2.0.79",
@@ -8253,8 +8278,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "once_cell",
@@ -8287,7 +8312,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.79",
@@ -8300,7 +8325,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9552f850d5f0964a4e4d0bf306459ac29323ddfbae05e35a7c0d35cb0803cc5"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.79",
@@ -9112,8 +9137,8 @@ dependencies = [
  "dashmap 5.5.3",
  "data_components",
  "datafusion",
- "datafusion-federation",
- "datafusion-federation-sql",
+ "datafusion-federation 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690)",
+ "datafusion-federation-sql 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=ce1ce6158ce03f88c67cde25fca00f436c3e1690)",
  "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",
@@ -9956,7 +9981,7 @@ version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03c3c6b7927ffe7ecaa769ee0e3994da3b8cafc8f444578982c83ecb161af917"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.79",
@@ -11513,7 +11538,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
- "rand 0.7.3",
+ "rand 0.8.5",
  "static_assertions",
 ]
 
@@ -12037,7 +12062,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
