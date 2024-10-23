@@ -161,6 +161,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp
+          pattern: images-*
 
       - name: Verify artifacts
         run: |
