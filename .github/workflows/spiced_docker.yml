@@ -21,7 +21,7 @@ jobs:
 
   build-amd64:
     needs: setup
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
       
