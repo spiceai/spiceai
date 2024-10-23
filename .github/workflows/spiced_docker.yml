@@ -161,7 +161,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp
-          merge-multiple: true
 
       - name: Verify artifacts
         run: |
