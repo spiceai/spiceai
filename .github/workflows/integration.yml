@@ -68,7 +68,9 @@ jobs:
           path: ./integration_test
 
       - name: Mark test binary as executable
-        run: chmod +x ./integration_test
+        run: |
+          ls -l ./integration_test
+          chmod +x ./integration_test/integration_test
 
       - name: Login to ACR
         uses: docker/login-action@v3
@@ -99,7 +101,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            ./integration_test --nocapture
+            ./integration_test/integration_test --nocapture
           else
-            ./integration_test --nocapture --skip spiceai_integration_test
+            ./integration_test/integration_test --nocapture --skip spiceai_integration_test
           fi
