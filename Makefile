@@ -37,6 +37,7 @@ test:
 nextest:
 	@cargo nextest run --all
 
+# Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
 test-integration:
 	# Test if .env file exists, and login to Spice if not
