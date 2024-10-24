@@ -3331,7 +3331,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8b67c8c2af932644effc6054676c22934ec6f95b#8b67c8c2af932644effc6054676c22934ec6f95b"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b6d269912701b72620af47c4971d428b586569c8#b6d269912701b72620af47c4971d428b586569c8"
 dependencies = [
  "arrow",
  "arrow-json 53.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
