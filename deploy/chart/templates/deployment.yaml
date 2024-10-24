@@ -93,4 +93,4 @@ spec:
         {{- end }}
         - name: spiceai-config-volume
           configMap:
-            name: {{ .Release.Name }}-config
+            name: {{ template "spiceai.fullname" .  }}-spicepod
