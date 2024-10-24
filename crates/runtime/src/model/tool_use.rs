@@ -49,6 +49,7 @@ pub struct ToolUsingChat {
     inner_chat: Arc<Box<dyn Chat>>,
     rt: Arc<Runtime>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
+    recursion_limit: Option<usize>,
 }
 
 impl ToolUsingChat {
@@ -56,11 +57,13 @@ impl ToolUsingChat {
         inner_chat: Arc<Box<dyn Chat>>,
         rt: Arc<Runtime>,
         tools: Vec<Arc<dyn SpiceModelTool>>,
+        recursion_limit: Option<usize>,
     ) -> Self {
         Self {
             inner_chat,
             rt,
             tools,
+            recursion_limit,
         }
     }
 
@@ -90,6 +93,7 @@ impl ToolUsingChat {
 
         let mut req = req.clone();
         req.messages = list_dataset_messages;
+
         Ok(req)
     }
 
@@ -213,6 +217,66 @@ impl ToolUsingChat {
 
         Ok(Some(messages))
     }
+
+    async fn _chat_request(
+        &self,
+        req: CreateChatCompletionRequest,
+        recursion_limit: Option<usize>,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let inner_req = self.prepare_req(&req).await?;
+
+        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+        if inner_req
+            .tool_choice
+            .as_ref()
+            .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
+        {
+            tracing::debug!("User asked for no tools, calling inner chat model");
+            return self.inner_chat.chat_request(inner_req).await;
+        };
+
+        if recursion_limit.is_some_and(|f| f == 0) {
+            tracing::debug!(
+                "Tool-use recursion limit reached. Will call model, but not process further"
+            );
+            return self.inner_chat.chat_request(inner_req).await;
+        };
+
+        // Append spiced runtime tools to the request.
+        let mut inner_req = inner_req.clone();
+        let mut runtime_tools = self.runtime_tools();
+        if !runtime_tools.is_empty() {
+            runtime_tools.extend(inner_req.tools.unwrap_or_default());
+            inner_req.tools = Some(runtime_tools);
+        };
+
+        let resp = self.inner_chat.chat_request(inner_req).await?;
+        let usage = resp.usage.clone();
+
+        let tools_used = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.tool_calls.clone());
+
+        match self
+            .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
+            .await?
+        {
+            // New messages means we have run spice tools locally, ready to recall model.
+            Some(messages) => {
+                let new_req = CreateChatCompletionRequestArgs::default()
+                    .model(req.model)
+                    .messages(messages)
+                    .build()?;
+                let mut resp = self
+                    ._chat_request(new_req, recursion_limit.map(|r| r - 1))
+                    .await?;
+                resp.usage = combine_usage(usage, resp.usage);
+                Ok(resp)
+            }
+            None => Ok(resp),
+        }
+    }
 }
 
 #[async_trait]
@@ -243,6 +307,13 @@ impl Chat for ToolUsingChat {
             return self.inner_chat.chat_stream(inner_req).await;
         };
 
+        if self.recursion_limit.is_some_and(|f| f == 0) {
+            tracing::debug!(
+                "Tool-use recursion limit reached. Will call model, but not process further"
+            );
+            return self.inner_chat.chat_stream(inner_req).await;
+        };
+
         // Append spiced runtime tools to the request.
         let mut runtime_tools = self.runtime_tools();
         if !runtime_tools.is_empty() {
@@ -258,6 +329,7 @@ impl Chat for ToolUsingChat {
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
                 self.tools.clone(),
+                self.recursion_limit.map(|r| r - 1),
             ),
             req.clone(),
             s,
@@ -268,50 +340,7 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let inner_req = self.prepare_req(&req).await?;
-
-        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-        if inner_req
-            .tool_choice
-            .as_ref()
-            .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
-        {
-            tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_chat.chat_request(inner_req).await;
-        };
-
-        // Append spiced runtime tools to the request.
-        let mut inner_req = inner_req.clone();
-        let mut runtime_tools = self.runtime_tools();
-        if !runtime_tools.is_empty() {
-            runtime_tools.extend(inner_req.tools.unwrap_or_default());
-            inner_req.tools = Some(runtime_tools);
-        };
-
-        let resp = self.inner_chat.chat_request(inner_req).await?;
-        let usage = resp.usage.clone();
-
-        let tools_used = resp
-            .choices
-            .first()
-            .and_then(|c| c.message.tool_calls.clone());
-
-        match self
-            .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
-            .await?
-        {
-            // New messages means we have run spice tools locally, ready to recall model.
-            Some(messages) => {
-                let new_req = CreateChatCompletionRequestArgs::default()
-                    .model(req.model)
-                    .messages(messages)
-                    .build()?;
-                let mut resp = self.chat_request(new_req).await?;
-                resp.usage = combine_usage(usage, resp.usage);
-                Ok(resp)
-            }
-            None => Ok(resp),
-        }
+        self._chat_request(req, self.recursion_limit).await
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
