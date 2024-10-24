@@ -25,7 +25,7 @@ concurrency:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -38,7 +38,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "teraswitch-runners",
+                builder: "spiceai-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
@@ -271,16 +271,108 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
         with:
           name: eth_recent_blocks
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+
+  test_quickstart_s3:
+    name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
+    runs-on: ${{ matrix.target.runner }}
+    # run quickstart with external service dependency only on manual trigger
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    needs:
+      - build
+      - setup-matrix
+
+    strategy:
+      matrix:
+        acceleration: [{}, { engine: arrow, mode: memory }]
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice dataset configure
+        working-directory: test_app
+        run: |
+          echo "datasets:" >> spicepod.yaml
+          echo "  - name: test_parquet_table" >> spicepod.yaml
+          echo "    from: s3://spiceai-public-datasets/test_parquet_table/" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      file_format: parquet" >> spicepod.yaml
+
+          ENGINE=$(echo '${{ matrix.acceleration.engine }}')
+          MODE=$(echo '${{ matrix.acceleration.mode }}')
+
+          if [[ -n "$ENGINE" ]]; then
+            echo "    acceleration:" >> spicepod.yaml
+            echo "      enabled: true" >> spicepod.yaml
+            echo "      engine: $ENGINE" >> spicepod.yaml
+            if [[ -n "$MODE" ]]; then
+              echo "      mode: $MODE" >> spicepod.yaml
+           fi
+          fi
+
+          # add params if present
+          PARAMS=$(echo '${{ toJson(matrix.acceleration.params) }}')
+          if [[ "$PARAMS" != "null" ]]; then
+            echo "      params:" >> spicepod.yaml
+            for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
+              value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              echo "        $key: $value" >> spicepod.yaml
+            done
+          fi
+
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
+
+      - name: Wait for dataset to be ready
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: test_parquet_table
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -403,11 +495,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -557,11 +649,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -642,7 +734,7 @@ jobs:
         run: |
           echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
           # configure clickhouse credentials
-          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
+          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
           cat spicepod.yaml
           cat ./datasets/test_clickhouse_table/dataset.yaml
 
@@ -655,11 +747,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -737,11 +829,11 @@ jobs:
           # time to initialize added dataset
           sleep 5
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: duckdb-app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -848,11 +940,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Manually refresh dataset
         working-directory: test_app
@@ -935,11 +1027,11 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
@@ -1088,11 +1180,11 @@ jobs:
           # time to accelerate added datasets
           sleep 20
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
       - name: Run test query (issues)
         uses: ./.github/actions/run-query
@@ -1211,7 +1303,7 @@ jobs:
           # time to accelerate added datasets
           sleep 20
 
-      - name: Wait for Spice runtime healthy
+      - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
         run: |

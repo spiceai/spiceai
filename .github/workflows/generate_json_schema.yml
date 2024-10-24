@@ -10,7 +10,7 @@ on:
 
 jobs:
   generate_schema:
-    runs-on: teraswitch-runners
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4

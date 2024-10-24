@@ -135,8 +135,12 @@ impl DataConnectorFactory for ClickhouseFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match get_config_from_params(params).await {
-                Ok((options, compute_context)) => {
-                    let pool = ClickhouseConnectionPool::new(options, compute_context);
+                Ok(config) => {
+                    let pool = ClickhouseConnectionPool::new(
+                        config.options,
+                        config.db,
+                        config.compute_context,
+                    );
                     let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Clickhouse { clickhouse_factory }) as Arc<dyn DataConnector>)
                 }
@@ -207,9 +211,25 @@ impl DataConnector for Clickhouse {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Returns a Clickhouse `Options` based on user-provided parameters.
-/// Also returns the sanitized connection string for use as a federation `compute_context`.
-async fn get_config_from_params(params: Parameters) -> Result<(Options, String)> {
+pub(crate) struct ClickhouseConfig {
+    pub(crate) options: Options,
+    pub(crate) db: Arc<str>,
+    pub(crate) compute_context: String,
+}
+
+impl ClickhouseConfig {
+    pub fn new(options: Options, db: Arc<str>, compute_context: String) -> Self {
+        Self {
+            options,
+            db,
+            compute_context,
+        }
+    }
+}
+
+/// Returns a `ClickhouseConfig` based on user-provided parameters.
+async fn get_config_from_params(params: Parameters) -> Result<ClickhouseConfig> {
+    let mut db: Arc<str> = "default".into();
     let connection_string = match params.get("connection_string") {
         ParamLookup::Present(clickhouse_connection_string) => {
             clickhouse_connection_string.expose_secret().to_string()
@@ -244,15 +264,19 @@ async fn get_config_from_params(params: Parameters) -> Result<(Options, String)>
                 .await
                 .map_err(std::convert::Into::into)
                 .context(InvalidHostOrPortSnafu { host, port })?;
-            let db = params.get("db").expose().ok_or_else(|p| {
+            let db_param = params.get("db").expose().ok_or_else(|p| {
                 Error::MissingRequiredParameterForConnection {
                     parameter_name: p.0,
                 }
             })?;
 
-            format!("tcp://{user}:{password}@{host}:{port}/{db}")
+            format!("tcp://{user}:{password}@{host}:{port}/{db_param}")
         }
     };
+
+    if let Some(db_name) = get_database_from_url(&connection_string) {
+        db = db_name.into();
+    }
 
     let mut sanitized_connection_string =
         Url::parse(&connection_string).context(UnableToParseConnectionStringSnafu)?;
@@ -285,5 +309,106 @@ async fn get_config_from_params(params: Parameters) -> Result<(Options, String)>
         })?;
     options = options.secure(secure.unwrap_or(true));
 
-    Ok((options, sanitized_connection_string.to_string()))
+    Ok(ClickhouseConfig::new(
+        options,
+        db,
+        sanitized_connection_string.to_string(),
+    ))
+}
+
+/// Extracts the database name from a Clickhouse URL.
+///
+/// This function parses the URL and attempts to extract the database name from the path.
+/// It returns `Some(database_name)` if a valid database name is found, or `None` if no
+/// database is specified or the path is empty.
+///
+/// # Arguments
+///
+/// * `url` - A reference to a parsed `Url` struct representing the Clickhouse connection URL.
+///
+/// # Returns
+///
+/// An `Option<&str>` containing the database name if found, or `None` otherwise.
+///
+/// # Example
+///
+/// ```
+/// use url::Url;
+///
+/// let url = Url::parse("tcp://user:pass@host:9000/mydb").unwrap();
+/// let database = get_database_from_url(&url);
+/// assert_eq!(database, Some("mydb"));
+///
+/// let url_without_db = Url::parse("tcp://user:pass@host:9000").unwrap();
+/// let database = get_database_from_url(&url_without_db);
+/// assert_eq!(database, None);
+/// ```
+fn get_database_from_url(url_str: &str) -> Option<String> {
+    let url = Url::parse(url_str).ok()?;
+    match url.path_segments() {
+        None => None,
+        Some(mut segments) => {
+            let head = segments.next();
+
+            if segments.next().is_some() {
+                return None;
+            }
+
+            match head {
+                Some(database) if !database.is_empty() => Some(database.to_string()),
+                _ => None,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_database_from_url() {
+        let test_cases = vec![
+            ("tcp://user:pass@host:9000/mydb", Some("mydb")),
+            ("tcp://user:pass@host:9000/", None),
+            ("tcp://user:pass@host:9000", None),
+            (
+                "tcp://user:pass@host:9000/db_name_with_underscores",
+                Some("db_name_with_underscores"),
+            ),
+            (
+                "tcp://user:pass@host:9000/db-name-with-hyphens",
+                Some("db-name-with-hyphens"),
+            ),
+            (
+                "tcp://user:pass@host:9000/dbNameWithCamelCase",
+                Some("dbNameWithCamelCase"),
+            ),
+            (
+                "tcp://user:pass@host:9000/DB_NAME_WITH_UPPERCASE",
+                Some("DB_NAME_WITH_UPPERCASE"),
+            ),
+            (
+                "tcp://user:pass@host:9000/db123WithNumbers",
+                Some("db123WithNumbers"),
+            ),
+        ];
+
+        for (url_str, expected_db) in test_cases {
+            match get_database_from_url(url_str) {
+                Some(db) => assert_eq!(
+                    db,
+                    expected_db.expect("Expected a database name"),
+                    "Unexpected result for URL: {url_str}"
+                ),
+                None => assert_eq!(expected_db, None, "Unexpected result for URL: {url_str}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_database_from_url_with_invalid_path() {
+        let result = get_database_from_url("tcp://user:pass@host:9000/db/invalid");
+        assert!(result.is_none(), "Expected None for invalid path");
+    }
 }
