@@ -60,6 +60,8 @@ jobs:
     needs: build
     runs-on: spiceai-runners
     steps:
+      - uses: actions/checkout@v4
+
       # Download the test binary artifact
       - name: Download test binary
         uses: actions/download-artifact@v4
