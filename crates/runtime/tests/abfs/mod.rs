@@ -21,7 +21,6 @@ use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
-use std::path::PathBuf;
 use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
