@@ -223,59 +223,65 @@ impl ToolUsingChat {
         req: CreateChatCompletionRequest,
         recursion_limit: Option<usize>,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let inner_req = self.prepare_req(&req).await?;
+        Box::pin(async move {
+            let inner_req = self.prepare_req(&req).await?;
 
-        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-        if inner_req
-            .tool_choice
-            .as_ref()
-            .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
-        {
-            tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_chat.chat_request(inner_req).await;
-        };
+            // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+            if inner_req
+                .tool_choice
+                .as_ref()
+                .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
+            {
+                tracing::debug!("User asked for no tools, calling inner chat model");
+                return self.inner_chat.chat_request(inner_req).await;
+            };
 
-        if recursion_limit.is_some_and(|f| f == 0) {
-            tracing::debug!(
-                "Tool-use recursion limit reached. Will call model, but not process further"
-            );
-            return self.inner_chat.chat_request(inner_req).await;
-        };
+            if recursion_limit.is_some_and(|f| f == 0) {
+                tracing::debug!(
+                    "Tool-use recursion limit reached. Will call model, but not process further"
+                );
+                return self.inner_chat.chat_request(inner_req).await;
+            };
 
-        // Append spiced runtime tools to the request.
-        let mut inner_req = inner_req.clone();
-        let mut runtime_tools = self.runtime_tools();
-        if !runtime_tools.is_empty() {
-            runtime_tools.extend(inner_req.tools.unwrap_or_default());
-            inner_req.tools = Some(runtime_tools);
-        };
+            // Append spiced runtime tools to the request.
+            let mut inner_req = inner_req.clone();
+            let mut runtime_tools = self.runtime_tools();
+            if !runtime_tools.is_empty() {
+                runtime_tools.extend(inner_req.tools.unwrap_or_default());
+                inner_req.tools = Some(runtime_tools);
+            };
 
-        let resp = self.inner_chat.chat_request(inner_req).await?;
-        let usage = resp.usage.clone();
+            let resp = self.inner_chat.chat_request(inner_req).await?;
+            let usage = resp.usage.clone();
 
-        let tools_used = resp
-            .choices
-            .first()
-            .and_then(|c| c.message.tool_calls.clone());
+            let tools_used = resp
+                .choices
+                .first()
+                .and_then(|c| c.message.tool_calls.clone());
 
-        match self
-            .process_tool_calls_and_run_spice_tools(req.messages, tools_used.unwrap_or_default())
-            .await?
-        {
-            // New messages means we have run spice tools locally, ready to recall model.
-            Some(messages) => {
-                let new_req = CreateChatCompletionRequestArgs::default()
-                    .model(req.model)
-                    .messages(messages)
-                    .build()?;
-                let mut resp = self
-                    ._chat_request(new_req, recursion_limit.map(|r| r - 1))
-                    .await?;
-                resp.usage = combine_usage(usage, resp.usage);
-                Ok(resp)
+            match self
+                .process_tool_calls_and_run_spice_tools(
+                    req.messages,
+                    tools_used.unwrap_or_default(),
+                )
+                .await?
+            {
+                // New messages means we have run spice tools locally, ready to recall model.
+                Some(messages) => {
+                    let new_req = CreateChatCompletionRequestArgs::default()
+                        .model(req.model)
+                        .messages(messages)
+                        .build()?;
+                    let mut resp = self
+                        ._chat_request(new_req, recursion_limit.map(|r| r - 1))
+                        .await?;
+                    resp.usage = combine_usage(usage, resp.usage);
+                    Ok(resp)
+                }
+                None => Ok(resp),
             }
-            None => Ok(resp),
-        }
+        })
+        .await
     }
 }
 
