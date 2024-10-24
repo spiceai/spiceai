@@ -108,7 +108,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" ./integration_test/integration_test --nocapture
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" ./integration_test/integration_test --nocapture --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture --skip spiceai_integration_test
           fi
