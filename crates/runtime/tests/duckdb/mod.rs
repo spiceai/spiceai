@@ -37,7 +37,9 @@ fn make_test_query(table_name: &str) -> String {
 #[tokio::test]
 async fn duckdb_from_functions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let local_path_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
+    let local_path_root = PathBuf::from(manifest_dir).join("tests/test_data");
     let app = AppBuilder::new("duckdb_function_test")
         .with_dataset(make_duckdb_dataset(
             "csv_remote",
