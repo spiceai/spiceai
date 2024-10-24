@@ -58,7 +58,7 @@ jobs:
   test:
     name: Integration Tests
     needs: build
-    runs-on: spiceai-runners
+    runs-on: ubuntu-latest-16-cores
     steps:
       - uses: actions/checkout@v4
 
@@ -66,12 +66,6 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-
-      - name: Set up make
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
 
       # Download the test binary artifact
       - name: Download test binary
@@ -114,7 +108,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            ./integration_test/integration_test --nocapture
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture
           else
-            ./integration_test/integration_test --nocapture --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture --skip spiceai_integration_test
           fi

@@ -18,8 +18,8 @@ use crate::init_tracing;
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
+use scopeguard::defer;
 use spicepod::component::dataset::Dataset;
-use std::path::PathBuf;
 
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
     let mut dataset = Dataset::new(
@@ -37,7 +37,18 @@ fn make_test_query(table_name: &str) -> String {
 #[tokio::test]
 async fn duckdb_from_functions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let local_path_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data");
+    let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+    let sample_json_contents = include_str!("../test_data/taxi_sample.json");
+    // Write the sample file to a temporary directory
+    let temp_dir = std::env::temp_dir().join("spiced_test_data");
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    let sample_csv_path = temp_dir.join("taxi_sample.csv");
+    std::fs::write(&sample_csv_path, sample_csv_contents).expect("failed to write sample file");
+    let sample_json_path = temp_dir.join("taxi_sample.json");
+    std::fs::write(&sample_json_path, sample_json_contents).expect("failed to write sample file");
+    defer! {
+        std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
+    }
     let app = AppBuilder::new("duckdb_function_test")
         .with_dataset(make_duckdb_dataset(
             "csv_remote",
@@ -47,13 +58,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
         .with_dataset(make_duckdb_dataset(
             "csv_local",
             "csv",
-            &format!(
-                "'{}'",
-                local_path_root
-                    .join("taxi_sample.csv")
-                    .to_str()
-                    .unwrap_or("invalid_path")
-            ),
+            &format!("'{}'", sample_csv_path.display()),
         ))
         .with_dataset(make_duckdb_dataset(
             "parquet_remote",
@@ -68,13 +73,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
         .with_dataset(make_duckdb_dataset(
             "json_local",
             "json",
-            &format!(
-                "'{}'",
-                local_path_root
-                    .join("taxi_sample.json")
-                    .to_str()
-                    .unwrap_or("invalid_path")
-            ),
+            &format!("'{}'", sample_json_path.display()),
         ))
         .build();
 
