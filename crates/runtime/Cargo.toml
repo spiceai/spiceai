@@ -131,6 +131,7 @@ insta.workspace = true
 azure_storage_blobs = "0.20.0"
 azure_core = "0.20.0"
 azure_storage = "0.20.0"
+scopeguard = "1.2.0"
 
 [features]
 aws-secrets-manager = [

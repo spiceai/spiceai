@@ -56,11 +56,7 @@ pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
     container_client.create().await?;
     tracing::trace!("Storage container created");
     tracing::trace!("Uploading sample file");
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
-    let sample_file = std::fs::read_to_string(
-        PathBuf::from(manifest_dir).join("tests/test_data/taxi_sample.csv"),
-    )?;
+    let sample_file = include_str!("../test_data/taxi_sample.csv");
     let blob_client = container_client.blob_client("taxi_sample.csv");
 
     blob_client
