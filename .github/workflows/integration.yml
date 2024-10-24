@@ -58,7 +58,7 @@ jobs:
   test:
     name: Integration Tests
     needs: build
-    runs-on: spiceai-runners
+    runs-on: ubuntu-latest-16-cores
     steps:
       - uses: actions/checkout@v4
 
