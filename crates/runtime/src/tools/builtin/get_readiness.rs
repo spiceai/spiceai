@@ -21,6 +21,7 @@ use crate::tools::SpiceModelTool;
 use crate::Runtime;
 use async_trait::async_trait;
 use serde_json::Value;
+use snafu::ResultExt;
 
 pub struct GetReadinessTool {
     name: String,
@@ -62,13 +63,17 @@ impl SpiceModelTool for GetReadinessTool {
         _arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name());
 
         let statuses = rt.status().get_all_statuses();
         let statuses_map: serde_json::Map<String, Value> = statuses
             .iter()
             .map(|(k, v)| (k.clone(), Value::String(v.to_string())))
             .collect();
+
+        let captured_output_json = serde_json::to_string(&statuses_map).boxed()?;
+        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+
         Ok(Value::Object(statuses_map))
     }
 }
