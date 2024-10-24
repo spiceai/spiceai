@@ -22,6 +22,7 @@ use crate::parameters::Parameters;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
+use datafusion::config::ConfigField;
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
