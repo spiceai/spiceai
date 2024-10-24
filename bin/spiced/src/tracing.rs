@@ -21,12 +21,17 @@ use app::{
     App,
 };
 use futures::future::BoxFuture;
+use opentelemetry::global::Error as OtelError;
+use opentelemetry::trace::TraceError;
 use opentelemetry_sdk::{
     export::trace::{ExportResult, SpanData, SpanExporter},
+    runtime::TrySendError,
     trace::{Config, TracerProvider},
     Resource,
 };
+use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
+use std::time::Duration;
 use tracing::Subscriber;
 use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
 
@@ -57,15 +62,15 @@ impl LogVerbosity {
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
         match v {
-            LogVerbosity::Default => EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,WARN"),
-            LogVerbosity::Verbose => EnvFilter::new("task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,INFO"),
-            LogVerbosity::VeryVerbose => EnvFilter::new("task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,DEBUG"),
+            LogVerbosity::Default => EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,WARN"),
+            LogVerbosity::Verbose => EnvFilter::new("task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,llms=DEBUG,INFO"),
+            LogVerbosity::VeryVerbose => EnvFilter::new("task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,llms=TRACE,DEBUG"),
             LogVerbosity::Specific(filter) => EnvFilter::new(filter),
         }
     }
 }
 
-pub(crate) fn init_tracing(
+pub(crate) async fn init_tracing(
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
@@ -91,7 +96,7 @@ pub(crate) fn init_tracing(
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(datafusion_task_history_tracing(df, app, config)?)
+        .with(datafusion_task_history_tracing(df, app, config).await?)
         .with(
             fmt::layer()
                 .with_ansi(true)
@@ -102,10 +107,14 @@ pub(crate) fn init_tracing(
 
     tracing::subscriber::set_global_default(subscriber)?;
 
+    if let Err(e) = opentelemetry::global::set_error_handler(handle_opentelemetry_error) {
+        tracing::debug!("Failed to set OpenTelemetry error handler: {e}");
+    }
+
     Ok(())
 }
 
-fn datafusion_task_history_tracing<S>(
+async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: &Option<Arc<App>>,
     config: Option<&TracingConfig>,
@@ -126,7 +135,7 @@ where
         task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
     )];
 
-    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config) {
+    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config).await {
         exporters.push(zipkin_exporter);
     }
 
@@ -149,7 +158,7 @@ where
     Ok(layer)
 }
 
-fn zipkin_task_history_otel_exporter(
+async fn zipkin_task_history_otel_exporter(
     app_name: Option<String>,
     config: Option<&TracingConfig>,
 ) -> Result<Option<Box<dyn SpanExporter>>, Box<dyn std::error::Error>> {
@@ -164,6 +173,13 @@ fn zipkin_task_history_otel_exporter(
         return Err("zipkin_endpoint is required when zipkin_enabled is true".into());
     };
 
+    if !is_zipkin_endpoint_reachable(zipkin_endpoint).await {
+        eprintln!(
+            "Zipkin endpoint '{zipkin_endpoint}' is not reachable. Skipping Zipkin exporter initialization."
+        );
+        return Ok(None);
+    }
+
     let service_name: Cow<'static, str> = match app_name {
         Some(name) => Cow::Owned(name),
         None => Cow::Borrowed("Spice.ai"),
@@ -173,9 +189,21 @@ fn zipkin_task_history_otel_exporter(
         opentelemetry_zipkin::new_pipeline()
             .with_service_name(service_name)
             .with_collector_endpoint(zipkin_endpoint)
-            .with_http_client(reqwest::Client::new())
+            .with_http_client(Client::new())
             .init_exporter()?,
     )))
+}
+
+async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
+    let client = Client::new();
+    let timeout = Duration::from_secs(5);
+
+    let url = format!("{endpoint}?serviceName=test");
+
+    match client.get(&url).timeout(timeout).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug)]
@@ -226,5 +254,35 @@ impl SpanExporter for OtelExportMultiplexer {
         for exporter in &mut self.exporters {
             exporter.set_resource(resource);
         }
+    }
+}
+
+fn handle_opentelemetry_error(e: OtelError) {
+    if let OtelError::Trace(trace_error) = e {
+        handle_trace_error(trace_error);
+    } else {
+        tracing::error!("OpenTelemetry error occurred: {e}");
+    }
+}
+
+fn handle_trace_error(e: TraceError) {
+    if let TraceError::Other(other) = e {
+        handle_trace_other_error(other);
+    } else {
+        tracing::error!("OpenTelemetry trace error occurred: {e}");
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn handle_trace_other_error(other: Box<dyn std::error::Error + Send + Sync>) {
+    if let Some(send_error) = other.downcast_ref::<TrySendError>() {
+        if let TrySendError::ChannelClosed = send_error {
+            // This is expected to happen when the runtime is shutting down
+            tracing::trace!("OpenTelemetry trace channel closed");
+        } else {
+            tracing::error!("OpenTelemetry trace error occurred: {other}");
+        }
+    } else {
+        tracing::error!("OpenTelemetry trace error occurred: {other}");
     }
 }

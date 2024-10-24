@@ -118,7 +118,6 @@ thread_local! {
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: Arc<str>,
-    restricted_sql_options: bool,
     tracker: QueryTracker,
 }
 
@@ -134,16 +133,10 @@ impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count();
-        let span = match &self.tracker.nsql {
-            Some(nsql) => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "nsql_query", input = %nsql, runtime_query = false)
-            }
-            None => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false)
-            }
-        };
 
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
         let inner_span = span.clone();
+
         let query_result = async {
             let mut session = self.df.ctx.state();
 
@@ -208,17 +201,15 @@ impl Query {
                 tracker = tracker.results_cache_hit(false);
             }
 
-            if ctx.restricted_sql_options {
-                if let Err(e) =
-                    RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
-                {
-                    handle_error!(
-                        tracker,
-                        ErrorCode::QueryPlanningError,
-                        e,
-                        UnableToExecuteQuery
-                    )
-                }
+            if let Err(e) =
+                RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
+            {
+                handle_error!(
+                    tracker,
+                    ErrorCode::QueryPlanningError,
+                    e,
+                    UnableToExecuteQuery
+                )
             }
 
             let input_tables = get_logical_plan_input_tables(&plan);
@@ -302,19 +293,30 @@ impl Query {
     }
 
     pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
-        let df = match self.df.ctx.sql(&self.sql).await {
-            Ok(df) => df,
+        let session = self.df.ctx.state();
+        let plan = match session.create_logical_plan(&self.sql).await {
+            Ok(plan) => plan,
             Err(e) => {
-                // If there is an error getting the schema, we still want to track it in task history
-                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
-                let error_code = ErrorCode::from(&e);
-                span.in_scope(|| {
-                    self.finish_with_error(e.to_string(), error_code);
-                });
+                self.handle_schema_error(&e);
                 return Err(e);
             }
         };
-        Ok(df.schema().into())
+
+        // Verify the plan against the restricted options
+        if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
+            self.handle_schema_error(&e);
+            return Err(e);
+        }
+        Ok(plan.schema().as_arrow().clone())
+    }
+
+    fn handle_schema_error(self, e: &DataFusionError) {
+        // If there is an error getting the schema, we still want to track it in task history
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let error_code = ErrorCode::from(e);
+        span.in_scope(|| {
+            self.finish_with_error(e.to_string(), error_code);
+        });
     }
 }
 

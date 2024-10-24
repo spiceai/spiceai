@@ -32,26 +32,27 @@ exclude = [".github/"]
 homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.81"
-version = "1.0.0-rc"
+rust-version = "1.82"
+version = "1.0.0-rc.1"
 
 [workspace.dependencies]
 arrow = "53"
 arrow-buffer = "53"
 arrow-flight = "53"
-arrow-json = "53"
+# Use published version once https://github.com/apache/arrow-rs/pull/6606 is released
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6013498d7d4d59f7b16d0e28b3e0b379732fbf07" }
 arrow-ipc = "53"
 arrow-schema = "53"
 parquet = "53"
 arrow-odbc = "11.2.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "84d64f0431fa5c164207bf434eb4c0e18b5b4e7d" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "df4fc93b21711a46e6cd3e91ecea72b4f32c856f" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
 chrono = "0.4.38"
-clap = { version = "4.5.18", features = ["derive"] }
+clap = { version = "4.5.20", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
   "tokio_io",
   "tls",
@@ -61,11 +62,11 @@ datafusion-common = "42"
 datafusion-expr = "42"
 datafusion-execution = "42"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f1e7b17755d96b30bafb4d185467ca4c55f85aec" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "ce1ce6158ce03f88c67cde25fca00f436c3e1690" }
 datafusion-functions-json = "0.42"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
-duckdb = "1.0.0"
+duckdb = "1.1.1"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.15"
@@ -77,11 +78,11 @@ lazy_static = "1.5.0"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.11" }
 odbc-api = { version = "8.1.2" }
-opentelemetry = { version = "0.25", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "0.25", default-features = false, features = ["metrics", "rt-tokio", "trace"] }
+opentelemetry = { version = "0.26", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.26", default-features = false, features = ["metrics", "rt-tokio", "trace"] }
 opentelemetry-prometheus = "0.17"
-opentelemetry-zipkin = { version = "0.25", default-features = false, features = ["reqwest", "reqwest-rustls"] }
-opentelemetry-http = { version = "0.25", features = ["reqwest-rustls"] }
+opentelemetry-zipkin = { version = "0.26", default-features = false, features = ["reqwest", "reqwest-rustls"] }
+opentelemetry-http = { version = "0.26", features = ["reqwest-rustls"] }
 pem = "3.0.4"
 prometheus = "0.13"
 r2d2 = "0.8.10"
@@ -114,21 +115,19 @@ tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-tracing-opentelemetry = "0.26"
+tracing-opentelemetry = "0.27"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "ee13eb01498287692295f6821711d49c45f62bfc" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "fbedf88bb46b3b9b680977a80f76a5ee8d4a9bc4" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "fbedf88bb46b3b9b680977a80f76a5ee8d4a9bc4" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "fbedf88bb46b3b9b680977a80f76a5ee8d4a9bc4" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "fbedf88bb46b3b9b680977a80f76a5ee8d4a9bc4" }
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f1e7b17755d96b30bafb4d185467ca4c55f85aec" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c058f1e1fe4391a47b985c485eee91b3b41e1172" }
-
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "5b98603705a381ceeb5cc371e4f606b7332b57ce" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "ce1ce6158ce03f88c67cde25fca00f436c3e1690" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "2bcf481b4abe9d0bd6bb2479ce49020df66ff97f" }
 
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "dfb1e03a5f0702c1a318db5abf40e762d6b2bcc2" }
@@ -138,8 +137,5 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-# Required until next release with https://github.com/open-telemetry/opentelemetry-rust/pull/2095 is included
-opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "c3b59ba61055b7ec6916b6b88a9ac94f6656922b" }
-opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "c3b59ba61055b7ec6916b6b88a9ac94f6656922b" }
-tracing-opentelemetry = { git = "https://github.com/spiceai/tracing-opentelemetry.git", rev = "67d70b46ec463e5eae31e655bad9c05ac760d986" }
-opentelemetry-prometheus = { git = "https://github.com/spiceai/opentelemetry-rust.git", rev = "39584779eff60a71ea6b900daca71fd85730e91a" }
+# Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183
+opentelemetry-prometheus = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "e91138351a689cd21923c15eb48f5fbc95ded807" }

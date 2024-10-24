@@ -97,10 +97,19 @@ impl SpiceModelTool for TableSchemaTool {
                 .await
                 .boxed()?;
 
-            let v = serde_json::value::to_value(schema).boxed()?;
+            let schema_value = serde_json::value::to_value(schema).boxed()?;
 
-            table_schemas.push(v);
+            let table_schema = serde_json::json!({
+                "table": t,
+                "schema": schema_value
+            });
+
+            table_schemas.push(table_schema);
         }
+
+        let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
+        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+
         Ok(Value::Array(table_schemas))
     }
 }

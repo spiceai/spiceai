@@ -16,7 +16,13 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset, LogErrors, Runtime,
+    accelerated_table::refresh::RefreshOverrides,
+    component::dataset::Dataset,
+    tools::builtin::sample::{
+        distinct::DistinctColumnsParams, random::RandomSampleParams, top_samples::TopSamplesParams,
+        SampleFrom, SampleTableMethod, SampleTableParams,
+    },
+    LogErrors, Runtime,
 };
 use app::App;
 use axum::{
@@ -26,14 +32,20 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
+use headers_accept::Accept;
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
-use super::{convert_entry_to_csv, dataset_status, Format};
+use super::{
+    arrow_to_csv, arrow_to_json, arrow_to_plain, convert_entry_to_csv, dataset_status, ArrowFormat,
+    Format,
+};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DatasetFilter {
@@ -128,6 +140,9 @@ pub(crate) async fn refresh(
     Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     overrides_opt: Option<Json<RefreshOverrides>>,
+    // When this is an Option<Json>, Json rejections are silenced
+    // This means malformed Json, etc, will simply return None
+    // To get around this, we would need to implement a custom extractor
 ) -> Response {
     let app_lock = app.read().await;
     let Some(readable_app) = &*app_lock else {
@@ -228,5 +243,56 @@ pub(crate) async fn acceleration(
             }),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleQueryParams {
+    #[serde(rename = "type")]
+    pub r#type: Option<SampleTableMethod>,
+}
+
+pub(crate) async fn sample(
+    Extension(df): Extension<Arc<DataFusion>>,
+    accept: Option<TypedHeader<Accept>>,
+    Query(query): Query<SampleQueryParams>,
+    body: String,
+) -> Response {
+    // Convulted way to handle parsing [`SampleTableParams`] since params might overlap. Allow
+    // users to specify the type of sampling they want.
+    let params_result = match query.r#type {
+        Some(SampleTableMethod::DistinctColumns) => {
+            serde_json::from_str::<DistinctColumnsParams>(&body)
+                .map(SampleTableParams::DistinctColumns)
+        }
+        Some(SampleTableMethod::RandomSample) => {
+            serde_json::from_str::<RandomSampleParams>(&body).map(SampleTableParams::RandomSample)
+        }
+        Some(SampleTableMethod::TopNSample) => {
+            serde_json::from_str::<TopSamplesParams>(&body).map(SampleTableParams::TopNSample)
+        }
+        None => serde_json::from_str::<SampleTableParams>(&body),
+    };
+
+    let Ok(params) = params_result else {
+        return (status::StatusCode::BAD_REQUEST, "Invalid request body").into_response();
+    };
+
+    let sample = match params.sample(df).await {
+        Ok(sample) => sample,
+        Err(e) => {
+            return (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let res = match ArrowFormat::from_accept_header(&accept) {
+        ArrowFormat::Json => arrow_to_json(&[sample]),
+        ArrowFormat::Csv => arrow_to_csv(&[sample]),
+        ArrowFormat::Plain => arrow_to_plain(&[sample]),
+    };
+
+    match res {
+        Ok(body) => (StatusCode::OK, body).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+assertion_line: 386
+expression: records_pretty
+---
++------------------+------------------+------------+-----------+
+| w_warehouse_name | i_item_id        | inv_before | inv_after |
++------------------+------------------+------------+-----------+
+|                  | AAAAAAAAAABDAAAA | 1696       | 1891      |
+|                  | AAAAAAAAAACDAAAA | 2208       | 2222      |
+|                  | AAAAAAAAAAHDAAAA | 2196       | 2495      |
+|                  | AAAAAAAAACHCAAAA | 1419       | 1635      |
+|                  | AAAAAAAAACLDAAAA | 2091       | 2700      |
+|                  | AAAAAAAAADKBAAAA | 1724       | 1870      |
+|                  | AAAAAAAAAEADAAAA | 2499       | 2105      |
+|                  | AAAAAAAAAFACAAAA | 2419       | 2083      |
+|                  | AAAAAAAAAFADAAAA | 2668       | 2691      |
+|                  | AAAAAAAAAHDEAAAA | 2100       | 1792      |
++------------------+------------------+------------+-----------+

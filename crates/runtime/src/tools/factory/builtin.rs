@@ -22,7 +22,10 @@ use spicepod::component::tool::Tool;
 use crate::tools::{
     builtin::{
         document_similarity::DocumentSimilarityTool, get_readiness::GetReadinessTool,
-        list_datasets::ListDatasetsTool, sql::SqlTool, table_schema::TableSchemaTool,
+        list_datasets::ListDatasetsTool,
+        sample::{tool::SampleDataTool, SampleTableMethod},
+        sql::SqlTool,
+        table_schema::TableSchemaTool,
     },
     SpiceModelTool,
 };
@@ -54,6 +57,18 @@ impl ToolFactory for BuiltinToolFactory {
             "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(&name, description))),
             "table_schema" => Ok(Arc::new(TableSchemaTool::new(&name, description))),
             "sql" => Ok(Arc::new(SqlTool::new(&name, description))),
+            "sample_distinct_columns" => Ok(Arc::new(
+                SampleDataTool::new(SampleTableMethod::DistinctColumns)
+                    .with_overrides(Some(name.as_str()), description.as_deref()),
+            )),
+            "random_sample" => Ok(Arc::new(
+                SampleDataTool::new(SampleTableMethod::RandomSample)
+                    .with_overrides(Some(name.as_str()), description.as_deref()),
+            )),
+            "top_n_sample" => Ok(Arc::new(
+                SampleDataTool::new(SampleTableMethod::TopNSample)
+                    .with_overrides(Some(name.as_str()), description.as_deref()),
+            )),
             "list_datasets" => {
                 let table_allowlist: Option<Vec<&str>> = component
                     .params

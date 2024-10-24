@@ -48,6 +48,7 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use itertools::Itertools;
 use query::{Protocol, QueryBuilder};
 use snafu::prelude::*;
 use tokio::spawn;
@@ -287,16 +288,16 @@ impl DataFusion {
 
     pub async fn get_table(
         &self,
-        table_reference: TableReference,
+        table_reference: &TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
-        let catalog_provider = match &table_reference {
+        let catalog_provider = match table_reference {
             TableReference::Bare { .. } | TableReference::Partial { .. } => {
                 self.ctx.catalog(SPICE_DEFAULT_CATALOG)
             }
             TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
         }?;
 
-        let schema_provider = match &table_reference {
+        let schema_provider = match table_reference {
             TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
             TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
                 catalog_provider.schema(schema)
@@ -994,6 +995,52 @@ impl DataFusion {
         });
 
         Ok(())
+    }
+
+    /// Returns all table names in user defined schemas (i.e. not system or runtime schemas).
+    ///
+    /// Specifically filters out:
+    ///  - `spice.runtime`
+    ///  - `spice.metadata`
+    pub fn get_user_table_names(&self) -> Vec<TableReference> {
+        self.ctx
+            .catalog_names()
+            .iter()
+            .flat_map(|ctlg| {
+                let schemas = self
+                    .ctx
+                    .catalog(ctlg)
+                    .map(|c| c.schema_names())
+                    .unwrap_or_default();
+
+                self.ctx
+                    .catalog(ctlg)
+                    .map(|c| {
+                        schemas
+                            .iter()
+                            .filter(|schema| {
+                                !(ctlg == SPICE_DEFAULT_CATALOG && *schema == SPICE_RUNTIME_SCHEMA
+                                    || *schema == SPICE_METADATA_SCHEMA)
+                            })
+                            .flat_map(|schema| {
+                                c.schema(schema)
+                                    .map(|s| s.table_names())
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(|t| {
+                                        TableReference::full(
+                                            Arc::from(ctlg.clone()),
+                                            Arc::from(schema.clone()),
+                                            Arc::from(t.clone()),
+                                        )
+                                    })
+                                    .collect::<Vec<TableReference>>()
+                            })
+                            .collect::<Vec<TableReference>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect_vec()
     }
 
     pub fn get_public_table_names(&self) -> Result<Vec<String>> {

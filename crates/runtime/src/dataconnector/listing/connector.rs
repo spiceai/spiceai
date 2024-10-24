@@ -307,7 +307,9 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                     })?;
 
                 // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
-                if dataset.get_param("hive_infer_partitions", true) && table_path.is_collection() {
+                if dataset.get_param("hive_partitioning_enabled", false)
+                    && table_path.is_collection()
+                {
                     let inferred_partitions =
                         infer_partitions_with_types(&ctx.state(), &table_path, &extension).await;
                     match inferred_partitions {

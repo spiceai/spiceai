@@ -54,10 +54,16 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-buffer 53.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
+- arrow-csv 53.1.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
 - arrow-flight 53.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - arrow-ipc 53.1.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- arrow-json 53.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - arrow-json 53.1.0, Apache-2.0 
@@ -144,7 +150,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.10.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.19, Apache-2.0 OR MIT 
+- clap 4.5.20, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
@@ -186,7 +192,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dotenvy 0.15.7, MIT 
   <br/>https://github.com/allan2/dotenvy
 
-- duckdb 1.1.0, MIT 
+- duckdb 1.1.1, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
 - dyn-clone 1.0.17, Apache-2.0 OR MIT 
@@ -263,6 +269,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - itertools 0.13.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
+
+- jsonwebtoken 9.3.0, MIT 
+  <br/>https://github.com/Keats/jsonwebtoken
 
 - keyring 2.3.3, Apache-2.0 OR MIT 
   <br/>https://github.com/hwchen/keyring-rs.git
@@ -444,7 +453,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - text-embeddings-backend-core 1.4.0,  
   <br/>
 
-- text-splitter 0.16.1, MIT 
+- text-splitter 0.17.0, MIT 
   <br/>https://github.com/benbrandt/text-splitter
 
 - tiberius 0.12.3, Apache-2.0 OR MIT 
@@ -512,6 +521,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - uuid 1.10.0, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
+
+- winver 1.0.0, MIT 
+  <br/>https://github.com/rhysd/winver
 
 - x509-certificate 0.23.1, MPL-2.0 
   <br/>https://github.com/indygreg/cryptography-rs.git

@@ -1,0 +1,13 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------------+------------------+----------------+--------------+
+| call_center      | call_center_name | manager        | returns_loss |
++------------------+------------------+----------------+--------------+
+| AAAAAAAACAAAAAAA | Mid Atlantic     | Mark Hightower | 4046.80      |
+| AAAAAAAABAAAAAAA | NY Metro         | Bob Belcher    | 615.62       |
+| AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray   | 434.88       |
+| AAAAAAAACAAAAAAA | Mid Atlantic     | Mark Hightower | 365.47       |
+| AAAAAAAABAAAAAAA | NY Metro         | Bob Belcher    | 165.59       |
++------------------+------------------+----------------+--------------+

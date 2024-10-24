@@ -1,23 +1,38 @@
+# Additional labels to add to all resources
+additionalLabels: {}
+
 image:
   repository: spiceai/spiceai
-  tag: 0.19.0-beta
+  tag: 0.19.2-beta
 replicaCount: 1
+
+serviceAccount:
+  # Specifies whether a ServiceAccount should be created
+  create: false
+  # The name of the ServiceAccount to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name:
+
 monitoring:
   podMonitor:
     enabled: false
+    # Set labels for the PodMonitor, use this to define your scrape label for Prometheus Operator
+    additionalLabels: {}
+
 spicepod:
   name: app
   version: v1beta1
   kind: Spicepod
 
-  datasets:
-    - from: s3://spiceai-demo-datasets/taxi_trips/2024/
-      name: taxi_trips
-      description: Demo taxi trips in s3
-      params:
-        file_format: parquet
-      acceleration:
-        enabled: true
-        # Uncomment to refresh the acceleration on a schedule
-        # refresh_check_interval: 1h
-        # refresh_mode: full
+  datasets: []
+  # Example:
+  # - from: s3://spiceai-demo-datasets/taxi_trips/2024/
+  #   name: taxi_trips
+  #   description: Demo taxi trips in s3
+  #   params:
+  #     file_format: parquet
+  #   acceleration:
+  #     enabled: true
+  #     # Uncomment to refresh the acceleration on a schedule
+  #     # refresh_check_interval: 1h
+  #     # refresh_mode: full

@@ -25,7 +25,6 @@ use super::{error_code::ErrorCode, metrics, Protocol};
 
 pub(crate) struct QueryTracker {
     pub(crate) schema: Option<SchemaRef>,
-    pub(crate) nsql: Option<Arc<str>>,
     pub(crate) query_duration_secs: Option<f32>,
     pub(crate) query_execution_duration_secs: Option<f32>,
     pub(crate) rows_produced: u64,
@@ -127,7 +126,7 @@ impl QueryTracker {
     }
 }
 
-fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
+fn trace_query(query_tracker: &QueryTracker, captured_output: &str) {
     if let Some(error_code) = &query_tracker.error_code {
         tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
@@ -157,5 +156,5 @@ fn trace_query(query_tracker: &QueryTracker, truncated_output: &str) {
         .collect::<Vec<String>>()
         .join(",");
     tracing::info!(target: "task_history", protocol = ?query_tracker.protocol, datasets = datasets_str, "labels");
-    tracing::info!(target: "task_history", truncated_output = %truncated_output);
+    tracing::info!(target: "task_history", captured_output = %captured_output);
 }

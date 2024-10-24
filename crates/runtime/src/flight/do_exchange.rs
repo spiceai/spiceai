@@ -69,7 +69,7 @@ pub(crate) async fn handle(
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    let Some(table_provider) = flight_svc.datafusion.get_table(data_path.clone()).await else {
+    let Some(table_provider) = flight_svc.datafusion.get_table(&data_path).await else {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
@@ -88,11 +88,12 @@ pub(crate) async fn handle(
         (tx, rx)
     };
 
+    let table_provider_stream = Arc::clone(&table_provider);
     let response_stream = stream::unfold(rx, move |mut rx| {
         let encoder = IpcDataGenerator::default();
         let mut tracker = DictionaryTracker::new(false);
         let write_options = writer::IpcWriteOptions::default();
-        let table_provider = Arc::clone(&table_provider);
+        let table_provider = Arc::clone(&table_provider_stream);
         async move {
             match rx.recv().await {
                 Ok(data_update) => {
@@ -169,12 +170,9 @@ pub(crate) async fn handle(
     .flat_map(|x| x);
 
     let datafusion = Arc::clone(&flight_svc.datafusion);
+    let table_provider = Arc::clone(&table_provider);
     tokio::spawn(async move {
-        let Ok(df) = datafusion
-            .ctx
-            .sql(&format!(r#"SELECT * FROM {data_path}"#))
-            .await
-        else {
+        let Ok(df) = datafusion.ctx.read_table(table_provider) else {
             return;
         };
         let Ok(results) = df.collect().await else {

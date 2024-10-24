@@ -19,6 +19,8 @@ use snafu::prelude::*;
 use spicepod::component::{catalog as spicepod_catalog, params::Params};
 use std::collections::HashMap;
 
+use super::validate_identifier;
+
 #[derive(Debug, Clone)]
 pub struct Catalog {
     pub provider: String,
@@ -64,6 +66,8 @@ impl TryFrom<spicepod_catalog::Catalog> for Catalog {
                     .context(crate::ErrorConvertingGlobSetToRegexSnafu)?,
             );
         }
+
+        validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
 
         Ok(Catalog {
             provider: provider.to_string(),
