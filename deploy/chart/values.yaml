@@ -24,14 +24,15 @@ spicepod:
   version: v1beta1
   kind: Spicepod
 
-  datasets:
-    - from: s3://spiceai-demo-datasets/taxi_trips/2024/
-      name: taxi_trips
-      description: Demo taxi trips in s3
-      params:
-        file_format: parquet
-      acceleration:
-        enabled: true
-        # Uncomment to refresh the acceleration on a schedule
-        # refresh_check_interval: 1h
-        # refresh_mode: full
+  datasets: []
+  # Example:
+  # - from: s3://spiceai-demo-datasets/taxi_trips/2024/
+  #   name: taxi_trips
+  #   description: Demo taxi trips in s3
+  #   params:
+  #     file_format: parquet
+  #   acceleration:
+  #     enabled: true
+  #     # Uncomment to refresh the acceleration on a schedule
+  #     # refresh_check_interval: 1h
+  #     # refresh_mode: full

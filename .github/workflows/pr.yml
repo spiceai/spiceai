@@ -24,7 +24,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report 
   # a sucess when skipped).
   check_changes:
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
@@ -68,7 +68,7 @@ jobs:
 
   lint:
     name: Run Go & Rust Linters
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     env:
       GOVER: 1.22.0
     needs: check_changes
@@ -123,7 +123,7 @@ jobs:
 
   build:
     name: Build Go & Rust
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     env:
       GOVER: 1.22.0
     needs: check_changes
@@ -153,7 +153,7 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     needs: check_changes
 
     steps:
