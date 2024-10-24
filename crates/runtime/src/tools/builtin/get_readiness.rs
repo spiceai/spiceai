@@ -59,9 +59,11 @@ impl SpiceModelTool for GetReadinessTool {
 
     async fn call(
         &self,
-        arg: &str,
+        _arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name());
+
         let statuses = rt.status().get_all_statuses();
         let statuses_map: serde_json::Map<String, Value> = statuses
             .iter()
