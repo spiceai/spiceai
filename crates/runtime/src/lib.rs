@@ -102,6 +102,7 @@ pub mod tls;
 pub mod tools;
 pub(crate) mod tracers;
 mod tracing_util;
+mod user_agent_util;
 mod view;
 
 #[derive(Debug, Snafu)]

@@ -46,6 +46,12 @@ static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
+static INTERNAL_BUILD: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SPICEAI_INTERNAL_BUILD")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+});
+
 fn resource(spicepod_name: &str) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
@@ -62,13 +68,25 @@ fn resource(spicepod_name: &str) -> Resource {
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
-    Resource::new(vec![
+    let mut key_values = vec![
         KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
         KeyValue::new("name", "spiced"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        #[cfg(debug_assertions)]
+        KeyValue::new("service.build", "dev"),
+        #[cfg(not(debug_assertions))]
+        KeyValue::new("service.build", "release"),
         KeyValue::new("service.instance.id", instance_id),
         KeyValue::new("spicepod.id", spicepod_id),
-    ])
+    ];
+
+    if *INTERNAL_BUILD {
+        key_values.push(KeyValue::new("service.internal", "true"));
+    } else {
+        key_values.push(KeyValue::new("service.internal", "false"));
+    }
+
+    Resource::new(key_values)
 }
 
 pub async fn start(spicepod_name: &str) {
