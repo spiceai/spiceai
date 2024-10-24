@@ -62,6 +62,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       # Download the test binary artifact
       - name: Download test binary
         uses: actions/download-artifact@v4
