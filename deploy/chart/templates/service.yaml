@@ -1,0 +1,22 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    {{- include "spiceai.labels" . | indent 4 }}
+    app: {{ .Release.Name }}
+  name: {{ template "spiceai.fullname" .  }}
+  namespace: {{ template "spiceai.namespace" . }}
+spec:
+  ports:
+    - port: 8090
+      name: http
+    - port: 9090
+      name: metrics
+    - port: 50051
+      name: flight
+    - port: 50052
+      name: otel
+  selector:
+    {{- include "spiceai.labels" . | indent 4 }}
+    app: {{ .Release.Name }}

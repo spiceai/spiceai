@@ -3,6 +3,11 @@ apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
   name: {{ .Release.Name }}-podmonitor
+  labels:
+    {{- include "spiceai.labels" . | indent 4 }}
+    {{- if .Values.monitoring.podMonitor.additionalLabels }}
+    {{ toYaml .Values.monitoring.podMonitor.additionalLabels }}
+    {{- end }}
 spec:
   podMetricsEndpoints:
   - interval: 10s
@@ -11,5 +16,6 @@ spec:
     targetPort: 9090
   selector:
     matchLabels:
+      {{- include "spiceai.selectorLabels" . | indent 6 }}
       app: {{ .Release.Name }}
 {{ end }}
