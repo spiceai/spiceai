@@ -66,6 +66,8 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
 
     let rt = Runtime::builder()
         .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+        .with_tokio_servers_runtime()
+        .expect("tokio runtime to be created")
         .build()
         .await;
 

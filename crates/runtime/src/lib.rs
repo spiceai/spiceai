@@ -59,7 +59,8 @@ use spicepod::component::model::{Model as SpicepodModel, ModelType};
 use spicepod::component::tool::Tool;
 use timing::TimeMeasurement;
 use tls::TlsConfig;
-use tokio::sync::oneshot::error::RecvError;
+use tokio::runtime::{Handle, Runtime as TokioRuntime};
+use tokio::sync::oneshot::{self, error::RecvError};
 use tokio::sync::RwLock;
 use tools::builtin::get_builtin_tool_spec;
 use tools::factory as tool_factory;
@@ -110,7 +111,9 @@ pub enum Error {
     UnableToStartHttpServer { source: http::Error },
 
     #[snafu(display("{source}"))]
-    UnableToJoinTask { source: tokio::task::JoinError },
+    UnableToReceiveTask {
+        source: tokio::sync::oneshot::error::RecvError,
+    },
 
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
     UnableToStartMetricsServer { source: metrics_server::Error },
@@ -296,6 +299,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    tokio_servers_runtime: Option<Arc<TokioRuntime>>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -357,9 +361,10 @@ impl Runtime {
 
     /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.
     ///
-    /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
+    /// The future returned by this function will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_servers(
         &self,
         config: Config,
@@ -368,23 +373,35 @@ impl Runtime {
         self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
-        let http_server_future = tokio::spawn(http::start(
-            config.http_bind_address,
-            Arc::clone(&self.app),
-            Arc::clone(&self.df),
-            Arc::clone(&self.models),
-            Arc::clone(&self.llms),
-            Arc::clone(&self.embeds),
-            config.clone().into(),
-            self.metrics_endpoint,
-            tls_config.clone(),
-        ));
+        // Get the Tokio runtime handle for spawning the server tasks.
+        // Uses the runtime configured in the `RuntimeBuilder` if one was specified,
+        // otherwise uses the current thread's handle (which must exist since we're in an async block).
+        let server_handle = if let Some(runtime) = self.tokio_servers_runtime.as_ref() {
+            runtime.handle()
+        } else {
+            &Handle::current()
+        };
+
+        let http_server_rx = spawn_on_handle(
+            server_handle,
+            http::start(
+                config.http_bind_address,
+                Arc::clone(&self.app),
+                Arc::clone(&self.df),
+                Arc::clone(&self.models),
+                Arc::clone(&self.llms),
+                Arc::clone(&self.embeds),
+                config.clone().into(),
+                self.metrics_endpoint,
+                tls_config.clone(),
+            ),
+        );
 
         // Spawn the metrics server in the background
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
-        tokio::spawn(async move {
+        server_handle.spawn(async move {
             if let Err(e) =
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
@@ -393,16 +410,22 @@ impl Runtime {
             }
         });
 
-        let flight_server_future = tokio::spawn(flight::start(
-            config.flight_bind_address,
-            Arc::clone(&self.df),
-            tls_config.clone(),
-        ));
-        let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
-            config.open_telemetry_bind_address,
-            Arc::clone(&self.df),
-            tls_config.clone(),
-        ));
+        let flight_server_rx = spawn_on_handle(
+            server_handle,
+            flight::start(
+                config.flight_bind_address,
+                Arc::clone(&self.df),
+                tls_config.clone(),
+            ),
+        );
+        let open_telemetry_server_rx = spawn_on_handle(
+            server_handle,
+            opentelemetry::start(
+                config.open_telemetry_bind_address,
+                Arc::clone(&self.df),
+                tls_config.clone(),
+            ),
+        );
 
         let pods_watcher_future = if self.pods_watcher.read().await.is_some() {
             Some(self.start_pods_watcher())
@@ -422,27 +445,27 @@ impl Runtime {
         }
 
         tokio::select! {
-            http_res = http_server_future => {
+            http_res = http_server_rx => {
                 match http_res {
                     Ok(http_res) => http_res.context(UnableToStartHttpServerSnafu),
                     Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-             },
-            flight_res = flight_server_future => {
-                match flight_res {
-                    Ok(flight_res) => flight_res.context(UnableToStartFlightServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
+                        Err(Error::UnableToReceiveTask { source })
                     }
                 }
             },
-            open_telemetry_res = open_telemetry_server_future => {
+            flight_res = flight_server_rx => {
+                match flight_res {
+                    Ok(flight_res) => flight_res.context(UnableToStartFlightServerSnafu),
+                    Err(source) => {
+                        Err(Error::UnableToReceiveTask { source })
+                    }
+                }
+            },
+            open_telemetry_res = open_telemetry_server_rx => {
                 match open_telemetry_res {
                     Ok(open_telemetry_res) => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
                     Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
+                        Err(Error::UnableToReceiveTask { source })
                     }
                 }
             },
@@ -1750,4 +1773,22 @@ pub fn spice_data_base_path() -> String {
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     let base_folder = spice_data_base_path();
     std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
+}
+
+/// Spawns a future on the given Tokio runtime handle and returns a oneshot receiver for the result.
+///
+/// This allows running tasks on a specific runtime and awaiting the result from a different runtime.
+pub fn spawn_on_handle<F, T>(handle: &Handle, future: F) -> oneshot::Receiver<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+
+    handle.spawn(async move {
+        let result = future.await;
+        let _ = tx.send(result);
+    });
+
+    rx
 }
