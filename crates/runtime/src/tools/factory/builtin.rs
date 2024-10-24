@@ -21,8 +21,8 @@ use spicepod::component::tool::Tool;
 
 use crate::tools::{
     builtin::{
-        document_similarity::DocumentSimilarityTool, list_datasets::ListDatasetsTool, sql::SqlTool,
-        table_schema::TableSchemaTool,
+        document_similarity::DocumentSimilarityTool, get_readiness::GetReadinessTool,
+        list_datasets::ListDatasetsTool, sql::SqlTool, table_schema::TableSchemaTool,
     },
     SpiceModelTool,
 };
@@ -31,6 +31,7 @@ use super::ToolFactory;
 
 pub struct BuiltinToolFactory {}
 
+/// Builtin tools must also be added to [`crate::tools::get_builtin_tools`] and [`crate::tools::get_builtin_tool_spec`].
 impl ToolFactory for BuiltinToolFactory {
     fn construct(
         &self,
@@ -49,6 +50,7 @@ impl ToolFactory for BuiltinToolFactory {
         let description = component.description.clone();
 
         match id {
+            "get_readiness" => Ok(Arc::new(GetReadinessTool::new(&name, description))),
             "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(&name, description))),
             "table_schema" => Ok(Arc::new(TableSchemaTool::new(&name, description))),
             "sql" => Ok(Arc::new(SqlTool::new(&name, description))),

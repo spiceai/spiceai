@@ -17,20 +17,21 @@ limitations under the License.
 use std::sync::Arc;
 
 use document_similarity::DocumentSimilarityTool;
+use get_readiness::GetReadinessTool;
 use list_datasets::ListDatasetsTool;
 use spicepod::component::tool::Tool;
 use sql::SqlTool;
 use table_schema::TableSchemaTool;
-use get_readiness::GetReadinessTool;
 
 use super::SpiceModelTool;
 
 pub mod document_similarity;
+pub mod get_readiness;
 pub mod list_datasets;
 pub mod sql;
 pub mod table_schema;
-pub mod get_readiness;
 
+// Builtin tools must also be added to [`super::factory::builtin::BuiltinToolFactory`]
 pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
     vec![
         Arc::new(DocumentSimilarityTool::default()),
@@ -41,6 +42,7 @@ pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
     ]
 }
 
+// Builtin tools must also be added to [`super::factory::builtin::BuiltinToolFactory`]
 #[must_use]
 pub fn get_builtin_tool_spec() -> Vec<Tool> {
     vec![

@@ -17,44 +17,68 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::tools::SpiceModelTool;
+use crate::Runtime;
 use async_trait::async_trait;
 use serde_json::Value;
-use spicepod::component::tool::{Tool, ToolExecutionError, ToolExecutionResult, ToolSpec};
-use crate::status::RuntimeStatus;
-use crate::tools::SpiceModelTool;
 
 pub struct GetReadinessTool {
-    runtime_status: Arc<RuntimeStatus>,
+    name: String,
+    description: Option<String>,
 }
 
 impl GetReadinessTool {
-    pub fn new(runtime_status: Arc<RuntimeStatus>) -> Self {
-        Self { runtime_status }
+    #[must_use]
+    pub fn new(name: &str, description: Option<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            description,
+        }
+    }
+}
+impl Default for GetReadinessTool {
+    fn default() -> Self {
+        Self::new(
+            "get_readiness",
+            Some("Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.".to_string()),
+        )
     }
 }
 
 #[async_trait]
 impl SpiceModelTool for GetReadinessTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "get_readiness".to_string(),
-            description: "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.".to_string(),
-            ..Default::default()
-        }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    fn parameters(&self) -> Option<Value> {
+        None
     }
 
-    async fn execute(&self, _params: HashMap<String, Value>) -> Result<ToolExecutionResult, ToolExecutionError> {
-        let statuses = self.runtime_status.get_all_statuses();
-        Ok(ToolExecutionResult::new(statuses))
+    async fn call(
+        &self,
+        arg: &str,
+        rt: Arc<Runtime>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let statuses = rt.status().get_all_statuses();
+        let statuses_map: serde_json::Map<String, Value> = statuses
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.to_string())))
+            .collect();
+        Ok(Value::Object(statuses_map))
     }
 }
 
-impl From<GetReadinessTool> for Tool {
-    fn from(tool: GetReadinessTool) -> Self {
-        Tool {
-            name: tool.spec().name,
-            description: tool.spec().description,
-            ..Default::default()
+impl From<GetReadinessTool> for spicepod::component::tool::Tool {
+    fn from(val: GetReadinessTool) -> Self {
+        spicepod::component::tool::Tool {
+            from: format!("builtin:{}", val.name()),
+            name: val.name().to_string(),
+            description: val.description().map(ToString::to_string),
+            params: HashMap::default(),
+            depends_on: Vec::default(),
         }
     }
 }
