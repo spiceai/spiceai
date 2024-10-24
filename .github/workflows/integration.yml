@@ -25,10 +25,65 @@ env:
 
 jobs:
   build:
-    name: Integration Tests
-    runs-on: ubuntu-latest-16-cores
+    name: Build Test Binary
+    runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      # Build the test binary without running tests
+      - name: Build integration test binary
+        run: |
+          TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          cp $TEST_BINARY_PATH ./integration_test
+
+      # Upload the test binary as an artifact
+      - name: Upload test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-binary
+          path: ./integration_test
+          retention-days: 1
+
+  test:
+    name: Integration Tests
+    needs: build
+    runs-on: spiceai-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      # Download the test binary artifact
+      - name: Download test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-binary
+          path: ./integration_test
+
+      - name: Mark test binary as executable
+        run: |
+          ls -l ./integration_test
+          chmod +x ./integration_test/integration_test
 
       - name: Login to ACR
         uses: docker/login-action@v3
@@ -50,17 +105,6 @@ jobs:
           docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
-
-      - name: Set up make
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
-
       - name: Set up Spice.ai API Key
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
@@ -70,7 +114,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            make test-integration
+            ./integration_test/integration_test --nocapture
           else
-            make test-integration-without-spiceai-dataset
+            ./integration_test/integration_test --nocapture --skip spiceai_integration_test
           fi
