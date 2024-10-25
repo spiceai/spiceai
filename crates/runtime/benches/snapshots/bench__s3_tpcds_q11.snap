@@ -5,14 +5,14 @@ expression: records_pretty
 +------------------+---------------------+--------------------+-----------------------------------+
 | customer_id      | customer_first_name | customer_last_name | customer_email_address            |
 +------------------+---------------------+--------------------+-----------------------------------+
-| AAAAAAAAAAAHBAAA | Mark                | Roberts            | Mark.Roberts@XnKkSX0.org          |
-| AAAAAAAAAABLAAAA | John                | Wheeler            | John.Wheeler@Dui01bXMLCQ4NX7x.com |
-| AAAAAAAAAABPAAAA | Danuta              | Mcallister         | Danuta.Mcallister@t.edu           |
-| AAAAAAAAAAFOAAAA | Eduardo             | Wilhelm            | Eduardo.Wilhelm@kPRoFT0T.com      |
-| AAAAAAAAAAICBAAA | Ronald              | Mitchell           | Ronald.Mitchell@pnQlzt0R6Sxmm.edu |
-| AAAAAAAAAAKBAAAA | Esther              | Mitchell           | Esther.Mitchell@arhtMCnshxB.edu   |
-| AAAAAAAAAAKDAAAA | Stephen             | Valdes             | Stephen.Valdes@Hv6.edu            |
-| AAAAAAAAAALGAAAA | Ryan                | Ford               | Ryan.Ford@AqLu2.com               |
-| AAAAAAAAAAOFAAAA | Hannah              | Bell               | Hannah.Bell@Rke89ZyLJ5a7o01G.com  |
-| AAAAAAAAABAPAAAA | Margaret            | Dominguez          | Margaret.Dominguez@x6HrmyI.org    |
+| AAAAAAAAAGEJAAAA | Michael             | Tolbert            | Michael.Tolbert@D8O5R.com         |
+| AAAAAAAAAGOLAAAA | Lawrence            | Reed               | Lawrence.Reed@4tUSGo1o.org        |
+| AAAAAAAAAHAGBAAA | Nilda               | Bernal             | Nilda.Bernal@afeQH6HuLAeQt.org    |
+| AAAAAAAAAHLFAAAA | Michelle            | Early              | Michelle.Early@XIPPlCYfJv.org     |
+| AAAAAAAAAIFBBAAA | Juana               | Giles              | Juana.Giles@D0JsFLeloECaxb.com    |
+| AAAAAAAAAJNGBAAA | Roger               | Kaufman            | Roger.Kaufman@rMosVj1GQS.org      |
+| AAAAAAAAAKOBBAAA | William             | Alderman           | William.Alderman@LHfDRblj.edu     |
+| AAAAAAAAALDHBAAA | Lori                | Barrett            | Lori.Barrett@XpjxdL.edu           |
+| AAAAAAAAANNNAAAA | Cindy               | Julian             | Cindy.Julian@ChEB5eyUCBe.org      |
+| AAAAAAAAAOGBAAAA | George              | Johnston           | George.Johnston@uxl3oglEmB1hA.org |
 +------------------+---------------------+--------------------+-----------------------------------+
