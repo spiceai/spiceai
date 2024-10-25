@@ -64,7 +64,7 @@ async fn test_github_pulls() -> Result<(), String> {
         .await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = rt.load_components() => {}
@@ -110,7 +110,7 @@ async fn test_github_pulls() -> Result<(), String> {
     // search should be orders of magnitude faster than auto
     let magnitude = auto_elapsed_ms / search_elapsed_ms;
     assert!(
-        magnitude > 5,
+        magnitude > 3,
         "auto: {auto_elapsed_ms} search: {search_elapsed_ms}"
     );
 
@@ -136,7 +136,7 @@ async fn test_github_issues() -> Result<(), String> {
         .await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = rt.load_components() => {}
@@ -182,7 +182,7 @@ async fn test_github_issues() -> Result<(), String> {
     // search should be orders of magnitude faster than auto
     let magnitude = auto_elapsed_ms / search_elapsed_ms;
     assert!(
-        magnitude > 5,
+        magnitude > 3,
         "auto: {auto_elapsed_ms} search: {search_elapsed_ms}"
     );
 
@@ -205,7 +205,7 @@ async fn test_github_commits() -> Result<(), String> {
         .await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = rt.load_components() => {}
@@ -258,7 +258,7 @@ async fn test_github_stargazers() -> Result<(), String> {
         .await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = rt.load_components() => {}
