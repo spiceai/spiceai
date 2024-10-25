@@ -25,7 +25,7 @@ concurrency:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: teraswitch-runners
+    runs-on: spiceai-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -38,7 +38,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "teraswitch-runners",
+                builder: "spiceai-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",

@@ -133,7 +133,18 @@ fn build_app(
     app_builder = match connector {
         "spice.ai" => Ok(crate::bench_spicecloud::build_app(app_builder)),
         // Run both S3, ABFS and any other object store benchmarks
-        "s3" | "abfs" => crate::bench_object_store::build_app(connector, app_builder, bench_name),
+        "s3" | "abfs" => {
+            // SQLite acceleration does not support default TPC-DS source scale so we use a smaller scale
+            if bench_name == "tpcds"
+                && acceleration
+                    .as_ref()
+                    .is_some_and(|a| a.engine == Some("sqlite".to_string()))
+            {
+                crate::bench_object_store::build_app(connector, app_builder, "tpcds_sf0_01")
+            } else {
+                crate::bench_object_store::build_app(connector, app_builder, bench_name)
+            }
+        }
         #[cfg(feature = "spark")]
         "spark" => Ok(crate::bench_spark::build_app(app_builder)),
         #[cfg(feature = "postgres")]
@@ -229,6 +240,60 @@ fn get_accelerator_indexes(
                         let mut indexes: HashMap<String, IndexType> = HashMap::new();
                         indexes.insert("c_phone".to_string(), IndexType::Enabled);
                         indexes.insert("c_acctbal".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
+                "tpcds_sf0_01" => match dataset {
+                    "catalog_sales" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("cs_ship_customer_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("cs_sold_date_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "customer_address" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("ca_county".to_string(), IndexType::Enabled);
+                        indexes.insert(
+                            "(ca_address_sk, ca_country, ca_state)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        Some(indexes)
+                    }
+                    "customer_demographics" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert(
+                            "(cd_demo_sk, cd_marital_status, cd_education_status)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        Some(indexes)
+                    }
+                    "date_dim" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("(d_year, d_date_sk)".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "household_demographics" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes
+                            .insert("(hd_demo_sk, hd_dep_count)".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    "store_sales" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("ss_customer_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("ss_sold_date_sk".to_string(), IndexType::Enabled);
+                        indexes.insert(
+                            "(ss_store_sk, ss_sold_date_sk, ss_sales_price, ss_net_profit)"
+                                .to_string(),
+                            IndexType::Enabled,
+                        );
+                        Some(indexes)
+                    }
+                    "web_sales" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes.insert("ws_bill_customer_sk".to_string(), IndexType::Enabled);
+                        indexes.insert("ws_sold_date_sk".to_string(), IndexType::Enabled);
                         Some(indexes)
                     }
                     _ => None,
