@@ -72,16 +72,6 @@ async fn test_github_pulls() -> Result<(), String> {
 
     let mut now = std::time::Instant::now();
 
-    let plan_results = rt
-        .datafusion()
-        .ctx
-        .sql("SELECT * FROM spiceai_pulls_auto WHERE author = 'peasee' LIMIT 10")
-        .await
-        .map_err(|e| format!("query to plan: {e}"))?
-        .collect()
-        .await
-        .map_err(|e| format!("query to results: {e}"))?;
-
     run_query_and_check_results(
         &mut rt,
         "test_spiceai_pulls_auto",
