@@ -141,7 +141,12 @@ pub trait ListingTableConnector: DataConnector {
                 let mut table_parquet_options = TableParquetOptions::new();
                 table_parquet_options
                     .set("pushdown_filters", "true")
-                    .unwrap();
+                    .map_err(|e| {
+                        crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                            dataconnector: format!("{self}"),
+                            source: Box::new(e),
+                        }
+                    })?;
                 Ok((
                     Some(Arc::new(
                         ParquetFormat::default().with_options(table_parquet_options),
@@ -163,7 +168,12 @@ pub trait ListingTableConnector: DataConnector {
                             let mut table_parquet_options = TableParquetOptions::new();
                             table_parquet_options
                                 .set("pushdown_filters", "true")
-                                .unwrap();
+                                .map_err(|e| {
+                                    crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                                        dataconnector: format!("{self}"),
+                                        source: Box::new(e),
+                                    }
+                                })?;
                             return Ok((
                                 Some(Arc::new(
                                     ParquetFormat::default().with_options(table_parquet_options),
