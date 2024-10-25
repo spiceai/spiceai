@@ -56,6 +56,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Model '{model_name}' does not exist"))]
+    ModelDoesNotExist { model_name: String },
+
     #[snafu(display("No model from {from} currently supports {task}"))]
     UnsupportedTaskForModel { from: String, task: String },
 }

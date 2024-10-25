@@ -85,7 +85,6 @@ impl EmbeddingConnector {
                 )});
             }
         }
-
         let embed_chunker_config: HashMap<String, ChunkingConfig> = dataset
             .embeddings
             .iter()
