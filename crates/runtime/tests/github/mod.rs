@@ -77,10 +77,10 @@ async fn test_github_pulls() -> Result<(), String> {
         .ctx
         .sql("SELECT * FROM spiceai_pulls_auto WHERE author = 'peasee' LIMIT 10")
         .await
-        .map_err(|e| format!("query `{query}` to plan: {e}"))?
+        .map_err(|e| format!("query to plan: {e}"))?
         .collect()
         .await
-        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+        .map_err(|e| format!("query to results: {e}"))?;
 
     run_query_and_check_results(
         &mut rt,
