@@ -82,6 +82,9 @@ pub enum Error {
     #[snafu(display("Unable to initialize metrics: {source}"))]
     UnableToInitializeMetrics { source: Box<dyn std::error::Error> },
 
+    #[snafu(display("Unable to initialize Tokio runtime: {source}"))]
+    UnableToInitializeTokioRuntime { source: std::io::Error },
+
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 }
@@ -192,7 +195,9 @@ pub async fn run(args: Args) -> Result<()> {
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
         )]))
         .with_datasets_health_monitor()
-        .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
+        .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
+        .with_tokio_servers_runtime()
+        .context(UnableToInitializeTokioRuntimeSnafu)?;
 
     if args.pods_watcher_enabled {
         let pods_watcher = PodsWatcher::new(current_dir.clone());

@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
-use tokio::sync::RwLock;
+use tokio::{runtime::Runtime as TokioRuntime, sync::RwLock};
 
 use crate::{
     dataaccelerator, dataconnector,
@@ -41,6 +41,7 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
+    tokio_servers_runtime: Option<Arc<TokioRuntime>>,
 }
 
 impl RuntimeBuilder {
@@ -55,6 +56,7 @@ impl RuntimeBuilder {
             datafusion: None,
             autoload_extensions: HashMap::new(),
             runtime_status: None,
+            tokio_servers_runtime: None,
         }
     }
 
@@ -117,6 +119,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Configures a separate Tokio runtime instance to be used by the servers.
+    /// (e.g. HTTP, Flight, etc.)
+    pub fn with_tokio_servers_runtime(mut self) -> std::io::Result<Self> {
+        self.tokio_servers_runtime = Some(Arc::new(TokioRuntime::new()?));
+        Ok(self)
+    }
+
     pub fn with_runtime_status(mut self, runtime_status: Arc<status::RuntimeStatus>) -> Self {
         self.runtime_status = Some(runtime_status);
         self
@@ -169,6 +178,7 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             status,
+            tokio_servers_runtime: self.tokio_servers_runtime,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
