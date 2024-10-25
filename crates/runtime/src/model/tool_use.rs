@@ -417,7 +417,9 @@ fn make_a_stream(
                     Ok(response) => response,
                     Err(e) => {
                         if let Err(e) = sender_clone.send(Err(e)).await {
-                            tracing::error!("Error sending error: {}", e);
+                            if !sender_clone.is_closed() {
+                                tracing::error!("Error sending error: {}", e);
+                            }
                         }
                         return;
                     }
@@ -511,7 +513,9 @@ fn make_a_stream(
                                 }
                                 Err(e) => {
                                     if let Err(e) = sender_clone.send(Err(e)).await {
-                                        tracing::error!("Error sending error: {}", e);
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending error: {}", e);
+                                        }
                                     }
                                     return;
                                 }
@@ -524,14 +528,18 @@ fn make_a_stream(
                                     while let Some(resp) = s.next().await {
                                         // TODO check if this works for choices > 1.
                                         if let Err(e) = sender_clone.send(resp).await {
-                                            tracing::error!("Error sending error: {}", e);
+                                            if !sender_clone.is_closed() {
+                                                tracing::error!("Error sending error: {}", e);
+                                            }
                                             return;
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     if let Err(e) = sender_clone.send(Err(e)).await {
-                                        tracing::error!("Error sending error: {}", e);
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending error: {}", e);
+                                        }
                                     }
                                     return;
                                 }
@@ -553,7 +561,9 @@ fn make_a_stream(
                     let mut resp2 = response.clone();
                     resp2.choices = finished_choices;
                     if let Err(e) = sender_clone.send(Ok(resp2)).await {
-                        tracing::error!("Error sending error: {}", e);
+                        if !sender_clone.is_closed() {
+                            tracing::error!("Error sending error: {}", e);
+                        }
                     }
                 }
             }
