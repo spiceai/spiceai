@@ -41,6 +41,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to create chunker: {source}"))]
+    FailedToCreateChunker {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to instantiate embedding model: {source}"))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -71,10 +76,12 @@ pub trait Embed: Sync + Send {
         Ok(())
     }
 
-    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
-        Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
-            cfg,
-        )))
+    fn chunker(&self, cfg: &ChunkingConfig) -> Result<Arc<dyn Chunker>> {
+        Ok(Arc::new(
+            RecursiveSplittingChunker::with_character_sizer(cfg)
+                .boxed()
+                .context(FailedToCreateChunkerSnafu)?,
+        ))
     }
 
     /// Returns the size of the embedding vector returned by the model. Return -1 if the size should be inferred from [`Embed::embed`] method.

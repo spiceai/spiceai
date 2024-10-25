@@ -98,7 +98,7 @@ impl Embed for TaskEmbed {
         self.vector_size
     }
 
-    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
+    fn chunker(&self, cfg: &ChunkingConfig) -> EmbedResult<Arc<dyn Chunker>> {
         self.inner.chunker(cfg)
     }
 

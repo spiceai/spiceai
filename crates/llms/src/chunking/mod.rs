@@ -13,7 +13,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use text_splitter::{Characters, ChunkCapacity, ChunkConfig, ChunkSizer};
+use snafu::ResultExt;
+use text_splitter::{Characters, ChunkCapacity, ChunkConfig, ChunkConfigError, ChunkSizer};
 use tokenizers::Tokenizer;
 
 use tiktoken_rs::{
@@ -58,11 +59,20 @@ pub struct RecursiveSplittingChunker<Sizer: ChunkSizer> {
 
 impl<Sizer: ChunkSizer> RecursiveSplittingChunker<Sizer> {
     #[must_use]
-    pub fn new(cfg: &ChunkingConfig, sizer: Sizer) -> Self {
+    pub fn try_new(cfg: &ChunkingConfig, sizer: Sizer) -> Result<Self, ChunkConfigError> {
         let cfg_with_overlap: ChunkConfig<Sizer> =
             ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
                 .with_trim(cfg.trim_whitespace)
-                .with_sizer(sizer);
+                .with_sizer(sizer)
+                .with_overlap(cfg.overlap_size)
+                .map_err(|e| {
+                    tracing::warn!(
+                "Cannot have overlap ({overlap}) >= target_chunk_size ({target_chunk_size})",
+                overlap = cfg.overlap_size,
+                target_chunk_size = cfg.target_chunk_size
+            );
+                    e
+                })?;
 
         let splitter = match cfg.file_format {
             Some("md" | ".md" | "mdx" | ".mdx") => {
@@ -71,14 +81,14 @@ impl<Sizer: ChunkSizer> RecursiveSplittingChunker<Sizer> {
             _ => Splitter::Text(text_splitter::TextSplitter::new(cfg_with_overlap)),
         };
 
-        Self { splitter }
+        Ok(Self { splitter })
     }
 }
 
 impl RecursiveSplittingChunker<Characters> {
     #[must_use]
-    pub fn with_character_sizer(cfg: &ChunkingConfig) -> Self {
-        Self::new(cfg, Characters)
+    pub fn with_character_sizer(cfg: &ChunkingConfig) -> Result<Self, ChunkConfigError> {
+        Self::try_new(cfg, Characters)
     }
 }
 
@@ -99,24 +109,23 @@ impl From<Arc<Tokenizer>> for TokenizerWrapper {
 
 impl RecursiveSplittingChunker<TokenizerWrapper> {
     #[must_use]
-    pub fn with_tokenizer_sizer(cfg: &ChunkingConfig, tokenizer: Arc<Tokenizer>) -> Self {
-        Self::new(cfg, tokenizer.into())
+    pub fn with_tokenizer_sizer(
+        cfg: &ChunkingConfig,
+        tokenizer: Arc<Tokenizer>,
+    ) -> Result<Self, ChunkConfigError> {
+        Self::try_new(cfg, tokenizer.into())
     }
 }
 
 impl RecursiveSplittingChunker<CoreBPE> {
-    #[must_use]
-    pub fn for_openai_model(model_id: &str, cfg: &ChunkingConfig) -> Option<Self> {
-        match get_bpe_from_tokenizer(get_tokenizer(model_id).unwrap_or(OpenAITokenizer::Cl100kBase))
-        {
-            Ok(tok) => Some(Self::new(cfg, tok)),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get BPE tokenizer for OpenAI model {model_id}. Error: {e}."
-                );
-                None
-            }
-        }
+    pub fn for_openai_model(
+        model_id: &str,
+        cfg: &ChunkingConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let bpe =
+            get_bpe_from_tokenizer(get_tokenizer(model_id).unwrap_or(OpenAITokenizer::Cl100kBase))
+                .map_err(|e| format!("Could not create BPE tokenizer: {e:?}"))?;
+        Self::try_new(cfg, bpe).boxed()
     }
 }
 
@@ -162,9 +171,56 @@ mod tests {
                 "target_chunk_size",
                 ": 3",
                 "overlap_size:",
-                "1"
+                ": 1"
             ]
         );
+    }
+
+    #[test]
+    fn test_tokenizer_chunker() {
+        let cfg = ChunkingConfig {
+            target_chunk_size: 3,
+            overlap_size: 1,
+            trim_whitespace: true,
+            file_format: None,
+        };
+
+        let tok = Arc::new(
+            Tokenizer::from_file(
+                "/Users/jeadie/Github/spiceai/models/embed/BAAI/bge-small-en-v1.5/tokenizer.json",
+            )
+            .expect("Failed to load tokenizer from file"),
+        );
+        let chunker = RecursiveSplittingChunker::with_tokenizer_sizer(&cfg, Arc::clone(&tok))
+            .expect("failed to create chunker");
+
+        let chunks: Vec<_> = chunker
+            .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")
+            .collect();
+
+        assert_eq!(
+            chunks,
+            vec![
+                "let cfg",
+                "=",
+                "ChunkingCon",
+                "Config",
+                "{",
+                "target_chunk",
+                "nk_size",
+                ": 3",
+                "overlap_size",
+                ": 1"
+            ]
+        );
+        for c in chunks {
+            let s = tok.size(c);
+            assert!(
+                tok.size(c) <= 3,
+                "Chunk='{c}' has {s} tokens, but it should have <= {}",
+                cfg.target_chunk_size
+            );
+        }
     }
 
     #[test]
@@ -176,7 +232,8 @@ mod tests {
             file_format: Some("md"),
         };
 
-        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg);
+        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg)
+            .expect("failed to create chunker");
         assert!(matches!(chunker.splitter, Splitter::Markdown(_)));
     }
 }
