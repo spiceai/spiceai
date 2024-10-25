@@ -1,0 +1,11 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++---------------------+------------------+------------+-----------+
+| w_warehouse_name    | i_item_id        | inv_before | inv_after |
++---------------------+------------------+------------+-----------+
+| Conventional childr | AAAAAAAAHDAAAAAA | 2171       | 2759      |
+| Conventional childr | AAAAAAAAMBAAAAAA | 2427       | 2495      |
+| Conventional childr | AAAAAAAAPKAAAAAA | 2319       | 2866      |
++---------------------+------------------+------------+-----------+

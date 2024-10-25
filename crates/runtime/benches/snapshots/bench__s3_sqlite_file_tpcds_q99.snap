@@ -1,0 +1,14 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name  | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
+| Conventional childr                                   | EXPRESS   | NY Metro | 241     | 271        | 261        | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | NY Metro | 178     | 185        | 178        | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | NY Metro | 274     | 244        | 267        | 0           | 0         |
+| Conventional childr                                   | OVERNIGHT | NY Metro | 201     | 177        | 199        | 0           | 0         |
+| Conventional childr                                   | REGULAR   | NY Metro | 183     | 199        | 194        | 0           | 0         |
+| Conventional childr                                   | TWO DAY   | NY Metro | 182     | 173        | 191        | 0           | 0         |
++-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+

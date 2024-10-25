@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+---------------+-----------------+------------------+---------+-----------+
+| c_last_name | c_first_name | ca_city       | bought_city     | ss_ticket_number | amt     | profit    |
++-------------+--------------+---------------+-----------------+------------------+---------+-----------+
+| Adams       | Chris        | Spring Hill   | Lakeview        | 114              | 428.59  | -2260.63  |
+| Adams       | Chris        | Spring Hill   | Pleasant Valley | 1908             | 1336.67 | -11872.45 |
+| Aguilar     | Roy          | Montpelier    | Green Acres     | 614              | 1271.18 | -3249.77  |
+| Anderson    | Marc         | Martinsville  | Marion          | 1559             | 1579.93 | -21411.41 |
+| Archie      | Geneva       | Enterprise    | Lakeview        | 89               | 2578.22 | -10494.29 |
+| Bass        | Valerie      | Woodland      | Crossroads      | 1750             | 5324.08 | -9542.73  |
+| Beyer       | Laurence     | Lakeview      | Five Points     | 51               | 43.34   | -4263.18  |
+| Boles       | Eduardo      | Shady Grove   | Montezuma       | 416              | 490.32  | 209.20    |
+| Boone       | Charles      | Highland Park | Pleasant Valley | 1967             | 103.69  | -12151.37 |
+| Booth       | Melva        | Crossroads    | Pleasant Valley | 1822             | 2963.03 | -1365.61  |
++-------------+--------------+---------------+-----------------+------------------+---------+-----------+
