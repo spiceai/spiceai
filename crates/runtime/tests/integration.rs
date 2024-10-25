@@ -35,6 +35,7 @@ mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod federation;
+mod github;
 mod graphql;
 #[cfg(feature = "mysql")]
 mod mysql;

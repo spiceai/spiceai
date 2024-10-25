@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT * FROM spiceai_issues_auto WHERE author = 'peasee'"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                       |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                                                         |
+|               |   Filter: spiceai_issues_auto.author = Utf8("peasee")                                                                                                                                                      |
+|               |     TableScan: spiceai_issues_auto projection=[id, number, title, url, author, body, created_at, updated_at, closed_at, state, milestone_id, milestone_title, labels, comments_count, comments, assignees] |
+| physical_plan | BytesProcessedExec                                                                                                                                                                                         |
+|               |   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                              |
+|               |     FilterExec: author@4 = peasee                                                                                                                                                                          |
+|               |       MemoryExec: partitions=11, partition_sizes=[100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 84]                                                                                                    |
+|               |                                                                                                                                                                                                            |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

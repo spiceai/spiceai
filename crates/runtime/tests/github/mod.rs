@@ -1,0 +1,291 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use app::AppBuilder;
+
+use arrow::array::RecordBatch;
+use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
+use async_graphql::{Object, Schema};
+use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use axum::{routing::post, Extension, Router};
+use runtime::{status, Runtime};
+use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use tokio::net::TcpListener;
+
+use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
+
+fn make_github_dataset(owner: &str, repo: &str, query_type: &str, query_mode: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        format!("github:github.com/{owner}/{repo}/{query_type}"),
+        format!("{repo}_{query_type}_{query_mode}"),
+    );
+    let params = HashMap::from([
+        ("github_query_mode".to_string(), query_mode.to_string()),
+        (
+            "github_token".to_string(),
+            "${secrets:GITHUB_TOKEN}".to_string(),
+        ),
+    ]);
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset
+}
+
+#[tokio::test]
+async fn test_github_pulls() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let app = AppBuilder::new("github_integration_test")
+        .with_dataset(make_github_dataset("spiceai", "spiceai", "pulls", "auto"))
+        .with_dataset(make_github_dataset("spiceai", "spiceai", "pulls", "search"))
+        .build();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .with_runtime_status(status)
+        .build()
+        .await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return Err("Timed out waiting for datasets to load".to_string());
+        }
+        () = rt.load_components() => {}
+    }
+
+    let mut now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_spiceai_pulls_auto",
+        "SELECT * FROM spiceai_pulls_auto WHERE author = 'peasee'",
+        Some(Box::new(|result_batches| {
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+            }
+        })),
+    )
+    .await?;
+
+    let auto_elapsed = now.elapsed();
+    now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_spiceai_pulls_search",
+        "SELECT * FROM spiceai_pulls_search WHERE author = 'peasee'",
+        Some(Box::new(|result_batches| {
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+            }
+        })),
+    )
+    .await?;
+
+    let search_elapsed = now.elapsed();
+    let auto_elapsed_ms = auto_elapsed.as_millis();
+    let search_elapsed_ms = search_elapsed.as_millis();
+
+    // search should be orders of magnitude faster than auto
+    let magnitude = auto_elapsed_ms / search_elapsed_ms;
+    assert!(
+        magnitude > 5,
+        "auto: {auto_elapsed_ms} search: {search_elapsed_ms}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_github_issues() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let app = AppBuilder::new("github_integration_test")
+        .with_dataset(make_github_dataset("spiceai", "spiceai", "issues", "auto"))
+        .with_dataset(make_github_dataset(
+            "spiceai", "spiceai", "issues", "search",
+        ))
+        .build();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .with_runtime_status(status)
+        .build()
+        .await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return Err("Timed out waiting for datasets to load".to_string());
+        }
+        () = rt.load_components() => {}
+    }
+
+    let mut now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_spiceai_issues_auto",
+        "SELECT * FROM spiceai_issues_auto WHERE author = 'peasee'",
+        Some(Box::new(|result_batches| {
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+            }
+        })),
+    )
+    .await?;
+
+    let auto_elapsed = now.elapsed();
+    now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_spiceai_issues_search",
+        "SELECT * FROM spiceai_issues_search WHERE author = 'peasee'",
+        Some(Box::new(|result_batches| {
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+            }
+        })),
+    )
+    .await?;
+
+    let search_elapsed = now.elapsed();
+    let auto_elapsed_ms = auto_elapsed.as_millis();
+    let search_elapsed_ms = search_elapsed.as_millis();
+
+    // search should be orders of magnitude faster than auto
+    let magnitude = auto_elapsed_ms / search_elapsed_ms;
+    assert!(
+        magnitude > 5,
+        "auto: {auto_elapsed_ms} search: {search_elapsed_ms}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_github_commits() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let app = AppBuilder::new("github_integration_test")
+        .with_dataset(make_github_dataset("spiceai", "spiceai", "commits", "auto"))
+        .build();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .with_runtime_status(status)
+        .build()
+        .await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return Err("Timed out waiting for datasets to load".to_string());
+        }
+        () = rt.load_components() => {}
+    }
+
+    let now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_spiceai_commits_auto",
+        "SELECT * FROM spiceai_commits_auto LIMIT 10",
+        Some(Box::new(|result_batches| {
+            let mut row_count = 0;
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 10, "num_cols: {}", batch.num_columns());
+                row_count += batch.num_rows();
+            }
+            assert_eq!(row_count, 10, "num_rows: {row_count}");
+        })),
+    )
+    .await?;
+
+    let elapsed = now.elapsed().as_secs();
+
+    // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
+    assert!(elapsed < 15, "elapsed: {elapsed}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_github_stargazers() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let app = AppBuilder::new("github_integration_test")
+        .with_dataset(make_github_dataset(
+            "spiceai",
+            "spiceai",
+            "stargazers",
+            "auto",
+        ))
+        .build();
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
+    let mut rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .with_runtime_status(status)
+        .build()
+        .await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return Err("Timed out waiting for datasets to load".to_string());
+        }
+        () = rt.load_components() => {}
+    }
+
+    let now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_spiceai_stargazers_auto",
+        "SELECT * FROM spiceai_stargazers_auto LIMIT 10",
+        Some(Box::new(|result_batches| {
+            let mut row_count = 0;
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 9, "num_cols: {}", batch.num_columns());
+                row_count += batch.num_rows();
+            }
+            assert_eq!(row_count, 10, "num_rows: {row_count}");
+        })),
+    )
+    .await?;
+
+    let elapsed = now.elapsed().as_secs();
+
+    // LIMIT should stop this query from retrieving every stargazer, so it shouldn't take that long
+    assert!(elapsed < 15, "elapsed: {elapsed}");
+
+    Ok(())
+}
