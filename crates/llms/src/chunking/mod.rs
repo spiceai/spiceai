@@ -58,20 +58,18 @@ pub struct RecursiveSplittingChunker<Sizer: ChunkSizer> {
 }
 
 impl<Sizer: ChunkSizer> RecursiveSplittingChunker<Sizer> {
-    #[must_use]
     pub fn try_new(cfg: &ChunkingConfig, sizer: Sizer) -> Result<Self, ChunkConfigError> {
         let cfg_with_overlap: ChunkConfig<Sizer> =
             ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
                 .with_trim(cfg.trim_whitespace)
                 .with_sizer(sizer)
                 .with_overlap(cfg.overlap_size)
-                .map_err(|e| {
+                .inspect_err(|_| {
                     tracing::warn!(
                 "Cannot have overlap ({overlap}) >= target_chunk_size ({target_chunk_size})",
                 overlap = cfg.overlap_size,
                 target_chunk_size = cfg.target_chunk_size
             );
-                    e
                 })?;
 
         let splitter = match cfg.file_format {
@@ -86,7 +84,6 @@ impl<Sizer: ChunkSizer> RecursiveSplittingChunker<Sizer> {
 }
 
 impl RecursiveSplittingChunker<Characters> {
-    #[must_use]
     pub fn with_character_sizer(cfg: &ChunkingConfig) -> Result<Self, ChunkConfigError> {
         Self::try_new(cfg, Characters)
     }
@@ -108,7 +105,6 @@ impl From<Arc<Tokenizer>> for TokenizerWrapper {
 }
 
 impl RecursiveSplittingChunker<TokenizerWrapper> {
-    #[must_use]
     pub fn with_tokenizer_sizer(
         cfg: &ChunkingConfig,
         tokenizer: Arc<Tokenizer>,
@@ -174,53 +170,6 @@ mod tests {
                 ": 1"
             ]
         );
-    }
-
-    #[test]
-    fn test_tokenizer_chunker() {
-        let cfg = ChunkingConfig {
-            target_chunk_size: 3,
-            overlap_size: 1,
-            trim_whitespace: true,
-            file_format: None,
-        };
-
-        let tok = Arc::new(
-            Tokenizer::from_file(
-                "/Users/jeadie/Github/spiceai/models/embed/BAAI/bge-small-en-v1.5/tokenizer.json",
-            )
-            .expect("Failed to load tokenizer from file"),
-        );
-        let chunker = RecursiveSplittingChunker::with_tokenizer_sizer(&cfg, Arc::clone(&tok))
-            .expect("failed to create chunker");
-
-        let chunks: Vec<_> = chunker
-            .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")
-            .collect();
-
-        assert_eq!(
-            chunks,
-            vec![
-                "let cfg",
-                "=",
-                "ChunkingCon",
-                "Config",
-                "{",
-                "target_chunk",
-                "nk_size",
-                ": 3",
-                "overlap_size",
-                ": 1"
-            ]
-        );
-        for c in chunks {
-            let s = tok.size(c);
-            assert!(
-                tok.size(c) <= 3,
-                "Chunk='{c}' has {s} tokens, but it should have <= {}",
-                cfg.target_chunk_size
-            );
-        }
     }
 
     #[test]
