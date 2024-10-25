@@ -21,6 +21,9 @@ spec:
       annotations:
         checksum/spicepod: {{ toYaml .Values.spicepod | sha256sum }}
     spec:
+      {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "spiceai.serviceAccountName" . }}
+      {{- end }}
       {{- if .Values.imagePullSecrets }}
       imagePullSecrets: {{ toYaml .Values.imagePullSecrets | nindent 8 }}
       {{- end }}
