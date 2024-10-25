@@ -2,17 +2,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name }}
   labels:
+    {{- include "spiceai.labels" . | indent 4 }}
     app: {{ .Release.Name }}
+  name: {{ template "spiceai.fullname" .  }}
+  namespace: {{ template "spiceai.namespace" . }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
+      {{- include "spiceai.selectorLabels" . | indent 6 }}
       app: {{ .Release.Name }}
   template:
     metadata:
       labels:
+        {{- include "spiceai.labels" . | indent 8 }}
         app: {{ .Release.Name }}
       annotations:
         checksum/spicepod: {{ toYaml .Values.spicepod | sha256sum }}
@@ -89,23 +93,4 @@ spec:
         {{- end }}
         - name: spiceai-config-volume
           configMap:
-            name: {{ .Release.Name }}-config
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .Release.Name }}
-  labels:
-    app: {{ .Release.Name }}
-spec:
-  ports:
-    - port: 8090
-      name: http
-    - port: 9090
-      name: metrics
-    - port: 50051
-      name: flight
-    - port: 50052
-      name: otel
-  selector:
-    app: {{ .Release.Name }}
+            name: {{ template "spiceai.fullname" .  }}-spicepod

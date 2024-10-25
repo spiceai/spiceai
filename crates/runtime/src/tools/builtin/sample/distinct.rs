@@ -16,7 +16,10 @@ limitations under the License.
 use arrow::array::{ArrayRef, RecordBatch};
 use datafusion::sql::TableReference;
 use itertools::Itertools;
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use crate::datafusion::{query::Protocol, DataFusion};
 use arrow::compute::concat;
@@ -37,6 +40,15 @@ pub struct DistinctColumnsParams {
 
     /// The columns to sample distinct values from. If None, all columns are sampled.
     pub cols: Option<Vec<String>>,
+}
+
+impl Display for DistinctColumnsParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(s) => write!(f, "{s}"),
+            Err(_) => Err(std::fmt::Error),
+        }
+    }
 }
 
 impl DistinctColumnsParams {

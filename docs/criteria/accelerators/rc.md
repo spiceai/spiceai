@@ -55,3 +55,4 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 
 - [ ] Documentation includes all known issues/limitations for the accelerator.
 - [ ] Documentation includes any exceptions made to allow this accelerator to reach RC quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [ ] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).
