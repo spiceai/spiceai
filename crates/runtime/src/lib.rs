@@ -35,7 +35,7 @@ use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
 use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use dataconnector::local::LocalConnector;
+use dataconnector::localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR};
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
@@ -710,14 +710,14 @@ impl Runtime {
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
 
-        // Separate datasets into local and non-local
-        let (local_datasets, non_local_datasets): (Vec<_>, Vec<_>) = initialized_datasets
+        // Separate datasets into localpod and non-localpod
+        let (localpod_datasets, non_localpod_datasets): (Vec<_>, Vec<_>) = initialized_datasets
             .into_iter()
-            .partition(|ds| ds.source() == "local");
+            .partition(|ds| ds.source() == LOCALPOD_DATACONNECTOR);
         let mut futures = vec![];
 
-        // Load non-local datasets first in parallel
-        for ds in non_local_datasets {
+        // Load non-localpod datasets first in parallel
+        for ds in non_localpod_datasets {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             futures.push(self.load_dataset(ds));
@@ -730,8 +730,8 @@ impl Runtime {
             let _ = join_all(futures).await;
         }
 
-        // Load local datasets
-        for ds in local_datasets {
+        // Load localpod datasets
+        for ds in localpod_datasets {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             self.load_dataset(ds).await;
@@ -1177,9 +1177,9 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let secret_map = self.get_params_with_secrets(&params).await;
 
-        // Unlike most other data connectors, the local connector needs a reference to the current DataFusion instance.
-        if source == "local" {
-            return Ok(Arc::new(LocalConnector::new(Arc::clone(&self.df))));
+        // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
+        if source == LOCALPOD_DATACONNECTOR {
+            return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
         match dataconnector::create_new_connector(source, secret_map, self.secrets(), metadata)

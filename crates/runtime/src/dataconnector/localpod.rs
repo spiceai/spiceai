@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Data connector that reads from datasets already registered in Spice.
+//! Data connector that reads from datasets already registered in the current Spicepod.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -27,12 +27,14 @@ use crate::component::dataset::Dataset;
 use crate::datafusion::DataFusion;
 use crate::DataConnector;
 
+pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
+
 #[derive(Clone)]
-pub struct LocalConnector {
+pub struct LocalPodConnector {
     datafusion: Arc<DataFusion>,
 }
 
-impl LocalConnector {
+impl LocalPodConnector {
     #[must_use]
     pub fn new(datafusion: Arc<DataFusion>) -> Self {
         Self { datafusion }
@@ -40,7 +42,7 @@ impl LocalConnector {
 }
 
 #[async_trait]
-impl DataConnector for LocalConnector {
+impl DataConnector for LocalPodConnector {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -53,7 +55,7 @@ impl DataConnector for LocalConnector {
         let path_table_ref = TableReference::parse_str(&path);
         self.datafusion.get_table(&path_table_ref).await.ok_or(
             super::DataConnectorError::InvalidTableName {
-                dataconnector: "local".to_string(),
+                dataconnector: LOCALPOD_DATACONNECTOR.to_string(),
                 dataset_name: dataset.name.to_string(),
                 table_name: path_table_ref.to_string(),
             },
