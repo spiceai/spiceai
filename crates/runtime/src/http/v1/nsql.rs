@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::ArrowFormat;
@@ -88,7 +89,9 @@ async fn sample_messages(
                 limit: 3,
             }),
         ] {
-            let (req, resp) = call_sample_and_create_messages(Arc::clone(&df), &params).await?;
+            let (req, resp) = call_sample_and_create_messages(Arc::clone(&df), &params)
+                .instrument(Span::current())
+                .await?;
             messages.push(req.into());
             messages.push(resp.into());
         }
@@ -107,6 +110,7 @@ async fn schema_messages(
 
     let table_schemas = schema_tool
         .get_schema(Arc::clone(&df), &schema_tool_params)
+        .instrument(Span::current())
         .await?;
     let table_schema_assistant_msg = schema_tool
         .to_assistant_request_message("schemas-nsql", &schema_tool_params)
@@ -135,6 +139,7 @@ async fn call_sample_and_create_messages(
     let ds = params.dataset();
     let result = SampleDataTool::new(params.into())
         .call_with(params, Arc::clone(&df))
+        .instrument(Span::current())
         .await?;
 
     let req = ChatCompletionRequestAssistantMessageArgs::default()
@@ -200,7 +205,10 @@ pub(crate) async fn post(
         .unwrap_or(df.get_user_table_names());
 
     // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
-    let schema_messages = match schema_messages(Arc::clone(&df), &tables).await {
+    let schema_messages = match schema_messages(Arc::clone(&df), &tables)
+        .instrument(span.clone())
+        .await
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Error getting schema messages: {e}");
@@ -210,7 +218,10 @@ pub(crate) async fn post(
 
     // Create sample data assistant/tool messages if user wants to sample from dataset(s).
     let tool_use_messages = if payload.sample_data_enabled {
-        match sample_messages(&tables, Arc::clone(&df)).await {
+        match sample_messages(&tables, Arc::clone(&df))
+            .instrument(span.clone())
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("Error sampling datasets for NSQL messages: {e}");
