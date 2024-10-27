@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::array::{ArrayRef, RecordBatch};
-use datafusion::sql::TableReference;
+use datafusion::{common::utils::quote_identifier, sql::TableReference};
 use itertools::Itertools;
 use std::{
     fmt::{Display, Formatter},
@@ -58,8 +58,8 @@ impl DistinctColumnsParams {
     ///  - If `d >= n`, `n` distinct values are sampled, but no guarantee on which rows are returned.
     async fn sample_distinct_from_column(
         df: Arc<DataFusion>,
-        tbl: &TableReference,
-        col: &str,
+        table: &TableReference,
+        column: &str,
         n: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure that we still get `n` rows when `len(distinct(col)) < n`, whilst
@@ -75,7 +75,9 @@ impl DistinctColumnsParams {
                 FROM {tbl}
             ) combined
             ORDER BY priority, {col}
-            LIMIT {n}"
+            LIMIT {n}",
+                col = quote_identifier(column),
+                tbl = table.to_quoted_string(),
             ),
         )
         .await

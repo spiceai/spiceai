@@ -55,7 +55,7 @@ impl SampleFrom for RandomSampleParams {
                 &format!(
                     "SELECT * FROM {tbl} LIMIT {limit}",
                     limit = self.limit,
-                    tbl = self.tbl
+                    tbl = self.tbl,
                 ),
                 Protocol::Internal,
             )
