@@ -103,7 +103,7 @@ async fn schema_messages(
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
     let schema_tool = TableSchemaTool::default();
     let schema_tool_params =
-        TableSchemaToolParams::new(tables.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>());
 
     let table_schemas = schema_tool
         .get_schema(Arc::clone(&df), &schema_tool_params)
