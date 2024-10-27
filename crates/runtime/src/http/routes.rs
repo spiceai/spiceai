@@ -102,7 +102,7 @@ async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
 
     let response = next.run(req).await;
 
-    let latency = start.elapsed().as_secs_f64();
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let status = response.status().as_u16().to_string();
 
     let labels = [
@@ -112,7 +112,7 @@ async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
     ];
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
-    metrics::REQUESTS_DURATION_SECONDS.record(latency, &labels);
+    metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
     response
 }
