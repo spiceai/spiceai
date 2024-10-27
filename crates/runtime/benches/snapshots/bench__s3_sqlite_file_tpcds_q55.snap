@@ -1,0 +1,9 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++----------+---------------------+-----------+
+| brand_id | brand               | ext_price |
++----------+---------------------+-----------+
+| 9015008  | scholarunivamalg #8 | 25131.36  |
++----------+---------------------+-----------+

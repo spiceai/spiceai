@@ -1,0 +1,13 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+--------------+-------------------+----------+--------+---------------+---------------+------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | ca_street_number | ca_street_name | ca_street_type | ca_suite_number | ca_city      | ca_county         | ca_state | ca_zip | ca_country    | ca_gmt_offset | ca_location_type | ctr_total_return |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+--------------+-------------------+----------+--------+---------------+---------------+------------------+------------------+
+| AAAAAAAACNAAAAAA | Ms.          | Diane        | Blount      | 730              | 4th Church     | Ln             | Suite B         | Stringtown   | Montgomery County | TX       | 70162  | United States | -6.00         | single family    | 1992.70          |
+| AAAAAAAADIAAAAAA | Mrs.         | Christine    | Walton      | 992              | View Ash       | Parkway        | Suite J         | Forest Hills | Hall County       | TX       | 79237  | United States | -6.00         | single family    | 1318.09          |
+| AAAAAAAAEMDAAAAA | Dr.          | Aline        | Ramos       | 594              | Cherry Main    | Road           | Suite R         | Newport      | Montgomery County | TX       | 71521  | United States | -6.00         | single family    | 1584.16          |
+| AAAAAAAAJKCAAAAA | Ms.          | Rochel       | Smith       | 858              | Sunset Main    | Way            | Suite 320       | Enterprise   | Hardin County     | TX       | 71757  | United States | -6.00         | single family    | 5193.11          |
+| AAAAAAAANIDAAAAA | Miss         | Andra        | Hailey      | 470              | Jefferson      | Parkway        | Suite 180       | Riverside    | Hutchinson County | TX       | 79231  | United States | -6.00         | condo            | 278.37           |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+--------------+-------------------+----------+--------+---------------+---------------+------------------+------------------+

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+-----------------+--------------+------------------+----------------+--------------+------------+
+| c_last_name | c_first_name | ca_city         | bought_city  | ss_ticket_number | extended_price | extended_tax | list_price |
++-------------+--------------+-----------------+--------------+------------------+----------------+--------------+------------+
+| Batson      | Gina         | Hopewell        | Rankin       | 1347             | 16088.73       | 493.53       | 34692.87   |
+| Berry       | Nancy        | Pleasant Valley | Mount Vernon | 2352             | 16653.06       | 844.01       | 32011.82   |
+| Betz        | Bruce        | Altamont        | Lewisburg    | 182              | 12086.78       | 380.32       | 39598.13   |
+| Butler      | Jay          | Oakdale         | Riverview    | 1124             | 28497.54       | 1508.43      | 46444.94   |
+| Chapa       | Marilyn      | Woodlawn        | Maple Grove  | 2372             | 18919.89       | 760.49       | 42509.68   |
+| Clemons     | Sarah        | Summit          | Macedonia    | 1286             | 12770.98       | 437.55       | 29972.51   |
+| Foster      |              | Oak Ridge       | Five Forks   | 1167             | 9921.97        | 440.34       | 22954.42   |
+| Gilmore     | Raymond      | Centerville     | Riverview    | 1714             | 10894.52       | 378.16       | 20085.94   |
+| Hernandez   | Rachel       | Greenwood       | Harmony      | 1864             | 32529.65       | 1395.73      | 53606.11   |
+| Marcum      | Issac        | Green Acres     | Enterprise   | 2102             | 21845.11       | 1284.43      | 47769.79   |
++-------------+--------------+-----------------+--------------+------------------+----------------+--------------+------------+
