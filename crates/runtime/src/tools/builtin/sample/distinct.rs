@@ -58,7 +58,7 @@ impl DistinctColumnsParams {
     ///  - If `d >= n`, `n` distinct values are sampled, but no guarantee on which rows are returned.
     async fn sample_distinct_from_column(
         df: Arc<DataFusion>,
-        table: &TableReference,
+        tbl: &TableReference,
         column: &str,
         n: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
@@ -76,8 +76,7 @@ impl DistinctColumnsParams {
             ) combined
             ORDER BY priority, {col}
             LIMIT {n}",
-                col = quote_identifier(column),
-                tbl = table.to_quoted_string(),
+                col = quote_identifier(column)
             ),
         )
         .await

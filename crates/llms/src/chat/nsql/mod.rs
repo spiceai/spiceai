@@ -26,7 +26,6 @@ pub trait SqlGeneration: Sync + Send {
         &self,
         model_id: &str,
         query: &str,
-        create_table_statements: &[String],
     ) -> Result<CreateChatCompletionRequest, OpenAIError>;
 
     fn parse_response(
@@ -37,10 +36,9 @@ pub trait SqlGeneration: Sync + Send {
 
 /// Default system prompt for SQL code generation.
 #[must_use]
-pub fn create_prompt(query: &str, create_table_statements: &[String]) -> String {
+pub fn create_prompt(query: &str) -> String {
     format!(
-        "```SQL\n{table_create_schemas}```\nTask: Write a postgres SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional.",
-        table_create_schemas=create_table_statements.join("\n")
+        r#"Task: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional. Columns with capitals must be quoted. For tables with schemas and catalogs '"catalog"."schema"."table"' not '"catalog.schema.table"'."#
     )
 }
 
@@ -50,18 +48,12 @@ mod tests {
     use default::DefaultSqlGeneration;
 
     use super::*;
-
-    static CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS documents (
-        location VARCHAR NOT NULL,
-        content TEXT NOT NULL
-    );";
-
     static MODEL_ID: &str = "model_id";
 
     #[test]
     fn test_default_create_request_for_query() {
         let req = DefaultSqlGeneration {}
-            .create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()])
+            .create_request_for_query(MODEL_ID, "SELECT * FROM table")
             .expect("failed to create request");
         let req_str = serde_json::to_string_pretty(&req).expect("failed to serialize");
 
@@ -71,7 +63,7 @@ mod tests {
     #[test]
     fn test_json_create_request_for_query() {
         let req = json::JsonSchemaSqlGeneration {}
-            .create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()])
+            .create_request_for_query(MODEL_ID, "SELECT * FROM table")
             .expect("failed to create request");
         let req_str = serde_json::to_string_pretty(&req).expect("failed to serialize");
 
@@ -81,7 +73,7 @@ mod tests {
     #[test]
     fn test_structured_output_create_request_for_query() {
         let req = structured_output::StructuredOutputSqlGeneration {}
-            .create_request_for_query(MODEL_ID, "SELECT * FROM table", &[CREATE_TABLE.to_string()])
+            .create_request_for_query(MODEL_ID, "SELECT * FROM table")
             .expect("failed to create request");
         let req_str = serde_json::to_string_pretty(&req).expect("failed to serialize");
 
