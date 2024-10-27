@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 
 use opentelemetry::{
     global,
-    metrics::{Counter, Histogram, Meter},
+    metrics::{Counter, Meter},
 };
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("query"));
