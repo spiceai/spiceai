@@ -6,6 +6,10 @@ image:
   tag: 0.19.2-beta
 replicaCount: 1
 
+service:
+  type: null
+  additionalAnnotations: {}
+
 serviceAccount:
   # Specifies whether a ServiceAccount should be created
   create: false
