@@ -153,19 +153,20 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if repl_flight_endpoint == "http://localhost:50051" {
             repl_flight_endpoint = "https://localhost:50051".to_string();
         }
-        Channel::from_shared(repl_flight_endpoint)?
+        Channel::from_shared(repl_flight_endpoint.clone())?
             .tls_config(client_tls_config)?
             .connect()
             .await
     } else {
-        Channel::from_shared(repl_flight_endpoint)?.connect().await
+        Channel::from_shared(repl_flight_endpoint.clone())?
+            .connect()
+            .await
     };
 
     // Set up the Flight client
-    let spice_endpoint = repl_config.http_endpoint.clone();
     let channel = channel.map_err(|_err| {
         Box::<dyn Error>::from(format!(
-            "Unable to connect to spiced at {spice_endpoint}. Is it running?"
+            "Unable to connect to spiced at {repl_flight_endpoint}. Is it running?"
         ))
     })?;
 
