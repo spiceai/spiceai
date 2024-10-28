@@ -404,7 +404,7 @@ pub fn error_checker(
     if let Some(true) = rate_limited {
         // A secondary rate limit was exceeded
         return Err(graphql::Error::RateLimited {
-            message: "GitHub GraphQL API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
+            message: "GitHub API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
         });
     }
 
@@ -417,7 +417,7 @@ pub fn error_checker(
             .unwrap_or(1);
         if ratelimit_remaining == 0 {
             return Err(graphql::Error::RateLimited {
-                message: "GitHub GraphQL API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
+                message: "GitHub API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
             });
         }
     }
