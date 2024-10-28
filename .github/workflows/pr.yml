@@ -32,39 +32,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set base and head refs
-        id: set_refs
-        run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "base_ref=${{ github.base_ref }}" >> $GITHUB_OUTPUT
-            echo "base_sha=$(git rev-parse origin/${{ github.base_ref }})" >> $GITHUB_OUTPUT
-            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
-            echo "base_ref=${{ github.event.merge_group.base_ref }}" >> $GITHUB_OUTPUT
-            echo "base_sha=${{ github.event.merge_group.base_sha }}" >> $GITHUB_OUTPUT
-            echo "head_sha=${{ github.event.merge_group.head_sha }}" >> $GITHUB_OUTPUT
-          else
-            echo "base_ref=${{ github.event.inputs.base_ref }}" >> $GITHUB_OUTPUT
-            echo "base_sha=$(git rev-parse origin/${{ github.event.inputs.base_ref }})" >> $GITHUB_OUTPUT
-            echo "head_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Fetch base branch
-        run: git fetch origin ${{ steps.set_refs.outputs.base_ref }}
+      - name: Detect all code changes
+        id: changed-code-files
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code_changes:
+              - 'crates/**'
+              - 'bin/**'
+              - 'test/**'
+              - 'install/**'
+              - '.github/workflows/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'go.mod'
+              - 'go.sum'
 
       - name: Check for relevant changes
         id: check_changes
         run: |
-          BASE_SHA=${{ steps.set_refs.outputs.base_sha }}
-          HEAD_SHA=${{ steps.set_refs.outputs.head_sha }}
-          echo "Comparing $BASE_SHA...$HEAD_SHA"
-          if git diff --name-only $BASE_SHA $HEAD_SHA | grep -vE "${{ env.IGNORED_PATHS }}"; then
-            echo "Relevant changes detected."
-            echo "relevant_changes=true" >> $GITHUB_OUTPUT
-          else
-            echo "No relevant changes detected."
-            echo "relevant_changes=false" >> $GITHUB_OUTPUT
-          fi
+          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
   lint:
     name: Run Go & Rust Linters

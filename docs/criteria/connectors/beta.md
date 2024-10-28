@@ -15,7 +15,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | File                    | ❌ |  |
 | FTP/SFTP                | ❌ |  |
 | GraphQL                 | ❌ |  |
-| GitHub                  | ❌ |  |
+| GitHub                  | ✅ | @peasee |
 | HTTP/HTTPS              | ❌ |  |
 | MS SQL                  | ❌ |  |
 | MySQL                   | ❌ |  |
