@@ -19,12 +19,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::AcceleratedTableBuilderError;
+use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, create_accelerator_table};
+use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
@@ -729,10 +730,61 @@ impl DataFusion {
             };
         }
 
+        // If this is a localpod accelerated table, attempt to synchronize refreshes with the parent table
+        if dataset.source() == LOCALPOD_DATACONNECTOR {
+            self.attempt_to_synchronize_accelerated_table(&mut accelerated_table_builder, dataset)
+                .await;
+        }
+
         accelerated_table_builder
             .build()
             .await
             .context(UnableToBuildAcceleratedTableSnafu)
+    }
+
+    /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
+    ///
+    /// This will not work if:
+    /// - The parent table is not an accelerated table.
+    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    ///
+    /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
+    pub async fn attempt_to_synchronize_accelerated_table(
+        &self,
+        accelerated_table_builder: &mut accelerated_table::Builder,
+        dataset: &Dataset,
+    ) {
+        let parent_table_reference = TableReference::parse_str(&dataset.path());
+        let Ok(parent_table) = self.get_table_provider(&parent_table_reference).await else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found.");
+            return;
+        };
+        let Some(parent_table_federation_adaptor) = parent_table
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>(
+        ) else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table.");
+            return;
+        };
+        let Some(parent_table) = parent_table_federation_adaptor.table_provider.clone() else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider.");
+            return;
+        };
+        let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table.");
+            return;
+        };
+        if let Err(e) = accelerated_table_builder
+            .synchronize_with(parent_table)
+            .await
+        {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Error: {e}");
+            return;
+        }
+
+        tracing::info!(
+            "Localpod dataset {} synchronizing refreshes with parent table {parent_table_reference}", dataset.name
+        );
     }
 
     pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {

@@ -117,6 +117,10 @@ impl RefreshTaskRunner {
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
                             task_completion = Some(Box::pin(refresh_task.run(request)));
                         }
+                        else => {
+                            // The parent refresher is shutting down, we should too
+                            break;
+                        }
                     }
                 }
             }
