@@ -69,7 +69,7 @@ async fn test_github_pulls() -> Result<(), String> {
     run_query_and_check_results(
         &mut rt,
         "test_github_pulls_auto",
-        "SELECT * FROM spiceai_pulls_auto WHERE author = 'peasee' LIMIT 10",
+        "SELECT * FROM spiceai_pulls_auto LIMIT 10",
         false, // can't snapshot this plan, as the partition size increases with more pulls
         Some(Box::new(|result_batches| {
             for batch in result_batches {
@@ -87,7 +87,7 @@ async fn test_github_pulls() -> Result<(), String> {
     run_query_and_check_results(
         &mut rt,
         "test_github_pulls_search",
-        "SELECT * FROM spiceai_pulls_search WHERE author = 'peasee' LIMIT 10",
+        "SELECT * FROM spiceai_pulls_search LIMIT 10",
         false, // can't snapshot this plan, as the partition size increases with more pulls
         Some(Box::new(|result_batches| {
             for batch in result_batches {
@@ -101,13 +101,39 @@ async fn test_github_pulls() -> Result<(), String> {
 
     let search_elapsed = now.elapsed();
     let auto_elapsed_ms = auto_elapsed.as_millis();
-    let search_elapsed_ms = search_elapsed.as_millis();
+    let search_limit_elapsed_ms = search_elapsed.as_millis();
 
-    // search should be orders of magnitude faster than auto
-    let magnitude = auto_elapsed_ms / search_elapsed_ms;
+    // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
+    assert!(auto_elapsed_ms < 15, "auto_elapsed_ms: {auto_elapsed_ms}");
     assert!(
-        magnitude > 3,
-        "auto: {auto_elapsed_ms} search: {search_elapsed_ms}"
+        search_limit_elapsed_ms < 15,
+        "search_limit_elapsed_ms: {search_limit_elapsed_ms}"
+    );
+
+    now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_github_pulls_search_author",
+        "SELECT * FROM spiceai_pulls_search WHERE author = 'peasee' LIMIT 100",
+        false, // can't snapshot this plan, as the partition size increases with more pulls
+        Some(Box::new(|result_batches| {
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+            }
+        })),
+    )
+    .await?;
+
+    let search_author_elapsed = now.elapsed();
+    let search_author_elapsed_ms = search_author_elapsed.as_millis();
+
+    // search should push down the filter, preventing the query from retrieving every pull
+    assert!(
+        search_author_elapsed_ms < 5,
+        "search_author_elapsed_ms: {search_author_elapsed_ms}"
     );
 
     Ok(())
@@ -143,7 +169,7 @@ async fn test_github_issues() -> Result<(), String> {
     run_query_and_check_results(
         &mut rt,
         "test_github_issues_auto",
-        "SELECT * FROM spiceai_issues_auto WHERE author = 'peasee' LIMIT 10",
+        "SELECT * FROM spiceai_issues_auto LIMIT 10",
         false, // can't snapshot this plan, as the partition size increases with more issues
         Some(Box::new(|result_batches| {
             for batch in result_batches {
@@ -161,7 +187,7 @@ async fn test_github_issues() -> Result<(), String> {
     run_query_and_check_results(
         &mut rt,
         "test_github_issues_search",
-        "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 10",
+        "SELECT * FROM spiceai_issues_search LIMIT 10",
         false, // can't snapshot this plan, as the partition size increases with more issues
         Some(Box::new(|result_batches| {
             for batch in result_batches {
@@ -177,11 +203,37 @@ async fn test_github_issues() -> Result<(), String> {
     let auto_elapsed_ms = auto_elapsed.as_millis();
     let search_elapsed_ms = search_elapsed.as_millis();
 
-    // search should be orders of magnitude faster than auto
-    let magnitude = auto_elapsed_ms / search_elapsed_ms;
+    // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
+    assert!(auto_elapsed_ms < 15, "auto_elapsed_ms: {auto_elapsed_ms}");
     assert!(
-        magnitude > 3,
-        "auto: {auto_elapsed_ms} search: {search_elapsed_ms}"
+        search_elapsed_ms < 15,
+        "search_elapsed_ms: {search_elapsed_ms}"
+    );
+
+    now = std::time::Instant::now();
+
+    run_query_and_check_results(
+        &mut rt,
+        "test_github_issues_search_author",
+        "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 100",
+        false, // can't snapshot this plan, as the partition size increases with more pulls
+        Some(Box::new(|result_batches| {
+            for batch in result_batches {
+                let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+            }
+        })),
+    )
+    .await?;
+
+    let search_author_elapsed = now.elapsed();
+    let search_author_elapsed_ms = search_author_elapsed.as_millis();
+
+    // search should push down the filter, preventing the query from retrieving every issue
+    assert!(
+        search_author_elapsed_ms < 5,
+        "search_author_elapsed_ms: {search_author_elapsed_ms}"
     );
 
     Ok(())
