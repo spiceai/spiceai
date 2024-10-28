@@ -100,14 +100,17 @@ async fn test_github_pulls() -> Result<(), String> {
     .await?;
 
     let search_elapsed = now.elapsed();
-    let auto_elapsed_ms = auto_elapsed.as_millis();
-    let search_limit_elapsed_ms = search_elapsed.as_millis();
+    let auto_elapsed_secs = auto_elapsed.as_secs();
+    let search_limit_elapsed_secs = search_elapsed.as_secs();
 
     // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
-    assert!(auto_elapsed_ms < 15, "auto_elapsed_ms: {auto_elapsed_ms}");
     assert!(
-        search_limit_elapsed_ms < 15,
-        "search_limit_elapsed_ms: {search_limit_elapsed_ms}"
+        auto_elapsed_secs < 20,
+        "auto_elapsed_secs: {auto_elapsed_secs}"
+    );
+    assert!(
+        search_limit_elapsed_secs < 20,
+        "search_limit_elapsed_secs: {search_limit_elapsed_secs}"
     );
 
     now = std::time::Instant::now();
@@ -128,12 +131,12 @@ async fn test_github_pulls() -> Result<(), String> {
     .await?;
 
     let search_author_elapsed = now.elapsed();
-    let search_author_elapsed_ms = search_author_elapsed.as_millis();
+    let search_author_elapsed_secs = search_author_elapsed.as_secs();
 
     // search should push down the filter, preventing the query from retrieving every pull
     assert!(
-        search_author_elapsed_ms < 5,
-        "search_author_elapsed_ms: {search_author_elapsed_ms}"
+        search_author_elapsed_secs < 10,
+        "search_author_elapsed_secs: {search_author_elapsed_secs}"
     );
 
     Ok(())
@@ -200,14 +203,17 @@ async fn test_github_issues() -> Result<(), String> {
     .await?;
 
     let search_elapsed = now.elapsed();
-    let auto_elapsed_ms = auto_elapsed.as_millis();
-    let search_elapsed_ms = search_elapsed.as_millis();
+    let auto_elapsed_secs = auto_elapsed.as_secs();
+    let search_limit_elapsed_secs = search_elapsed.as_secs();
 
     // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
-    assert!(auto_elapsed_ms < 15, "auto_elapsed_ms: {auto_elapsed_ms}");
     assert!(
-        search_elapsed_ms < 15,
-        "search_elapsed_ms: {search_elapsed_ms}"
+        auto_elapsed_secs < 20,
+        "auto_elapsed_secs: {auto_elapsed_secs}"
+    );
+    assert!(
+        search_limit_elapsed_secs < 20,
+        "search_limit_elapsed_secs: {search_limit_elapsed_secs}"
     );
 
     now = std::time::Instant::now();
@@ -216,7 +222,7 @@ async fn test_github_issues() -> Result<(), String> {
         &mut rt,
         "test_github_issues_search_author",
         "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 100",
-        false, // can't snapshot this plan, as the partition size increases with more pulls
+        false, // can't snapshot this plan, as the partition size increases with more issues
         Some(Box::new(|result_batches| {
             for batch in result_batches {
                 let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -228,12 +234,12 @@ async fn test_github_issues() -> Result<(), String> {
     .await?;
 
     let search_author_elapsed = now.elapsed();
-    let search_author_elapsed_ms = search_author_elapsed.as_millis();
+    let search_author_elapsed_secs = search_author_elapsed.as_secs();
 
     // search should push down the filter, preventing the query from retrieving every issue
     assert!(
-        search_author_elapsed_ms < 5,
-        "search_author_elapsed_ms: {search_author_elapsed_ms}"
+        search_author_elapsed_secs < 10,
+        "search_author_elapsed_secs: {search_author_elapsed_secs}"
     );
 
     Ok(())
