@@ -337,9 +337,9 @@ mod tests {
 
         for (i, token) in tokens.iter().enumerate().take(10) {
             if i < 7 {
-                assert_eq!(token, "token_1");
+                assert_eq!(token, "token_1", "{i}");
             } else {
-                assert_eq!(token, "token_2");
+                assert_eq!(token, "token_2", "{i}");
             }
         }
 

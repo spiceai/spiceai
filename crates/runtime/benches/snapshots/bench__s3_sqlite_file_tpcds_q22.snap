@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++----------------+-------------------+------------+------------+--------------------+
+| i_product_name | i_brand           | i_class    | i_category | qoh                |
++----------------+-------------------+------------+------------+--------------------+
+| antiese        | namelesscorp #6   | mens watch | Jewelry    | 143.66666666666666 |
+| antiese        | namelesscorp #6   | mens watch |            | 143.66666666666666 |
+| antiese        | namelesscorp #6   |            |            | 143.66666666666666 |
+| antiese        |                   |            |            | 143.66666666666666 |
+| pripri         | exportiexporti #2 | toddlers   | Children   | 148.5              |
+| pripri         | exportiexporti #2 | toddlers   |            | 148.5              |
+| pripri         | exportiexporti #2 |            |            | 148.5              |
+| pripri         |                   |            |            | 148.5              |
+| prically       | importoimporto #2 | shirts     | Men        | 264.0              |
+| prically       | importoimporto #2 | shirts     |            | 264.0              |
++----------------+-------------------+------------+------------+--------------------+

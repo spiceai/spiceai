@@ -28,6 +28,7 @@ pub(crate) static DURATION_SECONDS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
         .f64_histogram("query_duration_seconds")
         .with_description("Duration in seconds to execute a query.")
         .with_unit("s")
+        .with_boundaries(telemetry::HISTOGRAM_BOUNDARIES_PRECISE_FLOAT.clone())
         .init()
 });
 

@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT * FROM spiceai_stargazers_auto LIMIT 10"
+---
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                         |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Limit: skip=0, fetch=10                                                                                                                      |
+|               |   BytesProcessedNode                                                                                                                         |
+|               |     TableScan: spiceai_stargazers_auto projection=[starred_at, login, email, name, company, x_username, location, avatar_url, bio], fetch=10 |
+| physical_plan | GlobalLimitExec: skip=0, fetch=10                                                                                                            |
+|               |   BytesProcessedExec                                                                                                                         |
+|               |     MemoryExec: partitions=1, partition_sizes=[10]                                                                                           |
+|               |                                                                                                                                              |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------+

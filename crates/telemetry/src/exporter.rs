@@ -20,15 +20,10 @@ use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
 use opentelemetry::metrics::MetricsError;
-use opentelemetry_sdk::metrics::{
-    data::Temporality,
-    reader::{AggregationSelector, DefaultAggregationSelector, TemporalitySelector},
-    Aggregation, InstrumentKind,
-};
+use opentelemetry_sdk::metrics::{data::Temporality, reader::TemporalitySelector, InstrumentKind};
 
 #[derive(Debug, Clone)]
 pub struct AnonymousTelemetryExporter {
-    aggregation_selector: DefaultAggregationSelector,
     flight_client: Option<FlightClient>,
 }
 
@@ -41,16 +36,7 @@ impl AnonymousTelemetryExporter {
                 None
             }
         };
-        Self {
-            aggregation_selector: DefaultAggregationSelector::new(),
-            flight_client,
-        }
-    }
-}
-
-impl AggregationSelector for AnonymousTelemetryExporter {
-    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
-        self.aggregation_selector.aggregation(kind)
+        Self { flight_client }
     }
 }
 

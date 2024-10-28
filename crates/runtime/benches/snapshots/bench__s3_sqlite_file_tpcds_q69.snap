@@ -1,0 +1,17 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-----------+-------------------+---------------------+------+----------------------+------+------------------+------+
+| cd_gender | cd_marital_status | cd_education_status | cnt1 | cd_purchase_estimate | cnt2 | cd_credit_rating | cnt3 |
++-----------+-------------------+---------------------+------+----------------------+------+------------------+------+
+| F         | D                 | Secondary           | 1    | 5000                 | 1    | Good             | 1    |
+| F         | M                 | Secondary           | 1    | 2000                 | 1    | Unknown          | 1    |
+| F         | S                 | College             | 1    | 3000                 | 1    | Low Risk         | 1    |
+| F         | U                 | 2 yr Degree         | 1    | 6500                 | 1    | Good             | 1    |
+| F         | U                 | Unknown             | 1    | 7500                 | 1    | Good             | 1    |
+| M         | M                 | College             | 1    | 5500                 | 1    | Low Risk         | 1    |
+| M         | S                 | 2 yr Degree         | 1    | 3000                 | 1    | Unknown          | 1    |
+| M         | S                 | Primary             | 1    | 500                  | 1    | High Risk        | 1    |
+| M         | W                 | 4 yr Degree         | 1    | 1000                 | 1    | Unknown          | 1    |
++-----------+-------------------+---------------------+------+----------------------+------+------------------+------+

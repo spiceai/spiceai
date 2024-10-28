@@ -72,11 +72,14 @@ The RC release criteria expand on and require that all [Beta release criteria](.
 
 #### Documentation
 
+Documentation criteria should be re-checked on every release, to ensure the documentation is still accurate for the connector.
+
 - [ ] Documentation includes all information and steps for a user to set up the connector.
 - [ ] Documentation includes any mappings from [Core Connector Data Types](../definitions.md) to [Core Arrow Data Types](../definitions.md) types.
 - [ ] Documentation includes all known issues/limitations for the connector.
 - [ ] Documentation includes any exceptions made to allow this connector to reach RC quality (e.g. if a particular data type cannot be supported by the connector).
 - [ ] The connector has an easy to follow quickstart.
+- [ ] The connector status is updated in the table of connectors in [spiceai/docs](https://github.com/spiceai/docs).
 
 ### Conditional Criteria
 

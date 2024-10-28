@@ -52,6 +52,7 @@ default = [
   "clickhouse",
   "sharepoint",
   "snowflake",
+  "spark",
   "ftp",
   "debezium",
   "anonymous_telemetry",

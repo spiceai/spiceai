@@ -1,0 +1,9 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------------+---------------------+--------------------+--------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address         |
++------------------+---------------------+--------------------+--------------------------------+
+| AAAAAAAAJIBAAAAA | Bruce               | Olvera             | Bruce.Olvera@x4L7yzc2I65OB.org |
++------------------+---------------------+--------------------+--------------------------------+

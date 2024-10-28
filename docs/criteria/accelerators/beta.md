@@ -11,7 +11,7 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 | Arrow      | ❌ |  |
 | DuckDB     | ❌ |  |
 | SQLite     | ❌ |  |
-| PostgreSQL | ❌ |  |
+| PostgreSQL | ✅ | @sgrebnov  |
 
 ## Beta Release Criteria
 
@@ -85,3 +85,4 @@ When referring to accelerator access modes, "all supported modes" identifies eve
 - [ ] The accelerator has an easy to follow quickstart.
 - [ ] All [Minor Bugs](../definitions.md) for TPC-DS and TPC-H are raised as issues.
 - [ ] All ClickBench bugs are raised as issues.
+- [ ] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).

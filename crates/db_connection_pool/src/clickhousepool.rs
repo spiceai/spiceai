@@ -54,19 +54,26 @@ pub enum Error {
 
 pub struct ClickhouseConnectionPool {
     pool: Arc<Pool>,
+    db: Arc<str>,
     join_push_down: JoinPushDown,
 }
 
 impl ClickhouseConnectionPool {
     // Creates a new instance of `ClickhouseConnectionPool`.
     #[must_use]
-    pub fn new(options: Options, compute_context: String) -> Self {
+    pub fn new(options: Options, db: Arc<str>, compute_context: String) -> Self {
         let pool = Pool::new(options);
 
         Self {
             pool: Arc::new(pool),
             join_push_down: JoinPushDown::AllowedFor(compute_context),
+            db,
         }
+    }
+
+    #[must_use]
+    pub fn db(&self) -> Arc<str> {
+        Arc::clone(&self.db)
     }
 }
 
@@ -123,6 +130,7 @@ impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectio
         Ok(Box::new(ClickhouseConnection::new(
             conn,
             Arc::clone(&self.pool),
+            Arc::clone(&self.db),
         )))
     }
 

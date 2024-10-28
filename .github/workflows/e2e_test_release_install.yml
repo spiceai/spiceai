@@ -12,7 +12,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: teraswitch-runners
+            runner: spiceai-runners
             target_os: linux
             target_arch: x86_64
           - name: Linux aarch64

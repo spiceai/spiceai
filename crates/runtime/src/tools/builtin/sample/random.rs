@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use super::SampleFrom;
 use crate::datafusion::{query::Protocol, DataFusion};
@@ -31,6 +34,15 @@ pub struct RandomSampleParams {
     pub tbl: String,
     /// The number of rows, each with distinct values per column, to sample.
     pub limit: usize,
+}
+
+impl Display for RandomSampleParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(s) => write!(f, "{s}"),
+            Err(_) => Err(std::fmt::Error),
+        }
+    }
 }
 
 impl SampleFrom for RandomSampleParams {
