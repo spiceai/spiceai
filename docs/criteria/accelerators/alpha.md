@@ -33,6 +33,7 @@ The Alpha Release Criteria is not intended to cover any edge cases or complex fu
 
 #### Testing
 
+- [ ] End-to-end test to cover accelerating TPC-H scale factor 1 data from S3 and benchmarking TPC-H queries (official and simple).
 - [ ] The accelerator in all [Access Modes](../definitions.md) successfully loads TPC-H derived data at scale factor 1.
 - [ ] The accelerator in all [Access Modes](../definitions.md) successfully executes at least 75% of TPC-H derived queries at scale factor 1.
 
