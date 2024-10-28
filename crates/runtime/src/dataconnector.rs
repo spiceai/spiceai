@@ -67,6 +67,7 @@ pub mod ftp;
 pub mod github;
 pub mod graphql;
 pub mod https;
+pub mod localpod;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]

@@ -95,6 +95,13 @@ assignees: ''
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/quickstarts/pulls)
 - [ ] Update release notes
   - [ ] Ensure any external contributors have been acknowledged.
+- [ ] Add any SDK releases to the release notes
+  - [ ] [spice.js](https://github.com/spiceai/spice.js/releases)
+  - [ ] [spicepy](https://github.com/spiceai/spicepy/releases)
+  - [ ] [spice-rs](https://github.com/spiceai/spice-rs/releases)
+  - [ ] [spice-java](https://github.com/spiceai/spice-java/releases)
+  - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
+  - [ ] [gospice](https://github.com/spiceai/gospice/releases)
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
   - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docs/acknowledgements/index.md)
 - [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)

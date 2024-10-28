@@ -35,6 +35,7 @@ use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
 use dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use dataconnector::localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR};
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
@@ -707,22 +708,34 @@ impl Runtime {
         };
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
+        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
+
+        // Separate datasets into localpod and non-localpod
+        let (localpod_datasets, non_localpod_datasets): (Vec<_>, Vec<_>) = initialized_datasets
+            .into_iter()
+            .partition(|ds| ds.source() == LOCALPOD_DATACONNECTOR);
         let mut futures = vec![];
 
-        // Load only successfully initialized datasets
-        for ds in &self.initialize_accelerators(&valid_datasets).await {
+        // Load non-localpod datasets first in parallel
+        for ds in non_localpod_datasets {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(Arc::clone(ds)));
+            futures.push(self.load_dataset(ds));
         }
 
         if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
             let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
             let _ = stream.collect::<Vec<_>>().await;
-            return;
+        } else {
+            let _ = join_all(futures).await;
         }
 
-        let _ = join_all(futures).await;
+        // Load localpod datasets
+        for ds in localpod_datasets {
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            self.load_dataset(ds).await;
+        }
 
         // After all datasets have loaded, load the views.
         self.load_views(app);
@@ -1163,6 +1176,11 @@ impl Runtime {
         metadata: Option<HashMap<String, String>>,
     ) -> Result<Arc<dyn DataConnector>> {
         let secret_map = self.get_params_with_secrets(&params).await;
+
+        // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
+        if source == LOCALPOD_DATACONNECTOR {
+            return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
+        }
 
         match dataconnector::create_new_connector(source, secret_map, self.secrets(), metadata)
             .await

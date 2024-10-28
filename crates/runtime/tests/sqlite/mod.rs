@@ -150,7 +150,8 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
     {
         match check_function {
             CheckFunction::ValidateFullPlan(snapshot_name) => {
-                run_query_and_check_results(&mut rt, &snapshot_name, query, validate_result).await
+                run_query_and_check_results(&mut rt, &snapshot_name, query, true, validate_result)
+                    .await
             }
             CheckFunction::ValidateSubPlan(plan_checks) => {
                 run_query_and_check_results_with_plan_checks(
@@ -201,7 +202,8 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
     {
         match check_function {
             CheckFunction::ValidateFullPlan(snapshot_name) => {
-                run_query_and_check_results(&mut rt, &snapshot_name, query, validate_result).await
+                run_query_and_check_results(&mut rt, &snapshot_name, query, true, validate_result)
+                    .await
             }
             CheckFunction::ValidateSubPlan(plan_checks) => {
                 run_query_and_check_results_with_plan_checks(
