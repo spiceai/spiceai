@@ -43,3 +43,12 @@ Core Connector Data Types depend on the specific connector, but in general can b
 - Date: DATETIME, TIMESTAMP, TIME, DATE
 - Binary: BLOB, BINARY, CLOB
 - Structures: SET, ENUM
+
+## Access Mode
+
+Defines the supported access modes for a particular accelerator:
+
+- Arrow: in-memory only.
+- DuckDB: in-memory or file based.
+- SQLite: in-memory or file based.
+- PostgreSQL: database only.
