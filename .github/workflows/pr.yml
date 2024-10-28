@@ -32,8 +32,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get all changed docs files
-        id: changed-docs-files
+      - name: Detect all code changes
+        id: changed-code-files
         uses: dorny/paths-filter@v3
         with:
           filters: |
@@ -51,7 +51,7 @@ jobs:
       - name: Check for relevant changes
         id: check_changes
         run: |
-          echo "relevant_changes=${{ steps.changed-docs-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
   lint:
     name: Run Go & Rust Linters
