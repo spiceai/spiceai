@@ -39,7 +39,7 @@ assignees: ''
   - [ ] [Streaming changes in real-time with Debezium CDC](https://github.com/spiceai/samples/blob/trunk/cdc-debezium/README.md)
   - [ ] [Encryption in transit using TLS](https://github.com/spiceai/samples/blob/trunk/tls/README.md)
   - [ ] [Adding Spice as a Grafana datasource](https://github.com/spiceai/samples/blob/trunk/grafana-datasource/README.md)
-  - [ ] [FTP/SFTP Data Connector](https://github.com/spiceai/samples/blob/trunk/data-connectors/README.md)
+  - [ ] [FTP/SFTP Data Connector](https://github.com/spiceai/samples/blob/trunk/ftp/README.md)
   - [ ] [Spice with go sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
   - [ ] [Spice with Java sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
   - [ ] [Spice with rust sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
