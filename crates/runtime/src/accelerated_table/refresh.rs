@@ -300,7 +300,7 @@ pub struct Refresher {
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    refresh_task_runner: RefreshTaskRunner,
+    refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
 }
 
@@ -312,14 +312,6 @@ impl Refresher {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
-        let refresh_task_runner = RefreshTaskRunner::new(
-            Arc::clone(&runtime_status),
-            dataset_name.clone(),
-            Arc::clone(&federated),
-            Arc::clone(&refresh),
-            Arc::clone(&accelerator),
-        );
-
         Self {
             runtime_status,
             dataset_name,
@@ -327,7 +319,7 @@ impl Refresher {
             refresh,
             accelerator,
             cache_provider: None,
-            refresh_task_runner,
+            refresh_task_runner: None,
             checkpointer: None,
         }
     }
@@ -382,7 +374,16 @@ impl Refresher {
             }
         };
 
-        let (start_refresh, mut on_refresh_complete) = self.refresh_task_runner.start();
+        let mut refresh_task_runner = RefreshTaskRunner::new(
+            Arc::clone(&self.runtime_status),
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            Arc::clone(&self.refresh),
+            Arc::clone(&self.accelerator),
+        );
+
+        let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
+        self.refresh_task_runner = Some(refresh_task_runner);
 
         let mut ready_sender = Some(ready_sender);
         let dataset_name = self.dataset_name.clone();
@@ -474,6 +475,26 @@ impl Refresher {
         }))
     }
 
+    /// Subscribes a new table provider to receive refresh notifications from an existing full refresh mode accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
+    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
+        assert!(
+            matches!(self.refresh.read().await.mode, RefreshMode::Full),
+            "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
+        );
+
+        if let Some(refresh_task_runner) = &self.refresh_task_runner {
+            refresh_task_runner
+                .subscribe_table_provider(new_table_provider)
+                .await;
+        } else {
+            unreachable!("Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug");
+        }
+    }
+
     fn start_streaming_append(
         &mut self,
         ready_sender: oneshot::Sender<()>,
@@ -527,7 +548,9 @@ impl Refresher {
 
 impl Drop for Refresher {
     fn drop(&mut self) {
-        self.refresh_task_runner.abort();
+        if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
+            refresh_task_runner.abort();
+        }
     }
 }
 

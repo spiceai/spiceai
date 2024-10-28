@@ -9177,6 +9177,7 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tokio-rustls 0.26.0",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tonic-health",
@@ -10982,6 +10983,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

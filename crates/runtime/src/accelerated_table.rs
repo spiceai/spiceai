@@ -58,6 +58,7 @@ mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
+mod sink;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -440,6 +441,13 @@ impl AcceleratedTable {
         }
 
         Ok(())
+    }
+
+    /// Subscribes a new table provider to receive refresh notifications from an existing full refresh mode accelerated table.
+    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
+        self.refresher
+            .subscribe_table_provider(new_table_provider)
+            .await;
     }
 
     #[allow(clippy::cast_possible_wrap)]

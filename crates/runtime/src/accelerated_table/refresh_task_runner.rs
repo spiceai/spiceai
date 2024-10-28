@@ -35,11 +35,9 @@ use super::refresh::Refresh;
 /// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
 /// refreshing an `accelerator`.
 pub struct RefreshTaskRunner {
-    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
-    federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
-    accelerator: Arc<dyn TableProvider>,
+    refresh_task: Arc<RefreshTask>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -52,12 +50,17 @@ impl RefreshTaskRunner {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
-        Self {
+        let refresh_task = Arc::new(RefreshTask::new(
             runtime_status,
-            dataset_name,
+            dataset_name.clone(),
             federated,
-            refresh,
             accelerator,
+        ));
+
+        Self {
+            dataset_name,
+            refresh,
+            refresh_task,
             task: None,
         }
     }
@@ -77,13 +80,9 @@ impl RefreshTaskRunner {
         let dataset_name = self.dataset_name.clone();
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
 
-        let refresh_task = Arc::new(RefreshTask::new(
-            Arc::clone(&self.runtime_status),
-            dataset_name.clone(),
-            Arc::clone(&self.federated),
-            Arc::clone(&self.accelerator),
-        ));
         let base_refresh = Arc::clone(&self.refresh);
+
+        let refresh_task = Arc::clone(&self.refresh_task);
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<BoxFuture<super::Result<()>>> = None;
@@ -124,6 +123,13 @@ impl RefreshTaskRunner {
         }));
 
         (start_refresh, on_refresh_complete)
+    }
+
+    /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
+    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
+        self.refresh_task
+            .subscribe_table_provider(new_table_provider)
+            .await;
     }
 
     /// Create a new [`Refresh`] based on defaults and overrides.
