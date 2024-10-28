@@ -1,0 +1,17 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++--------+-----------+-------------------------------+
+| ca_zip | ca_city   | sum(web_sales.ws_sales_price) |
++--------+-----------+-------------------------------+
+| 45413  | Sutton    | 24.45                         |
+| 61398  | Warwick   | 51.72                         |
+| 61904  | Midway    | 74.41                         |
+| 65709  | Fairview  | 171.60                        |
+| 65804  | Harmony   | 52.90                         |
+| 68721  | Union     | 126.97                        |
+| 68828  | Greenwood | 89.11                         |
+| 75804  | Harmony   | 49.55                         |
+| 89275  | Shiloh    | 19.51                         |
++--------+-----------+-------------------------------+

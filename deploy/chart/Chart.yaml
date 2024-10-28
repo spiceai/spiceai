@@ -1,4 +1,4 @@
 apiVersion: v2
 name: spiceai
 description: Spice.ai OSS
-version: 0.1.30
+version: 0.1.31

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-------------+--------------+--------------------------------------+------------------+---------+-----------+
+| c_last_name | c_first_name | substr(ms.s_city,Int64(1),Int64(30)) | ss_ticket_number | amt     | profit    |
++-------------+--------------+--------------------------------------+------------------+---------+-----------+
+| Adams       | Donald       | Midway                               | 791              | 2998.05 | -14582.72 |
+| Austin      | Isela        | Midway                               | 2338             | 7797.18 | -18347.59 |
+| Austin      | Isela        | Midway                               | 2338             | 0.00    |           |
+| Buchanan    | Alvin        | Midway                               | 2216             | 138.30  | -7505.52  |
+| Byrd        | Craig        | Midway                               | 859              | 724.38  | -21096.53 |
+| Davis       | Wanda        | Midway                               | 1545             | 701.86  | -20047.83 |
+| Douglas     | Ashley       | Midway                               | 1428             | 7199.42 | -10955.13 |
+| Eller       | Christopher  | Midway                               | 1114             | 685.19  | -4589.30  |
+| Flynn       | Clifford     | Midway                               | 75               | 446.84  | -11522.64 |
+| Foster      |              | Midway                               | 1167             | 250.90  | -6909.18  |
++-------------+--------------+--------------------------------------+------------------+---------+-----------+

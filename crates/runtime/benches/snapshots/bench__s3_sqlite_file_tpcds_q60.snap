@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------------+-------------+
+| i_item_id        | total_sales |
++------------------+-------------+
+| AAAAAAAAAFAAAAAA | 9761.39     |
+| AAAAAAAAAHAAAAAA | 14394.76    |
+| AAAAAAAAAKAAAAAA | 17968.38    |
+| AAAAAAAACDAAAAAA | 3240.86     |
+| AAAAAAAACFAAAAAA | 6407.28     |
+| AAAAAAAAEJAAAAAA | 4413.43     |
+| AAAAAAAAGHAAAAAA | 4583.73     |
+| AAAAAAAAGIAAAAAA | 28091.38    |
+| AAAAAAAAHGAAAAAA | 10131.95    |
+| AAAAAAAAIIAAAAAA | 18945.76    |
++------------------+-------------+
