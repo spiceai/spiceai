@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use super::{
-    commits_inject_parameters, error_checker, filter_pushdown, inject_parameters, GitHubTableArgs,
+    commits_inject_parameters, filter_pushdown, inject_parameters, GitHubTableArgs,
     GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::{
-    client::GraphQLQuery, ErrorChecker, FilterPushdownResult, GraphQLContext,
+use data_components::{
+    github::error_checker,
+    graphql::{client::GraphQLQuery, ErrorChecker, FilterPushdownResult, GraphQLContext},
 };
 use datafusion::prelude::Expr;
 use std::sync::Arc;
