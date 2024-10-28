@@ -74,8 +74,9 @@ async fn test_github_pulls() -> Result<(), String> {
 
     run_query_and_check_results(
         &mut rt,
-        "test_spiceai_pulls_auto",
-        "SELECT * FROM spiceai_pulls_auto WHERE author = 'peasee'",
+        "test_github_pulls_auto",
+        "SELECT * FROM spiceai_pulls_auto WHERE author = 'peasee' LIMIT 10",
+        false, // can't snapshot this plan, as the partition size increases with more pulls
         Some(Box::new(|result_batches| {
             for batch in result_batches {
                 let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -91,8 +92,9 @@ async fn test_github_pulls() -> Result<(), String> {
 
     run_query_and_check_results(
         &mut rt,
-        "test_spiceai_pulls_search",
-        "SELECT * FROM spiceai_pulls_search WHERE author = 'peasee'",
+        "test_github_pulls_search",
+        "SELECT * FROM spiceai_pulls_search WHERE author = 'peasee' LIMIT 10",
+        false, // can't snapshot this plan, as the partition size increases with more pulls
         Some(Box::new(|result_batches| {
             for batch in result_batches {
                 let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -146,8 +148,9 @@ async fn test_github_issues() -> Result<(), String> {
 
     run_query_and_check_results(
         &mut rt,
-        "test_spiceai_issues_auto",
-        "SELECT * FROM spiceai_issues_auto WHERE author = 'peasee'",
+        "test_github_issues_auto",
+        "SELECT * FROM spiceai_issues_auto WHERE author = 'peasee' LIMIT 10",
+        false, // can't snapshot this plan, as the partition size increases with more issues
         Some(Box::new(|result_batches| {
             for batch in result_batches {
                 let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -163,8 +166,9 @@ async fn test_github_issues() -> Result<(), String> {
 
     run_query_and_check_results(
         &mut rt,
-        "test_spiceai_issues_search",
-        "SELECT * FROM spiceai_issues_search WHERE author = 'peasee'",
+        "test_github_issues_search",
+        "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 10",
+        false, // can't snapshot this plan, as the partition size increases with more issues
         Some(Box::new(|result_batches| {
             for batch in result_batches {
                 let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -215,8 +219,9 @@ async fn test_github_commits() -> Result<(), String> {
 
     run_query_and_check_results(
         &mut rt,
-        "test_spiceai_commits_auto",
+        "test_github_commits_auto",
         "SELECT * FROM spiceai_commits_auto LIMIT 10",
+        true,
         Some(Box::new(|result_batches| {
             let mut row_count = 0;
             for batch in result_batches {
@@ -268,8 +273,9 @@ async fn test_github_stargazers() -> Result<(), String> {
 
     run_query_and_check_results(
         &mut rt,
-        "test_spiceai_stargazers_auto",
+        "test_github_stargazers_auto",
         "SELECT * FROM spiceai_stargazers_auto LIMIT 10",
+        true,
         Some(Box::new(|result_batches| {
             let mut row_count = 0;
             for batch in result_batches {
