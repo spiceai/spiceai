@@ -15,21 +15,15 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use app::AppBuilder;
 
 use arrow::array::RecordBatch;
-use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
-use async_graphql::{Object, Schema};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{routing::post, Extension, Router};
 use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
-use tokio::net::TcpListener;
 
-use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
+use crate::{get_test_datafusion, init_tracing, run_query_and_check_results};
 
 fn make_github_dataset(owner: &str, repo: &str, query_type: &str, query_mode: &str) -> Dataset {
     let mut dataset = Dataset::new(
