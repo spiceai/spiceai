@@ -7,7 +7,14 @@ metadata:
     app: {{ .Release.Name }}
   name: {{ template "spiceai.fullname" .  }}
   namespace: {{ template "spiceai.namespace" . }}
+  {{- if .Values.service.additionalAnnotations }}
+  annotations:
+    {{ toYaml .Values.service.additionalAnnotations }}
+  {{- end }}
 spec:
+  {{- if .Values.service.type }}
+  type: {{ .Values.service.type }}
+  {{- end }}
   ports:
     - port: 8090
       name: http
