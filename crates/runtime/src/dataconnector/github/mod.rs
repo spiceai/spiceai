@@ -23,10 +23,11 @@ use commits::CommitsTableArgs;
 use data_components::{
     github::{GithubFilesTableProvider, GithubRestClient},
     graphql::{
+        self,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
-        FilterPushdownResult, GraphQLOptimizer,
+        FilterPushdownResult, GraphQLContext,
     },
     token_provider::{StaticTokenProvider, TokenProvider},
 };
@@ -43,9 +44,11 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
+use http::{HeaderMap, HeaderValue};
 use issues::IssuesTableArgs;
 use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
+use serde_json::Value;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
@@ -133,7 +136,7 @@ impl Github {
     async fn create_gql_table_provider(
         &self,
         table_args: Arc<dyn GitHubTableArgs>,
-        optimizer: Option<Arc<dyn GraphQLOptimizer>>,
+        optimizer: Option<Arc<dyn GraphQLContext>>,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
@@ -910,6 +913,39 @@ where
     let (pagination_parameters, json_pointer) = PaginationParameters::parse(&query.ast);
     query.pagination_parameters = pagination_parameters;
     query.json_pointer = json_pointer.map(Arc::from);
+
+    Ok(())
+}
+
+// For GitHub, first checks if an explicit rate limit error was returned, then checks the headers
+pub(crate) fn error_checker(
+    headers: &HeaderMap<HeaderValue>,
+    response: &Value,
+) -> Result<(), graphql::Error> {
+    // check if there's an explicit rate limit error
+    let rate_limited: Option<bool> = response["message"]
+        .as_str()
+        .map(|s| s.to_lowercase().contains("rate limit"));
+    if let Some(true) = rate_limited {
+        // A secondary rate limit was exceeded
+        return Err(graphql::Error::RateLimited {
+            message: "GitHub GraphQL API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
+        });
+    }
+
+    // Check if the primary rate limit is exceeded
+    if let Some(ratelimit_remaining) = headers.get("x-ratelimit-remaining") {
+        let ratelimit_remaining = ratelimit_remaining
+            .to_str()
+            .unwrap_or("1")
+            .parse::<u32>()
+            .unwrap_or(1);
+        if ratelimit_remaining == 0 {
+            return Err(graphql::Error::RateLimited {
+                message: "GitHub GraphQL API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
+            });
+        }
+    }
 
     Ok(())
 }

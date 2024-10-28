@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use super::{
-    filter_pushdown, inject_parameters, search_inject_parameters, GitHubQueryMode, GitHubTableArgs,
-    GitHubTableGraphQLParams,
+    error_checker, filter_pushdown, inject_parameters, search_inject_parameters, GitHubQueryMode,
+    GitHubTableArgs, GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::graphql::{
-    client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer, Result,
+    client::GraphQLQuery, ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub struct IssuesTableArgs {
     pub query_mode: GitHubQueryMode,
 }
 
-impl GraphQLOptimizer for IssuesTableArgs {
+impl GraphQLContext for IssuesTableArgs {
     fn filter_pushdown(
         &self,
         expr: &Expr,
@@ -58,6 +58,10 @@ impl GraphQLOptimizer for IssuesTableArgs {
         }
 
         inject_parameters("search", search_inject_parameters, filters, query)
+    }
+
+    fn error_checker(&self) -> Option<ErrorChecker> {
+        Some(Arc::new(error_checker))
     }
 }
 

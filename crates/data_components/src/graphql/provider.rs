@@ -27,7 +27,7 @@ use datafusion::{
 };
 use std::{any::Any, sync::Arc};
 
-use super::{client::GraphQLClient, GraphQLOptimizer, ResultTransformSnafu};
+use super::{client::GraphQLClient, GraphQLContext, ResultTransformSnafu};
 use super::{client::GraphQLQuery, Result};
 
 pub type TransformFn =
@@ -36,7 +36,7 @@ pub type TransformFn =
 pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
     transform_fn: Option<TransformFn>,
-    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
+    optimizer: Option<Arc<dyn GraphQLContext>>,
 }
 
 impl GraphQLTableProviderBuilder {
@@ -56,7 +56,7 @@ impl GraphQLTableProviderBuilder {
     }
 
     #[must_use]
-    pub fn with_optimizer(mut self, optimizer: Arc<dyn GraphQLOptimizer>) -> Self {
+    pub fn with_optimizer(mut self, optimizer: Arc<dyn GraphQLContext>) -> Self {
         self.optimizer = Some(optimizer);
         self
     }
@@ -68,7 +68,16 @@ impl GraphQLTableProviderBuilder {
             return Err(super::Error::NoJsonPointerFound {});
         }
 
-        let result = self.client.execute(&mut query, None, None, None).await?;
+        let result = self
+            .client
+            .execute(
+                &mut query,
+                None,
+                None,
+                None,
+                self.optimizer.clone().and_then(|o| o.error_checker()),
+            )
+            .await?;
 
         let table_schema = match (self.transform_fn, result.records.first()) {
             (Some(transform_fn), Some(record_batch)) => transform_fn(record_batch)
@@ -94,7 +103,7 @@ pub struct GraphQLTableProvider {
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
     transform_fn: Option<TransformFn>,
-    optimizer: Option<Arc<dyn GraphQLOptimizer>>,
+    optimizer: Option<Arc<dyn GraphQLContext>>,
 }
 
 #[async_trait]
@@ -138,18 +147,27 @@ impl TableProvider for GraphQLTableProvider {
         let mut query = GraphQLQuery::try_from(self.base_query.as_str())
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-        if let Some(optimizer) = &self.optimizer {
+        let error_checker = if let Some(optimizer) = &self.optimizer {
             let parameters = filters
                 .iter()
                 .map(|f| optimizer.filter_pushdown(f))
                 .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
 
             optimizer.inject_parameters(&parameters, &mut query)?;
-        }
+
+            optimizer.error_checker()
+        } else {
+            None
+        };
 
         let mut res = self
             .client
-            .execute_paginated(&mut query, Arc::clone(&self.gql_schema), limit)
+            .execute_paginated(
+                &mut query,
+                Arc::clone(&self.gql_schema),
+                limit,
+                error_checker,
+            )
             .await
             .boxed()
             .map_err(DataFusionError::External)?;

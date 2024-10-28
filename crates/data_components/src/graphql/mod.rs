@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow::error::ArrowError;
 use client::GraphQLQuery;
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use snafu::Snafu;
 
@@ -51,6 +52,9 @@ pub enum Error {
 
     #[snafu(display("{message}"))]
     InvalidCredentialsOrPermissions { message: String },
+
+    #[snafu(display("{message}"))]
+    RateLimited { message: String },
 
     #[snafu(display("Query response transformation failed: {source}"))]
     ResultTransformError {
@@ -86,9 +90,10 @@ pub struct FilterPushdownResult {
 }
 
 pub type ValuePreprocessor = Arc<dyn Fn(&mut Value) -> Result<()>>;
+pub type ErrorChecker = Arc<dyn Fn(&HeaderMap<HeaderValue>, &Value) -> Result<()> + Send + Sync>;
 
 /// A trait optionally provided to GraphQL ``TableProvider``s to alter the behavior of filter push down
-pub trait GraphQLOptimizer: Send + Sync {
+pub trait GraphQLContext: Send + Sync {
     /// A function executed for each filter push down requested from the ``TableProvider``
     /// A custom implementation can override this function to implement custom filter pushdown logic
     fn filter_pushdown(
@@ -110,5 +115,11 @@ pub trait GraphQLOptimizer: Send + Sync {
         _query: &mut GraphQLQuery<'_>,
     ) -> Result<(), datafusion::error::DataFusionError> {
         Ok(())
+    }
+
+    /// Return a function that will receive the headers from the GraphQL response
+    /// A custom implementation can override this function to process the headers and response, and return custom errors or warnings
+    fn error_checker(&self) -> Option<ErrorChecker> {
+        None
     }
 }
