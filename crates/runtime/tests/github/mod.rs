@@ -226,7 +226,7 @@ async fn test_github_issues() -> Result<(), String> {
         Some(Box::new(|result_batches| {
             for batch in result_batches {
                 let batch: RecordBatch = batch; // Rust can't type infer here for some reason
-                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
                 assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
             }
         })),
