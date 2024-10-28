@@ -302,6 +302,7 @@ pub struct Refresher {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
+    synchronize_with: Option<Arc<Refresher>>,
 }
 
 impl Refresher {
@@ -321,6 +322,7 @@ impl Refresher {
             cache_provider: None,
             refresh_task_runner: None,
             checkpointer: None,
+            synchronize_with: None,
         }
     }
 
@@ -334,6 +336,12 @@ impl Refresher {
 
     pub fn checkpointer(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
         self.checkpointer = checkpointer.map(Arc::new);
+        self
+    }
+
+    /// Synchronize further refreshes with an existing accelerated table after the initial load completes
+    pub fn synchronize_with(&mut self, refresher: Arc<Refresher>) -> &mut Self {
+        self.synchronize_with = Some(refresher);
         self
     }
 
@@ -394,6 +402,9 @@ impl Refresher {
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
+
+        let synchronize_with = self.synchronize_with.clone();
+        let accelerator = Arc::clone(&self.accelerator);
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
@@ -459,6 +470,12 @@ impl Refresher {
                                     tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
                                 };
                             }
+                        }
+
+                        // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
+                        if let Some(synchronize_with) = &synchronize_with {
+                            synchronize_with.subscribe_table_provider(accelerator).await;
+                            return;
                         }
 
                         // Restart periodic refresh timer (after either cron or manual dataset refresh).

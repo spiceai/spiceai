@@ -40,7 +40,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
-use refresh::RefreshOverrides;
+use refresh::{RefreshOverrides, Refresher};
 use snafu::prelude::*;
 use tokio::task::JoinHandle;
 
@@ -136,6 +136,9 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(display("Append stream is required for `RefreshMode::Append` without time_column"))]
     AppendStreamRequired,
+
+    #[snafu(display("Synchronized accelerated table requires full refresh mode"))]
+    SynchronizedAcceleratedTableRequiresFullRefresh,
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -191,6 +194,7 @@ pub struct Builder {
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
     checkpointer: Option<DatasetCheckpoint>,
+    synchronize_with: Option<Arc<Refresher>>,
 }
 
 impl Builder {
@@ -213,6 +217,7 @@ impl Builder {
             changes_stream: None,
             append_stream: None,
             checkpointer: None,
+            synchronize_with: None,
             disable_query_push_down: false,
         }
     }
@@ -274,6 +279,31 @@ impl Builder {
         self
     }
 
+    /// Set the existing full refresh mode accelerated table to synchronize with after the initial load completes
+    ///
+    /// A full table scan of the existing accelerated table is required to initialize a synchronized accelerated table.
+    ///
+    /// Handling append/changes mode should be possible, but requires more care to ensure
+    /// that delta updates are applied correctly after the initial table scan.
+    pub async fn synchronize_with(
+        &mut self,
+        existing_accelerated_table: &AcceleratedTable,
+    ) -> AcceleratedTableBuilderResult<&mut Self> {
+        ensure!(
+            matches!(self.refresh.mode, RefreshMode::Full),
+            SynchronizedAcceleratedTableRequiresFullRefreshSnafu
+        );
+        ensure!(
+            matches!(
+                existing_accelerated_table.refresh_params.read().await.mode,
+                RefreshMode::Full
+            ),
+            SynchronizedAcceleratedTableRequiresFullRefreshSnafu
+        );
+        self.synchronize_with = Some(existing_accelerated_table.refresher());
+        Ok(self)
+    }
+
     /// Build the accelerated table
     pub async fn build(
         self,
@@ -331,6 +361,10 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
+
+        if let Some(synchronize_with) = self.synchronize_with {
+            refresher.synchronize_with(synchronize_with);
+        }
 
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
@@ -441,13 +475,6 @@ impl AcceleratedTable {
         }
 
         Ok(())
-    }
-
-    /// Subscribes a new table provider to receive refresh notifications from an existing full refresh mode accelerated table.
-    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
-        self.refresher
-            .subscribe_table_provider(new_table_provider)
-            .await;
     }
 
     #[allow(clippy::cast_possible_wrap)]
