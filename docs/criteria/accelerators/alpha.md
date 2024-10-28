@@ -25,9 +25,9 @@ The Alpha Release Criteria is not intended to cover edge cases or advanced funct
 
 - [ ] The accelerator implements the querying functionality of the native accelerator source in all [Access Modes](../definitions.md)
 - [ ] The accelerator supports only String, Number, Date and Binary [Core Connector Data Types](../definitions.md).
-- [ ] The accelerator executes common use case queries with a low error rate (e.g. `SELECT * FROM tbl WHERE col = 'blah'`).
-- [ ] Known [Minor and Major](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve a low query error rate and/or TPC-H success.
-  - A "low error rate" indicates that more than 90% of the time, the common use case succeeds.
+- [ ] The accelerator executes common use case queries (e.g. `SELECT * FROM tbl WHERE col = 'blah'`).
+  - Advanced queries (e.g. nested subqueries, derived tables, window frame functions and rank) should not make up common use cases, even if included in TPC-H.
+- [ ] Known [Minor and Major](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve the common use cases and/or TPC-H success.
 
 #### Testing
 
