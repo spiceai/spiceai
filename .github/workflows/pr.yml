@@ -34,18 +34,24 @@ jobs:
 
       - name: Get all changed docs files
         id: changed-docs-files
-        uses: tj-actions/changed-files@v45
+        uses: dorny/paths-filter@v3
         with:
-          # Avoid using single or double quotes for multiline patterns
-          files: |
-            **.md
-            **.txt
-            docs/**/**.md
+          filters: |
+            code_changes:
+              - 'crates/**'
+              - 'bin/**'
+              - 'test/**'
+              - 'install/**'
+              - '.github/workflows/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'go.mod'
+              - 'go.sum'
 
       - name: Check for relevant changes
         id: check_changes
         run: |
-          echo "relevant_changes=${{ steps.changed-docs-files.outputs.any_changed }}" >> $GITHUB_OUTPUT
+          echo "relevant_changes=${{ steps.changed-docs-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
   lint:
     name: Run Go & Rust Linters
