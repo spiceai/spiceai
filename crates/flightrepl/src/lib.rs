@@ -164,9 +164,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     };
 
     // Set up the Flight client
-    let channel = channel.map_err(|err| {
+    let channel = channel.map_err(|_err| {
         Box::<dyn Error>::from(format!(
-            "Unable to connect to spiced at {repl_flight_endpoint}. Is it running? ({err})"
+            "Unable to connect to spiced at {repl_flight_endpoint}. Is it running?"
         ))
     })?;
 
