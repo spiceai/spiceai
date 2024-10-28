@@ -23,16 +23,15 @@ The Alpha Release Criteria is not intended to cover any edge cases or complex fu
 
 ### All Accelerators
 
-- [ ] The connector implements the basic functionality of the native accelerator source.
-  - Basic functionality is determined at the discretion of the connector DRI.
-  - For example, for DuckDB basic functionality is querying tables from a database either in-memory or on-disk.
-- [ ] The accelerator executes common use cases with a low error rate.
-  - A common use case is determined at the discretion of the connector DRI.
-- [ ] Known [Minor and Major](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve a low error rate or TPC-H data loading.
+- [ ] The accelerator implements the querying functionality of the native accelerator source in all [Access Modes](../definitions.md)
+- [ ] The accelerator supports only String, Number, Date and Binary [Core Connector Data Types](../definitions.md).
+- [ ] The accelerator executes common use case queries with a low error rate (e.g. `SELECT * FROM tbl WHERE col = 'blah'`).
+- [ ] Known [Minor and Major](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve a low query error rate and/or TPC-H success.
   - A "low error rate" indicates that more than 90% of the time, the common use case succeeds.
 
 #### Testing
 
+- [ ] End-to-end test to cover accelerating only String, Number, Date and Binary [Core Connector Data Types](../definitions.md)
 - [ ] End-to-end test to cover accelerating TPC-H scale factor 1 data from S3 and benchmarking TPC-H queries (official and simple).
 - [ ] The accelerator in all [Access Modes](../definitions.md) successfully loads TPC-H derived data at scale factor 1.
 - [ ] The accelerator in all [Access Modes](../definitions.md) successfully executes at least 75% of TPC-H derived queries at scale factor 1.
