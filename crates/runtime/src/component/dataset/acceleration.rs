@@ -276,6 +276,8 @@ pub struct Acceleration {
 
     pub on_zero_results: ZeroResultsAction,
 
+    pub loading_behavior: LoadingBehavior,
+
     pub indexes: HashMap<ColumnReference, IndexType>,
 
     pub primary_key: Option<ColumnReference>,
@@ -393,6 +395,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             retention_check_enabled: acceleration.retention_check_enabled,
             disable_query_push_down,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
+            loading_behavior: LoadingBehavior::from(acceleration.loading_behavior),
             indexes,
             primary_key,
             on_conflict,
@@ -420,6 +423,7 @@ impl Default for Acceleration {
             retention_check_interval: None,
             retention_check_enabled: false,
             on_zero_results: ZeroResultsAction::ReturnEmpty,
+            loading_behavior: LoadingBehavior::ReadyAfterInitialLoad,
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
