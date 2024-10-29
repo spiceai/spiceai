@@ -27,7 +27,7 @@ use runtime::{
 };
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
 
-use crate::{init_tracing, wait_until_true};
+use crate::{init_tracing, runtime_ready_check, wait_until_true};
 
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
@@ -123,6 +123,8 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
         }
         () = rt.load_components() => {}
     }
+
+    runtime_ready_check(&rt).await;
 
     let query = rt
         .datafusion()
