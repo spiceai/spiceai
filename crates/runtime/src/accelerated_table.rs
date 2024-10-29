@@ -40,8 +40,9 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
-use refresh::{RefreshOverrides, Refresher};
+use refresh::RefreshOverrides;
 use snafu::prelude::*;
+use synchronized_table::SynchronizedTable;
 use tokio::task::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -59,6 +60,7 @@ pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
 mod sink;
+mod synchronized_table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -159,6 +161,7 @@ pub struct AcceleratedTable {
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
     disable_query_push_down: bool,
+    synchronized_with: Option<SynchronizedTable>,
 }
 
 fn validate_refresh_data_window(
@@ -194,7 +197,7 @@ pub struct Builder {
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
     checkpointer: Option<DatasetCheckpoint>,
-    synchronize_with: Option<Arc<Refresher>>,
+    synchronize_with: Option<SynchronizedTable>,
 }
 
 impl Builder {
@@ -300,7 +303,8 @@ impl Builder {
             ),
             SynchronizedAcceleratedTableRequiresFullRefreshSnafu
         );
-        self.synchronize_with = Some(existing_accelerated_table.refresher());
+        let synchronized_table = SynchronizedTable::from(existing_accelerated_table);
+        self.synchronize_with = Some(synchronized_table);
         Ok(self)
     }
 
@@ -362,8 +366,8 @@ impl Builder {
         refresher.cache_provider(self.cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
 
-        if let Some(synchronize_with) = self.synchronize_with {
-            refresher.synchronize_with(synchronize_with);
+        if let Some(synchronize_with) = &self.synchronize_with {
+            refresher.synchronize_with(synchronize_with.refresher());
         }
 
         let refresh_handle = refresher
@@ -396,6 +400,7 @@ impl Builder {
                 refresh_params,
                 refresher,
                 disable_query_push_down: self.disable_query_push_down,
+                synchronized_with: self.synchronize_with,
             },
             is_ready,
         ))
@@ -430,12 +435,15 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn refresh_trigger(&self) -> Option<mpsc::Sender<Option<RefreshOverrides>>> {
-        self.refresh_trigger.clone()
+    pub fn refresh_trigger(&self) -> Option<&mpsc::Sender<Option<RefreshOverrides>>> {
+        match &self.synchronized_with {
+            Some(synchronized_table) => synchronized_table.refresh_trigger(),
+            None => self.refresh_trigger.as_ref(),
+        }
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
-        match &self.refresh_trigger {
+        match self.refresh_trigger() {
             Some(refresh_trigger) => {
                 refresh_trigger
                     .send(overrides)
