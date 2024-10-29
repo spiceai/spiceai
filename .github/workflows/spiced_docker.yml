@@ -22,7 +22,8 @@ jobs:
         id: set_version
         run: |
           python3 ./.github/scripts/get_release_version.py
-          echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
+          echo "rel_version=${REL_VERSION}" >> $GITHUB_OUTPUT
+          echo $REL_VERSION
 
   build-amd64:
     needs: setup
