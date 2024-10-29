@@ -247,3 +247,12 @@ Query Error Unable to convert record batch: Invalid argument error: Column 'am_p
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
 | [q90.sql](tpcds/q90.sql) | |
+
+### SQLite does not support `stddev`
+
+**Limitation**: SQLite Data Accelerator does not support the `stddev` (standard deviation) function. There is an error `no such function: stddev` when running the following TPC-DS queries:
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q17.sql](tpcds/q17.sql) | [q29.sql](tpcds/q29.sql) |
+| [q35.sql](tpcds/q35.sql) | [q74.sql](tpcds/q74.sql) |
