@@ -333,7 +333,8 @@ LIMIT 100;
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
 | [q5.sql](tpcds/q5.sql)   | [q18.sql](tpcds/q18.sql) |
-| [q22.sql](tpcds/q22.sql) | [q27.sql](tpcds/q27.sql) |
-| [q36.sql](tpcds/q36.sql) | [q67.sql](tpcds/q67.sql) |
-| [q70.sql](tpcds/q70.sql) | [q77.sql](tpcds/q77.sql) |
-| [q80.sql](tpcds/q80.sql) | [q44.sql](tpcds/q86.sql) |
+| [q14.sql](tpcds/q14.sql) | [q27.sql](tpcds/q27.sql) |
+| [q22.sql](tpcds/q22.sql) | [q67.sql](tpcds/q67.sql) |
+| [q36.sql](tpcds/q36.sql) | [q77.sql](tpcds/q77.sql) |
+| [q70.sql](tpcds/q70.sql) | [q86.sql](tpcds/q86.sql) |
+| [q80.sql](tpcds/q80.sql) |  |
