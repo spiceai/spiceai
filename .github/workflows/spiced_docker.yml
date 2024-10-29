@@ -18,12 +18,14 @@ jobs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Add REL_VERSION to output
         id: set_version
         run: |
-          python3 ./.github/scripts/get_release_version.py
-          echo "rel_version=${REL_VERSION}" >> $GITHUB_OUTPUT
-          echo $REL_VERSION
+          echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
 
   build-amd64:
     needs: setup
