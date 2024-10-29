@@ -247,6 +247,7 @@ impl RefreshTask {
             tracing::warn!("Failed to update dataset {dataset_name}: {e}");
             self.mark_dataset_status(sql, status::ComponentStatus::Error)
                 .await;
+            return Err(e);
         }
 
         if let (Some(start_time), Ok(refresh_stat)) =
