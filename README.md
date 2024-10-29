@@ -2,9 +2,9 @@
   <img src="https://github.com/user-attachments/assets/13ff4c9d-d6a7-4c20-9408-45573c508c41" alt="spice oss logo" width="600"/>
 </p>
 <p align="center">
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a> 
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a> 
-  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a> 
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a>
+  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a>
   <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
 </p>
 
@@ -75,7 +75,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 ### Watch a 30-sec BI dashboard acceleration demo
 
-https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a
+<https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a>
 
 ### Supported Data Connectors
 
@@ -83,12 +83,12 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name          | Description                                                                                    | Status | Protocol/Format                                                                                    |
 | ------------- | ---------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- |
+| `mysql`       | MySQL                                                                                          | Release Candidate   |                                                                                                    |
 | `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Beta   | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
 | `github`      | GitHub                                                                                         | Beta  |                                                                                                    |
 | `postgres`    | PostgreSQL                                                                                     | Beta   |                                                                                                    |
 | `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Beta   | Arrow Flight                                                                                       |
 | `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Beta   | Parquet, CSV                                                                                       |
-| `mysql`       | MySQL                                                                                          | Beta   |                                                                                                    |
 | `odbc`        | ODBC                                                                                           | Beta   | ODBC                                                                                               |
 | `delta_lake`  | [Delta Lake](https://delta.io/)                                                                | Alpha  | [Delta Lake](https://delta.io/)                                                                    |
 | `dremio`      | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha  | Arrow Flight                                                                                       |
@@ -110,16 +110,16 @@ Currently supported data stores for local materialization/acceleration. More com
 
 | Name       | Description                                                                                                   | Status | Engine Modes     |
 | ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- |
-| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         |
-| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` |
-| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
+| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Beta   | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Beta   | `file`           |
+| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         |
+| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
 
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **beta** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
 
 ## ⚡️ Quickstart (Local Machine)
 
-https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0
+<https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0>
 
 **Step 1.** Install the Spice CLI:
 

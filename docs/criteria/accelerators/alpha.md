@@ -9,9 +9,9 @@ All criteria must be met for the accelerator to be considered Alpha, with except
 | Accelerator | Alpha Quality | DRI Sign-off |
 | - | - | - |
 | Arrow      | ❌ |  |
-| DuckDB     | ❌ |  |
+| DuckDB     | ✅ | @peasee |
 | SQLite     | ❌ |  |
-| PostgreSQL | ❌ |  |
+| PostgreSQL | ✅ | @sgrebnov |
 
 ## Alpha Release Criteria
 
