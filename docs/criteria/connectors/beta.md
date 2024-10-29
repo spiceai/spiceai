@@ -18,7 +18,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GitHub                  | ✅ | @peasee |
 | HTTP/HTTPS              | ❌ |  |
 | MS SQL                  | ❌ |  |
-| MySQL                   | ❌ |  |
+| MySQL                   | ✅ | @peasee |
 | ODBC                    | ❌ |  |
 | PostgreSQL              | ❌ |  |
 | Sharepoint              | ❌ |  |

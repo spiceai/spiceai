@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::status;
 
-use super::{refresh::RefreshOverrides, refresh_task::RefreshTask};
+use super::{
+    refresh::RefreshOverrides, refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
+};
 use futures::future::BoxFuture;
 use tokio::{
     select,
@@ -35,11 +37,9 @@ use super::refresh::Refresh;
 /// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
 /// refreshing an `accelerator`.
 pub struct RefreshTaskRunner {
-    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
-    federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
-    accelerator: Arc<dyn TableProvider>,
+    refresh_task: Arc<RefreshTask>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -52,12 +52,17 @@ impl RefreshTaskRunner {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
-        Self {
+        let refresh_task = Arc::new(RefreshTask::new(
             runtime_status,
-            dataset_name,
+            dataset_name.clone(),
             federated,
-            refresh,
             accelerator,
+        ));
+
+        Self {
+            dataset_name,
+            refresh,
+            refresh_task,
             task: None,
         }
     }
@@ -77,13 +82,9 @@ impl RefreshTaskRunner {
         let dataset_name = self.dataset_name.clone();
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
 
-        let refresh_task = Arc::new(RefreshTask::new(
-            Arc::clone(&self.runtime_status),
-            dataset_name.clone(),
-            Arc::clone(&self.federated),
-            Arc::clone(&self.accelerator),
-        ));
         let base_refresh = Arc::clone(&self.refresh);
+
+        let refresh_task = Arc::clone(&self.refresh_task);
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<BoxFuture<super::Result<()>>> = None;
@@ -118,12 +119,23 @@ impl RefreshTaskRunner {
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
                             task_completion = Some(Box::pin(refresh_task.run(request)));
                         }
+                        else => {
+                            // The parent refresher is shutting down, we should too
+                            break;
+                        }
                     }
                 }
             }
         }));
 
         (start_refresh, on_refresh_complete)
+    }
+
+    /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
+    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
+        self.refresh_task
+            .add_synchronized_table(synchronized_table)
+            .await;
     }
 
     /// Create a new [`Refresh`] based on defaults and overrides.

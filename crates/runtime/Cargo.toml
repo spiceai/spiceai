@@ -109,6 +109,7 @@ tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
+tokio-stream.workspace = true
 tonic-health.workspace = true
 tonic.workspace = true
 tracing.workspace = true

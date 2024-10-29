@@ -42,6 +42,7 @@ use datafusion::{
 };
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
+use synchronized_table::SynchronizedTable;
 use tokio::task::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -58,6 +59,8 @@ mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
+mod sink;
+mod synchronized_table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -135,6 +138,9 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(display("Append stream is required for `RefreshMode::Append` without time_column"))]
     AppendStreamRequired,
+
+    #[snafu(display("Synchronized accelerated table requires full refresh mode"))]
+    SynchronizedAcceleratedTableRequiresFullRefresh,
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -155,6 +161,7 @@ pub struct AcceleratedTable {
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
     disable_query_push_down: bool,
+    synchronized_with: Option<SynchronizedTable>,
 }
 
 fn validate_refresh_data_window(
@@ -190,6 +197,7 @@ pub struct Builder {
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
     checkpointer: Option<DatasetCheckpoint>,
+    synchronize_with: Option<SynchronizedTable>,
 }
 
 impl Builder {
@@ -212,6 +220,7 @@ impl Builder {
             changes_stream: None,
             append_stream: None,
             checkpointer: None,
+            synchronize_with: None,
             disable_query_push_down: false,
         }
     }
@@ -273,6 +282,36 @@ impl Builder {
         self
     }
 
+    /// Set the existing full refresh mode accelerated table to synchronize with after the initial load completes
+    ///
+    /// A full table scan of the existing accelerated table is required to initialize a synchronized accelerated table.
+    ///
+    /// Handling append/changes mode should be possible, but requires more care to ensure
+    /// that delta updates are applied correctly after the initial table scan.
+    pub async fn synchronize_with(
+        &mut self,
+        existing_accelerated_table: &AcceleratedTable,
+    ) -> AcceleratedTableBuilderResult<&mut Self> {
+        ensure!(
+            matches!(self.refresh.mode, RefreshMode::Full),
+            SynchronizedAcceleratedTableRequiresFullRefreshSnafu
+        );
+        ensure!(
+            matches!(
+                existing_accelerated_table.refresh_params.read().await.mode,
+                RefreshMode::Full
+            ),
+            SynchronizedAcceleratedTableRequiresFullRefreshSnafu
+        );
+        let synchronized_table = SynchronizedTable::from(
+            existing_accelerated_table,
+            Arc::clone(&self.accelerator),
+            self.dataset_name.clone(),
+        );
+        self.synchronize_with = Some(synchronized_table);
+        Ok(self)
+    }
+
     /// Build the accelerated table
     pub async fn build(
         self,
@@ -331,6 +370,10 @@ impl Builder {
         refresher.cache_provider(self.cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
 
+        if let Some(synchronize_with) = &self.synchronize_with {
+            refresher.synchronize_with(synchronize_with.clone());
+        }
+
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
             .await;
@@ -361,6 +404,7 @@ impl Builder {
                 refresh_params,
                 refresher,
                 disable_query_push_down: self.disable_query_push_down,
+                synchronized_with: self.synchronize_with,
             },
             is_ready,
         ))
@@ -395,12 +439,15 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn refresh_trigger(&self) -> Option<mpsc::Sender<Option<RefreshOverrides>>> {
-        self.refresh_trigger.clone()
+    pub fn refresh_trigger(&self) -> Option<&mpsc::Sender<Option<RefreshOverrides>>> {
+        match &self.synchronized_with {
+            Some(synchronized_table) => synchronized_table.refresh_trigger(),
+            None => self.refresh_trigger.as_ref(),
+        }
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
-        match &self.refresh_trigger {
+        match self.refresh_trigger() {
             Some(refresh_trigger) => {
                 refresh_trigger
                     .send(overrides)

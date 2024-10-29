@@ -41,6 +41,7 @@ use tokio::time::sleep;
 
 use super::metrics;
 use super::refresh_task_runner::RefreshTaskRunner;
+use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -300,8 +301,9 @@ pub struct Refresher {
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    refresh_task_runner: RefreshTaskRunner,
+    refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
+    synchronize_with: Option<SynchronizedTable>,
 }
 
 impl Refresher {
@@ -312,14 +314,6 @@ impl Refresher {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
-        let refresh_task_runner = RefreshTaskRunner::new(
-            Arc::clone(&runtime_status),
-            dataset_name.clone(),
-            Arc::clone(&federated),
-            Arc::clone(&refresh),
-            Arc::clone(&accelerator),
-        );
-
         Self {
             runtime_status,
             dataset_name,
@@ -327,8 +321,9 @@ impl Refresher {
             refresh,
             accelerator,
             cache_provider: None,
-            refresh_task_runner,
+            refresh_task_runner: None,
             checkpointer: None,
+            synchronize_with: None,
         }
     }
 
@@ -342,6 +337,12 @@ impl Refresher {
 
     pub fn checkpointer(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
         self.checkpointer = checkpointer.map(Arc::new);
+        self
+    }
+
+    /// Synchronize further refreshes with an existing accelerated table after the initial load completes
+    pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
+        self.synchronize_with = Some(synchronized_table);
         self
     }
 
@@ -382,7 +383,16 @@ impl Refresher {
             }
         };
 
-        let (start_refresh, mut on_refresh_complete) = self.refresh_task_runner.start();
+        let mut refresh_task_runner = RefreshTaskRunner::new(
+            Arc::clone(&self.runtime_status),
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            Arc::clone(&self.refresh),
+            Arc::clone(&self.accelerator),
+        );
+
+        let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
+        self.refresh_task_runner = Some(refresh_task_runner);
 
         let mut ready_sender = Some(ready_sender);
         let dataset_name = self.dataset_name.clone();
@@ -393,6 +403,8 @@ impl Refresher {
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
+
+        let synchronize_with = self.synchronize_with.clone();
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
@@ -460,6 +472,15 @@ impl Refresher {
                             }
                         }
 
+                        // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
+                        if let Some(synchronize_with) = &synchronize_with {
+                            synchronize_with
+                                .refresher()
+                                .add_synchronized_table(synchronize_with.clone())
+                                .await;
+                            return;
+                        }
+
                         // Restart periodic refresh timer (after either cron or manual dataset refresh).
                         // For datasets with no periodic refresh, this will be a no-op.
                         if let Some(refresh_check_interval) = refresh_check_interval {
@@ -472,6 +493,26 @@ impl Refresher {
                 }
             }
         }))
+    }
+
+    /// Subscribes a new table provider to receive refresh notifications from an existing full refresh mode accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
+    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
+        assert!(
+            matches!(self.refresh.read().await.mode, RefreshMode::Full),
+            "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
+        );
+
+        if let Some(refresh_task_runner) = &self.refresh_task_runner {
+            refresh_task_runner
+                .add_synchronized_table(synchronized_table)
+                .await;
+        } else {
+            unreachable!("Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug");
+        }
     }
 
     fn start_streaming_append(
@@ -527,7 +568,9 @@ impl Refresher {
 
 impl Drop for Refresher {
     fn drop(&mut self) {
-        self.refresh_task_runner.abort();
+        if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
+            refresh_task_runner.abort();
+        }
     }
 }
 
