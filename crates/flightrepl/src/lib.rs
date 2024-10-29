@@ -430,7 +430,7 @@ fn display_grpc_error(err: &Status) {
         Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
             ("Error", "An internal error occurred. Execute '.error' to show details.")
         },
-        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => {
+        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
             let message = err.message().split('\n').next().unwrap_or(err.message());
             ("Query Error", message)},
         Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
@@ -439,7 +439,6 @@ fn display_grpc_error(err: &Status) {
         Code::PermissionDenied => ("Error", "The query could not be completed because the user does not have permission to access the requested data."),
         Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
         Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
-        Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable."),
         Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
     };
 
