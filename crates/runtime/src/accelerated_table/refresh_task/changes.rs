@@ -28,6 +28,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 
@@ -65,6 +66,7 @@ impl RefreshTask {
         mut changes_stream: ChangesStream,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
+        initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
@@ -84,6 +86,7 @@ impl RefreshTask {
                             if let Some(ready_sender) = ready_sender.take() {
                                 ready_sender.send(()).ok();
                             }
+                            initial_load_completed.store(true, Ordering::Relaxed);
 
                             if let Err(e) = change_envelope.commit() {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");

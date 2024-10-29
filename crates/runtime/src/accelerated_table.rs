@@ -17,7 +17,7 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::acceleration::{LoadingBehavior, RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
@@ -158,6 +158,7 @@ pub struct AcceleratedTable {
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     pub(crate) handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
+    loading_behavior: LoadingBehavior,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
     disable_query_push_down: bool,
@@ -192,6 +193,7 @@ pub struct Builder {
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
+    loading_behavior: LoadingBehavior,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
@@ -216,6 +218,7 @@ impl Builder {
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
+            loading_behavior: LoadingBehavior::default(),
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
@@ -232,6 +235,11 @@ impl Builder {
 
     pub fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
         self.zero_results_action = zero_results_action;
+        self
+    }
+
+    pub fn loading_behavior(&mut self, loading_behavior: LoadingBehavior) -> &mut Self {
+        self.loading_behavior = loading_behavior;
         self
     }
 
@@ -393,6 +401,13 @@ impl Builder {
             ));
             handlers.push(retention_check_handle);
         }
+
+        // If the table should be ready immediately, mark it as ready.
+        if let LoadingBehavior::ReadyImmediately = self.loading_behavior {
+            self.runtime_status
+                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+        }
+
         Ok((
             AcceleratedTable {
                 dataset_name: self.dataset_name,
@@ -401,6 +416,7 @@ impl Builder {
                 refresh_trigger,
                 handlers,
                 zero_results_action: self.zero_results_action,
+                loading_behavior: self.loading_behavior,
                 refresh_params,
                 refresher,
                 disable_query_push_down: self.disable_query_push_down,
@@ -631,6 +647,14 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // If the initial load hasn't completed yet, we need to handle the loading behavior.
+        if !self.refresher().initial_load_completed() {
+            // If the table is ready immediately, use the federated table
+            if let LoadingBehavior::ReadyImmediately = self.loading_behavior {
+                return self.federated.scan(state, projection, filters, limit).await;
+            }
+        }
+
         let input = self
             .accelerator
             .scan(state, projection, filters, limit)

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -304,6 +305,8 @@ pub struct Refresher {
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
     synchronize_with: Option<SynchronizedTable>,
+
+    initial_load_completed: Arc<AtomicBool>,
 }
 
 impl Refresher {
@@ -324,6 +327,7 @@ impl Refresher {
             refresh_task_runner: None,
             checkpointer: None,
             synchronize_with: None,
+            initial_load_completed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -344,6 +348,11 @@ impl Refresher {
     pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
         self.synchronize_with = Some(synchronized_table);
         self
+    }
+
+    #[must_use]
+    pub fn initial_load_completed(&self) -> bool {
+        self.initial_load_completed.load(Ordering::Relaxed)
     }
 
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
@@ -404,6 +413,8 @@ impl Refresher {
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
 
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
+
         let synchronize_with = self.synchronize_with.clone();
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
@@ -455,6 +466,7 @@ impl Refresher {
 
                         if let Ok(()) = res {
                             notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
+                            initial_load_completed.store(true, Ordering::Relaxed);
 
                             if let Some(cache_provider) = &cache_provider {
                                 if let Err(e) = cache_provider
@@ -529,10 +541,16 @@ impl Refresher {
         let refresh_defaults = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streaming_append(cache_provider, Some(ready_sender), refresh_defaults)
+                .start_streaming_append(
+                    cache_provider,
+                    Some(ready_sender),
+                    refresh_defaults,
+                    initial_load_completed,
+                )
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
@@ -554,10 +572,17 @@ impl Refresher {
 
         let cache_provider = self.cache_provider.clone();
         let refresh = Arc::clone(&self.refresh);
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_changes_stream(refresh, changes_stream, cache_provider, Some(ready_sender))
+                .start_changes_stream(
+                    refresh,
+                    changes_stream,
+                    cache_provider,
+                    Some(ready_sender),
+                    initial_load_completed,
+                )
                 .await
             {
                 tracing::error!("Changes stream failed with error: {err}");

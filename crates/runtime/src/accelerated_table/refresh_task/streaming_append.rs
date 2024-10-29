@@ -23,6 +23,7 @@ use cache::QueryResultsCacheProvider;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{oneshot, RwLock};
@@ -33,6 +34,7 @@ impl RefreshTask {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
         ready_sender: Option<oneshot::Sender<()>>,
         refresh: Arc<RwLock<Refresh>>,
+        initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
@@ -57,6 +59,7 @@ impl RefreshTask {
                         if let Some(ready_sender) = ready_sender.take() {
                             ready_sender.send(()).ok();
                         }
+                        initial_load_completed.store(true, Ordering::Relaxed);
 
                         if let Some(cache_provider) = &cache_provider {
                             if let Err(e) = cache_provider

@@ -199,6 +199,18 @@ pub mod acceleration {
         }
     }
 
+    /// Behavior when a query on an accelerated table is executed before the initial load completes.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    #[serde(rename_all = "snake_case")]
+    pub enum LoadingBehavior {
+        /// The table is ready once the initial load completes.
+        #[default]
+        ReadyAfterInitialLoad,
+        /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
+        ReadyImmediately,
+    }
+
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
@@ -291,6 +303,9 @@ pub mod acceleration {
         #[serde(default)]
         pub on_zero_results: ZeroResultsAction,
 
+        #[serde(default)]
+        pub loading_behavior: LoadingBehavior,
+
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub indexes: HashMap<String, IndexType>,
 
@@ -330,6 +345,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
+                loading_behavior: LoadingBehavior::ReadyAfterInitialLoad,
                 indexes: HashMap::default(),
                 primary_key: None,
                 on_conflict: HashMap::default(),

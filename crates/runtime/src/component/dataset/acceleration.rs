@@ -94,6 +94,38 @@ impl Display for ZeroResultsAction {
     }
 }
 
+/// Behavior when a query on an accelerated table is executed before the initial load completes.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum LoadingBehavior {
+    /// The table is ready once the initial load completes.
+    #[default]
+    ReadyAfterInitialLoad,
+    /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
+    ReadyImmediately,
+}
+
+impl From<spicepod_acceleration::LoadingBehavior> for LoadingBehavior {
+    fn from(loading_behavior: spicepod_acceleration::LoadingBehavior) -> Self {
+        match loading_behavior {
+            spicepod_acceleration::LoadingBehavior::ReadyAfterInitialLoad => {
+                LoadingBehavior::ReadyAfterInitialLoad
+            }
+            spicepod_acceleration::LoadingBehavior::ReadyImmediately => {
+                LoadingBehavior::ReadyImmediately
+            }
+        }
+    }
+}
+
+impl Display for LoadingBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadingBehavior::ReadyAfterInitialLoad => write!(f, "ready_after_initial_load"),
+            LoadingBehavior::ReadyImmediately => write!(f, "ready_immediately"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum Engine {
     #[default]
