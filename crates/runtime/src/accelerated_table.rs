@@ -303,7 +303,11 @@ impl Builder {
             ),
             SynchronizedAcceleratedTableRequiresFullRefreshSnafu
         );
-        let synchronized_table = SynchronizedTable::from(existing_accelerated_table);
+        let synchronized_table = SynchronizedTable::from(
+            existing_accelerated_table,
+            Arc::clone(&self.accelerator),
+            self.dataset_name.clone(),
+        );
         self.synchronize_with = Some(synchronized_table);
         Ok(self)
     }
@@ -367,7 +371,7 @@ impl Builder {
         refresher.checkpointer(self.checkpointer);
 
         if let Some(synchronize_with) = &self.synchronize_with {
-            refresher.synchronize_with(synchronize_with.refresher());
+            refresher.synchronize_with(synchronize_with.clone());
         }
 
         let refresh_handle = refresher

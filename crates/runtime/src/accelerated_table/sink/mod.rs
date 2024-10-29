@@ -20,6 +20,8 @@ use std::{pin::Pin, sync::Arc};
 use table::TableSink;
 use util::RetryError;
 
+use super::synchronized_table::SynchronizedTable;
+
 pub(crate) mod multi;
 pub(crate) mod table;
 
@@ -34,14 +36,21 @@ impl AccelerationSink {
     }
 
     // Adds a table provider to the AccelerationSink, converting a TableSink to a MultiSink if necessary
-    pub fn add_table_provider(&mut self, new_table_provider: Arc<dyn TableProvider>) {
+    pub fn add_synchronized_table(&mut self, synchronized_table: SynchronizedTable) {
         match self {
             AccelerationSink::Table(table_sink) => {
                 let table_provider = Arc::clone(&table_sink.table_provider);
-                let multi_sink = MultiSink::new(vec![table_provider, new_table_provider]);
+                let multi_sink = MultiSink::new(table_provider, vec![synchronized_table]);
                 *self = AccelerationSink::Multi(multi_sink);
             }
-            AccelerationSink::Multi(sink) => sink.add_table_provider(new_table_provider),
+            AccelerationSink::Multi(sink) => sink.add_synchronized_table(synchronized_table),
+        }
+    }
+
+    pub fn synchronized_tables(&self) -> Vec<&SynchronizedTable> {
+        match self {
+            AccelerationSink::Table(_) => vec![],
+            AccelerationSink::Multi(sink) => sink.synchronized_tables().iter().collect(),
         }
     }
 

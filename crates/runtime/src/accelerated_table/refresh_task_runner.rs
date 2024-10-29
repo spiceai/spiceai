@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::status;
 
-use super::{refresh::RefreshOverrides, refresh_task::RefreshTask};
+use super::{
+    refresh::RefreshOverrides, refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
+};
 use futures::future::BoxFuture;
 use tokio::{
     select,
@@ -130,9 +132,9 @@ impl RefreshTaskRunner {
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
-    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
+    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
         self.refresh_task
-            .subscribe_table_provider(new_table_provider)
+            .add_synchronized_table(synchronized_table)
             .await;
     }
 

@@ -45,6 +45,7 @@ use crate::{
 
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
+use super::synchronized_table::SynchronizedTable;
 use super::{metrics, UnableToCreateMemTableFromUpdateSnafu};
 
 use crate::component::dataset::TimeFormat;
@@ -100,11 +101,11 @@ impl RefreshTask {
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
-    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
+    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
         self.sink
             .write()
             .await
-            .add_table_provider(new_table_provider);
+            .add_synchronized_table(synchronized_table);
     }
 
     pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
@@ -136,11 +137,8 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        self.mark_dataset_status(
-            &self.dataset_name,
-            refresh.sql.as_deref(),
-            status::ComponentStatus::Refreshing,
-        );
+        self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
+            .await;
 
         let _timer = TimeMeasurement::new(
             match refresh.mode {
@@ -172,11 +170,8 @@ impl RefreshTask {
             Ok(data_update) => data_update,
             Err(e) => {
                 tracing::warn!("Failed to load data for dataset {}: {e}", self.dataset_name);
-                self.mark_dataset_status(
-                    &self.dataset_name,
-                    refresh.sql.as_deref(),
-                    status::ComponentStatus::Error,
-                );
+                self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Error)
+                    .await;
                 return Err(e);
             }
         };
@@ -248,20 +243,21 @@ impl RefreshTask {
         let sink_lock = self.sink.read().await;
         let sink = &*sink_lock;
 
-        sink.insert_into(record_batch_stream, overwrite)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!("Failed to update dataset {dataset_name}: {e}");
-                self.mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Error);
-            })?;
+        if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
+            tracing::warn!("Failed to update dataset {dataset_name}: {e}");
+            self.mark_dataset_status(sql, status::ComponentStatus::Error)
+                .await;
+        }
 
         if let (Some(start_time), Ok(refresh_stat)) =
             (start_time, on_written_data_stat_available.try_recv())
         {
-            self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size);
+            self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size)
+                .await;
         }
 
-        self.mark_dataset_status(&dataset_name, sql, status::ComponentStatus::Ready);
+        self.mark_dataset_status(sql, status::ComponentStatus::Ready)
+            .await;
 
         Ok(())
     }
@@ -309,14 +305,11 @@ impl RefreshTask {
                 .map_or(false, |x| x.columns().is_empty())
         {
             if let Some(start_time) = start_time {
-                self.trace_dataset_loaded(start_time, 0, 0);
+                self.trace_dataset_loaded(start_time, 0, 0).await;
             }
 
-            self.mark_dataset_status(
-                &self.dataset_name,
-                sql.as_deref(),
-                status::ComponentStatus::Ready,
-            );
+            self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Ready)
+                .await;
 
             return Ok(());
         };
@@ -366,7 +359,12 @@ impl RefreshTask {
         }
     }
 
-    fn trace_dataset_loaded(&self, start_time: SystemTime, num_rows: usize, memory_size: usize) {
+    async fn trace_dataset_loaded(
+        &self,
+        start_time: SystemTime,
+        num_rows: usize,
+        memory_size: usize,
+    ) {
         if let Ok(elapsed) = util::humantime_elapsed(start_time) {
             let dataset_name = &self.dataset_name;
             let num_rows = util::pretty_print_number(num_rows);
@@ -384,6 +382,12 @@ impl RefreshTask {
                 tracing::info!(
                     "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}."
                 );
+                for synchronized_table in self.sink.read().await.synchronized_tables() {
+                    tracing::info!(
+                        "Loaded {num_rows} rows{memory_size} for dataset {} in {elapsed}.",
+                        synchronized_table.child_dataset_name()
+                    );
+                }
             }
         }
     }
@@ -629,30 +633,32 @@ impl RefreshTask {
         }
     }
 
-    fn mark_dataset_status(
-        &self,
-        dataset_name: &TableReference,
-        sql: Option<&str>,
-        status: status::ComponentStatus,
-    ) {
-        self.runtime_status.update_dataset(dataset_name, status);
-
-        if status == status::ComponentStatus::Error {
-            let labels = [KeyValue::new("dataset", dataset_name.to_string())];
-            metrics::REFRESH_ERRORS.add(1, &labels);
+    async fn mark_dataset_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        let mut dataset_names = vec![self.dataset_name.clone()];
+        for synchronized_table in self.sink.read().await.synchronized_tables() {
+            dataset_names.push(synchronized_table.child_dataset_name());
         }
 
-        if status == status::ComponentStatus::Ready {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
+        for dataset_name in dataset_names {
+            self.runtime_status.update_dataset(&dataset_name, status);
 
-            let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
-            if let Some(sql) = sql {
-                labels.push(KeyValue::new("sql", sql.to_string()));
-            };
+            if status == status::ComponentStatus::Error {
+                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
+                metrics::REFRESH_ERRORS.add(1, &labels);
+            }
 
-            metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
+            if status == status::ComponentStatus::Ready {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+
+                let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
+                if let Some(sql) = sql {
+                    labels.push(KeyValue::new("sql", sql.to_string()));
+                };
+
+                metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
+            }
         }
     }
 }

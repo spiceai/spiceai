@@ -41,6 +41,7 @@ use tokio::time::sleep;
 
 use super::metrics;
 use super::refresh_task_runner::RefreshTaskRunner;
+use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -302,7 +303,7 @@ pub struct Refresher {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
-    synchronize_with: Option<Arc<Refresher>>,
+    synchronize_with: Option<SynchronizedTable>,
 }
 
 impl Refresher {
@@ -340,8 +341,8 @@ impl Refresher {
     }
 
     /// Synchronize further refreshes with an existing accelerated table after the initial load completes
-    pub fn synchronize_with(&mut self, refresher: Arc<Refresher>) -> &mut Self {
-        self.synchronize_with = Some(refresher);
+    pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
+        self.synchronize_with = Some(synchronized_table);
         self
     }
 
@@ -404,7 +405,6 @@ impl Refresher {
         let max_jitter = self.refresh.read().await.max_jitter;
 
         let synchronize_with = self.synchronize_with.clone();
-        let accelerator = Arc::clone(&self.accelerator);
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
@@ -474,7 +474,10 @@ impl Refresher {
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
                         if let Some(synchronize_with) = &synchronize_with {
-                            synchronize_with.subscribe_table_provider(accelerator).await;
+                            synchronize_with
+                                .refresher()
+                                .add_synchronized_table(synchronize_with.clone())
+                                .await;
                             return;
                         }
 
@@ -497,7 +500,7 @@ impl Refresher {
     /// # Panics
     ///
     /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
-    pub async fn subscribe_table_provider(&self, new_table_provider: Arc<dyn TableProvider>) {
+    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
         assert!(
             matches!(self.refresh.read().await.mode, RefreshMode::Full),
             "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
@@ -505,7 +508,7 @@ impl Refresher {
 
         if let Some(refresh_task_runner) = &self.refresh_task_runner {
             refresh_task_runner
-                .subscribe_table_provider(new_table_provider)
+                .add_synchronized_table(synchronized_table)
                 .await;
         } else {
             unreachable!("Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug");

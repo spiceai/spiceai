@@ -32,21 +32,32 @@ use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
 use crate::{
-    accelerated_table::refresh_task::retry_from_df_error,
+    accelerated_table::{refresh_task::retry_from_df_error, synchronized_table::SynchronizedTable},
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
 
 pub(crate) struct MultiSink {
-    table_providers: Vec<Arc<dyn TableProvider>>,
+    original_table_provider: Arc<dyn TableProvider>,
+    synchronized_tables: Vec<SynchronizedTable>,
 }
 
 impl MultiSink {
-    pub fn new(table_providers: Vec<Arc<dyn TableProvider>>) -> Self {
-        Self { table_providers }
+    pub fn new(
+        original_table_provider: Arc<dyn TableProvider>,
+        synchronized_tables: Vec<SynchronizedTable>,
+    ) -> Self {
+        Self {
+            original_table_provider,
+            synchronized_tables,
+        }
     }
 
-    pub fn add_table_provider(&mut self, table_provider: Arc<dyn TableProvider>) {
-        self.table_providers.push(table_provider);
+    pub fn add_synchronized_table(&mut self, synchronized_table: SynchronizedTable) {
+        self.synchronized_tables.push(synchronized_table);
+    }
+
+    pub fn synchronized_tables(&self) -> &Vec<SynchronizedTable> {
+        &self.synchronized_tables
     }
 
     pub async fn insert_into(
@@ -61,9 +72,8 @@ impl MultiSink {
         let ctx = SessionContext::new();
 
         // Spawn tasks for each table provider
-        for provider in &self.table_providers {
+        for provider in self.table_providers() {
             let rx = tx.subscribe();
-            let provider = Arc::clone(provider);
             let ctx_state = ctx.state();
             let schema = Arc::clone(&schema);
 
@@ -124,6 +134,16 @@ impl MultiSink {
         }
 
         Ok(())
+    }
+
+    fn table_providers(&self) -> Vec<Arc<dyn TableProvider>> {
+        let mut table_providers = vec![Arc::clone(&self.original_table_provider)];
+        table_providers.extend(
+            self.synchronized_tables
+                .iter()
+                .map(SynchronizedTable::child_accelerator),
+        );
+        table_providers
     }
 }
 
