@@ -38,9 +38,8 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
         &self,
         model_id: &str,
         query: &str,
-        create_table_statements: &[String],
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = create_prompt(query, create_table_statements);
+        let prompt = create_prompt(query);
 
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
