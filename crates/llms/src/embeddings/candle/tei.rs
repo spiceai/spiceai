@@ -271,10 +271,11 @@ impl Embed for TeiEmbed {
         self.model_size
     }
 
-    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
-        Some(Arc::new(RecursiveSplittingChunker::with_tokenizer_sizer(
-            cfg,
-            Arc::clone(&self.tok),
-        )))
+    fn chunker(&self, cfg: &ChunkingConfig) -> Result<Arc<dyn Chunker>> {
+        Ok(Arc::new(
+            RecursiveSplittingChunker::with_tokenizer_sizer(cfg, Arc::clone(&self.tok))
+                .boxed()
+                .map_err(|e| Error::FailedToCreateChunker { source: e })?,
+        ))
     }
 }

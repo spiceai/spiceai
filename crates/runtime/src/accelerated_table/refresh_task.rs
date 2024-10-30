@@ -27,11 +27,13 @@ use datafusion_table_providers::util::retriable_error::{
 use futures::{stream, StreamExt};
 use opentelemetry::KeyValue;
 use snafu::{OptionExt, ResultExt};
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::error::{get_spice_df_error, SpiceExternalError};
 use crate::datafusion::schema::BaseSchema;
+use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -40,7 +42,6 @@ use crate::{
     execution_plan::schema_cast::EnsureSchema,
     object_store_registry::default_runtime_env,
     status,
-    timing::TimeMeasurement,
 };
 
 use super::refresh::get_timestamp;
@@ -121,18 +122,35 @@ impl RefreshTask {
 
         let dataset_name = self.dataset_name.clone();
 
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+        let mut spans = vec![];
+        let mut parent_span = Span::current();
+        for dataset_name in self.get_dataset_names().await {
+            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+            spans.push(span.clone());
+            parent_span = span;
+        }
+        let span = spans
+            .iter()
+            .last()
+            .unwrap_or_else(|| unreachable!("There is always at least one span"));
         retry(retry_strategy, || async {
-            self.run_once(&refresh).await.inspect_err(|_err| {
-                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
-                metrics::REFRESH_ERRORS.add(1, &labels);
-            })
+            match self.run_once(&refresh).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    for label_set in self.get_dataset_label_sets().await {
+                        metrics::REFRESH_ERRORS.add(1, &label_set);
+                    }
+                    Err(e)
+                }
+            }
         })
         .instrument(span.clone())
         .await
         .inspect_err(|e| {
             tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
-            tracing::error!(target: "task_history", parent: &span, "{e}");
+            for span in &spans {
+                tracing::error!(target: "task_history", parent: span, "{e}");
+            }
         })
     }
 
@@ -140,7 +158,7 @@ impl RefreshTask {
         self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
-        let _timer = TimeMeasurement::new(
+        let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -149,7 +167,7 @@ impl RefreshTask {
                 RefreshMode::Append => &metrics::APPEND_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            vec![KeyValue::new("dataset", self.dataset_name.to_string())],
+            self.get_dataset_label_sets().await,
         );
 
         let start_time = SystemTime::now();
@@ -169,8 +187,7 @@ impl RefreshTask {
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
-                tracing::warn!("Failed to load data for dataset {}: {e}", self.dataset_name);
-                self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Error)
+                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
                     .await;
                 return Err(e);
             }
@@ -634,11 +651,24 @@ impl RefreshTask {
         }
     }
 
-    async fn mark_dataset_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+    async fn get_dataset_names(&self) -> Vec<TableReference> {
         let mut dataset_names = vec![self.dataset_name.clone()];
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             dataset_names.push(synchronized_table.child_dataset_name());
         }
+        dataset_names
+    }
+
+    async fn get_dataset_label_sets(&self) -> Vec<Vec<KeyValue>> {
+        let dataset_names = self.get_dataset_names().await;
+        dataset_names
+            .into_iter()
+            .map(|name| vec![KeyValue::new("dataset", name.to_string())])
+            .collect()
+    }
+
+    async fn mark_dataset_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        let dataset_names = self.get_dataset_names().await;
 
         for dataset_name in dataset_names {
             self.runtime_status.update_dataset(&dataset_name, status);
@@ -661,6 +691,29 @@ impl RefreshTask {
                 metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
             }
         }
+    }
+
+    async fn log_refresh_error(&self, error: &super::Error, refresh_sql: Option<&str>) {
+        if let super::Error::UnableToGetDataFromConnector { source } = error {
+            if let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
+                get_spice_df_error(source)
+            {
+                tracing::warn!(
+                    "Dataset {} is waiting for {dataset_name} to finish loading initial acceleration.",
+                    self.dataset_name
+                );
+                self.mark_dataset_status(refresh_sql, status::ComponentStatus::Initializing)
+                    .await;
+                return;
+            }
+        }
+
+        tracing::warn!(
+            "Failed to load data for dataset {}: {error}",
+            self.dataset_name
+        );
+        self.mark_dataset_status(refresh_sql, status::ComponentStatus::Error)
+            .await;
     }
 }
 
@@ -735,6 +788,14 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
 }
 
 fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
+    match error {
+        RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
+            inner_err
+        }
+    }
+}
+
+fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
     match error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err

@@ -60,6 +60,7 @@ use tokio::time::{sleep, Instant};
 pub mod query;
 
 pub mod builder;
+pub mod error;
 mod extension;
 pub mod filter_converter;
 pub mod refresh_sql;
@@ -150,7 +151,7 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to trigger refresh for {table_name}: {source}"))]
+    #[snafu(display("Cannot refresh {table_name}: {source}"))]
     UnableToTriggerRefresh {
         table_name: String,
         source: crate::accelerated_table::Error,
@@ -646,6 +647,18 @@ impl DataFusion {
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
 
+        // If we already have an existing dataset checkpoint table that has been checkpointed,
+        // it means there is data from a previous acceleration and we don't need
+        // to wait for the first refresh to complete to mark it ready.
+        let mut initial_load_complete = false;
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await {
+            if checkpoint.exists().await {
+                self.runtime_status
+                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                initial_load_complete = true;
+            }
+        }
+
         let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
             refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str())
@@ -700,9 +713,13 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
+        accelerated_table_builder.ready_state(acceleration_settings.ready_state);
+
         accelerated_table_builder.cache_provider(self.cache_provider());
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
+
+        accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         if acceleration_settings.disable_query_push_down {
             accelerated_table_builder.disable_query_push_down();

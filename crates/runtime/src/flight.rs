@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::query::{Protocol, QueryBuilder};
+use crate::datafusion::error::SpiceExternalError;
+use crate::datafusion::query::{self, Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
@@ -185,7 +186,7 @@ impl Service {
             .protocol(protocol)
             .build();
 
-        let query_result = query.run().await.map_err(to_tonic_err)?;
+        let query_result = query.run().await.map_err(handle_query_error)?;
 
         let schema = query_result.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
@@ -262,6 +263,13 @@ where
     }
 }
 
+fn handle_query_error(e: query::Error) -> Status {
+    match e {
+        query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        _ => to_tonic_err(e),
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn handle_datafusion_error(e: DataFusionError) -> Status {
     match e {
@@ -278,6 +286,19 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
         },
         DataFusionError::SchemaError(schema_err, _) => {
             Status::invalid_argument(format!("{schema_err}"))
+        }
+        DataFusionError::External(e) => {
+            if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
+                match e {
+                    SpiceExternalError::AccelerationNotReady { dataset_name } => {
+                        Status::unavailable(format!(
+                            "Acceleration not ready; loading initial data for {dataset_name}"
+                        ))
+                    }
+                }
+            } else {
+                to_tonic_err(e)
+            }
         }
         _ => to_tonic_err(e),
     }

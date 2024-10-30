@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -304,6 +305,8 @@ pub struct Refresher {
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
     synchronize_with: Option<SynchronizedTable>,
+
+    initial_load_completed: Arc<AtomicBool>,
 }
 
 impl Refresher {
@@ -324,6 +327,7 @@ impl Refresher {
             refresh_task_runner: None,
             checkpointer: None,
             synchronize_with: None,
+            initial_load_completed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -344,6 +348,16 @@ impl Refresher {
     pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
         self.synchronize_with = Some(synchronized_table);
         self
+    }
+
+    pub fn set_initial_load_completed(&mut self, initial_load_completed: bool) {
+        self.initial_load_completed
+            .store(initial_load_completed, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn initial_load_completed(&self) -> bool {
+        self.initial_load_completed.load(Ordering::Relaxed)
     }
 
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
@@ -404,6 +418,8 @@ impl Refresher {
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
 
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
+
         let synchronize_with = self.synchronize_with.clone();
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
@@ -455,6 +471,7 @@ impl Refresher {
 
                         if let Ok(()) = res {
                             notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
+                            initial_load_completed.store(true, Ordering::Relaxed);
 
                             if let Some(cache_provider) = &cache_provider {
                                 if let Err(e) = cache_provider
@@ -529,10 +546,16 @@ impl Refresher {
         let refresh_defaults = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streaming_append(cache_provider, Some(ready_sender), refresh_defaults)
+                .start_streaming_append(
+                    cache_provider,
+                    Some(ready_sender),
+                    refresh_defaults,
+                    initial_load_completed,
+                )
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
@@ -554,10 +577,17 @@ impl Refresher {
 
         let cache_provider = self.cache_provider.clone();
         let refresh = Arc::clone(&self.refresh);
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_changes_stream(refresh, changes_stream, cache_provider, Some(ready_sender))
+                .start_changes_stream(
+                    refresh,
+                    changes_stream,
+                    cache_provider,
+                    Some(ready_sender),
+                    initial_load_completed,
+                )
                 .await
             {
                 tracing::error!("Changes stream failed with error: {err}");
@@ -604,8 +634,6 @@ async fn notify_refresh_done(
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
-
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
         datatypes::{DataType, Field, Fields, Schema},
@@ -734,30 +762,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_status_change_to_ready() {
-        fn wait_until_ready_status(
+        async fn wait_until_ready_status(
             registry: &prometheus::Registry,
             desired: status::ComponentStatus,
+            max_attempts: usize,
+            delay: Duration,
         ) -> bool {
-            for _i in 1..20 {
-                let hashmap = registry.gather();
-                let metric = hashmap
-                    .iter()
-                    .find(|m| m.get_name() == "datasets_status")
-                    .expect("datasets_status metric exists");
-                match metric.get_field_type() {
-                    MetricType::GAUGE => {
+            for _attempt in 0..max_attempts {
+                let metrics = registry.gather();
+                if let Some(metric) = metrics.iter().find(|m| m.get_name() == "datasets_status") {
+                    if metric.get_field_type() == MetricType::GAUGE {
                         let value = metric.get_metric()[0].get_gauge().get_value();
-
                         if value.is_eq(f64::from(desired as i32)) {
                             return true;
                         }
                     }
-                    _ => panic!("datasets_status is a gauge"),
                 }
-
-                sleep(Duration::from_millis(100));
+                tokio::time::sleep(delay).await;
             }
-
             false
         }
 
@@ -794,10 +816,17 @@ mod tests {
         )
         .await;
 
-        assert!(wait_until_ready_status(
-            &registry,
-            status::ComponentStatus::Ready
-        ));
+        // Use more attempts with shorter delays for better test performance
+        assert!(
+            wait_until_ready_status(
+                &registry,
+                status::ComponentStatus::Ready,
+                20,
+                Duration::from_millis(50)
+            )
+            .await,
+            "Status did not change to Ready within timeout"
+        );
 
         status.update_dataset(
             &TableReference::bare("test"),
@@ -806,10 +835,16 @@ mod tests {
 
         setup_and_test(Arc::clone(&status), vec![], vec![], 0).await;
 
-        assert!(wait_until_ready_status(
-            &registry,
-            status::ComponentStatus::Ready
-        ));
+        assert!(
+            wait_until_ready_status(
+                &registry,
+                status::ComponentStatus::Ready,
+                20,
+                Duration::from_millis(50)
+            )
+            .await,
+            "Status did not change to Ready within timeout"
+        );
     }
 
     #[allow(clippy::too_many_lines)]

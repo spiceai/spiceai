@@ -31,7 +31,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 
 ## For Chunking
-text-splitter = {version =  "0.18.1", features = ["markdown", "tokenizers", "tiktoken-rs"]}
+text-splitter = { version =  "0.18.1", features = ["markdown", "tokenizers", "tiktoken-rs"]}
 pulldown-cmark = "0.12.1"
 tiktoken-rs = "0.6.0"
 
