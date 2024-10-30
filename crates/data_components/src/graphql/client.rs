@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::token_provider::TokenProvider;
 
-use super::{ArrowInternalSnafu, Error, ReqwestInternalSnafu, Result};
+use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -707,6 +707,7 @@ impl GraphQLClient {
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
     ) -> Result<GraphQLQueryResult> {
         let query_string = query.to_string(limit, cursor);
 
@@ -716,9 +717,14 @@ impl GraphQLClient {
         request = request_with_auth(request, &self.auth).await;
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
+        let response_headers = response.headers().clone();
+
         let status = response.status();
         let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
 
+        error_checker
+            .map(|p| p(&response_headers, &response))
+            .transpose()?;
         handle_http_error(status, &response)?;
         handle_graphql_query_error(&response, &query_string)?;
 
@@ -785,9 +791,16 @@ impl GraphQLClient {
         query: &mut GraphQLQuery<'a>,
         schema: SchemaRef,
         limit: Option<usize>,
+        error_checker: Option<ErrorChecker>,
     ) -> Result<Vec<Vec<RecordBatch>>> {
         let mut result = self
-            .execute(query, Some(Arc::clone(&schema)), limit, None)
+            .execute(
+                query,
+                Some(Arc::clone(&schema)),
+                limit,
+                None,
+                error_checker.clone(),
+            )
             .await?;
         let mut res = vec![result.records];
         let mut limit = limit;
@@ -809,6 +822,7 @@ impl GraphQLClient {
                     Some(Arc::clone(&schema)),
                     limit,
                     Some(next_cursor_val),
+                    error_checker.clone(),
                 )
                 .await?;
             res.push(result.records);

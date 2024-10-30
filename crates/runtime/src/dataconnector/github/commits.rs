@@ -19,7 +19,10 @@ use super::{
     GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::{client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer};
+use data_components::{
+    github::error_checker,
+    graphql::{client::GraphQLQuery, ErrorChecker, FilterPushdownResult, GraphQLContext},
+};
 use datafusion::prelude::Expr;
 use std::sync::Arc;
 
@@ -29,7 +32,7 @@ pub struct CommitsTableArgs {
     pub repo: String,
 }
 
-impl GraphQLOptimizer for CommitsTableArgs {
+impl GraphQLContext for CommitsTableArgs {
     fn filter_pushdown(
         &self,
         expr: &Expr,
@@ -43,6 +46,10 @@ impl GraphQLOptimizer for CommitsTableArgs {
         query: &mut GraphQLQuery<'_>,
     ) -> Result<(), datafusion::error::DataFusionError> {
         inject_parameters("history", commits_inject_parameters, filters, query)
+    }
+
+    fn error_checker(&self) -> Option<ErrorChecker> {
+        Some(Arc::new(error_checker))
     }
 }
 
