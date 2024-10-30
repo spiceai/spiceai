@@ -17,6 +17,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | GraphQL                 | ❌ |  |
 | GitHub                  | ❌ |  |
 | HTTP/HTTPS              | ❌ |  |
+| Localpod                | ❌ |  |
 | MS SQL                  | ❌ |  |
 | MySQL                   | ✅ | @peasee |
 | ODBC                    | ❌ |  |

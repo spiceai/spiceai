@@ -103,6 +103,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `sharepoint`  | Microsoft SharePoint                                                                           | Alpha             | Unstructured UTF-8 documents                                                                       |
 | `mssql`       | Microsoft SQL Server                                                                           | Alpha             | Tabular Data Stream (TDS)                                                                          |
 | `abfs`        | Azure BlobFS                                                                                   | Alpha             | Parquet, CSV                                                                                       |
+| `localpod`    | [Local dataset replication](https://github.com/spiceai/quickstarts/blob/trunk/localpod/README.md)                                                                                   | -             |                                                                                        |
 
 ### Supported Data Stores/Accelerators
 
