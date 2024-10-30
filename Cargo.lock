@@ -3409,9 +3409,9 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16155315d01e177d0d2217fbe972f03b1383b1618a07955b2e38e853cdf0e77b"
+checksum = "5faf8f3fa6e52c3b0a9c09b7e75003240332b995d64bff66b20bd8c6a471156b"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3424,13 +3424,11 @@ dependencies = [
  "bytes",
  "chrono",
  "delta_kernel_derive",
- "either",
  "fix-hidden-lifetime-bug",
  "futures",
  "hdfs-native-object-store",
  "indexmap 2.6.0",
  "itertools 0.13.0",
- "lazy_static",
  "object_store",
  "parquet",
  "reqwest 0.12.8",
@@ -3450,9 +3448,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec5c4fb5b59b1bd55ed8ebcf941f27a327d600c19a4a4103546846c358be93ff"
+checksum = "b1fedc71a2a766add80b18b425b191624eff508eb8befafe80d4bbe69faabb8c"
 dependencies = [
  "proc-macro2",
  "quote",
