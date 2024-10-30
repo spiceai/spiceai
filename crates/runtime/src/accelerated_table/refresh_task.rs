@@ -32,6 +32,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
 use crate::datafusion::schema::BaseSchema;
+use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -40,7 +41,6 @@ use crate::{
     execution_plan::schema_cast::EnsureSchema,
     object_store_registry::default_runtime_env,
     status,
-    timing::TimeMeasurement,
 };
 
 use super::refresh::get_timestamp;
@@ -140,7 +140,7 @@ impl RefreshTask {
         self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
-        let _timer = TimeMeasurement::new(
+        let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -149,7 +149,7 @@ impl RefreshTask {
                 RefreshMode::Append => &metrics::APPEND_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            vec![KeyValue::new("dataset", self.dataset_name.to_string())],
+            self.get_dataset_label_sets().await,
         );
 
         let start_time = SystemTime::now();
@@ -634,11 +634,24 @@ impl RefreshTask {
         }
     }
 
-    async fn mark_dataset_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+    async fn get_dataset_names(&self) -> Vec<TableReference> {
         let mut dataset_names = vec![self.dataset_name.clone()];
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             dataset_names.push(synchronized_table.child_dataset_name());
         }
+        dataset_names
+    }
+
+    async fn get_dataset_label_sets(&self) -> Vec<Vec<KeyValue>> {
+        let dataset_names = self.get_dataset_names().await;
+        dataset_names
+            .into_iter()
+            .map(|name| vec![KeyValue::new("dataset", name.to_string())])
+            .collect()
+    }
+
+    async fn mark_dataset_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        let dataset_names = self.get_dataset_names().await;
 
         for dataset_name in dataset_names {
             self.runtime_status.update_dataset(&dataset_name, status);
