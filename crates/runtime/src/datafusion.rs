@@ -19,12 +19,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::AcceleratedTableBuilderError;
+use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, create_accelerator_table};
+use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
@@ -59,6 +60,7 @@ use tokio::time::{sleep, Instant};
 pub mod query;
 
 pub mod builder;
+pub mod error;
 mod extension;
 pub mod filter_converter;
 pub mod refresh_sql;
@@ -149,7 +151,7 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to trigger refresh for {table_name}: {source}"))]
+    #[snafu(display("Cannot refresh {table_name}: {source}"))]
     UnableToTriggerRefresh {
         table_name: String,
         source: crate::accelerated_table::Error,
@@ -645,6 +647,18 @@ impl DataFusion {
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
 
+        // If we already have an existing dataset checkpoint table that has been checkpointed,
+        // it means there is data from a previous acceleration and we don't need
+        // to wait for the first refresh to complete to mark it ready.
+        let mut initial_load_complete = false;
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await {
+            if checkpoint.exists().await {
+                self.runtime_status
+                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                initial_load_complete = true;
+            }
+        }
+
         let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
             refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str())
@@ -699,9 +713,13 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
+        accelerated_table_builder.ready_state(acceleration_settings.ready_state);
+
         accelerated_table_builder.cache_provider(self.cache_provider());
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
+
+        accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         if acceleration_settings.disable_query_push_down {
             accelerated_table_builder.disable_query_push_down();
@@ -729,10 +747,61 @@ impl DataFusion {
             };
         }
 
+        // If this is a localpod accelerated table, attempt to synchronize refreshes with the parent table
+        if dataset.source() == LOCALPOD_DATACONNECTOR {
+            self.attempt_to_synchronize_accelerated_table(&mut accelerated_table_builder, dataset)
+                .await;
+        }
+
         accelerated_table_builder
             .build()
             .await
             .context(UnableToBuildAcceleratedTableSnafu)
+    }
+
+    /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
+    ///
+    /// This will not work if:
+    /// - The parent table is not an accelerated table.
+    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    ///
+    /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
+    pub async fn attempt_to_synchronize_accelerated_table(
+        &self,
+        accelerated_table_builder: &mut accelerated_table::Builder,
+        dataset: &Dataset,
+    ) {
+        let parent_table_reference = TableReference::parse_str(&dataset.path());
+        let Ok(parent_table) = self.get_table_provider(&parent_table_reference).await else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found.");
+            return;
+        };
+        let Some(parent_table_federation_adaptor) = parent_table
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>(
+        ) else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table.");
+            return;
+        };
+        let Some(parent_table) = parent_table_federation_adaptor.table_provider.clone() else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider.");
+            return;
+        };
+        let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table.");
+            return;
+        };
+        if let Err(e) = accelerated_table_builder
+            .synchronize_with(parent_table)
+            .await
+        {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Error: {e}");
+            return;
+        }
+
+        tracing::info!(
+            "Localpod dataset {} synchronizing refreshes with parent table {parent_table_reference}", dataset.name
+        );
     }
 
     pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {

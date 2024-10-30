@@ -19,7 +19,10 @@ use std::time::Duration;
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
-use runtime::{datafusion::query::Protocol, Runtime};
+use runtime::{
+    datafusion::query::{self, Protocol},
+    Runtime,
+};
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
@@ -33,6 +36,8 @@ use crate::{init_tracing, wait_until_true};
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::get_test_datafusion;
     use crate::postgres::common;
+    use datafusion::error::DataFusionError;
+    use runtime::datafusion::error::SpiceExternalError;
     use runtime::status;
     use std::sync::Arc;
 
@@ -159,7 +164,7 @@ CREATE TABLE test (
     );
     assert!(
         wait_until_true(Duration::from_secs(30), || async {
-            let mut query_result = rt
+            let mut query_result = match rt
                 .datafusion()
                 .query_builder(
                     "SELECT * FROM non_federated_abc LIMIT 1",
@@ -168,7 +173,25 @@ CREATE TABLE test (
                 .build()
                 .run()
                 .await
-                .expect("result returned");
+            {
+                Ok(result) => result,
+                Err(e) => match e {
+                    query::Error::UnableToExecuteQuery { source } => match source {
+                        DataFusionError::External(e) => {
+                            if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
+                                match e {
+                                    SpiceExternalError::AccelerationNotReady { .. } => {
+                                        return false;
+                                    }
+                                }
+                            }
+                            panic!("Expected SpiceExternalError");
+                        }
+                        _ => panic!("Expected SpiceExternalError"),
+                    },
+                    _ => panic!("Expected query::Error::UnableToExecuteQuery"),
+                },
+            };
             let mut batches = vec![];
             while let Some(batch) = query_result.data.next().await {
                 batches.push(batch.expect("batch"));

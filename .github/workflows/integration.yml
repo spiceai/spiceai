@@ -58,6 +58,7 @@ jobs:
   test:
     name: Integration Tests
     needs: build
+    permissions: read-all
     runs-on: ubuntu-latest-16-cores
     steps:
       - uses: actions/checkout@v4
@@ -106,6 +107,7 @@ jobs:
       - name: Run integration test
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture

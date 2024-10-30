@@ -15,10 +15,11 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | File                    | ❌ |  |
 | FTP/SFTP                | ❌ |  |
 | GraphQL                 | ❌ |  |
-| GitHub                  | ❌ |  |
+| GitHub                  | ✅ | @peasee |
 | HTTP/HTTPS              | ❌ |  |
+| Localpod                | ❌ |  |
 | MS SQL                  | ❌ |  |
-| MySQL                   | ❌ |  |
+| MySQL                   | ✅ | @peasee |
 | ODBC                    | ❌ |  |
 | PostgreSQL              | ❌ |  |
 | Sharepoint              | ❌ |  |

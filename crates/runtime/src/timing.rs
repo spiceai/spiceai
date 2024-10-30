@@ -53,6 +53,34 @@ impl Drop for TimeMeasurement {
     }
 }
 
+/// Measures the time in milliseconds it takes to execute a block of code and records it in a histogram metric
+/// with multiple independent sets of labels.
+pub struct MultiTimeMeasurement {
+    start: Instant,
+    metric: &'static Histogram<f64>,
+    label_sets: Vec<Vec<KeyValue>>,
+}
+
+impl MultiTimeMeasurement {
+    #[must_use]
+    pub fn new(metric: &'static Histogram<f64>, label_sets: Vec<Vec<KeyValue>>) -> Self {
+        Self {
+            start: Instant::now(),
+            metric,
+            label_sets,
+        }
+    }
+}
+
+impl Drop for MultiTimeMeasurement {
+    fn drop(&mut self) {
+        let elapsed = 1000_f64 * self.start.elapsed().as_secs_f64();
+        for label_set in &self.label_sets {
+            self.metric.record(elapsed, label_set);
+        }
+    }
+}
+
 #[pin_project]
 pub struct TimedStream<S, F>
 where

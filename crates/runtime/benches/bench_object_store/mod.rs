@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
@@ -51,13 +53,13 @@ pub(crate) async fn run(
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
                     super::bench_postgres::get_tpcds_test_queries()
                 } else {
-                    get_tpcds_test_queries()
+                    get_tpcds_test_queries(&engine)
                 }
             }
 
             #[cfg(not(feature = "postgres"))]
             {
-                get_tpcds_test_queries()
+                get_tpcds_test_queries(&engine)
             }
         }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
@@ -86,7 +88,10 @@ pub(crate) async fn run(
         } else if query_name.starts_with("tpcds_q") {
             matches!(
                 bench_name.as_str(),
-                "s3" | "s3_postgres_memory" | "s3_arrow_memory" | "s3_duckdb_file"
+                "s3" | "s3_postgres_memory"
+                    | "s3_arrow_memory"
+                    | "s3_duckdb_file"
+                    | "s3_sqlite_file"
             )
         } else {
             false
@@ -169,8 +174,9 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'static str)> {
+    let test_queries = vec![
+        // see workarounds for more information on skipped queries: https://github.com/spiceai/spiceai/blob/trunk/crates/runtime/benches/queries/README.md
         ("tpcds_q1", include_str!("../queries/tpcds/q1.sql")),
         ("tpcds_q2", include_str!("../queries/tpcds/q2.sql")),
         ("tpcds_q3", include_str!("../queries/tpcds/q3.sql")),
@@ -178,13 +184,13 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q5", include_str!("../queries/tpcds/q5.sql")),
         ("tpcds_q6", include_str!("../queries/tpcds/q6.sql")),
         ("tpcds_q7", include_str!("../queries/tpcds/q7.sql")),
-        ("tpcds_q8", include_str!("../queries/tpcds/q8.sql")),
+        // ("tpcds_q8", include_str!("../queries/tpcds/q8.sql")), // EXCEPT and INTERSECT aren't supported
         ("tpcds_q9", include_str!("../queries/tpcds/q9.sql")),
         ("tpcds_q10", include_str!("../queries/tpcds/q10.sql")),
         ("tpcds_q11", include_str!("../queries/tpcds/q11.sql")),
         ("tpcds_q12", include_str!("../queries/tpcds/q12.sql")),
         ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")),
-        ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")),
+        // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), // EXCEPT and INTERSECT aren't supported
         ("tpcds_q15", include_str!("../queries/tpcds/q15.sql")),
         ("tpcds_q16", include_str!("../queries/tpcds/q16.sql")),
         ("tpcds_q17", include_str!("../queries/tpcds/q17.sql")),
@@ -193,8 +199,8 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q20", include_str!("../queries/tpcds/q20.sql")),
         ("tpcds_q21", include_str!("../queries/tpcds/q21.sql")),
         ("tpcds_q22", include_str!("../queries/tpcds/q22.sql")),
-        ("tpcds_q23", include_str!("../queries/tpcds/q23.sql")),
-        ("tpcds_q24", include_str!("../queries/tpcds/q24.sql")),
+        // ("tpcds_q23", include_str!("../queries/tpcds/q23.sql")), // this query contains multiple queries, which aren't supported
+        // ("tpcds_q24", include_str!("../queries/tpcds/q24.sql")), // this query contains multiple queries, which aren't supported
         ("tpcds_q25", include_str!("../queries/tpcds/q25.sql")),
         ("tpcds_q26", include_str!("../queries/tpcds/q26.sql")),
         ("tpcds_q27", include_str!("../queries/tpcds/q27.sql")),
@@ -208,8 +214,8 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q35", include_str!("../queries/tpcds/q35.sql")),
         ("tpcds_q36", include_str!("../queries/tpcds/q36.sql")),
         ("tpcds_q37", include_str!("../queries/tpcds/q37.sql")),
-        ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")),
-        ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")),
+        // ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")), // EXCEPT and INTERSECT aren't supported
+        // ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")), // this query contains multiple queries, which aren't supported
         ("tpcds_q40", include_str!("../queries/tpcds/q40.sql")),
         ("tpcds_q41", include_str!("../queries/tpcds/q41.sql")),
         ("tpcds_q42", include_str!("../queries/tpcds/q42.sql")),
@@ -221,7 +227,7 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q48", include_str!("../queries/tpcds/q48.sql")),
         ("tpcds_q49", include_str!("../queries/tpcds/q49.sql")),
         ("tpcds_q50", include_str!("../queries/tpcds/q50.sql")),
-        ("tpcds_q51", include_str!("../queries/tpcds/q51.sql")),
+        // ("tpcds_q51", include_str!("../queries/tpcds/q51.sql")), // MySQL does not support FULL JOIN
         ("tpcds_q52", include_str!("../queries/tpcds/q52.sql")),
         ("tpcds_q53", include_str!("../queries/tpcds/q53.sql")),
         ("tpcds_q54", include_str!("../queries/tpcds/q54.sql")),
@@ -257,7 +263,7 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q84", include_str!("../queries/tpcds/q84.sql")),
         ("tpcds_q85", include_str!("../queries/tpcds/q85.sql")),
         ("tpcds_q86", include_str!("../queries/tpcds/q86.sql")),
-        ("tpcds_q87", include_str!("../queries/tpcds/q87.sql")),
+        // ("tpcds_q87", include_str!("../queries/tpcds/q87.sql")), // EXCEPT and INTERSECT aren't supported
         ("tpcds_q88", include_str!("../queries/tpcds/q88.sql")),
         ("tpcds_q89", include_str!("../queries/tpcds/q89.sql")),
         ("tpcds_q90", include_str!("../queries/tpcds/q90.sql")),
@@ -270,5 +276,52 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q97", include_str!("../queries/tpcds/q97.sql")),
         ("tpcds_q98", include_str!("../queries/tpcds/q98.sql")),
         ("tpcds_q99", include_str!("../queries/tpcds/q99.sql")),
-    ]
+    ];
+
+    let overrides: HashMap<_, Option<&str>> = (match engine.as_deref() {
+        Some("sqlite") => vec![
+            (
+                "tpcds_q75",
+                Some(include_str!("../queries/tpcds/q75_sqlite.sql")),
+            ),
+            (
+                "tpcds_q90",
+                Some(include_str!("../queries/tpcds/q90_sqlite.sql")),
+            ),
+            // SQLite does not support `stddev`
+            ("tpcds_q17", None),
+            ("tpcds_q29", None),
+            ("tpcds_q35", None),
+            ("tpcds_q74", None),
+            // SQLite does not support `ROLLUP` and `GROUPING`
+            ("tpcds_q5", None),
+            ("tpcds_q14", None),
+            ("tpcds_q18", None),
+            ("tpcds_q22", None),
+            ("tpcds_q27", None),
+            ("tpcds_q36", None),
+            ("tpcds_q67", None),
+            ("tpcds_q70", None),
+            ("tpcds_q77", None),
+            ("tpcds_q80", None),
+            ("tpcds_q86", None),
+        ],
+        _ => vec![],
+    })
+    .into_iter()
+    .collect();
+
+    test_queries
+        .into_iter()
+        .filter_map(|(key, default_value)| {
+            match overrides.get(key) {
+                // override query
+                Some(Some(query_override)) => Some((key, *query_override)),
+                // exclude query from running
+                Some(None) => None,
+                // use default query
+                None => Some((key, default_value)),
+            }
+        })
+        .collect()
 }

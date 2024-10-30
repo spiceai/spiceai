@@ -244,7 +244,7 @@ fn get_accelerator_indexes(
                     }
                     _ => None,
                 },
-                "tpcds_sf0_01" => match dataset {
+                "tpcds" => match dataset {
                     "catalog_sales" => {
                         let mut indexes: HashMap<String, IndexType> = HashMap::new();
                         indexes.insert("cs_ship_customer_sk".to_string(), IndexType::Enabled);

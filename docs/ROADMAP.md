@@ -15,11 +15,11 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - S3 data connector (Release Candidate)
 - PostgreSQL data connector (Release Candidate)
 - MySQL data connector (Release Candidate)
+- GitHub data connector (Release Candidate)
 
 ## [v1.0-rc.2 (Oct 2024)](https://github.com/spiceai/spiceai/milestone/48)
 
 - Bugfixes and performance improvements
-- GitHub data connector (Release Candidate)
 - GraphQL data connector (Release Candidate)
 - Databricks DeltaLake data connector (Release Candidate)
 - Spice.ai Cloud Platform data connector (Release Candidate)

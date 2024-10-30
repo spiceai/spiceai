@@ -2,9 +2,9 @@
   <img src="https://github.com/user-attachments/assets/13ff4c9d-d6a7-4c20-9408-45573c508c41" alt="spice oss logo" width="600"/>
 </p>
 <p align="center">
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a> 
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a> 
-  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a> 
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a>
+  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a>
   <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
 </p>
 
@@ -75,51 +75,65 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 ### Watch a 30-sec BI dashboard acceleration demo
 
-https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a
+<https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a>
 
 ### Supported Data Connectors
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name          | Description                                                                                    | Status | Protocol/Format                                                                                    |
-| ------------- | ---------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- |
-| `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Beta   | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
-| `postgres`    | PostgreSQL                                                                                     | Beta   |                                                                                                    |
-| `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Beta   | Arrow Flight                                                                                       |
-| `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Beta   | Parquet, CSV                                                                                       |
-| `mysql`       | MySQL                                                                                          | Beta   |                                                                                                    |
-| `odbc`        | ODBC                                                                                           | Beta   | ODBC                                                                                               |
-| `delta_lake`  | [Delta Lake](https://delta.io/)                                                                | Alpha  | [Delta Lake](https://delta.io/)                                                                    |
-| `dremio`      | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha  | Arrow Flight                                                                                       |
-| `duckdb`      | DuckDB                                                                                         | Alpha  |                                                                                                    |
-| `clickhouse`  | Clickhouse                                                                                     | Alpha  |                                                                                                    |
-| `spark`       | Spark                                                                                          | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  |
-| `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   |
-| `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              |
-| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV, Markdown                                                                             |
-| `graphql`     | GraphQL                                                                                        | Alpha  | JSON                                                                                               |
-| `github`      | GitHub                                                                                         | Alpha  |                                                                                                    |
-| `debezium`    | Debezium CDC                                                                                   | Alpha  | Kafka + JSON                                                                                       |
-| `sharepoint`  | Microsoft SharePoint                                                                           | Alpha  | Unstructured UTF-8 documents                                                                       |
-| `mssql`       | Microsoft SQL Server                                                                           | Alpha  | Tabular Data Stream (TDS)                                                                          |
-| `abfs`        | Azure BlobFS                                                                                   | Alpha  | Parquet, CSV                                                                                       |
+| Name            | Description                           | Status            | Protocol/Format                            |
+| --------------- | ------------------------------------- | ----------------- | ------------------------------------------ |
+| `github`        | GitHub                                | Release Candidate |                                            |
+| `mysql`         | MySQL                                 | Release Candidate |                                            |
+| `databricks`    | [Databricks][databricks]              | Beta              | [Spark Connect][spark] <br/> S3/Delta Lake |
+| `delta_lake`    | Delta Lake                            | Beta              | Delta Lake                                 |
+| `flightsql`     | FlightSQL                             | Beta              | Arrow Flight SQL                           |
+| `odbc`          | ODBC                                  | Beta              | ODBC                                       |
+| `postgres`      | PostgreSQL                            | Beta              |                                            |
+| `s3`            | [S3][s3]                              | Beta              | Parquet, CSV                               |
+| `spiceai`       | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                               |
+| `abfs`          | Azure BlobFS                          | Alpha             | Parquet, CSV                               |
+| `clickhouse`    | Clickhouse                            | Alpha             |                                            |
+| `debezium`      | Debezium CDC                          | Alpha             | Kafka + JSON                               |
+| `dremio`        | [Dremio][dremio]                      | Alpha             | Arrow Flight                               |
+| `duckdb`        | DuckDB                                | Alpha             |                                            |
+| `file`          | File                                  | Alpha             | Parquet, CSV                               |
+| `ftp`, `sftp`   | FTP/SFTP                              | Alpha             | Parquet, CSV                               |
+| `graphql`       | GraphQL                               | Alpha             | JSON                                       |
+| `http`, `https` | HTTP(s)                               | Alpha             | Parquet, CSV                               |
+| `localpod`      | [Local dataset replication][localpod] | Alpha             |                                            |
+| `mssql`         | Microsoft SQL Server                  | Alpha             | Tabular Data Stream (TDS)                  |
+| `sharepoint`    | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents               |
+| `snowflake`     | Snowflake                             | Alpha             | Arrow                                      |
+| `spark`         | Spark                                 | Alpha             | [Spark Connect][spark]                     |
+
+[databricks]: https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks
+[spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
+[s3]: https://github.com/spiceai/quickstarts/tree/trunk/s3#readme
+[spiceai]: https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme
+[dremio]: https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme
+[localpod]: https://github.com/spiceai/quickstarts/blob/trunk/localpod/README.md
 
 ### Supported Data Stores/Accelerators
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
-| Name       | Description                                                                                                   | Status | Engine Modes     |
-| ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- |
-| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         |
-| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` |
-| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Beta   | `file`           |
+| Name       | Description                     | Status | Engine Modes     |
+| ---------- | ------------------------------- | ------ | ---------------- |
+| `duckdb`   | Embedded [DuckDB][duckdb]       | Beta   | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres] | Beta   |                  |
+| `arrow`    | In-Memory Arrow Records         | Beta   | `memory`         |
+| `sqlite`   | Embedded [SQLite][sqlite]       | Alpha  | `memory`, `file` |
+
+[duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
+[postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator
+[sqlite]: https://docs.spiceai.org/data-accelerators/sqlite
 
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **beta** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
 
 ## ⚡️ Quickstart (Local Machine)
 
-https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0
+<https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0>
 
 **Step 1.** Install the Spice CLI:
 

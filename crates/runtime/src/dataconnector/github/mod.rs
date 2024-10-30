@@ -26,7 +26,7 @@ use data_components::{
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
-        FilterPushdownResult, GraphQLOptimizer,
+        FilterPushdownResult, GraphQLContext,
     },
     token_provider::{StaticTokenProvider, TokenProvider},
 };
@@ -133,7 +133,7 @@ impl Github {
     async fn create_gql_table_provider(
         &self,
         table_args: Arc<dyn GitHubTableArgs>,
-        optimizer: Option<Arc<dyn GraphQLOptimizer>>,
+        context: Option<Arc<dyn GraphQLContext>>,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
@@ -144,8 +144,8 @@ impl Github {
         let provider_builder = GraphQLTableProviderBuilder::new(client)
             .with_schema_transform(github_gql_raw_schema_cast);
 
-        let provider_builder = if let Some(optimizer) = optimizer {
-            provider_builder.with_optimizer(optimizer)
+        let provider_builder = if let Some(context) = context {
+            provider_builder.with_context(context)
         } else {
             provider_builder
         };

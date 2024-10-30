@@ -1,3 +1,12 @@
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessage,
+        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
+        ChatCompletionToolType, FunctionCall,
+    },
+};
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -20,6 +29,7 @@ use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
+    datafusion::DataFusion,
     tools::{parameters, SpiceModelTool},
     Runtime,
 };
@@ -31,6 +41,14 @@ pub struct TableSchemaToolParams {
     /// Which subset of tables to return results for. Default to all tables.
     tables: Vec<String>,
 }
+
+impl TableSchemaToolParams {
+    #[must_use]
+    pub fn new(tables: Vec<String>) -> Self {
+        Self { tables }
+    }
+}
+
 pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
@@ -43,6 +61,71 @@ impl TableSchemaTool {
             name: name.to_string(),
             description,
         }
+    }
+
+    pub async fn get_schema(
+        &self,
+        df: Arc<DataFusion>,
+        req: &TableSchemaToolParams,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = serde_json::to_string(&req).boxed()?);
+
+        let mut table_schemas: Vec<Value> = Vec::with_capacity(req.tables.len());
+        for t in &req.tables {
+            let schema = df
+                .get_arrow_schema(t)
+                .instrument(span.clone())
+                .await
+                .boxed()?;
+
+            let schema_value = serde_json::value::to_value(schema).boxed()?;
+
+            let table_schema = serde_json::json!({
+                "table": t,
+                "schema": schema_value
+            });
+
+            table_schemas.push(table_schema);
+        }
+
+        let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
+        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+
+        Ok(Value::Array(table_schemas))
+    }
+
+    /// Creates a [`ChatCompletionRequestToolMessage`] as if a language model had called this tool.
+    pub fn to_tool_response_message(
+        &self,
+        id: &str,
+        result: &Value,
+    ) -> Result<ChatCompletionRequestToolMessage, OpenAIError> {
+        ChatCompletionRequestToolMessageArgs::default()
+            .tool_call_id(id)
+            .content(ChatCompletionRequestToolMessageContent::Text(
+                result.to_string(),
+            ))
+            .build()
+    }
+
+    /// Creates a [`ChatCompletionRequestAssistantMessage`] as if a language model has requested to call this tool with the given [`TableSchemaToolParams`].
+    pub fn to_assistant_request_message(
+        &self,
+        id: &str,
+        params: &TableSchemaToolParams,
+    ) -> Result<ChatCompletionRequestAssistantMessage, OpenAIError> {
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(vec![ChatCompletionMessageToolCall {
+                id: id.to_string(),
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionCall {
+                    name: self.name().to_string(),
+                    arguments: serde_json::to_string(&params)
+                        .map_err(OpenAIError::JSONDeserialize)?
+                        .to_string(),
+                },
+            }])
+            .build()
     }
 }
 impl Default for TableSchemaTool {
@@ -85,31 +168,7 @@ impl SpiceModelTool for TableSchemaTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = arg);
         let req: TableSchemaToolParams = serde_json::from_str(arg)?;
-
-        let mut table_schemas: Vec<Value> = Vec::with_capacity(req.tables.len());
-        for t in &req.tables {
-            let schema = rt
-                .datafusion()
-                .get_arrow_schema(t)
-                .instrument(span.clone())
-                .await
-                .boxed()?;
-
-            let schema_value = serde_json::value::to_value(schema).boxed()?;
-
-            let table_schema = serde_json::json!({
-                "table": t,
-                "schema": schema_value
-            });
-
-            table_schemas.push(table_schema);
-        }
-
-        let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
-        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
-
-        Ok(Value::Array(table_schemas))
+        self.get_schema(rt.datafusion(), &req).await
     }
 }
