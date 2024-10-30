@@ -771,7 +771,7 @@ impl Runtime {
         .await;
     }
 
-    // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
+    /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     async fn load_dataset(&self, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
