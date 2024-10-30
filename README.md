@@ -113,10 +113,10 @@ Currently supported data stores for local materialization/acceleration. More com
 
 | Name       | Description                                                                                                   | Status | Engine Modes     |
 | ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- |
-| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Beta   | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Beta   | `file`           |
-| `arrow`    | In-Memory Arrow Records                                                                                       | Beta   | `memory`         |
-| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
+| `duckdb` | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb) | Beta | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Beta | |
+| `arrow` | In-Memory Arrow Records | Beta | `memory` |
+| `sqlite` | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite) | Alpha | `memory`, `file` |
 
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **beta** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
 
