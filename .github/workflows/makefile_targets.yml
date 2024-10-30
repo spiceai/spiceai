@@ -7,7 +7,7 @@ on:
       - release-*
       - feature-*
     paths-ignore:
-      - './docs/**'
+      - 'docs/**'
       - 'README.md'
       - 'version.txt'
       - 'acknowledgements.md'
