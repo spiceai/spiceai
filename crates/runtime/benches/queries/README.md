@@ -347,3 +347,63 @@ LIMIT 100;
 | ------------------------ | ------------------------ |
 | [q17.sql](tpcds/q17.sql) | [q29.sql](tpcds/q29.sql) |
 | [q35.sql](tpcds/q35.sql) | [q74.sql](tpcds/q74.sql) |
+
+### SQLite DECIMAL Casting and Division
+
+**Limitation**: In SQLite, `CAST(value AS DECIMAL)` does not convert an integer to a floating-point value if the casted value is an integer. Mathematical operations like `CAST(1 AS DECIMAL) / CAST(2 AS DECIMAL)` will be treated as integer division, resulting in `0` instead of the expected `0.5`.
+
+**Solution**: Use `FLOAT` to ensure conversion to a floating-point value: `CAST(1 AS FLOAT) / CAST(2 AS FLOAT)`
+
+Example for TPC-DS Q90. Orignal query:
+
+```sql
+select  cast(amc as decimal(15,4))/cast(pmc as decimal(15,4)) am_pm_ratio
+ from ( select count(*) amc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 9 and 9+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) at,
+      ( select count(*) pmc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 15 and 15+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) pt
+ order by am_pm_ratio
+  LIMIT 100;
+```
+
+Rewritten query:
+
+```sql
+-- Updated TPC-DS Q90 with `CAST(.. AS DECIMAL(15,4)` replaced with `FLOAT` to match SQLite's type system
+
+select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
+ from ( select count(*) amc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 9 and 9+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) at,
+      ( select count(*) pmc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 15 and 15+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) pt
+ order by am_pm_ratio
+  LIMIT 100;
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q75.sql](tpcds/q75.sql) | [q90.sql](tpcds/q90.sql) |
