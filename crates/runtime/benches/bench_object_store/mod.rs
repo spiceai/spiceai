@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
@@ -51,13 +53,13 @@ pub(crate) async fn run(
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
                     super::bench_postgres::get_tpcds_test_queries()
                 } else {
-                    get_tpcds_test_queries()
+                    get_tpcds_test_queries(&engine)
                 }
             }
 
             #[cfg(not(feature = "postgres"))]
             {
-                get_tpcds_test_queries()
+                get_tpcds_test_queries(&engine)
             }
         }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
@@ -172,8 +174,8 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
-    vec![
+fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'static str)> {
+    let test_queries = vec![
         ("tpcds_q1", include_str!("../queries/tpcds/q1.sql")),
         ("tpcds_q2", include_str!("../queries/tpcds/q2.sql")),
         ("tpcds_q3", include_str!("../queries/tpcds/q3.sql")),
@@ -273,5 +275,52 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q97", include_str!("../queries/tpcds/q97.sql")),
         ("tpcds_q98", include_str!("../queries/tpcds/q98.sql")),
         ("tpcds_q99", include_str!("../queries/tpcds/q99.sql")),
-    ]
+    ];
+
+    let overrides: HashMap<_, Option<&str>> = (match engine.as_deref() {
+        Some("sqlite") => vec![
+            (
+                "tpcds_q75",
+                Some(include_str!("../queries/tpcds/q75_sqlite.sql")),
+            ),
+            (
+                "tpcds_q90",
+                Some(include_str!("../queries/tpcds/q90_sqlite.sql")),
+            ),
+            // SQLite does not support `stddev`
+            ("tpcds_q17", None),
+            ("tpcds_q29", None),
+            ("tpcds_q35", None),
+            ("tpcds_q74", None),
+            // SQLite does not support `ROLLUP` and `GROUPING`
+            ("tpcds_q5", None),
+            ("tpcds_q14", None),
+            ("tpcds_q18", None),
+            ("tpcds_q22", None),
+            ("tpcds_q27", None),
+            ("tpcds_q36", None),
+            ("tpcds_q67", None),
+            ("tpcds_q70", None),
+            ("tpcds_q77", None),
+            ("tpcds_q80", None),
+            ("tpcds_q86", None),
+        ],
+        _ => vec![],
+    })
+    .into_iter()
+    .collect();
+
+    test_queries
+        .into_iter()
+        .filter_map(|(key, default_value)| {
+            match overrides.get(key) {
+                // override query
+                Some(Some(query_override)) => Some((key, *query_override)),
+                // exclude query from running
+                Some(None) => None,
+                // use default query
+                None => Some((key, default_value)),
+            }
+        })
+        .collect()
 }
