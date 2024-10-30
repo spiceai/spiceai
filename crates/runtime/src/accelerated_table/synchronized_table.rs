@@ -25,6 +25,7 @@ use crate::accelerated_table::AcceleratedTable;
 
 #[derive(Clone)]
 pub struct SynchronizedTable {
+    parent_dataset_name: TableReference,
     child_dataset_name: TableReference,
     child_accelerator: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
@@ -38,6 +39,7 @@ impl SynchronizedTable {
         child_dataset_name: TableReference,
     ) -> Self {
         Self {
+            parent_dataset_name: accelerated_table.dataset_name.clone(),
             child_dataset_name,
             child_accelerator,
             refresh_trigger: accelerated_table.refresh_trigger.clone(),
@@ -47,6 +49,10 @@ impl SynchronizedTable {
 
     pub fn child_dataset_name(&self) -> TableReference {
         self.child_dataset_name.clone()
+    }
+
+    pub fn parent_dataset_name(&self) -> TableReference {
+        self.parent_dataset_name.clone()
     }
 
     pub fn child_accelerator(&self) -> Arc<dyn TableProvider> {

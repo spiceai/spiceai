@@ -89,6 +89,14 @@ pub enum Error {
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
 
+    #[snafu(display(
+        "Cannot refresh {dataset}. Refresh must be triggered on '{parent_dataset}', which will propagate to this table."
+    ))]
+    RefreshNotSupportedForChildTable {
+        dataset: TableReference,
+        parent_dataset: TableReference,
+    },
+
     #[snafu(display("Failed to find latest timestamp in accelerated table"))]
     FailedToQueryLatestTimestamp {
         source: datafusion::error::DataFusionError,
@@ -458,22 +466,26 @@ impl AcceleratedTable {
     #[must_use]
     pub fn refresh_trigger(&self) -> Option<&mpsc::Sender<Option<RefreshOverrides>>> {
         match &self.synchronized_with {
-            Some(synchronized_table) => synchronized_table.refresh_trigger(),
+            Some(_) => None,
             None => self.refresh_trigger.as_ref(),
         }
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
-        match self.refresh_trigger() {
-            Some(refresh_trigger) => {
-                refresh_trigger
-                    .send(overrides)
-                    .await
-                    .context(FailedToTriggerRefreshSnafu)?;
+        if let Some(refresh_trigger) = self.refresh_trigger() {
+            refresh_trigger
+                .send(overrides)
+                .await
+                .context(FailedToTriggerRefreshSnafu)?;
+        } else {
+            if let Some(synchronized_with) = &self.synchronized_with {
+                RefreshNotSupportedForChildTableSnafu {
+                    dataset: self.dataset_name.clone(),
+                    parent_dataset: synchronized_with.parent_dataset_name(),
+                }
+                .fail()?;
             }
-            None => {
-                ManualRefreshIsNotSupportedSnafu.fail()?;
-            }
+            ManualRefreshIsNotSupportedSnafu.fail()?;
         }
 
         Ok(())
