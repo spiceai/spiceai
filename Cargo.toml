@@ -122,10 +122,10 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "60ca4213f0105bc5682737cb9483b46b5fa0967e" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "60ca4213f0105bc5682737cb9483b46b5fa0967e" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "60ca4213f0105bc5682737cb9483b46b5fa0967e" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "60ca4213f0105bc5682737cb9483b46b5fa0967e" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2eb5c10e57abd7f0c3d5990cbc59d558051b9f7b" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "2eb5c10e57abd7f0c3d5990cbc59d558051b9f7b" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2eb5c10e57abd7f0c3d5990cbc59d558051b9f7b" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "2eb5c10e57abd7f0c3d5990cbc59d558051b9f7b" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0aabd423ef8aea0ae05479331d1486e9ef8f8061" }
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "5d1126273d162137c7c387238b15d9b61cdfbb45" }
