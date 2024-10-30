@@ -83,11 +83,11 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name            | Description                           | Status            | Protocol/Format                            |
 | --------------- | ------------------------------------- | ----------------- | ------------------------------------------ |
+| `github`        | GitHub                                | Release Candidate |                                            |
 | `mysql`         | MySQL                                 | Release Candidate |                                            |
 | `databricks`    | [Databricks][databricks]              | Beta              | [Spark Connect][spark] <br/> S3/Delta Lake |
 | `delta_lake`    | Delta Lake                            | Beta              | Delta Lake                                 |
 | `flightsql`     | FlightSQL                             | Beta              | Arrow Flight SQL                           |
-| `github`        | GitHub                                | Beta              |                                            |
 | `odbc`          | ODBC                                  | Beta              | ODBC                                       |
 | `postgres`      | PostgreSQL                            | Beta              |                                            |
 | `s3`            | [S3][s3]                              | Beta              | Parquet, CSV                               |

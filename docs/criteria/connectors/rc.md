@@ -15,7 +15,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | File                    | ❌ |  |
 | FTP/SFTP                | ❌ |  |
 | GraphQL                 | ❌ |  |
-| GitHub                  | ❌ |  |
+| GitHub                  | ✅ | @peasee |
 | HTTP/HTTPS              | ❌ |  |
 | Localpod                | ❌ |  |
 | MS SQL                  | ❌ |  |
