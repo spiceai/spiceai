@@ -90,12 +90,9 @@ pub enum Error {
     ManualRefreshIsNotSupported {},
 
     #[snafu(display(
-        "Cannot refresh {dataset}. Refresh must be triggered on '{parent_dataset}', which will propagate to this table."
+        "Refresh must be triggered on '{parent_dataset}', which will propagate to this table."
     ))]
-    RefreshNotSupportedForChildTable {
-        dataset: TableReference,
-        parent_dataset: TableReference,
-    },
+    RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display("Failed to find latest timestamp in accelerated table"))]
     FailedToQueryLatestTimestamp {
@@ -480,7 +477,6 @@ impl AcceleratedTable {
         } else {
             if let Some(synchronized_with) = &self.synchronized_with {
                 RefreshNotSupportedForChildTableSnafu {
-                    dataset: self.dataset_name.clone(),
                     parent_dataset: synchronized_with.parent_dataset_name(),
                 }
                 .fail()?;
