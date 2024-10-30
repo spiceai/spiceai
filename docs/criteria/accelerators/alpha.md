@@ -7,11 +7,11 @@ All criteria must be met for the Accelerator to be considered Alpha. As Alpha si
 ## Alpha Quality Accelerators
 
 | Accelerator | Alpha Quality | DRI Sign-off |
-| - | - | - |
-| Arrow      | ❌ |  |
-| DuckDB     | ✅ | @peasee |
-| SQLite     | ❌ |  |
-| PostgreSQL | ✅ | @sgrebnov |
+| ----------- | ------------- | ------------ |
+| Arrow       | ✅            | @Sevenannn   |
+| DuckDB      | ✅            | @peasee      |
+| SQLite      | ❌            |              |
+| PostgreSQL  | ✅            | @sgrebnov    |
 
 ## Alpha Release Criteria
 
