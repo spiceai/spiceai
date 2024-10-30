@@ -27,7 +27,7 @@ use datafusion_table_providers::util::retriable_error::{
 use futures::{stream, StreamExt};
 use opentelemetry::KeyValue;
 use snafu::{OptionExt, ResultExt};
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
@@ -121,7 +121,17 @@ impl RefreshTask {
 
         let dataset_name = self.dataset_name.clone();
 
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+        let mut spans = vec![];
+        let mut parent_span = Span::current();
+        for dataset_name in self.get_dataset_names().await {
+            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+            spans.push(span.clone());
+            parent_span = span;
+        }
+        let span = spans
+            .iter()
+            .last()
+            .unwrap_or_else(|| unreachable!("There is always at least one span"));
         retry(retry_strategy, || async {
             match self.run_once(&refresh).await {
                 Ok(()) => Ok(()),
@@ -137,7 +147,9 @@ impl RefreshTask {
         .await
         .inspect_err(|e| {
             tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
-            tracing::error!(target: "task_history", parent: &span, "{e}");
+            for span in &spans {
+                tracing::error!(target: "task_history", parent: span, "{e}");
+            }
         })
     }
 
