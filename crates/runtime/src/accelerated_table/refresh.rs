@@ -350,6 +350,11 @@ impl Refresher {
         self
     }
 
+    pub fn set_initial_load_completed(&mut self, initial_load_completed: bool) {
+        self.initial_load_completed
+            .store(initial_load_completed, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn initial_load_completed(&self) -> bool {
         self.initial_load_completed.load(Ordering::Relaxed)

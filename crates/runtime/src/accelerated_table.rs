@@ -206,6 +206,7 @@ pub struct Builder {
     disable_query_push_down: bool,
     checkpointer: Option<DatasetCheckpoint>,
     synchronize_with: Option<SynchronizedTable>,
+    initial_load_complete: bool,
 }
 
 impl Builder {
@@ -231,6 +232,7 @@ impl Builder {
             checkpointer: None,
             synchronize_with: None,
             disable_query_push_down: false,
+            initial_load_complete: false,
         }
     }
 
@@ -326,6 +328,14 @@ impl Builder {
         Ok(self)
     }
 
+    /// Tell the accelerated table that an initial load has already been completed, via a previous dataset checkpoint.
+    ///
+    /// This will allow the table to be marked as ready immediately.
+    pub fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
+        self.initial_load_complete = initial_load_complete;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(
         self,
@@ -383,7 +393,7 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
-
+        refresher.set_initial_load_completed(self.initial_load_complete);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }
