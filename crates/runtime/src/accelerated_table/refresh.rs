@@ -629,8 +629,6 @@ async fn notify_refresh_done(
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
-
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
         datatypes::{DataType, Field, Fields, Schema},
@@ -759,30 +757,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_status_change_to_ready() {
-        fn wait_until_ready_status(
+        async fn wait_until_ready_status(
             registry: &prometheus::Registry,
             desired: status::ComponentStatus,
+            max_attempts: usize,
+            delay: Duration,
         ) -> bool {
-            for _i in 1..20 {
-                let hashmap = registry.gather();
-                let metric = hashmap
-                    .iter()
-                    .find(|m| m.get_name() == "datasets_status")
-                    .expect("datasets_status metric exists");
-                match metric.get_field_type() {
-                    MetricType::GAUGE => {
+            for _attempt in 0..max_attempts {
+                let metrics = registry.gather();
+                if let Some(metric) = metrics.iter().find(|m| m.get_name() == "datasets_status") {
+                    if metric.get_field_type() == MetricType::GAUGE {
                         let value = metric.get_metric()[0].get_gauge().get_value();
-
                         if value.is_eq(f64::from(desired as i32)) {
                             return true;
                         }
                     }
-                    _ => panic!("datasets_status is a gauge"),
                 }
-
-                sleep(Duration::from_millis(100));
+                tokio::time::sleep(delay).await;
             }
-
             false
         }
 
@@ -819,10 +811,17 @@ mod tests {
         )
         .await;
 
-        assert!(wait_until_ready_status(
-            &registry,
-            status::ComponentStatus::Ready
-        ));
+        // Use more attempts with shorter delays for better test performance
+        assert!(
+            wait_until_ready_status(
+                &registry,
+                status::ComponentStatus::Ready,
+                20,
+                Duration::from_millis(50)
+            )
+            .await,
+            "Status did not change to Ready within timeout"
+        );
 
         status.update_dataset(
             &TableReference::bare("test"),
@@ -831,10 +830,16 @@ mod tests {
 
         setup_and_test(Arc::clone(&status), vec![], vec![], 0).await;
 
-        assert!(wait_until_ready_status(
-            &registry,
-            status::ComponentStatus::Ready
-        ));
+        assert!(
+            wait_until_ready_status(
+                &registry,
+                status::ComponentStatus::Ready,
+                20,
+                Duration::from_millis(50)
+            )
+            .await,
+            "Status did not change to Ready within timeout"
+        );
     }
 
     #[allow(clippy::too_many_lines)]
