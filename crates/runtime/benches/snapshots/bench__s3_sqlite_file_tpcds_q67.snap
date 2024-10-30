@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++------------+---------+---------------------+----------------+--------+-------+-------+------------+----------+----+
+| i_category | i_class | i_brand             | i_product_name | d_year | d_qoy | d_moy | s_store_id | sumsales | rk |
++------------+---------+---------------------+----------------+--------+-------+-------+------------+----------+----+
+| Books      | arts    | amalgmaxi #12       | ationbarought  | 2000   |       |       |            | 27064.66 | 79 |
+| Books      | arts    | amalgmaxi #12       | ationbarought  |        |       |       |            | 27064.66 | 79 |
+| Books      | arts    | amalgmaxi #12       |                |        |       |       |            | 45641.52 | 43 |
+| Books      | arts    |                     |                |        |       |       |            | 45641.52 | 43 |
+| Books      | fiction | scholarunivamalg #2 | ationn st      | 1999   | 3     |       |            | 26725.52 | 81 |
+| Books      | fiction | scholarunivamalg #2 | ationn st      | 1999   | 4     |       |            | 36018.11 | 61 |
+| Books      | fiction | scholarunivamalg #2 | ationn st      | 1999   |       |       |            | 62743.63 | 38 |
+| Books      | fiction | scholarunivamalg #2 | ationn st      | 2000   |       |       |            | 21590.31 | 97 |
+| Books      | fiction | scholarunivamalg #2 | ationn st      |        |       |       |            | 84333.94 | 30 |
+| Books      | fiction | scholarunivamalg #2 |                |        |       |       |            | 84333.94 | 30 |
++------------+---------+---------------------+----------------+--------+-------+-------+------------+----------+----+

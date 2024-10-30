@@ -39,7 +39,7 @@ assignees: ''
   - [ ] [Streaming changes in real-time with Debezium CDC](https://github.com/spiceai/samples/blob/trunk/cdc-debezium/README.md)
   - [ ] [Encryption in transit using TLS](https://github.com/spiceai/samples/blob/trunk/tls/README.md)
   - [ ] [Adding Spice as a Grafana datasource](https://github.com/spiceai/samples/blob/trunk/grafana-datasource/README.md)
-  - [ ] [FTP/SFTP Data Connector](https://github.com/spiceai/samples/blob/trunk/data-connectors/README.md)
+  - [ ] [FTP/SFTP Data Connector](https://github.com/spiceai/samples/blob/trunk/ftp/README.md)
   - [ ] [Spice with go sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
   - [ ] [Spice with Java sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
   - [ ] [Spice with rust sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
@@ -95,6 +95,13 @@ assignees: ''
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/quickstarts/pulls)
 - [ ] Update release notes
   - [ ] Ensure any external contributors have been acknowledged.
+- [ ] Add any SDK releases to the release notes
+  - [ ] [spice.js](https://github.com/spiceai/spice.js/releases)
+  - [ ] [spicepy](https://github.com/spiceai/spicepy/releases)
+  - [ ] [spice-rs](https://github.com/spiceai/spice-rs/releases)
+  - [ ] [spice-java](https://github.com/spiceai/spice-java/releases)
+  - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
+  - [ ] [gospice](https://github.com/spiceai/gospice/releases)
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
   - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docs/acknowledgements/index.md)
 - [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)

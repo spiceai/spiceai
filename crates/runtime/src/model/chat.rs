@@ -69,18 +69,28 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     let model = construct_model(&prefix, model_id, component, params)?;
 
     // Handle tool usage
-    let spice_tool_opt: Option<SpiceToolsOptions> = params
-        .get("spice_tools")
-        .map(Secret::expose_secret)
+    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "spice_tools")
         .map(|x| x.parse())
         .transpose()
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
+
+    let spice_recursion_limit: Option<usize> = extract_secret!(params, "tool_recursion_limit")
+        .map(|x| {
+            x.parse().map_err(|e| LlmError::FailedToLoadModel {
+                source: format!(
+                    "Invalid value specified for `params.recursion_depth`: {x}. Error: {e}"
+                )
+                .into(),
+            })
+        })
+        .transpose()?;
 
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => Box::new(ToolUsingChat::new(
             Arc::new(model),
             Arc::clone(&rt),
             get_tools(Arc::clone(&rt), &opts).await,
+            spice_recursion_limit,
         )),
         Some(_) | None => model,
     };
@@ -95,7 +105,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model = match prefix {
         ModelSource::HuggingFace => {
-            let model_type = params.get("model_type").map(Secret::expose_secret).cloned();
+            let model_type = extract_secret!(params, "model_type");
 
             let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
             let tokenizer_config_path =
@@ -104,7 +114,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 .clone()
                 .or(component.find_any_file_path(ModelFileType::Weights));
 
-            let hf_token = params.get("hf_token").map(Secret::expose_secret).cloned();
+            let hf_token = extract_secret!(params, "hf_token");
 
             match model_id {
                 Some(id) => {

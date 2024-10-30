@@ -192,7 +192,7 @@ pub(crate) async fn refresh(
         Err(err) => (
             status::StatusCode::INTERNAL_SERVER_ERROR,
             Json(MessageResponse {
-                message: format!("Failed to trigger refresh for {dataset_name}: {err}."),
+                message: format!("{err}"),
             }),
         )
             .into_response(),

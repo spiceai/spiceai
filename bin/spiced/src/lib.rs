@@ -226,7 +226,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     let cloned_rt = rt.clone();
     let server_thread =
-        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, tls_config).await });
+        tokio::spawn(
+            async move { Box::pin(cloned_rt.start_servers(args.runtime, tls_config)).await },
+        );
 
     tokio::select! {
         () = rt.load_components() => {},

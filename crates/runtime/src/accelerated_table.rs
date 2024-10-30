@@ -17,9 +17,10 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::acceleration::{ReadyState, RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::status;
 use arrow::array::UInt64Array;
@@ -42,6 +43,7 @@ use datafusion::{
 };
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
+use synchronized_table::SynchronizedTable;
 use tokio::task::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -58,6 +60,8 @@ mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
+mod sink;
+mod synchronized_table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -84,6 +88,11 @@ pub enum Error {
 
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
+
+    #[snafu(display(
+        "Refresh must be triggered on '{parent_dataset}', which will propagate to this table."
+    ))]
+    RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display("Failed to find latest timestamp in accelerated table"))]
     FailedToQueryLatestTimestamp {
@@ -135,6 +144,9 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(display("Append stream is required for `RefreshMode::Append` without time_column"))]
     AppendStreamRequired,
+
+    #[snafu(display("Synchronized accelerated table requires full refresh mode"))]
+    SynchronizedAcceleratedTableRequiresFullRefresh,
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -152,9 +164,11 @@ pub struct AcceleratedTable {
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     pub(crate) handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
+    ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
     disable_query_push_down: bool,
+    synchronized_with: Option<SynchronizedTable>,
 }
 
 fn validate_refresh_data_window(
@@ -185,11 +199,14 @@ pub struct Builder {
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
+    ready_state: ReadyState,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
     checkpointer: Option<DatasetCheckpoint>,
+    synchronize_with: Option<SynchronizedTable>,
+    initial_load_complete: bool,
 }
 
 impl Builder {
@@ -208,11 +225,14 @@ impl Builder {
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
+            ready_state: ReadyState::default(),
             cache_provider: None,
             changes_stream: None,
             append_stream: None,
             checkpointer: None,
+            synchronize_with: None,
             disable_query_push_down: false,
+            initial_load_complete: false,
         }
     }
 
@@ -223,6 +243,11 @@ impl Builder {
 
     pub fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
         self.zero_results_action = zero_results_action;
+        self
+    }
+
+    pub fn ready_state(&mut self, ready_state: ReadyState) -> &mut Self {
+        self.ready_state = ready_state;
         self
     }
 
@@ -270,6 +295,44 @@ impl Builder {
     /// Set the checkpointer for the accelerated table
     pub fn checkpointer_opt(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
         self.checkpointer = checkpointer;
+        self
+    }
+
+    /// Set the existing full refresh mode accelerated table to synchronize with after the initial load completes
+    ///
+    /// A full table scan of the existing accelerated table is required to initialize a synchronized accelerated table.
+    ///
+    /// Handling append/changes mode should be possible, but requires more care to ensure
+    /// that delta updates are applied correctly after the initial table scan.
+    pub async fn synchronize_with(
+        &mut self,
+        existing_accelerated_table: &AcceleratedTable,
+    ) -> AcceleratedTableBuilderResult<&mut Self> {
+        ensure!(
+            matches!(self.refresh.mode, RefreshMode::Full),
+            SynchronizedAcceleratedTableRequiresFullRefreshSnafu
+        );
+        ensure!(
+            matches!(
+                existing_accelerated_table.refresh_params.read().await.mode,
+                RefreshMode::Full
+            ),
+            SynchronizedAcceleratedTableRequiresFullRefreshSnafu
+        );
+        let synchronized_table = SynchronizedTable::from(
+            existing_accelerated_table,
+            Arc::clone(&self.accelerator),
+            self.dataset_name.clone(),
+        );
+        self.synchronize_with = Some(synchronized_table);
+        Ok(self)
+    }
+
+    /// Tell the accelerated table that an initial load has already been completed, via a previous dataset checkpoint.
+    ///
+    /// This will allow the table to be marked as ready immediately.
+    pub fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
+        self.initial_load_complete = initial_load_complete;
         self
     }
 
@@ -330,6 +393,10 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
+        refresher.set_initial_load_completed(self.initial_load_complete);
+        if let Some(synchronize_with) = &self.synchronize_with {
+            refresher.synchronize_with(synchronize_with.clone());
+        }
 
         let refresh_handle = refresher
             .start(acceleration_refresh_mode, ready_sender)
@@ -350,6 +417,13 @@ impl Builder {
             ));
             handlers.push(retention_check_handle);
         }
+
+        // If the table should be ready immediately, mark it as ready.
+        if let ReadyState::OnRegistration = self.ready_state {
+            self.runtime_status
+                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+        }
+
         Ok((
             AcceleratedTable {
                 dataset_name: self.dataset_name,
@@ -358,9 +432,11 @@ impl Builder {
                 refresh_trigger,
                 handlers,
                 zero_results_action: self.zero_results_action,
+                ready_state: self.ready_state,
                 refresh_params,
                 refresher,
                 disable_query_push_down: self.disable_query_push_down,
+                synchronized_with: self.synchronize_with,
             },
             is_ready,
         ))
@@ -395,21 +471,27 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn refresh_trigger(&self) -> Option<mpsc::Sender<Option<RefreshOverrides>>> {
-        self.refresh_trigger.clone()
+    pub fn refresh_trigger(&self) -> Option<&mpsc::Sender<Option<RefreshOverrides>>> {
+        match &self.synchronized_with {
+            Some(_) => None,
+            None => self.refresh_trigger.as_ref(),
+        }
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
-        match &self.refresh_trigger {
-            Some(refresh_trigger) => {
-                refresh_trigger
-                    .send(overrides)
-                    .await
-                    .context(FailedToTriggerRefreshSnafu)?;
+        if let Some(refresh_trigger) = self.refresh_trigger() {
+            refresh_trigger
+                .send(overrides)
+                .await
+                .context(FailedToTriggerRefreshSnafu)?;
+        } else {
+            if let Some(synchronized_with) = &self.synchronized_with {
+                RefreshNotSupportedForChildTableSnafu {
+                    parent_dataset: synchronized_with.parent_dataset_name(),
+                }
+                .fail()?;
             }
-            None => {
-                ManualRefreshIsNotSupportedSnafu.fail()?;
-            }
+            ManualRefreshIsNotSupportedSnafu.fail()?;
         }
 
         Ok(())
@@ -584,6 +666,20 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // If the initial load hasn't completed yet, we need to handle the loading behavior.
+        if !self.refresher().initial_load_completed() {
+            match self.ready_state {
+                ReadyState::OnLoad => {
+                    return Err(DataFusionError::External(
+                        SpiceExternalError::acceleration_not_ready(self.dataset_name.to_string()),
+                    ));
+                }
+                ReadyState::OnRegistration => {
+                    return self.federated.scan(state, projection, filters, limit).await;
+                }
+            }
+        }
+
         let input = self
             .accelerator
             .scan(state, projection, filters, limit)

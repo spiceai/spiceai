@@ -199,6 +199,18 @@ pub mod acceleration {
         }
     }
 
+    /// Controls when the table is marked ready for queries.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    #[serde(rename_all = "snake_case")]
+    pub enum ReadyState {
+        /// The table is ready once the initial load completes.
+        #[default]
+        OnLoad,
+        /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
+        OnRegistration,
+    }
+
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
@@ -291,6 +303,9 @@ pub mod acceleration {
         #[serde(default)]
         pub on_zero_results: ZeroResultsAction,
 
+        #[serde(default)]
+        pub ready_state: ReadyState,
+
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub indexes: HashMap<String, IndexType>,
 
@@ -330,6 +345,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
+                ready_state: ReadyState::OnLoad,
                 indexes: HashMap::default(),
                 primary_key: None,
                 on_conflict: HashMap::default(),

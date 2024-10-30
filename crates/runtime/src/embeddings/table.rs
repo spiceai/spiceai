@@ -30,7 +30,10 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
-use llms::chunking::{Chunker, ChunkingConfig};
+use llms::{
+    chunking::{Chunker, ChunkingConfig},
+    embeddings::Error as EmbedError,
+};
 use snafu::prelude::*;
 
 use tokio::sync::RwLock;
@@ -123,10 +126,12 @@ impl EmbeddingTable {
 
                 let mut chunker = None;
                 if let Some(chunking_config) = chunking_config_opt {
-                    chunker =
-                        Self::construct_chunker(&model, chunking_config, &embedding_models).await;
-                    if chunker.is_none() {
-                        tracing::warn!("Column '{}' expects to be chunked, but the model '{}' does not support chunking. Ignoring chunking config.", column, model);
+                    match Self::construct_chunker(&model, chunking_config, &embedding_models).await
+                    {
+                        Ok(c) => chunker = Some(c),
+                        Err(e) => {
+                            tracing::warn!("Column '{column}' expects to be chunked, but the model '{model}' does not support chunking. Ignoring chunking config. Error: {e}");
+                        }
                     }
                 }
 
@@ -279,12 +284,13 @@ impl EmbeddingTable {
         model_name: &str,
         chunk_config: &ChunkingConfig<'_>,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    ) -> Option<Arc<dyn Chunker>> {
+    ) -> Result<Arc<dyn Chunker>, EmbedError> {
         let embedding_models_guard = embedding_models.read().await;
         let Some(embed_model) = embedding_models_guard.get(model_name) else {
             // Don't need warn, as we should have already checked/logged this.
-            tracing::debug!("Unexpectedly did not find model '{model_name}' in the model store.");
-            return None;
+            return Err(EmbedError::ModelDoesNotExist {
+                model_name: model_name.to_string(),
+            });
         };
         embed_model.chunker(chunk_config)
     }

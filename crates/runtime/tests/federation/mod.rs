@@ -202,6 +202,7 @@ async fn spiceai_integration_test_single_source_federation_push_down() -> Result
                 "spiceai_integration_test_single_source_federation_push_down_{snapshot_suffix}"
             ),
             query,
+            true,
             validate_result,
         )
         .await?;

@@ -163,7 +163,7 @@ impl ListingTableConnector for File {
 
         let path = get_path(dataset)?;
         let (tx, mut rx) = mpsc::channel(100);
-        let Some(refresh_trigger) = accelerated_table.refresh_trigger() else {
+        let Some(refresh_trigger) = accelerated_table.refresh_trigger().cloned() else {
             return Ok(());
         };
 
