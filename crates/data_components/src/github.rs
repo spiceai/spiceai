@@ -16,9 +16,10 @@ limitations under the License.
 use async_trait::async_trait;
 use futures::future;
 use globset::GlobSet;
+use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 
-use crate::{arrow::write::MemTable, token_provider::TokenProvider};
+use crate::{arrow::write::MemTable, graphql, token_provider::TokenProvider};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -44,6 +45,9 @@ pub enum Error {
     GithubApiError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("{message}"))]
+    RateLimited { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -289,33 +293,41 @@ impl GithubRestClient {
             return Ok(git_tree);
         }
 
+        let response_headers = response.headers().clone();
+        let response_status = response.status().as_u16();
+        let response: Value = response.json().await?;
+
+        error_checker(&response_headers, &response).map_err(|e| {
+            if let graphql::Error::RateLimited { message } = e {
+                Error::RateLimited { message }
+            } else {
+                Error::GithubApiError { source: e.into() }
+            }
+        })?;
+
         #[allow(clippy::single_match_else)]
-        match response.status().as_u16() {
+        match response_status {
             404 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {}; Please check that org `{owner}`, repo `{repo}` and git tree `{tree_sha}`are correct.",
-                    response.status()
+                    "The Github API ({endpoint}) failed with status code {response_status}; Please check that org `{owner}`, repo `{repo}` and git tree `{tree_sha}`are correct.",
                 );
                 Err(err_msg.into())
             }
             401 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {}; Please check if the token is correct.",
-                    response.status()
+                    "The Github API ({endpoint}) failed with status code {response_status}; Please check if the token is correct.",
                 );
                 Err(err_msg.into())
             }
             403 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {}; Please check if the token has the necessary permissions.",
-                    response.status()
+                    "The Github API ({endpoint}) failed with status code {response_status}; Please check if the token has the necessary permissions.",
                 );
                 Err(err_msg.into())
             }
             _ => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {}",
-                    response.status()
+                    "The Github API ({endpoint}) failed with status code {response_status}",
                 );
                 Err(err_msg.into())
             }
@@ -378,4 +390,37 @@ struct GitTreeNode {
     sha: String,
     size: Option<i64>,
     url: Option<String>,
+}
+
+// For GitHub, first checks if an explicit rate limit error was returned, then checks the headers
+pub fn error_checker(
+    headers: &HeaderMap<HeaderValue>,
+    response: &Value,
+) -> Result<(), graphql::Error> {
+    // check if there's an explicit rate limit error
+    let rate_limited: Option<bool> = response["message"]
+        .as_str()
+        .map(|s| s.to_lowercase().contains("rate limit"));
+    if let Some(true) = rate_limited {
+        // A secondary rate limit was exceeded
+        return Err(graphql::Error::RateLimited {
+            message: "GitHub API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
+        });
+    }
+
+    // Check if the primary rate limit is exceeded
+    if let Some(ratelimit_remaining) = headers.get("x-ratelimit-remaining") {
+        let ratelimit_remaining = ratelimit_remaining
+            .to_str()
+            .unwrap_or("1")
+            .parse::<u32>()
+            .unwrap_or(1);
+        if ratelimit_remaining == 0 {
+            return Err(graphql::Error::RateLimited {
+                message: "GitHub API rate limit exceeded. Try again later, and add a LIMIT clause to your query to reduce the number of requests.".to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }

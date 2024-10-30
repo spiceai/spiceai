@@ -19,8 +19,9 @@ use super::{
     GitHubTableGraphQLParams,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::{
-    client::GraphQLQuery, FilterPushdownResult, GraphQLOptimizer, Result,
+use data_components::{
+    github::error_checker,
+    graphql::{client::GraphQLQuery, ErrorChecker, FilterPushdownResult, GraphQLContext, Result},
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub struct IssuesTableArgs {
     pub query_mode: GitHubQueryMode,
 }
 
-impl GraphQLOptimizer for IssuesTableArgs {
+impl GraphQLContext for IssuesTableArgs {
     fn filter_pushdown(
         &self,
         expr: &Expr,
@@ -58,6 +59,10 @@ impl GraphQLOptimizer for IssuesTableArgs {
         }
 
         inject_parameters("search", search_inject_parameters, filters, query)
+    }
+
+    fn error_checker(&self) -> Option<ErrorChecker> {
+        Some(Arc::new(error_checker))
     }
 }
 
