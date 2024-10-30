@@ -384,6 +384,7 @@ async fn get_vectors_with_chunker(
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for chunkz_in_row in chunks_per_row {
         lengths.push(chunkz_in_row);
 
@@ -404,7 +405,7 @@ async fn get_vectors_with_chunker(
                 + chunks
                     .as_slice()
                     .get(curr + i)
-                    .map(|s| s.len())
+                    .map(String::len)
                     .unwrap_or_default();
             inner_offsets.push(start as i32);
             inner_offsets.push(end as i32);
