@@ -18,6 +18,9 @@ limitations under the License.
 
 use std::fmt::Display;
 
+use datafusion::error::DataFusionError;
+use datafusion_table_providers::util::retriable_error::RetriableError;
+
 #[derive(Debug)]
 pub enum SpiceExternalError {
     AccelerationNotReady { dataset_name: String },
@@ -42,5 +45,26 @@ impl Display for SpiceExternalError {
                 "Acceleration not ready; loading initial data for {dataset_name}"
             ),
         }
+    }
+}
+
+#[must_use]
+pub fn get_spice_df_error(e: &DataFusionError) -> Option<&SpiceExternalError> {
+    match e {
+        DataFusionError::External(e) => {
+            if let Some(spice_err) = e.downcast_ref::<SpiceExternalError>() {
+                Some(spice_err)
+            } else if let Some(retry_err) = e.downcast_ref::<RetriableError>() {
+                match retry_err {
+                    RetriableError::DataRetrievalError {
+                        source: DataFusionError::External(e),
+                    } => e.downcast_ref::<SpiceExternalError>(),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }

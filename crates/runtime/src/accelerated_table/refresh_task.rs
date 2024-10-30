@@ -31,6 +31,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::error::{get_spice_df_error, SpiceExternalError};
 use crate::datafusion::schema::BaseSchema;
 use crate::timing::MultiTimeMeasurement;
 use crate::{
@@ -186,8 +187,7 @@ impl RefreshTask {
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
-                tracing::warn!("Failed to load data for dataset {}: {e}", self.dataset_name);
-                self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Error)
+                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
                     .await;
                 return Err(e);
             }
@@ -692,6 +692,29 @@ impl RefreshTask {
             }
         }
     }
+
+    async fn log_refresh_error(&self, error: &super::Error, refresh_sql: Option<&str>) {
+        if let super::Error::UnableToGetDataFromConnector { source } = error {
+            if let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
+                get_spice_df_error(source)
+            {
+                tracing::warn!(
+                    "Dataset {} is waiting for {dataset_name} to finish loading initial acceleration.",
+                    self.dataset_name
+                );
+                self.mark_dataset_status(refresh_sql, status::ComponentStatus::Initializing)
+                    .await;
+                return;
+            }
+        }
+
+        tracing::warn!(
+            "Failed to load data for dataset {}: {error}",
+            self.dataset_name
+        );
+        self.mark_dataset_status(refresh_sql, status::ComponentStatus::Error)
+            .await;
+    }
 }
 
 fn filter_records(
@@ -765,6 +788,14 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
 }
 
 fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
+    match error {
+        RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
+            inner_err
+        }
+    }
+}
+
+fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
     match error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
