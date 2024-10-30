@@ -83,27 +83,29 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name          | Description                                                                                    | Status            | Protocol/Format                                                                                    |
 | ------------- | ---------------------------------------------------------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------- |
-| `mysql`       | MySQL                                                                                          | Release Candidate |                                                                                                    |
-| `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Beta              | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake |
-| `github`      | GitHub                                                                                         | Beta              |                                                                                                    |
-| `postgres`    | PostgreSQL                                                                                     | Beta              |                                                                                                    |
-| `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Beta              | Arrow Flight                                                                                       |
-| `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Beta              | Parquet, CSV                                                                                       |
-| `odbc`        | ODBC                                                                                           | Beta              | ODBC                                                                                               |
-| `delta_lake`  | [Delta Lake](https://delta.io/)                                                                | Alpha             | [Delta Lake](https://delta.io/)                                                                    |
-| `dremio`      | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha             | Arrow Flight                                                                                       |
-| `duckdb`      | DuckDB                                                                                         | Alpha             |                                                                                                    |
-| `clickhouse`  | Clickhouse                                                                                     | Alpha             |                                                                                                    |
-| `spark`       | Spark                                                                                          | Alpha             | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  |
-| `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha             | Arrow Flight SQL                                                                                   |
-| `snowflake`   | Snowflake                                                                                      | Alpha             | Arrow                                                                                              |
-| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha             | Parquet, CSV, Markdown                                                                             |
-| `graphql`     | GraphQL                                                                                        | Alpha             | JSON                                                                                               |
-| `debezium`    | Debezium CDC                                                                                   | Alpha             | Kafka + JSON                                                                                       |
-| `sharepoint`  | Microsoft SharePoint                                                                           | Alpha             | Unstructured UTF-8 documents                                                                       |
-| `mssql`       | Microsoft SQL Server                                                                           | Alpha             | Tabular Data Stream (TDS)                                                                          |
-| `abfs`        | Azure BlobFS                                                                                   | Alpha             | Parquet, CSV                                                                                       |
-| `localpod`    | [Local dataset replication](https://github.com/spiceai/quickstarts/blob/trunk/localpod/README.md)                                                                                   | -             |                                                                                        |
+| `mysql` | MySQL | Release Candidate | |
+| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Beta | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html) <br/> S3/Delta Lake |
+| `delta_lake` | Delta Lake | Beta | Delta Lake |
+| `flightsql` | FlightSQL | Beta | Arrow Flight SQL |
+| `github` | GitHub | Beta | |
+| `odbc` | ODBC | Beta | ODBC |
+| `postgres` | PostgreSQL | Beta | |
+| `s3` | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme) | Beta | Parquet, CSV |
+| `spiceai` | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme) | Beta | Arrow Flight |
+| `abfs` | Azure BlobFS | Alpha | Parquet, CSV |
+| `clickhouse` | Clickhouse | Alpha | |
+| `debezium` | Debezium CDC | Alpha | Kafka + JSON |
+| `dremio` | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme) | Alpha | Arrow Flight |
+| `duckdb` | DuckDB | Alpha | |
+| `file` | File | Alpha | Parquet, CSV |
+| `ftp`, `sftp` | FTP/SFTP | Alpha | Parquet, CSV |
+| `graphql` | GraphQL | Alpha | JSON |
+| `http`, `https` | HTTP(s) | Alpha | Parquet, CSV |
+| `localpod` | [Local dataset replication](https://github.com/spiceai/quickstarts/blob/trunk/localpod/README.md) | Alpha | |
+| `mssql` | Microsoft SQL Server | Alpha | Tabular Data Stream (TDS) |
+| `sharepoint` | Microsoft SharePoint | Alpha | Unstructured UTF-8 documents |
+| `snowflake` | Snowflake | Alpha | Arrow |
+| `spark` | Spark | Alpha | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html) |
 
 ### Supported Data Stores/Accelerators
 
