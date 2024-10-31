@@ -25,7 +25,7 @@ mod embed;
 mod eval;
 mod tool_use;
 
-pub use chat::{try_to_chat_model, LLMModelStore};
+pub use chat::{tool_use_option, try_to_chat_model, LLMModelStore};
 pub use embed::{try_to_embedding, EmbeddingModelStore};
 pub use eval::{
     dataset::{DatasetInput, DatasetOutput},

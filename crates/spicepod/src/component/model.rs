@@ -77,6 +77,7 @@ pub enum ModelSource {
     OpenAi,
     Azure,
     Anthropic,
+    Xai,
     HuggingFace,
     SpiceAI,
     File,
@@ -111,6 +112,7 @@ impl Display for ModelSource {
         match self {
             ModelSource::OpenAi => write!(f, "openai"),
             ModelSource::Azure => write!(f, "azure"),
+            ModelSource::Xai => write!(f, "xai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
             ModelSource::HuggingFace => write!(f, "huggingface:huggingface.co"),
             ModelSource::File => write!(f, "file"),
