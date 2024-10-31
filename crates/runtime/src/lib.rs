@@ -41,11 +41,8 @@ use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use tls::TlsConfig;
-use tokio::sync::oneshot::error::RecvError;
-use tokio::sync::RwLock;
-use tools::catalog::SpiceToolCatalog;
-use tools::SpiceModelTool;
-use tools::Tooling;
+use tokio::sync::{oneshot::error::RecvError, RwLock};
+use tools::{catalog::SpiceToolCatalog, SpiceModelTool, Tooling};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;

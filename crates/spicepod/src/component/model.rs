@@ -98,6 +98,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::OpenAi)
         } else if value.starts_with("azure") {
             Ok(ModelSource::Azure)
+        } else if value.starts_with("xai") {
+            Ok(ModelSource::Xai)
         } else if value.starts_with("spiceai") {
             Ok(ModelSource::SpiceAI)
         } else {
@@ -283,10 +285,11 @@ impl Model {
         // Some providers only support either ML or LLMs.
         if matches!(
             source,
-            ModelSource::Azure | ModelSource::OpenAi | ModelSource::Anthropic
+            ModelSource::Azure | ModelSource::OpenAi | ModelSource::Anthropic | ModelSource::Xai
         ) {
             return Some(ModelType::Llm);
         }
+
         if source == ModelSource::SpiceAI {
             return Some(ModelType::Ml);
         };

@@ -19,12 +19,13 @@ use async_openai::{
     error::OpenAIError,
     types::{
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        ChatCompletionRequestMessage, ChatCompletionResponseStream, CreateChatCompletionRequest,
+        CreateChatCompletionResponse,
     },
     Client,
 };
 use async_trait::async_trait;
+use serde_json::json;
 
 use crate::chat::{nsql::SqlGeneration, Chat};
 
@@ -73,6 +74,23 @@ impl Xai {
                 };
             }
         });
+
+        if let Some(ref mut tools) = req.tools {
+            tools.iter_mut().for_each(|t| {
+                if t.function.parameters.is_none() {
+                    t.function.parameters.replace(json!(
+                        {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "properties": {},
+                            "required": [],
+                            "title": "",
+                            "type": "object"
+                        }
+                    ));
+                }
+            });
+        }
+
         req
     }
 }
