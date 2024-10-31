@@ -82,6 +82,7 @@ pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
+pub mod federated_table;
 mod flight;
 mod http;
 pub mod internal_table;
