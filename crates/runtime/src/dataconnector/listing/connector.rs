@@ -137,23 +137,12 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_csv_format(params)?),
                 extension.unwrap_or(".csv".to_string()),
             )),
-            Some("parquet") => {
-                let mut table_parquet_options = TableParquetOptions::new();
-                table_parquet_options
-                    .set("pushdown_filters", "true")
-                    .map_err(|e| {
-                        crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                            dataconnector: format!("{self}"),
-                            source: Box::new(e),
-                        }
-                    })?;
-                Ok((
-                    Some(Arc::new(
-                        ParquetFormat::default().with_options(table_parquet_options),
-                    )),
-                    extension.unwrap_or(".parquet".to_string()),
-                ))
-            }
+            Some("parquet") => Ok((
+                Some(Arc::new(
+                    ParquetFormat::default().with_options(self.get_table_parquet_options()?),
+                )),
+                extension.unwrap_or(".parquet".to_string()),
+            )),
             Some(format) => Ok((None, format!(".{format}"))),
             None => {
                 if let Some(ext) = std::path::Path::new(dataset.path().as_str()).extension() {
@@ -164,18 +153,10 @@ pub trait ListingTableConnector: DataConnector {
                         ));
                     }
                     if ext.eq_ignore_ascii_case("parquet") {
-                        let mut table_parquet_options = TableParquetOptions::new();
-                        table_parquet_options
-                            .set("pushdown_filters", "true")
-                            .map_err(|e| {
-                                crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                                    dataconnector: format!("{self}"),
-                                    source: Box::new(e),
-                                }
-                            })?;
                         return Ok((
                             Some(Arc::new(
-                                ParquetFormat::default().with_options(table_parquet_options),
+                                ParquetFormat::default()
+                                    .with_options(self.get_table_parquet_options()?),
                             )),
                             extension.unwrap_or(".parquet".to_string()),
                         ));
@@ -244,6 +225,22 @@ pub trait ListingTableConnector: DataConnector {
                         })?,
                 ),
         ))
+    }
+
+    fn get_table_parquet_options(&self) -> DataConnectorResult<TableParquetOptions>
+    where
+        Self: Display,
+    {
+        let mut table_parquet_options = TableParquetOptions::new();
+        table_parquet_options
+            .set("pushdown_filters", "true")
+            .map_err(
+                |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                    dataconnector: format!("{self}"),
+                    source: Box::new(e),
+                },
+            )?;
+        Ok(table_parquet_options)
     }
 
     /// A hook that is called when an accelerated table is registered to the
