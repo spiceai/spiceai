@@ -667,10 +667,11 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
             .expect("data should be created");
 
-        let federated = Arc::new(
+        let mem_table = Arc::new(
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                 .expect("mem table should be created"),
         );
+        let federated = Arc::new(FederatedTable::new(mem_table));
 
         let arr = StringArray::from(existing_data);
 
