@@ -42,7 +42,7 @@ impl RefreshTask {
         self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
-        let mut stream = Box::pin(self.get_append_stream());
+        let mut stream = Box::pin(self.get_append_stream().await);
 
         let mut ready_sender = ready_sender;
 
@@ -86,12 +86,12 @@ impl RefreshTask {
         Ok(())
     }
 
-    fn get_append_stream(
+    async fn get_append_stream(
         &self,
     ) -> impl Stream<Item = crate::accelerated_table::Result<(Option<SystemTime>, DataUpdate)>>
     {
-        let ctx = self.refresh_df_context();
-        let federated = Arc::clone(&self.federated);
+        let federated = self.federated.table_provider().await;
+        let ctx = self.refresh_df_context(Arc::clone(&federated));
         let dataset_name = self.dataset_name.clone();
 
         stream! {

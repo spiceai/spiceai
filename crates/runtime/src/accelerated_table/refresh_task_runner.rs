@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::status;
+use crate::{federated_table::FederatedTable, status};
 
 use super::{
     refresh::RefreshOverrides, refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
@@ -48,7 +48,7 @@ impl RefreshTaskRunner {
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
-        federated: Arc<dyn TableProvider>,
+        federated: Arc<FederatedTable>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {

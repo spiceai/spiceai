@@ -31,6 +31,7 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
+use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::{status, view};
 
@@ -212,13 +213,13 @@ pub enum Error {
 pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
         accelerated_table: Option<AcceleratedTable>,
         secrets: Arc<TokioRwLock<Secrets>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
     },
     View(String),
 }
@@ -478,6 +479,7 @@ impl DataFusion {
             .read_provider(&pending_registration.dataset)
             .await
             .context(UnableToResolveTableProviderSnafu)?;
+        let federated_table = FederatedTable::new(read_provider);
 
         tracing::info!(
             "Loading data for dataset {}",
@@ -486,7 +488,7 @@ impl DataFusion {
         self.register_accelerated_table(
             Arc::clone(&pending_registration.dataset),
             sink_connector,
-            read_provider,
+            federated_table,
             Arc::clone(&pending_registration.secrets),
         )
         .await?;
@@ -608,22 +610,25 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
         tracing::debug!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.mode() {
-            Mode::Read => federated_read_table,
-            Mode::ReadWrite => source
-                .read_write_provider(dataset)
-                .await
-                .ok_or_else(|| {
-                    WriteProviderNotImplementedSnafu {
-                        table_name: dataset.name.to_string(),
-                    }
-                    .build()
-                })?
-                .context(UnableToResolveTableProviderSnafu)?,
+            Mode::Read => Arc::new(federated_read_table),
+            Mode::ReadWrite => {
+                let read_write_provider = source
+                    .read_write_provider(dataset)
+                    .await
+                    .ok_or_else(|| {
+                        WriteProviderNotImplementedSnafu {
+                            table_name: dataset.name.to_string(),
+                        }
+                        .build()
+                    })?
+                    .context(UnableToResolveTableProviderSnafu)?;
+                Arc::new(FederatedTable::new(read_write_provider))
+            }
         };
 
         let source_schema = source_table_provider.schema();
@@ -636,10 +641,15 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
+        let constraints = match &*source_table_provider {
+            FederatedTable::Immediate(table_provider) => table_provider.constraints(),
+            FederatedTable::Deferred(_) => None,
+        };
+
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
             Arc::clone(&source_schema),
-            source_table_provider.constraints(),
+            constraints,
             &acceleration_settings,
             secrets,
             Some(dataset),
@@ -816,7 +826,7 @@ impl DataFusion {
         &self,
         dataset: Arc<Dataset>,
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
         let (mut accelerated_table, _) = self
@@ -925,7 +935,7 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
     ) -> Result<()> {
         tracing::debug!("Registering federated table {dataset:?}");
         let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
@@ -933,8 +943,10 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
+        let federated_table_provider = federated_read_table.table_provider().await;
+
         let source_table_provider = match dataset.mode() {
-            Mode::Read => federated_read_table,
+            Mode::Read => federated_table_provider,
             Mode::ReadWrite => source
                 .read_write_provider(dataset)
                 .await

@@ -23,6 +23,7 @@ use super::UnableToGetReadProviderSnafu;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::federated_table::FederatedTable;
 use crate::Runtime;
 use arrow::datatypes::Schema;
 use arrow_flight::decode::DecodedPayload;
@@ -268,22 +269,32 @@ impl DataConnector for SpiceAI {
         true
     }
 
-    fn append_stream(&self, table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
-        let federated_table_provider_adaptor = table_provider
+    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        Some(Box::pin(stream! {
+            let table_provider = federated_table.table_provider().await;
+            let Some(federated_table_provider_adaptor) = table_provider
             .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()?;
-        let flight_table = federated_table_provider_adaptor
-            .table_provider
-            .as_ref()?
+            .downcast_ref::<FederatedTableProviderAdaptor>() else {
+                return;
+            };
+            let Some(federated_adaptor) = federated_table_provider_adaptor.table_provider.as_ref() else {
+                return;
+            };
+            let Some(flight_table) = federated_adaptor
             .as_any()
-            .downcast_ref::<FlightTable>()?;
+            .downcast_ref::<FlightTable>() else {
+                return;
+            };
 
-        let stream = Box::pin(subscribe_to_append_stream(
-            flight_table.get_flight_client(),
-            flight_table.get_table_reference(),
-        ));
+            let mut stream = Box::pin(subscribe_to_append_stream(
+                flight_table.get_flight_client(),
+                flight_table.get_table_reference(),
+            ));
 
-        Some(stream)
+            while let Some(item) = stream.next().await {
+                yield item;
+            }
+        }))
     }
 
     async fn catalog_provider(

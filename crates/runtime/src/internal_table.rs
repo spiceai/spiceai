@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
+use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
@@ -96,6 +97,7 @@ pub async fn create_internal_accelerated_table(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider = get_local_table_provider(name.clone(), &schema).await?;
+    let federated_table = Arc::new(FederatedTable::new(source_table_provider));
 
     let accelerated_table_provider = create_accelerator_table(
         name.clone(),
@@ -111,7 +113,7 @@ pub async fn create_internal_accelerated_table(
     let mut builder = AcceleratedTable::builder(
         runtime_status,
         name.clone(),
-        source_table_provider,
+        federated_table,
         accelerated_table_provider,
         refresh,
     );

@@ -59,6 +59,12 @@ pub struct DeferredTableProvider {
     schema: SchemaRef,
 }
 
+impl DeferredTableProvider {
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 impl FederatedTable {
     pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
         Self::Immediate(table_provider)

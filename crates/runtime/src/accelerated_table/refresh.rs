@@ -23,6 +23,7 @@ use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
 use cache::QueryResultsCacheProvider;
@@ -298,7 +299,7 @@ pub(crate) enum AccelerationRefreshMode {
 pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
-    federated: Arc<dyn TableProvider>,
+    federated: Arc<FederatedTable>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
@@ -313,7 +314,7 @@ impl Refresher {
     pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
-        federated: Arc<dyn TableProvider>,
+        federated: Arc<FederatedTable>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
