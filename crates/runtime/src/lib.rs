@@ -1410,7 +1410,7 @@ impl Runtime {
             Ok(t) => {
                 let mut tools_map = self.tools.write().await;
                 tools_map.insert(tool.name.clone(), t);
-                tracing::info!("Tool [{}] ready to use", tool.name);
+                tracing::debug!("Tool {} ready to use", tool.name);
                 metrics::tools::COUNT.add(1, &[KeyValue::new("tool", tool.name.clone())]);
                 self.status
                     .update_tool(&tool.name, status::ComponentStatus::Ready);
