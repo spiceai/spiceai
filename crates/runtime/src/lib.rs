@@ -962,6 +962,10 @@ impl Runtime {
                 if let Some(federated_table) =
                     FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&connector)).await
                 {
+                    tracing::warn!(
+                        "Connection to source failed for {}. Data from acceleration is available.\n\n{err}",
+                        ds.name
+                    );
                     federated_table
                 } else {
                     self.status

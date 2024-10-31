@@ -84,6 +84,7 @@ impl FederatedTable {
 
         let checkpoint = DatasetCheckpoint::try_new(&dataset).await.ok()?;
         let federated_schema = checkpoint.get_schema().await.ok()??;
+        let dataset_name = dataset.name.clone();
 
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
@@ -106,6 +107,7 @@ impl FederatedTable {
                             dataset.name,
                         );
                     }
+                    tracing::info!("Connection to source re-established for {dataset_name}.",);
                 }
                 Err(e) => {
                     tracing::error!(
