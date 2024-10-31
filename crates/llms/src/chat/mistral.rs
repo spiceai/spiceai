@@ -210,19 +210,21 @@ impl MistralLlama {
         Ok(Self::from_pipeline(pipeline))
     }
 
+    /// Get the device to use for the model.
+    /// Preference order: CUDA, Metal, CPU.
     fn get_device() -> Device {
-        let default_device = {
-            #[cfg(feature = "metal")]
-            {
-                Device::new_metal(0).unwrap_or(Device::Cpu)
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                Device::Cpu
-            }
-        };
-
-        Device::cuda_if_available(0).unwrap_or(default_device)
+        #[cfg(feature = "cuda")]
+        {
+            Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+        }
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+        {
+            Device::new_metal(0).unwrap_or(Device::Cpu)
+        }
+        #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+        {
+            Device::Cpu
+        }
     }
 
     pub fn from_hf(model_id: &str, arch: &str, hf_token_literal: Option<String>) -> Result<Self> {
@@ -241,7 +243,6 @@ impl MistralLlama {
             Some(model_parts[0].to_string()),
         );
         let device = Self::get_device();
-
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, TokenSource::Literal);
 
         let pipeline = builder

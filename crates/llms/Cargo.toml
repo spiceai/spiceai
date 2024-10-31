@@ -49,6 +49,6 @@ either = "1.13.0"
 
 [features]
 default = ["mistralrs"]
-metal = ["tei_backend/metal", "tei_candle/metal", "mistralrs-core/metal"]
-cuda = ["tei_backend/cuda", "tei_candle/cuda", "mistralrs-core/cuda"]
+metal = ["tei_backend/metal", "tei_candle/metal", "mistralrs-core/metal", "mistralrs/metal"]
+cuda = ["tei_backend/cuda", "tei_candle/cuda", "mistralrs-core/cuda", "mistralrs/cuda"]
 mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]

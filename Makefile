@@ -57,7 +57,8 @@ lint: lint-go lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	cargo clippy --all-targets --all-features --workspace -- \
+	## All except metal, cuda
+	cargo clippy --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
