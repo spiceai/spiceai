@@ -421,6 +421,7 @@ impl Refresher {
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         let synchronize_with = self.synchronize_with.clone();
+        let federated_schema = self.federated.schema();
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
@@ -483,7 +484,7 @@ impl Refresher {
                             }
 
                             if let Some(checkpointer) = &checkpointer {
-                                if let Err(e) = checkpointer.checkpoint().await {
+                                if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
                                     tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
                                 };
                             }
