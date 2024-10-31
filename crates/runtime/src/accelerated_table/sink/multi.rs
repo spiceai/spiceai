@@ -267,7 +267,7 @@ mod tests {
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .unwrap();
+                .expect("valid int32 array");
             received_values.extend(array.values());
         }
 
