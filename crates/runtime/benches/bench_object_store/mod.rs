@@ -190,7 +190,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         ("tpcds_q11", include_str!("../queries/tpcds/q11.sql")),
         ("tpcds_q12", include_str!("../queries/tpcds/q12.sql")),
         ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")),
-        ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")),
+        // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), // this query contains multiple queries, which aren't supported
         ("tpcds_q15", include_str!("../queries/tpcds/q15.sql")),
         ("tpcds_q16", include_str!("../queries/tpcds/q16.sql")),
         ("tpcds_q17", include_str!("../queries/tpcds/q17.sql")),
@@ -322,7 +322,34 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
             ("tpcds_q38", None),
             ("tpcds_q87", None),
         ],
-        _ => vec![],
+        Some("arrow") => vec![
+            // Physical plan does not support logical expression Exists
+            ("tpcds_q10", None),
+            ("tpcds_q35", None),
+            // physical plan is not yet implemented for GROUPING aggregate function
+            ("tpcds_q27", None),
+            ("tpcds_q36", None),
+            ("tpcds_q70", None),
+            ("tpcds_q86", None),
+            // Error during planning: Correlated column is not allowed in predicate
+            ("tpcds_q41", None),
+            // Physical plan does not support logical expression InSubquery
+            ("tpcds_q45", None),
+        ],
+        _ => vec![
+            // Physical plan does not support logical expression Exists
+            ("tpcds_q10", None),
+            ("tpcds_q35", None),
+            // physical plan is not yet implemented for GROUPING aggregate function
+            ("tpcds_q27", None),
+            ("tpcds_q36", None),
+            ("tpcds_q70", None),
+            ("tpcds_q86", None),
+            // Error during planning: Correlated column is not allowed in predicate
+            ("tpcds_q41", None),
+            // Physical plan does not support logical expression InSubquery
+            ("tpcds_q45", None),
+        ],
     })
     .into_iter()
     .collect();
