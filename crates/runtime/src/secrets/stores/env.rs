@@ -79,8 +79,8 @@ impl EnvSecretStore {
                         return;
                     }
                 }
-                _ => {
-                    tracing::warn!("Error opening path: {}", path.display());
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!("Error opening path: {}: {e}", path.display());
                     return;
                 }
             }
