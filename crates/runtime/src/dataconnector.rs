@@ -18,6 +18,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::federated_table::FederatedTable;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
@@ -378,7 +379,7 @@ pub trait DataConnector: Send + Sync {
         false
     }
 
-    fn changes_stream(&self, _table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
+    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         None
     }
 
@@ -386,7 +387,7 @@ pub trait DataConnector: Send + Sync {
         false
     }
 
-    fn append_stream(&self, _table_provider: Arc<dyn TableProvider>) -> Option<ChangesStream> {
+    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         None
     }
 

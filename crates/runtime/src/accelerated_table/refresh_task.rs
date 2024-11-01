@@ -33,6 +33,7 @@ use util::{retry, RetryError};
 
 use crate::datafusion::error::{get_spice_df_error, SpiceExternalError};
 use crate::datafusion::schema::BaseSchema;
+use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
@@ -79,7 +80,7 @@ struct RefreshStat {
 pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
-    federated: Arc<dyn TableProvider>,
+    federated: Arc<FederatedTable>,
     accelerator: Arc<dyn TableProvider>,
     sink: Arc<RwLock<AccelerationSink>>,
 }
@@ -89,7 +90,7 @@ impl RefreshTask {
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
-        federated: Arc<dyn TableProvider>,
+        federated: Arc<FederatedTable>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
@@ -415,8 +416,9 @@ impl RefreshTask {
         filters: Vec<Expr>,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let mut ctx = self.refresh_df_context();
-        let federated = Arc::clone(&self.federated);
+        let federated_provider = self.federated.table_provider().await;
+
+        let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
         let dataset_name = self.dataset_name.clone();
 
         let update_type = match refresh.mode {
@@ -431,7 +433,7 @@ impl RefreshTask {
         let get_data_result = get_data(
             &mut ctx,
             dataset_name.clone(),
-            Arc::clone(&federated),
+            federated_provider,
             refresh.sql.clone(),
             filters.clone(),
         )
@@ -452,7 +454,7 @@ impl RefreshTask {
         TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
     }
 
-    fn refresh_df_context(&self) -> SessionContext {
+    fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
         let ctx = SessionContext::new_with_config_rt(
             SessionConfig::new().set_bool(
                 "datafusion.execution.listing_table_ignore_subdirectory",
@@ -470,7 +472,7 @@ impl RefreshTask {
             }
         };
 
-        if let Err(e) = ctx.register_table(self.dataset_name.clone(), Arc::clone(&self.federated)) {
+        if let Err(e) = ctx.register_table(self.dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
@@ -539,8 +541,13 @@ impl RefreshTask {
             return Ok(update);
         };
 
+        let federated_provider = self.federated.table_provider().await;
+
         let existing_records = self
-            .accelerator_df(self.refresh_df_context(), refresh.sql.as_deref())
+            .accelerator_df(
+                self.refresh_df_context(Arc::clone(&federated_provider)),
+                refresh.sql.as_deref(),
+            )
             .await
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
@@ -549,7 +556,7 @@ impl RefreshTask {
             .await
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        let filter_schema = BaseSchema::get_schema(&self.federated);
+        let filter_schema = BaseSchema::get_schema(&federated_provider);
         let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
@@ -570,7 +577,8 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> super::Result<Option<u128>> {
-        let ctx = self.refresh_df_context();
+        let federated = self.federated.table_provider().await;
+        let ctx = self.refresh_df_context(federated);
 
         refresh
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())

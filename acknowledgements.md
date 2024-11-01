@@ -90,13 +90,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.83, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.5.8, Apache-2.0 
+- aws-config 1.5.9, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-sdk-secretsmanager 1.50.0, Apache-2.0 
+- aws-sdk-secretsmanager 1.51.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.46.0, Apache-2.0 
+- aws-sdk-sts 1.47.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.7.7, MIT 
@@ -129,7 +129,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - bb8 0.8.6, MIT 
   <br/>https://github.com/djc/bb8
 
-- bigdecimal 0.4.5, Apache-2.0 OR MIT 
+- bigdecimal 0.4.6, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
 
 - bollard 0.16.1, Apache-2.0 
@@ -180,7 +180,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-table-providers 0.1.0,  
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
-- delta_kernel 0.3.1, Apache-2.0 
+- delta_kernel 0.4.1, Apache-2.0 
   <br/>https://github.com/delta-incubator/delta-kernel-rs
 
 - dirs 5.0.1, Apache-2.0 OR MIT 
@@ -246,7 +246,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hyper 1.5.0, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper-util 0.1.9, MIT 
+- hyper-util 0.1.10, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
 - indexmap 1.9.3, Apache-2.0 OR MIT 
@@ -255,7 +255,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 2.6.0, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
-- insta 1.40.0, Apache-2.0 
+- insta 1.41.0, Apache-2.0 
   <br/>https://github.com/mitsuhiko/insta
 
 - itertools 0.10.5, Apache-2.0 OR MIT 
@@ -384,7 +384,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - reqwest 0.11.27, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
-- reqwest 0.12.8, Apache-2.0 OR MIT 
+- reqwest 0.12.9, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
 - reqwest-eventsource 0.6.0, Apache-2.0 OR MIT 
@@ -396,7 +396,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustls 0.21.12, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
-- rustls 0.23.15, Apache-2.0 OR ISC OR MIT 
+- rustls 0.23.16, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
 - rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
@@ -423,7 +423,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.213, Apache-2.0 OR MIT 
+- serde 1.0.214, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
 - serde-value 0.7.0, MIT 
@@ -471,7 +471,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - text-embeddings-core 1.4.0,  
   <br/>
 
-- text-splitter 0.18.0, MIT 
+- text-splitter 0.18.1, MIT 
   <br/>https://github.com/benbrandt/text-splitter
 
 - tiberius 0.12.3, Apache-2.0 OR MIT 
@@ -500,6 +500,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - tokio-rustls 0.26.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rustls/tokio-rustls
+
+- tokio-stream 0.1.16, MIT 
+  <br/>https://github.com/tokio-rs/tokio
 
 - tokio-util 0.7.12, MIT 
   <br/>https://github.com/tokio-rs/tokio
@@ -545,3 +548,4 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - x509-certificate 0.23.1, MPL-2.0 
   <br/>https://github.com/indygreg/cryptography-rs.git
+

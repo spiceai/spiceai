@@ -175,6 +175,14 @@
             "null"
           ]
         },
+        "ready_state": {
+          "default": "on_load",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReadyState"
+            }
+          ]
+        },
         "refresh_append_overlap": {
           "type": [
             "string",
@@ -726,6 +734,25 @@
     },
     "Params": {
       "type": "object"
+    },
+    "ReadyState": {
+      "description": "Controls when the table is marked ready for queries.",
+      "oneOf": [
+        {
+          "description": "The table is ready once the initial load completes.",
+          "type": "string",
+          "enum": [
+            "on_load"
+          ]
+        },
+        {
+          "description": "The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.",
+          "type": "string",
+          "enum": [
+            "on_registration"
+          ]
+        }
+      ]
     },
     "RefreshMode": {
       "type": "string",

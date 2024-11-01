@@ -22,6 +22,7 @@ use crate::component::dataset::TimeFormat;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
+use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
@@ -158,7 +159,7 @@ pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTa
 pub struct AcceleratedTable {
     dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
-    federated: Arc<dyn TableProvider>,
+    federated: Arc<FederatedTable>,
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
@@ -194,7 +195,7 @@ fn validate_refresh_data_window(
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
-    federated: Arc<dyn TableProvider>,
+    federated: Arc<FederatedTable>,
     accelerator: Arc<dyn TableProvider>,
     refresh: refresh::Refresh,
     retention: Option<Retention>,
@@ -213,7 +214,7 @@ impl Builder {
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
-        federated: Arc<dyn TableProvider>,
+        federated: Arc<FederatedTable>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Self {
@@ -447,7 +448,7 @@ impl AcceleratedTable {
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
-        federated: Arc<dyn TableProvider>,
+        federated: Arc<FederatedTable>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Builder {
@@ -498,7 +499,7 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn get_federated_table(&self) -> Arc<dyn TableProvider> {
+    pub fn get_federated_table(&self) -> Arc<FederatedTable> {
         Arc::clone(&self.federated)
     }
 
@@ -675,7 +676,12 @@ impl TableProvider for AcceleratedTable {
                     ));
                 }
                 ReadyState::OnRegistration => {
-                    return self.federated.scan(state, projection, filters, limit).await;
+                    // Getting the federated_provider should always return immediately here, because by definition an accelerated table has
+                    // completed its initial load if it has a previous checkpoint.
+                    let federated_provider = self.federated.table_provider().await;
+                    return federated_provider
+                        .scan(state, projection, filters, limit)
+                        .await;
                 }
             }
         }
@@ -715,8 +721,8 @@ impl TableProvider for AcceleratedTable {
             .await?;
 
         let federated_input = Arc::new(SliceExec::new(tee_input, 1));
-        let federated_insert_plan = self
-            .federated
+        let federated_table = self.federated.table_provider().await;
+        let federated_insert_plan = federated_table
             .insert_into(state, federated_input, overwrite)
             .await?;
 

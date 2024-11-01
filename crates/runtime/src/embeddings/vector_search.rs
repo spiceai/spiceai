@@ -521,7 +521,7 @@ impl VectorSearch {
                         data_source: vec![tbl.clone()],
                     })?;
 
-                let Some(embedding_table) = get_embedding_table(&table_provider) else {
+                let Some(embedding_table) = get_embedding_table(&table_provider).await else {
                     return Err(Error::CannotVectorSearchDataset {
                         data_source: tbl.clone()
                     });
@@ -588,6 +588,7 @@ impl VectorSearch {
                 })?;
 
             let embedding_models = get_embedding_table(&table)
+                .await
                 .context(NoEmbeddingColumnsSnafu {
                     data_source: data_source.to_string(),
                 })?
@@ -737,7 +738,7 @@ fn get_projection(batch: &RecordBatch, column_names: &[String]) -> Vec<usize> {
 
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
 /// This includes if the [`TableProvider`] is an [`AcceleratedTable`] with a [`EmbeddingTable`] underneath.
-fn get_embedding_table(tbl: &Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTable>> {
+async fn get_embedding_table(tbl: &Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTable>> {
     if let Some(embedding_table) = tbl.as_any().downcast_ref::<EmbeddingTable>() {
         return Some(Arc::new(embedding_table.clone()));
     }
@@ -749,11 +750,11 @@ fn get_embedding_table(tbl: &Arc<dyn TableProvider>) -> Option<Arc<EmbeddingTabl
     };
 
     if let Some(accelerated_table) = tbl.as_any().downcast_ref::<AcceleratedTable>() {
-        if let Some(embedding_table) = accelerated_table
+        let federated_table = accelerated_table
             .get_federated_table()
-            .as_any()
-            .downcast_ref::<EmbeddingTable>()
-        {
+            .table_provider()
+            .await;
+        if let Some(embedding_table) = federated_table.as_any().downcast_ref::<EmbeddingTable>() {
             return Some(Arc::new(embedding_table.clone()));
         }
     }

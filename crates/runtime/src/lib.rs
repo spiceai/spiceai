@@ -21,7 +21,6 @@ use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-use ::datafusion::datasource::TableProvider;
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
 use ::opentelemetry::KeyValue;
@@ -40,6 +39,7 @@ use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
 use embeddings::task::TaskEmbed;
 use extension::ExtensionFactory;
+use federated_table::FederatedTable;
 use futures::future::join_all;
 use futures::{Future, StreamExt};
 use llms::chat::Chat;
@@ -82,6 +82,7 @@ pub mod dataupdate;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
+pub mod federated_table;
 mod flight;
 mod http;
 pub mod internal_table;
@@ -944,18 +945,38 @@ impl Runtime {
             }
         }
 
-        // test dataset connectivity by attempting to get a read provider
-        let read_provider = match data_connector.read_provider(&ds).await {
-            Ok(provider) => provider,
+        // Only wrap data connector when necessary.
+        let connector = if ds.embeddings.is_empty() {
+            data_connector
+        } else {
+            let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
+            Arc::new(connector) as Arc<dyn DataConnector>
+        };
+
+        // Test dataset connectivity by attempting to get a read provider.
+        let federated_table = match connector.read_provider(&ds).await {
+            Ok(provider) => FederatedTable::new(provider),
             Err(err) => {
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
-                metrics::datasets::LOAD_ERROR.add(1, &[]);
-                warn_spaced!(spaced_tracer, "{}{err}", "");
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: ds.name.clone(),
+                // We couldn't connect to the federated table. If the dataset has an existing
+                // accelerated table, we can defer the federated table creation.
+                if let Some(federated_table) =
+                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&connector)).await
+                {
+                    tracing::warn!(
+                        "Connection to source failed for {}. Data from acceleration is available.\n\n{err}",
+                        ds.name
+                    );
+                    federated_table
+                } else {
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: ds.name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
             }
         };
 
@@ -963,8 +984,8 @@ impl Runtime {
             .register_dataset(
                 Arc::clone(&ds),
                 RegisterDatasetContext {
-                    data_connector: Arc::clone(&data_connector),
-                    federated_read_table: read_provider,
+                    data_connector: Arc::clone(&connector),
+                    federated_read_table: federated_table,
                     source,
                     accelerated_table,
                 },
@@ -974,11 +995,7 @@ impl Runtime {
             Ok(()) => {
                 tracing::info!(
                     "{}",
-                    dataset_registered_trace(
-                        &data_connector,
-                        &ds,
-                        self.df.cache_provider().is_some()
-                    )
+                    dataset_registered_trace(&connector, &ds, self.df.cache_provider().is_some())
                 );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
@@ -1135,11 +1152,12 @@ impl Runtime {
             }
             .build()
         })?;
+        let federated_table = FederatedTable::new(read_table);
 
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .create_accelerated_table(&ds, Arc::clone(&connector), read_table, self.secrets())
+            .create_accelerated_table(&ds, Arc::clone(&connector), federated_table, self.secrets())
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
                 dataset: ds.name.clone(),
@@ -1189,25 +1207,12 @@ impl Runtime {
     ) -> Result<()> {
         let RegisterDatasetContext {
             data_connector,
-            mut federated_read_table,
+            federated_read_table,
             source,
             accelerated_table,
         } = register_dataset_ctx;
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
-
-        // Only wrap data connector when necessary.
-        let connector = if ds.embeddings.is_empty() {
-            data_connector
-        } else {
-            let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
-            federated_read_table = connector
-                .wrap_table(federated_read_table, &ds)
-                .await
-                .boxed()
-                .context(UnableToInitializeDataConnectorSnafu)?;
-            Arc::new(connector) as Arc<dyn DataConnector>
-        };
 
         // FEDERATED TABLE
         if !ds.is_accelerated() {
@@ -1221,7 +1226,7 @@ impl Runtime {
                 .register_table(
                     ds,
                     datafusion::Table::Federated {
-                        data_connector: connector,
+                        data_connector,
                         federated_read_table,
                     },
                 )
@@ -1262,7 +1267,7 @@ impl Runtime {
             .register_table(
                 ds,
                 datafusion::Table::Accelerated {
-                    source: connector,
+                    source: data_connector,
                     federated_read_table,
                     accelerated_table,
                     secrets: self.secrets(),
@@ -1410,7 +1415,7 @@ impl Runtime {
             Ok(t) => {
                 let mut tools_map = self.tools.write().await;
                 tools_map.insert(tool.name.clone(), t);
-                tracing::info!("Tool [{}] ready to use", tool.name);
+                tracing::debug!("Tool {} ready to use", tool.name);
                 metrics::tools::COUNT.add(1, &[KeyValue::new("tool", tool.name.clone())]);
                 self.status
                     .update_tool(&tool.name, status::ComponentStatus::Ready);
@@ -1739,7 +1744,7 @@ impl Runtime {
 
 pub struct RegisterDatasetContext {
     data_connector: Arc<dyn DataConnector>,
-    federated_read_table: Arc<dyn TableProvider>,
+    federated_read_table: FederatedTable,
     source: String,
     accelerated_table: Option<AcceleratedTable>,
 }

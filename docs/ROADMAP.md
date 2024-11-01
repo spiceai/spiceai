@@ -8,7 +8,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v1.0-rc.1 (Oct 2024)](https://github.com/spiceai/spiceai/milestone/45)
+## [v1.0-rc.1 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/45)
 
 - Bugfixes and performance improvements
 - Data accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Beta)
@@ -17,7 +17,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MySQL data connector (Release Candidate)
 - GitHub data connector (Release Candidate)
 
-## [v1.0-rc.2 (Oct 2024)](https://github.com/spiceai/spiceai/milestone/48)
+## [v1.0-rc.2 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/48)
 
 - Bugfixes and performance improvements
 - GraphQL data connector (Release Candidate)

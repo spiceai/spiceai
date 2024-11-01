@@ -35,7 +35,6 @@ text-splitter = { version =  "0.18.1", features = ["markdown", "tokenizers", "ti
 pulldown-cmark = "0.12.1"
 tiktoken-rs = "0.6.0"
 
-## `candle` feature packages
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "60e9375b6049eead77cbda7cb3d3d83187f501a2", optional = true }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "60e9375b6049eead77cbda7cb3d3d83187f501a2", optional = true, package = "mistralrs-core" }
 rand = "0.8.5"
@@ -50,5 +49,6 @@ either = "1.13.0"
 
 [features]
 default = ["mistralrs"]
-metal = []
+metal = ["tei_backend/metal", "tei_candle/metal", "mistralrs-core/metal", "mistralrs/metal"]
+cuda = ["tei_backend/cuda", "tei_candle/cuda", "mistralrs-core/cuda", "mistralrs/cuda"]
 mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]

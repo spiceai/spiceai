@@ -34,10 +34,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 
+# Non-default features should be added to `lint-rust` make target.
 [features]
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
+cuda =  ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
@@ -65,6 +67,7 @@ duckdb = ["runtime/duckdb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
+metal =  ["runtime/metal"]
 models = ["runtime/models"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]

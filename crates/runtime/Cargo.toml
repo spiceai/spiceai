@@ -146,6 +146,7 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "data_components/clickhouse",
 ]
+cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
@@ -156,6 +157,7 @@ duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
+metal = ["llms/metal"]
 models = ["model_components/full", "llms/mistralrs"]
 mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]

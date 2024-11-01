@@ -36,6 +36,7 @@ use runtime::{
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnector, DataConnectorError},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
+    federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
     status, Runtime,
@@ -345,10 +346,11 @@ pub async fn create_synced_internal_accelerated_table(
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
         get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets)).await?;
+    let federated_table = Arc::new(FederatedTable::new(source_table_provider));
 
     let accelerated_table_provider = create_accelerator_table(
         table_reference.clone(),
-        source_table_provider.schema(),
+        federated_table.schema(),
         None,
         &acceleration,
         secrets,
@@ -360,7 +362,7 @@ pub async fn create_synced_internal_accelerated_table(
     let mut builder = AcceleratedTable::builder(
         runtime_status,
         table_reference.clone(),
-        source_table_provider,
+        federated_table,
         accelerated_table_provider,
         refresh,
     );
