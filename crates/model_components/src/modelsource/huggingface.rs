@@ -23,7 +23,6 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use uuid::Uuid;
 
 pub struct Huggingface {}
 
@@ -53,8 +52,7 @@ impl ModelSource for Huggingface {
         };
 
         // it is not copying local model into .spice folder
-        let local_path =
-            super::ensure_model_path(&Uuid::new_v4().simple().to_string(), name.as_str())?;
+        let local_path = super::ensure_model_path(name.as_str())?;
 
         let remote_path = params
             .get("path")

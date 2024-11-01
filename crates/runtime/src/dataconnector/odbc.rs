@@ -165,6 +165,16 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("sql_dialect"),
 ];
 
+fn driver_is_file(driver: &str) -> bool {
+    driver
+        .split('=')
+        .last()
+        // if the file doesn't yet exist, the connector will fail registration
+        // when the connector re-tries, if the file exists it will fail again
+        .filter(|s| std::fs::metadata(s).is_ok())
+        .is_some()
+}
+
 impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
@@ -188,14 +198,7 @@ impl DataConnectorFactory for ODBCFactory {
                     .context(NoDriverSpecifiedSnafu)?;
 
                 // explicitly check if the user has tried to specify a file path
-                if driver
-                    .split('=')
-                    .last()
-                    // if the file doesn't yet exist, the connector will fail registration
-                    // when the connector re-tries, if the file exists it will fail again
-                    .filter(|s| std::fs::metadata(s).is_ok())
-                    .is_some()
-                {
+                if driver_is_file(driver) {
                     return Err(Error::DirectDriverNotPermitted {}.into());
                 }
 
@@ -242,5 +245,27 @@ where
                     dataconnector: "odbc",
                 })?,
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_odbc_driver_is_file() {
+        std::fs::File::create("something.so").unwrap();
+        std::fs::File::create("noextfile").unwrap();
+
+        assert_eq!(driver_is_file("driver=foo"), false);
+        assert_eq!(driver_is_file("driver={mysql}"), false);
+        assert_eq!(driver_is_file("driver={microsoft sql server}"), false);
+        assert_eq!(driver_is_file("driver=./something.so"), true);
+        assert_eq!(driver_is_file("driver=something.so"), true);
+        assert_eq!(driver_is_file("driver=noextfile"), true);
+        assert_eq!(driver_is_file("driver=./noextfile"), true);
+
+        std::fs::remove_file("something.so").unwrap();
+        std::fs::remove_file("noextfile").unwrap();
     }
 }
