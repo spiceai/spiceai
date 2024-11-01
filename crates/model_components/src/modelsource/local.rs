@@ -21,6 +21,7 @@ use secrecy::{ExposeSecret, Secret, SecretString};
 use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct Local {}
 #[async_trait]
@@ -39,7 +40,7 @@ impl ModelSource for Local {
         };
 
         // it is not copying local model into .spice folder
-        let _ = super::ensure_model_path(name.as_str())?;
+        let _ = super::ensure_model_path(&Uuid::new_v4().simple().to_string(), name.as_str())?;
 
         let path = params
             .get("from")

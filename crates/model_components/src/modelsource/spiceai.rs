@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use regex::Regex;
 
@@ -45,7 +46,8 @@ impl ModelSource for SpiceAI {
         };
 
         // it is not copying local model into .spice folder
-        let local_path = super::ensure_model_path(name.as_str())?;
+        let local_path =
+            super::ensure_model_path(&Uuid::new_v4().simple().to_string(), name.as_str())?;
 
         let remote_path = params
             .get("path")

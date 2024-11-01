@@ -6796,6 +6796,7 @@ dependencies = [
  "tracing",
  "tract-core",
  "tract-onnx",
+ "uuid 1.11.0",
 ]
 
 [[package]]
