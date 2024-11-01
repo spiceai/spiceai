@@ -257,9 +257,9 @@ mod test {
         std::fs::File::create("something.so").expect("file should be created");
         std::fs::File::create("noextfile").expect("file should be created");
 
-        assert_eq!(driver_is_file("driver=foo"), false);
-        assert_eq!(driver_is_file("driver={mysql}"), false);
-        assert_eq!(driver_is_file("driver={microsoft sql server}"), false);
+        assert!(!driver_is_file("driver=foo"));
+        assert!(!driver_is_file("driver={mysql}"));
+        assert!(!driver_is_file("driver={microsoft sql server}"));
         assert!(driver_is_file("driver=./something.so"));
         assert!(driver_is_file("driver=something.so"));
         assert!(driver_is_file("driver=noextfile"));
