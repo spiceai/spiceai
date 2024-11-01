@@ -254,8 +254,8 @@ mod test {
 
     #[test]
     fn test_odbc_driver_is_file() {
-        std::fs::File::create("something.so").unwrap();
-        std::fs::File::create("noextfile").unwrap();
+        std::fs::File::create("something.so").expect("file should be created");
+        std::fs::File::create("noextfile").expect("file should be created");
 
         assert_eq!(driver_is_file("driver=foo"), false);
         assert_eq!(driver_is_file("driver={mysql}"), false);
@@ -265,7 +265,7 @@ mod test {
         assert_eq!(driver_is_file("driver=noextfile"), true);
         assert_eq!(driver_is_file("driver=./noextfile"), true);
 
-        std::fs::remove_file("something.so").unwrap();
-        std::fs::remove_file("noextfile").unwrap();
+        std::fs::remove_file("something.so").expect("file should be deleted");
+        std::fs::remove_file("noextfile").expect("file should be deleted");
     }
 }
