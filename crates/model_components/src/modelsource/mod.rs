@@ -123,7 +123,7 @@ impl FromStr for ModelSourceType {
 pub fn ensure_model_path(name: &str) -> Result<String> {
     let mut model_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
     model_path.push(".spice/models");
-    model_path.push(&Uuid::new_v4().simple().to_string());
+    model_path.push(Uuid::new_v4().simple().to_string());
     model_path.push(name);
 
     if !model_path.exists() {
