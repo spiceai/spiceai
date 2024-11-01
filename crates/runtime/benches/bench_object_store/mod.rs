@@ -336,7 +336,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
             // Physical plan does not support logical expression InSubquery
             ("tpcds_q45", None),
         ],
-        _ => vec![
+        None => vec![
             // Physical plan does not support logical expression Exists
             ("tpcds_q10", None),
             ("tpcds_q35", None),
