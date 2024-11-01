@@ -46,7 +46,7 @@ pub enum Error {
     InvalidParameter { param: String, msg: String },
     #[snafu(display("No ODBC driver was specified in the connection string"))]
     NoDriverSpecified,
-    #[snafu(display("Directly accessing an ODBC driver with a file path is not permitted. Create an ODBC profile instead."))]
+    #[snafu(display("Accessing an ODBC driver with a file path is not permitted. Create an ODBC profile instead."))]
     DirectDriverNotPermitted,
 }
 
