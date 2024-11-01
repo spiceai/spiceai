@@ -280,6 +280,10 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
     let overrides: HashMap<_, Option<&str>> = (match engine.as_deref() {
         Some("sqlite") => vec![
             (
+                "tpcds_q49",
+                Some(include_str!("../queries/tpcds/q49_sqlite.sql")),
+            ),
+            (
                 "tpcds_q75",
                 Some(include_str!("../queries/tpcds/q75_sqlite.sql")),
             ),

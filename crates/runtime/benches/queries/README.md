@@ -406,4 +406,5 @@ select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
 
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
-| [q75.sql](tpcds/q75.sql) | [q90.sql](tpcds/q90.sql) |
+| [q49.sql](tpcds/q49.sql) | [q75.sql](tpcds/q75.sql)|
+| [q90.sql](tpcds/q90.sql) |  |
