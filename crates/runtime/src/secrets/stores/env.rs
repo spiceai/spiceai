@@ -187,7 +187,7 @@ mod test {
         let mut env = EnvSecretStoreBuilder::new().with_path(path).build();
         env.load();
 
-        assert!(!env.loaded); // env should load
+        assert!(!env.loaded); // env should not load
 
         std::fs::remove_file("symlinked.env").expect("file should be removed");
         std::fs::remove_file("symlink.env").expect("file should be removed");
