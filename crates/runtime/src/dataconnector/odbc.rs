@@ -260,10 +260,10 @@ mod test {
         assert_eq!(driver_is_file("driver=foo"), false);
         assert_eq!(driver_is_file("driver={mysql}"), false);
         assert_eq!(driver_is_file("driver={microsoft sql server}"), false);
-        assert_eq!(driver_is_file("driver=./something.so"), true);
-        assert_eq!(driver_is_file("driver=something.so"), true);
-        assert_eq!(driver_is_file("driver=noextfile"), true);
-        assert_eq!(driver_is_file("driver=./noextfile"), true);
+        assert!(driver_is_file("driver=./something.so"));
+        assert!(driver_is_file("driver=something.so"));
+        assert!(driver_is_file("driver=noextfile"));
+        assert!(driver_is_file("driver=./noextfile"));
 
         std::fs::remove_file("something.so").expect("file should be deleted");
         std::fs::remove_file("noextfile").expect("file should be deleted");
