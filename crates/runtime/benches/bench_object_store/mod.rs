@@ -315,13 +315,13 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
             ("tpcds_q38", None),
             ("tpcds_q87", None),
         ],
-        Some("duckdb") => vec![(
+        Some("duckdb") => vec![
             // EXCEPT and INTERSECT aren't supported
             ("tpcds_q8", None),
             ("tpcds_q14", None),
             ("tpcds_q38", None),
             ("tpcds_q87", None),
-        )],
+        ],
         _ => vec![],
     })
     .into_iter()
