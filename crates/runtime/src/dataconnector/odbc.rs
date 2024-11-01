@@ -189,7 +189,7 @@ impl DataConnectorFactory for ODBCFactory {
 
                 // explicitly check if the user has tried to specify a file path
                 if driver
-                    .split("=")
+                    .split('=')
                     .last()
                     // if the file doesn't yet exist, the connector will fail registration
                     // when the connector re-tries, if the file exists it will fail again
