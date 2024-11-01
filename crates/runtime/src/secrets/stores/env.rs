@@ -47,7 +47,10 @@ impl EnvSecretStoreBuilder {
 
     #[must_use]
     pub fn build(self) -> EnvSecretStore {
-        let env = EnvSecretStore { path: self.path };
+        let mut env = EnvSecretStore {
+            path: self.path,
+            loaded: false,
+        };
         env.load();
         env
     }
@@ -55,13 +58,38 @@ impl EnvSecretStoreBuilder {
 
 pub struct EnvSecretStore {
     path: Option<PathBuf>,
+    loaded: bool,
 }
 
 impl EnvSecretStore {
-    fn load(&self) {
+    fn load(&mut self) {
         if let Some(path) = &self.path {
+            if path.is_symlink() {
+                tracing::warn!("Error opening path: {}: Path is a symlink", path.display());
+                return;
+            }
+
+            match (path.canonicalize(), std::env::current_dir()) {
+                (Ok(canonical_path), Ok(current_dir)) => {
+                    if !canonical_path.starts_with(current_dir) {
+                        tracing::warn!(
+                            "Error opening path: {}: Path is not in current directory",
+                            path.display()
+                        );
+                        return;
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!("Error opening path: {}: {e}", path.display());
+                    return;
+                }
+            }
+
             match dotenvy::from_path(path) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.loaded = true;
+                    return;
+                }
                 Err(err) => {
                     if matches!(err, dotenvy::Error::LineParse(_, _)) {
                         tracing::warn!("{err}");
@@ -107,5 +135,61 @@ impl SecretStore for EnvSecretStore {
             },
             Err(err) => Err(Box::new(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_loading_env_outside_of_current_dir() {
+        let path = PathBuf::from("/tmp/.env");
+        let mut env = EnvSecretStoreBuilder::new().with_path(path).build();
+        env.load();
+
+        assert!(!env.loaded); // env should not load because it's out of this directory
+    }
+
+    #[test]
+    fn test_loading_env() {
+        std::fs::File::create("test.env")
+            .expect("file should be created")
+            .write_all(b"TEST=1")
+            .expect("file should be written");
+
+        let path = PathBuf::from("test.env");
+        let mut env = EnvSecretStoreBuilder::new().with_path(path).build();
+        env.load();
+
+        assert!(env.loaded); // env should load
+
+        // check the env
+        let value = std::env::var("TEST").expect("env var should be set");
+        assert_eq!(value, "1");
+
+        std::fs::remove_file("test.env").expect("file should be removed");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_loading_env_with_symlink() {
+        std::fs::File::create("symlinked.env")
+            .expect("file should be created")
+            .write_all(b"TEST=1")
+            .expect("file should be written");
+
+        std::os::unix::fs::symlink("symlinked.env", "symlink.env")
+            .expect("symlink should be created");
+
+        let path = PathBuf::from("symlink.env");
+        let mut env = EnvSecretStoreBuilder::new().with_path(path).build();
+        env.load();
+
+        assert!(!env.loaded); // env should not load
+
+        std::fs::remove_file("symlinked.env").expect("file should be removed");
+        std::fs::remove_file("symlink.env").expect("file should be removed");
     }
 }

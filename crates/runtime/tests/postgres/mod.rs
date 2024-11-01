@@ -83,7 +83,7 @@ CREATE TABLE test (
         *record_batch.schema().fields()[0].data_type()
     );
     assert_eq!(
-        DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         *record_batch.schema().fields()[1].data_type()
     );
 
