@@ -322,7 +322,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
             ("tpcds_q38", None),
             ("tpcds_q87", None),
         ],
-        Some("arrow") => vec![
+        Some("arrow") | None => vec![
             // Physical plan does not support logical expression Exists
             ("tpcds_q10", None),
             ("tpcds_q35", None),
@@ -336,20 +336,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
             // Physical plan does not support logical expression InSubquery
             ("tpcds_q45", None),
         ],
-        None => vec![
-            // Physical plan does not support logical expression Exists
-            ("tpcds_q10", None),
-            ("tpcds_q35", None),
-            // physical plan is not yet implemented for GROUPING aggregate function
-            ("tpcds_q27", None),
-            ("tpcds_q36", None),
-            ("tpcds_q70", None),
-            ("tpcds_q86", None),
-            // Error during planning: Correlated column is not allowed in predicate
-            ("tpcds_q41", None),
-            // Physical plan does not support logical expression InSubquery
-            ("tpcds_q45", None),
-        ],
+        Some(&_) => vec![],
     })
     .into_iter()
     .collect();
