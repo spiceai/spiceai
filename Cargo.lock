@@ -7339,7 +7339,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.11.1"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=85b5ffea967b76ee2a6cd10a65647747d446901f#85b5ffea967b76ee2a6cd10a65647747d446901f"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=bd7210a4873a74445cf0286ff87f207f41cd1ec0#bd7210a4873a74445cf0286ff87f207f41cd1ec0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
