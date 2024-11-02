@@ -28,6 +28,7 @@ use crate::tools::{
         sql::SqlTool,
         table_schema::TableSchemaTool,
     },
+    calendar::CalendarTool,
     SpiceModelTool,
 };
 
@@ -54,6 +55,10 @@ impl ToolFactory for BuiltinToolFactory {
         let description = component.description.clone();
 
         match id {
+            "calendar" => {
+                let calendar = CalendarTool::try_from(component)?;
+                Ok(Arc::new(calendar))
+            }
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(&name, description))),
             "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(&name, description))),
             "table_schema" => Ok(Arc::new(TableSchemaTool::new(&name, description))),

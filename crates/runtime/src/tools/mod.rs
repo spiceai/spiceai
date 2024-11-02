@@ -24,6 +24,7 @@ use std::sync::Arc;
 use crate::Runtime;
 
 pub mod builtin;
+pub mod calendar;
 pub mod factory;
 pub mod options;
 
