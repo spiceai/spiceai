@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
+use column::Column;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -62,9 +63,11 @@ pub struct Dataset {
 
     pub description: Option<String>,
 
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, Value>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<Column>,
 
     #[serde(default)]
     pub mode: Mode,
@@ -87,12 +90,10 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "embeddings", default)]
+    #[serde(rename = "embeddings", default, skip_serializing_if = "Vec::is_empty")]
     pub embeddings: Vec<ColumnEmbeddingConfig>,
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "dependsOn", default)]
+    #[serde(rename = "dependsOn", default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
 }
 
@@ -110,6 +111,7 @@ impl Dataset {
             name: name.into(),
             description: None,
             metadata: HashMap::default(),
+            columns: Vec::default(),
             mode: Mode::default(),
             params: None,
             has_metadata_table: None,
@@ -130,6 +132,7 @@ impl WithDependsOn<Dataset> for Dataset {
             name: self.name.clone(),
             description: self.description.clone(),
             metadata: self.metadata.clone(),
+            columns: self.columns.clone(),
             mode: self.mode.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,
@@ -364,5 +367,43 @@ pub mod replication {
     pub struct Replication {
         #[serde(default)]
         pub enabled: bool,
+    }
+}
+
+pub mod column {
+    #[cfg(feature = "schemars")]
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+
+    use crate::component::embeddings::EmbeddingChunkConfig;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    pub struct Column {
+        pub name: String,
+
+        /// Optional semantic details about the column
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+
+        pub embeddings: Vec<ColumnLevelEmbeddingConfig>,
+    }
+
+    /// Configuration for if and how a dataset's column should be embedded.
+    /// Different to [`crate::component::embeddings::ColumnEmbeddingConfig`],
+    /// as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],
+    /// not [`super::Dataset].
+    ///
+    /// [`crate::component::embeddings::ColumnEmbeddingConfig`] will be
+    /// deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].
+    ///
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    pub struct ColumnLevelEmbeddingConfig {
+        #[serde(rename = "from", default)]
+        pub model: String,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub chunking: Option<EmbeddingChunkConfig>,
     }
 }

@@ -165,6 +165,9 @@ pub struct EmbeddingChunkConfig {
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
+///
+/// Prefer to use [`super::dataset::column::ColumnLevelEmbeddingConfig`] going
+/// forward. Support for [`ColumnEmbeddingConfig`] will be removed in future.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ColumnEmbeddingConfig {
