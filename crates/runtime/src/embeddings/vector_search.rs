@@ -177,6 +177,10 @@ fn default_limit() -> usize {
 }
 
 impl SearchRequest {
+    /// Create new [`SearchRequest`].
+    ///
+    /// [`where_cond`] should already be sanitized. For raw WHERE conditions,
+    /// use [`TryFrom<SearchRequestJson>`].
     #[must_use]
     pub fn new(
         text: String,
