@@ -184,13 +184,13 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         ("tpcds_q5", include_str!("../queries/tpcds/q5.sql")),
         ("tpcds_q6", include_str!("../queries/tpcds/q6.sql")),
         ("tpcds_q7", include_str!("../queries/tpcds/q7.sql")),
-        // ("tpcds_q8", include_str!("../queries/tpcds/q8.sql")), // EXCEPT and INTERSECT aren't supported
+        ("tpcds_q8", include_str!("../queries/tpcds/q8.sql")),
         ("tpcds_q9", include_str!("../queries/tpcds/q9.sql")),
         ("tpcds_q10", include_str!("../queries/tpcds/q10.sql")),
         ("tpcds_q11", include_str!("../queries/tpcds/q11.sql")),
         ("tpcds_q12", include_str!("../queries/tpcds/q12.sql")),
         ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")),
-        // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), // EXCEPT and INTERSECT aren't supported
+        // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), // this query contains multiple queries, which aren't supported
         ("tpcds_q15", include_str!("../queries/tpcds/q15.sql")),
         ("tpcds_q16", include_str!("../queries/tpcds/q16.sql")),
         ("tpcds_q17", include_str!("../queries/tpcds/q17.sql")),
@@ -214,7 +214,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         ("tpcds_q35", include_str!("../queries/tpcds/q35.sql")),
         ("tpcds_q36", include_str!("../queries/tpcds/q36.sql")),
         ("tpcds_q37", include_str!("../queries/tpcds/q37.sql")),
-        // ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")), // EXCEPT and INTERSECT aren't supported
+        ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")),
         // ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")), // this query contains multiple queries, which aren't supported
         ("tpcds_q40", include_str!("../queries/tpcds/q40.sql")),
         ("tpcds_q41", include_str!("../queries/tpcds/q41.sql")),
@@ -227,7 +227,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         ("tpcds_q48", include_str!("../queries/tpcds/q48.sql")),
         ("tpcds_q49", include_str!("../queries/tpcds/q49.sql")),
         ("tpcds_q50", include_str!("../queries/tpcds/q50.sql")),
-        // ("tpcds_q51", include_str!("../queries/tpcds/q51.sql")), // MySQL does not support FULL JOIN
+        ("tpcds_q51", include_str!("../queries/tpcds/q51.sql")),
         ("tpcds_q52", include_str!("../queries/tpcds/q52.sql")),
         ("tpcds_q53", include_str!("../queries/tpcds/q53.sql")),
         ("tpcds_q54", include_str!("../queries/tpcds/q54.sql")),
@@ -263,7 +263,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         ("tpcds_q84", include_str!("../queries/tpcds/q84.sql")),
         ("tpcds_q85", include_str!("../queries/tpcds/q85.sql")),
         ("tpcds_q86", include_str!("../queries/tpcds/q86.sql")),
-        // ("tpcds_q87", include_str!("../queries/tpcds/q87.sql")), // EXCEPT and INTERSECT aren't supported
+        ("tpcds_q87", include_str!("../queries/tpcds/q87.sql")),
         ("tpcds_q88", include_str!("../queries/tpcds/q88.sql")),
         ("tpcds_q89", include_str!("../queries/tpcds/q89.sql")),
         ("tpcds_q90", include_str!("../queries/tpcds/q90.sql")),
@@ -309,8 +309,34 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
             ("tpcds_q77", None),
             ("tpcds_q80", None),
             ("tpcds_q86", None),
+            // EXCEPT and INTERSECT aren't supported
+            ("tpcds_q8", None),
+            ("tpcds_q14", None),
+            ("tpcds_q38", None),
+            ("tpcds_q87", None),
         ],
-        _ => vec![],
+        Some("duckdb") => vec![
+            // EXCEPT and INTERSECT aren't supported
+            ("tpcds_q8", None),
+            ("tpcds_q14", None),
+            ("tpcds_q38", None),
+            ("tpcds_q87", None),
+        ],
+        Some("arrow") | None => vec![
+            // Physical plan does not support logical expression Exists
+            ("tpcds_q10", None),
+            ("tpcds_q35", None),
+            // physical plan is not yet implemented for GROUPING aggregate function
+            ("tpcds_q27", None),
+            ("tpcds_q36", None),
+            ("tpcds_q70", None),
+            ("tpcds_q86", None),
+            // Error during planning: Correlated column is not allowed in predicate
+            ("tpcds_q41", None),
+            // Physical plan does not support logical expression InSubquery
+            ("tpcds_q45", None),
+        ],
+        Some(&_) => vec![],
     })
     .into_iter()
     .collect();
