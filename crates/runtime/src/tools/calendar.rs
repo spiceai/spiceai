@@ -43,8 +43,11 @@ pub struct CalendarTool {
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct CalendarToolParams {
-    /// TODO description for
-    user: String,
+    /// The email address of the user to retrieve calendar events from.
+    email: String,
+
+    /// The number of events to return.
+    limit: usize,
 }
 
 #[async_trait]
@@ -70,7 +73,7 @@ impl SpiceModelTool for CalendarTool {
 
         let req: CalendarToolParams = serde_json::from_str(arg)?;
 
-        let events = self.client.get_events_for(req.user).await?;
+        let events = self.client.get_events_for(req.email, req.limit).await?;
         let captured_output_json = serde_json::to_string(&events).boxed()?;
         tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
 

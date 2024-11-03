@@ -78,25 +78,24 @@ impl CalendarClient {
     pub async fn get_events_for(
         &self,
         user: String,
+        limit: usize,
     ) -> Result<Vec<Event>, Box<dyn std::error::Error + Send + Sync>> {
-        println!("User: {user}");
-        let req = self
+        let resp = self
             .client
             .user(user.clone())
             .events()
             .list_events()
-            .select(&["start", "end", "body", "subject"]);
+            .select(&["start", "end", "body", "subject"])
+            .order_by(&["lastModifiedDateTime DESC"])
+            .top(limit.to_string())
+            .send()
+            .await
+            .boxed()?
+            .json::<GrphResponse>()
+            .await
+            .boxed()?;
 
-        println!("User: {user}, url={:?}", req.url());
-
-        let resp = req.send().await.boxed()?;
-        let text = resp.text().await.unwrap();
-        println!("Resp: {text:?}",);
-
-        let parsed_resp = serde_json::from_str::<GrphResponse>(&text).boxed()?;
-        // let parsed_resp = resp.json::<GrphResponse>().await.boxed()?;
-
-        Ok(parsed_resp
+        Ok(resp
             .value
             .iter()
             .map(|j| Event {
