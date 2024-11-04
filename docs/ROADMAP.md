@@ -12,6 +12,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - Bugfixes and performance improvements
 - Data Accelerators: Arrow & DuckDB  (Release Candidate)
+- DuckDB data connector (Release Candidate)
 - S3 data connector (Release Candidate)
 - PostgreSQL data connector (Release Candidate)
 - MySQL data connector (Release Candidate)
@@ -29,13 +30,12 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## v1.0-rc.3 (Nov 2024)
 
 - Bugfixes and performance improvements
-- Data Accelerators: SQLite & PostgreSQL (Beta)
 - DuckDB data connector (Release Candidate)
 - Dremio data connector (Release Candidate)
 - MS SQL data connector (Beta)
 - File data connector (Beta)
 
-## v1.0-rc.4 (Nov 2024)
+## v1.0-rc.4 (Dec 2024)
 
 - Bugfixes and performance improvements
 - MS SQL data connector (Release Candidate)
