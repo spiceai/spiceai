@@ -97,9 +97,9 @@ GROUP BY
 LIMIT 100;
 ```
 
-| **Affected queries**     |                          |
-| ------------------------ | ------------------------ |
-| [q35.sql](tpcds/q35.sql) | |
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [q35.sql](tpcds/q35.sql) |     |
 
 ### DataFusion Supports Only Single SQL Statement per Query
 
@@ -134,7 +134,7 @@ fatal runtime error: stack overflow
 | [q30.sql](tpcds/q30.sql) | [q31.sql](tpcds/q31.sql) |
 | [q33.sql](tpcds/q33.sql) | [q34.sql](tpcds/q34.sql) |
 | [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
-| [q49.sql](tpcds/q49.sql) | |
+| [q49.sql](tpcds/q49.sql) |                          |
 
 ### PostgreSQL does not support using a column alias in a CASE statement
 
@@ -185,7 +185,7 @@ select
 
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
-| [q36.sql](tpcds/q36.sql)   | [q86.sql](tpcds/q86.sql) |
+| [q36.sql](tpcds/q36.sql) | [q86.sql](tpcds/q86.sql) |
 
 ## MySQL does not support FULL JOIN
 
@@ -230,7 +230,7 @@ Query Error Execution error: Unable to query arrow: Server error: `ERROR 42000 (
 
 ```sql
 SELECT
-  CASE 
+  CASE
     WHEN count(t1_id) / count(t2_id) IS NULL THEN 0
     ELSE count(t1_id) / count(t2_id)
 FROM t1, t2
@@ -244,9 +244,9 @@ MySQL does not return a syntax error when dividing by zero, instead returning `N
 Query Error Unable to convert record batch: Invalid argument error: Column 'am_pm_ratio' is declared as non-nullable but contains null values
 ```
 
-| **Affected queries**     |                          |
-| ------------------------ | ------------------------ |
-| [q90.sql](tpcds/q90.sql) | |
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [q90.sql](tpcds/q90.sql) |     |
 
 ### SQLite does not support `ROLLUP` and `GROUPING`
 
@@ -406,5 +406,24 @@ select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
 
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
-| [q49.sql](tpcds/q49.sql) | [q75.sql](tpcds/q75.sql)|
-| [q90.sql](tpcds/q90.sql) |  |
+| [q49.sql](tpcds/q49.sql) | [q75.sql](tpcds/q75.sql) |
+| [q90.sql](tpcds/q90.sql) |                          |
+
+### Datafusion Physical Plan does not support logical expression `Exists`, `InSubquery` / not yet implemented for `GROUPING` aggregate function
+
+**Limitation**: Datafusion Physical Plan does not support `Exists`, `InSubquery`, `GROUPING` aggregate function, there will be errors when running the following queries in s3 connector and in-memory arrow accelerator
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q10.sql](tpcds/q10.sql) | [q27.sql](tpcds/q27.sql) |
+| [q35.sql](tpcds/q35.sql) | [q36.sql](tpcds/q36.sql) |
+| [q45.sql](tpcds/q45.sql) | [q70.sql](tpcds/q70.sql) |
+| [q86.sql](tpcds/q86.sql) |                          |
+
+### Datafusion Error during planning: Correlated column is not allowed in predicate
+
+**Limitation**: Datafusion doesn't support planning for queries containing correlated columns in predicate, for example, predicate `item.i_manufact = outer_ref(i1.i_manufact)`, there will be errors when running the following queries in s3 connector and in-memory arrow accelerator
+
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [q41.sql](tpcds/q41.sql) |     |
