@@ -411,7 +411,7 @@ select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
 
 ### Datafusion Physical Plan does not support logical expression `Exists`, `InSubquery` / not yet implemented for `GROUPING` aggregate function
 
-**Limitation**: Datafusion Physical Plan does not support `Exists`, `InSubquery`, `GROUPING` aggregate function, there will be errors when running the following queries in connector and in-memory arrow accelerator
+**Limitation**: Datafusion Physical Plan does not support `Exists`, `InSubquery`, `GROUPING` aggregate function, there will be errors when running the following queries in s3 connector and in-memory arrow accelerator
 
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
@@ -422,7 +422,7 @@ select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
 
 ### Datafusion Error during planning: Correlated column is not allowed in predicate
 
-**Limitation**: Datafusion doesn't support planning for queries containing correlated columns in predicate, for example, predicate `item.i_manufact = outer_ref(i1.i_manufact)`, there will be errors when running the following queries in connector and in-memory arrow accelerator
+**Limitation**: Datafusion doesn't support planning for queries containing correlated columns in predicate, for example, predicate `item.i_manufact = outer_ref(i1.i_manufact)`, there will be errors when running the following queries in s3 connector and in-memory arrow accelerator
 
 | **Affected queries**     |     |
 | ------------------------ | --- |
