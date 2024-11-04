@@ -123,7 +123,7 @@ Currently supported data stores for local materialization/acceleration. More com
 | `duckdb`   | Embedded [DuckDB][duckdb]       | Beta   | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Beta   |                  |
 | `arrow`    | In-Memory Arrow Records         | Beta   | `memory`         |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded [SQLite][sqlite]       | Beta   | `memory`, `file` |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator
