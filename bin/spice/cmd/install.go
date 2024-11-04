@@ -70,7 +70,7 @@ spice install ai
 			}
 			installed = true
 		} else {
-			installed, err = runtime.EnsureInstalled(flavor)
+			installed, err = runtime.EnsureInstalled(flavor, true)
 			if err != nil {
 				slog.Error("verifying runtime install", "error", err)
 				os.Exit(1)

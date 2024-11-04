@@ -26,7 +26,7 @@ import (
 )
 
 // Ensures the runtime is installed. Returns true if the runtime was installed or upgraded, false if it was already installed.
-func EnsureInstalled(flavor string) (bool, error) {
+func EnsureInstalled(flavor string, autoUpgrade bool) (bool, error) {
 	if flavor != "ai" && flavor != "" {
 		return false, fmt.Errorf("invalid flavor: %s", flavor)
 	}
@@ -47,7 +47,7 @@ func EnsureInstalled(flavor string) (bool, error) {
 		upgradeVersion, err = rtcontext.IsRuntimeUpgradeAvailable()
 		if err != nil {
 			slog.Warn("error checking for runtime upgrade", "error", err)
-		} else if upgradeVersion != "" {
+		} else if upgradeVersion != "" && autoUpgrade {
 			shouldInstall = true
 		}
 	}
@@ -76,7 +76,7 @@ func Run(args []string) error {
 		os.Exit(1)
 	}
 
-	_, err = EnsureInstalled("")
+	_, err = EnsureInstalled("", false)
 	if err != nil {
 		return err
 	}

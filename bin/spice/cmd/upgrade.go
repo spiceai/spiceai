@@ -121,7 +121,7 @@ spice upgrade
 			flavor = "ai"
 		}
 
-		upgraded, err := runtime.EnsureInstalled(flavor)
+		upgraded, err := runtime.EnsureInstalled(flavor, true)
 		if err != nil {
 			slog.Error("upgrading the spice runtime", "error", err)
 			return
