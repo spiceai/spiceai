@@ -21,6 +21,11 @@ use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
+use datafusion::sql::sqlparser::ast::Expr;
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::Token;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use futures::TryStreamExt;
@@ -47,15 +52,15 @@ pub enum Error {
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
-    #[snafu(display("Error occurred interacting with datafusion: {}", source))]
+    #[snafu(display("Error occurred interacting with datafusion: {source}"))]
     DataFusionError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Error occurred processing Arrow records: {}", source))]
+    #[snafu(display("Error occurred processing Arrow records: {source}"))]
     RecordProcessingError { source: ArrowError },
 
-    #[snafu(display("Could not format search results: {}", source))]
+    #[snafu(display("Could not format search results: {source}"))]
     FormattingError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -69,13 +74,16 @@ pub enum Error {
         num_embeddings: usize,
     },
 
-    #[snafu(display("Embedding model {} not found", model_name))]
+    #[snafu(display("Embedding model {model_name} not found"))]
     EmbeddingModelNotFound { model_name: String },
 
-    #[snafu(display("Error embedding input text: {}", source))]
+    #[snafu(display("Error embedding input text: {source}"))]
     EmbeddingError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Invalid WHERE condition: {where_cond}"))]
+    InvalidWhereCondition { where_cond: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -108,20 +116,19 @@ static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-#[allow(clippy::doc_markdown)]
-pub struct SearchRequest {
+pub struct SearchRequestJson {
     /// The text to search documents for similarity
     pub text: String,
 
-    /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
+    /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.
     #[serde(default)]
     pub datasets: Option<Vec<String>>,
 
     /// Number of documents to return for each dataset
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    #[serde(default)]
+    pub limit: Option<usize>,
 
-    /// An SQL filter predicate to apply. Format: 'WHERE <where_cond>'.
+    /// An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.
     #[serde(rename = "where", default)]
     pub where_cond: Option<String>,
 
@@ -130,17 +137,56 @@ pub struct SearchRequest {
     pub additional_columns: Vec<String>,
 }
 
+impl TryFrom<SearchRequestJson> for SearchRequest {
+    type Error = String;
+
+    fn try_from(req: SearchRequestJson) -> Result<Self, Self::Error> {
+        Ok(SearchRequest::new(
+            req.text,
+            req.datasets,
+            req.limit.unwrap_or(default_limit()),
+            req.where_cond
+                .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
+                .transpose()?,
+            req.additional_columns,
+        ))
+    }
+}
+
+#[allow(clippy::doc_markdown)]
+pub struct SearchRequest {
+    /// The text to search documents for similarity
+    pub text: String,
+
+    /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
+    pub datasets: Option<Vec<String>>,
+
+    /// Number of documents to return for each dataset
+    pub limit: usize,
+
+    /// An SQL filter predicate to apply. Format: 'WHERE <where_cond>'.
+    pub where_cond: Option<Expr>,
+
+    /// Additional columns to return from the dataset.
+    pub additional_columns: Vec<String>,
+}
+
+#[must_use]
 fn default_limit() -> usize {
     3
 }
 
 impl SearchRequest {
+    /// Create new [`SearchRequest`].
+    ///
+    /// [`where_cond`] should already be sanitized. For raw WHERE conditions,
+    /// use [`TryFrom<SearchRequestJson>`].
     #[must_use]
     pub fn new(
         text: String,
         datasets: Option<Vec<String>>,
         limit: usize,
-        where_cond: Option<String>,
+        where_cond: Option<Expr>,
         additional_columns: Vec<String>,
     ) -> Self {
         SearchRequest {
@@ -150,6 +196,35 @@ impl SearchRequest {
             where_cond,
             additional_columns,
         }
+    }
+
+    pub fn parse_where_cond(where_cond: String) -> Result<Expr> {
+        let parser = Parser::new(&GenericDialect);
+        let mut parser = parser.try_with_sql(&where_cond).map_err(|_| {
+            InvalidWhereConditionSnafu {
+                where_cond: where_cond.clone(),
+            }
+            .build()
+        })?;
+
+        // Parse the WHERE keyword if its there, otherwise ignore it.
+        let _ = parser.parse_keyword(Keyword::WHERE);
+
+        // Parse the expression after the WHERE keyword.
+        let expr = parser.parse_expr().map_err(|_| {
+            InvalidWhereConditionSnafu {
+                where_cond: where_cond.clone(),
+            }
+            .build()
+        })?;
+
+        // Ensure the WHERE clause is the last token.
+        let next_token = parser.next_token();
+        if next_token != Token::EOF {
+            return Err(InvalidWhereConditionSnafu { where_cond }.build());
+        }
+
+        Ok(expr)
     }
 }
 
@@ -354,7 +429,7 @@ impl VectorSearch {
         embedding_column: &str,
         is_chunked: bool,
         additional_columns: &[String],
-        where_cond: Option<&str>,
+        where_cond: Option<&Expr>,
         n: usize,
     ) -> Result<VectorSearchTableResult> {
         let projection: Vec<String> = primary_keys
@@ -551,7 +626,7 @@ impl VectorSearch {
                                 embedding_column,
                                 embedding_table.is_chunked(embedding_column),
                                 additional_columns,
-                                where_cond.as_deref(),
+                                where_cond.as_ref(),
                                 *limit,
                             )
                             .await?;
@@ -786,14 +861,136 @@ pub async fn parse_explicit_primary_keys(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::*;
+    use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr};
     use schemars::schema_for;
     use snafu::ResultExt;
 
-    use crate::embeddings::vector_search::SearchRequest;
-
     #[tokio::test]
     async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serde_json::to_value(schema_for!(SearchRequest)).boxed()?;
+        serde_json::to_value(schema_for!(SearchRequestJson)).boxed()?;
         Ok(())
+    }
+
+    #[test]
+    fn test_valid_where_conditions() {
+        // Test basic comparison
+        let result = SearchRequest::parse_where_cond("column = 'value'".to_string());
+        assert!(result.is_ok());
+
+        // Test with WHERE keyword
+        let result = SearchRequest::parse_where_cond("WHERE column = 'value'".to_string());
+        assert!(result.is_ok());
+
+        // Test numeric comparison
+        let result = SearchRequest::parse_where_cond("age > 18".to_string());
+        assert!(result.is_ok());
+
+        // Test boolean condition
+        let result = SearchRequest::parse_where_cond("is_active = true".to_string());
+        assert!(result.is_ok());
+
+        // Test AND condition
+        let result = SearchRequest::parse_where_cond("age > 18 AND is_active = true".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_malformed_conditions() {
+        // Test semicolon injection
+        let result =
+            SearchRequest::parse_where_cond("column = 'value'; DROP TABLE users;".to_string());
+        assert!(result.is_err(), "{}", result.expect("!"));
+
+        // Test UNION injection
+        let result = SearchRequest::parse_where_cond(
+            "column = 'value' UNION SELECT * FROM users".to_string(),
+        );
+        assert!(result.is_err());
+
+        // Test multiple statements
+        let result =
+            SearchRequest::parse_where_cond("column = 'value'; SELECT * FROM users".to_string());
+        assert!(result.is_err());
+
+        // Test stacked queries
+        let result = SearchRequest::parse_where_cond(
+            "column = 'value'); SELECT * FROM users; --".to_string(),
+        );
+        assert!(result.is_err());
+
+        // Test incomplete expression
+        let result = SearchRequest::parse_where_cond("column =".to_string());
+        assert!(result.is_err());
+
+        // Test invalid operator
+        let result = SearchRequest::parse_where_cond("column === value".to_string());
+        assert!(result.is_err());
+
+        // Test unclosed string
+        let result = SearchRequest::parse_where_cond("column = 'value".to_string());
+        assert!(result.is_err());
+
+        // Test invalid column name
+        let result = SearchRequest::parse_where_cond("'column' = 'value'".to_string());
+        assert!(result.is_ok()); // Note: This is actually valid SQL syntax
+
+        // Test empty condition
+        let result = SearchRequest::parse_where_cond(String::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_complex_valid_conditions() {
+        // Test nested AND/OR
+        let result = SearchRequest::parse_where_cond(
+            "age > 18 AND (is_active = true OR role = 'admin')".to_string(),
+        );
+        assert!(result.is_ok());
+
+        // Test IN clause
+        let result = SearchRequest::parse_where_cond("status IN ('active', 'pending')".to_string());
+        assert!(result.is_ok());
+
+        // Test BETWEEN
+        let result = SearchRequest::parse_where_cond("age BETWEEN 18 AND 65".to_string());
+        assert!(result.is_ok());
+
+        // Test IS NULL
+        let result = SearchRequest::parse_where_cond("last_login IS NULL".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_expression_structure() {
+        // Test basic equality expression structure
+        let result = SearchRequest::parse_where_cond("column = 'value'".to_string())
+            .expect("Should parse successfully");
+
+        if let Expr::BinaryOp {
+            left: _,
+            op,
+            right: _,
+        } = result
+        {
+            assert_eq!(op, BinaryOperator::Eq);
+        } else {
+            panic!("Expected BinaryOp expression");
+        }
+
+        // Test AND expression structure
+        let result = SearchRequest::parse_where_cond("col1 = 'val1' AND col2 = 'val2'".to_string())
+            .expect("Should parse successfully");
+
+        if let Expr::BinaryOp {
+            left: _,
+            op,
+            right: _,
+        } = result
+        {
+            assert_eq!(op, BinaryOperator::And);
+        } else {
+            panic!("Expected BinaryOp expression");
+        }
     }
 }

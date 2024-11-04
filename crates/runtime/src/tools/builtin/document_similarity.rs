@@ -21,7 +21,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     embeddings::vector_search::{
-        parse_explicit_primary_keys, to_matches, SearchRequest, VectorSearch,
+        parse_explicit_primary_keys, to_matches, SearchRequest, SearchRequestJson, VectorSearch,
     },
     tools::{parameters, SpiceModelTool},
     Runtime,
@@ -72,7 +72,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        parameters::<SearchRequest>()
+        parameters::<SearchRequestJson>()
     }
 
     async fn call(
@@ -83,7 +83,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name(), input = arg);
 
         let tool_use_result = async {
-            let mut req: SearchRequest = serde_json::from_str(arg)?;
+            let req: SearchRequestJson = serde_json::from_str(arg)?;
 
             let vs = VectorSearch::new(
                 rt.datafusion(),
@@ -91,14 +91,9 @@ impl SpiceModelTool for DocumentSimilarityTool {
                 parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
             );
 
-            // If model provides a `where` keyword in their [`where_cond`] field, strip it.
-            if let Some(cond) = &req.where_cond {
-                if cond.to_lowercase().starts_with("where ") {
-                    req.where_cond = Some(cond[5..].to_string());
-                }
-            }
+            let search_request = SearchRequest::try_from(req)?;
 
-            let result = vs.search(&req).await.boxed()?;
+            let result = vs.search(&search_request).await.boxed()?;
 
             let matches = to_matches(&result).boxed()?;
             serde_json::value::to_value(matches).boxed()

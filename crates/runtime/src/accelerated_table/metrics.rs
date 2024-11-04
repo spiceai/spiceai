@@ -53,3 +53,10 @@ pub(crate) static APPEND_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|
         .with_unit("ms")
         .init()
 });
+
+pub(crate) static READY_STATE_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("accelerated_ready_state_federated_fallback")
+        .with_description("Number of times the federated table was queried due to the accelerated table loading the initial data.")
+        .init()
+});
