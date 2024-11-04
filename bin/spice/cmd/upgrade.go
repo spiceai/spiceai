@@ -28,6 +28,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
+	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
@@ -47,10 +48,15 @@ spice upgrade
 		}
 
 		rtcontext := context.NewContext()
+		err = rtcontext.Init()
+		if err != nil {
+			slog.Error("initializing runtime context", "error", err)
+			os.Exit(1)
+		}
 		cliVersion := version.Version()
 
 		if cliVersion == release.TagName {
-			slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.\n", release.TagName))
+			slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
 			return
 		}
 
@@ -108,7 +114,22 @@ spice upgrade
 			return
 		}
 
-		slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.\n", release.TagName))
+		slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
+
+		flavor := ""
+		if rtcontext.ModelsFlavorInstalled() {
+			flavor = "ai"
+		}
+
+		upgraded, err := runtime.EnsureInstalled(flavor, true)
+		if err != nil {
+			slog.Error("upgrading the spice runtime", "error", err)
+			return
+		}
+
+		if upgraded {
+			slog.Info(fmt.Sprintf("Spice runtime upgraded to %s successfully.", release.TagName))
+		}
 	},
 }
 

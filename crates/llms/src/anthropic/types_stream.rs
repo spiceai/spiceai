@@ -25,7 +25,8 @@ use async_openai::{
 use futures::{future, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, time::SystemTime};
+use std::{collections::HashMap, fmt, pin::Pin, sync::Arc, time::SystemTime};
+use tokio::sync::Mutex;
 
 use super::types::{MessageRole, StopReason, Usage};
 
@@ -84,21 +85,23 @@ impl ContentBlock {
                 refusal: None,
                 role: None,
             },
-            ContentBlock::ToolUse(tool_use) => ChatCompletionStreamResponseDelta {
-                content: None,
-                function_call: None,
-                tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
-                    index: 0,
-                    id: Some(tool_use.id),
-                    r#type: Some(ChatCompletionToolType::Function),
-                    function: Some(FunctionCallStream {
-                        name: Some(tool_use.name),
-                        arguments: None,
-                    }),
-                }]),
-                refusal: None,
-                role: None,
-            },
+            ContentBlock::ToolUse(ContentBlockToolUse { id, name, .. }) => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                        index: 0,
+                        id: Some(id),
+                        r#type: Some(ChatCompletionToolType::Function),
+                        function: Some(FunctionCallStream {
+                            name: Some(name),
+                            arguments: None,
+                        }),
+                    }]),
+                    refusal: None,
+                    role: None,
+                }
+            }
         }
     }
 }
@@ -123,7 +126,7 @@ impl Delta {
     pub fn into_completion(
         self,
         role: &Option<MessageRole>,
-        tool_content: Option<(i32, ContentBlockToolUse)>,
+        tool_content: Option<&ContentBlockToolUse>,
     ) -> ChatCompletionStreamResponseDelta {
         match (self, tool_content) {
             (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta {
@@ -139,16 +142,16 @@ impl Delta {
             },
             (
                 Delta::InputJsonDelta { partial_json },
-                Some((index, ContentBlockToolUse { id, name, .. })),
+                Some(ContentBlockToolUse { id, name, .. }),
             ) => ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
-                    index,
-                    id: Some(id),
+                    index: 0,
+                    id: Some(id.clone()),
                     r#type: Some(ChatCompletionToolType::Function),
                     function: Some(FunctionCallStream {
-                        name: Some(name),
+                        name: Some(name.clone()),
                         arguments: Some(partial_json),
                     }),
                 }]),
@@ -257,7 +260,7 @@ pub fn transform_stream(
     //
     // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
     // Map `.index` to `.content_block`
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct StreamState {
         id: Option<String>,
         role: Option<MessageRole>,
@@ -266,13 +269,7 @@ pub fn transform_stream(
         tool_id_to_tool_delta_idx: HashMap<u32, i32>,
     }
 
-    let initial_state = StreamState {
-        id: None,
-        role: None,
-        usage: None,
-        tool_id_to_content_block: HashMap::new(),
-        tool_id_to_tool_delta_idx: HashMap::new(),
-    };
+    let state = Arc::new(Mutex::new(StreamState::default()));
 
     let transformed_stream = stream
         // Must filter out unneeded messages early to avoid the below [`Stream::scan`] returning early
@@ -284,10 +281,13 @@ pub fn transform_stream(
                     | MessageCreateStreamResponse::MessageStop)
             ))
         })
-        .scan(initial_state, move |state, item| {
-            let mut state = state.clone();
+        .then(move |item| {
+            let inner_state = Arc::clone(&state);
             let model = model.clone();
+
             async move {
+                let mut state = inner_state.lock().await;
+
                 match item {
                     Ok(MessageCreateStreamResponse::MessageStart {
                         message:
@@ -305,13 +305,12 @@ pub fn transform_stream(
                             completion_tokens: inner_usage.output_tokens,
                             total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
                         });
-                        let response = create_stream_response(
+                        create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &model,
                             None,
                             None,
-                        );
-                        Some(response)
+                        )
                     }
                     Ok(MessageCreateStreamResponse::ContentBlockStart {
                         index,
@@ -321,7 +320,7 @@ pub fn transform_stream(
                             state.tool_id_to_content_block.insert(index, t.clone());
                             state.tool_id_to_tool_delta_idx.insert(index, 0);
                         };
-                        let response = create_stream_response(
+                        create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &model,
                             None,
@@ -331,14 +330,13 @@ pub fn transform_stream(
                                 finish_reason: None,
                                 logprobs: None,
                             }),
-                        );
-                        Some(response)
+                        )
                     }
                     Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
                         let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
                         state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
-                        let response = create_stream_response(
+                        create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &model,
                             None,
@@ -348,14 +346,10 @@ pub fn transform_stream(
                                 finish_reason: None,
                                 delta: delta.into_completion(
                                     &state.role,
-                                    state
-                                        .tool_id_to_content_block
-                                        .get(&index)
-                                        .map(|b| (tool_idx, b.clone())),
+                                    state.tool_id_to_content_block.get(&index),
                                 ),
                             }),
-                        );
-                        Some(response)
+                        )
                     }
                     Ok(MessageCreateStreamResponse::MessageDelta {
                         delta: MessageDelta { stop_reason, .. },
@@ -367,7 +361,7 @@ pub fn transform_stream(
                             u.completion_tokens += inner_usage.output_tokens;
                             u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
                         }
-                        let response = create_stream_response(
+                        create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &model,
                             state.usage.clone(),
@@ -390,8 +384,7 @@ pub fn transform_stream(
                                     refusal: None,
                                 },
                             }),
-                        );
-                        Some(response)
+                        )
                     }
                     Ok(
                         MessageCreateStreamResponse::Ping
@@ -400,12 +393,12 @@ pub fn transform_stream(
                     ) => unreachable!("Filtered out"),
                     Err(e) => {
                         tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(OpenAIError::ApiError(ApiError {
+                        Err(OpenAIError::ApiError(ApiError {
                             message: e.to_string(),
                             r#type: Some("AnthropicStreamError".to_string()),
                             param: None,
                             code: None,
-                        })))
+                        }))
                     }
                 }
             }

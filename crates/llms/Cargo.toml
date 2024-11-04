@@ -29,6 +29,7 @@ secrecy.workspace = true
 tokenizers = { version = "0.20.0" }
 tracing.workspace = true
 tracing-futures.workspace = true
+regex = "1.10.4"
 
 ## For Chunking
 text-splitter = { version =  "0.18.1", features = ["markdown", "tokenizers", "tiktoken-rs"]}

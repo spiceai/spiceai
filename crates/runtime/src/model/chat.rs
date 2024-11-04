@@ -26,14 +26,13 @@ use futures::stream::StreamExt;
 use futures::Stream;
 use llms::openai::DEFAULT_LLM_MODEL;
 use llms::{
-    anthropic::{Anthropic, AnthropicConfig, AnthropicModelVariant, DEFAULT_ANTHROPIC_MODEL},
+    anthropic::{Anthropic, AnthropicConfig},
     chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult},
 };
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, sync::Arc};
 use tracing_futures::Instrument;
 
 use super::tool_use::ToolUsingChat;
@@ -173,16 +172,14 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 .with_auth_token(auth_token)
                 .with_base_url(api_base);
 
-            let model_id = AnthropicModelVariant::from_str(
-                &model_id
-                    .clone()
-                    .unwrap_or(DEFAULT_ANTHROPIC_MODEL.to_string()),
-            )
-            .map_err(|_| LlmError::FailedToLoadModel {
-                source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
-            })?;
+            let anthropic =
+                Anthropic::new(cfg, model_id.as_deref(), &component.name).map_err(|_| {
+                    LlmError::FailedToLoadModel {
+                        source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+                    }
+                })?;
 
-            Ok(Box::new(Anthropic::new(cfg, model_id, &component.name)) as Box<dyn Chat>)
+            Ok(Box::new(anthropic) as Box<dyn Chat>)
         }
         ModelSource::OpenAi => {
             let api_base = extract_secret!(params, "endpoint");

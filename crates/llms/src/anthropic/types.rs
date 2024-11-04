@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use async_openai::{error::OpenAIError, types::ChatCompletionTool};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{fmt::Display, str::FromStr};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageCreateParams {
@@ -296,83 +296,44 @@ pub struct MetadataParam {
     pub user_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum AnthropicModelVariant {
-    Claude35Sonnet20240620,
-    Claude3Opus20240229,
-    Claude3Sonnet20240229,
-    Claude3Haiku20240307,
-    Claude21,
-    Claude20,
-    ClaudeInstant12,
+// Combined pattern that matches all three formats:
+// 1. Anthropic API: claude-3-5-sonnet-20241022 or claude-3-5-sonnet-latest
+// 2. AWS Bedrock: anthropic.claude-3-5-sonnet-20241022-v2:0
+// 3. GCP Vertex AI: claude-3-5-sonnet-v2@20241022
+pub(crate) static ANTHROPIC_REGEX: &str = r"(?x) # Enable verbose mode
+    (?:anthropic\.)?                              # Optional 'anthropic.' prefix for AWS
+    claude-                                       # Required 'claude-' prefix
+    (?:instant-)?                                 # Optional 'instant-' for legacy
+    (?:\d+(?:\.\d+)?)-?                           # Version number (e.g., 3 or 3.5)
+    (?:opus|sonnet|haiku)?                        # Optional model type
+    (?:
+        -(?:latest|\d{8})                         # Anthropic format: -latest or -YYYYMMDD
+        |
+        -\d{8}-v\d+:\d+                           # AWS format: -YYYYMMDD-v2:0
+        |
+        -v\d+@\d{8}                               # GCP format: -v2@YYYYMMDD
+        |
+        @\d{8}                                    # Alternative GCP format: @YYYYMMDD
+    )?";
+pub type AnthropicModelVariant = String;
+
+pub(crate) fn validate_model_variant(model: &str) -> Result<AnthropicModelVariant, OpenAIError> {
+    Regex::new(ANTHROPIC_REGEX)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Regex error: {e}")))?
+        .find(model)
+        .ok_or(OpenAIError::InvalidArgument(format!(
+            "Invalid model variant: {model}"
+        )))?;
+    Ok(model.to_string())
 }
 
-impl std::str::FromStr for AnthropicModelVariant {
-    type Err = OpenAIError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "claude-3-5-sonnet-20240620" => Ok(AnthropicModelVariant::Claude35Sonnet20240620),
-            "claude-3-opus-20240229" => Ok(AnthropicModelVariant::Claude3Opus20240229),
-            "claude-3-sonnet-20240229" => Ok(AnthropicModelVariant::Claude3Sonnet20240229),
-            "claude-3-haiku-20240307" => Ok(AnthropicModelVariant::Claude3Haiku20240307),
-            "claude-2.1" => Ok(AnthropicModelVariant::Claude21),
-            "claude-2.0" => Ok(AnthropicModelVariant::Claude20),
-            "claude-instant-1.2" => Ok(AnthropicModelVariant::ClaudeInstant12),
-            _ => Err(OpenAIError::InvalidArgument(format!(
-                "Unknown model variant: {s}"
-            ))),
-        }
-    }
-}
-
-impl Display for AnthropicModelVariant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let z = match self {
-            AnthropicModelVariant::Claude35Sonnet20240620 => "claude-3-5-sonnet-20240620",
-            AnthropicModelVariant::Claude3Opus20240229 => "claude-3-opus-20240229",
-            AnthropicModelVariant::Claude3Sonnet20240229 => "claude-3-sonnet-20240229",
-            AnthropicModelVariant::Claude3Haiku20240307 => "claude-3-haiku-20240307",
-            AnthropicModelVariant::Claude21 => "claude-2.1",
-            AnthropicModelVariant::Claude20 => "claude-2.0",
-            AnthropicModelVariant::ClaudeInstant12 => "claude-instant-1.2",
-        };
-        write!(f, "{z}")
-    }
-}
-
-impl Serialize for AnthropicModelVariant {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-// Custom Deserialize implementation to use from_str() for deserialization
-impl<'de> Deserialize<'de> for AnthropicModelVariant {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        AnthropicModelVariant::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-impl AnthropicModelVariant {
-    #[must_use]
-    pub fn default_max_tokens(&self) -> u32 {
-        match self {
-            AnthropicModelVariant::Claude35Sonnet20240620
-            | AnthropicModelVariant::Claude3Opus20240229 => 8192,
-            AnthropicModelVariant::Claude3Sonnet20240229
-            | AnthropicModelVariant::Claude3Haiku20240307
-            | AnthropicModelVariant::Claude21
-            | AnthropicModelVariant::Claude20
-            | AnthropicModelVariant::ClaudeInstant12 => 4096,
-        }
+/// Max tokens, limited by the model variant
+/// Based on: `<https://docs.anthropic.com/en/docs/about-claude/models#model-comparison-table>`
+pub fn default_max_tokens(model: &AnthropicModelVariant) -> u32 {
+    if model.as_str().contains("claude-3-5-sonnet") {
+        8192
+    } else {
+        4096
     }
 }
 

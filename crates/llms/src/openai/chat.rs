@@ -54,8 +54,6 @@ impl Chat for Openai {
         Ok(Box::pin(stream))
     }
 
-    /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
-    /// implementation will be constructed based on the trait's [`run`] method.
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,

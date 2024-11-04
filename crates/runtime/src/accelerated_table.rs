@@ -42,6 +42,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
+use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
@@ -679,6 +680,10 @@ impl TableProvider for AcceleratedTable {
                     // Getting the federated_provider should always return immediately here, because by definition an accelerated table has
                     // completed its initial load if it has a previous checkpoint.
                     let federated_provider = self.federated.table_provider().await;
+                    metrics::READY_STATE_FALLBACK.add(
+                        1,
+                        &[KeyValue::new("dataset_name", self.dataset_name.to_string())],
+                    );
                     return federated_provider
                         .scan(state, projection, filters, limit)
                         .await;

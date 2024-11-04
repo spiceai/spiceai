@@ -246,12 +246,7 @@ impl ToolUsingChat {
             };
 
             // Append spiced runtime tools to the request.
-            let mut inner_req = req.clone();
-            let mut runtime_tools = self.runtime_tools();
-            if !runtime_tools.is_empty() {
-                runtime_tools.extend(inner_req.tools.unwrap_or_default());
-                inner_req.tools = Some(runtime_tools);
-            };
+            let inner_req = self.add_runtime_tools(&req);
 
             let resp = self.inner_chat.chat_request(inner_req).await?;
             let usage = resp.usage.clone();
@@ -286,6 +281,22 @@ impl ToolUsingChat {
         .await
     }
 
+    /// Add the spice runtime tools to a list of tools (may contain external tools too), and ensure no duplicates.
+    fn add_runtime_tools(&self, req: &CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+        let mut runtime_tools = self.runtime_tools();
+        if runtime_tools.is_empty() {
+            req.clone()
+        } else {
+            runtime_tools.extend(req.tools.clone().unwrap_or_default());
+            // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
+            runtime_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+            runtime_tools.dedup_by(|a, b| a.function.name == b.function.name);
+            let mut req = req.clone();
+            req.tools = Some(runtime_tools);
+            req
+        }
+    }
+
     async fn _chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -307,17 +318,8 @@ impl ToolUsingChat {
         };
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
-        let mut runtime_tools = self.runtime_tools();
-        let req = if runtime_tools.is_empty() {
-            req
-        } else {
-            runtime_tools.extend(req.tools.clone().unwrap_or_default());
-            let mut req = req.clone();
-            req.tools = Some(runtime_tools);
-            req
-        };
-
-        let s = self.inner_chat.chat_stream(req.clone()).await?;
+        let updated_req = self.add_runtime_tools(&req);
+        let s = self.inner_chat.chat_stream(updated_req.clone()).await?;
 
         Ok(make_a_stream(
             Span::current(),
@@ -476,7 +478,8 @@ fn make_a_stream(
                                 state.function.arguments.push_str(arguments);
                             }
                         }
-                    } else if chat_choice.delta.content.is_some() {
+                    }
+                    if chat_choice.delta.content.is_some() {
                         finished_choices.push(chat_choice.clone());
                     }
 
