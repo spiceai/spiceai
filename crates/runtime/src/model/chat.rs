@@ -113,7 +113,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 .clone()
                 .or(component.find_any_file_path(ModelFileType::Weights));
 
-            let hf_token = extract_secret!(params, "hf_token");
+            let hf_token = params.get("hf_token");
 
             match model_id {
                 Some(id) => {

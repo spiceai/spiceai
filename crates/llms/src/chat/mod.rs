@@ -21,6 +21,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use nsql::SqlGeneration;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use secrecy::Secret;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{path::Path, pin::Pin};
@@ -560,36 +561,21 @@ pub trait Chat: Sync + Send {
 pub fn create_hf_model(
     model_id: &str,
     model_type: Option<String>,
-    model_weights: &Option<String>,
+    _model_weights: &Option<String>,
     _tokenizer: &Option<String>,
     _tokenizer_config: &Option<String>,
-    hf_token_literal: Option<String>,
+    hf_token_literal: Option<&Secret<String>>,
 ) -> Result<Box<dyn Chat>> {
-    if model_type.is_none() && model_weights.is_none() {
-        return Err(Error::FailedToLoadModel {
-            source: format!("For {model_id} either model type or model weights is required").into(),
-        });
-    };
-
-    #[cfg(feature = "mistralrs")]
-    {
-        mistral::MistralLlama::from_hf(
-            model_id,
-            &model_type.unwrap_or_default(),
-            hf_token_literal,
-            // TODO: Support HF models with non-standard paths.
-            // model_weights,
-            // tokenizer,
-            // tokenizer_config,
-        )
-        .map(|x| Box::new(x) as Box<dyn Chat>)
-    }
-    #[cfg(not(feature = "mistralrs"))]
-    {
-        Err(Error::FailedToRunModel {
-            source: "No Chat model feature enabled".into(),
-        })
-    }
+    mistral::MistralLlama::from_hf(
+        model_id,
+        model_type.as_deref(),
+        hf_token_literal,
+        // TODO: Support HF models with non-standard paths.
+        // model_weights,
+        // tokenizer,
+        // tokenizer_config,
+    )
+    .map(|x| Box::new(x) as Box<dyn Chat>)
 }
 
 #[allow(unused_variables)]
