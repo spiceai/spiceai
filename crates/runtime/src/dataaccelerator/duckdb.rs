@@ -38,7 +38,7 @@ use crate::{
     spice_data_base_path, Runtime,
 };
 
-use super::{DataAccelerator, Error as DataAcceleratorError};
+use super::DataAccelerator;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -89,27 +89,24 @@ impl DuckDBAccelerator {
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
-    pub fn duckdb_file_path(&self, dataset: &Dataset) -> Result<String> {
+    #[must_use]
+    pub fn duckdb_file_path(&self, dataset: &Dataset) -> Option<String> {
         if !dataset.is_file_accelerated() {
-            Err(Error::InvalidConfiguration {
-                detail: Arc::from("Dataset is not file accelerated"),
-            })
-        } else if let Some(acceleration) = dataset.acceleration.as_ref() {
-            let mut params = acceleration.params.clone();
-            params.insert("data_directory".to_string(), spice_data_base_path());
-
-            if let Some(duckdb_file) = params.remove("duckdb_file") {
-                params.insert("duckdb_open".to_string(), duckdb_file.to_string());
-            }
-
-            self.duckdb_factory
-                .duckdb_file_path("accelerated_duckdb", &mut params)
-                .map_err(|err| Error::InvalidConfiguration {
-                    detail: Arc::from(err.to_string()),
-                })
-        } else {
-            unreachable!("Expected dataset to have acceleration parameters, but none were found")
+            return None;
         }
+        let acceleration = dataset.acceleration.as_ref()?;
+
+        let mut params = acceleration.params.clone();
+        params.insert("data_directory".to_string(), spice_data_base_path());
+
+        if let Some(duckdb_file) = params.remove("duckdb_file") {
+            params.insert("duckdb_open".to_string(), duckdb_file.to_string());
+        }
+
+        Some(
+            self.duckdb_factory
+                .duckdb_file_path("accelerated_duckdb", &mut params),
+        )
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
@@ -123,22 +120,29 @@ impl DuckDBAccelerator {
                 dataset: dataset.name.to_string(),
             })?;
 
-        let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => self
+        let pool = match (acceleration.mode, duckdb_file) {
+            (Mode::File, Some(duckdb_file)) => self
                 .duckdb_factory
                 .get_or_init_file_instance(duckdb_file)
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?,
-            (_, Mode::Memory) => self
+            (Mode::Memory, None) => self
                 .duckdb_factory
                 .get_or_init_memory_instance()
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?,
-            (Err(e), Mode::File) => {
+            (Mode::File, None) => {
                 return Err(Error::InvalidConfiguration {
-                    detail: Arc::from(e.to_string()),
+                    detail: Arc::from("duckdb_file parameter is required for file acceleration"),
+                })
+            }
+            (Mode::Memory, Some(_)) => {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "memory acceleration mode does not accept a duckdb_file parameter",
+                    ),
                 })
             }
         };
@@ -172,9 +176,8 @@ impl DataAccelerator for DuckDBAccelerator {
         vec!["db", "ddb", "duckdb"]
     }
 
-    fn file_path(&self, dataset: &Dataset) -> Result<String, DataAcceleratorError> {
+    fn file_path(&self, dataset: &Dataset) -> Option<String> {
         self.duckdb_file_path(dataset)
-            .map_err(|e| DataAcceleratorError::InvalidConfiguration { msg: e.to_string() })
     }
 
     fn is_initialized(&self, dataset: &Dataset) -> bool {
@@ -194,19 +197,19 @@ impl DataAccelerator for DuckDBAccelerator {
             return Ok(());
         }
 
-        let path = self.file_path(dataset)?;
+        let path = self.file_path(dataset);
 
-        if let Some(acceleration) = &dataset.acceleration {
+        if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
             } else if !self.is_valid_file(dataset) {
-                if std::path::Path::new(&path).is_dir() {
+                if std::path::Path::new(path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
 
-                let extension = std::path::Path::new(&path)
+                let extension = std::path::Path::new(path)
                     .extension()
                     .and_then(OsStr::to_str)
                     .unwrap_or("");
@@ -237,40 +240,44 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
-            if this_dataset.is_file_accelerated() {
-                // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
-                // then use the shared DuckDB file `accelerated_duckdb.db`
-                if !cmd.options.contains_key("open") {
-                    let duckdb_file = self.duckdb_file_path(this_dataset)?;
+            // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
+            // then use the shared DuckDB file `accelerated_duckdb.db`
+            if !cmd.options.contains_key("open") && this_dataset.is_file_accelerated() {
+                let duckdb_file = self.duckdb_file_path(this_dataset);
+                if let Some(duckdb_file) = duckdb_file {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
+            }
 
-                if let Some(app) = &this_dataset.app {
-                    let datasets =
-                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                    let self_path = self.file_path(this_dataset)?;
-                    let attach_databases = datasets
-                        .iter()
-                        .filter_map(|other_dataset| {
-                            if other_dataset.acceleration.as_ref().map_or(false, |a| {
-                                a.engine == Engine::DuckDB && a.mode == Mode::File
-                            }) {
-                                if **other_dataset == *this_dataset {
+            if let Some(app) = &this_dataset.app {
+                let datasets =
+                    Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                let self_path = self.file_path(this_dataset);
+                let attach_databases = datasets
+                    .iter()
+                    .filter_map(|other_dataset| {
+                        if other_dataset.acceleration.as_ref().map_or(false, |a| {
+                            a.engine == Engine::DuckDB && a.mode == Mode::File
+                        }) {
+                            if **other_dataset == *this_dataset {
+                                None
+                            } else {
+                                let other_path = self.file_path(other_dataset);
+                                if other_path == self_path {
                                     None
                                 } else {
-                                    let other_path = self.file_path(other_dataset);
-                                    other_path.ok().filter(|p| p != &self_path)
+                                    other_path
                                 }
-                            } else {
-                                None
                             }
-                        })
-                        .collect::<Vec<_>>();
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
-                    if !attach_databases.is_empty() {
-                        cmd.options
-                            .insert("attach_databases".to_string(), attach_databases.join(";"));
-                    }
+                if !attach_databases.is_empty() {
+                    cmd.options
+                        .insert("attach_databases".to_string(), attach_databases.join(";"));
                 }
             }
         }
@@ -549,7 +556,7 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
+        assert!(accelerator.file_path(&dataset).is_some());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
