@@ -440,9 +440,7 @@ mod test {
     async fn test_file_mode_duckdb_creation() {
         use std::{fs, path::Path};
 
-        let tmp_dir = std::env::temp_dir();
-        let path = format!("{}/abc-duckdb.db", tmp_dir.display());
-
+        let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
 
         register_all().await;
@@ -475,9 +473,7 @@ mod test {
     async fn test_file_mode_sqlite_creation() {
         use std::{fs, path::Path};
 
-        let tmp_dir = std::env::temp_dir();
-        let path = format!("{}/abc-sqlite.db", tmp_dir.display());
-
+        let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
 
         register_all().await;
