@@ -151,13 +151,15 @@ pub trait DataAccelerator: Send + Sync {
 
     /// For file-based accelerators, return the file path
     /// For any other accelerator, return None
-    fn file_path(&self, _dataset: &Dataset) -> Option<String> {
-        None
+    fn file_path(&self, _dataset: &Dataset) -> Result<String> {
+        Err(Error::InvalidConfiguration {
+            msg: "File path not supported for this accelerator".to_string(),
+        })
     }
 
     /// Check if the file path is valid
     fn is_valid_file(&self, dataset: &Dataset) -> bool {
-        if let Some(path) = self.file_path(dataset) {
+        if let Ok(path) = self.file_path(dataset) {
             let path = std::path::Path::new(&path);
 
             !path.is_dir()
@@ -171,7 +173,7 @@ pub trait DataAccelerator: Send + Sync {
 
     /// Check if the file path exists
     fn has_existing_file(&self, dataset: &Dataset) -> bool {
-        if let Some(path) = self.file_path(dataset) {
+        if let Ok(path) = self.file_path(dataset) {
             let path = std::path::Path::new(&path);
             path.is_file()
         } else {
