@@ -237,48 +237,40 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
-            // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
-            // then use the shared DuckDB file `accelerated_duckdb.db`
-            if !cmd.options.contains_key("open") && this_dataset.is_file_accelerated() {
-                let duckdb_file = self.duckdb_file_path(this_dataset)?;
-                cmd.options.insert("open".to_string(), duckdb_file);
-            }
+            if this_dataset.is_file_accelerated() {
+                // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
+                // then use the shared DuckDB file `accelerated_duckdb.db`
+                if !cmd.options.contains_key("open") {
+                    let duckdb_file = self.duckdb_file_path(this_dataset)?;
+                    cmd.options.insert("open".to_string(), duckdb_file);
+                }
 
-            if let Some(app) = &this_dataset.app {
-                let datasets =
-                    Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                let self_path = self.file_path(this_dataset)?;
-                let attach_databases = datasets
-                    .iter()
-                    .filter_map(|other_dataset| {
-                        if other_dataset.acceleration.as_ref().map_or(false, |a| {
-                            a.engine == Engine::DuckDB && a.mode == Mode::File
-                        }) {
-                            if **other_dataset == *this_dataset {
-                                None
+                if let Some(app) = &this_dataset.app {
+                    let datasets =
+                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                    let self_path = self.file_path(this_dataset)?;
+                    let attach_databases = datasets
+                        .iter()
+                        .filter_map(|other_dataset| {
+                            if other_dataset.acceleration.as_ref().map_or(false, |a| {
+                                a.engine == Engine::DuckDB && a.mode == Mode::File
+                            }) {
+                                if **other_dataset == *this_dataset {
+                                    None
+                                } else {
+                                    let other_path = self.file_path(other_dataset);
+                                    other_path.ok().filter(|p| p != &self_path)
+                                }
                             } else {
-                                let other_path = self.file_path(other_dataset);
-                                other_path.ok().filter(|p| p != &self_path)
-                                // match (self_path, other_path) {
-                                //     (Ok(self_path), Ok(other_path)) => {
-                                //         if other_path == self_path {
-                                //             None
-                                //         } else {
-                                //             Some(other_path)
-                                //         }
-                                //     }
-                                //     _ => None,
-                                // }
+                                None
                             }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                        })
+                        .collect::<Vec<_>>();
 
-                if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    if !attach_databases.is_empty() {
+                        cmd.options
+                            .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    }
                 }
             }
         }

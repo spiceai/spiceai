@@ -252,38 +252,40 @@ impl DataAccelerator for SqliteAccelerator {
         let mut cmd = cmd.clone();
 
         if let Some(this_dataset) = dataset {
-            // If the user didn't specify a SQLite file and this is a file-mode SQLite,
-            // then use the shared SQLite file `accelerated_sqlite.db`
-            if !cmd.options.contains_key("file") && this_dataset.is_file_accelerated() {
-                let sqlite_file = self.sqlite_file_path(this_dataset)?;
-                cmd.options.insert("file".to_string(), sqlite_file);
-            }
+            if this_dataset.is_file_accelerated() {
+                // If the user didn't specify a SQLite file and this is a file-mode SQLite,
+                // then use the shared SQLite file `accelerated_sqlite.db`
+                if !cmd.options.contains_key("file") {
+                    let sqlite_file = self.sqlite_file_path(this_dataset)?;
+                    cmd.options.insert("file".to_string(), sqlite_file);
+                }
 
-            if let Some(app) = &this_dataset.app {
-                let datasets =
-                    Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                let self_path = self.file_path(this_dataset)?;
-                let attach_databases = datasets
-                    .iter()
-                    .filter_map(|other_dataset| {
-                        if other_dataset.acceleration.as_ref().map_or(false, |a| {
-                            a.engine == Engine::Sqlite && a.mode == Mode::File
-                        }) {
-                            if **other_dataset == *this_dataset {
-                                None
+                if let Some(app) = &this_dataset.app {
+                    let datasets =
+                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                    let self_path = self.file_path(this_dataset)?;
+                    let attach_databases = datasets
+                        .iter()
+                        .filter_map(|other_dataset| {
+                            if other_dataset.acceleration.as_ref().map_or(false, |a| {
+                                a.engine == Engine::Sqlite && a.mode == Mode::File
+                            }) {
+                                if **other_dataset == *this_dataset {
+                                    None
+                                } else {
+                                    let other_path = self.file_path(other_dataset);
+                                    other_path.ok().filter(|p| p != &self_path)
+                                }
                             } else {
-                                let other_path = self.file_path(other_dataset);
-                                other_path.ok().filter(|p| p != &self_path)
+                                None
                             }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                        })
+                        .collect::<Vec<_>>();
 
-                if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    if !attach_databases.is_empty() {
+                        cmd.options
+                            .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    }
                 }
             }
         }

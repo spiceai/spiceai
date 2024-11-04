@@ -68,6 +68,9 @@ pub enum Error {
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("File mode is not supported for this accelerator engine."))]
+    FileModeUnsupported {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -152,9 +155,7 @@ pub trait DataAccelerator: Send + Sync {
     /// For file-based accelerators, return the file path
     /// For any other accelerator, return None
     fn file_path(&self, _dataset: &Dataset) -> Result<String> {
-        Err(Error::InvalidConfiguration {
-            msg: "File path not supported for this accelerator".to_string(),
-        })
+        Err(Error::FileModeUnsupported {})
     }
 
     /// Check if the file path is valid
