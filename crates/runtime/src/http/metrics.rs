@@ -28,7 +28,7 @@ pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> =
 
 pub(crate) static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("http_requests_duration")
+        .f64_histogram("http_requests_duration_ms")
         .with_unit("ms")
         .init()
 });

@@ -289,7 +289,7 @@ pub(crate) mod telemetry {
 
     static QUERY_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
         TELEMETRY_METER
-            .f64_histogram("query_duration")
+            .f64_histogram("query_duration_ms")
             .with_description(
                 "The total amount of time spent planning and executing queries in milliseconds.",
             )

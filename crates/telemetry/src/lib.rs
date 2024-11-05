@@ -69,8 +69,10 @@ pub fn track_bytes_returned(bytes: u64, protocol: Arc<str>) {
 
 static QUERY_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("query_duration")
-        .with_description("The total amount of time spent planning and executing queries.")
+        .f64_histogram("query_duration_ms")
+        .with_description(
+            "The total amount of time spent planning and executing queries in milliseconds.",
+        )
         .with_unit("ms")
         .init()
 });
