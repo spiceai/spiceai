@@ -25,7 +25,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Sharepoint              | ❌         |              |
 | Snowflake               | ❌         |              |
 | Spice.AI Cloud Platform | ❌         |              |
-| S3                      | ❌         |              |
+| S3                      | ✅         | @Sevenannn   |
 | Azure BlobFS            | ❌         |              |
 | Spark                   | ❌         |              |
 

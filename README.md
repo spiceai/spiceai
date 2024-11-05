@@ -86,11 +86,11 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `github`        | GitHub                                | Release Candidate |                                            |
 | `mysql`         | MySQL                                 | Release Candidate |                                            |
 | `postgres`      | PostgreSQL                            | Release Candidate |                                            |
+| `s3`            | [S3][s3]                              | Release Candidate | Parquet, CSV                               |
 | `databricks`    | [Databricks][databricks]              | Beta              | [Spark Connect][spark] <br/> S3/Delta Lake |
 | `delta_lake`    | Delta Lake                            | Beta              | Delta Lake                                 |
 | `flightsql`     | FlightSQL                             | Beta              | Arrow Flight SQL                           |
 | `odbc`          | ODBC                                  | Beta              | ODBC                                       |
-| `s3`            | [S3][s3]                              | Beta              | Parquet, CSV                               |
 | `spiceai`       | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                               |
 | `abfs`          | Azure BlobFS                          | Alpha             | Parquet, CSV                               |
 | `clickhouse`    | Clickhouse                            | Alpha             |                                            |
@@ -123,7 +123,7 @@ Currently supported data stores for local materialization/acceleration. More com
 | `duckdb`   | Embedded [DuckDB][duckdb]       | Beta   | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Beta   |                  |
 | `arrow`    | In-Memory Arrow Records         | Beta   | `memory`         |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded [SQLite][sqlite]       | Beta   | `memory`, `file` |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator

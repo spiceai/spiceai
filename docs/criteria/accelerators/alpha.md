@@ -10,7 +10,7 @@ All criteria must be met for the Accelerator to be considered Alpha. As Alpha si
 | ----------- | ------------- | ------------ |
 | Arrow       | ✅            | @Sevenannn   |
 | DuckDB      | ✅            | @peasee      |
-| SQLite      | ❌            |              |
+| SQLite      | ✅            | @sgrebnov    |
 | PostgreSQL  | ✅            | @sgrebnov    |
 
 ## Alpha Release Criteria
