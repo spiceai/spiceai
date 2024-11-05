@@ -561,21 +561,10 @@ pub trait Chat: Sync + Send {
 pub fn create_hf_model(
     model_id: &str,
     model_type: Option<String>,
-    _model_weights: &Option<String>,
-    _tokenizer: &Option<String>,
-    _tokenizer_config: &Option<String>,
     hf_token_literal: Option<&Secret<String>>,
 ) -> Result<Box<dyn Chat>> {
-    mistral::MistralLlama::from_hf(
-        model_id,
-        model_type.as_deref(),
-        hf_token_literal,
-        // TODO: Support HF models with non-standard paths.
-        // model_weights,
-        // tokenizer,
-        // tokenizer_config,
-    )
-    .map(|x| Box::new(x) as Box<dyn Chat>)
+    mistral::MistralLlama::from_hf(model_id, model_type.as_deref(), hf_token_literal)
+        .map(|x| Box::new(x) as Box<dyn Chat>)
 }
 
 #[allow(unused_variables)]

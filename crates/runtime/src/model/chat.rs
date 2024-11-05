@@ -117,14 +117,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
 
             match model_id {
                 Some(id) => {
-                    llms::chat::create_hf_model(
-                        &id,
-                        model_type.map(|x| x.to_string()),
-                        &weights_path,
-                        &tokenizer_path,
-                        &tokenizer_config_path, // TODO handle inline chat templates
-                        hf_token,
-                    )
+                    llms::chat::create_hf_model(&id, model_type.map(|x| x.to_string()), hf_token)
                 }
                 None => Err(LlmError::FailedToLoadModel {
                     source: "No model id for Huggingface model".to_string().into(),
