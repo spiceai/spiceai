@@ -97,9 +97,9 @@ GROUP BY
 LIMIT 100;
 ```
 
-| **Affected queries**     |                          |
-| ------------------------ | ------------------------ |
-| [q35.sql](tpcds/q35.sql) | |
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [q35.sql](tpcds/q35.sql) |     |
 
 ### DataFusion Supports Only Single SQL Statement per Query
 
@@ -134,7 +134,7 @@ fatal runtime error: stack overflow
 | [q30.sql](tpcds/q30.sql) | [q31.sql](tpcds/q31.sql) |
 | [q33.sql](tpcds/q33.sql) | [q34.sql](tpcds/q34.sql) |
 | [q41.sql](tpcds/q41.sql) | [q44.sql](tpcds/q44.sql) |
-| [q49.sql](tpcds/q49.sql) | |
+| [q49.sql](tpcds/q49.sql) |                          |
 
 ### PostgreSQL does not support using a column alias in a CASE statement
 
@@ -185,7 +185,7 @@ select
 
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
-| [q36.sql](tpcds/q36.sql)   | [q86.sql](tpcds/q86.sql) |
+| [q36.sql](tpcds/q36.sql) | [q86.sql](tpcds/q86.sql) |
 
 ## MySQL does not support FULL JOIN
 
@@ -230,7 +230,7 @@ Query Error Execution error: Unable to query arrow: Server error: `ERROR 42000 (
 
 ```sql
 SELECT
-  CASE 
+  CASE
     WHEN count(t1_id) / count(t2_id) IS NULL THEN 0
     ELSE count(t1_id) / count(t2_id)
 FROM t1, t2
@@ -244,6 +244,186 @@ MySQL does not return a syntax error when dividing by zero, instead returning `N
 Query Error Unable to convert record batch: Invalid argument error: Column 'am_pm_ratio' is declared as non-nullable but contains null values
 ```
 
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [q90.sql](tpcds/q90.sql) |     |
+
+### SQLite does not support `ROLLUP` and `GROUPING`
+
+**Limitation**: SQLite Data Acccelerator does not support advanced grouping features such as `ROLLUP` and `GROUPING`
+
+**Solution**: To achieve similar functionality in SQLite
+
+- Use manual aggregation with `UNION ALL`: write separate queries for each level of aggregation and combine them with `UNION ALL`.
+- Use `CASE` within a `GROUP BY`: simulate `ROLLUP` behavior by applying `CASE` statements within a `GROUP BY` clause.
+
+Example for TPC-DS Q27. Orignal query:
+
+```sql
+select  i_item_id,
+        s_state, grouping(s_state) g_state,
+        avg(ss_quantity) agg1,
+        avg(ss_list_price) agg2,
+        avg(ss_coupon_amt) agg3,
+        avg(ss_sales_price) agg4
+ from store_sales, customer_demographics, date_dim, store, item
+ where ss_sold_date_sk = d_date_sk and
+       ss_item_sk = i_item_sk and
+       ss_store_sk = s_store_sk and
+       ss_cdemo_sk = cd_demo_sk and
+       cd_gender = 'M' and
+       cd_marital_status = 'U' and
+       cd_education_status = 'Secondary' and
+       d_year = 2000 and
+       s_state in ('TN','TN', 'TN', 'TN', 'TN', 'TN')
+ group by rollup (i_item_id, s_state)
+ order by i_item_id
+         ,s_state
+  LIMIT 100;
+```
+
+Rewritten query:
+
+```sql
+SELECT i_item_id,
+       s_state,
+       0 AS g_state,
+       AVG(ss_quantity) AS agg1,
+       AVG(ss_list_price) AS agg2,
+       AVG(ss_coupon_amt) AS agg3,
+       AVG(ss_sales_price) AS agg4
+FROM store_sales
+JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk
+JOIN date_dim ON ss_sold_date_sk = d_date_sk
+JOIN store ON ss_store_sk = s_store_sk
+JOIN item ON ss_item_sk = i_item_sk
+WHERE cd_gender = 'M'
+  AND cd_marital_status = 'U'
+  AND cd_education_status = 'Secondary'
+  AND d_year = 2000
+  AND s_state IN ('TN')
+GROUP BY i_item_id, s_state
+
+UNION ALL
+
+-- Subtotals by i_item_id
+SELECT i_item_id,
+       NULL AS s_state,
+       1 AS g_state,
+       AVG(ss_quantity) AS agg1,
+       AVG(ss_list_price) AS agg2,
+       AVG(ss_coupon_amt) AS agg3,
+       AVG(ss_sales_price) AS agg4
+FROM store_sales
+JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk
+JOIN date_dim ON ss_sold_date_sk = d_date_sk
+JOIN store ON ss_store_sk = s_store_sk
+JOIN item ON ss_item_sk = i_item_sk
+WHERE cd_gender = 'M'
+  AND cd_marital_status = 'U'
+  AND cd_education_status = 'Secondary'
+  AND d_year = 2000
+  AND s_state IN ('TN')
+GROUP BY i_item_id
+
+ORDER BY i_item_id, s_state
+LIMIT 100;
+```
+
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
-| [q90.sql](tpcds/q90.sql) | |
+| [q5.sql](tpcds/q5.sql)   | [q14.sql](tpcds/q14.sql) |
+| [q18.sql](tpcds/q18.sql) | [q22.sql](tpcds/q22.sql) |
+| [q27.sql](tpcds/q27.sql) | [q36.sql](tpcds/q36.sql) |
+| [q67.sql](tpcds/q67.sql) | [q70.sql](tpcds/q70.sql) |
+| [q77.sql](tpcds/q77.sql) | [q80.sql](tpcds/q80.sql) |
+| [q86.sql](tpcds/q86.sql) |                          |
+
+### SQLite does not support `stddev`
+
+**Limitation**: SQLite Data Accelerator does not support the `stddev` (standard deviation) function. There is an error `no such function: stddev` when running the following TPC-DS queries:
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q17.sql](tpcds/q17.sql) | [q29.sql](tpcds/q29.sql) |
+| [q35.sql](tpcds/q35.sql) | [q74.sql](tpcds/q74.sql) |
+
+### SQLite DECIMAL Casting and Division
+
+**Limitation**: In SQLite, `CAST(value AS DECIMAL)` does not convert an integer to a floating-point value if the casted value is an integer. Mathematical operations like `CAST(1 AS DECIMAL) / CAST(2 AS DECIMAL)` will be treated as integer division, resulting in `0` instead of the expected `0.5`.
+
+**Solution**: Use `FLOAT` to ensure conversion to a floating-point value: `CAST(1 AS FLOAT) / CAST(2 AS FLOAT)`
+
+Example for TPC-DS Q90. Orignal query:
+
+```sql
+select  cast(amc as decimal(15,4))/cast(pmc as decimal(15,4)) am_pm_ratio
+ from ( select count(*) amc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 9 and 9+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) at,
+      ( select count(*) pmc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 15 and 15+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) pt
+ order by am_pm_ratio
+  LIMIT 100;
+```
+
+Rewritten query:
+
+```sql
+-- Updated TPC-DS Q90 with `CAST(.. AS DECIMAL(15,4)` replaced with `FLOAT` to match SQLite's type system
+
+select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
+ from ( select count(*) amc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 9 and 9+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) at,
+      ( select count(*) pmc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 15 and 15+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 2500 and 5200) pt
+ order by am_pm_ratio
+  LIMIT 100;
+```
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q49.sql](tpcds/q49.sql) | [q75.sql](tpcds/q75.sql) |
+| [q90.sql](tpcds/q90.sql) |                          |
+
+### Datafusion Physical Plan does not support logical expression `Exists`, `InSubquery` / not yet implemented for `GROUPING` aggregate function
+
+**Limitation**: Datafusion Physical Plan does not support `Exists`, `InSubquery`, `GROUPING` aggregate function, there will be errors when running the following queries in s3 connector and in-memory arrow accelerator
+
+| **Affected queries**     |                          |
+| ------------------------ | ------------------------ |
+| [q10.sql](tpcds/q10.sql) | [q27.sql](tpcds/q27.sql) |
+| [q35.sql](tpcds/q35.sql) | [q36.sql](tpcds/q36.sql) |
+| [q45.sql](tpcds/q45.sql) | [q70.sql](tpcds/q70.sql) |
+| [q86.sql](tpcds/q86.sql) |                          |
+
+### Datafusion Error during planning: Correlated column is not allowed in predicate
+
+**Limitation**: Datafusion doesn't support planning for queries containing correlated columns in predicate, for example, predicate `item.i_manufact = outer_ref(i1.i_manufact)`, there will be errors when running the following queries in s3 connector and in-memory arrow accelerator
+
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [q41.sql](tpcds/q41.sql) |     |

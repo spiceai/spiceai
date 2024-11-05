@@ -3,8 +3,12 @@ additionalLabels: {}
 
 image:
   repository: spiceai/spiceai
-  tag: 0.19.2-beta
+  tag: 0.20.0-beta
 replicaCount: 1
+
+service:
+  type: null
+  additionalAnnotations: {}
 
 serviceAccount:
   # Specifies whether a ServiceAccount should be created

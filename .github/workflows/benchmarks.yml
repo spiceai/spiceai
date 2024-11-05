@@ -78,7 +78,7 @@ jobs:
           path: ./spice_bench
 
   run-database-bench:
-    name: Run Connector/Accelerator Benchmark
+    name: Run ${{ matrix.name }} ${{ matrix.bench }} Benchmark
     runs-on: ubuntu-latest
     needs: build-database-bench-binary
 

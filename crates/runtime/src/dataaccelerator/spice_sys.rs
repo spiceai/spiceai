@@ -72,9 +72,7 @@ async fn acceleration_connection(
                 .downcast_ref::<DuckDBAccelerator>()
                 .ok_or("Accelerator is not a DuckDBAccelerator")?;
 
-            let duckdb_file = duckdb_accelerator
-                .duckdb_file_path(dataset)
-                .ok_or("Acceleration mode is not file-based.")?;
+            let duckdb_file = duckdb_accelerator.duckdb_file_path(dataset)?;
             if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
                 return Err("DuckDB file does not exist.".into());
             }
@@ -98,9 +96,7 @@ async fn acceleration_connection(
                 .downcast_ref::<SqliteAccelerator>()
                 .ok_or("Accelerator is not a SqliteAccelerator")?;
 
-            let sqlite_file = sqlite_accelerator
-                .sqlite_file_path(dataset)
-                .ok_or("Acceleration mode is not file-based.")?;
+            let sqlite_file = sqlite_accelerator.sqlite_file_path(dataset)?;
             if !create_table_if_not_exists && !Path::new(&sqlite_file).exists() {
                 return Err("Sqlite file does not exist.".into());
             }

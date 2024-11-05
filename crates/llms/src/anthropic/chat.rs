@@ -37,9 +37,9 @@ use async_openai::types::{
 use serde_json::json;
 
 use super::types::{
-    AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
-    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam,
+    default_max_tokens, AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams,
+    MessageCreateResponse, MessageParam, MessageRole, MetadataParam, ResponseContentBlock,
+    StopReason, TextBlockParam, ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam,
 };
 use super::types_stream::{transform_stream, AnthropicStreamError, MessageCreateStreamResponse};
 use super::Anthropic;
@@ -326,7 +326,7 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             temperature: value.temperature,
             max_tokens: value
                 .max_completion_tokens
-                .unwrap_or(model.default_max_tokens()),
+                .unwrap_or(default_max_tokens(&model)),
             stream: value.stream,
             metadata: value
                 .metadata

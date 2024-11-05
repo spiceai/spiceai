@@ -109,6 +109,7 @@ impl FibonacciBackoffBuilder {
         self
     }
 
+    /// Set the maximum number of retries. None means no limit.
     #[must_use]
     pub fn max_retries(mut self, value: Option<usize>) -> Self {
         self.max_retries = value;

@@ -151,4 +151,14 @@ impl RuntimeStatus {
             .keys()
             .all(|component| ever_ready.contains(component))
     }
+
+    /// Returns the status of all registered components.
+    #[must_use]
+    pub fn get_all_statuses(&self) -> HashMap<String, ComponentStatus> {
+        let statuses = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        statuses.clone()
+    }
 }

@@ -8,34 +8,34 @@ assignees: ''
 
 ## Describe the bug
 
-A clear and concise description of what the bug is.
+_A clear and concise description of what the bug is._
 
 ## To Reproduce
 
-Steps to reproduce the behavior:
+_Steps to reproduce the behavior:_
 
 1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
+2. Click on '...'
+3. Scroll down to '...'
 4. See error
 
 ## Expected behavior
 
-A clear and concise description of what you expected to happen.
+_A clear and concise description of what you expected to happen._
 
 ## Runtime Details
 
 ### Spicepod
 
-Add the relevant `spicepod.yml` section.
+_Add the relevant `spicepod.yml` section._
 
-### Output of the `describe table`
+### Output of `describe table`
 
-Add any relevant `describe table` output here.
+_Add any relevant `describe table` output here._
 
 ### Output of `explain query`
 
-Add any relevant `explain query` output here.
+_Add any relevant `explain query` output here._
 
 E.g. `explain select 1`
 

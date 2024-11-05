@@ -126,6 +126,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
             &mut rt,
             &format!("mysql_federation_push_down_{snapshot_suffix}"),
             query,
+            true,
             validate_result,
         )
         .await?;
@@ -214,6 +215,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             &mut rt,
             &format!("mysql_federation_inner_join_with_acc_{snapshot_suffix}"),
             query,
+            true,
             validate_result,
         )
         .await?;

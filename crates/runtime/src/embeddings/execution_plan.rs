@@ -334,7 +334,7 @@ async fn get_vectors(
 /// ```text
 ///                 +--- Chunker ---+               +--- Embedding Model ---+
 ///                 |               v               |                       v
-/// +---------------------+  +-------------------------------+  +--------------------------------------+  
+/// +---------------------+  +-------------------------------+  +--------------------------------------+
 /// | "Hello, World!"     |  | ["Hello, ", ", World!"]       |  | [[0.1, 1.2], [0.3, 0.4]]             |
 /// | "How are you doing?"|  | ["How ", "are you ", "doing?"]|  | [[0.5, 0.6], [0.7, 0.8], [0.9, 1.0]] |
 /// | "I'm doing well."   |  | ["I'm doing ", "doing well."] |  | [[1.1, 1.2], [1.3, 1.4]]             |
@@ -370,7 +370,7 @@ async fn get_vectors_with_chunker(
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
 
     let embedded_data = model
-        .embed(EmbeddingInput::StringArray(chunks))
+        .embed(EmbeddingInput::StringArray(chunks.clone()))
         .await
         .boxed()?;
 
@@ -384,31 +384,35 @@ async fn get_vectors_with_chunker(
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
 
-    for chunks_in_row in chunks_per_row {
-        lengths.push(chunks_in_row);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for chunkz_in_row in chunks_per_row {
+        lengths.push(chunkz_in_row);
 
         // Get the actual vectors
-        let inner = embedded_data.as_slice()[curr..curr + chunks_in_row]
+        let inner = embedded_data.as_slice()[curr..curr + chunkz_in_row]
             .iter()
             .flatten()
             .copied()
             .collect_vec();
         values.append_slice(&inner); // I believe this is a clone under the hood.
 
-        // Get the length of the last chunk
-        let last_chunk_length = embedded_data
-            .as_slice()
-            .get(curr + chunks_in_row - 1)
-            .map(Vec::len)
-            .unwrap_or_default();
+        // Create flattened version of [(start, end), (start, end), ...]
+        // Explicitly find `end` to handle when chunks have overlap.
+        let mut inner_offsets = Vec::with_capacity(2 * chunkz_in_row);
+        for i in 0..chunkz_in_row {
+            let start = chunk_offsets[curr + i];
+            let end = start
+                + chunks
+                    .as_slice()
+                    .get(curr + i)
+                    .map(String::len)
+                    .unwrap_or_default();
+            inner_offsets.push(start as i32);
+            inner_offsets.push(end as i32);
+        }
+        chunk_values.append_slice(inner_offsets.as_slice());
 
-        let inner_offsets = chunk_offsets_to_col_values(
-            &chunk_offsets.as_slice()[curr..curr + chunks_in_row],
-            last_chunk_length,
-        );
-        chunk_values.append_slice(&inner_offsets.iter().flatten().copied().collect_vec());
-
-        curr += chunks_in_row;
+        curr += chunkz_in_row;
     }
 
     // These are offsets for both the vectors and the content offsets
@@ -465,22 +469,4 @@ async fn get_vectors_with_chunker(
     };
 
     Ok((vectors, content_offsets))
-}
-
-/// Convert a slice of [`usize`] offsets into the format expected by [`ListArray`].
-/// Example:
-/// ```rust
-/// assert_eq!(chunk_offsets_to_col_values(&[0, 4, 7, 12], 3), [[0, 4], [4, 7], [7, 12], [12, 15]]);
-/// ```
-///
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn chunk_offsets_to_col_values(offsets: &[usize], last_chunk_length: usize) -> Vec<[i32; 2]> {
-    let mut values = Vec::with_capacity(offsets.len());
-    for window in offsets.windows(2) {
-        values.push([window[0] as i32, window[1] as i32]);
-    }
-    if let Some(last) = offsets.last() {
-        values.push([*last as i32, (*last + last_chunk_length) as i32]);
-    }
-    values
 }

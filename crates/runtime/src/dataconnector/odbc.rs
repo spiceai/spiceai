@@ -46,6 +46,8 @@ pub enum Error {
     InvalidParameter { param: String, msg: String },
     #[snafu(display("No ODBC driver was specified in the connection string"))]
     NoDriverSpecified,
+    #[snafu(display("Accessing an ODBC driver with a file path is not permitted. Create an ODBC profile instead."))]
+    DirectDriverNotPermitted,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -66,7 +68,7 @@ impl SQLDialectParam {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ODBCDriver {
+enum ODBCProfile {
     MySql,
     PostgreSql,
     Sqlite,
@@ -89,34 +91,32 @@ fn athena_dialect() -> CustomDialect {
         .build()
 }
 
-impl From<&str> for ODBCDriver {
+impl From<&str> for ODBCProfile {
     fn from(val: &str) -> Self {
+        // match a profile name to a dialect
         match val {
-            _ if val.contains("mysql") => ODBCDriver::MySql, // odbcinst.ini profile name
-            _ if val.contains("libmyodbc") => ODBCDriver::MySql, // library filename
-            _ if val.contains("postgres") => ODBCDriver::PostgreSql, // odbcinst.ini profile name
-            _ if val.contains("psqlodbc") => ODBCDriver::PostgreSql, // library filename
-            _ if val.contains("sqlite") => ODBCDriver::Sqlite, // profile and library name
-            _ if val.contains("libsparkodbc") => ODBCDriver::Databricks, // library filename
-            _ if val.contains("databricks") => ODBCDriver::Databricks, // profile name
-            _ if val.contains("athena") => ODBCDriver::Athena, // profile and library name
+            _ if val.contains("mysql") => ODBCProfile::MySql,
+            _ if val.contains("postgres") => ODBCProfile::PostgreSql,
+            _ if val.contains("sqlite") => ODBCProfile::Sqlite,
+            _ if val.contains("databricks") => ODBCProfile::Databricks,
+            _ if val.contains("athena") => ODBCProfile::Athena,
             _ => {
-                tracing::debug!("Unknown ODBC driver detected: {}", val);
-                ODBCDriver::Unknown
+                tracing::debug!("Unknown ODBC profile detected: {}", val);
+                ODBCProfile::Unknown
             }
         }
     }
 }
 
-impl From<ODBCDriver> for Option<Arc<dyn Dialect + Send + Sync>> {
-    fn from(val: ODBCDriver) -> Self {
+impl From<ODBCProfile> for Option<Arc<dyn Dialect + Send + Sync>> {
+    fn from(val: ODBCProfile) -> Self {
         match val {
-            ODBCDriver::MySql => Some(Arc::new(MySqlDialect {})),
-            ODBCDriver::PostgreSql => Some(Arc::new(PostgreSqlDialect {})),
-            ODBCDriver::Sqlite => Some(Arc::new(SqliteDialect {})),
-            ODBCDriver::Databricks => Some(Arc::new(databricks_dialect())),
-            ODBCDriver::Athena => Some(Arc::new(athena_dialect())),
-            ODBCDriver::Unknown => Some(Arc::new(DefaultDialect {})),
+            ODBCProfile::MySql => Some(Arc::new(MySqlDialect {})),
+            ODBCProfile::PostgreSql => Some(Arc::new(PostgreSqlDialect {})),
+            ODBCProfile::Sqlite => Some(Arc::new(SqliteDialect {})),
+            ODBCProfile::Databricks => Some(Arc::new(databricks_dialect())),
+            ODBCProfile::Athena => Some(Arc::new(athena_dialect())),
+            ODBCProfile::Unknown => Some(Arc::new(DefaultDialect {})),
         }
     }
 }
@@ -165,6 +165,16 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("sql_dialect"),
 ];
 
+fn driver_is_file(driver: &str) -> bool {
+    driver
+        .split('=')
+        .last()
+        // if the file doesn't yet exist, the connector will fail registration
+        // when the connector re-tries, if the file exists it will fail again
+        .filter(|s| std::fs::metadata(s).is_ok())
+        .is_some()
+}
+
 impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
@@ -187,7 +197,12 @@ impl DataConnectorFactory for ODBCFactory {
                     .find(|s| s.starts_with("driver="))
                     .context(NoDriverSpecifiedSnafu)?;
 
-                Ok(ODBCDriver::from(driver).into())
+                // explicitly check if the user has tried to specify a file path
+                if driver_is_file(driver) {
+                    return Err(Error::DirectDriverNotPermitted {}.into());
+                }
+
+                Ok(ODBCProfile::from(driver).into())
             }?;
 
             let pool: Arc<ODBCDbConnectionPool> = Arc::new(
@@ -230,5 +245,27 @@ where
                     dataconnector: "odbc",
                 })?,
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_odbc_driver_is_file() {
+        std::fs::File::create("something.so").expect("file should be created");
+        std::fs::File::create("noextfile").expect("file should be created");
+
+        assert!(!driver_is_file("driver=foo"));
+        assert!(!driver_is_file("driver={mysql}"));
+        assert!(!driver_is_file("driver={microsoft sql server}"));
+        assert!(driver_is_file("driver=./something.so"));
+        assert!(driver_is_file("driver=something.so"));
+        assert!(driver_is_file("driver=noextfile"));
+        assert!(driver_is_file("driver=./noextfile"));
+
+        std::fs::remove_file("something.so").expect("file should be deleted");
+        std::fs::remove_file("noextfile").expect("file should be deleted");
     }
 }

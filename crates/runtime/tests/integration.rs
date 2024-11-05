@@ -35,6 +35,7 @@ mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod federation;
+mod github;
 mod graphql;
 #[cfg(feature = "mysql")]
 mod mysql;
@@ -109,6 +110,7 @@ async fn run_query_and_check_results<F>(
     rt: &mut Runtime,
     snapshot_name: &str,
     query: &str,
+    snapshot_plan: bool,
     validate_result: Option<F>,
 ) -> Result<(), String>
 where
@@ -130,12 +132,15 @@ where
     let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
         panic!("Failed to format plan");
     };
-    insta::with_settings!({
-        description => format!("Query: {query}"),
-        omit_expression => true
-    }, {
-        insta::assert_snapshot!(snapshot_name, explain_plan);
-    });
+
+    if snapshot_plan {
+        insta::with_settings!({
+            description => format!("Query: {query}"),
+            omit_expression => true
+        }, {
+            insta::assert_snapshot!(snapshot_name, explain_plan);
+        });
+    }
 
     // Check the result
     if let Some(validate_result) = validate_result {

@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use async_openai::{config::Config, Client};
+#![allow(clippy::missing_errors_doc)]
+use async_openai::{config::Config, error::OpenAIError, Client};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use secrecy::{ExposeSecret, Secret};
 use std::sync::LazyLock;
+use types::validate_model_variant;
 
 mod chat;
 mod types;
@@ -34,21 +35,22 @@ pub struct Anthropic {
 }
 
 static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
-pub static DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-sonnet-20240620";
+pub static DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-sonnet-latest";
 static ANTHROPIC_API_VERSION: &str = "2023-06-01";
 static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(String::new()));
 
 impl Anthropic {
-    pub fn new<S: Into<AnthropicModelVariant>>(
+    pub fn new(
         config: AnthropicConfig,
-        model: S,
+        model: Option<&str>,
         name: &str,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, OpenAIError> {
+        let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
+        Ok(Self {
             client: Client::<AnthropicConfig>::with_config(config),
-            model: model.into(),
+            model: variant,
             name: name.to_string(),
-        }
+        })
     }
 }
 

@@ -19,17 +19,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::AcceleratedTableBuilderError;
+use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, create_accelerator_table};
+use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
+use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::{status, view};
 
@@ -59,6 +61,7 @@ use tokio::time::{sleep, Instant};
 pub mod query;
 
 pub mod builder;
+pub mod error;
 mod extension;
 pub mod filter_converter;
 pub mod refresh_sql;
@@ -149,7 +152,7 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to trigger refresh for {table_name}: {source}"))]
+    #[snafu(display("Cannot refresh {table_name}: {source}"))]
     UnableToTriggerRefresh {
         table_name: String,
         source: crate::accelerated_table::Error,
@@ -210,13 +213,13 @@ pub enum Error {
 pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
         accelerated_table: Option<AcceleratedTable>,
         secrets: Arc<TokioRwLock<Secrets>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
     },
     View(String),
 }
@@ -476,6 +479,7 @@ impl DataFusion {
             .read_provider(&pending_registration.dataset)
             .await
             .context(UnableToResolveTableProviderSnafu)?;
+        let federated_table = FederatedTable::new(read_provider);
 
         tracing::info!(
             "Loading data for dataset {}",
@@ -484,7 +488,7 @@ impl DataFusion {
         self.register_accelerated_table(
             Arc::clone(&pending_registration.dataset),
             sink_connector,
-            read_provider,
+            federated_table,
             Arc::clone(&pending_registration.secrets),
         )
         .await?;
@@ -606,22 +610,25 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
         tracing::debug!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.mode() {
-            Mode::Read => federated_read_table,
-            Mode::ReadWrite => source
-                .read_write_provider(dataset)
-                .await
-                .ok_or_else(|| {
-                    WriteProviderNotImplementedSnafu {
-                        table_name: dataset.name.to_string(),
-                    }
-                    .build()
-                })?
-                .context(UnableToResolveTableProviderSnafu)?,
+            Mode::Read => Arc::new(federated_read_table),
+            Mode::ReadWrite => {
+                let read_write_provider = source
+                    .read_write_provider(dataset)
+                    .await
+                    .ok_or_else(|| {
+                        WriteProviderNotImplementedSnafu {
+                            table_name: dataset.name.to_string(),
+                        }
+                        .build()
+                    })?
+                    .context(UnableToResolveTableProviderSnafu)?;
+                Arc::new(FederatedTable::new(read_write_provider))
+            }
         };
 
         let source_schema = source_table_provider.schema();
@@ -634,16 +641,33 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
+        let constraints = match &*source_table_provider {
+            FederatedTable::Immediate(table_provider) => table_provider.constraints(),
+            FederatedTable::Deferred(_) => None,
+        };
+
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
             Arc::clone(&source_schema),
-            source_table_provider.constraints(),
+            constraints,
             &acceleration_settings,
             secrets,
             Some(dataset),
         )
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        // If we already have an existing dataset checkpoint table that has been checkpointed,
+        // it means there is data from a previous acceleration and we don't need
+        // to wait for the first refresh to complete to mark it ready.
+        let mut initial_load_complete = false;
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await {
+            if checkpoint.exists().await {
+                self.runtime_status
+                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                initial_load_complete = true;
+            }
+        }
 
         let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
@@ -699,9 +723,13 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
+        accelerated_table_builder.ready_state(acceleration_settings.ready_state);
+
         accelerated_table_builder.cache_provider(self.cache_provider());
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
+
+        accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         if acceleration_settings.disable_query_push_down {
             accelerated_table_builder.disable_query_push_down();
@@ -729,10 +757,61 @@ impl DataFusion {
             };
         }
 
+        // If this is a localpod accelerated table, attempt to synchronize refreshes with the parent table
+        if dataset.source() == LOCALPOD_DATACONNECTOR {
+            self.attempt_to_synchronize_accelerated_table(&mut accelerated_table_builder, dataset)
+                .await;
+        }
+
         accelerated_table_builder
             .build()
             .await
             .context(UnableToBuildAcceleratedTableSnafu)
+    }
+
+    /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
+    ///
+    /// This will not work if:
+    /// - The parent table is not an accelerated table.
+    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    ///
+    /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
+    pub async fn attempt_to_synchronize_accelerated_table(
+        &self,
+        accelerated_table_builder: &mut accelerated_table::Builder,
+        dataset: &Dataset,
+    ) {
+        let parent_table_reference = TableReference::parse_str(&dataset.path());
+        let Ok(parent_table) = self.get_table_provider(&parent_table_reference).await else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found.");
+            return;
+        };
+        let Some(parent_table_federation_adaptor) = parent_table
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>(
+        ) else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table.");
+            return;
+        };
+        let Some(parent_table) = parent_table_federation_adaptor.table_provider.clone() else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider.");
+            return;
+        };
+        let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table.");
+            return;
+        };
+        if let Err(e) = accelerated_table_builder
+            .synchronize_with(parent_table)
+            .await
+        {
+            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Error: {e}");
+            return;
+        }
+
+        tracing::info!(
+            "Localpod dataset {} synchronizing refreshes with parent table {parent_table_reference}", dataset.name
+        );
     }
 
     pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
@@ -747,7 +826,7 @@ impl DataFusion {
         &self,
         dataset: Arc<Dataset>,
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
         let (mut accelerated_table, _) = self
@@ -856,7 +935,7 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
-        federated_read_table: Arc<dyn TableProvider>,
+        federated_read_table: FederatedTable,
     ) -> Result<()> {
         tracing::debug!("Registering federated table {dataset:?}");
         let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
@@ -864,8 +943,10 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
+        let federated_table_provider = federated_read_table.table_provider().await;
+
         let source_table_provider = match dataset.mode() {
-            Mode::Read => federated_read_table,
+            Mode::Read => federated_table_provider,
             Mode::ReadWrite => source
                 .read_write_provider(dataset)
                 .await

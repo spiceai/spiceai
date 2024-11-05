@@ -22,6 +22,8 @@ use crate::parameters::Parameters;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
+use datafusion::config::ConfigField;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -136,7 +138,9 @@ pub trait ListingTableConnector: DataConnector {
                 extension.unwrap_or(".csv".to_string()),
             )),
             Some("parquet") => Ok((
-                Some(Arc::new(ParquetFormat::default())),
+                Some(Arc::new(
+                    ParquetFormat::default().with_options(self.get_table_parquet_options()?),
+                )),
                 extension.unwrap_or(".parquet".to_string()),
             )),
             Some(format) => Ok((None, format!(".{format}"))),
@@ -150,7 +154,10 @@ pub trait ListingTableConnector: DataConnector {
                     }
                     if ext.eq_ignore_ascii_case("parquet") {
                         return Ok((
-                            Some(Arc::new(ParquetFormat::default())),
+                            Some(Arc::new(
+                                ParquetFormat::default()
+                                    .with_options(self.get_table_parquet_options()?),
+                            )),
                             extension.unwrap_or(".parquet".to_string()),
                         ));
                     }
@@ -218,6 +225,22 @@ pub trait ListingTableConnector: DataConnector {
                         })?,
                 ),
         ))
+    }
+
+    fn get_table_parquet_options(&self) -> DataConnectorResult<TableParquetOptions>
+    where
+        Self: Display,
+    {
+        let mut table_parquet_options = TableParquetOptions::new();
+        table_parquet_options
+            .set("pushdown_filters", "true")
+            .map_err(
+                |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                    dataconnector: format!("{self}"),
+                    source: Box::new(e),
+                },
+            )?;
+        Ok(table_parquet_options)
     }
 
     /// A hook that is called when an accelerated table is registered to the

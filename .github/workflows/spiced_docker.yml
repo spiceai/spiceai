@@ -5,6 +5,11 @@ on:
     tags:
       - v*
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the Docker images to the registry
+        required: false
+        default: 'false'
 
 jobs:
   setup:
@@ -13,10 +18,13 @@ jobs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Add REL_VERSION to output
         id: set_version
         run: |
-          python3 ./.github/scripts/get_release_version.py
           echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
 
   build-amd64:
@@ -177,7 +185,7 @@ jobs:
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
       - name: Login to GitHub Package Registry
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -185,14 +193,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
+        env:
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true' }}
         run: |
+          echo "REL_VERSION=${REL_VERSION}"
+          echo "PUBLISH=${PUBLISH}"
           variants=("slim" "full" "models")
           for variant in "${variants[@]}"; do
             suffix=""
@@ -211,11 +224,11 @@ jobs:
             docker push localhost:5000/spiceai:${variant}-amd64
             docker push localhost:5000/spiceai:${variant}-arm64
 
-            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            if [[ "${PUBLISH}" == "true" ]]; then
               # Push to GitHub Container Registry
               echo "Pushing to GHCR"
               docker buildx imagetools create \
-                -t ghcr.io/spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
+                -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
                 -t ghcr.io/spiceai/spiceai:latest${suffix} \
                 localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
@@ -223,16 +236,16 @@ jobs:
               # Push to DockerHub
               echo "Pushing to DockerHub"
               docker buildx imagetools create \
-                -t spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix} \
+                -t spiceai/spiceai:${REL_VERSION}${suffix} \
                 -t spiceai/spiceai:latest${suffix} \
                 localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
               
               echo "Verifying GHCR image:"
-              docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}
+              docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
               
               echo "Verifying DockerHub image:"
-              docker buildx imagetools inspect spiceai/spiceai:${{ needs.setup.outputs.rel_version }}${suffix}
+              docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}${suffix}
             else
               echo "Skipping push for non-tag build"
               echo "Creating local manifest for testing:"

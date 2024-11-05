@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use document_similarity::DocumentSimilarityTool;
+use get_readiness::GetReadinessTool;
 use list_datasets::ListDatasetsTool;
 use sample::{tool::SampleDataTool, SampleTableMethod};
 use spicepod::component::tool::Tool;
@@ -26,23 +27,27 @@ use table_schema::TableSchemaTool;
 use super::SpiceModelTool;
 
 pub mod document_similarity;
+pub mod get_readiness;
 pub mod list_datasets;
 pub mod sample;
 pub mod sql;
 pub mod table_schema;
 
+// Builtin tools must also be added to [`super::factory::builtin::BuiltinToolFactory`]
 pub(crate) fn get_builtin_tools() -> Vec<Arc<dyn SpiceModelTool>> {
     vec![
         Arc::new(DocumentSimilarityTool::default()),
         Arc::new(TableSchemaTool::default()),
         Arc::new(SqlTool::default()),
         Arc::new(ListDatasetsTool::default()),
+        Arc::new(GetReadinessTool::default()),
         Arc::new(SampleDataTool::new(SampleTableMethod::RandomSample)),
         Arc::new(SampleDataTool::new(SampleTableMethod::DistinctColumns)),
         Arc::new(SampleDataTool::new(SampleTableMethod::TopNSample)),
     ]
 }
 
+// Builtin tools must also be added to [`super::factory::builtin::BuiltinToolFactory`]
 #[must_use]
 pub fn get_builtin_tool_spec() -> Vec<Tool> {
     vec![
@@ -50,6 +55,7 @@ pub fn get_builtin_tool_spec() -> Vec<Tool> {
         TableSchemaTool::default().into(),
         SqlTool::default().into(),
         ListDatasetsTool::default().into(),
+        GetReadinessTool::default().into(),
         SampleDataTool::new(SampleTableMethod::RandomSample).into(),
         SampleDataTool::new(SampleTableMethod::DistinctColumns).into(),
         SampleDataTool::new(SampleTableMethod::TopNSample).into(),

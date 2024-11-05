@@ -232,6 +232,7 @@ async fn mysql_integration_test() -> Result<(), String> {
             &mut rt,
             &format!("mysql_integration_test_{snapshot_suffix}"),
             query,
+            true,
             validate_result,
         )
         .await?;

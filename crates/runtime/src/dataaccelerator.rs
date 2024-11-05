@@ -68,6 +68,9 @@ pub enum Error {
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("File mode is not supported for this accelerator engine."))]
+    FileModeUnsupported {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -151,13 +154,13 @@ pub trait DataAccelerator: Send + Sync {
 
     /// For file-based accelerators, return the file path
     /// For any other accelerator, return None
-    fn file_path(&self, _dataset: &Dataset) -> Option<String> {
-        None
+    fn file_path(&self, _dataset: &Dataset) -> Result<String> {
+        Err(Error::FileModeUnsupported {})
     }
 
     /// Check if the file path is valid
     fn is_valid_file(&self, dataset: &Dataset) -> bool {
-        if let Some(path) = self.file_path(dataset) {
+        if let Ok(path) = self.file_path(dataset) {
             let path = std::path::Path::new(&path);
 
             !path.is_dir()
@@ -171,7 +174,7 @@ pub trait DataAccelerator: Send + Sync {
 
     /// Check if the file path exists
     fn has_existing_file(&self, dataset: &Dataset) -> bool {
-        if let Some(path) = self.file_path(dataset) {
+        if let Ok(path) = self.file_path(dataset) {
             let path = std::path::Path::new(&path);
             path.is_file()
         } else {
@@ -437,9 +440,7 @@ mod test {
     async fn test_file_mode_duckdb_creation() {
         use std::{fs, path::Path};
 
-        let tmp_dir = std::env::temp_dir();
-        let path = format!("{}/abc-duckdb.db", tmp_dir.display());
-
+        let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
 
         register_all().await;
@@ -472,9 +473,7 @@ mod test {
     async fn test_file_mode_sqlite_creation() {
         use std::{fs, path::Path};
 
-        let tmp_dir = std::env::temp_dir();
-        let path = format!("{}/abc-sqlite.db", tmp_dir.display());
-
+        let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
 
         register_all().await;

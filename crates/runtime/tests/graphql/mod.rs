@@ -276,6 +276,7 @@ async fn test_graphql() -> Result<(), String> {
             &mut rt,
             &format!("test_graphql_{snapshot_suffix}"),
             query,
+            true,
             validate_result,
         )
         .await?;
@@ -353,6 +354,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
             &mut rt,
             &format!("test_graphql_pagination_{snapshot_suffix}"),
             query,
+            true,
             validate_result,
         )
         .await?;

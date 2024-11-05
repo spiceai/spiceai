@@ -16,14 +16,19 @@ limitations under the License.
 
 //! CREATE TABLE `spice_sys_dataset_checkpoint` (
 //!     `dataset_name` TEXT PRIMARY KEY,
+//!     `schema_json` TEXT,
 //!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
 
 use super::{acceleration_connection, AccelerationConnection, Result};
 use crate::component::dataset::Dataset;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use serde_json;
 
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
+const SCHEMA_MIGRATION_01_STMT: &str =
+    "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
@@ -48,16 +53,40 @@ impl DatasetCheckpoint {
     }
 
     async fn init(connection: &AccelerationConnection) -> Result<()> {
+        // First create the initial table
         match connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
             #[cfg(feature = "postgres")]
-            AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await,
+            AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await,
+            AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await?,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
-        }
+            _ => return Err("No acceleration connection available".into()),
+        };
+
+        // Then add the schema column if it doesn't exist
+        match connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => Self::migrate_duckdb(pool)?,
+            #[cfg(feature = "postgres")]
+            AccelerationConnection::Postgres(pool) => Self::migrate_postgres(pool).await?,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => Self::migrate_sqlite(conn).await?,
+            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            _ => return Err("No acceleration connection available".into()),
+        };
+
+        Ok(())
+    }
+
+    fn serialize_schema(schema: &SchemaRef) -> Result<String> {
+        Ok(serde_json::to_string(schema).map_err(Box::new)?)
+    }
+
+    fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
+        let schema: Schema = serde_json::from_str(schema_json).map_err(Box::new)?;
+        Ok(std::sync::Arc::new(schema))
     }
 
     pub async fn exists(&self) -> bool {
@@ -77,14 +106,27 @@ impl DatasetCheckpoint {
         }
     }
 
-    pub async fn checkpoint(&self) -> Result<()> {
+    pub async fn checkpoint(&self, schema: &SchemaRef) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool, schema),
             #[cfg(feature = "postgres")]
-            AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool).await,
+            AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool, schema).await,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn).await,
+            AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn, schema).await,
+            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            _ => Err("No acceleration connection available".into()),
+        }
+    }
+
+    pub async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+        match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
+            #[cfg(feature = "postgres")]
+            AccelerationConnection::Postgres(pool) => self.get_schema_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => self.get_schema_sqlite(conn).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
             _ => Err("No acceleration connection available".into()),
         }

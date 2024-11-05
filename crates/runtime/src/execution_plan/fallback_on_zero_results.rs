@@ -16,7 +16,6 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -33,6 +32,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
+use crate::federated_table::FederatedTable;
 
 use super::TableScanParams;
 
@@ -45,7 +45,7 @@ pub struct FallbackOnZeroResultsScanExec {
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
     /// A closure to get the fallback execution plan if needed.
-    fallback_table_provider: Arc<dyn TableProvider>,
+    fallback_table_provider: Arc<FederatedTable>,
     fallback_scan_params: TableScanParams,
     properties: PlanProperties,
 }
@@ -55,7 +55,7 @@ impl FallbackOnZeroResultsScanExec {
     pub fn new(
         table_name: TableReference,
         mut input: Arc<dyn ExecutionPlan>,
-        fallback_table_provider: Arc<dyn TableProvider>,
+        fallback_table_provider: Arc<FederatedTable>,
         fallback_scan_params: TableScanParams,
     ) -> Self {
         let eq_properties = input.equivalence_properties().clone();
@@ -193,7 +193,8 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 tracing::info!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
-                let fallback_plan = match fallback_provider
+                let federated_provider = fallback_provider.table_provider().await;
+                let fallback_plan = match federated_provider
                     .scan(
                         &scan_params.state,
                         scan_params.projection.as_ref(),
@@ -272,6 +273,8 @@ mod tests {
     }
 
     mod empty_fallback {
+        use datafusion::catalog::TableProvider;
+
         use super::*;
 
         fn batch() -> RecordBatch {
@@ -306,7 +309,7 @@ mod tests {
             let exec = FallbackOnZeroResultsScanExec::new(
                 TableReference::bare("test"),
                 empty_memory_exec(),
-                memory_table_provider(),
+                Arc::new(FederatedTable::new(memory_table_provider())),
                 TableScanParams {
                     state: ctx.state(),
                     projection: None,
@@ -329,6 +332,7 @@ mod tests {
 
     mod non_empty_filtered_fallback {
         use datafusion::{
+            catalog::TableProvider,
             logical_expr::{binary_expr, col, Expr, Operator},
             scalar::ScalarValue,
         };
@@ -378,7 +382,7 @@ mod tests {
             let ctx = SessionContext::new();
 
             let input_plan = memory_exec();
-            let fallback_provider = memory_table_provider();
+            let fallback_provider = Arc::new(FederatedTable::new(memory_table_provider()));
             let fallback_scan_params = TableScanParams {
                 state: ctx.state(),
                 projection: None,

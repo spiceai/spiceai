@@ -10,6 +10,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
+
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -41,6 +43,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to create chunker: {source}"))]
+    FailedToCreateChunker {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to instantiate embedding model: {source}"))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -50,6 +57,9 @@ pub enum Error {
     UnknownModelSource {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Model '{model_name}' does not exist"))]
+    ModelDoesNotExist { model_name: String },
 
     #[snafu(display("No model from {from} currently supports {task}"))]
     UnsupportedTaskForModel { from: String, task: String },
@@ -71,10 +81,12 @@ pub trait Embed: Sync + Send {
         Ok(())
     }
 
-    fn chunker(&self, cfg: &ChunkingConfig) -> Option<Arc<dyn Chunker>> {
-        Some(Arc::new(RecursiveSplittingChunker::with_character_sizer(
-            cfg,
-        )))
+    fn chunker(&self, cfg: &ChunkingConfig) -> Result<Arc<dyn Chunker>> {
+        Ok(Arc::new(
+            RecursiveSplittingChunker::with_character_sizer(cfg)
+                .boxed()
+                .context(FailedToCreateChunkerSnafu)?,
+        ))
     }
 
     /// Returns the size of the embedding vector returned by the model. Return -1 if the size should be inferred from [`Embed::embed`] method.
