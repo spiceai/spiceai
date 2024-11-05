@@ -560,7 +560,7 @@ pub trait Chat: Sync + Send {
 
 pub fn create_hf_model(
     model_id: &str,
-    model_type: Option<String>,
+    model_type: &Option<String>,
     hf_token_literal: Option<&Secret<String>>,
 ) -> Result<Box<dyn Chat>> {
     mistral::MistralLlama::from_hf(model_id, model_type.as_deref(), hf_token_literal)
