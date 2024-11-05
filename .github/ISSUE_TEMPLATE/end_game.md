@@ -79,6 +79,9 @@ assignees: ''
   - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/databricks/README.md)
   - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
   - [ ] [Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/unity_catalog/README.md)
+  - **AI/ML Models:**
+  - [ ] [search_github_files](https://github.com/spiceai/quickstarts/tree/trunk/search_github_files)
+  - [ ] [text-to-sql](https://github.com/spiceai/quickstarts/tree/trunk/text-to-sql)
   - **Other Quickstarts:**
   - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
   - [ ] [Data Retention Policy](https://github.com/spiceai/quickstarts/blob/trunk/retention/README.md)
