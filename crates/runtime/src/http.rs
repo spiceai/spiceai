@@ -63,7 +63,7 @@ where
         Arc::clone(&rt.embeds),
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
     ));
-    let routes = routes::routes(rt, config, vsearch);
+    let routes = routes::routes(&rt, config, vsearch);
 
     let listener = TcpListener::bind(&bind_address)
         .await

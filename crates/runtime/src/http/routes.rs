@@ -36,7 +36,7 @@ use tokio::time::Instant;
 use super::{metrics, v1};
 
 pub(crate) fn routes(
-    rt: Arc<Runtime>,
+    rt: &Arc<Runtime>,
     config: Arc<config::Config>,
     vector_search: Arc<vector_search::VectorSearch>,
 ) -> Router {
@@ -77,7 +77,7 @@ pub(crate) fn routes(
     router = router
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))
-        .layer(Extension(Arc::clone(&rt)))
+        .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
     router
