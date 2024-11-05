@@ -72,7 +72,7 @@ futures = "0.3.30"
 globset = "0.4.15"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
-insta = { version = "1.41.0", features = ["filters"] }
+insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 lazy_static = "1.5.0"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
