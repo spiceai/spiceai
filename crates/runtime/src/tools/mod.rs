@@ -1,3 +1,11 @@
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionToolType,
+        FunctionCall,
+    },
+};
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -41,6 +49,46 @@ pub trait SpiceModelTool: Sync + Send {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Creates the messages that would be sent and received if a language model were to request the `tool`
+/// to be called (via an assistant message), with defined `arg`, and the response from running the
+/// tool (via a tool message) also as a message.
+///
+/// Useful for constructing [`Vec<ChatCompletionRequestMessage>`], simulating a model already
+/// having requested specific tools.
+pub async fn create_tool_use_messages(
+    rt: Arc<Runtime>,
+    tool: &dyn SpiceModelTool,
+    id: &str,
+    params: impl serde::Serialize,
+) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
+    let arg =
+        serde_json::to_string(&params).map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+    let resp = tool
+        .call(arg.as_str(), rt)
+        .await
+        .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+    Ok(vec![
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(vec![ChatCompletionMessageToolCall {
+                id: id.to_string(),
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionCall {
+                    name: tool.name().to_string(),
+                    arguments: arg.to_string(),
+                },
+            }])
+            .build()?
+            .into(),
+        ChatCompletionRequestToolMessageArgs::default()
+            .content(resp.to_string())
+            .tool_call_id(id.to_string())
+            .build()?
+            .into(),
+    ])
 }
 
 /// Construct a [`serde_json::Value`] from a [`JsonSchema`] type.

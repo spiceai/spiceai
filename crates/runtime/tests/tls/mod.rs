@@ -71,7 +71,7 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
 
     // Start the servers
     tokio::spawn(async move {
-        Box::pin(rt.start_servers(api_config, Some(Arc::new(tls_config)))).await
+        Box::pin(Arc::new(rt).start_servers(api_config, Some(Arc::new(tls_config)))).await
     });
 
     // Wait for the servers to start
