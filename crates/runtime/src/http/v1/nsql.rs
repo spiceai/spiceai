@@ -175,7 +175,7 @@ pub(crate) async fn post(
         )
             .into_response();
     };
-    // for {
+
     let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
     let Ok(mut req) = sql_gen.create_request_for_query(&payload.model, &payload.query) else {
         return (
@@ -222,5 +222,4 @@ pub(crate) async fn post(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
-    // }
 }
