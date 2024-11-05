@@ -62,7 +62,7 @@ tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tracing.workspace = true
-url = "2.5.0"
+url = "2.5.3"
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
