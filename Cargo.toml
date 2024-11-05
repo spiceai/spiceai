@@ -122,10 +122,10 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c503f0b3ea6aa49321d5dc9b9655460b419c6082" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c503f0b3ea6aa49321d5dc9b9655460b419c6082" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "c503f0b3ea6aa49321d5dc9b9655460b419c6082" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "c503f0b3ea6aa49321d5dc9b9655460b419c6082" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "28efc885abb1d611511de89259af947414ddcd9b" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "28efc885abb1d611511de89259af947414ddcd9b" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "28efc885abb1d611511de89259af947414ddcd9b" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "28efc885abb1d611511de89259af947414ddcd9b" }
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733"}
 
