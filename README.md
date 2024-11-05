@@ -71,7 +71,7 @@ Spice makes it easy and fast to query data from one or more sources using SQL. Y
 
 - **Is Spice a CDN for databases?** Yes, you can think of Spice like a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data application or for AI-inference.
 
-- **Where is the AI?** Spice provides a unified API for both data _and_ AI/ML with a high-performance bus between the two. However, because the first step in AI-readiness is data-readiness, the Getting Started content is focused on data. Spice has [endpoints and APIs](https://docs.spiceai.org/machine-learning) for model deployment and inference including LLMs, accelerated embeddings, and an AI-gateway for providers like OpenAI and Anthropic. Read more about the vision to enable development of [intelligent AI-driven applications](https://docs.spiceai.org/intelligent-applications).
+- **Where is the AI?** Spice provides a unified API for both data _and_ AI/ML with a high-performance bus between the two. However, because the first step in AI-readiness is data-readiness, the Getting Started content is focused on data. Spice has [endpoints and APIs](https://docs.spiceai.org/api/http) for model deployment and inference including LLMs, accelerated embeddings, and an AI-gateway for providers like OpenAI and Anthropic. Read more about the vision to enable development of [intelligent AI-driven applications](https://docs.spiceai.org/intelligent-applications).
 
 ### Watch a 30-sec BI dashboard acceleration demo
 
@@ -86,11 +86,11 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `github`        | GitHub                                | Release Candidate |                                            |
 | `mysql`         | MySQL                                 | Release Candidate |                                            |
 | `postgres`      | PostgreSQL                            | Release Candidate |                                            |
+| `s3`            | [S3][s3]                              | Release Candidate | Parquet, CSV                               |
 | `databricks`    | [Databricks][databricks]              | Beta              | [Spark Connect][spark] <br/> S3/Delta Lake |
 | `delta_lake`    | Delta Lake                            | Beta              | Delta Lake                                 |
 | `flightsql`     | FlightSQL                             | Beta              | Arrow Flight SQL                           |
 | `odbc`          | ODBC                                  | Beta              | ODBC                                       |
-| `s3`            | [S3][s3]                              | Beta              | Parquet, CSV                               |
 | `spiceai`       | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                               |
 | `abfs`          | Azure BlobFS                          | Alpha             | Parquet, CSV                               |
 | `clickhouse`    | Clickhouse                            | Alpha             |                                            |
@@ -123,7 +123,7 @@ Currently supported data stores for local materialization/acceleration. More com
 | `duckdb`   | Embedded [DuckDB][duckdb]       | Beta   | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Beta   |                  |
 | `arrow`    | In-Memory Arrow Records         | Beta   | `memory`         |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded [SQLite][sqlite]       | Beta   | `memory`, `file` |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator

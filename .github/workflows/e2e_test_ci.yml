@@ -946,7 +946,7 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
 
-      - name: Manually refresh dataset
+      - name: Manually refresh dataset (no params)
         working-directory: test_app
         run: |
           output=$(spice refresh eth.recent_blocks 2>&1)
@@ -964,6 +964,25 @@ jobs:
         with:
           name: eth.recent_blocks
           expected-rows-count: 1
+      
+      - name: Manually refresh dataset (with params)
+        working-directory: test_app
+        run: |
+          output=$(spice refresh eth.recent_blocks --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks LIMIT 2' 2>&1)
+          echo "$output"
+          if [[ $output == *"Dataset refresh triggered"* ]]; then
+            # time to refresh dataset
+            sleep 5
+          else
+            echo "Failed to trigger dataset refresh."
+            exit 1
+          fi
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: eth.recent_blocks
+          expected-rows-count: 2
 
       - name: Stop spice and check logs
         working-directory: test_app
