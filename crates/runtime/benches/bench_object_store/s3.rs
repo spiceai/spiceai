@@ -233,6 +233,11 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
                 "spiceai-public-datasets/tpcds_sf0_01/web_site.parquet",
                 "web_site",
             ))),
+
+        "clickbench" => Ok(app_builder.with_dataset(make_dataset(
+            "spiceai-public-datasets/clickbench/hits_partitioned/",
+            "hits",
+        ))),
         _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
@@ -240,9 +245,12 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("s3://{path}"), name.to_string());
     dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "parquet".to_string())]
-            .into_iter()
-            .collect(),
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "3h".to_string()),
+        ]
+        .into_iter()
+        .collect(),
     ));
     dataset
 }

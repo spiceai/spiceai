@@ -73,8 +73,13 @@ pub(crate) async fn setup_benchmark(
         .build()
         .await;
 
+    let wait_time = match bench_name {
+        "clickbench" => std::time::Duration::from_secs(3 * 60 * 60),
+        _ => std::time::Duration::from_secs(15 * 60),
+    };
+
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60*15)) => { // Databricks can take awhile to start up
+        () = tokio::time::sleep(wait_time) => { // Databricks can take awhile to start up
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
         () = rt.load_components() => {}
