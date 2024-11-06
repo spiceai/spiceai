@@ -30,3 +30,21 @@ pub trait HttpAuth {
     /// This function will return an error if the validator can't validate the request.
     fn http(&self, request: &http::request::Parts) -> Result<AuthVerdict, Error>;
 }
+
+pub trait FlightBasicAuth {
+    // Receive the username/password for Flight basic auth and return a verdict
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the validator can't validate the request.
+    fn flight_basic(&self, username: String, password: String) -> Result<AuthVerdict, Error>;
+}
+
+pub trait GrpcAuth {
+    // Receive the entire gRPC request object and return a verdict
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the validator can't validate the request.
+    fn grpc(&self, req: &http::request::Parts) -> Result<AuthVerdict, Error>;
+}
