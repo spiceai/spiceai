@@ -225,10 +225,9 @@ pub async fn run(args: Args) -> Result<()> {
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let cloned_rt = rt.clone();
-    let server_thread =
-        tokio::spawn(
-            async move { Box::pin(cloned_rt.start_servers(args.runtime, tls_config)).await },
-        );
+    let server_thread = tokio::spawn(async move {
+        Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config)).await
+    });
 
     tokio::select! {
         () = rt.load_components() => {},

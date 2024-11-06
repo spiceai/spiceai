@@ -26,10 +26,9 @@ static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http"));
 pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("http_requests_total").init());
 
-pub(crate) static REQUESTS_DURATION_SECONDS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+pub(crate) static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("http_requests_duration_seconds")
-        .with_unit("s")
-        .with_boundaries(telemetry::HISTOGRAM_BOUNDARIES_PRECISE_FLOAT.clone())
+        .f64_histogram("http_requests_duration_ms")
+        .with_unit("ms")
         .init()
 });

@@ -207,8 +207,9 @@ impl Model {
         };
 
         // TODO: Need to scan filenames from HF for [`ModelSource::HuggingFace`]. Below is a hack
-        // to determine if it's an LLM from HF.
-        if source == ModelSource::HuggingFace && self.params.contains_key("model_type") {
+        // to determine if it's an LLM from HF by check if an ML files are set manually.
+        let no_ml_files = self.files.iter().all(|f| !is_ml_file(Path::new(&f.path)));
+        if source == ModelSource::HuggingFace && no_ml_files {
             return Some(ModelType::Llm);
         }
         let mut files = self.files.clone();

@@ -18,19 +18,10 @@ use std::sync::LazyLock;
 
 use opentelemetry::{
     global,
-    metrics::{Counter, Histogram, Meter},
+    metrics::{Counter, Meter},
 };
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("query"));
-
-pub(crate) static DURATION_SECONDS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-    METER
-        .f64_histogram("query_duration_seconds")
-        .with_description("Duration in seconds to execute a query.")
-        .with_unit("s")
-        .with_boundaries(telemetry::HISTOGRAM_BOUNDARIES_PRECISE_FLOAT.clone())
-        .init()
-});
 
 pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER

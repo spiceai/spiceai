@@ -83,7 +83,7 @@
             "formulas": [
               {
                 "number_format": {
-                  "unit": { "type": "canonical_unit", "unit_name": "second" }
+                  "unit": { "type": "canonical_unit", "unit_name": "millisecond" }
                 },
                 "formula": "query1"
               }
@@ -92,7 +92,7 @@
               {
                 "data_source": "metrics",
                 "name": "query1",
-                "query": "avg:spice.query_duration_seconds_summary.quantile{$host, quantile:0.95}"
+                "query": "avg:spice.query_duration_ms_summary.quantile{$host, quantile:0.95}"
               }
             ],
             "response_format": "timeseries",
