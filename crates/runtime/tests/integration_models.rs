@@ -19,7 +19,6 @@ use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "models")]
 mod models;
-
 mod utils;
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
