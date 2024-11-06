@@ -30,8 +30,8 @@ use async_openai::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
+    FunctionObject,
 };
 
 use async_trait::async_trait;
@@ -248,7 +248,7 @@ impl ToolUsingChat {
             // Append spiced runtime tools to the request.
             let inner_req = self.add_runtime_tools(&req);
 
-            let resp = self.inner_chat.chat_request(inner_req).await?;
+            let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
             let usage = resp.usage.clone();
 
             let tools_used = resp
@@ -265,12 +265,11 @@ impl ToolUsingChat {
             {
                 // New messages means we have run spice tools locally, ready to recall model.
                 Some(messages) => {
-                    let new_req = CreateChatCompletionRequestArgs::default()
-                        .model(req.model)
-                        .messages(messages)
-                        .build()?;
                     let mut resp = self
-                        ._chat_request(new_req, recursion_limit.map(|r| r - 1))
+                        ._chat_request(
+                            create_new_recursive_req(&inner_req, messages),
+                            recursion_limit.map(|r| r - 1),
+                        )
                         .await?;
                     resp.usage = combine_usage(usage, resp.usage);
                     Ok(resp)
@@ -367,6 +366,23 @@ impl Chat for ToolUsingChat {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         self.inner_chat.as_sql()
     }
+}
+
+/// Create a new [`CreateChatCompletionRequest`] with new messages.
+///
+/// Remove `tool_choice` if it is named (since it was just used), and set it to `Auto`.
+fn create_new_recursive_req(
+    req: &CreateChatCompletionRequest,
+    new_msg: Vec<ChatCompletionRequestMessage>,
+) -> CreateChatCompletionRequest {
+    let mut new_req = req.clone();
+    new_req.messages = new_msg;
+    if let Some(ChatCompletionToolChoiceOption::Named(t)) = new_req.tool_choice {
+        tracing::debug!("Not recursively using tool_choice named={t:?} in subsequent calls.");
+        // Auto is default when tools exist.
+        new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Auto);
+    }
+    new_req
 }
 
 pub fn combine_usage(
@@ -524,9 +540,10 @@ fn make_a_stream(
                                 }
                             };
 
-                            let mut new_req = req.clone();
-                            new_req.messages.clone_from(&new_messages);
-                            match model._chat_stream(new_req).await {
+                            match model
+                                ._chat_stream(create_new_recursive_req(&req, new_messages))
+                                .await
+                            {
                                 Ok(mut s) => {
                                     while let Some(resp) = s.next().await {
                                         // TODO check if this works for choices > 1.
