@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use api_key::ApiKeyAuth;
 use app::App;
 
 pub mod api_key;
@@ -48,12 +49,31 @@ impl EndpointAuth {
             grpc_auth: None,
         }
     }
+
+    #[must_use]
+    pub fn with_http_auth(mut self, auth: Arc<dyn HttpAuth + Send + Sync>) -> Self {
+        self.http_auth = Some(auth);
+        self
+    }
+}
+
+impl Default for EndpointAuth {
+    fn default() -> Self {
+        Self::no_auth()
+    }
 }
 
 /// Gets the HTTP auth provider configured for the app, if any
 #[must_use]
-fn http_auth(_app: &App) -> Option<Arc<dyn HttpAuth + Send + Sync>> {
-    None
+fn http_auth(app: &App) -> Option<Arc<dyn HttpAuth + Send + Sync>> {
+    let api_key_auth = app
+        .runtime
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.api_key.as_ref())?;
+    println!("found api key auth");
+
+    Some(Arc::new(ApiKeyAuth::new(api_key_auth.keys.clone())))
 }
 
 #[must_use]

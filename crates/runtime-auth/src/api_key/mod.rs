@@ -45,3 +45,60 @@ impl HttpAuth for ApiKeyAuth {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::request::Builder;
+
+    fn create_request_parts(api_key: Option<&str>) -> http::request::Parts {
+        let mut builder = Builder::new().uri("https://example.com");
+
+        if let Some(key) = api_key {
+            builder = builder.header("X-API-Key", key);
+        }
+
+        let request = builder.body(()).expect("Failed to build request");
+        request.into_parts().0
+    }
+
+    #[test]
+    fn test_valid_api_key() {
+        let auth = ApiKeyAuth::new(vec!["valid-key".to_string()]);
+        let parts = create_request_parts(Some("valid-key"));
+
+        let result = auth.http(&parts);
+        assert!(matches!(result, Ok(AuthVerdict::Allow)));
+    }
+
+    #[test]
+    fn test_invalid_api_key() {
+        let auth = ApiKeyAuth::new(vec!["valid-key".to_string()]);
+        let parts = create_request_parts(Some("invalid-key"));
+
+        let result = auth.http(&parts);
+        assert!(matches!(result, Ok(AuthVerdict::Deny)));
+    }
+
+    #[test]
+    fn test_missing_api_key() {
+        let auth = ApiKeyAuth::new(vec!["valid-key".to_string()]);
+        let parts = create_request_parts(None);
+
+        let result = auth.http(&parts);
+        assert!(matches!(result, Ok(AuthVerdict::Deny)));
+    }
+
+    #[test]
+    fn test_multiple_valid_keys() {
+        let auth = ApiKeyAuth::new(vec![
+            "key1".to_string(),
+            "key2".to_string(),
+            "key3".to_string(),
+        ]);
+
+        let parts = create_request_parts(Some("key2"));
+        let result = auth.http(&parts);
+        assert!(matches!(result, Ok(AuthVerdict::Allow)));
+    }
+}
