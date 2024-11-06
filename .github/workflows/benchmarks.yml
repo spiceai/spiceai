@@ -78,242 +78,242 @@ jobs:
           name: spice_bench
           path: ./spice_bench
 
-  run-database-bench:
-    name: Run ${{ matrix.name }} ${{ matrix.bench }} Benchmark
-    runs-on: ubuntu-latest
-    needs: build-database-bench-binary
+  # run-database-bench:
+  #   name: Run ${{ matrix.name }} ${{ matrix.bench }} Benchmark
+  #   runs-on: ubuntu-latest
+  #   needs: build-database-bench-binary
 
-    services:
-      mysql_tpch:
-        image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
-        options: >-
-          --health-cmd="mysqladmin ping -uroot -proot --silent"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 3306:3306
-        env:
-          MYSQL_ROOT_PASSWORD: root
-      mysql_tpcds:
-        image: ${{ matrix.cmd == '-c mysql -b tpcds' && 'ghcr.io/spiceai/spice-mysql-tpcds-bench:latest' || '' }}
-        options: >-
-          --shm-size=10gb
-          --health-cmd="mysqladmin ping -uroot -proot --silent"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 3306:3306
-        env:
-          MYSQL_ROOT_PASSWORD: root
-      postgres_tpch:
-        image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
-        options: >-
-          --shm-size=2gb
-          --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-        env:
-          POSTGRES_PASSWORD: postgres
-      postgres_tpcds:
-        image: ${{ matrix.cmd == '-c postgres -b tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || '' }}
-        options: >-
-          --shm-size=2gb
-          --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-        env:
-          POSTGRES_PASSWORD: postgres
-      postgres_acc:
-        image: ${{( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
-        options: >-
-          --shm-size=2gb
-          --health-cmd="pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-        env:
-          POSTGRES_PASSWORD: postgres
+  #   services:
+  #     mysql_tpch:
+  #       image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
+  #       options: >-
+  #         --health-cmd="mysqladmin ping -uroot -proot --silent"
+  #         --health-interval 10s
+  #         --health-timeout 5s
+  #         --health-retries 5
+  #       ports:
+  #         - 3306:3306
+  #       env:
+  #         MYSQL_ROOT_PASSWORD: root
+  #     mysql_tpcds:
+  #       image: ${{ matrix.cmd == '-c mysql -b tpcds' && 'ghcr.io/spiceai/spice-mysql-tpcds-bench:latest' || '' }}
+  #       options: >-
+  #         --shm-size=10gb
+  #         --health-cmd="mysqladmin ping -uroot -proot --silent"
+  #         --health-interval 10s
+  #         --health-timeout 5s
+  #         --health-retries 5
+  #       ports:
+  #         - 3306:3306
+  #       env:
+  #         MYSQL_ROOT_PASSWORD: root
+  #     postgres_tpch:
+  #       image: ${{ matrix.cmd == '-c postgres' && 'ghcr.io/spiceai/spice-postgres-bench:latest' || '' }}
+  #       options: >-
+  #         --shm-size=2gb
+  #         --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
+  #         --health-interval 10s
+  #         --health-timeout 5s
+  #         --health-retries 5
+  #       ports:
+  #         - 5432:5432
+  #       env:
+  #         POSTGRES_PASSWORD: postgres
+  #     postgres_tpcds:
+  #       image: ${{ matrix.cmd == '-c postgres -b tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || '' }}
+  #       options: >-
+  #         --shm-size=2gb
+  #         --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
+  #         --health-interval 10s
+  #         --health-timeout 5s
+  #         --health-retries 5
+  #       ports:
+  #         - 5432:5432
+  #       env:
+  #         POSTGRES_PASSWORD: postgres
+  #     postgres_acc:
+  #       image: ${{( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+  #       options: >-
+  #         --shm-size=2gb
+  #         --health-cmd="pg_isready -U postgres"
+  #         --health-interval 10s
+  #         --health-timeout 5s
+  #         --health-retries 5
+  #       ports:
+  #         - 5432:5432
+  #       env:
+  #         POSTGRES_PASSWORD: postgres
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - cmd: '-c spice.ai'
-            name: 'spice.ai connector'
-            bench: 'tpch'
-          - cmd: '-c s3'
-            name: 's3 connector'
-            bench: 'tpch'
-          - cmd: '-c s3 -b tpcds'
-            name: 's3 connector'
-            bench: 'tpcds'
-          - cmd: '-c abfs'
-            name: 'abfs connector'
-            bench: 'tpch'
-          - cmd: '-c spark'
-            name: 'spark connector'
-            bench: 'tpch'
-          - cmd: '-c postgres'
-            name: 'postgres connector'
-            bench: 'tpch'
-          - cmd: '-c postgres -b tpcds'
-            name: 'postgres connector'
-            bench: 'tpcds'
-          - cmd: '-c mysql'
-            name: 'mysql connector'
-            bench: 'tpch'
-          - cmd: '-c mysql -b tpcds'
-            name: 'mysql connector'
-            bench: 'tpcds'
-          - cmd: '-c odbc-databricks'
-            name: 'odbc-databricks connector'
-            bench: 'tpch'
-          - cmd: '-c odbc-athena'
-            name: 'odbc-athena connector'
-            bench: 'tpch'
-          - cmd: '-c delta_lake'
-            name: 'delta_lake connector'
-            bench: 'tpch'
-          - cmd: '-a arrow'
-            name: 'arrow accelerator (memory mode)'
-            bench: 'tpch'
-          - cmd: '-a duckdb -m memory'
-            name: 'duckdb accelerator (memory mode)'
-            bench: 'tpch'
-          - cmd: '-a duckdb -m file'
-            name: 'duckdb accelerator (file mode)'
-            bench: 'tpch'
-          - cmd: '-a sqlite -m memory'
-            name: 'sqlite accelerator (memory mode)'
-            bench: 'tpch'
-          - cmd: '-a sqlite -m file'
-            name: 'sqlite accelerator (file mode)'
-            bench: 'tpch'
-          - cmd: '-a postgres'
-            name: 'postgres accelerator'
-            bench: 'tpch'
-          - cmd: '-a arrow -b tpcds'
-            name: 'arrow accelerator (memory mode)'
-            bench: 'tpcds'
-          - cmd: '-a duckdb -m memory -b tpcds'
-            name: 'duckdb accelerator (memory mode)'
-            bench: 'tpcds'
-          - cmd: '-a duckdb -m file -b tpcds'
-            name: 'duckdb accelerator (file mode)'
-            bench: 'tpcds'
-          - cmd: '-a sqlite -m memory -b tpcds'
-            name: 'sqlite accelerator (memory mode)'
-            bench: 'tpcds'
-          - cmd: '-a sqlite -m file -b tpcds'
-            name: 'sqlite accelerator (file mode)'
-            bench: 'tpcds'
-          - cmd: '-a postgres -b tpcds'
-            name: 'postgres accelerator'
-            bench: 'tpcds'
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - cmd: '-c spice.ai'
+  #           name: 'spice.ai connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c s3'
+  #           name: 's3 connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c s3 -b tpcds'
+  #           name: 's3 connector'
+  #           bench: 'tpcds'
+  #         - cmd: '-c abfs'
+  #           name: 'abfs connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c spark'
+  #           name: 'spark connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c postgres'
+  #           name: 'postgres connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c postgres -b tpcds'
+  #           name: 'postgres connector'
+  #           bench: 'tpcds'
+  #         - cmd: '-c mysql'
+  #           name: 'mysql connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c mysql -b tpcds'
+  #           name: 'mysql connector'
+  #           bench: 'tpcds'
+  #         - cmd: '-c odbc-databricks'
+  #           name: 'odbc-databricks connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c odbc-athena'
+  #           name: 'odbc-athena connector'
+  #           bench: 'tpch'
+  #         - cmd: '-c delta_lake'
+  #           name: 'delta_lake connector'
+  #           bench: 'tpch'
+  #         - cmd: '-a arrow'
+  #           name: 'arrow accelerator (memory mode)'
+  #           bench: 'tpch'
+  #         - cmd: '-a duckdb -m memory'
+  #           name: 'duckdb accelerator (memory mode)'
+  #           bench: 'tpch'
+  #         - cmd: '-a duckdb -m file'
+  #           name: 'duckdb accelerator (file mode)'
+  #           bench: 'tpch'
+  #         - cmd: '-a sqlite -m memory'
+  #           name: 'sqlite accelerator (memory mode)'
+  #           bench: 'tpch'
+  #         - cmd: '-a sqlite -m file'
+  #           name: 'sqlite accelerator (file mode)'
+  #           bench: 'tpch'
+  #         - cmd: '-a postgres'
+  #           name: 'postgres accelerator'
+  #           bench: 'tpch'
+  #         - cmd: '-a arrow -b tpcds'
+  #           name: 'arrow accelerator (memory mode)'
+  #           bench: 'tpcds'
+  #         - cmd: '-a duckdb -m memory -b tpcds'
+  #           name: 'duckdb accelerator (memory mode)'
+  #           bench: 'tpcds'
+  #         - cmd: '-a duckdb -m file -b tpcds'
+  #           name: 'duckdb accelerator (file mode)'
+  #           bench: 'tpcds'
+  #         - cmd: '-a sqlite -m memory -b tpcds'
+  #           name: 'sqlite accelerator (memory mode)'
+  #           bench: 'tpcds'
+  #         - cmd: '-a sqlite -m file -b tpcds'
+  #           name: 'sqlite accelerator (file mode)'
+  #           bench: 'tpcds'
+  #         - cmd: '-a postgres -b tpcds'
+  #           name: 'postgres accelerator'
+  #           bench: 'tpcds'
 
-    steps:
-      - name: Checkout repository
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        uses: actions/checkout@v4
+  #   steps:
+  #     - name: Checkout repository
+  #       if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+  #       uses: actions/checkout@v4
 
-      - name: Set up Spice.ai API Key
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: |
-          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
+  #     - name: Set up Spice.ai API Key
+  #       if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+  #       run: |
+  #         echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
-      - name: Increase swapfile
-        run: |
-          df -h
-          sudo swapoff -a
-          sudo fallocate -l 10G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo swapon --show
+  #     - name: Increase swapfile
+  #       run: |
+  #         df -h
+  #         sudo swapoff -a
+  #         sudo fallocate -l 10G /swapfile
+  #         sudo chmod 600 /swapfile
+  #         sudo mkswap /swapfile
+  #         sudo swapon /swapfile
+  #         sudo swapon --show
 
-      - name: Download benchmark binary
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        uses: actions/download-artifact@v4
-        with:
-          name: spice_bench
+  #     - name: Download benchmark binary
+  #       if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: spice_bench
 
-      - name: 'Restart accelerator service container with customize configurations'
-        if: ( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
-        run: |
-          docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "shared_buffers=1GB" >> /var/lib/postgresql/data/postgresql.conf'
-          docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "work_mem=256MB" >> /var/lib/postgresql/data/postgresql.conf'
-          docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "max_wal_size=6GB" >> /var/lib/postgresql/data/postgresql.conf'
-          docker kill --signal=SIGHUP ${{ job.services.postgres_acc.id }}
+  #     - name: 'Restart accelerator service container with customize configurations'
+  #       if: ( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+  #       run: |
+  #         docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "shared_buffers=1GB" >> /var/lib/postgresql/data/postgresql.conf'
+  #         docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "work_mem=256MB" >> /var/lib/postgresql/data/postgresql.conf'
+  #         docker exec ${{ job.services.postgres_acc.id }} sh -c 'echo "max_wal_size=6GB" >> /var/lib/postgresql/data/postgresql.conf'
+  #         docker kill --signal=SIGHUP ${{ job.services.postgres_acc.id }}
 
-      - name: Install Databricks ODBC driver
-        if: matrix.cmd == '-c odbc-databricks' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
-        run: |
-          sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
-          wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
-          unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
-          sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
-          cat <<EOF > /tmp/odbcinst.ini
-          [Simba Spark ODBC Driver]
-          Description=Simba Spark ODBC Driver
-          Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
-          Setup=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
-          EOF
-          sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
+  #     - name: Install Databricks ODBC driver
+  #       if: matrix.cmd == '-c odbc-databricks' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+  #       run: |
+  #         sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
+  #         wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
+  #         unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
+  #         sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
+  #         cat <<EOF > /tmp/odbcinst.ini
+  #         [Simba Spark ODBC Driver]
+  #         Description=Simba Spark ODBC Driver
+  #         Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
+  #         Setup=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
+  #         EOF
+  #         sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
 
-      - name: Install Athena ODBC driver
-        if: matrix.cmd == '-c odbc-athena' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
-        run: |
-          sudo apt-get install alien -y
-          wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
-          sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
-          cat <<EOF > /tmp/odbcinst.ini
-          [Amazon Athena ODBC Driver]
-          Description=Amazon Athena ODBC Driver
-          Driver=/opt/athena/odbc/lib/libathena-odbc.so
-          Setup=/opt/athena/odbc/lib/libathena-odbc.so
-          EOF
-          sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
+  #     - name: Install Athena ODBC driver
+  #       if: matrix.cmd == '-c odbc-athena' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+  #       run: |
+  #         sudo apt-get install alien -y
+  #         wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
+  #         sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
+  #         cat <<EOF > /tmp/odbcinst.ini
+  #         [Amazon Athena ODBC Driver]
+  #         Description=Amazon Athena ODBC Driver
+  #         Driver=/opt/athena/odbc/lib/libathena-odbc.so
+  #         Setup=/opt/athena/odbc/lib/libathena-odbc.so
+  #         EOF
+  #         sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
 
-      - name: Make benchmark binary executable
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: chmod +x ./spice_bench
+  #     - name: Make benchmark binary executable
+  #       if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+  #       run: chmod +x ./spice_bench
 
-      - name: Run benchmark with ${{ matrix.name }}
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: ./spice_bench --bench ${{ matrix.cmd }}
-        continue-on-error: true
-        env:
-          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
-          PG_BENCHMARK_PG_HOST: localhost
-          PG_BENCHMARK_PG_USER: postgres
-          PG_BENCHMARK_PG_PASS: postgres
-          PG_BENCHMARK_PG_SSLMODE: disable
-          PG_TPCH_BENCHMARK_PG_DBNAME: tpch_sf1
-          PG_TPCDS_BENCHMARK_PG_DBNAME: tpcds_sf1
-          PG_BENCHMARK_ACC_PG_DBNAME: postgres
-          SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
-          MYSQL_BENCHMARK_MYSQL_HOST: localhost
-          MYSQL_BENCHMARK_MYSQL_USER: root
-          MYSQL_BENCHMARK_MYSQL_PASS: root
-          MYSQL_TPCH_BENCHMARK_MYSQL_DB: tpch_sf1
-          MYSQL_TPCDS_BENCHMARK_MYSQL_DB: tpcds_sf1
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+  #     - name: Run benchmark with ${{ matrix.name }}
+  #       if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+  #       run: ./spice_bench --bench ${{ matrix.cmd }}
+  #       continue-on-error: true
+  #       env:
+  #         UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+  #         PG_BENCHMARK_PG_HOST: localhost
+  #         PG_BENCHMARK_PG_USER: postgres
+  #         PG_BENCHMARK_PG_PASS: postgres
+  #         PG_BENCHMARK_PG_SSLMODE: disable
+  #         PG_TPCH_BENCHMARK_PG_DBNAME: tpch_sf1
+  #         PG_TPCDS_BENCHMARK_PG_DBNAME: tpcds_sf1
+  #         PG_BENCHMARK_ACC_PG_DBNAME: postgres
+  #         SPICE_SPARK_REMOTE: ${{ secrets.SPICE_SPARK_REMOTE }}
+  #         MYSQL_BENCHMARK_MYSQL_HOST: localhost
+  #         MYSQL_BENCHMARK_MYSQL_USER: root
+  #         MYSQL_BENCHMARK_MYSQL_PASS: root
+  #         MYSQL_TPCH_BENCHMARK_MYSQL_DB: tpch_sf1
+  #         MYSQL_TPCDS_BENCHMARK_MYSQL_DB: tpcds_sf1
+  #         DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  #         DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
+  #         DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+  #         AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+  #         AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+  #         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+  #         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
 
   run-clickbench:
     name: Run ${{ matrix.name }} Clickbench
