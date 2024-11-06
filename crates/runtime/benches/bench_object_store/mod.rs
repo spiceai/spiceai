@@ -357,6 +357,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn get_clickbench_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         (

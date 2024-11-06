@@ -342,16 +342,3 @@ fn make_dataset(path: &str, name: &str, bench_name: &str) -> Dataset {
     dataset.params = Some(Params::from_string_map(params.into_iter().collect()));
     dataset
 }
-
-fn make_clickbench_dataset(path: &str, name: &str) -> Dataset {
-    let mut dataset = Dataset::new(format!("s3://{path}"), name.to_string());
-    dataset.params = Some(Params::from_string_map(
-        vec![
-            ("file_format".to_string(), "parquet".to_string()),
-            ("client_timeout".to_string(), "3h".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    ));
-    dataset
-}
