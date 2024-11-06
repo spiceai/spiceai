@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use app::App;
-use arrow_schema::{Fields, Schema};
+use arrow_schema::{Field, Fields, Schema};
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -31,7 +31,7 @@ use llms::chat::nsql::default;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spicepod::component::dataset::column::Column;
+use spicepod::component::dataset::{column::Column, Dataset};
 use std::{collections::HashMap, io::empty, sync::Arc};
 
 use crate::{
@@ -53,6 +53,7 @@ pub struct TableSchemaToolParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum OutputType {
     #[default]
     Full,
@@ -161,6 +162,7 @@ impl TableSchemaTool {
     }
 
     /// Retrieve column information for the given tables. Output order is the same as the input order.
+    /// Output Hashmap is column name to [`Column`].
     fn column_information_for_tables(
         tables: &[String],
         app: Arc<App>,
@@ -168,7 +170,7 @@ impl TableSchemaTool {
         tables
             .iter()
             .map(|t| {
-                let Some(table) = app.datasets.iter().find(|d| d.name == *t) else {
+                let Some(table) = Self::table_in_app(&app, t) else {
                     return HashMap::new();
                 };
                 table
@@ -178,6 +180,15 @@ impl TableSchemaTool {
                     .collect()
             })
             .collect_vec()
+    }
+
+    /// Checks if a given table exists in the app, by resolving and comparing as [`TableReference`].
+    fn table_in_app<'a>(app: &'a App, table: &str) -> Option<&'a Dataset> {
+        let tbl = TableReference::parse_str(table);
+
+        app.datasets
+            .iter()
+            .find(|d| tbl.resolved_eq(&TableReference::parse_str(&d.name)))
     }
 
     /// Creates a [`ChatCompletionRequestToolMessage`] as if a language model had called this tool.
