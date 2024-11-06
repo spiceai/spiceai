@@ -249,6 +249,16 @@ impl ToolUsingChat {
             let inner_req = self.add_runtime_tools(&req);
 
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
+            let proceed_with_tools = resp.choices.first().is_some_and(|c| {
+                c.finish_reason
+                    .is_some_and(|f| matches!(f, FinishReason::ToolCalls))
+            });
+
+            // Return reason was not to call tools, so return early.
+            if !proceed_with_tools {
+                return Ok(resp);
+            }
+
             let usage = resp.usage.clone();
 
             let tools_used = resp
@@ -267,7 +277,7 @@ impl ToolUsingChat {
                 Some(messages) => {
                     let mut resp = self
                         ._chat_request(
-                            create_new_recursive_req(&inner_req, messages),
+                            create_new_recursive_req(&inner_req, messages, &resp.usage),
                             recursion_limit.map(|r| r - 1),
                         )
                         .await?;
@@ -374,6 +384,7 @@ impl Chat for ToolUsingChat {
 fn create_new_recursive_req(
     req: &CreateChatCompletionRequest,
     new_msg: Vec<ChatCompletionRequestMessage>,
+    marginal_usage: &Option<CompletionUsage>,
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
@@ -382,6 +393,15 @@ fn create_new_recursive_req(
         // Auto is default when tools exist.
         new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Auto);
     }
+
+    // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
+    if let Some(max_completion_tokens) = new_req.max_completion_tokens {
+        if let Some(usage) = marginal_usage {
+            new_req.max_completion_tokens =
+                Some(max_completion_tokens.saturating_sub(usage.completion_tokens));
+        }
+    }
+
     new_req
 }
 
@@ -541,7 +561,11 @@ fn make_a_stream(
                             };
 
                             match model
-                                ._chat_stream(create_new_recursive_req(&req, new_messages))
+                                ._chat_stream(create_new_recursive_req(
+                                    &req,
+                                    new_messages,
+                                    &response.usage,
+                                ))
                                 .await
                             {
                                 Ok(mut s) => {
