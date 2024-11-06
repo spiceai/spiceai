@@ -1,0 +1,13 @@
+[package]
+description = "Authentication traits/middleware for the Spice runtime"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-auth"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+app = { path = "../app" }
+axum.workspace = true

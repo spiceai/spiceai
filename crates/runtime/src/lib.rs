@@ -379,6 +379,7 @@ impl Runtime {
             config.clone().into(),
             self.metrics_endpoint,
             tls_config.clone(),
+            None,
         ));
 
         // Spawn the metrics server in the background

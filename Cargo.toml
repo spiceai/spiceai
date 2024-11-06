@@ -13,6 +13,8 @@ members = [
   "crates/model_components",
   "crates/ns_lookup",
   "crates/otel-arrow",
+  "crates/runtime",
+  "crates/runtime-auth",
   "crates/spicepod",
   "crates/spice_cloud",
   "crates/telemetry",
@@ -43,6 +45,7 @@ arrow-flight = "53"
 arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6013498d7d4d59f7b16d0e28b3e0b379732fbf07" }
 arrow-ipc = "53"
 arrow-schema = "53"
+axum = { version = "0.7.7", features = ["macros"] }
 parquet = "53"
 arrow-odbc = "11.2.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "df4fc93b21711a46e6cd3e91ecea72b4f32c856f" }
@@ -114,6 +117,7 @@ tokio-util = { version = "0.7.11", features = ["compat"] }
 tokio-stream = { version = "0.1.16", features = ["sync"] }
 tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
+tower = "0.5.1"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing-opentelemetry = "0.27"

@@ -9479,6 +9479,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.9",
+ "runtime-auth",
  "rusqlite",
  "rustls 0.23.16",
  "rustls-pemfile 2.2.0",
@@ -9502,6 +9503,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
+ "tower 0.5.1",
  "tracing",
  "tracing-futures",
  "tracing-subscriber",
@@ -9510,6 +9512,14 @@ dependencies = [
  "util",
  "uuid 1.11.0",
  "x509-certificate",
+]
+
+[[package]]
+name = "runtime-auth"
+version = "1.0.0-rc.1"
+dependencies = [
+ "app",
+ "axum",
 ]
 
 [[package]]

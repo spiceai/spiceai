@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
+use auth::AuthLayer;
 use axum::Router;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -24,6 +25,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use model_components::model::Model;
+use runtime_auth::HttpAuth;
 use snafu::prelude::*;
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -40,6 +42,7 @@ use crate::{
     tls::TlsConfig,
 };
 
+mod auth;
 mod metrics;
 mod routes;
 mod v1;
@@ -66,6 +69,7 @@ pub(crate) async fn start<A>(
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
     tls_config: Option<Arc<TlsConfig>>,
+    auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
@@ -75,7 +79,8 @@ where
         Arc::clone(&embeddings),
         parse_explicit_primary_keys(Arc::clone(&app)).await,
     ));
-    let routes = routes::routes(
+
+    let mut routes: Router = routes::routes(
         app,
         df,
         models,
@@ -85,6 +90,10 @@ where
         with_metrics,
         vsearch,
     );
+
+    if let Some(auth_provider) = auth_provider {
+        routes = routes.layer(AuthLayer::new(auth_provider));
+    }
 
     let listener = TcpListener::bind(&bind_address)
         .await
