@@ -280,15 +280,15 @@ jobs:
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: chmod +x ./spice_bench
 
-      - name: Generate DuckDB Connector Data
+      - name: Download DuckDB Connector Data
         if: matrix.cmd == '-c duckdb' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
-          aws s3 cp s3://spiceai-public-datasets/duckdb/tpch.db . --no-sign-request
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpch.db
 
-      - name: Generate DuckDB Connector Data
+      - name: Download DuckDB Connector Data
         if: matrix.cmd == '-c duckdb -b tpcds' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
-          aws s3 cp s3://spiceai-public-datasets/duckdb/tpcds.db . --no-sign-request
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpcds.db
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
