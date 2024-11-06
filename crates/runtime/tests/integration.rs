@@ -14,18 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::{
     execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
-use futures::Future;
+
 use runtime::{datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
-
 mod abfs;
 mod acceleration;
 mod catalog;
@@ -50,6 +49,7 @@ mod s3;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
+mod utils;
 
 // MySQL is required for the rehydration tests
 #[cfg(feature = "mysql")]
@@ -233,28 +233,6 @@ where
     }
 
     Ok(())
-}
-
-async fn runtime_ready_check(rt: &Runtime) {
-    assert!(wait_until_true(Duration::from_secs(30), || async { rt.status().is_ready() }).await);
-}
-
-async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let start = std::time::Instant::now();
-
-    while start.elapsed() < max_wait {
-        if f().await {
-            return true;
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    false
 }
 
 fn container_registry() -> String {

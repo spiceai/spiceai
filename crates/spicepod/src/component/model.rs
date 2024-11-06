@@ -132,6 +132,20 @@ impl Display for ModelType {
 
 impl Model {
     #[must_use]
+    pub fn new(from: impl Into<String>, name: impl Into<String>) -> Self {
+        Model {
+            from: from.into(),
+            name: name.into(),
+            description: None,
+            metadata: HashMap::default(),
+            files: Vec::default(),
+            params: HashMap::default(),
+            datasets: Vec::default(),
+            depends_on: Vec::default(),
+        }
+    }
+
+    #[must_use]
     pub fn get_all_file_paths(&self) -> Vec<String> {
         self.files.iter().map(|f| f.path.clone()).collect()
     }

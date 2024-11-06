@@ -27,7 +27,7 @@ use spicepod::component::dataset::Dataset;
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
-use crate::{get_test_datafusion, init_tracing, runtime_ready_check};
+use crate::{get_test_datafusion, init_tracing, utils::runtime_ready_check};
 
 #[tokio::test]
 async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {

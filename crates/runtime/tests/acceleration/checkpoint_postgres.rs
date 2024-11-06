@@ -28,7 +28,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     get_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params, get_random_port},
-    runtime_ready_check,
+    utils::runtime_ready_check,
 };
 
 #[tokio::test]

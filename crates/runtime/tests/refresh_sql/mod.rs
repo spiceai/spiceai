@@ -27,7 +27,10 @@ use runtime::{
 };
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
 
-use crate::{init_tracing, runtime_ready_check, wait_until_true};
+use crate::{
+    init_tracing,
+    utils::{runtime_ready_check, wait_until_true},
+};
 
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
