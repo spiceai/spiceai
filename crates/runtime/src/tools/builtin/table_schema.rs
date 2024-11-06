@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use app::App;
-use arrow_schema::{Field, Fields, Schema};
+use arrow_schema::{Field, Schema};
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -27,15 +27,13 @@ use async_openai::{
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
-use llms::chat::nsql::default;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spicepod::component::dataset::{column::Column, Dataset};
-use std::{collections::HashMap, io::empty, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    datafusion::DataFusion,
     tools::{parameters, SpiceModelTool},
     Runtime,
 };
