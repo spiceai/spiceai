@@ -82,7 +82,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("client_timeout")
         .description("The timeout setting for S3 client."),
     ParameterSpec::runtime("allow_http")
-        .description("Allow HTTP protocal for S3 endpoint."),
+        .description("Allow HTTP protocol for S3 endpoint."),
 
     // Common listing table parameters
     ParameterSpec::runtime("file_format"),
