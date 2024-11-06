@@ -90,15 +90,12 @@ impl TableSchemaTool {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = serde_json::to_string(&req).boxed()?);
         let TableSchemaToolParams { tables, output } = req;
 
-        // Only need column info for full output
-        let column_info: Vec<HashMap<String, Column>> = if matches!(output, OutputType::Full) {
-            if let Some(app) = rt.app.read().await.clone() {
+        // Precompute extra column details only if needed (for `full` output).
+        let column_info = match (output, rt.app.read().await.clone()) {
+            (OutputType::Full, Some(app)) => {
                 Self::column_information_for_tables(tables.as_slice(), app)
-            } else {
-                vec![]
             }
-        } else {
-            vec![]
+            _ => vec![],
         };
 
         let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
@@ -120,23 +117,23 @@ impl TableSchemaTool {
 
                     if let Some(columns) = column_info.get(i) {
                         fields = fields
-                            .iter()
+                            .into_iter()
                             .map(|f| {
-                                if let Some(c) = columns.get(f.name()) {
-                                    Arc::new(
-                                        Field::new(
-                                            f.name(),
-                                            f.data_type().clone(),
-                                            f.is_nullable(),
+                                columns.get(f.name()).map_or_else(
+                                    || f.clone(),
+                                    |c| {
+                                        Arc::new(
+                                            Field::new(
+                                                f.name(),
+                                                f.data_type().clone(),
+                                                f.is_nullable(),
+                                            )
+                                            .with_metadata(c.metadata()),
                                         )
-                                        .with_metadata(c.metadata()),
-                                    )
-                                } else {
-                                    f.clone()
-                                }
+                                    },
+                                )
                             })
-                            .collect_vec()
-                            .into();
+                            .collect();
                     }
 
                     Schema::new_with_metadata(fields, metadata)
