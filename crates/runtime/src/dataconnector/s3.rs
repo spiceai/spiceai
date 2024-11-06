@@ -81,6 +81,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("auth").description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.").secret(),
     ParameterSpec::runtime("client_timeout")
         .description("The timeout setting for S3 client."),
+    ParameterSpec::runtime("allow_http")
+        .description("Allow HTTP protocol for S3 endpoint."),
 
     // Common listing table parameters
     ParameterSpec::runtime("file_format"),
@@ -175,6 +177,7 @@ impl ListingTableConnector for S3 {
                 "key",
                 "secret",
                 "client_timeout",
+                "allow_http",
                 "auth",
             ],
         )));

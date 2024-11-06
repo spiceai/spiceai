@@ -64,7 +64,7 @@ pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
-    let connection_string = "Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so;Host=${ env:DATABRICKS_HOST };Port=443;HTTPPath=${ env:DATABRICKS_ODBC_PATH };SSL=1;ThriftTransport=2;AuthMech=3;UID=token;PWD=${ env:DATABRICKS_TOKEN }".to_string();
+    let connection_string = "Driver={Simba Spark ODBC Driver};Host=${ env:DATABRICKS_HOST };Port=443;HTTPPath=${ env:DATABRICKS_ODBC_PATH };SSL=1;ThriftTransport=2;AuthMech=3;UID=token;PWD=${ env:DATABRICKS_TOKEN }".to_string();
 
     dataset.params = Some(Params::from_string_map(
         vec![("odbc_connection_string".to_string(), connection_string)]

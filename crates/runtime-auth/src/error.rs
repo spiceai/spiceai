@@ -14,18 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+#[derive(Debug)]
+pub enum Error {
+    HttpAuthError(Box<dyn std::error::Error + Send + Sync>),
+}
 
-use crate::status::RuntimeStatus;
-use axum::{
-    http::status,
-    response::{IntoResponse, Response},
-    Extension,
-};
-
-pub(crate) async fn get(Extension(status): Extension<Arc<RuntimeStatus>>) -> Response {
-    if status.is_ready() {
-        return (status::StatusCode::OK, "Ready").into_response();
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::HttpAuthError(e) => write!(f, "Error validating HTTP request: {e}"),
+        }
     }
-    (status::StatusCode::SERVICE_UNAVAILABLE, "Not Ready").into_response()
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::HttpAuthError(e) => Some(e.as_ref()),
+        }
+    }
 }

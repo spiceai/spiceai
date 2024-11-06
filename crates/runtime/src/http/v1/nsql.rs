@@ -15,25 +15,21 @@ limitations under the License.
 */
 use crate::{
     datafusion::DataFusion,
-    http::v1::sql_to_http_response,
+    http::v1::{sql_to_http_response, ArrowFormat},
     model::LLMModelStore,
-    tools::builtin::{
-        sample::{
-            distinct::DistinctColumnsParams, random::RandomSampleParams, tool::SampleDataTool,
-            SampleTableParams,
+    tools::{
+        builtin::{
+            sample::{
+                distinct::DistinctColumnsParams, random::RandomSampleParams, tool::SampleDataTool,
+                SampleTableParams,
+            },
+            table_schema::{TableSchemaTool, TableSchemaToolParams},
         },
-        table_schema::{TableSchemaTool, TableSchemaToolParams},
+        create_tool_use_messages,
     },
+    Runtime,
 };
-use async_openai::{
-    error::OpenAIError,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestToolMessageContent, ChatCompletionToolType, FunctionCall,
-    },
-};
+use async_openai::types::ChatCompletionRequestMessage;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -46,13 +42,10 @@ use headers_accept::Accept;
 use itertools::Itertools;
 use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::Span;
 use tracing_futures::Instrument;
-
-use super::ArrowFormat;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -73,9 +66,9 @@ fn clean_model_based_sql(input: &str) -> String {
 /// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
 async fn sample_messages(
     sample_from: &[TableReference],
-    df: Arc<DataFusion>,
+    rt: Arc<Runtime>,
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut messages = Vec::with_capacity(4 * sample_from.len());
+    let mut messages = Vec::new();
 
     for dataset in sample_from {
         for params in [
@@ -89,82 +82,18 @@ async fn sample_messages(
                 limit: 3,
             }),
         ] {
-            let (req, resp) = call_sample_and_create_messages(Arc::clone(&df), &params)
-                .instrument(Span::current())
-                .await?;
-            messages.push(req.into());
-            messages.push(resp.into());
+            let msgs = create_tool_use_messages(
+                Arc::clone(&rt),
+                &SampleDataTool::new((&params).into()),
+                "id",
+                params,
+            )
+            .instrument(Span::current())
+            .await?;
+            messages.extend(msgs);
         }
     }
     Ok(messages)
-}
-
-/// Runs the [`TableSchemaTool`] on the provided tables and returns an Assistant and Tool message as if requested by a language model.
-async fn schema_messages(
-    df: Arc<DataFusion>,
-    tables: &[TableReference],
-) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
-    let schema_tool = TableSchemaTool::default();
-    let schema_tool_params =
-        TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>());
-
-    let table_schemas = schema_tool
-        .get_schema(Arc::clone(&df), &schema_tool_params)
-        .instrument(Span::current())
-        .await?;
-    let table_schema_assistant_msg = schema_tool
-        .to_assistant_request_message("schemas-nsql", &schema_tool_params)
-        .boxed()?;
-    let table_schema_tool_msg = schema_tool
-        .to_tool_response_message("schemas-nsql", &table_schemas)
-        .boxed()?;
-
-    Ok(vec![
-        table_schema_assistant_msg.into(),
-        table_schema_tool_msg.into(),
-    ])
-}
-
-/// Call the `sample_data` tool with the given parameters and create associated Assistant and Tool messages.
-async fn call_sample_and_create_messages(
-    df: Arc<DataFusion>,
-    params: &SampleTableParams,
-) -> Result<
-    (
-        ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestToolMessage,
-    ),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let ds = params.dataset();
-    let result = SampleDataTool::new(params.into())
-        .call_with(params, Arc::clone(&df))
-        .instrument(Span::current())
-        .await?;
-
-    let req = ChatCompletionRequestAssistantMessageArgs::default()
-        .tool_calls(vec![ChatCompletionMessageToolCall {
-            id: format!("distinct-{ds}-nsql"),
-            r#type: ChatCompletionToolType::Function,
-            function: FunctionCall {
-                name: "sample_data".to_string(),
-                arguments: serde_json::to_string(&params)
-                    .map_err(OpenAIError::JSONDeserialize)?
-                    .to_string(),
-            },
-        }])
-        .build()
-        .boxed()?;
-
-    let resp = ChatCompletionRequestToolMessageArgs::default()
-        .tool_call_id(format!("distinct-{ds}-nsql"))
-        .content(ChatCompletionRequestToolMessageContent::Text(
-            result.to_string(),
-        ))
-        .build()
-        .boxed()?;
-
-    Ok((req, resp))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +121,7 @@ fn default_model() -> String {
 
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     accept: Option<TypedHeader<Accept>>,
     Json(payload): Json<Request>,
@@ -205,9 +135,14 @@ pub(crate) async fn post(
         .unwrap_or(df.get_user_table_names());
 
     // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
-    let schema_messages = match schema_messages(Arc::clone(&df), &tables)
-        .instrument(span.clone())
-        .await
+    let schema_messages = match create_tool_use_messages(
+        Arc::clone(&rt),
+        &TableSchemaTool::default(),
+        "schemas-nsql",
+        TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
+    )
+    .instrument(span.clone())
+    .await
     {
         Ok(m) => m,
         Err(e) => {
@@ -217,8 +152,8 @@ pub(crate) async fn post(
     };
 
     // Create sample data assistant/tool messages if user wants to sample from dataset(s).
-    let tool_use_messages = if payload.sample_data_enabled {
-        match sample_messages(&tables, Arc::clone(&df))
+    let sample_data_messages = if payload.sample_data_enabled {
+        match sample_messages(&tables, Arc::clone(&rt))
             .instrument(span.clone())
             .await
         {
@@ -232,41 +167,37 @@ pub(crate) async fn post(
         vec![]
     };
 
-    let sql_query_result = match llms.read().await.get(&payload.model) {
-        Some(nql_model) => {
-            let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
-            let Ok(mut req) = sql_gen.create_request_for_query(&payload.model, &payload.query)
-            else {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Error preparing data for NQL model".to_string(),
-                )
-                    .into_response();
-            };
+    let models = llms.read().await;
+    let Some(nql_model) = models.get(&payload.model) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Model {} not found", payload.model),
+        )
+            .into_response();
+    };
 
-            req.messages.extend(schema_messages);
-            req.messages.extend(tool_use_messages);
+    let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
+    let Ok(mut req) = sql_gen.create_request_for_query(&payload.model, &payload.query) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Error preparing data for NQL model".to_string(),
+        )
+            .into_response();
+    };
 
-            let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Error running NQL model: {e}");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
-            };
-            sql_gen.parse_response(resp)
-        }
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Model {} not found", payload.model),
-            )
-                .into_response()
+    req.messages.extend(schema_messages);
+    req.messages.extend(sample_data_messages);
+
+    let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Error running NQL model: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
     // Run the SQL from the NSQL model through datafusion.
-    match sql_query_result {
+    match sql_gen.parse_response(resp) {
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
             tracing::trace!("Running query:\n{cleaned_query}");

@@ -14,16 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::config;
 use crate::embeddings::vector_search;
-use crate::model::EmbeddingModelStore;
-use crate::model::LLMModelStore;
-use crate::{config, datafusion::DataFusion};
-use app::App;
+use crate::Runtime;
+
 use axum::routing::patch;
-use model_components::model::Model;
 use opentelemetry::KeyValue;
-use std::net::SocketAddr;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -34,23 +31,17 @@ use axum::{
     routing::{get, post, Router},
     Extension,
 };
-use tokio::{sync::RwLock, time::Instant};
+use tokio::time::Instant;
 
-use super::{metrics, v1};
+use super::{auth::AuthLayer, metrics, v1};
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn routes(
-    app: Arc<RwLock<Option<Arc<App>>>>,
-    df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<LLMModelStore>>,
-    embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    with_metrics: Option<SocketAddr>,
     vector_search: Arc<vector_search::VectorSearch>,
+    auth_layer: Option<AuthLayer>,
 ) -> Router {
-    let mut router = Router::new()
-        .route("/health", get(|| async { "ok\n" }))
+    let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
@@ -64,12 +55,10 @@ pub(crate) fn routes(
             "/v1/datasets/:name/acceleration",
             patch(v1::datasets::acceleration),
         )
-        .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/ready", get(v1::ready::get))
-        .route_layer(middleware::from_fn(track_metrics));
+        .route("/v1/spicepods", get(v1::spicepods::get));
 
     if cfg!(feature = "models") {
-        router = router
+        authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
@@ -77,18 +66,32 @@ pub(crate) fn routes(
             .route("/v1/chat/completions", post(v1::chat::post))
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
-            .layer(Extension(llms))
-            .layer(Extension(models))
+            .layer(Extension(Arc::clone(&rt.llms)))
+            .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(vector_search))
-            .layer(Extension(embeddings));
+            .layer(Extension(Arc::clone(&rt.embeds)));
     }
 
-    router = router
-        .layer(Extension(app))
-        .layer(Extension(df))
-        .layer(Extension(with_metrics))
+    authenticated_router = authenticated_router
+        .layer(Extension(Arc::clone(&rt.app)))
+        .layer(Extension(Arc::clone(&rt.df)))
+        .layer(Extension(Arc::clone(rt)))
+        .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
-    router
+
+    // If we have an auth layer, add it to the authenticated router
+    if let Some(auth_layer) = auth_layer {
+        authenticated_router = authenticated_router.route_layer(auth_layer);
+    }
+
+    let unauthenticated_router = Router::new()
+        .route("/health", get(|| async { "ok\n" }))
+        .route("/v1/ready", get(v1::ready::get))
+        .layer(Extension(Arc::clone(&rt.status)));
+
+    unauthenticated_router
+        .merge(authenticated_router)
+        .route_layer(middleware::from_fn(track_metrics))
 }
 
 async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {

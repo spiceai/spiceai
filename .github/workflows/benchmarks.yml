@@ -261,6 +261,13 @@ jobs:
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
+          cat <<EOF > /tmp/odbcinst.ini
+          [Simba Spark ODBC Driver]
+          Description=Simba Spark ODBC Driver
+          Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
+          Setup=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
+          EOF
+          sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
 
       - name: Install Athena ODBC driver
         if: matrix.cmd == '-c odbc-athena' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
@@ -268,6 +275,13 @@ jobs:
           sudo apt-get install alien -y
           wget https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm
           sudo alien -i AmazonAthenaODBC-2.0.3.0.rpm
+          cat <<EOF > /tmp/odbcinst.ini
+          [Amazon Athena ODBC Driver]
+          Description=Amazon Athena ODBC Driver
+          Driver=/opt/athena/odbc/lib/libathena-odbc.so
+          Setup=/opt/athena/odbc/lib/libathena-odbc.so
+          EOF
+          sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
 
       - name: Make benchmark binary executable
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'

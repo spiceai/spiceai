@@ -50,6 +50,7 @@ use model::{
 };
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
+use runtime_auth::EndpointAuth;
 use secrecy::SecretString;
 use secrets::ParamStr;
 use snafu::prelude::*;
@@ -362,23 +363,20 @@ impl Runtime {
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
     pub async fn start_servers(
-        &self,
+        self: Arc<Self>,
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
+        endpoint_auth: EndpointAuth,
     ) -> Result<()> {
         self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
         let http_server_future = tokio::spawn(http::start(
             config.http_bind_address,
-            Arc::clone(&self.app),
-            Arc::clone(&self.df),
-            Arc::clone(&self.models),
-            Arc::clone(&self.llms),
-            Arc::clone(&self.embeds),
+            Arc::clone(&self),
             config.clone().into(),
-            self.metrics_endpoint,
             tls_config.clone(),
+            endpoint_auth.http_auth,
         ));
 
         // Spawn the metrics server in the background

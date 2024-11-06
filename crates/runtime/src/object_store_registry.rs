@@ -73,6 +73,14 @@ impl SpiceObjectStoreRegistry {
                     DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
                 })?);
         }
+        if let Some(allow_http) = params.get("allow_http") {
+            let as_bool = allow_http.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{allow_http} is not a valid boolean for allow_http"
+                ))
+            })?;
+            client_options = client_options.with_allow_http(as_bool);
+        }
         if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
