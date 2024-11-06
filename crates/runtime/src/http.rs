@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{fmt::Debug, sync::Arc};
 
-use app::App;
 use auth::AuthLayer;
 use axum::Router;
 use hyper_util::{
