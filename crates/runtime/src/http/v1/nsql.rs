@@ -24,6 +24,7 @@ use crate::{
         },
         table_schema::{TableSchemaTool, TableSchemaToolParams},
     },
+    Runtime,
 };
 use async_openai::{
     error::OpenAIError,
@@ -101,7 +102,7 @@ async fn sample_messages(
 
 /// Runs the [`TableSchemaTool`] on the provided tables and returns an Assistant and Tool message as if requested by a language model.
 async fn schema_messages(
-    df: Arc<DataFusion>,
+    rt: Arc<Runtime>,
     tables: &[TableReference],
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
     let schema_tool = TableSchemaTool::default();
@@ -109,7 +110,7 @@ async fn schema_messages(
         TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>());
 
     let table_schemas = schema_tool
-        .get_schema(Arc::clone(&df), &schema_tool_params)
+        .get_schema(Arc::clone(&rt), &schema_tool_params)
         .instrument(Span::current())
         .await?;
     let table_schema_assistant_msg = schema_tool

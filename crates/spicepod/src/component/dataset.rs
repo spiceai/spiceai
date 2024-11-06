@@ -371,6 +371,8 @@ pub mod replication {
 }
 
 pub mod column {
+    use std::collections::HashMap;
+
     #[cfg(feature = "schemars")]
     use schemars::JsonSchema;
     use serde::{de::Error, Deserialize, Serialize};
@@ -389,10 +391,22 @@ pub mod column {
         pub embeddings: Vec<ColumnLevelEmbeddingConfig>,
     }
 
+    impl Column {
+        /// Return the column-level metadata that should be added to a [`arrow::datatypes::Field`].
+        #[must_use]
+        pub fn metadata(&self) -> HashMap<String, String> {
+            let mut metadata = HashMap::new();
+            if let Some(d) = self.description.as_ref() {
+                metadata.insert("description".to_string(), d.to_string());
+            }
+            metadata
+        }
+    }
+
     /// Configuration for if and how a dataset's column should be embedded.
     /// Different to [`crate::component::embeddings::ColumnEmbeddingConfig`],
     /// as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],
-    /// not [`super::Dataset].
+    /// not [`super::Dataset`].
     ///
     /// [`crate::component::embeddings::ColumnEmbeddingConfig`] will be
     /// deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].
@@ -447,6 +461,7 @@ pub mod column {
         }
     }
 
+    #[allow(clippy::unwrap_used)]
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -454,20 +469,20 @@ pub mod column {
 
         #[test]
         fn test_deserialize_row_ids_single_string() {
-            let yaml = r#"
+            let yaml = r"
                 from: foo
                 row_id: foo
-            "#;
+            ";
             let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(parsed.row_ids, Some(vec!["foo".to_string()]));
         }
 
         #[test]
         fn test_deserialize_row_ids_comma_separated() {
-            let yaml = r#"
+            let yaml = r"
                 from: foo
                 row_id: foo, bar
-            "#;
+            ";
             let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(
                 parsed.row_ids,
@@ -477,12 +492,12 @@ pub mod column {
 
         #[test]
         fn test_deserialize_row_ids_list() {
-            let yaml = r#"
+            let yaml = r"
                 from: foo
                 row_id:
                  - foo
                  - bar
-            "#;
+            ";
             let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(
                 parsed.row_ids,

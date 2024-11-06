@@ -1,12 +1,3 @@
-use async_openai::{
-    error::OpenAIError,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
-        ChatCompletionToolType, FunctionCall,
-    },
-};
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -22,11 +13,26 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use app::App;
+use arrow_schema::{Fields, Schema};
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessage,
+        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
+        ChatCompletionToolType, FunctionCall,
+    },
+};
 use async_trait::async_trait;
+use datafusion::sql::TableReference;
+use itertools::Itertools;
+use llms::chat::nsql::default;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use spicepod::component::dataset::column::Column;
+use std::{collections::HashMap, io::empty, sync::Arc};
 
 use crate::{
     datafusion::DataFusion,
@@ -40,12 +46,26 @@ use tracing_futures::Instrument;
 pub struct TableSchemaToolParams {
     /// Which subset of tables to return results for. Default to all tables.
     tables: Vec<String>,
+
+    /// If `full` return metadata and semantic details about the columns.
+    #[serde(default)]
+    output: OutputType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub enum OutputType {
+    #[default]
+    Full,
+    Minimal,
 }
 
 impl TableSchemaToolParams {
     #[must_use]
     pub fn new(tables: Vec<String>) -> Self {
-        Self { tables }
+        Self {
+            tables,
+            output: OutputType::default(),
+        }
     }
 }
 
@@ -65,18 +85,64 @@ impl TableSchemaTool {
 
     pub async fn get_schema(
         &self,
-        df: Arc<DataFusion>,
+        rt: Arc<Runtime>,
         req: &TableSchemaToolParams,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = serde_json::to_string(&req).boxed()?);
+        let TableSchemaToolParams { tables, output } = req;
 
-        let mut table_schemas: Vec<Value> = Vec::with_capacity(req.tables.len());
-        for t in &req.tables {
-            let schema = df
+        // Only need column info for full output
+        let column_info: Vec<HashMap<String, Column>> = if matches!(output, OutputType::Full) {
+            if let Some(app) = rt.app.read().await.clone() {
+                Self::column_information_for_tables(tables.as_slice(), app)
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
+        for (i, t) in tables.iter().enumerate() {
+            let base_schema = rt
+                .df
                 .get_arrow_schema(t)
                 .instrument(span.clone())
                 .await
                 .boxed()?;
+
+            let schema = match output {
+                OutputType::Minimal => base_schema,
+                OutputType::Full => {
+                    let Schema {
+                        mut fields,
+                        metadata,
+                    } = base_schema;
+
+                    if let Some(columns) = column_info.get(i) {
+                        fields = fields
+                            .iter()
+                            .map(|f| {
+                                if let Some(c) = columns.get(f.name()) {
+                                    Arc::new(
+                                        Field::new(
+                                            f.name(),
+                                            f.data_type().clone(),
+                                            f.is_nullable(),
+                                        )
+                                        .with_metadata(c.metadata()),
+                                    )
+                                } else {
+                                    f.clone()
+                                }
+                            })
+                            .collect_vec()
+                            .into();
+                    }
+
+                    Schema::new_with_metadata(fields, metadata)
+                }
+            };
 
             let schema_value = serde_json::value::to_value(schema).boxed()?;
 
@@ -92,6 +158,26 @@ impl TableSchemaTool {
         tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
 
         Ok(Value::Array(table_schemas))
+    }
+
+    /// Retrieve column information for the given tables. Output order is the same as the input order.
+    fn column_information_for_tables(
+        tables: &[String],
+        app: Arc<App>,
+    ) -> Vec<HashMap<String, Column>> {
+        tables
+            .iter()
+            .map(|t| {
+                let Some(table) = app.datasets.iter().find(|d| d.name == *t) else {
+                    return HashMap::new();
+                };
+                table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.clone()))
+                    .collect()
+            })
+            .collect_vec()
     }
 
     /// Creates a [`ChatCompletionRequestToolMessage`] as if a language model had called this tool.
@@ -169,6 +255,6 @@ impl SpiceModelTool for TableSchemaTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let req: TableSchemaToolParams = serde_json::from_str(arg)?;
-        self.get_schema(rt.datafusion(), &req).await
+        self.get_schema(rt, &req).await
     }
 }
