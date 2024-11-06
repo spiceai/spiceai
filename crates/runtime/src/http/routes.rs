@@ -33,15 +33,15 @@ use axum::{
 };
 use tokio::time::Instant;
 
-use super::{metrics, v1};
+use super::{auth::AuthLayer, metrics, v1};
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
     vector_search: Arc<vector_search::VectorSearch>,
+    auth_layer: Option<AuthLayer>,
 ) -> Router {
-    let mut router = Router::new()
-        .route("/health", get(|| async { "ok\n" }))
+    let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
@@ -55,12 +55,10 @@ pub(crate) fn routes(
             "/v1/datasets/:name/acceleration",
             patch(v1::datasets::acceleration),
         )
-        .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/ready", get(v1::ready::get))
-        .route_layer(middleware::from_fn(track_metrics));
+        .route("/v1/spicepods", get(v1::spicepods::get));
 
     if cfg!(feature = "models") {
-        router = router
+        authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
@@ -74,13 +72,26 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.embeds)));
     }
 
-    router = router
+    authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
-    router
+
+    // If we have an auth layer, add it to the authenticated router
+    if let Some(auth_layer) = auth_layer {
+        authenticated_router = authenticated_router.route_layer(auth_layer);
+    }
+
+    let unauthenticated_router = Router::new()
+        .route("/health", get(|| async { "ok\n" }))
+        .route("/v1/ready", get(v1::ready::get))
+        .layer(Extension(Arc::clone(&rt.status)));
+
+    unauthenticated_router
+        .merge(authenticated_router)
+        .route_layer(middleware::from_fn(track_metrics))
 }
 
 async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {

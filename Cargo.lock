@@ -10455,6 +10455,7 @@ dependencies = [
  "prometheus",
  "reqwest 0.12.9",
  "runtime",
+ "runtime-auth",
  "rustls 0.23.16",
  "rustls-pemfile 2.2.0",
  "serde_json",

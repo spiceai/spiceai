@@ -50,6 +50,7 @@ use model::{
 };
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
+use runtime_auth::EndpointAuth;
 use secrecy::SecretString;
 use secrets::ParamStr;
 use snafu::prelude::*;
@@ -365,6 +366,7 @@ impl Runtime {
         self: Arc<Self>,
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
+        endpoint_auth: EndpointAuth,
     ) -> Result<()> {
         self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
@@ -374,7 +376,7 @@ impl Runtime {
             Arc::clone(&self),
             config.clone().into(),
             tls_config.clone(),
-            None,
+            endpoint_auth.http_auth,
         ));
 
         // Spawn the metrics server in the background

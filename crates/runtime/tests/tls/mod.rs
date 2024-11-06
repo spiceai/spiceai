@@ -28,6 +28,7 @@ use arrow_flight::{
 use prost::Message;
 use rand::Rng;
 use runtime::{config::Config, tls::TlsConfig, Runtime};
+use runtime_auth::EndpointAuth;
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -71,7 +72,12 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
 
     // Start the servers
     tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(api_config, Some(Arc::new(tls_config)))).await
+        Box::pin(Arc::new(rt).start_servers(
+            api_config,
+            Some(Arc::new(tls_config)),
+            EndpointAuth::no_auth(),
+        ))
+        .await
     });
 
     // Wait for the servers to start

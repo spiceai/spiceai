@@ -14,7 +14,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
+use app::App;
+
+pub mod api_key;
 pub mod error;
 mod traits;
 
 pub use traits::*;
+
+pub struct EndpointAuth {
+    pub http_auth: Option<Arc<dyn HttpAuth + Send + Sync>>,
+}
+
+impl EndpointAuth {
+    #[must_use]
+    pub fn new(app: Arc<App>) -> Self {
+        Self {
+            http_auth: http_auth(app),
+        }
+    }
+
+    #[must_use]
+    pub fn no_auth() -> Self {
+        Self { http_auth: None }
+    }
+}
+
+/// Gets the HTTP auth provider configured for the app, if any
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+fn http_auth(_app: Arc<App>) -> Option<Arc<dyn HttpAuth + Send + Sync>> {
+    None
+}
