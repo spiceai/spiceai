@@ -1,18 +1,20 @@
 ---
 name: Enhancement
-about: An enhancement
+about: Suggest an Enhancement
 title: 'Enhancement: <>'
 type: enhancement
 assignees: ''
 ---
 
-\*REMEMBER, BE **SMART**!
+**_Remove italics helper text upon creation._**
 
-S: Specific
-M: Measurable
-A: Achievable
-R: Relevant
-T: Time-Bound\*
+_REMEMBER, BE **SMART**!_
+
+_S: Specific_
+_M: Measurable_
+_A: Achievable_
+_R: Relevant_
+_T: Time-Bound_
 
 ## Goal-State/What/Result
 
@@ -31,7 +33,7 @@ _A target date for done-done completion of the entire enhancement._
 
 ## Done-Done
 
-- [ ] [First Principles Driven](https://github.com/spiceai/spiceai/blob/trunk/docs/PRINCIPLES.md)
+- [ ] [Principles Driven](https://github.com/spiceai/spiceai/blob/trunk/docs/PRINCIPLES.md)
 - [ ] The Algorithm
 - [ ] PM/Design Review
 - [ ] DX/UX Review
@@ -50,20 +52,24 @@ _A target date for done-done completion of the entire enhancement._
 - [ ] Break down into smaller iterations/milestones.
 - [ ] Opportunities for automation.
 
-## Spec
+## Specification
 
-_Basic specification of the enhancement._
+_Provide a basic specification of the enhancement._
+
+### Security Review
+
+_Provide threat model and security review._
 
 ## How/Plan
 
 _A clear and concise plan of how this should be implemented._
 
-### Implementation (Sub Issues)
+### Implementation (Sub-Issues)
 
-- Sub Issue 1
-- Sub Issue 2
+- [ ] _Sub-Issue 1_
+- [ ] _Sub-Issue 2_
 
 ### QA
 
-- Sub Issue 1
-- Sub Issue 2
+- [ ] _Sub-Issue 1_
+- [ ] _Sub-Issue 2_

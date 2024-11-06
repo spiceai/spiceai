@@ -104,32 +104,15 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model = match prefix {
         ModelSource::HuggingFace => {
-            let model_type = extract_secret!(params, "model_type");
-
-            let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
-            let tokenizer_config_path =
-                component.find_any_file_path(ModelFileType::TokenizerConfig);
-            let weights_path = model_id
-                .clone()
-                .or(component.find_any_file_path(ModelFileType::Weights));
-
-            let hf_token = extract_secret!(params, "hf_token");
-
-            match model_id {
-                Some(id) => {
-                    llms::chat::create_hf_model(
-                        &id,
-                        model_type.map(|x| x.to_string()),
-                        &weights_path,
-                        &tokenizer_path,
-                        &tokenizer_config_path, // TODO handle inline chat templates
-                        hf_token,
-                    )
-                }
-                None => Err(LlmError::FailedToLoadModel {
+            let Some(id) = model_id else {
+                return Err(LlmError::FailedToLoadModel {
                     source: "No model id for Huggingface model".to_string().into(),
-                }),
-            }
+                });
+            };
+            let model_type = extract_secret!(params, "model_type");
+            let hf_token = params.get("hf_token");
+
+            llms::chat::create_hf_model(&id, &model_type, hf_token)
         }
         ModelSource::File => {
             let weights_path = model_id

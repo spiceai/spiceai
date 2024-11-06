@@ -14,30 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
-use app::App;
 use axum::Router;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use model_components::model::Model;
 use snafu::prelude::*;
-use tokio::{
-    net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::RwLock,
-};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
     config,
-    datafusion::DataFusion,
     embeddings::vector_search::{self, parse_explicit_primary_keys},
     metrics as runtime_metrics,
-    model::{EmbeddingModelStore, LLMModelStore},
     tls::TlsConfig,
+    Runtime,
 };
 
 mod metrics;
@@ -55,36 +49,21 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start<A>(
     bind_address: A,
-    app: Arc<RwLock<Option<Arc<App>>>>,
-    df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<LLMModelStore>>,
-    embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    rt: Arc<Runtime>,
     config: Arc<config::Config>,
-    with_metrics: Option<SocketAddr>,
     tls_config: Option<Arc<TlsConfig>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
     let vsearch = Arc::new(vector_search::VectorSearch::new(
-        Arc::clone(&df),
-        Arc::clone(&embeddings),
-        parse_explicit_primary_keys(Arc::clone(&app)).await,
+        Arc::clone(&rt.df),
+        Arc::clone(&rt.embeds),
+        parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
     ));
-    let routes = routes::routes(
-        app,
-        df,
-        models,
-        llms,
-        embeddings,
-        config,
-        with_metrics,
-        vsearch,
-    );
+    let routes = routes::routes(&rt, config, vsearch);
 
     let listener = TcpListener::bind(&bind_address)
         .await

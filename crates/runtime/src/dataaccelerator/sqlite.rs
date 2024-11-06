@@ -38,7 +38,7 @@ use crate::{
     spice_data_base_path, Runtime,
 };
 
-use super::DataAccelerator;
+use super::{DataAccelerator, Error as DataAcceleratorError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -73,6 +73,9 @@ pub enum Error {
 
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
     AccelerationNotEnabled { dataset: Arc<str> },
+
+    #[snafu(display("Invalid SQLite acceleration configuration: {detail}"))]
+    InvalidConfiguration { detail: Arc<str> },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -96,21 +99,24 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
-    #[must_use]
-    pub fn sqlite_file_path(&self, dataset: &Dataset) -> Option<String> {
+    pub fn sqlite_file_path(&self, dataset: &Dataset) -> Result<String> {
         if !dataset.is_file_accelerated() {
-            return None;
-        }
+            Err(Error::InvalidConfiguration {
+                detail: Arc::from("Dataset is not file accelerated"),
+            })
+        } else if let Some(acceleration) = dataset.acceleration.as_ref() {
+            let mut acceleration_params = acceleration.params.clone();
 
-        let acceleration = dataset.acceleration.as_ref()?;
-        let mut acceleration_params = acceleration.params.clone();
+            acceleration_params.insert("data_directory".to_string(), spice_data_base_path());
 
-        acceleration_params.insert("data_directory".to_string(), spice_data_base_path());
-
-        Some(
             self.sqlite_factory
-                .sqlite_file_path("accelerated", &acceleration_params),
-        )
+                .sqlite_file_path("accelerated", &acceleration_params)
+                .map_err(|err| Error::InvalidConfiguration {
+                    detail: Arc::from(err.to_string()),
+                })
+        } else {
+            unreachable!("Expected dataset to have acceleration parameters, but none were found")
+        }
     }
 
     /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
@@ -127,7 +133,7 @@ impl SqliteAccelerator {
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
     pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
-        let sqlite_file = self.sqlite_file_path(dataset);
+        let sqlite_file = self.sqlite_file_path(dataset)?;
 
         let acceleration = dataset
             .acceleration
@@ -140,7 +146,7 @@ impl SqliteAccelerator {
             Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
-        let file_path: Arc<str> = sqlite_file.map_or_else(|| "".into(), Arc::from);
+        let file_path: Arc<str> = sqlite_file.into();
         let busy_timeout = self.sqlite_busy_timeout(dataset)?;
 
         let pool = self
@@ -180,8 +186,11 @@ impl DataAccelerator for SqliteAccelerator {
         vec!["sqlite", "db"]
     }
 
-    fn file_path(&self, dataset: &Dataset) -> Option<String> {
+    fn file_path(&self, dataset: &Dataset) -> Result<String, DataAcceleratorError> {
         self.sqlite_file_path(dataset)
+            .map_err(|err| DataAcceleratorError::InvalidConfiguration {
+                msg: err.to_string(),
+            })
     }
 
     fn is_initialized(&self, dataset: &Dataset) -> bool {
@@ -205,18 +214,18 @@ impl DataAccelerator for SqliteAccelerator {
             return Ok(());
         }
 
-        let path = self.file_path(dataset);
+        let path = self.file_path(dataset)?;
 
-        if let (Some(path), Some(acceleration)) = (&path, &dataset.acceleration) {
+        if let Some(acceleration) = &dataset.acceleration {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
             } else if !self.is_valid_file(dataset) {
-                if std::path::Path::new(path).is_dir() {
+                if std::path::Path::new(&path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
 
-                let extension = std::path::Path::new(path)
+                let extension = std::path::Path::new(&path)
                     .extension()
                     .and_then(OsStr::to_str)
                     .unwrap_or("");
@@ -243,38 +252,40 @@ impl DataAccelerator for SqliteAccelerator {
         let mut cmd = cmd.clone();
 
         if let Some(this_dataset) = dataset {
-            // If the user didn't specify a SQLite file and this is a file-mode SQLite,
-            // then use the shared SQLite file `accelerated_sqlite.db`
-            if !cmd.options.contains_key("file") && this_dataset.is_file_accelerated() {
-                let sqlite_file = self.sqlite_file_path(this_dataset);
-                if let Some(sqlite_file) = sqlite_file {
+            if this_dataset.is_file_accelerated() {
+                // If the user didn't specify a SQLite file and this is a file-mode SQLite,
+                // then use the shared SQLite file `accelerated_sqlite.db`
+                if !cmd.options.contains_key("file") {
+                    let sqlite_file = self.sqlite_file_path(this_dataset)?;
                     cmd.options.insert("file".to_string(), sqlite_file);
                 }
-            }
 
-            if let Some(app) = &this_dataset.app {
-                let datasets =
-                    Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                let attach_databases = datasets
-                    .iter()
-                    .filter_map(|other_dataset| {
-                        if other_dataset.acceleration.as_ref().map_or(false, |a| {
-                            a.engine == Engine::Sqlite && a.mode == Mode::File
-                        }) {
-                            if **other_dataset == *this_dataset {
-                                None
+                if let Some(app) = &this_dataset.app {
+                    let datasets =
+                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                    let self_path = self.file_path(this_dataset)?;
+                    let attach_databases = datasets
+                        .iter()
+                        .filter_map(|other_dataset| {
+                            if other_dataset.acceleration.as_ref().map_or(false, |a| {
+                                a.engine == Engine::Sqlite && a.mode == Mode::File
+                            }) {
+                                if **other_dataset == *this_dataset {
+                                    None
+                                } else {
+                                    let other_path = self.file_path(other_dataset);
+                                    other_path.ok().filter(|p| p != &self_path)
+                                }
                             } else {
-                                self.file_path(other_dataset)
+                                None
                             }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                        })
+                        .collect::<Vec<_>>();
 
-                if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    if !attach_databases.is_empty() {
+                        cmd.options
+                            .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    }
                 }
             }
         }
@@ -454,7 +465,7 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_some());
+        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());

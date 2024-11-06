@@ -498,7 +498,7 @@
               }
             ]
           },
-          "unit": "s"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -528,7 +528,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (protocol, quantile)(query_duration_seconds_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"}>0)",
+          "expr": "sum by (protocol, quantile)(query_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"}>0)",
           "instant": false,
           "legendFormat": "{{protocol}} (P{{quantile}})",
           "range": true,
@@ -1452,7 +1452,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (method, path, job, status, quantile) (1000*http_requests_duration_seconds_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} > 0)",
+          "expr": "sum by (method, path, job, status, quantile) (http_requests_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} > 0)",
           "instant": false,
           "legendFormat": "{{method}} {{path}} (P{{quantile}})",
           "range": true,
@@ -1546,7 +1546,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (path, method) (\n  http_requests_duration_seconds_count{pod=~\"${pods}\"} - \n  http_requests_duration_seconds_count{pod=~\"${pods}\"} offset $__rate_interval\n) > 0",
+          "expr": "sum by (path, method) (\n  http_requests_duration_ms_count{pod=~\"${pods}\"} - \n  http_requests_duration_ms_count{pod=~\"${pods}\"} offset $__rate_interval\n) > 0",
           "instant": false,
           "legendFormat": "{{method}} {{path}}",
           "range": true,

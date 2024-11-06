@@ -11,7 +11,8 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## [v1.0-rc.1 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/45)
 
 - Bugfixes and performance improvements
-- Data accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Beta)
+- Data Accelerators: Arrow & DuckDB  (Release Candidate)
+- DuckDB data connector (Release Candidate)
 - S3 data connector (Release Candidate)
 - PostgreSQL data connector (Release Candidate)
 - MySQL data connector (Release Candidate)
@@ -24,22 +25,21 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Databricks DeltaLake data connector (Release Candidate)
 - Spice.ai Cloud Platform data connector (Release Candidate)
 - ODBC Data Connector - Athena, Databricks, MySQL (Release Candidate)
+- Dremio data connector (Beta)
 
 ## v1.0-rc.3 (Nov 2024)
 
 - Bugfixes and performance improvements
-- Data accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Release Candidate)
 - DuckDB data connector (Release Candidate)
+- Dremio data connector (Release Candidate)
 - MS SQL data connector (Beta)
 - File data connector (Beta)
-- Dremio data connector (Beta)
 
-## v1.0-rc.4 (Nov 2024)
+## v1.0-rc.4 (Dec 2024)
 
 - Bugfixes and performance improvements
 - MS SQL data connector (Release Candidate)
 - File data connector (Release Candidate)
-- Dremio data connector (Release Candidate)
 
 ## v1.0-rc.5 (Dec 2024)
 
@@ -48,6 +48,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## v1.0-rc.6 (Dec 2024)
 
 - Bugfixes and performance improvements
+- Data Accelerators: SQLite & PostgreSQL (Release Candidate)
 
 ## v1.0-stable (Jan 2025)
 

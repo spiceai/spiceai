@@ -362,7 +362,7 @@ impl Runtime {
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
     pub async fn start_servers(
-        &self,
+        self: Arc<Self>,
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
     ) -> Result<()> {
@@ -371,13 +371,8 @@ impl Runtime {
 
         let http_server_future = tokio::spawn(http::start(
             config.http_bind_address,
-            Arc::clone(&self.app),
-            Arc::clone(&self.df),
-            Arc::clone(&self.models),
-            Arc::clone(&self.llms),
-            Arc::clone(&self.embeds),
+            Arc::clone(&self),
             config.clone().into(),
-            self.metrics_endpoint,
             tls_config.clone(),
         ));
 

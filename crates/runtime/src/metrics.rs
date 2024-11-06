@@ -289,17 +289,17 @@ pub(crate) mod telemetry {
 
     static QUERY_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
         TELEMETRY_METER
-            .f64_histogram("query_duration")
-            .with_description("The total amount of time spent planning and executing queries.")
+            .f64_histogram("query_duration_ms")
+            .with_description(
+                "The total amount of time spent planning and executing queries in milliseconds.",
+            )
             .with_unit("ms")
             .init()
     });
 
-    pub fn track_query_duration(duration: Duration, protocol: Arc<str>) {
-        telemetry::track_query_duration(duration, Arc::clone(&protocol));
-
-        let dimensions = create_dimensions(protocol);
-        QUERY_DURATION.record(duration.as_secs_f64() * 1000.0, &dimensions);
+    pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
+        telemetry::track_query_duration(duration, dimensions);
+        QUERY_DURATION.record(duration.as_secs_f64() * 1000.0, dimensions);
     }
 
     static QUERY_EXECUTION_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -312,11 +312,9 @@ pub(crate) mod telemetry {
         .init()
     });
 
-    pub fn track_query_execution_duration(duration: Duration, protocol: Arc<str>) {
-        telemetry::track_query_execution_duration(duration, Arc::clone(&protocol));
-
-        let dimensions = create_dimensions(protocol);
-        QUERY_EXECUTION_DURATION.record(duration.as_secs_f64() * 1000.0, &dimensions);
+    pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
+        telemetry::track_query_execution_duration(duration, dimensions);
+        QUERY_EXECUTION_DURATION.record(duration.as_secs_f64() * 1000.0, dimensions);
     }
 
     fn create_dimensions(protocol: Arc<str>) -> [KeyValue; 1] {

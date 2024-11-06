@@ -35,6 +35,7 @@ use mistralrs::{
     TokenSource, Tool, ToolChoice, ToolType,
 };
 
+use secrecy::{ExposeSecret, Secret};
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
@@ -227,14 +228,22 @@ impl MistralLlama {
         }
     }
 
-    pub fn from_hf(model_id: &str, arch: &str, hf_token_literal: Option<String>) -> Result<Self> {
+    pub fn from_hf(
+        model_id: &str,
+        arch: Option<&str>,
+        hf_token_literal: Option<&Secret<String>>,
+    ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
-        let loader_type = mistralrs::NormalLoaderType::from_str(arch).map_err(|_| {
-            ChatError::FailedToLoadModel {
-                source: format!("Unknown model type: {arch}").into(),
-            }
-        })?;
+        // Hardcoded model architecture can ensure correct loading type.
+        // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
+        let loader_type = arch
+            .map(|a| {
+                mistralrs::NormalLoaderType::from_str(a).map_err(|_| ChatError::FailedToLoadModel {
+                    source: format!("Unknown model type: {a}").into(),
+                })
+            })
+            .transpose()?;
 
         let builder = NormalLoaderBuilder::new(
             mistralrs::NormalSpecificConfig::default(),
@@ -243,10 +252,12 @@ impl MistralLlama {
             Some(model_parts[0].to_string()),
         );
         let device = Self::get_device();
-        let token_source = hf_token_literal.map_or(TokenSource::CacheToken, TokenSource::Literal);
+        let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
+            TokenSource::Literal(secret.expose_secret().clone())
+        });
 
         let pipeline = builder
-            .build(Some(loader_type))
+            .build(loader_type)
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
