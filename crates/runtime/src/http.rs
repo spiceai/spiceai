@@ -68,10 +68,10 @@ where
         Arc::clone(&rt.embeds),
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
     ));
-    let routes = routes::routes(&rt, config, vsearch);
+    let mut routes = routes::routes(&rt, config, vsearch);
 
     if let Some(auth_provider) = auth_provider {
-        routes = routes.layer(AuthLayer::new(auth_provider));
+        routes = routes.route_layer(AuthLayer::new(auth_provider));
     }
 
     let listener = TcpListener::bind(&bind_address)
