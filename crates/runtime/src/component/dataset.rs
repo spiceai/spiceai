@@ -478,6 +478,7 @@ impl Dataset {
         }
     }
 
+    #[must_use]
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }

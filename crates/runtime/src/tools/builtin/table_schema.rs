@@ -93,7 +93,7 @@ impl TableSchemaTool {
         // Precompute extra column details only if needed (for `full` output).
         let column_info = match (output, rt.app.read().await.clone()) {
             (OutputType::Full, Some(app)) => {
-                Self::column_information_for_tables(tables.as_slice(), app)
+                Self::column_information_for_tables(tables.as_slice(), &app)
             }
             _ => vec![],
         };
@@ -120,7 +120,7 @@ impl TableSchemaTool {
                             .into_iter()
                             .map(|f| {
                                 columns.get(f.name()).map_or_else(
-                                    || f.clone(),
+                                    || Arc::clone(f),
                                     |c| {
                                         Arc::new(
                                             Field::new(
@@ -160,12 +160,12 @@ impl TableSchemaTool {
     /// Output Hashmap is column name to [`Column`].
     fn column_information_for_tables(
         tables: &[String],
-        app: Arc<App>,
+        app: &Arc<App>,
     ) -> Vec<HashMap<String, Column>> {
         tables
             .iter()
             .map(|t| {
-                let Some(table) = Self::table_in_app(&app, t) else {
+                let Some(table) = Self::table_in_app(app, t) else {
                     return HashMap::new();
                 };
                 table
