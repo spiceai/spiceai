@@ -449,20 +449,20 @@ pub mod column {
             serde_yaml::Value::String(s) => {
                 Ok(Some(s.split(',').map(|s| s.trim().to_string()).collect()))
             }
-            serde_yaml::Value::Sequence(seq) => seq
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(ToString::to_string)
-                        .ok_or_else(|| D::Error::custom("Expected a string"))
-                })
-                .collect::<Result<Vec<String>, D::Error>>()
-                .map(Some),
-            _ => Err(D::Error::custom("Invalid format for row_id")),
+            serde_yaml::Value::Sequence(seq) => {
+                seq.iter()
+                    .map(|v| {
+                        v.as_str().map(ToString::to_string).ok_or_else(|| {
+                            D::Error::custom(format!("Invalid format for row_id. Expected a string, or array of strings. Found {v:?}"))
+                        })
+                    })
+                    .collect::<Result<Vec<String>, D::Error>>()
+                    .map(Some)
+            }
+            other => Err(D::Error::custom(format!("Invalid format for row_id. Expected a string, or array of strings. Found {other:?}"))),
         }
     }
 
-    #[allow(clippy::unwrap_used)]
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -474,7 +474,8 @@ pub mod column {
                 from: foo
                 row_id: foo
             ";
-            let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
+            let parsed: ColumnLevelEmbeddingConfig =
+                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
             assert_eq!(parsed.row_ids, Some(vec!["foo".to_string()]));
         }
 
@@ -484,7 +485,8 @@ pub mod column {
                 from: foo
                 row_id: foo, bar
             ";
-            let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
+            let parsed: ColumnLevelEmbeddingConfig =
+                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
             assert_eq!(
                 parsed.row_ids,
                 Some(vec!["foo".to_string(), "bar".to_string()])
@@ -499,7 +501,8 @@ pub mod column {
                  - foo
                  - bar
             ";
-            let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
+            let parsed: ColumnLevelEmbeddingConfig =
+                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
             assert_eq!(
                 parsed.row_ids,
                 Some(vec!["foo".to_string(), "bar".to_string()])
@@ -507,9 +510,44 @@ pub mod column {
         }
 
         #[test]
+        fn test_deserialize_row_ids_errors() {
+            match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+                r"
+                from: foo
+                row_id: 
+                  - foo: bar
+            ",
+            ) {
+                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
+                Err(e) => assert_eq!(e.to_string(), "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"),
+            };
+
+            match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+                r"
+                from: foo
+                row_id: {foo: bar, extra: value}
+            ",
+            ) {
+                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
+                Err(e) => assert_eq!(e.to_string(), "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"),
+            };
+
+            match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+                r"
+                from: foo
+                row_id: [foo, bar
+            ",
+            ) {
+                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
+                Err(e) => assert_eq!(e.to_string(), "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"),
+            };
+        }
+
+        #[test]
         fn test_deserialize_row_ids_missing() {
             let yaml = "from: model_name";
-            let parsed: ColumnLevelEmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
+            let parsed: ColumnLevelEmbeddingConfig =
+                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
             assert_eq!(parsed.row_ids, None);
         }
     }
