@@ -100,7 +100,7 @@ async fn openai_nsql_test() -> Result<(), anyhow::Error> {
         "how many records in taxi_trips dataset?",
         Some("nql"),
         Some(false),
-        Some(vec!["dummy".to_string()]),
+        Some(vec!["dataset_not_in_spice".to_string()]),
     )
     .await
     .is_err());
@@ -109,7 +109,7 @@ async fn openai_nsql_test() -> Result<(), anyhow::Error> {
     assert!(send_nsql_request(
         base_url.as_str(),
         "how many records in taxi_trips dataset?",
-        Some("dummy"),
+        Some("model_not_in_spice"),
         Some(false),
         None,
     )

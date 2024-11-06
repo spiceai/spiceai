@@ -40,6 +40,7 @@ where
     false
 }
 
+#[allow(dead_code)]
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
     let mut secrets = runtime::secrets::Secrets::new();
     // Will automatically load `env` as the default
