@@ -293,7 +293,6 @@ fn get_openai_embeddings(model: Option<impl Into<String>>, name: impl Into<Strin
         None => Embeddings::new("openai", name),
     };
     embedding.params.insert(
-        //text-embedding-3-small
         "openai_api_key".to_string(),
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );
