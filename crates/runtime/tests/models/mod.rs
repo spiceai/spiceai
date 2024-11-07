@@ -166,6 +166,21 @@ fn normalize_search_response(mut json: Value) -> String {
     json.to_string()
 }
 
+fn normalize_embeddings_response(mut json: Value) -> String {
+    if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+        for entry in data {
+            if let Some(embedding) = entry.get_mut("embedding") {
+                if let Some(embedding_array) = embedding.as_array_mut() {
+                    let num_elements = embedding_array.len();
+                    *embedding = json!(format!("array_{}_items", num_elements));
+                }
+            }
+        }
+    }
+
+    json.to_string()
+}
+
 async fn send_embeddings_request(
     base_url: &str,
     model: &str,

@@ -32,8 +32,7 @@ use spicepod::component::{
 use crate::{
     init_tracing,
     models::{
-        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
-        normalize_search_response, send_nsql_request, send_search_request,
+        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response, send_nsql_request, send_search_request
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -259,7 +258,6 @@ async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
 
     let mut test_id = 0;
 
-    // OpenAI's embedding models are deterministic, so the embeddings result for the same input, model version, parameters is the same
     for (input, encoding_format, user, dimensions) in embeddins_test {
         test_id += 1;
         let response = send_embeddings_request(
@@ -272,7 +270,8 @@ async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
         )
         .await?;
 
-        insta::assert_snapshot!(format!("embeddings_{}", test_id), response);
+        // OpenAI's embeddings response is not deterministic; embedding values can vary for the same input, model version, and parameters.
+        insta::assert_snapshot!(format!("embeddings_{}", test_id), normalize_embeddings_response(response));
     }
 
     Ok(())
