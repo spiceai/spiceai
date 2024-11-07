@@ -455,7 +455,7 @@ fn display_grpc_error(err: &Status) {
         Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
         Code::Aborted => ("Error", "The query was aborted before it could complete."),
         Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded."),
-        Code::PermissionDenied => ("Error", "The query could not be completed because the user does not have permission to access the requested data."),
+        Code::PermissionDenied => ("Error", "Unauthorized."),
         Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
         Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
         Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
