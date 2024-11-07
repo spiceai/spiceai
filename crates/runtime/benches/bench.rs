@@ -49,6 +49,8 @@ mod bench_spicecloud;
 
 #[cfg(feature = "delta_lake")]
 mod bench_delta;
+#[cfg(feature = "duckdb")]
+mod bench_duckdb;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
 #[cfg(feature = "odbc")]
@@ -112,6 +114,8 @@ async fn main() -> Result<(), String> {
                 "postgres",
                 #[cfg(feature = "mysql")]
                 "mysql",
+                #[cfg(feature = "duckdb")]
+                "duckdb",
                 #[cfg(feature = "odbc")]
                 "odbc-databricks",
                 #[cfg(feature = "odbc")]
@@ -232,6 +236,10 @@ async fn run_connector_bench(
         #[cfg(feature = "mysql")]
         "mysql" => {
             bench_mysql::run(&mut rt, &mut benchmark_results, bench_name).await?;
+        }
+        #[cfg(feature = "duckdb")]
+        "duckdb" => {
+            bench_duckdb::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {

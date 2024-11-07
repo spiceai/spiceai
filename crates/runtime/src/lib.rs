@@ -944,11 +944,11 @@ impl Runtime {
         }
 
         // Only wrap data connector when necessary.
-        let connector = if ds.embeddings.is_empty() {
-            data_connector
-        } else {
+        let connector = if ds.has_embeddings() {
             let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
             Arc::new(connector) as Arc<dyn DataConnector>
+        } else {
+            data_connector
         };
 
         // Test dataset connectivity by attempting to get a read provider.

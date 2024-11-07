@@ -63,7 +63,7 @@ pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
-    let connection_string = "Driver=/opt/athena/odbc/lib/libathena-odbc.so;Catalog=AwsDataCatalog;AwsRegion=us-east-2;Schema=tpch;Workgroup=primary;S3OutputLocation=s3://aws-athena-query-results-211125479522-us-east-2/;AuthenticationType=IAM Credentials;UID=${ env:AWS_ACCESS_KEY_ID };PWD=${ env:AWS_SECRET_ACCESS_KEY };".to_string();
+    let connection_string = "Driver={Amazon Athena ODBC Driver};Catalog=AwsDataCatalog;AwsRegion=us-east-2;Schema=tpch;Workgroup=primary;S3OutputLocation=s3://aws-athena-query-results-211125479522-us-east-2/;AuthenticationType=IAM Credentials;UID=${ env:AWS_ACCESS_KEY_ID };PWD=${ env:AWS_SECRET_ACCESS_KEY };".to_string();
 
     dataset.params = Some(Params::from_string_map(
         vec![("odbc_connection_string".to_string(), connection_string)]

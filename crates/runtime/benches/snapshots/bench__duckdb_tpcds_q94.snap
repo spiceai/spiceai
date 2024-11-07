@@ -1,0 +1,10 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++-------------+---------------------+------------------+
+| order count | total shipping cost | total net profit |
++-------------+---------------------+------------------+
+| 10          | 11670.10            | 2179.34          |
++-------------+---------------------+------------------+

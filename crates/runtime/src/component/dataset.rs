@@ -21,7 +21,8 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::component::{
-    dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
+    dataset as spicepod_dataset, dataset::column::Column, embeddings::ColumnEmbeddingConfig,
+    params::Params,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
@@ -118,6 +119,7 @@ pub struct Dataset {
     pub mode: Mode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
+    pub columns: Vec<Column>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
@@ -144,6 +146,7 @@ impl PartialEq for Dataset {
             && self.acceleration == other.acceleration
             && self.embeddings == other.embeddings
             && self.schema == other.schema
+            && self.columns == other.columns
     }
 }
 
@@ -174,6 +177,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.to_string()))
                 .collect(),
+            columns: dataset.columns,
             has_metadata_table: dataset
                 .has_metadata_table
                 .unwrap_or(Dataset::have_metadata_table_by_default()),
@@ -196,6 +200,7 @@ impl Dataset {
             mode: Mode::default(),
             params: HashMap::default(),
             metadata: HashMap::default(),
+            columns: Vec::default(),
             has_metadata_table: Self::have_metadata_table_by_default(),
             replication: None,
             time_column: None,
@@ -472,8 +477,12 @@ impl Dataset {
             default_value
         }
     }
-}
 
+    #[must_use]
+    pub fn has_embeddings(&self) -> bool {
+        !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
+    }
+}
 pub mod acceleration;
 
 pub mod replication {

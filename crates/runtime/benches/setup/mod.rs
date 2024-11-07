@@ -151,6 +151,8 @@ fn build_app(
         "postgres" => crate::bench_postgres::build_app(app_builder, bench_name),
         #[cfg(feature = "mysql")]
         "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
+        #[cfg(feature = "duckdb")]
+        "duckdb" => crate::bench_duckdb::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
         "odbc-databricks" => Ok(crate::bench_odbc_databricks::build_app(app_builder)),
         #[cfg(feature = "odbc")]
