@@ -81,6 +81,7 @@ pub(crate) fn routes(
 
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
+        tracing::info!("Enabled authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 

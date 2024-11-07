@@ -33,6 +33,7 @@ mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
+mod endpoint_auth;
 mod federation;
 mod github;
 mod graphql;

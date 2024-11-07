@@ -24,6 +24,7 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Runtime {
     #[serde(default)]
     pub results_cache: ResultsCache,
@@ -42,6 +43,9 @@ pub struct Runtime {
 
     #[serde(default)]
     pub task_history: TaskHistory,
+
+    #[serde(default)]
+    pub auth: Option<Auth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -186,4 +190,21 @@ impl TaskHistory {
     pub fn retention_check_interval_as_secs(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
         Self::retention_value_as_secs(&self.retention_check_interval, "check interval")
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    #[serde(rename = "api-key")]
+    pub api_key: Option<ApiKeyAuth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyAuth {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub keys: Vec<String>,
 }

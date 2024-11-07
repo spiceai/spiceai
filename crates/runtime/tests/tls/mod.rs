@@ -27,8 +27,7 @@ use arrow_flight::{
 };
 use prost::Message;
 use rand::Rng;
-use runtime::{config::Config, tls::TlsConfig, Runtime};
-use runtime_auth::EndpointAuth;
+use runtime::{auth::EndpointAuth, config::Config, tls::TlsConfig, Runtime};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 

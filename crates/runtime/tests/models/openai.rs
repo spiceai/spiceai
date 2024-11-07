@@ -22,8 +22,7 @@ use std::{
 
 use app::AppBuilder;
 use rand::Rng;
-use runtime::{config::Config, Runtime};
-use runtime_auth::EndpointAuth;
+use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig, Embeddings},
     model::Model,
