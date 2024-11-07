@@ -48,6 +48,10 @@ test-integration:
 test-integration-without-spiceai-dataset:
 	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture --skip spiceai_integration_test
 
+.PHONY: test-integration-models
+test-integration-models:
+	@cargo test -p runtime --test integration_models --features models -- --nocapture
+
 .PHONY: test-bench
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{get_test_datafusion, init_tracing, postgres::common, runtime_ready_check};
+use crate::{get_test_datafusion, init_tracing, postgres::common, utils::runtime_ready_check};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use rand::Rng;
