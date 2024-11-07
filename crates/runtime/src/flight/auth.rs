@@ -48,18 +48,18 @@ pub(crate) fn validate_basic_auth_handshake(
 
     let auth_value = get_authorization_value(metadata, "Basic")?;
     let Ok(decoded_auth) = BASE64_STANDARD.decode(auth_value) else {
-        return Err(Status::permission_denied("Invalid handshake request"));
+        return Err(Status::unauthenticated("Invalid handshake request"));
     };
     let Ok(decoded_auth_str) = String::from_utf8(decoded_auth) else {
-        return Err(Status::permission_denied("Invalid handshake request"));
+        return Err(Status::unauthenticated("Invalid handshake request"));
     };
 
     let [username, password] = decoded_auth_str.splitn(2, ':').collect::<Vec<&str>>()[..2] else {
-        return Err(Status::permission_denied("Invalid credentials"));
+        return Err(Status::unauthenticated("Invalid credentials"));
     };
     match basic_auth.validate(username, password) {
         Ok(token) => Ok(Some(token)),
-        Err(_) => Err(Status::permission_denied("Invalid credentials")),
+        Err(_) => Err(Status::unauthenticated("Invalid credentials")),
     }
 }
 
@@ -68,14 +68,14 @@ fn get_authorization_value<'a>(
     prefix: &'static str,
 ) -> Result<&'a str, Status> {
     let Some(auth_header) = metadata.get("authorization") else {
-        return Err(Status::permission_denied("Missing authorization header"));
+        return Err(Status::unauthenticated("Missing authorization header"));
     };
     let Ok(auth_header_str) = auth_header.to_str() else {
-        return Err(Status::permission_denied("Invalid authorization header"));
+        return Err(Status::unauthenticated("Invalid authorization header"));
     };
     let auth_header_split = auth_header_str.splitn(2, ' ').collect::<Vec<&str>>();
     if auth_header_split.len() != 2 || auth_header_split[0] != prefix {
-        return Err(Status::permission_denied("Invalid authorization header"));
+        return Err(Status::unauthenticated("Invalid authorization header"));
     }
     Ok(auth_header_split[1])
 }
@@ -161,7 +161,7 @@ where
                 ResponseFuture::future(inner.call(request))
             }
             Ok(AuthVerdict::Deny) => {
-                ResponseFuture::status(Status::permission_denied("Invalid credentials"))
+                ResponseFuture::status(Status::unauthenticated("Invalid credentials"))
             }
             Err(e) => ResponseFuture::status(Status::internal(e.to_string())),
         }

@@ -446,11 +446,7 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown
-        | Code::Internal
-        | Code::Unauthenticated
-        | Code::DataLoss
-        | Code::FailedPrecondition => (
+        Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
             "An unexpected internal error occurred. Execute '.error' for details.",
         ),
@@ -466,6 +462,10 @@ fn display_grpc_error(err: &Status) {
         Code::DeadlineExceeded => (
             "Timeout Error",
             "The operation could not complete within the allowed time limit.",
+        ),
+        Code::Unauthenticated => (
+            "Authentication Error",
+            "Access denied. Invalid credentials.",
         ),
         Code::PermissionDenied => (
             "Authorization Error",
