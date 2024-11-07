@@ -21,6 +21,7 @@ use std::{
 };
 
 use app::AppBuilder;
+use async_openai::types::EmbeddingInput;
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use spicepod::component::{
@@ -36,6 +37,8 @@ use crate::{
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
+
+use super::send_embeddings_request;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
@@ -151,7 +154,11 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds_tpcds_item)
-        .with_embedding(get_openai_embeddings("openai_embeddings"))
+        // test default embeddings model
+        .with_embedding(get_openai_embeddings(
+            Option::<String>::None,
+            "openai_embeddings",
+        ))
         .build();
 
     let http_port = rand::thread_rng().gen_range(50000..60000);
@@ -177,8 +184,6 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
 
     let base_url = format!("http://localhost:{http_port}");
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     tracing::info!("/v1/search: Ensure simple search request succeeds");
     let response = send_search_request(
         base_url.as_str(),
@@ -195,6 +200,84 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[tokio::test]
+async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let app = AppBuilder::new("search_app")
+        .with_embedding(get_openai_embeddings(
+            Some("text-embedding-3-small"),
+            "openai_embeddings",
+        ))
+        .build();
+
+    let http_port = rand::thread_rng().gen_range(50000..60000);
+
+    tracing::debug!("Running Spice runtime with http port: {http_port}");
+
+    let api_config = Config::new().with_http_bind_address(SocketAddr::new(LOCALHOST, http_port));
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let rt_ref_copy = Arc::clone(&rt);
+    tokio::spawn(async move {
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let base_url = format!("http://localhost:{http_port}");
+
+    let embeddins_test = vec![
+        (
+            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+            Some("float"),
+            None,
+            None,
+        ),
+        (
+            EmbeddingInput::StringArray(vec![
+                "The food was delicious".to_string(),
+                "and the waiter...".to_string(),
+            ]),
+            // Some("base64"), Error: When encoding_format is base64, use Embeddings::create_base64
+            None,
+            Some("test_user_id"),
+            Some(256),
+        ),
+    ];
+
+    let mut test_id = 0;
+
+    // OpenAI's embedding models are deterministic, so the embeddings result for the same input, model version, parameters is the same
+    for (input, encoding_format, user, dimensions) in embeddins_test {
+        test_id += 1;
+        let response = send_embeddings_request(
+            base_url.as_str(),
+            "openai_embeddings",
+            input,
+            encoding_format,
+            user,
+            dimensions,
+        )
+        .await?;
+
+        insta::assert_snapshot!(format!("embeddings_{}", test_id), response);
+    }
+
+    Ok(())
+}
+
 fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
     model.params.insert(
@@ -204,9 +287,13 @@ fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model 
     model
 }
 
-fn get_openai_embeddings(name: impl Into<String>) -> Embeddings {
-    let mut embedding = Embeddings::new("openai", name);
+fn get_openai_embeddings(model: Option<impl Into<String>>, name: impl Into<String>) -> Embeddings {
+    let mut embedding = match model {
+        Some(model) => Embeddings::new(format!("openai:{}", model.into()), name),
+        None => Embeddings::new("openai", name),
+    };
     embedding.params.insert(
+        //text-embedding-3-small
         "openai_api_key".to_string(),
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );

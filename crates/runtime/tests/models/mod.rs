@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use async_openai::types::EmbeddingInput;
 use reqwest::Client;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
@@ -163,4 +164,45 @@ fn normalize_search_response(mut json: Value) -> String {
     }
 
     json.to_string()
+}
+
+async fn send_embeddings_request(
+    base_url: &str,
+    model: &str,
+    input: EmbeddingInput,
+    // The format to return the embeddings in. Can be either `float` or [`base64`](https://pypi.org/project/pybase64/). Defaults to float
+    encoding_format: Option<&str>,
+    // OpenAI only: A unique identifier representing your end-user, [Learn more](https://platform.openai.com/docs/usage-policies/end-user-ids).
+    user: Option<&str>,
+    // The number of dimensions the resulting output embeddings should have. Only supported in `text-embedding-3` and later models.
+    dimensions: Option<u32>,
+) -> Result<Value, reqwest::Error> {
+    let mut request_body = json!({
+        "model": model,
+        "input": input,
+    });
+
+    if let Some(ef) = encoding_format {
+        request_body["encoding_format"] = json!(ef);
+    }
+
+    if let Some(u) = user {
+        request_body["user"] = json!(u);
+    }
+
+    if let Some(d) = dimensions {
+        request_body["dimensions"] = json!(d);
+    }
+
+    let response = Client::new()
+        .post(format!("{base_url}/v1/embeddings"))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+
+    Ok(response)
 }
