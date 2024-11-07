@@ -54,10 +54,9 @@ pub(crate) fn validate_basic_auth_handshake(
         return Err(Status::permission_denied("Invalid handshake request"));
     };
 
-    let Some(colon_index) = decoded_auth_str.find(':') else {
+    let [username, password] = decoded_auth_str.splitn(2, ':').collect::<Vec<&str>>()[..2] else {
         return Err(Status::permission_denied("Invalid credentials"));
     };
-    let (username, password) = decoded_auth_str.split_at(colon_index);
     match basic_auth.validate(username, password) {
         Ok(token) => Ok(Some(token)),
         Err(_) => Err(Status::permission_denied("Invalid credentials")),
