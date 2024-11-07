@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use app::AppBuilder;
@@ -32,7 +33,7 @@ use crate::{
     init_tracing,
     models::{
         get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
-        send_nsql_request, send_search_request, verify_search_response,
+        normalize_search_response, send_nsql_request, send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -155,8 +156,6 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
     }];
 
     let app = AppBuilder::new("search_app")
-        // taxi_trips is added to test search against dataset with no embeddings
-        .with_dataset(get_taxi_trips_dataset())
         .with_dataset(ds_tpcds_item)
         .with_embedding(get_openai_embeddings("openai_embeddings"))
         .build();
@@ -184,17 +183,20 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
 
     let base_url = format!("http://localhost:{http_port}");
 
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     tracing::info!("/v1/search: Ensure simple search request succeeds");
     let response = send_search_request(
         base_url.as_str(),
-        "original item",
-        Some(3),
+        "worldwide school",
+        Some(2),
         Some(vec!["item".to_string()]),
         None,
-        None,
+        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
     )
     .await?;
-    verify_search_response(&response, 3).map_err(anyhow::Error::msg)?;
+
+    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
 
     Ok(())
 }

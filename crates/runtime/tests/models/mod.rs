@@ -21,9 +21,8 @@ use spicepod::component::{
 };
 
 use serde_json::{json, Value};
-
-mod openai;
 mod hf;
+mod openai;
 
 fn get_taxi_trips_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
@@ -150,20 +149,18 @@ async fn send_search_request(
     Ok(response)
 }
 
-fn verify_search_response(json: &Value, num_matches_expected: usize) -> Result<(), String> {
-    let matches = json
-        .get("matches")
-        .ok_or("Response does not contain a 'matches' field")?
-        .as_array()
-        .ok_or("The 'matches' field is not an array")?;
-
-    if matches.len() != num_matches_expected {
-        return Err(format!(
-            "Expected {} records in 'matches', but found {}",
-            num_matches_expected,
-            matches.len()
-        ));
+fn normalize_search_response(mut json: Value) -> String {
+    if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
+        for m in matches {
+            if let Some(score) = m.get_mut("score") {
+                *score = json!("score_val");
+            }
+        }
     }
 
-    Ok(())
+    if let Some(duration) = json.get_mut("duration_ms") {
+        *duration = json!("duration_ms_val");
+    }
+
+    json.to_string()
 }

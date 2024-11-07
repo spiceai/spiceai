@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc
+    sync::Arc,
 };
 
 use app::AppBuilder;
@@ -31,7 +31,7 @@ use spicepod::component::{
 use crate::{
     init_tracing,
     models::{
-        get_taxi_trips_dataset, get_tpcds_dataset, send_search_request, verify_search_response,
+        get_taxi_trips_dataset, get_tpcds_dataset, normalize_search_response, send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -135,14 +135,15 @@ async fn huggingface_search_test() -> Result<(), anyhow::Error> {
     tracing::info!("/v1/search: Ensure simple search request succeeds");
     let response = send_search_request(
         base_url.as_str(),
-        "original item",
-        Some(3),
+        "worldwide school",
+        Some(2),
         Some(vec!["item".to_string()]),
         None,
-        None,
+        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
     )
     .await?;
-    verify_search_response(&response, 3).map_err(anyhow::Error::msg)?;
+
+    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
 
     Ok(())
 }
