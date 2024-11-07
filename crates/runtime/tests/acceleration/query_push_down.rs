@@ -28,7 +28,7 @@ use spicepod::component::{
     params::Params,
 };
 
-use crate::{init_tracing, wait_until_true};
+use crate::{init_tracing, utils::wait_until_true};
 
 #[cfg(feature = "postgres")]
 #[allow(clippy::too_many_lines)]

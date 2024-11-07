@@ -18,7 +18,7 @@ limitations under the License.
 //! Expects a Docker daemon to be running.
 use crate::{
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    runtime_ready_check,
+    utils::runtime_ready_check,
 };
 use std::sync::Arc;
 
