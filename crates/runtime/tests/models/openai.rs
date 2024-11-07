@@ -16,8 +16,7 @@ limitations under the License.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
+    sync::Arc
 };
 
 use app::AppBuilder;
@@ -207,7 +206,7 @@ async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
         .await
         .map_err(anyhow::Error::msg)?;
 
-    let app = AppBuilder::new("search_app")
+let app = AppBuilder::new("search_app")
         .with_embedding(get_openai_embeddings(
             Some("text-embedding-3-small"),
             "openai_embeddings",
@@ -249,7 +248,7 @@ async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
                 "The food was delicious".to_string(),
                 "and the waiter...".to_string(),
             ]),
-            // Some("base64"), Error: When encoding_format is base64, use Embeddings::create_base64
+            // Some("base64"), Error: 'When encoding_format is base64, use Embeddings::create_base64'
             None,
             Some("test_user_id"),
             Some(256),
