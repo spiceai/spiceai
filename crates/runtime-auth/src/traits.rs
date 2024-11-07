@@ -37,7 +37,7 @@ pub trait FlightBasicAuth {
     /// # Errors
     ///
     /// This function will return an error if the validator can't validate the request.
-    fn flight_basic(&self, username: String, password: String) -> Result<AuthVerdict, Error>;
+    fn flight_basic(&self, username: &str, password: &str) -> Result<AuthVerdict, Error>;
 }
 
 pub trait GrpcAuth {

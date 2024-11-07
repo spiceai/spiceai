@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::pin::Pin;
-
 use arrow_flight::HandshakeResponse;
 use futures::Stream;
+use runtime_auth::FlightBasicAuth;
+use std::pin::Pin;
+use std::sync::Arc;
 use tonic::{metadata::MetadataValue, Response, Status};
 use uuid::Uuid;
 
@@ -28,7 +29,9 @@ use super::metrics;
 type HandshakeResponseStream =
     Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
 
-pub(crate) fn handle() -> Result<Response<HandshakeResponseStream>, Status> {
+pub(crate) fn handle(
+    basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+) -> Result<Response<HandshakeResponseStream>, Status> {
     // THIS IS PLACEHOLDER NO-OP AUTH THAT DOES NOT CHECK THE PROVIDED TOKEN AND SIMPLY RETURNS A UUID.
     // TODO: Implement proper auth.
     let token = Uuid::new_v4().to_string();

@@ -372,12 +372,13 @@ impl Runtime {
         self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
+        let http_auth = endpoint_auth.http_auth.clone();
         let http_server_future = tokio::spawn(http::start(
             config.http_bind_address,
             Arc::clone(&self),
             config.clone().into(),
             tls_config.clone(),
-            endpoint_auth.http_auth,
+            http_auth,
         ));
 
         // Spawn the metrics server in the background
@@ -397,6 +398,7 @@ impl Runtime {
             config.flight_bind_address,
             Arc::clone(&self.df),
             tls_config.clone(),
+            endpoint_auth.clone(),
         ));
         let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
             config.open_telemetry_bind_address,
