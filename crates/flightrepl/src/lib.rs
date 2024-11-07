@@ -43,7 +43,7 @@ use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter,
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::metadata::errors::InvalidMetadataValue;
-use tonic::metadata::AsciiMetadataKey;
+use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
@@ -75,6 +75,10 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub tls_root_certificate_file: Option<String>,
+
+    /// The API key to use for authentication
+    #[arg(long, value_name = "API_KEY", help_heading = "SQL REPL")]
+    pub api_key: Option<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -253,7 +257,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let _ = rl.add_history_entry(line);
 
         let start_time = Instant::now();
-        match get_records(client.clone(), line).await {
+        match get_records(client.clone(), line, repl_config.api_key.as_ref()).await {
             Ok((_, 0, from_cache)) => {
                 println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
@@ -285,6 +289,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
+    api_key: Option<&String>,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -292,7 +297,10 @@ async fn get_records(
     };
     let sql_command_bytes = sql_command.as_any().encode_to_vec();
 
-    let request = FlightDescriptor::new_cmd(sql_command_bytes);
+    let request = add_api_key(
+        FlightDescriptor::new_cmd(sql_command_bytes).into_request(),
+        api_key,
+    );
 
     let mut flight_info = client.get_flight_info(request).await?.into_inner();
     let Some(endpoint) = flight_info.endpoint.pop() else {
@@ -301,7 +309,7 @@ async fn get_records(
     let Some(ticket) = endpoint.ticket else {
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
-    let mut request = ticket.into_request();
+    let mut request = add_api_key(ticket.into_request(), api_key);
     let user_agent_key = AsciiMetadataKey::from_str("x-spice-user-agent")
         .map_err(|e| FlightError::ExternalError(e.into()))?;
     let user_agent_value = get_user_agent()
@@ -336,6 +344,17 @@ async fn get_records(
     }
 
     Ok((records, total_rows, from_cache))
+}
+
+fn add_api_key<T>(mut request: tonic::Request<T>, api_key: Option<&String>) -> tonic::Request<T> {
+    if let Some(api_key) = api_key {
+        let val: MetadataValue<Ascii> = match format!("Bearer {api_key}").parse() {
+            Ok(val) => val,
+            Err(e) => panic!("Invalid API key: {e}"),
+        };
+        request.metadata_mut().insert("authorization", val);
+    }
+    request
 }
 
 /// Display a set of record batches to the user. This function will display the first 500 rows.

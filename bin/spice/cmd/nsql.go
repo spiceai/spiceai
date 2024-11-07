@@ -57,6 +57,11 @@ nsql> How much money have I made in each country?
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		rtcontext.RequireModelsFlavor(cmd)
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
@@ -207,6 +212,7 @@ func init() {
 	nsqlCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for nsql (default: false)")
 	nsqlCmd.Flags().String(modelKeyFlag, "", "Model to use for nsql")
 	nsqlCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for nsql (default: http://localhost:8090)")
+	nsqlCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(nsqlCmd)
 }

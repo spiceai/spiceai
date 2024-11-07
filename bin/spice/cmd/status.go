@@ -35,6 +35,12 @@ spice status
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
+
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		err := api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
 		if err != nil {
 			slog.Error("getting spiced status", "error", err)
@@ -44,5 +50,6 @@ spice status
 
 func init() {
 	statusCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	statusCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(statusCmd)
 }

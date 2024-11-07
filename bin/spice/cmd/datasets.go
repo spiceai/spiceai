@@ -36,6 +36,12 @@ spice datasets
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
+
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
 			slog.Error("listing dataset statuses", "error", err)
@@ -52,5 +58,6 @@ spice datasets
 
 func init() {
 	datasetsCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	datasetsCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(datasetsCmd)
 }

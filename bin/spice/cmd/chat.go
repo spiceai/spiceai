@@ -73,6 +73,11 @@ spice chat --model <model> --cloud
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		rtcontext.RequireModelsFlavor(cmd)
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
@@ -228,6 +233,7 @@ func init() {
 	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
+	chatCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(chatCmd)
 }

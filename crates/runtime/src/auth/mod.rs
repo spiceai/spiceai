@@ -40,10 +40,17 @@ impl EndpointAuth {
         };
 
         if let Some(api_key_auth_config) = auth.api_key.as_ref() {
+            if !api_key_auth_config.enabled {
+                return Self::no_auth();
+            }
+
             let api_key_auth = api_key_auth(secrets, api_key_auth_config).await;
+            let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
+            let flight_basic_auth =
+                Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;
             return Self {
-                http_auth: Some(api_key_auth),
-                flight_basic_auth: None,
+                http_auth: Some(http_auth),
+                flight_basic_auth: Some(flight_basic_auth),
                 grpc_auth: None,
             };
         }

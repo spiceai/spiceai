@@ -37,6 +37,11 @@ spice catalogs
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
 
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		catalogs, err := api.GetData[api.Catalog](rtcontext, "/v1/catalogs")
 		if err != nil {
 			slog.Error("getting spiced catalogs", "error", err)
@@ -51,5 +56,6 @@ spice catalogs
 
 func init() {
 	catalogsCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	catalogsCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(catalogsCmd)
 }

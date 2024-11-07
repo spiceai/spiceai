@@ -28,6 +28,7 @@ use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
+use auth::BasicAuthLayer;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::parser::ParserError;
@@ -80,10 +81,10 @@ impl FlightService for Service {
 
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
         metrics::HANDSHAKE_REQUESTS.add(1, &[]);
-        handshake::handle(self.basic_auth.as_ref().map(Arc::clone))
+        handshake::handle(request.metadata(), self.basic_auth.as_ref())
     }
 
     async fn list_flights(
@@ -336,7 +337,7 @@ pub async fn start(
     let service = Service {
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
-        basic_auth: endpoint_auth.flight_basic_auth,
+        basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
     let svc = FlightServiceServer::new(service);
 
@@ -355,7 +356,12 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
+    let auth_layer = tower::ServiceBuilder::new()
+        .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
+        .into_inner();
+
     server
+        .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
         .await
