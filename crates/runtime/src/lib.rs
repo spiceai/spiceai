@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::auth::EndpointAuth;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
@@ -50,7 +51,6 @@ use model::{
 };
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use runtime_auth::EndpointAuth;
 use secrecy::SecretString;
 use secrets::ParamStr;
 use snafu::prelude::*;
@@ -72,6 +72,7 @@ use util::{retry, RetryError};
 
 use crate::extension::Extension;
 pub mod accelerated_table;
+pub mod auth;
 mod builder;
 pub mod component;
 pub mod config;

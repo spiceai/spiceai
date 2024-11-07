@@ -21,8 +21,8 @@ use std::{
 
 use crate::init_tracing;
 use rand::Rng;
-use runtime::{config::Config, Runtime};
-use runtime_auth::{api_key::ApiKeyAuth, EndpointAuth, HttpAuth};
+use runtime::{auth::EndpointAuth, config::Config, Runtime};
+use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
