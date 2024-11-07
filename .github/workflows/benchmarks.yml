@@ -334,7 +334,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install required packages
-        run: sudo apt-get install -y unixodbc-dev unixodbc
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev unixodbc wget
 
       - name: Get artifact URL
         run: |
