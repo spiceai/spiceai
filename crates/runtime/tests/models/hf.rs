@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::Arc
 };
 
 use app::AppBuilder;
@@ -31,8 +31,7 @@ use spicepod::component::{
 use crate::{
     init_tracing,
     models::{
-        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
-        send_nsql_request, send_search_request, verify_search_response,
+        get_taxi_trips_dataset, get_tpcds_dataset, send_search_request, verify_search_response,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -40,17 +39,20 @@ use crate::{
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[tokio::test]
-async fn openai_nsql_test() -> Result<(), anyhow::Error> {
+async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+    verify_env_secret_exists("SPICE_HF_TOKEN")
         .await
         .map_err(anyhow::Error::msg)?;
 
     let app = AppBuilder::new("text-to-sql")
         .with_dataset(get_taxi_trips_dataset())
-        .with_model(get_openai_model("gpt-4o-mini", "nql"))
-        .with_model(get_openai_model("gpt-4o-mini", "nql-2"))
+        .with_model(get_huggingface_model(
+            "meta-llama/Llama-3.2-1B-Instruct",
+            "llama",
+            "hf_model",
+        ))
         .build();
 
     let http_port = rand::thread_rng().gen_range(50000..60000);
@@ -66,7 +68,8 @@ async fn openai_nsql_test() -> Result<(), anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        // increased timeout to download and load huggingface model
+        () = tokio::time::sleep(std::time::Duration::from_secs(180)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -74,77 +77,21 @@ async fn openai_nsql_test() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    let base_url = format!("http://localhost:{http_port}");
-
-    // example responses for the test query: '[{"count(*)":10}]', '[{"record_count":10}]'
-
-    tracing::info!("/v1/nsql: Ensure default request succeeds");
-    let response = send_nsql_request(
-        base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        None,
-        Some(false),
-        None,
-    )
-    .await?;
-
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
-
-    tracing::info!("/v1/nsql: Ensure model selection works");
-    let response = send_nsql_request(
-        base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("nql-2"),
-        Some(false),
-        None,
-    )
-    .await?;
-
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
-
-    tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
-    assert!(send_nsql_request(
-        base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("nql"),
-        Some(false),
-        Some(vec!["dataset_not_in_spice".to_string()]),
-    )
-    .await
-    .is_err());
-
-    tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
-    assert!(send_nsql_request(
-        base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("model_not_in_spice"),
-        Some(false),
-        None,
-    )
-    .await
-    .is_err());
-
     Ok(())
 }
 
 #[tokio::test]
-async fn openai_search_test() -> Result<(), anyhow::Error> {
+async fn huggingface_search_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+    verify_env_secret_exists("SPICE_HF_TOKEN")
         .await
         .map_err(anyhow::Error::msg)?;
 
     let mut ds_tpcds_item = get_tpcds_dataset("item");
     ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
         column: "i_item_desc".to_string(),
-        model: "openai_embeddings".to_string(),
+        model: "hf_minilm".to_string(),
         primary_keys: Some(vec!["i_item_sk".to_string()]),
         chunking: Some(EmbeddingChunkConfig {
             enabled: true,
@@ -154,11 +101,12 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
         }),
     }];
 
-    let app = AppBuilder::new("search_app")
-        // taxi_trips is added to test search against dataset with no embeddings
-        .with_dataset(get_taxi_trips_dataset())
+    let app = AppBuilder::new("text-to-sql")
         .with_dataset(ds_tpcds_item)
-        .with_embedding(get_openai_embeddings("openai_embeddings"))
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
         .build();
 
     let http_port = rand::thread_rng().gen_range(50000..60000);
@@ -174,7 +122,7 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -199,20 +147,28 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
-    let mut model = Model::new(format!("openai:{}", model.into()), name);
-    model.params.insert(
-        "openai_api_key".to_string(),
-        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
-    );
+fn get_huggingface_model(
+    model: impl Into<String>,
+    model_type: impl Into<String>,
+    name: impl Into<String>,
+) -> Model {
+    let mut model = Model::new(format!("huggingface:huggingface.co/{}", model.into()), name);
+    model
+        .params
+        .insert("hf_token".to_string(), "${ secrets:SPICE_HF_TOKEN }".into());
+    model
+        .params
+        .insert("model_type".to_string(), model_type.into().into());
+
     model
 }
 
-fn get_openai_embeddings(name: impl Into<String>) -> Embeddings {
-    let mut embedding = Embeddings::new("openai", name);
-    embedding.params.insert(
-        "openai_api_key".to_string(),
-        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
-    );
-    embedding
+fn get_huggingface_embeddings(model: impl Into<String>, name: impl Into<String>) -> Embeddings {
+    let mut embeddings =
+        Embeddings::new(format!("huggingface:huggingface.co/{}", model.into()), name);
+    embeddings
+        .params
+        .insert("hf_token".to_string(), "${ secrets:SPICE_HF_TOKEN }".into());
+
+    embeddings
 }
