@@ -23,7 +23,7 @@ use app::AppBuilder;
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig, Embeddings},
+    embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
 
@@ -36,6 +36,69 @@ use crate::{
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+#[tokio::test]
+async fn huggingface_search_test() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    verify_env_secret_exists("SPICE_HF_TOKEN")
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut ds_tpcds_item = get_tpcds_dataset("item");
+    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+        column: "i_item_desc".to_string(),
+        model: "hf_minilm".to_string(),
+        primary_keys: Some(vec!["i_item_sk".to_string()]),
+        chunking: None,
+    }];
+
+    let app = AppBuilder::new("text-to-sql")
+        .with_dataset(ds_tpcds_item)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .build();
+
+    let http_port = rand::thread_rng().gen_range(50000..60000);
+
+    tracing::debug!("Running Spice runtime with http port: {http_port}");
+
+    let api_config = Config::new().with_http_bind_address(SocketAddr::new(LOCALHOST, http_port));
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let rt_ref_copy = Arc::clone(&rt);
+    tokio::spawn(async move {
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let base_url = format!("http://localhost:{http_port}");
+
+    tracing::info!("/v1/search: Ensure simple search request succeeds");
+    let response = send_search_request(
+        base_url.as_str(),
+        "new patient",
+        Some(2),
+        Some(vec!["item".to_string()]),
+        None,
+        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
+    )
+    .await?;
+
+    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
@@ -75,74 +138,6 @@ async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
     }
 
     runtime_ready_check(&rt).await;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn huggingface_search_test() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-
-    verify_env_secret_exists("SPICE_HF_TOKEN")
-        .await
-        .map_err(anyhow::Error::msg)?;
-
-    let mut ds_tpcds_item = get_tpcds_dataset("item");
-    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-        column: "i_item_desc".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: Some(vec!["i_item_sk".to_string()]),
-        chunking: Some(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 1000,
-            overlap_size: 100,
-            trim_whitespace: true,
-        }),
-    }];
-
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(ds_tpcds_item)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .build();
-
-    let http_port = rand::thread_rng().gen_range(50000..60000);
-
-    tracing::debug!("Running Spice runtime with http port: {http_port}");
-
-    let api_config = Config::new().with_http_bind_address(SocketAddr::new(LOCALHOST, http_port));
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
-
-    let base_url = format!("http://localhost:{http_port}");
-
-    tracing::info!("/v1/search: Ensure simple search request succeeds");
-    let response = send_search_request(
-        base_url.as_str(),
-        "worldwide school",
-        Some(2),
-        Some(vec!["item".to_string()]),
-        None,
-        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
-    )
-    .await?;
-
-    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
 
     Ok(())
 }

@@ -24,7 +24,7 @@ use app::AppBuilder;
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig, Embeddings},
+    embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
 
@@ -146,12 +146,7 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
         column: "i_item_desc".to_string(),
         model: "openai_embeddings".to_string(),
         primary_keys: Some(vec!["i_item_sk".to_string()]),
-        chunking: Some(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 1000,
-            overlap_size: 100,
-            trim_whitespace: true,
-        }),
+        chunking: None,
     }];
 
     let app = AppBuilder::new("search_app")
@@ -187,7 +182,7 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
     tracing::info!("/v1/search: Ensure simple search request succeeds");
     let response = send_search_request(
         base_url.as_str(),
-        "worldwide school",
+        "vehicles and journalists",
         Some(2),
         Some(vec!["item".to_string()]),
         None,

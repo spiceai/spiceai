@@ -57,7 +57,7 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!("SELECT * FROM {ds_name} LIMIT 10")),
+        refresh_sql: Some(format!("SELECT * FROM {ds_name} LIMIT 20")),
         ..Default::default()
     });
     dataset
