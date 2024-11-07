@@ -1,1 +1,1 @@
-SELECT MIN("EventDate"::INT::DATE), MAX("EventDate"::INT::DATE) FROM hits;
+SELECT MIN(to_timestamp("EventDate" * 86400)), MAX(to_timestamp("EventDate" * 86400)) FROM hits;
