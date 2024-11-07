@@ -345,7 +345,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          wget --header="Authorization: token $GITHUB_TOKEN" -O spice_bench.zip "$ARTIFACT_URL"
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/test-bench/spice_bench -O spice_bench
 
       - name: Set up Spice.ai API Key
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
