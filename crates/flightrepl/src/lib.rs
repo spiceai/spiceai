@@ -446,19 +446,43 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
-            ("Error", "An internal error occurred. Execute '.error' to show details.")
-        },
+        Code::Unknown
+        | Code::Internal
+        | Code::Unauthenticated
+        | Code::DataLoss
+        | Code::FailedPrecondition => (
+            "Internal Error",
+            "An unexpected internal error occurred. Execute '.error' for details.",
+        ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
             let message = err.message().split('\n').next().unwrap_or(err.message());
-            ("Query Error", message)},
-        Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
-        Code::Aborted => ("Error", "The query was aborted before it could complete."),
-        Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded."),
-        Code::PermissionDenied => ("Error", "Unauthorized."),
-        Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
-        Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
-        Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
+            ("Query Error", message)
+        }
+        Code::Cancelled => (
+            "Cancelled",
+            "The operation was cancelled before completion.",
+        ),
+        Code::Aborted => ("Aborted", "The operation was aborted before completion."),
+        Code::DeadlineExceeded => (
+            "Timeout Error",
+            "The operation could not complete within the allowed time limit.",
+        ),
+        Code::PermissionDenied => (
+            "Authorization Error",
+            "Access denied. Insufficient permisions to complete the request.",
+        ),
+        Code::ResourceExhausted => (
+            "Resource Limit Exceeded",
+            "The operation could not be completed because the server resources are exhausted.",
+        ),
+        Code::Unimplemented => (
+            "Unsupported Operation",
+            "The query could not be completed because the requested operation is not supported.",
+        ),
+        Code::OutOfRange => (
+            "Result Limit Exceeded",
+            "The query result exceeds allowable limits. Consider using a `limit` clause.",
+        ),
     };
 
     println!("{} {user_err_msg}", Colour::Red.paint(error_type));
