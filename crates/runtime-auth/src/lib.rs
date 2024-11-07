@@ -71,7 +71,6 @@ fn http_auth(app: &App) -> Option<Arc<dyn HttpAuth + Send + Sync>> {
         .auth
         .as_ref()
         .and_then(|auth| auth.api_key.as_ref())?;
-    println!("found api key auth");
 
     Some(Arc::new(ApiKeyAuth::new(api_key_auth.keys.clone())))
 }
@@ -84,4 +83,28 @@ fn flight_basic_auth(_app: &App) -> Option<Arc<dyn FlightBasicAuth + Send + Sync
 #[must_use]
 fn grpc_auth(_app: &App) -> Option<Arc<dyn GrpcAuth + Send + Sync>> {
     None
+}
+
+impl std::fmt::Debug for EndpointAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const PRESENT: &str = "PRESENT";
+        const ABSENT: &str = "ABSENT";
+        let mut builder = f.debug_struct("EndpointAuth");
+        if self.http_auth.is_some() {
+            builder.field("http_auth", &PRESENT);
+        } else {
+            builder.field("http_auth", &ABSENT);
+        }
+        if self.flight_basic_auth.is_some() {
+            builder.field("flight_basic_auth", &PRESENT);
+        } else {
+            builder.field("flight_basic_auth", &ABSENT);
+        }
+        if self.grpc_auth.is_some() {
+            builder.field("grpc_auth", &PRESENT);
+        } else {
+            builder.field("grpc_auth", &ABSENT);
+        }
+        builder.finish()
+    }
 }

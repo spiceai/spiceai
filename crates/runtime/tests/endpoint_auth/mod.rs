@@ -87,7 +87,7 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
     assert!(response.status().is_success());
     tracing::info!("HTTP health check passed");
 
-    // Ready APIis not authenticated
+    // Ready API is not authenticated
     let http_url = format!("http://127.0.0.1:{http_port}/v1/ready");
     let response = http_client
         .get(&http_url)
@@ -107,24 +107,35 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
     assert!(response.status().is_success());
     tracing::info!("Metrics health check passed");
 
-    // v1/datasets is authenticated
-    let datasets_url = format!("http://127.0.0.1:{http_port}/v1/datasets");
+    // v1/status is authenticated
+    let status_url = format!("http://127.0.0.1:{http_port}/v1/status");
     let response = http_client
-        .get(&datasets_url)
+        .get(&status_url)
         .send()
         .await
         .expect("valid response");
     assert!(!response.status().is_success());
     assert_eq!(response.status().as_u16(), 401);
 
+    // Test valid API key
     let response = http_client
-        .get(&datasets_url)
+        .get(&status_url)
         .header("x-api-key", "valid")
         .send()
         .await
         .expect("valid response");
     assert!(response.status().is_success());
     assert_eq!(response.status().as_u16(), 200);
+
+    // Test invalid API key
+    let response = http_client
+        .get(&status_url)
+        .header("x-api-key", "invalid")
+        .send()
+        .await
+        .expect("valid response");
+    assert!(!response.status().is_success());
+    assert_eq!(response.status().as_u16(), 401);
 
     Ok(())
 }
