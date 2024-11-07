@@ -34,7 +34,7 @@ use spicepod::component::dataset::{column::Column, Dataset};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    tools::{parameters, SpiceModelTool},
+    tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 use snafu::ResultExt;

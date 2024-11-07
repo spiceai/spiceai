@@ -23,7 +23,7 @@ use crate::{
     embeddings::vector_search::{
         parse_explicit_primary_keys, to_matches, SearchRequest, SearchRequestJson, VectorSearch,
     },
-    tools::{parameters, SpiceModelTool},
+    tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 

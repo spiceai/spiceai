@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::{
     datafusion::DataFusion,
-    tools::{parameters, SpiceModelTool},
+    tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 use arrow::util::pretty::pretty_format_batches;

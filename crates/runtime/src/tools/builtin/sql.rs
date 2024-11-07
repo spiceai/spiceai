@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     datafusion::query::Protocol,
-    tools::{parameters, SpiceModelTool},
+    tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 use futures::TryStreamExt;

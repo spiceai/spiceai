@@ -26,6 +26,7 @@ use table_schema::TableSchemaTool;
 
 use super::SpiceModelTool;
 
+pub mod catalog;
 pub mod document_similarity;
 pub mod get_readiness;
 pub mod list_datasets;
