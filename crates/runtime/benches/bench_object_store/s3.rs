@@ -306,7 +306,7 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
             ))),
 
         "clickbench" => Ok(app_builder.with_dataset(make_dataset(
-            "benchmarks/clickbench/hits_partitioned/",
+            "benchmarks/clickbench/hits/",
             "hits",
             bench_name,
         ))),
