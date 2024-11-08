@@ -36,6 +36,12 @@ spice models
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
+
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		model_statuses, _, err := api.GetComponentStatuses(rtcontext)
 		if err != nil {
 			slog.Error("getting component statuses", "error", err)
@@ -60,5 +66,6 @@ spice models
 
 func init() {
 	modelsCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	modelsCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(modelsCmd)
 }

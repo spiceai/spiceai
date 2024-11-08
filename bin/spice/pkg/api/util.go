@@ -39,13 +39,25 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 
 	switch method {
 	case GET:
-		resp, err = rtcontext.Client().Get(url)
+		var request *http.Request
+		request, err = http.NewRequest("GET", url, nil)
+		if err != nil {
+			return *new(T), fmt.Errorf("error creating request: %w", err)
+		}
+		request.Header = rtcontext.GetHeaders()
+		resp, err = rtcontext.Client().Do(request)
 	case POST:
 		var reader io.Reader
+		var request *http.Request
 		if body != nil {
 			reader = strings.NewReader(*body)
 		}
-		resp, err = rtcontext.Client().Post(url, "application/json", reader)
+		request, err = http.NewRequest("POST", url, reader)
+		if err != nil {
+			return *new(T), fmt.Errorf("error creating request: %w", err)
+		}
+		request.Header = rtcontext.GetHeaders()
+		resp, err = rtcontext.Client().Do(request)
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)
 	}
@@ -57,6 +69,10 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		return *new(T), fmt.Errorf("error performing request to %s: %w", url, err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return *new(T), fmt.Errorf("Unauthorized")
+	}
 
 	var result T
 	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {

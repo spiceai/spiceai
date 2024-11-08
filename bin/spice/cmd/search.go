@@ -82,6 +82,11 @@ spice search --cloud
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		matches := map[string][]SearchMatch{}
 
 		limit, err := cmd.Flags().GetUint(limitKeyFlag)
@@ -191,6 +196,7 @@ func init() {
 	searchCmd.Flags().String(modelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for search (default: http://localhost:8090)")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
+	searchCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(searchCmd)
 }

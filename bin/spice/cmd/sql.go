@@ -54,6 +54,10 @@ sql> show tables
 			args = append(args, "--tls-root-certificate-file", rootCertPath)
 		}
 
+		if apiKey, err := cmd.Flags().GetString("api-key"); err == nil && apiKey != "" {
+			args = append(args, "--api-key", apiKey)
+		}
+
 		args = append(spiceArgs, args...)
 
 		execCmd, err := rtcontext.GetRunCmd(args)
@@ -76,5 +80,6 @@ sql> show tables
 
 func init() {
 	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	sqlCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(sqlCmd)
 }

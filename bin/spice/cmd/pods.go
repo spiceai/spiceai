@@ -37,6 +37,11 @@ spice pods
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
 
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey != "" {
+			rtcontext.SetApiKey(apiKey)
+		}
+
 		spicepods, err := api.GetData[api.Spicepod](rtcontext, "/v1/spicepods")
 		if err != nil {
 			slog.Error("listing spiced pods", "error", err)
@@ -58,5 +63,6 @@ spice pods
 
 func init() {
 	podsCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	podsCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(podsCmd)
 }

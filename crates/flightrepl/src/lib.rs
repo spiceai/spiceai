@@ -43,7 +43,7 @@ use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter,
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::metadata::errors::InvalidMetadataValue;
-use tonic::metadata::AsciiMetadataKey;
+use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
@@ -75,6 +75,10 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub tls_root_certificate_file: Option<String>,
+
+    /// The API key to use for authentication
+    #[arg(long, value_name = "API_KEY", help_heading = "SQL REPL")]
+    pub api_key: Option<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -253,7 +257,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let _ = rl.add_history_entry(line);
 
         let start_time = Instant::now();
-        match get_records(client.clone(), line).await {
+        match get_records(client.clone(), line, repl_config.api_key.as_ref()).await {
             Ok((_, 0, from_cache)) => {
                 println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
@@ -285,6 +289,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
+    api_key: Option<&String>,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -292,7 +297,10 @@ async fn get_records(
     };
     let sql_command_bytes = sql_command.as_any().encode_to_vec();
 
-    let request = FlightDescriptor::new_cmd(sql_command_bytes);
+    let request = add_api_key(
+        FlightDescriptor::new_cmd(sql_command_bytes).into_request(),
+        api_key,
+    );
 
     let mut flight_info = client.get_flight_info(request).await?.into_inner();
     let Some(endpoint) = flight_info.endpoint.pop() else {
@@ -301,7 +309,7 @@ async fn get_records(
     let Some(ticket) = endpoint.ticket else {
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
-    let mut request = ticket.into_request();
+    let mut request = add_api_key(ticket.into_request(), api_key);
     let user_agent_key = AsciiMetadataKey::from_str("x-spice-user-agent")
         .map_err(|e| FlightError::ExternalError(e.into()))?;
     let user_agent_value = get_user_agent()
@@ -336,6 +344,17 @@ async fn get_records(
     }
 
     Ok((records, total_rows, from_cache))
+}
+
+fn add_api_key<T>(mut request: tonic::Request<T>, api_key: Option<&String>) -> tonic::Request<T> {
+    if let Some(api_key) = api_key {
+        let val: MetadataValue<Ascii> = match format!("Bearer {api_key}").parse() {
+            Ok(val) => val,
+            Err(e) => panic!("Invalid API key: {e}"),
+        };
+        request.metadata_mut().insert("authorization", val);
+    }
+    request
 }
 
 /// Display a set of record batches to the user. This function will display the first 500 rows.
@@ -427,19 +446,43 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
-            ("Error", "An internal error occurred. Execute '.error' to show details.")
-        },
+        Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
+            "Internal Error",
+            "An unexpected internal error occurred. Execute '.error' for details.",
+        ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
             let message = err.message().split('\n').next().unwrap_or(err.message());
-            ("Query Error", message)},
-        Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
-        Code::Aborted => ("Error", "The query was aborted before it could complete."),
-        Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded."),
-        Code::PermissionDenied => ("Error", "The query could not be completed because the user does not have permission to access the requested data."),
-        Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
-        Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
-        Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
+            ("Query Error", message)
+        }
+        Code::Cancelled => (
+            "Cancelled",
+            "The operation was cancelled before completion.",
+        ),
+        Code::Aborted => ("Aborted", "The operation was aborted before completion."),
+        Code::DeadlineExceeded => (
+            "Timeout Error",
+            "The operation could not complete within the allowed time limit.",
+        ),
+        Code::Unauthenticated => (
+            "Authentication Error",
+            "Access denied. Invalid credentials.",
+        ),
+        Code::PermissionDenied => (
+            "Authorization Error",
+            "Access denied. Insufficient permisions to complete the request.",
+        ),
+        Code::ResourceExhausted => (
+            "Resource Limit Exceeded",
+            "The operation could not be completed because the server resources are exhausted.",
+        ),
+        Code::Unimplemented => (
+            "Unsupported Operation",
+            "The query could not be completed because the requested operation is not supported.",
+        ),
+        Code::OutOfRange => (
+            "Result Limit Exceeded",
+            "The query result exceeds allowable limits. Consider using a `limit` clause.",
+        ),
     };
 
     println!("{} {user_err_msg}", Colour::Red.paint(error_type));

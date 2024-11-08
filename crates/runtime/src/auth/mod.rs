@@ -20,9 +20,11 @@ use crate::{
 };
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth, GrpcAuth, HttpAuth};
 use secrecy::ExposeSecret;
+use spicepod::component::runtime::ApiKeyAuth as SpicepodApiKeyAuth;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[derive(Clone)]
 pub struct EndpointAuth {
     pub http_auth: Option<Arc<dyn HttpAuth + Send + Sync>>,
     pub flight_basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -32,11 +34,28 @@ pub struct EndpointAuth {
 impl EndpointAuth {
     #[must_use]
     pub async fn new(secrets: Arc<RwLock<Secrets>>, app: &App) -> Self {
-        Self {
-            http_auth: http_auth(Arc::clone(&secrets), app).await,
-            flight_basic_auth: flight_basic_auth(Arc::clone(&secrets), app),
-            grpc_auth: grpc_auth(Arc::clone(&secrets), app),
+        let secrets = &*secrets.read().await;
+        let Some(auth) = app.runtime.auth.as_ref() else {
+            return Self::no_auth();
+        };
+
+        if let Some(api_key_auth_config) = auth.api_key.as_ref() {
+            if !api_key_auth_config.enabled {
+                return Self::no_auth();
+            }
+
+            let api_key_auth = api_key_auth(secrets, api_key_auth_config).await;
+            let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
+            let flight_basic_auth =
+                Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;
+            return Self {
+                http_auth: Some(http_auth),
+                flight_basic_auth: Some(flight_basic_auth),
+                grpc_auth: None,
+            };
         }
+
+        Self::no_auth()
     }
 
     #[must_use]
@@ -61,19 +80,8 @@ impl Default for EndpointAuth {
     }
 }
 
-/// Gets the HTTP auth provider configured for the app, if any
 #[must_use]
-async fn http_auth(
-    secrets: Arc<RwLock<Secrets>>,
-    app: &App,
-) -> Option<Arc<dyn HttpAuth + Send + Sync>> {
-    let api_key_auth = app
-        .runtime
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.api_key.as_ref())?;
-
-    let secrets = secrets.read().await;
+async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> Arc<ApiKeyAuth> {
     let mut keys = Vec::with_capacity(api_key_auth.keys.len());
     for key in &api_key_auth.keys {
         keys.push(
@@ -85,25 +93,7 @@ async fn http_auth(
         );
     }
 
-    Some(Arc::new(ApiKeyAuth::new(keys)))
-}
-
-#[must_use]
-#[allow(clippy::needless_pass_by_value)]
-fn flight_basic_auth(
-    _secrets: Arc<RwLock<Secrets>>,
-    _app: &App,
-) -> Option<Arc<dyn FlightBasicAuth + Send + Sync>> {
-    None
-}
-
-#[must_use]
-#[allow(clippy::needless_pass_by_value)]
-fn grpc_auth(
-    _secrets: Arc<RwLock<Secrets>>,
-    _app: &App,
-) -> Option<Arc<dyn GrpcAuth + Send + Sync>> {
-    None
+    Arc::new(ApiKeyAuth::new(keys))
 }
 
 impl std::fmt::Debug for EndpointAuth {

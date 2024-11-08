@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::auth::EndpointAuth;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::query::{self, Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
@@ -27,12 +28,14 @@ use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
+use auth::BasicAuthLayer;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use runtime_auth::FlightBasicAuth;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -43,6 +46,7 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
+mod auth;
 mod do_exchange;
 mod do_get;
 mod do_put;
@@ -62,6 +66,7 @@ use arrow_flight::{
 pub struct Service {
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
+    basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
 
 #[tonic::async_trait]
@@ -76,10 +81,10 @@ impl FlightService for Service {
 
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
         metrics::HANDSHAKE_REQUESTS.add(1, &[]);
-        handshake::handle()
+        handshake::handle(request.metadata(), self.basic_auth.as_ref())
     }
 
     async fn list_flights(
@@ -327,10 +332,12 @@ pub async fn start(
     bind_address: std::net::SocketAddr,
     df: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
+    endpoint_auth: EndpointAuth,
 ) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
+        basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
     let svc = FlightServiceServer::new(service);
 
@@ -349,7 +356,12 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
+    let auth_layer = tower::ServiceBuilder::new()
+        .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
+        .into_inner();
+
     server
+        .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
         .await

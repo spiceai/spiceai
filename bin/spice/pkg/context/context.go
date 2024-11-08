@@ -49,6 +49,7 @@ type RuntimeContext struct {
 	metricsEndpoint string
 	isCloud         bool
 	httpClient      *http.Client
+	apiKey          string
 }
 
 func NewContext() *RuntimeContext {
@@ -317,6 +318,10 @@ func (c *RuntimeContext) WithCloud(isCloud bool) *RuntimeContext {
 	return c
 }
 
+func (c *RuntimeContext) SetApiKey(apiKey string) {
+	c.apiKey = apiKey
+}
+
 func (c *RuntimeContext) GetHeaders() http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
@@ -326,6 +331,10 @@ func (c *RuntimeContext) GetHeaders() http.Header {
 		if apiKey != "" {
 			headers.Set("X-API-Key", apiKey)
 		}
+	}
+
+	if c.apiKey != "" {
+		headers.Set("X-API-Key", c.apiKey)
 	}
 
 	return headers

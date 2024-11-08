@@ -16,6 +16,7 @@ limitations under the License.
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidCredentials,
     HttpAuthError(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -23,6 +24,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::HttpAuthError(e) => write!(f, "Error validating HTTP request: {e}"),
+            Error::InvalidCredentials => write!(f, "Invalid credentials"),
         }
     }
 }
@@ -31,6 +33,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::HttpAuthError(e) => Some(e.as_ref()),
+            Error::InvalidCredentials => None,
         }
     }
 }

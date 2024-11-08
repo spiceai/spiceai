@@ -16,7 +16,7 @@ limitations under the License.
 
 use axum::http;
 
-use crate::{error::Error, AuthVerdict, HttpAuth};
+use crate::{error::Error, AuthVerdict, FlightBasicAuth, HttpAuth};
 
 pub struct ApiKeyAuth {
     api_keys: Vec<String>,
@@ -39,6 +39,24 @@ impl HttpAuth for ApiKeyAuth {
             .unwrap_or_default();
 
         if self.api_keys.iter().any(|key| key == api_key) {
+            Ok(AuthVerdict::Allow)
+        } else {
+            Ok(AuthVerdict::Deny)
+        }
+    }
+}
+
+impl FlightBasicAuth for ApiKeyAuth {
+    fn validate(&self, _username: &str, password: &str) -> Result<String, Error> {
+        if self.api_keys.iter().any(|key| key == password) {
+            Ok(password.to_string())
+        } else {
+            Err(Error::InvalidCredentials)
+        }
+    }
+
+    fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error> {
+        if self.api_keys.iter().any(|key| key == bearer_token) {
             Ok(AuthVerdict::Allow)
         } else {
             Ok(AuthVerdict::Deny)
