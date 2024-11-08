@@ -31,7 +31,8 @@ use spicepod::component::{
 use crate::{
     init_tracing,
     models::{
-        get_taxi_trips_dataset, get_tpcds_dataset, normalize_embeddings_response, normalize_search_response, send_embeddings_request, send_search_request
+        get_taxi_trips_dataset, get_tpcds_dataset, normalize_embeddings_response,
+        normalize_search_response, send_embeddings_request, send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -156,10 +157,7 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
             "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
         ))
-        .with_embedding(get_huggingface_embeddings(
-            "intfloat/e5-small-v2",
-            "hf_e5",
-        ))
+        .with_embedding(get_huggingface_embeddings("intfloat/e5-small-v2", "hf_e5"))
         .build();
 
     let http_port = rand::thread_rng().gen_range(50000..60000);
@@ -191,7 +189,6 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
             EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
             Some("float"),
             None,
-            None,
         ),
         (
             "hf_minilm",
@@ -200,13 +197,11 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
                 "and the waiter...".to_string(),
             ]),
             None, // `base64` paramerter is not supported when using local model
-            None, // `user` parameter is not supported when using local model
             Some(256),
         ),
         (
             "hf_e5",
             EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-            None,
             None,
             Some(384),
         ),
@@ -214,20 +209,24 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
 
     let mut test_id = 0;
 
-    for (model, input, encoding_format, user, dimensions) in embeddins_test {
+    for (model, input, encoding_format, dimensions) in embeddins_test {
         test_id += 1;
         let response = send_embeddings_request(
             base_url.as_str(),
             model,
             input,
             encoding_format,
-            user,
+            None, // `user` parameter is not supported when using local model
             dimensions,
         )
         .await?;
 
-        //Embeddings are not deterministic; values can vary for the same input, model version, and parameters.
-        insta::assert_snapshot!(format!("embeddings_{}", test_id), normalize_embeddings_response(response));
+        insta::assert_snapshot!(
+            format!("embeddings_{}", test_id),
+            // Embeddingsare are not deterministic (values vary for the same input, model version, and parameters) so
+            // we normalize the response before snapshotting
+            normalize_embeddings_response(response)
+        );
     }
 
     Ok(())

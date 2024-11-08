@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc
+    sync::Arc,
 };
 
 use app::AppBuilder;
@@ -31,7 +31,9 @@ use spicepod::component::{
 use crate::{
     init_tracing,
     models::{
-        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response, send_nsql_request, send_search_request
+        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
+        normalize_embeddings_response, normalize_search_response, send_nsql_request,
+        send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -206,7 +208,7 @@ async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
         .await
         .map_err(anyhow::Error::msg)?;
 
-let app = AppBuilder::new("search_app")
+    let app = AppBuilder::new("search_app")
         .with_embedding(get_openai_embeddings(
             Some("text-embedding-3-small"),
             "openai_embeddings",
@@ -269,8 +271,12 @@ let app = AppBuilder::new("search_app")
         )
         .await?;
 
-        // OpenAI's embeddings response is not deterministic; embedding values can vary for the same input, model version, and parameters.
-        insta::assert_snapshot!(format!("embeddings_{}", test_id), normalize_embeddings_response(response));
+        insta::assert_snapshot!(
+            format!("embeddings_{}", test_id),
+            // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
+            // we normalize the response before snapshotting
+            normalize_embeddings_response(response)
+        );
     }
 
     Ok(())
