@@ -318,7 +318,7 @@ jobs:
   run-clickbench:
     name: Run ${{ matrix.name }} Clickbench
     runs-on: spiceai-large-runners
-    # needs: build-database-bench-binary
+    needs: build-database-bench-binary
 
     strategy:
       fail-fast: false
