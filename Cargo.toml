@@ -21,7 +21,8 @@ members = [
   "crates/util",
   "tools/flightpublisher/",
   "tools/flightsubscriber/",
-  "tools/spicepodschema/", 
+  "tools/spicepodschema/",
+  "tools/otelpublisher/",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -75,6 +76,7 @@ futures = "0.3.30"
 globset = "0.4.15"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
+http = "1.1.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 lazy_static = "1.5.0"
@@ -88,6 +90,7 @@ opentelemetry-zipkin = { version = "0.26", default-features = false, features = 
 opentelemetry-http = { version = "0.26", features = ["reqwest-rustls"] }
 pem = "3.0.4"
 prometheus = "0.13"
+pin-project = "1.0"
 r2d2 = "0.8.10"
 regex = "1.10.3"
 reqwest = {version = "0.12.5", features = ["json", "rustls-tls"] }

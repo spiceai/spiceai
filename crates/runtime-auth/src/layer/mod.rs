@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod api_key;
-pub mod error;
-pub mod layer;
-mod traits;
-
-pub use traits::*;
+pub mod flight;
+pub mod grpc;
+pub mod http;

@@ -7969,6 +7969,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "otelpublisher"
+version = "1.0.0-rc.1"
+dependencies = [
+ "clap",
+ "futures",
+ "opentelemetry-proto",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "outref"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9520,6 +9531,13 @@ version = "1.0.0-rc.1"
 dependencies = [
  "app",
  "axum",
+ "base64 0.22.1",
+ "futures",
+ "http 1.1.0",
+ "pin-project",
+ "tonic",
+ "tower 0.5.1",
+ "tracing",
 ]
 
 [[package]]

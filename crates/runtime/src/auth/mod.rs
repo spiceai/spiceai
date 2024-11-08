@@ -48,10 +48,11 @@ impl EndpointAuth {
             let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
             let flight_basic_auth =
                 Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;
+            let grpc_auth = Arc::clone(&api_key_auth) as Arc<dyn GrpcAuth + Send + Sync>;
             return Self {
                 http_auth: Some(http_auth),
                 flight_basic_auth: Some(flight_basic_auth),
-                grpc_auth: None,
+                grpc_auth: Some(grpc_auth),
             };
         }
 
