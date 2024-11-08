@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++---------------------+------------------+------------+-----------+
+| w_warehouse_name    | i_item_id        | inv_before | inv_after |
++---------------------+------------------+------------+-----------+
+| Conventional childr | AAAAAAAAAABDAAAA | 2370       | 2076      |
+| Conventional childr | AAAAAAAAAACDAAAA | 2697       | 2639      |
+| Conventional childr | AAAAAAAAAAHDAAAA | 1861       | 2672      |
+| Conventional childr | AAAAAAAAAALAAAAA | 2031       | 2323      |
+| Conventional childr | AAAAAAAAABBDAAAA | 2757       | 2638      |
+| Conventional childr | AAAAAAAAACHCAAAA | 2441       | 2090      |
+| Conventional childr | AAAAAAAAACKCAAAA | 1823       | 1554      |
+| Conventional childr | AAAAAAAAACLDAAAA | 2267       | 2625      |
+| Conventional childr | AAAAAAAAACPDAAAA | 1794       | 2310      |
+| Conventional childr | AAAAAAAAADGBAAAA | 2264       | 2930      |
++---------------------+------------------+------------+-----------+

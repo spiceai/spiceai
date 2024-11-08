@@ -37,6 +37,7 @@ on:
           - 'spark connector'
           - 'postgres connector'
           - 'mysql connector'
+          - 'duckdb connector'
           - 'odbc-databricks connector'
           - 'odbc-athena connector'
           - 'delta_lake connector'
@@ -171,6 +172,12 @@ jobs:
           - cmd: '-c mysql'
             name: 'mysql connector'
             bench: 'tpch'
+          - cmd: '-c duckdb'
+            name: 'duckdb connector'
+            bench: 'tpch'
+          - cmd: '-c duckdb -b tpcds'
+            name: 'duckdb connector'
+            bench: 'tpcds'
           - cmd: '-c mysql -b tpcds'
             name: 'mysql connector'
             bench: 'tpcds'
@@ -286,6 +293,16 @@ jobs:
       - name: Make benchmark binary executable
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: chmod +x ./spice_bench
+
+      - name: Download DuckDB Connector Data
+        if: matrix.cmd == '-c duckdb' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        run: |
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpch.db
+
+      - name: Download DuckDB Connector Data
+        if: matrix.cmd == '-c duckdb -b tpcds' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        run: |
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpcds.db
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'

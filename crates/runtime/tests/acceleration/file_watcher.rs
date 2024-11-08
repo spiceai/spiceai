@@ -28,7 +28,9 @@ use spicepod::component::{
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::{acceleration::get_params, get_test_datafusion, init_tracing, runtime_ready_check};
+use crate::{
+    acceleration::get_params, get_test_datafusion, init_tracing, utils::runtime_ready_check,
+};
 
 #[expect(clippy::expect_used)]
 fn get_dataset() -> Dataset {

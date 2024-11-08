@@ -66,6 +66,8 @@ pub(crate) fn routes(
             .route("/v1/chat/completions", post(v1::chat::post))
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
+            .route("/v1/tools", get(v1::tools::list))
+            .route("/v1/tool/:name", post(v1::tools::post))
             .layer(Extension(Arc::clone(&rt.llms)))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(vector_search))
@@ -81,6 +83,7 @@ pub(crate) fn routes(
 
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
+        tracing::info!("Enabled authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 

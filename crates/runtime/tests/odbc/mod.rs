@@ -20,7 +20,7 @@ use app::AppBuilder;
 use runtime::Runtime;
 use tracing::instrument;
 
-use crate::{init_tracing, wait_until_true};
+use crate::{init_tracing, utils::wait_until_true};
 
 use std::collections::HashMap;
 

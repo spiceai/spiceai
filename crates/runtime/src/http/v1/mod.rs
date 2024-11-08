@@ -25,6 +25,7 @@ pub mod ready;
 pub mod search;
 pub mod spicepods;
 pub mod status;
+pub mod tools;
 
 use std::sync::Arc;
 
