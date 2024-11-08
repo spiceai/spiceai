@@ -9027,6 +9027,7 @@ dependencies = [
  "libc",
  "libz-sys",
  "num_enum 0.5.11",
+ "openssl-sys",
  "pkg-config",
 ]
 
