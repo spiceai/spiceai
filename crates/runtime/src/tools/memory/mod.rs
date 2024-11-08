@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
-use spicepod::component::tool::Tool;
 
 pub mod catalog;
 pub mod load;
@@ -34,7 +33,10 @@ pub struct MemoryTableElement {
 
 pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> {
     let values = StringArray::from_iter_values(data.iter().map(|d| d.value.as_str()));
-    let created_by = StringArray::from_iter(data.iter().map(|d| d.created_by.as_deref()));
+    let created_by = data
+        .iter()
+        .map(|d| d.created_by.as_deref())
+        .collect::<StringArray>();
     let created_at: TimestampSecondArray =
         TimestampSecondArray::from(data.iter().map(|e| e.created_at).collect::<Vec<_>>());
 
@@ -56,10 +58,4 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
             Arc::new(created_at) as ArrayRef,
         ],
     )
-}
-
-// Model tools must also be added to [`super::memory::factory::MemoryToolFactory`]
-#[must_use]
-pub fn get_memory_tool_spec() -> Vec<Tool> {
-    vec![]
 }

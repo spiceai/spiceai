@@ -28,8 +28,9 @@ pub mod memory;
 pub mod options;
 pub mod utils;
 
-/// [`Tooling`] define several ways to access tools. Tools can be defined
-/// singularly, or as a set of tools a user may want to include all together.
+/// [`Tooling`] define several ways to access and load tools into the runtime.
+/// Tools can be defined singularly, or as a set of tools a user may want to
+/// include all together (i.e. a catalog).
 pub enum Tooling {
     Tool(Arc<dyn SpiceModelTool>),
     Catalog(Arc<dyn SpiceToolCatalog>),

@@ -50,6 +50,7 @@ pub async fn register_all_factories() {
     register_tool_factory("memory", Arc::new(MemoryToolCatalog {})).await;
 }
 
+/// Get all catalogs available by default in the spice runtime.
 #[must_use]
 pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {
     vec![

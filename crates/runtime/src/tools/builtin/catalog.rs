@@ -35,7 +35,8 @@ use super::{
 pub struct BuiltinToolCatalog {}
 
 impl BuiltinToolCatalog {
-    fn construct_builtin(
+    // Must be in sync with [`super::get_builtin_tools`].
+    pub(crate) fn construct_builtin(
         id: &str,
         name: Option<&str>,
         description: Option<String>,
@@ -74,7 +75,6 @@ impl BuiltinToolCatalog {
     }
 }
 
-/// Builtin tools must also be added to [`crate::tools::get_builtin_tools`] and [`crate::tools::get_builtin_tool_spec`].
 impl ToolFactory for BuiltinToolCatalog {
     fn construct(
         &self,
@@ -100,7 +100,6 @@ impl ToolFactory for BuiltinToolCatalog {
 }
 
 impl SpiceToolCatalog for BuiltinToolCatalog {
-    // Builtin tools must also be added to [`super::factory::builtin::BuiltinToolFactory`]
     fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         get_builtin_tools()
     }

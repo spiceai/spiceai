@@ -45,7 +45,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
                 description: tool.description().map(ToString::to_string),
                 parameters: tool.parameters(),
             }),
-            _ => None,
+            Tooling::Catalog(_) => None,
         })
         .collect::<Vec<_>>();
 

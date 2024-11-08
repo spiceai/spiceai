@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::ResultExt;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tracing_futures::Instrument;
 
 use crate::{
@@ -62,18 +62,6 @@ impl Default for LoadMemoryTool {
     }
 }
 
-impl From<LoadMemoryTool> for spicepod::component::tool::Tool {
-    fn from(val: LoadMemoryTool) -> Self {
-        spicepod::component::tool::Tool {
-            from: format!("memory:{}", val.name()),
-            name: val.name().to_string(),
-            description: val.description().map(ToString::to_string),
-            params: HashMap::default(),
-            depends_on: Vec::default(),
-        }
-    }
-}
-
 #[async_trait]
 impl SpiceModelTool for LoadMemoryTool {
     fn name(&self) -> &str {
@@ -100,7 +88,6 @@ impl SpiceModelTool for LoadMemoryTool {
 
             let batches = rt
                 .datafusion()
-                //SELECT NOW() - INTERVAL '10000' SECOND;
                 .query_builder(
                     &format!(
                         "SELECT value FROM {} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
@@ -120,9 +107,10 @@ impl SpiceModelTool for LoadMemoryTool {
 
             let history = batches
                 .iter()
-                .filter_map(|b| match b.column(0).as_string_opt::<i32>() {
-                    Some(s) => Some(s.iter().map(|s| s.unwrap_or_default()).collect::<Vec<_>>()),
-                    _ => {
+                .filter_map(|b| {
+                    if let Some(s) = b.column(0).as_string_opt::<i32>() {
+                        Some(s.iter().map(Option::unwrap_or_default).collect::<Vec<_>>())
+                    } else {
                         tracing::trace!(
                             "Using tool={}, failed to convert record batch to string",
                             self.name()

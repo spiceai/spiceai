@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tracing_futures::Instrument;
 
 use crate::{
@@ -72,18 +72,6 @@ impl Default for StoreMemoryTool {
             "store_memory",
             Some("Store important details provided by a user for future reference.".to_string()),
         )
-    }
-}
-
-impl From<StoreMemoryTool> for spicepod::component::tool::Tool {
-    fn from(val: StoreMemoryTool) -> Self {
-        spicepod::component::tool::Tool {
-            from: format!("memory:{}", val.name()),
-            name: val.name().to_string(),
-            description: val.description().map(ToString::to_string),
-            params: HashMap::default(),
-            depends_on: Vec::default(),
-        }
     }
 }
 
