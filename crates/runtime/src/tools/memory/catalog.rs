@@ -19,7 +19,9 @@ use std::{collections::HashMap, sync::Arc};
 use secrecy::SecretString;
 use spicepod::component::tool::Tool;
 
-use crate::tools::{catalog::SpiceToolCatalog, factory::ToolFactory, SpiceModelTool};
+use crate::tools::{
+    catalog::SpiceToolCatalog, factory::ToolFactory, memory::store::StoreMemoryTool, SpiceModelTool,
+};
 
 use super::load::LoadMemoryTool;
 
@@ -34,6 +36,7 @@ impl MemoryToolCatalog {
         let name = name.unwrap_or(id);
         match id {
             "load" => Some(Arc::new(LoadMemoryTool::new(name, description))),
+            "store" => Some(Arc::new(StoreMemoryTool::new(name, description))),
             _ => None,
         }
     }
@@ -68,7 +71,10 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     }
 
     fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
-        vec![Arc::new(LoadMemoryTool::default())]
+        vec![
+            Arc::new(LoadMemoryTool::default()),
+            Arc::new(StoreMemoryTool::default()),
+        ]
     }
 
     fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {

@@ -30,6 +30,8 @@ use crate::{
     Runtime,
 };
 
+use super::DEFAULT_MEMORY_TABLE;
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
     /// Retrieve memories create in the 'last' interval. ISO 8601 Format, e.g: "1h", "2m30s".
@@ -101,9 +103,10 @@ impl SpiceModelTool for LoadMemoryTool {
                 //SELECT NOW() - INTERVAL '10000' SECOND;
                 .query_builder(
                     &format!(
-                    "SELECT value FROM store WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
-                    last_interval.as_secs()
-                ),
+                        "SELECT value FROM {} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
+                        DEFAULT_MEMORY_TABLE,
+                        last_interval.as_secs()
+                    ),
                     Protocol::Internal,
                 )
                 .build()
