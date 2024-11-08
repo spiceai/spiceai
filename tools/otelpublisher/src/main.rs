@@ -107,10 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut request = request.into_request();
 
     if let Some(api_key) = args.api_key {
-        request.metadata_mut().insert(
-            "x-api-key",
-            MetadataValue::try_from(api_key).expect("Invalid API key"),
-        );
+        let metadata_value = match MetadataValue::try_from(api_key) {
+            Ok(metadata_value) => metadata_value,
+            Err(e) => panic!("Invalid API key: {e}"),
+        };
+        request.metadata_mut().insert("x-api-key", metadata_value);
     }
 
     client.export(request).await?;
