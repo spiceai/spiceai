@@ -92,6 +92,7 @@ assignees: ''
   - [ ] [Results Caching](https://github.com/spiceai/quickstarts/blob/trunk/caching/README.md)
   - [ ] [Securing data in transit via TLS](https://github.com/spiceai/quickstarts/blob/trunk/tls/README.md)
   - [ ] [TPC-H Benchmarking](https://github.com/spiceai/quickstarts/blob/trunk/tpc-h/README.md)
+  - [ ] [API Key Authentication](https://github.com/spiceai/quickstarts/blob/trunk/api_key/README.md)
 - [ ] Merge [Docs PRs](https://github.com/spiceai/docs/pulls)
   - [ ] Update spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docusaurus.config.ts#L60)
 - [ ] Merge [Samples PRs](https://github.com/spiceai/samples/pulls)
