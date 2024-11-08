@@ -9453,6 +9453,7 @@ dependencies = [
  "dotenvy",
  "duckdb",
  "flight_client",
+ "flightrepl",
  "fundu",
  "futures",
  "globset",

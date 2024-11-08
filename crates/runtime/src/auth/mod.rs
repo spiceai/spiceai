@@ -73,6 +73,18 @@ impl EndpointAuth {
         self.http_auth = Some(auth);
         self
     }
+
+    #[must_use]
+    pub fn with_flight_basic_auth(mut self, auth: Arc<dyn FlightBasicAuth + Send + Sync>) -> Self {
+        self.flight_basic_auth = Some(auth);
+        self
+    }
+
+    #[must_use]
+    pub fn with_grpc_auth(mut self, auth: Arc<dyn GrpcAuth + Send + Sync>) -> Self {
+        self.grpc_auth = Some(auth);
+        self
+    }
 }
 
 impl Default for EndpointAuth {
