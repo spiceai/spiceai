@@ -43,6 +43,7 @@ impl From<StoreMemoryParams> for Vec<MemoryTableElement> {
         val.thoughts
             .iter()
             .map(|thought| MemoryTableElement {
+                id: uuid::Uuid::now_v7(),
                 value: thought.to_string(),
                 created_by: None,
                 created_at: chrono::Utc::now().timestamp(),
@@ -70,7 +71,7 @@ impl Default for StoreMemoryTool {
     fn default() -> Self {
         Self::new(
             "store_memory",
-            Some("Store important details provided by a user for future reference.".to_string()),
+            Some("Record any details from 'user' messages that are worth remembering for future conversations.".to_string()),
         )
     }
 }

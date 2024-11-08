@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use uuid::Uuid;
 
 pub mod catalog;
 pub mod load;
@@ -26,12 +27,14 @@ pub mod store;
 pub static DEFAULT_MEMORY_TABLE: &str = "spice.public.store";
 
 pub struct MemoryTableElement {
+    pub id: Uuid,
     pub value: String,
     pub created_by: Option<String>,
     pub created_at: i64, // Unix timestamp in Seconds
 }
 
 pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> {
+    let ids = StringArray::from_iter_values(data.iter().map(|d| d.id.to_string()));
     let values = StringArray::from_iter_values(data.iter().map(|d| d.value.as_str()));
     let created_by = data
         .iter()
@@ -41,6 +44,7 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
         TimestampSecondArray::from(data.iter().map(|e| e.created_at).collect::<Vec<_>>());
 
     let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
         Field::new("value", DataType::Utf8, false),
         Field::new("created_by", DataType::Utf8, true),
         Field::new(
@@ -53,6 +57,7 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
     RecordBatch::try_new(
         schema,
         vec![
+            Arc::new(ids) as ArrayRef,
             Arc::new(values) as ArrayRef,
             Arc::new(created_by) as ArrayRef,
             Arc::new(created_at) as ArrayRef,
