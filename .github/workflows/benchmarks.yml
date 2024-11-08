@@ -52,31 +52,31 @@ env:
   FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 jobs:
-  build-database-bench-binary:
-    name: Build Benchmark Test Binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  # build-database-bench-binary:
+  #   name: Build Benchmark Test Binary
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
+  #     - name: Set up Rust
+  #       uses: ./.github/actions/setup-rust
+  #       with:
+  #         os: 'linux'
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+  #     - name: Install Protoc
+  #       uses: arduino/setup-protoc@v3
 
-      - name: Build benchmark binary
-        run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
+  #     - name: Build benchmark binary
+  #       run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
 
-      - name: Find, move, and rename benchmark binary
-        run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
+  #     - name: Find, move, and rename benchmark binary
+  #       run: find target/release/deps -type f -name "bench-*" ! -name "*.d" -exec mv {} ./spice_bench \;
 
-      - name: Upload benchmark binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: spice_bench
-          path: ./spice_bench
+  #     - name: Upload benchmark binary
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: spice_bench
+  #         path: ./spice_bench
 
   # run-database-bench:
   #   name: Run ${{ matrix.name }} ${{ matrix.bench }} Benchmark
@@ -317,22 +317,22 @@ jobs:
 
   run-clickbench:
     name: Run ${{ matrix.name }} Clickbench
-    runs-on: spiceai-runners
-    needs: build-database-bench-binary
+    runs-on: spiceai-large-runners
+    # needs: build-database-bench-binary
 
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 1
       matrix:
         include:
+          - cmd: '-a arrow -b clickbench'
+            name: 'arrow accelerator (file mode)'
+            bench: 'clickbench'
           - cmd: '-a duckdb -m file -b clickbench'
             name: 'duckdb accelerator (file mode)'
             bench: 'clickbench'
           - cmd: '-a duckdb -m memory -b clickbench'
             name: 'duckdb accelerator (memory mode)'
-            bench: 'clickbench'
-          - cmd: '-a arrow -b clickbench'
-            name: 'arrow accelerator (file mode)'
             bench: 'clickbench'
 
     steps:
@@ -343,16 +343,22 @@ jobs:
       - name: Install required packages
         run: sudo apt-get update && sudo apt-get install -y unixodbc-dev unixodbc wget
 
+      - name: Download artifact
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/test-bench/spice_bench -O spice_bench
+
       - name: Set up Spice.ai API Key
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
-      - name: Download benchmark binary
-        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        uses: actions/download-artifact@v4
-        with:
-          name: spice_bench
+      # - name: Download benchmark binary
+      #   if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+      #   uses: actions/download-artifact@v4
+      #   with:
+      #     name: spice_bench
 
       - name: Make benchmark binary executable
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
