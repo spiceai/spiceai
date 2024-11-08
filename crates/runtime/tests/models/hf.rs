@@ -156,6 +156,10 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
             "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
         ))
+        .with_embedding(get_huggingface_embeddings(
+            "intfloat/e5-small-v2",
+            "hf_e5",
+        ))
         .build();
 
     let http_port = rand::thread_rng().gen_range(50000..60000);
@@ -183,12 +187,14 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
 
     let embeddins_test = vec![
         (
+            "hf_minilm",
             EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
             Some("float"),
             None,
             None,
         ),
         (
+            "hf_minilm",
             EmbeddingInput::StringArray(vec![
                 "The food was delicious".to_string(),
                 "and the waiter...".to_string(),
@@ -197,15 +203,22 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
             None, // `user` parameter is not supported when using local model
             Some(256),
         ),
+        (
+            "hf_e5",
+            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+            None,
+            None,
+            Some(384),
+        ),
     ];
 
     let mut test_id = 0;
 
-    for (input, encoding_format, user, dimensions) in embeddins_test {
+    for (model, input, encoding_format, user, dimensions) in embeddins_test {
         test_id += 1;
         let response = send_embeddings_request(
             base_url.as_str(),
-            "hf_minilm",
+            model,
             input,
             encoding_format,
             user,
