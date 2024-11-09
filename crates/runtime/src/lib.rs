@@ -404,6 +404,7 @@ impl Runtime {
             config.open_telemetry_bind_address,
             Arc::clone(&self.df),
             tls_config.clone(),
+            endpoint_auth.grpc_auth.clone(),
         ));
 
         let pods_watcher_future = if self.pods_watcher.read().await.is_some() {

@@ -56,7 +56,7 @@ globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 headers-accept = "0.1.3"
-http = "1.1.0"
+http.workspace = true
 http-body-util = "0.1.2"
 hyper = "1.4.1"
 hyper-util = { version = "0.1.6", features = ["service"] }
@@ -83,7 +83,7 @@ opentelemetry-proto = { version = "0.25", features = [
 ] }
 opentelemetry-prometheus.workspace = true
 otel-arrow = { path = "../otel-arrow" }
-pin-project = "1.0"
+pin-project.workspace = true
 prometheus.workspace = true
 prometheus-parse = "0.2.5"
 prost = { version = "0.13.1", default-features = false, features = [
@@ -135,6 +135,7 @@ azure_storage_blobs = "0.20.0"
 azure_core = "0.20.0"
 azure_storage = "0.20.0"
 scopeguard = "1.2.0"
+flightrepl = { path = "../flightrepl" }
 
 [features]
 aws-secrets-manager = [

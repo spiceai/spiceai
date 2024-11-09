@@ -557,6 +557,9 @@ impl DataFusion {
             },
         )?;
 
+        self.runtime_status
+            .update_dataset(&table_reference, status::ComponentStatus::Ready);
+
         Ok(())
     }
 
