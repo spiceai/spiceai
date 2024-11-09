@@ -14,14 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use app::AppBuilder;
-use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
+use async_openai::types::EmbeddingInput;
+use runtime::{auth::EndpointAuth, Runtime};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
@@ -30,12 +27,12 @@ use spicepod::component::{
 use crate::{
     init_tracing,
     models::{
-        get_taxi_trips_dataset, get_tpcds_dataset, normalize_search_response, send_search_request,
+        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
+        normalize_embeddings_response, normalize_search_response, send_embeddings_request,
+        send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
-
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[tokio::test]
 async fn huggingface_search_test() -> Result<(), anyhow::Error> {
@@ -61,11 +58,9 @@ async fn huggingface_search_test() -> Result<(), anyhow::Error> {
         ))
         .build();
 
-    let http_port = rand::thread_rng().gen_range(50000..60000);
+    let api_config = create_api_bindings_config();
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    tracing::debug!("Running Spice runtime with http port: {http_port}");
-
-    let api_config = Config::new().with_http_bind_address(SocketAddr::new(LOCALHOST, http_port));
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
     let rt_ref_copy = Arc::clone(&rt);
@@ -82,11 +77,9 @@ async fn huggingface_search_test() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    let base_url = format!("http://localhost:{http_port}");
-
     tracing::info!("/v1/search: Ensure simple search request succeeds");
     let response = send_search_request(
-        base_url.as_str(),
+        http_base_url.as_str(),
         "new patient",
         Some(2),
         Some(vec!["item".to_string()]),
@@ -117,11 +110,7 @@ async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
         ))
         .build();
 
-    let http_port = rand::thread_rng().gen_range(50000..60000);
-
-    tracing::debug!("Running Spice runtime with http port: {http_port}");
-
-    let api_config = Config::new().with_http_bind_address(SocketAddr::new(LOCALHOST, http_port));
+    let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
     let rt_ref_copy = Arc::clone(&rt);
@@ -138,6 +127,90 @@ async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
     }
 
     runtime_ready_check(&rt).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    verify_env_secret_exists("SPICE_HF_TOKEN")
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let app = AppBuilder::new("text-to-sql")
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .with_embedding(get_huggingface_embeddings("intfloat/e5-small-v2", "hf_e5"))
+        .build();
+
+    let api_config = create_api_bindings_config();
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let rt_ref_copy = Arc::clone(&rt);
+    tokio::spawn(async move {
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let embeddins_test = vec![
+        (
+            "hf_minilm",
+            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+            Some("float"),
+            None,
+        ),
+        (
+            "hf_minilm",
+            EmbeddingInput::StringArray(vec![
+                "The food was delicious".to_string(),
+                "and the waiter...".to_string(),
+            ]),
+            None, // `base64` paramerter is not supported when using local model
+            Some(256),
+        ),
+        (
+            "hf_e5",
+            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+            None,
+            Some(384),
+        ),
+    ];
+
+    let mut test_id = 0;
+
+    for (model, input, encoding_format, dimensions) in embeddins_test {
+        test_id += 1;
+        let response = send_embeddings_request(
+            http_base_url.as_str(),
+            model,
+            input,
+            encoding_format,
+            None, // `user` parameter is not supported when using local model
+            dimensions,
+        )
+        .await?;
+
+        insta::assert_snapshot!(
+            format!("embeddings_{}", test_id),
+            // Embeddingsare are not deterministic (values vary for the same input, model version, and parameters) so
+            // we normalize the response before snapshotting
+            normalize_embeddings_response(response)
+        );
+    }
 
     Ok(())
 }
