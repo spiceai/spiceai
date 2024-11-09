@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use app::AppBuilder;
 use async_openai::types::EmbeddingInput;
@@ -34,7 +34,7 @@ use crate::{
         json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response,
         send_embeddings_request, send_nsql_request, send_search_request,
     },
-    utils::{runtime_ready_check, wait_until_true},
+    utils::runtime_ready_check,
 };
 
 #[tokio::test]
