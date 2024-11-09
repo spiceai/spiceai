@@ -48,10 +48,11 @@ impl EndpointAuth {
             let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
             let flight_basic_auth =
                 Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;
+            let grpc_auth = Arc::clone(&api_key_auth) as Arc<dyn GrpcAuth + Send + Sync>;
             return Self {
                 http_auth: Some(http_auth),
                 flight_basic_auth: Some(flight_basic_auth),
-                grpc_auth: None,
+                grpc_auth: Some(grpc_auth),
             };
         }
 
@@ -70,6 +71,18 @@ impl EndpointAuth {
     #[must_use]
     pub fn with_http_auth(mut self, auth: Arc<dyn HttpAuth + Send + Sync>) -> Self {
         self.http_auth = Some(auth);
+        self
+    }
+
+    #[must_use]
+    pub fn with_flight_basic_auth(mut self, auth: Arc<dyn FlightBasicAuth + Send + Sync>) -> Self {
+        self.flight_basic_auth = Some(auth);
+        self
+    }
+
+    #[must_use]
+    pub fn with_grpc_auth(mut self, auth: Arc<dyn GrpcAuth + Send + Sync>) -> Self {
+        self.grpc_auth = Some(auth);
         self
     }
 }

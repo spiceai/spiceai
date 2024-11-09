@@ -28,7 +28,7 @@ pub trait HttpAuth {
     /// # Errors
     ///
     /// This function will return an error if the validator can't validate the request.
-    fn http(&self, request: &http::request::Parts) -> Result<AuthVerdict, Error>;
+    fn http_verify(&self, request: &http::request::Parts) -> Result<AuthVerdict, Error>;
 }
 
 /// A trait for validating Flight basic auth requests.
@@ -57,5 +57,5 @@ pub trait GrpcAuth {
     /// # Errors
     ///
     /// This function will return an error if the validator can't validate the request.
-    fn grpc(&self, req: &http::request::Parts) -> Result<AuthVerdict, Error>;
+    fn grpc_verify(&self, req: &tonic::Request<()>) -> Result<AuthVerdict, Error>;
 }

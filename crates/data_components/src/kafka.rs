@@ -59,6 +59,17 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
+pub struct KafkaConfig {
+    pub brokers: String,
+    pub security_protocol: String,
+    pub sasl_mechanism: String,
+    pub sasl_username: Option<String>,
+    pub sasl_password: Option<String>,
+    pub ssl_ca_location: Option<String>,
+    pub enable_ssl_certificate_verification: bool,
+}
+
 pub struct KafkaConsumer {
     group_id: String,
     consumer: StreamConsumer,
@@ -67,13 +78,16 @@ pub struct KafkaConsumer {
 impl KafkaConsumer {
     pub fn create_with_existing_group_id(
         group_id: impl Into<String>,
-        brokers: String,
+        kafka_config: KafkaConfig,
     ) -> Result<Self> {
-        Self::create(group_id.into(), brokers)
+        Self::create(group_id.into(), kafka_config)
     }
 
-    pub fn create_with_generated_group_id(dataset: &str, brokers: String) -> Result<Self> {
-        Self::create(Self::generate_group_id(dataset), brokers)
+    pub fn create_with_generated_group_id(
+        dataset: &str,
+        kafka_config: KafkaConfig,
+    ) -> Result<Self> {
+        Self::create(Self::generate_group_id(dataset), kafka_config)
     }
 
     #[must_use]
@@ -174,13 +188,14 @@ impl KafkaConsumer {
         Ok(())
     }
 
-    fn create(group_id: String, brokers: String) -> Result<Self> {
+    fn create(group_id: String, kafka_config: KafkaConfig) -> Result<Self> {
         let (_, version) = get_rdkafka_version();
         tracing::debug!("rd_kafka_version: {}", version);
 
-        let consumer: StreamConsumer = ClientConfig::new()
+        let mut config = ClientConfig::new();
+        config
             .set("group.id", group_id.clone())
-            .set("bootstrap.servers", brokers)
+            .set("bootstrap.servers", kafka_config.brokers)
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
             // Commit offsets automatically
@@ -190,6 +205,23 @@ impl KafkaConsumer {
             // Don't automatically store offsets the library provides to us - we will store them after processing explicitly
             // This is what gives us the "at least once" semantics
             .set("enable.auto.offset.store", "false")
+            .set("security.protocol", kafka_config.security_protocol)
+            .set("sasl.mechanism", kafka_config.sasl_mechanism);
+
+        if let Some(sasl_username) = kafka_config.sasl_username {
+            config.set("sasl.username", sasl_username);
+        }
+        if let Some(sasl_password) = kafka_config.sasl_password {
+            config.set("sasl.password", sasl_password);
+        }
+        if let Some(ssl_ca_location) = kafka_config.ssl_ca_location {
+            config.set("ssl.ca.location", ssl_ca_location);
+        }
+        if kafka_config.enable_ssl_certificate_verification {
+            config.set("enable.ssl.certificate.verification", "true");
+        }
+
+        let consumer: StreamConsumer = config
             .set_log_level(RDKafkaLogLevel::Debug)
             .create()
             .context(UnableToCreateConsumerSnafu)?;

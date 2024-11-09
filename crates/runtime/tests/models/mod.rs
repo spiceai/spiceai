@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use async_openai::types::EmbeddingInput;
+use rand::Rng;
 use reqwest::Client;
+use runtime::config::Config;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
@@ -23,6 +28,27 @@ use spicepod::component::{
 use serde_json::{json, Value};
 mod hf;
 mod openai;
+
+fn create_api_bindings_config() -> Config {
+    let mut rng = rand::thread_rng();
+    let http_port: u16 = rng.gen_range(50000..60000);
+    let flight_port: u16 = http_port + 1;
+    let otel_port: u16 = http_port + 2;
+    let metrics_port: u16 = http_port + 3;
+
+    let localhost: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+    let api_config = Config::new()
+        .with_http_bind_address(SocketAddr::new(localhost, http_port))
+        .with_flight_bind_address(SocketAddr::new(localhost, flight_port))
+        .with_open_telemetry_bind_address(SocketAddr::new(localhost, otel_port));
+
+    tracing::debug!(
+        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+    );
+
+    api_config
+}
 
 fn get_taxi_trips_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
@@ -163,4 +189,63 @@ fn normalize_search_response(mut json: Value) -> String {
     }
 
     json.to_string()
+}
+
+/// Normalizes embeddings response for consistent snapshot testing by replacing actual embedding arrays with a placeholder,
+fn normalize_embeddings_response(mut json: Value) -> String {
+    if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+        for entry in data {
+            if let Some(embedding) = entry.get_mut("embedding") {
+                if let Some(embedding_array) = embedding.as_array_mut() {
+                    let num_elements = embedding_array.len();
+                    *embedding = json!(format!("array_{}_items", num_elements));
+                }
+            }
+        }
+    }
+
+    json.to_string()
+}
+
+/// Normalizes semantic search response for consistent snapshot testing by replacing dynamic values
+/// (such as scores and durations) with placeholders.
+async fn send_embeddings_request(
+    base_url: &str,
+    model: &str,
+    input: EmbeddingInput,
+    // The format to return the embeddings in. Can be either `float` or [`base64`](https://pypi.org/project/pybase64/). Defaults to float
+    encoding_format: Option<&str>,
+    // OpenAI only: A unique identifier representing your end-user, [Learn more](https://platform.openai.com/docs/usage-policies/end-user-ids).
+    user: Option<&str>,
+    // The number of dimensions the resulting output embeddings should have. Only supported in `text-embedding-3` and later models.
+    dimensions: Option<u32>,
+) -> Result<Value, reqwest::Error> {
+    let mut request_body = json!({
+        "model": model,
+        "input": input,
+    });
+
+    if let Some(ef) = encoding_format {
+        request_body["encoding_format"] = json!(ef);
+    }
+
+    if let Some(u) = user {
+        request_body["user"] = json!(u);
+    }
+
+    if let Some(d) = dimensions {
+        request_body["dimensions"] = json!(d);
+    }
+
+    let response = Client::new()
+        .post(format!("{base_url}/v1/embeddings"))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+
+    Ok(response)
 }

@@ -25,7 +25,7 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::KafkaConsumer;
+use data_components::kafka::{KafkaConfig, KafkaConsumer};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Debezium {
-    kafka_brokers: String,
+    kafka_config: KafkaConfig,
 }
 
 impl Debezium {
@@ -70,15 +70,51 @@ impl Debezium {
             return InvalidMessageFormatSnafu.fail();
         }
 
-        let kakfa_brokers = params
-            .get("kafka_bootstrap_servers")
-            .expose()
-            .ok()
-            .context(MissingKafkaBootstrapServersSnafu)?;
+        let kafka_config = KafkaConfig {
+            brokers: params
+                .get("kafka_bootstrap_servers")
+                .expose()
+                .ok()
+                .context(MissingKafkaBootstrapServersSnafu)?
+                .to_string(),
+            security_protocol: params
+                .get("kafka_security_protocol")
+                .expose()
+                .ok()
+                .unwrap_or("sasl_ssl")
+                .to_string(),
+            sasl_mechanism: params
+                .get("kafka_sasl_mechanism")
+                .expose()
+                .ok()
+                .unwrap_or("SCRAM-SHA-512")
+                .to_string(),
+            sasl_username: params
+                .get("kafka_sasl_username")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            sasl_password: params
+                .get("kafka_sasl_password")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_ca_location: params
+                .get("kafka_ssl_ca_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            enable_ssl_certificate_verification: params
+                .get("kafka_enable_ssl_certificate_verification")
+                .expose()
+                .ok()
+                .unwrap_or("true")
+                .to_string()
+                .parse()
+                .unwrap_or(true),
+        };
 
-        Ok(Self {
-            kafka_brokers: kakfa_brokers.to_string(),
-        })
+        Ok(Self { kafka_config })
     }
 }
 
@@ -111,6 +147,24 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description(
             "A list of host/port pairs for establishing the initial Kafka cluster connection.",
         ),
+     ParameterSpec::runtime("kafka_security_protocol")
+        .default("sasl_ssl")
+        .description("Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'."),
+    ParameterSpec::runtime("kafka_sasl_mechanism")
+        .default("SCRAM-SHA-512")
+        .description("SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'."),
+    ParameterSpec::runtime("kafka_sasl_username")
+        .secret()
+        .description("SASL username."),
+    ParameterSpec::runtime("kafka_sasl_password")
+        .secret()
+        .description("SASL password."),
+    ParameterSpec::runtime("kafka_ssl_ca_location")
+        .secret()
+        .description("Path to the SSL/TLS CA certificate file for server verification."),
+    ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
+        .default("true")
+        .description("Enable SSL/TLS certificate verification. Default: 'true'."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -189,7 +243,7 @@ impl DataConnector for Debezium {
             Some(metadata) => {
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
                     &metadata.consumer_group_id,
-                    self.kafka_brokers.clone(),
+                    self.kafka_config.clone(),
                 )
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
@@ -220,7 +274,7 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, &topic, self.kafka_brokers.clone()).await?,
+            None => get_metadata_from_kafka(dataset, &topic, self.kafka_config.clone()).await?,
         };
 
         let debezium_kafka = Arc::new(DebeziumKafka::new(
@@ -276,15 +330,14 @@ async fn set_metadata_to_accelerator(
 async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
-    kafka_brokers: String,
+    kafka_config: KafkaConfig,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    let kafka_consumer =
-        KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_brokers)
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-            })?;
+    let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+        })?;
 
     kafka_consumer
         .subscribe(topic)

@@ -21,9 +21,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::{AuthVerdict, FlightBasicAuth};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use pin_project::pin_project;
-use runtime_auth::{AuthVerdict, FlightBasicAuth};
 use tonic::{
     metadata::{MetadataMap, GRPC_CONTENT_TYPE},
     Status,
@@ -38,7 +38,11 @@ use tower::{Layer, Service};
 /// ```
 ///
 /// The returned token is used on subsequent requests as the bearer token.
-pub(crate) fn validate_basic_auth_handshake(
+///
+/// # Errors
+///
+/// Returns an error if the authorization header is missing, the header is not a valid bearer token, or the credentials are invalid.
+pub fn validate_basic_auth_handshake(
     metadata: &MetadataMap,
     basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
 ) -> Result<Option<String>, Status> {
@@ -86,6 +90,7 @@ pub struct BasicAuthLayer {
 }
 
 impl BasicAuthLayer {
+    #[must_use]
     pub fn new(auth_verifier: Option<Arc<dyn FlightBasicAuth + Send + Sync>>) -> Self {
         Self { auth_verifier }
     }
