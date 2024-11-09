@@ -23,7 +23,7 @@ use async_openai::types::{
     ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
 };
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 
 use super::Openai;
 
@@ -54,7 +54,7 @@ impl Chat for Openai {
         let stream = self.client.chat().create_stream(inner_req).await?;
 
         Ok(Box::pin(stream.map_ok(move |mut s| {
-            s.model = outer_model.clone();
+            s.model.clone_from(&outer_model);
             s
         })))
     }
