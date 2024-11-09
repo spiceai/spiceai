@@ -117,7 +117,6 @@ tonic-health.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-tracing-subscriber.workspace = true
 tract-core = "0.21.0"
 url = "2.5.0"
 util = { path = "../util" }
@@ -132,9 +131,11 @@ azure_core = "0.20.0"
 azure_storage = "0.20.0"
 azure_storage_blobs = "0.20.0"
 bollard = "0.16.1"
+flightrepl = { path = "../flightrepl" }
 insta.workspace = true
 scopeguard = "1.2.0"
-flightrepl = { path = "../flightrepl" }
+spice-cloud = { path = "../spice_cloud" }
+tracing-subscriber.workspace = true
 
 [features]
 aws-secrets-manager = [

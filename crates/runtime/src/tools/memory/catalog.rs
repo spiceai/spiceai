@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
-
+use async_trait::async_trait;
 use secrecy::SecretString;
 use spicepod::component::tool::Tool;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::tools::{
     catalog::SpiceToolCatalog, factory::ToolFactory, memory::store::StoreMemoryTool, SpiceModelTool,
@@ -65,19 +65,20 @@ impl ToolFactory for MemoryToolCatalog {
     }
 }
 
+#[async_trait]
 impl SpiceToolCatalog for MemoryToolCatalog {
     fn name(&self) -> &str {
         "memory"
     }
 
-    fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+    async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         vec![
             Arc::new(LoadMemoryTool::default()),
             Arc::new(StoreMemoryTool::default()),
         ]
     }
 
-    fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+    async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         Self::get_tool(name, None, None)
     }
 }

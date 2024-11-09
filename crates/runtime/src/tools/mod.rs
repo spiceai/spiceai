@@ -38,10 +38,10 @@ pub enum Tooling {
 
 impl Tooling {
     #[must_use]
-    pub fn tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+    pub async fn tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         match self {
             Tooling::Tool(t) => vec![Arc::clone(t)],
-            Tooling::Catalog(c) => c.all(),
+            Tooling::Catalog(c) => c.all().await,
         }
     }
 }

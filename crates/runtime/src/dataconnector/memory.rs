@@ -40,7 +40,6 @@ impl MemoryConnector {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("value", DataType::Utf8, false),
                 Field::new("created_by", DataType::Utf8, true), // Might be unknown.
-                // Field::new("model", DataType::Utf8, false), // Not yet possible to know from tool perspective.
                 Field::new(
                     "created_at",
                     DataType::Timestamp(TimeUnit::Second, None),

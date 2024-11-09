@@ -23,11 +23,11 @@ pub trait SpiceToolCatalog: Send + Sync {
     fn name(&self) -> &str;
 
     /// Retrieve all available tools from a tool catalog.
-    fn all(&self) -> Vec<Arc<dyn SpiceModelTool>>;
+    async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>>;
 
     /// Retrieve a tool by name from a tool catalog.
     ///
     /// Tool will either be built with default parameters, or additional
     /// parameters from the catalog.
-    fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>>;
+    async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>>;
 }

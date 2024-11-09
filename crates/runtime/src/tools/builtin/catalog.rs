@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
-
+use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::tool::Tool;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::tools::{catalog::SpiceToolCatalog, factory::ToolFactory};
 
@@ -99,12 +99,13 @@ impl ToolFactory for BuiltinToolCatalog {
     }
 }
 
+#[async_trait]
 impl SpiceToolCatalog for BuiltinToolCatalog {
-    fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+    async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         get_builtin_tools()
     }
 
-    fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+    async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         Self::construct_builtin(name, None, None, &HashMap::new())
     }
 

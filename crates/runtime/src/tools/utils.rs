@@ -93,7 +93,7 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
 
             for tt in t {
                 if let Some(tool) = all_tools.get(tt) {
-                    tools.extend(tool.tools());
+                    tools.extend(tool.tools().await);
                 } else {
                     tracing::warn!("Tool {tt} not found in registry");
                 }

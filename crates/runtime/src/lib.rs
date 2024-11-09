@@ -1405,7 +1405,7 @@ impl Runtime {
         //   `spice_tools: sql, load_memory`
         for ctlg in default_available_catalogs() {
             self.insert_tool_catalog(&ctlg).await;
-            for tool in ctlg.all() {
+            for tool in ctlg.all().await {
                 self.insert_tool(&tool).await;
             }
         }
