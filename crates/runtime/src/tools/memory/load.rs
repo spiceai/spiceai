@@ -34,7 +34,7 @@ use super::DEFAULT_MEMORY_TABLE;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
-    /// Retrieve memories create in the 'last' interval. ISO 8601 Format, e.g: "1h", "2m30s".
+    /// Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: "1h", "2m30s".
     pub last: String,
 }
 

@@ -17,7 +17,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
-use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 pub mod catalog;
@@ -25,6 +26,20 @@ pub mod load;
 pub mod store;
 
 pub static DEFAULT_MEMORY_TABLE: &str = "spice.public.store";
+
+pub static MEMORY_TABLE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+    Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+        Field::new("created_by", DataType::Utf8, true),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        ),
+    ])
+    .into()
+});
 
 pub struct MemoryTableElement {
     pub id: Uuid,
@@ -43,19 +58,8 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
     let created_at: TimestampSecondArray =
         TimestampSecondArray::from(data.iter().map(|e| e.created_at).collect::<Vec<_>>());
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("value", DataType::Utf8, false),
-        Field::new("created_by", DataType::Utf8, true),
-        Field::new(
-            "created_at",
-            DataType::Timestamp(TimeUnit::Second, None),
-            false,
-        ),
-    ]));
-
     RecordBatch::try_new(
-        schema,
+        Arc::clone(&MEMORY_TABLE_SCHEMA),
         vec![
             Arc::new(ids) as ArrayRef,
             Arc::new(values) as ArrayRef,

@@ -14,15 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow_schema::TimeUnit;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
 use snafu::ResultExt;
 
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, tools::memory::MEMORY_TABLE_SCHEMA};
 use datafusion::datasource::TableProvider;
 use futures::Future;
 
@@ -36,16 +35,7 @@ pub struct MemoryConnector {}
 impl MemoryConnector {
     pub(crate) fn schema_from_path(path: &str) -> Option<SchemaRef> {
         match path {
-            "store" => Some(Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("value", DataType::Utf8, false),
-                Field::new("created_by", DataType::Utf8, true), // Might be unknown.
-                Field::new(
-                    "created_at",
-                    DataType::Timestamp(TimeUnit::Second, None),
-                    false,
-                ),
-            ]))),
+            "store" => Some(Arc::clone(&MEMORY_TABLE_SCHEMA)),
             _ => None,
         }
     }
