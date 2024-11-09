@@ -197,11 +197,6 @@ pub enum Error {
     #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
     NeedToSpecifySQLView { name: String },
 
-    #[snafu(display(
-        "A federated table was configured as read_write without setting replication.enabled = true"
-    ))]
-    FederatedReadWriteTableWithoutReplication,
-
     #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
     AcceleratedReadWriteTableWithoutReplication,
 
@@ -1219,11 +1214,6 @@ impl Runtime {
 
         // FEDERATED TABLE
         if !ds.is_accelerated() {
-            if ds.mode() == dataset::Mode::ReadWrite && !replicate {
-                // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
-                FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
-            }
-
             let ds_name: TableReference = ds.name.clone();
             self.df
                 .register_table(
@@ -1251,7 +1241,6 @@ impl Runtime {
                     name: ds.name.to_string(),
                 })?;
         let accelerator_engine = acceleration_settings.engine;
-        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         if ds.mode() == dataset::Mode::ReadWrite && !replicate {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
