@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 use async_openai::types::EmbeddingInput;
+use rand::Rng;
 use reqwest::Client;
+use runtime::config::Config;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
@@ -24,6 +28,27 @@ use spicepod::component::{
 use serde_json::{json, Value};
 mod hf;
 mod openai;
+
+fn create_api_bindings_config() -> Config {
+    let mut rng = rand::thread_rng();
+    let http_port: u16 = rng.gen_range(50000..60000);
+    let flight_port: u16 = http_port + 1;
+    let otel_port: u16 = http_port + 2;
+    let metrics_port: u16 = http_port + 3;
+
+    let localhost: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+    let api_config = Config::new()
+        .with_http_bind_address(SocketAddr::new(localhost, http_port))
+        .with_flight_bind_address(SocketAddr::new(localhost, flight_port))
+        .with_open_telemetry_bind_address(SocketAddr::new(localhost, otel_port));
+
+    tracing::debug!(
+        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+    );
+
+    api_config
+}
 
 fn get_taxi_trips_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
@@ -166,6 +191,7 @@ fn normalize_search_response(mut json: Value) -> String {
     json.to_string()
 }
 
+/// Normalizes embeddings response for consistent snapshot testing by replacing actual embedding arrays with a placeholder,
 fn normalize_embeddings_response(mut json: Value) -> String {
     if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
         for entry in data {
@@ -181,6 +207,8 @@ fn normalize_embeddings_response(mut json: Value) -> String {
     json.to_string()
 }
 
+/// Normalizes semantic search response for consistent snapshot testing by replacing dynamic values
+/// (such as scores and durations) with placeholders.
 async fn send_embeddings_request(
     base_url: &str,
     model: &str,
