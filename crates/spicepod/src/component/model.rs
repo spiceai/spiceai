@@ -109,7 +109,7 @@ impl Display for ModelSource {
             ModelSource::OpenAi => write!(f, "openai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
             ModelSource::HuggingFace => write!(f, "huggingface:huggingface.co"),
-            ModelSource::File => write!(f, "file:"),
+            ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
         }
     }

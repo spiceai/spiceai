@@ -16,6 +16,7 @@ use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
         CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
+        EmbeddingVector, EncodingFormat,
     },
 };
 use async_trait::async_trait;
@@ -67,6 +68,17 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Convert the float-vector representation to the desired format.
+fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector {
+    match format {
+        EncodingFormat::Float => EmbeddingVector::Float(array),
+        EncodingFormat::Base64 => {
+            let base64_str = EmbeddingVector::Float(array).into();
+            EmbeddingVector::Base64(base64_str)
+        }
+    }
+}
+
 #[async_trait]
 pub trait Embed: Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
@@ -99,6 +111,7 @@ pub trait Embed: Sync + Send {
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let format = req.encoding_format.unwrap_or_default();
         let result = self.embed(req.input).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -112,12 +125,12 @@ pub trait Embed: Sync + Send {
             object: "list".to_string(),
             model: req.model.clone(),
             data: result
-                .iter()
+                .into_iter()
                 .enumerate()
                 .map(|(i, emb)| Embedding {
                     index: i as u32,
                     object: "embedding".to_string(),
-                    embedding: emb.clone(),
+                    embedding: encode_embedding(&format, emb),
                 })
                 .collect(),
             usage: EmbeddingUsage {
