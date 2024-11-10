@@ -1653,7 +1653,7 @@ impl Runtime {
 
         // Get ordering of views to load, including those unchanged but with dependencies that have changed
         // If we can't determine the order, we'll just load the views in the order they are in the app
-        let afffected_views_in_order_of_dependencies = match valid_views
+        let affected_views_in_order_of_dependencies = match valid_views
             .iter()
             .map(|v| {
                 let Some(statement) =
